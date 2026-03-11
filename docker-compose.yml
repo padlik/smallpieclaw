@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  tm-agent:
+    build: .
+    container_name: tm-agent
+    restart: unless-stopped
+    
+    # Environment variables (use .env file or uncomment below)
+    environment:
+      # Required
+      - TM_TELEGRAM_TOKEN=${TM_TELEGRAM_TOKEN}
+      - TM_LLM_API_KEY=${TM_LLM_API_KEY}
+      - TM_LLM_MODEL=${TM_LLM_MODEL:-gpt-4o-mini}
+      - TM_LLM_BASE_URL=${TM_LLM_BASE_URL:-https://api.openai.com/v1}
+      
+      # Embeddings (optional, can be same as LLM)
+      - TM_EMBEDDINGS_API_KEY=${TM_EMBEDDINGS_API_KEY:-${TM_LLM_API_KEY}}
+      - TM_EMBEDDINGS_MODEL=${TM_EMBEDDINGS_MODEL:-text-embedding-3-small}
+      - TM_EMBEDDINGS_BASE_URL=${TM_EMBEDDINGS_BASE_URL:-${TM_LLM_BASE_URL}}
+      
+      # Security
+      - TM_ADMIN_ID=${TM_ADMIN_ID}
+      - TM_PAIR_SECRET=${TM_PAIR_SECRET}
+      
+      # Paths (Docker-specific)
+      - TM_TOOLS_DIR=/app/tools
+      - TM_TOOLS_GENERATED_DIR=/app/tools/tools_generated
+      - TM_ALLOWED_IDS_PATH=/app/data/allowed_ids.json
+      - TM_MEMORY_PATH=/app/data/memory.json
+      - TM_TOOL_INDEX_PATH=/app/data/tool_index.json
+      
+      # System limits
+      - TM_MAX_STEPS=${TM_MAX_STEPS:-8}
+      - TM_TOOL_TIMEOUT=${TM_TOOL_TIMEOUT:-10}
+      - TM_MAX_OUTPUT_BYTES=${TM_MAX_OUTPUT_BYTES:-20000}
+    
+    # Volume mounts for persistent data
+    volumes:
+      - ./data:/app/data:rw
+      - ./logs:/app/logs:rw
+      # Optional: Mount tools directory for external scripts
+      # - ./custom_tools:/app/tools/custom:rw
+    
+    # Resource limits for Raspberry Pi
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+          cpus: '0.25'
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    
+    # Network (none needed - outbound only)
+    networks:
+      - tmagent-net
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Simple monitoring with watchtower
+  watchtower:
+    image: containrrr/watchtower
+    container_name: tm-agent-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=3600
+    command: --interval 3600 tm-agent
+    profiles:
+      - monitoring
+
+networks:
+  tmagent-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-tmagent
+
