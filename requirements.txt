@@ -1,0 +1,16 @@
+# Telegram AI Agent — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
+python-telegram-bot>=21.0,<22.0
+
+# ── LLM providers (install only what you need) ────────────────────────────────
+openai>=1.30.0             # OpenAI + OpenRouter
+anthropic>=0.28.0          # Claude
+google-generativeai>=0.7.0 # Google Gemini
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+apscheduler>=3.10.0
+
+# ── No heavy ML libraries needed — embeddings use the LLM API ─────────────────
+# numpy is NOT required; cosine similarity is pure Python

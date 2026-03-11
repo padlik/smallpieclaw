@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram AI Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/agent
+EnvironmentFile=/home/pi/agent/.env
+ExecStart=/usr/bin/python3 /home/pi/agent/main.py
+Restart=on-failure
+RestartSec=10
+# Memory limit as safety net
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

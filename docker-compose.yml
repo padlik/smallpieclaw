@@ -1,0 +1,119 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram AI Agent — Docker Compose (testing)
+#
+# Usage:
+#   cp .env.example .env      # fill in tokens
+#   docker compose up --build
+#
+# Includes:
+#   agent     — the main bot
+#   watchtower — optional auto-restart on image rebuild (comment out to disable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Main agent ──────────────────────────────────────────────────────────────
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg_agent
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    # Override individual env vars here for testing without editing .env
+    environment:
+      # Uncomment and set directly for quick tests:
+      # TELEGRAM_TOKEN: "..."
+      # LLM_PROVIDER: "openai"
+      # OPENAI_API_KEY: "sk-..."
+      # PAIRING_PIN: "test1234"
+
+      # Keep logs unformatted inside Docker (timestamps come from Docker)
+      PYTHONUNBUFFERED: "1"
+
+      # Redirect persistent files into the named volume
+      MEMORY_FILE: "/app/data/memory.json"
+      TOOL_INDEX_FILE: "/app/data/tool_index.json"
+      PAIRED_USERS_FILE: "/app/data/paired_users.json"
+
+    volumes:
+      # ── Persistent data (survives container restarts) ──────────────────────
+      - agent_data:/app/data
+
+      # ── Live-reload source during development ─────────────────────────────
+      # Mount individual files so you can edit them without rebuilding:
+      - ./agent.py:/app/agent.py:ro
+      - ./telegram_bot.py:/app/telegram_bot.py:ro
+      - ./tool_registry.py:/app/tool_registry.py:ro
+      - ./tool_index.py:/app/tool_index.py:ro
+      - ./tool_executor.py:/app/tool_executor.py:ro
+      - ./tool_creator.py:/app/tool_creator.py:ro
+      - ./scheduler.py:/app/scheduler.py:ro
+      - ./memory.py:/app/memory.py:ro
+      - ./security.py:/app/security.py:ro
+      - ./llm_client.py:/app/llm_client.py:ro
+      - ./config.py:/app/config.py:ro
+
+      # ── Tools directories ─────────────────────────────────────────────────
+      - ./tools:/app/tools:ro
+      - tools_generated:/app/tools_generated
+
+      # ── Docker socket so docker_status.sh can talk to host daemon ─────────
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    # Give the container access to host process list (for check_cpu.sh)
+    pid: host
+
+    # Needed for /proc/meminfo, temperature sensors, etc.
+    # Remove for stricter isolation
+    privileged: false
+    cap_add:
+      - SYS_PTRACE   # ps aux visibility
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import telegram; print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    networks:
+      - agent_net
+
+  # ── Watchtower: auto-restart agent when image is rebuilt ────────────────────
+  # Useful during development: docker compose build agent → agent restarts
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: tg_agent_watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 30 --cleanup tg_agent
+    networks:
+      - agent_net
+    profiles:
+      # Only starts with: docker compose --profile watch up
+      - watch
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+volumes:
+  agent_data:
+    driver: local
+  tools_generated:
+    driver: local
+
+# ── Network ────────────────────────────────────────────────────────────────────
+networks:
+  agent_net:
+    driver: bridge

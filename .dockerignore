@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Runtime data — these live in the named volume, not the image
+memory.json
+tool_index.json
+paired_users.json
+tools_generated/
+
+# Local config overrides
+.env
+config_local.py
+
+# Docs / CI
+README.md
+*.md
+*.service
