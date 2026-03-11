@@ -1,0 +1,32 @@
+# Optimized for ARM64/Raspberry Pi
+FROM python:3.11-alpine
+
+# Install minimal dependencies
+RUN apk add --no-cache \
+    bash \
+    curl \
+    ca-certificates
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY . .
+
+# Setup
+RUN mkdir -p tools/tools_generated data logs && \
+    chmod +x agent/tools/*.sh tools/*.sh
+
+# Non-root user
+RUN addgroup -g 1001 tmagent && \
+    adduser -D -u 1001 -G tmagent tmagent && \
+    chown -R tmagent:tmagent /app
+
+USER tmagent
+
+CMD ["python", "-m", "agent.telegram_bot"]
+

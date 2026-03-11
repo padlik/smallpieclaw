@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  tm-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tm-agent-prod
+    restart: always
+    
+    environment:
+      - TM_TELEGRAM_TOKEN=${TM_TELEGRAM_TOKEN}
+      - TM_LLM_API_KEY=${TM_LLM_API_KEY}
+      - TM_LLM_MODEL=${TM_LLM_MODEL:-gpt-4o-mini}
+      - TM_LLM_BASE_URL=${TM_LLM_BASE_URL:-https://api.openai.com/v1}
+      - TM_EMBEDDINGS_API_KEY=${TM_EMBEDDINGS_API_KEY:-${TM_LLM_API_KEY}}
+      - TM_EMBEDDINGS_MODEL=${TM_EMBEDDINGS_MODEL:-text-embedding-3-small}
+      - TM_EMBEDDINGS_BASE_URL=${TM_EMBEDDINGS_BASE_URL:-${TM_LLM_BASE_URL}}
+      - TM_ADMIN_ID=${TM_ADMIN_ID}
+      - TM_PAIR_SECRET=${TM_PAIR_SECRET}
+      - TM_TOOLS_DIR=/app/tools
+      - TM_TOOLS_GENERATED_DIR=/app/tools/tools_generated
+      - TM_ALLOWED_IDS_PATH=/app/data/allowed_ids.json
+      - TM_MEMORY_PATH=/app/data/memory.json
+      - TM_TOOL_INDEX_PATH=/app/data/tool_index.json
+      - TM_MAX_STEPS=${TM_MAX_STEPS:-8}
+      - TM_TOOL_TIMEOUT=${TM_TOOL_TIMEOUT:-10}
+      - TM_MAX_OUTPUT_BYTES=${TM_MAX_OUTPUT_BYTES:-20000}
+    
+    volumes:
+      - tmagent_data:/app/data
+      - tmagent_logs:/app/logs
+      - ./tools:/app/tools:ro  # Read-only tools mount
+    # Resource limits tuned for Raspberry Pi
+    mem_limit: 256m
+    cpus: '0.5'
+    
+    security_opt:
+      - no-new-privileges:true
+    
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  tmagent_data:
+  tmagent_logs:
+
