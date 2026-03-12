@@ -123,12 +123,12 @@ class _GoogleClient:
 
 
 class _OpenRouterClient(_OpenAIClient):
-    """OpenRouter is OpenAI-compatible."""
+    """OpenRouter — OpenAI-compatible, fixed base URL, no embeddings."""
     def __init__(self, api_key: str, model: str):
         super().__init__(
             api_key=api_key,
             model=model,
-            base_url="https://openrouter.ai/api/v1",
+            base_url=config.OPENROUTER_BASE_URL,
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -136,6 +136,40 @@ class _OpenRouterClient(_OpenAIClient):
             "OpenRouter does not expose embeddings. "
             "Set EMBEDDING_PROVIDER=openai or EMBEDDING_PROVIDER=none."
         )
+
+
+class _OpenAICompatibleClient(_OpenAIClient):
+    """
+    Generic OpenAI-compatible client.
+
+    Works with any server that implements the OpenAI Chat Completions API:
+      - Ollama      (http://localhost:11434/v1)
+      - LM Studio   (http://localhost:1234/v1)
+      - vLLM        (http://<host>:8000/v1)
+      - Groq        (https://api.groq.com/openai/v1)
+      - Together AI (https://api.together.xyz/v1)
+      - … and others
+
+    Configure via:
+      OPENAI_COMPATIBLE_BASE_URL  — required
+      OPENAI_COMPATIBLE_API_KEY   — often "ollama" / "lm-studio" / real key
+      OPENAI_COMPATIBLE_MODEL     — model name as the server expects it
+    """
+    def __init__(self):
+        super().__init__(
+            api_key=config.OPENAI_COMPATIBLE_API_KEY,
+            model=config.OPENAI_COMPATIBLE_MODEL,
+            base_url=config.OPENAI_COMPATIBLE_BASE_URL,
+        )
+        logger.info(
+            "OpenAI-compatible client: base_url=%s model=%s",
+            config.OPENAI_COMPATIBLE_BASE_URL,
+            config.OPENAI_COMPATIBLE_MODEL,
+        )
+
+    # Embeddings only work if the remote server supports them.
+    # Most local servers (Ollama, LM Studio) do expose /v1/embeddings,
+    # so we attempt it and let the parent class handle any errors naturally.
 
 
 # ── public interface ───────────────────────────────────────────────────────────
@@ -150,15 +184,25 @@ def _get_chat_client():
         return _chat_client
     p = config.LLM_PROVIDER
     if p == "openai":
-        _chat_client = _OpenAIClient(config.OPENAI_API_KEY, config.OPENAI_MODEL)
+        # Honour OPENAI_BASE_URL if set (Azure, proxies, self-hosted, etc.)
+        _chat_client = _OpenAIClient(
+            config.OPENAI_API_KEY,
+            config.OPENAI_MODEL,
+            base_url=config.OPENAI_BASE_URL,   # None = official endpoint
+        )
     elif p == "claude":
         _chat_client = _ClaudeClient(config.CLAUDE_API_KEY, config.CLAUDE_MODEL)
     elif p == "google":
         _chat_client = _GoogleClient(config.GOOGLE_API_KEY, config.GOOGLE_MODEL)
     elif p == "openrouter":
         _chat_client = _OpenRouterClient(config.OPENROUTER_API_KEY, config.OPENROUTER_MODEL)
+    elif p == "openai_compatible":
+        _chat_client = _OpenAICompatibleClient()
     else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {p}")
+        raise ValueError(
+            f"Unknown LLM_PROVIDER: {p!r}. "
+            "Valid options: openai, claude, google, openrouter, openai_compatible"
+        )
     return _chat_client
 
 
@@ -168,14 +212,28 @@ def _get_embed_client():
         return _embed_client
     p = config.EMBEDDING_PROVIDER
     if p == "openai":
-        _embed_client = _OpenAIClient(config.OPENAI_API_KEY, config.EMBEDDING_MODEL)
+        _embed_client = _OpenAIClient(
+            config.OPENAI_API_KEY,
+            config.EMBEDDING_MODEL,
+            base_url=config.OPENAI_BASE_URL,
+        )
     elif p == "google":
         _embed_client = _GoogleClient(config.GOOGLE_API_KEY, config.GOOGLE_MODEL)
+    elif p == "openai_compatible":
+        # Reuse the compatible client; model can be overridden via EMBEDDING_MODEL
+        _embed_client = _OpenAIClient(
+            api_key=config.OPENAI_COMPATIBLE_API_KEY,
+            model=config.EMBEDDING_MODEL,
+            base_url=config.OPENAI_COMPATIBLE_BASE_URL,
+        )
     elif p == "none":
         _embed_client = None
         return None
     else:
-        raise ValueError(f"Unknown EMBEDDING_PROVIDER: {p}")
+        raise ValueError(
+            f"Unknown EMBEDDING_PROVIDER: {p!r}. "
+            "Valid options: openai, google, openai_compatible, none"
+        )
     return _embed_client
 
 
