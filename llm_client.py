@@ -3,11 +3,16 @@ llm_client.py
 -------------
 Unified LLM client supporting OpenAI-compatible APIs, Google Gemini, and Anthropic.
 Handles both chat completions and embeddings, configured separately.
+
+Note on OpenAI reasoning models (o1, o1-mini, o3, o3-mini, o4-mini, gpt-5, etc.):
+  These models do NOT accept a `temperature` parameter — passing any value causes
+  a 400 "Unsupported parameter" error. The client detects these models by name
+  and omits temperature (and other unsupported sampling params) automatically.
 """
 
-import json
 import logging
 import math
+import re
 from typing import Any
 
 import httpx
@@ -27,6 +32,22 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+# Matches OpenAI reasoning / o-series model names:
+#   o1, o1-mini, o1-preview, o3, o3-mini, o4-mini, gpt-5, gpt-5-pro, …
+_REASONING_MODEL_RE = re.compile(
+    r"^(o\d+(-mini|-preview|-pro)?|gpt-5\S*)$",
+    re.IGNORECASE,
+)
+
+
+def _is_reasoning_model(model_name: str) -> bool:
+    """
+    Return True if the model is an OpenAI reasoning model that does not
+    accept temperature, top_p, frequency_penalty, or presence_penalty.
+    """
+    return bool(_REASONING_MODEL_RE.match(model_name.strip()))
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +90,34 @@ class LLMClient:
             raise
 
     def _openai_chat(self, messages: list[dict], system: str | None) -> str:
+        model = self.llm_cfg["model"]
+        reasoning = _is_reasoning_model(model)
+
         payload_messages = []
         if system:
-            payload_messages.append({"role": "system", "content": system})
+            if reasoning:
+                # o-series models don't support the "system" role — embed it as
+                # the first user turn so context is still passed through.
+                payload_messages.append({
+                    "role": "user",
+                    "content": f"[Instructions]\n{system}",
+                })
+            else:
+                payload_messages.append({"role": "system", "content": system})
         payload_messages.extend(messages)
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": payload_messages,
+            "max_completion_tokens": self.llm_cfg.get("max_tokens", 1024),
+        }
+
+        if reasoning:
+            # Reasoning models (o1, o3, o4-mini, gpt-5, …) reject temperature,
+            # top_p, frequency_penalty, and presence_penalty entirely.
+            logger.debug("Reasoning model detected (%s) — omitting sampling params", model)
+        else:
+            payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
 
         resp = self._http.post(
             f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions",
@@ -80,12 +125,7 @@ class LLMClient:
                 "Authorization": f"Bearer {self.llm_cfg['api_key']}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": self.llm_cfg["model"],
-                "messages": payload_messages,
-                "max_tokens": self.llm_cfg.get("max_tokens", 1024),
-                "temperature": self.llm_cfg.get("temperature", 0.2),
-            },
+            json=payload,
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
@@ -187,3 +227,4 @@ class LLMClient:
 
     def close(self):
         self._http.close()
+
