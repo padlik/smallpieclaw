@@ -10,11 +10,13 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 
 - **ReAct agent loop** — reasons step-by-step, executes tools, and loops until done
 - **Semantic tool search** — finds the right tool using embedding-based cosine similarity
-- **Self-building tools** — the LLM can create new `.sh`/`.py` tools when a capability is missing
+- **Self-building tools** — the LLM can create new `.sh`/`.py` tools when a capability is missing; creation is reported to the user immediately
 - **Secure Telegram bot** — allowlist or pairing-token access control
-- **Persistent memory** — JSON-backed key-value store injected into every LLM prompt
-- **Scheduler** — nightly health checks and periodic disk alerts sent to Telegram
+- **4-tier memory architecture** — short-term conversation history, working task context, long-term vector knowledge index, and results history
+- **Configurable scheduler** — jobs defined in `scheduler.toml`; manage jobs from chat or via `/jobs`
+- **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude
+- **Token usage tracking** — daily prompt/completion counters visible in `/status`
 
 ---
 
@@ -23,20 +25,24 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 ```
 main.py                  # Entry point
 config.toml              # All configuration
-llm_client.py            # LLM + embeddings client (multi-provider)
-agent_controller.py      # ReAct agent loop
-telegram_interface.py    # Telegram bot with security
+scheduler.toml           # Scheduled job definitions
+llm_client.py            # LLM + embeddings client (multi-provider, token tracking)
+agent_controller.py      # ReAct agent loop with 4-tier memory
+telegram_interface.py    # Telegram bot with security and streaming
 tool_registry.py         # Discovers and registers tools
 tool_executor.py         # Runs tools in subprocess
 tool_index.py            # Semantic search over tool descriptions
 tool_creator.py          # LLM-generated tools with safety validation
 scheduler.py             # Background task scheduler
-memory_store.py          # Persistent JSON memory
+memory_store.py          # Short-term, working, long-term, and results memory
 tools/                   # Built-in tools (.sh and .py)
 tools_generated/         # Tools created by the LLM at runtime
 data/
-    tool_index.json      # Persisted embedding vectors
-    memory.json          # Persistent agent memory
+    tool_index.json          # Persisted embedding vectors for tools
+    memory.json              # Persistent agent key-value memory
+    longterm_memory.json     # Long-term vector knowledge index
+    results_memory.json      # Past task summaries and results
+    scheduler_state.json     # Current scheduler job state (read by manage_scheduler tool)
 ```
 
 ---
@@ -82,10 +88,39 @@ Required settings:
 | `llm.api_key` | Your LLM provider API key |
 | `llm.provider` | `openai`, `openrouter`, `google`, or `anthropic` |
 | `llm.model` | e.g. `gpt-4o-mini`, `gemini-1.5-flash`, `claude-3-haiku-20240307` |
-| `embeddings.api_key` | API key for embeddings (can be same as LLM) |
+| `embeddings.api_key` | API key for embeddings — if empty, falls back to `llm.api_key` |
 | `embeddings.model` | e.g. `text-embedding-3-small` |
 
 > **Tip:** To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
+
+### 5. (Optional) Configure the scheduler
+
+Edit `scheduler.toml` to enable/disable jobs or change their schedule:
+
+```toml
+[jobs.nightly_health]
+enabled = true
+schedule = "daily"
+time = "02:00"
+task = "Run a full system health check and summarize the status."
+notify = true
+
+[jobs.disk_check]
+enabled = true
+schedule = "interval"
+hours = 6
+task = "Check disk usage on all mount points. Alert if any mount point is above 80% full."
+notify = true
+
+[jobs.longterm_memory_update]
+enabled = true
+schedule = "daily"
+time = "03:00"
+task = "Summarize the key events and findings from today into long-term memory."
+notify = false
+```
+
+You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `manage_scheduler` tool), or use `/jobs` to see all active jobs.
 
 ### 5. Run
 
@@ -179,7 +214,7 @@ Restart the agent (or wait for the next query) to pick up new tools.
 | Google | `google` | Gemini models |
 | Anthropic | `anthropic` | Claude models |
 
-Embeddings can use a different provider/key than the main LLM.
+Embeddings can use a different provider/key than the main LLM. If `embeddings.api_key` is empty, the agent falls back to `llm.api_key` automatically.
 
 ---
 
@@ -187,18 +222,40 @@ Embeddings can use a different provider/key than the main LLM.
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Introduction and usage |
-| `/help` | Help text |
-| `/status` | Bot and config status |
+| `/start` | Introduction and usage examples |
+| `/help` | Full command reference |
+| `/status` | Uptime, LLM model, embeddings status, and today's token usage |
+| `/tools` | List all built-in and generated tools |
+| `/jobs` | List all scheduled jobs with last-run times |
+| `/reset` | Save current task context to results memory and start fresh |
+| `/reset discard` | Clear task context without saving |
 | `/pair` | Generate or submit pairing token |
 | `/unpair <id>` | Remove a user from the allowlist |
 | `/myid` | Show your Telegram user ID |
+
+Typing `/` in Telegram shows the full command list with descriptions (registered via BotFather's `setMyCommands`).
 
 Or just send a natural language message:
 - *"check disk usage"*
 - *"is Docker running?"*
 - *"show me the CPU temperature"*
 - *"create a tool that lists all open ports"*
+- *"remind me every day at 9am to check the backup logs"*
+
+---
+
+## Memory Architecture
+
+The agent uses a four-tier memory system:
+
+| Tier | Storage | Purpose |
+|------|---------|---------|
+| **Short-term** | In-memory (ring buffer, last 20 turns) | Recent conversation context injected into every prompt |
+| **Working** | In-memory (current task) | Tracks the current goal, tool calls, and results; cleared on `/reset` |
+| **Long-term** | `data/longterm_memory.json` (vector index) | Nightly summaries and manually added facts; semantically searchable |
+| **Results** | `data/results_memory.json` (vector index) | Past task summaries saved on `/reset` or task completion |
+
+When you send `/reset`, the working memory is summarised by the LLM and persisted to results memory before being cleared. Use `/reset discard` to skip saving.
 
 ---
 

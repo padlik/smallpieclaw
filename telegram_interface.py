@@ -6,11 +6,13 @@ Telegram bot interface with two security modes:
   - pairing:   users request access; owner approves via /pair command
 """
 
+import asyncio
 import logging
 import secrets
+import time
 from typing import Callable, Optional
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -29,13 +31,27 @@ class TelegramInterface:
     Calls `agent_handler(user_id, text, reply_fn)` for each authorized message.
     """
 
-    def __init__(self, config: dict, agent_handler: Callable):
+    def __init__(
+        self,
+        config: dict,
+        agent_handler: Callable,
+        agent_reset_fn: Optional[Callable] = None,
+        scheduler=None,
+        tool_registry=None,
+        llm_client=None,
+    ):
         tg_cfg = config["telegram"]
+        self._config = config
         self.token: str = tg_cfg["bot_token"]
         self.security_mode: str = tg_cfg.get("security_mode", "allowlist")
         self.allowed_ids: set[int] = set(tg_cfg.get("allowed_user_ids", []))
         self.pairing_timeout: int = tg_cfg.get("pairing_timeout", 300)
         self.agent_handler = agent_handler
+        self.agent_reset_fn = agent_reset_fn
+        self.scheduler = scheduler
+        self.tool_registry = tool_registry
+        self.llm_client = llm_client
+        self._start_time = time.time()
 
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
@@ -48,7 +64,12 @@ class TelegramInterface:
     # ------------------------------------------------------------------
 
     def build(self) -> Application:
-        self._app = Application.builder().token(self.token).build()
+        self._app = (
+            Application.builder()
+            .token(self.token)
+            .post_init(self._post_init)
+            .build()
+        )
         self._register_handlers()
         logger.info(
             "Telegram bot built. Security mode: %s. Allowed IDs: %s",
@@ -64,6 +85,28 @@ class TelegramInterface:
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
     # ------------------------------------------------------------------
+    # Post-init (register bot commands)
+    # ------------------------------------------------------------------
+
+    async def _post_init(self, app: Application) -> None:
+        commands = [
+            BotCommand("start", "Introduction and usage examples"),
+            BotCommand("help", "Help and command reference"),
+            BotCommand("status", "Agent status, uptime, and token usage"),
+            BotCommand("tools", "List available tools"),
+            BotCommand("jobs", "List scheduled jobs"),
+            BotCommand("reset", "Save and clear current task context"),
+            BotCommand("pair", "Generate or submit pairing token"),
+            BotCommand("unpair", "Remove a user from access list"),
+            BotCommand("myid", "Show your Telegram user ID"),
+        ]
+        try:
+            await app.bot.set_my_commands(commands)
+            logger.info("Bot commands registered with Telegram.")
+        except Exception as exc:
+            logger.warning("Could not register bot commands: %s", exc)
+
+    # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
 
@@ -72,6 +115,9 @@ class TelegramInterface:
         app.add_handler(CommandHandler("start", self._cmd_start))
         app.add_handler(CommandHandler("help", self._cmd_help))
         app.add_handler(CommandHandler("status", self._cmd_status))
+        app.add_handler(CommandHandler("reset", self._cmd_reset))
+        app.add_handler(CommandHandler("jobs", self._cmd_jobs))
+        app.add_handler(CommandHandler("tools", self._cmd_tools))
         app.add_handler(CommandHandler("pair", self._cmd_pair))
         app.add_handler(CommandHandler("unpair", self._cmd_unpair))
         app.add_handler(CommandHandler("myid", self._cmd_myid))
@@ -104,9 +150,12 @@ class TelegramInterface:
             "  `show system health`\n"
             "  `how much RAM is free?`\n\n"
             "*Commands:*\n"
-            "  /status — bot + system status\n"
-            "  /pair   — generate pairing token (admin)\n"
-            "  /myid   — show your Telegram user ID\n",
+            "  /status  — agent status, uptime, token usage\n"
+            "  /tools   — list available tools\n"
+            "  /jobs    — list scheduled jobs\n"
+            "  /reset   — save and clear task context (`/reset discard` to skip saving)\n"
+            "  /pair    — pairing token management\n"
+            "  /myid    — show your Telegram user ID\n",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -114,12 +163,109 @@ class TelegramInterface:
         if not self._is_authorized(update.effective_user.id):
             await self._send_unauthorized(update)
             return
+
+        uptime_secs = int(time.time() - self._start_time)
+        h = uptime_secs // 3600
+        m = (uptime_secs % 3600) // 60
+        s = uptime_secs % 60
+
+        llm_model = self._config["llm"]["model"]
+        emb_cfg = self._config.get("embeddings", {})
+        emb_model = emb_cfg.get("model", "N/A")
+        emb_key_status = "own key" if emb_cfg.get("api_key") else "using LLM key (fallback)"
+
+        token_line = ""
+        if self.llm_client:
+            usage = self.llm_client.get_today_usage()
+            token_line = (
+                f"\n📊 *Token Usage Today:*\n"
+                f"  Prompt: {usage['prompt_tokens']:,}\n"
+                f"  Completion: {usage['completion_tokens']:,}\n"
+                f"  Total: {usage['total_tokens']:,}"
+            )
+
         await update.message.reply_text(
-            f"✅ Agent online.\n"
-            f"Security: `{self.security_mode}`\n"
-            f"Authorized users: {len(self.allowed_ids)}",
+            f"✅ *Agent Status*\n\n"
+            f"⏱ Uptime: `{h}h {m}m {s}s`\n"
+            f"🤖 LLM: `{llm_model}`\n"
+            f"🔍 Embeddings: `{emb_model}` ({emb_key_status})\n"
+            f"🔐 Security: `{self.security_mode}`\n"
+            f"👥 Authorized users: {len(self.allowed_ids)}"
+            f"{token_line}",
             parse_mode=ParseMode.MARKDOWN,
         )
+
+    async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        args = ctx.args or []
+        discard = "discard" in [a.lower() for a in args]
+
+        status_msg = await update.message.reply_text(
+            "🗑️ Discarding task context…" if discard else "💾 Saving task context…"
+        )
+
+        if self.agent_reset_fn:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, lambda: self.agent_reset_fn(save=not discard)
+            )
+            await self._safe_edit(status_msg, result)
+        else:
+            await self._safe_edit(status_msg, "✅ Context cleared.")
+
+    async def _cmd_jobs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if not self.scheduler:
+            await update.message.reply_text("Scheduler not available.")
+            return
+
+        jobs = self.scheduler.list_jobs()
+        if not jobs:
+            await update.message.reply_text("No scheduled jobs configured.")
+            return
+
+        lines = [f"📅 *Scheduled Jobs* ({len(jobs)} total)\n"]
+        for job in jobs:
+            icon = "✅" if job["enabled"] else "⏸"
+            last_run = job.get("last_run") or "never"
+            lines.append(f"{icon} `{job['tag']}`")
+            lines.append(f"   Schedule: {job['schedule']}")
+            lines.append(f"   Last run: {last_run}")
+            lines.append(f"   {job['task']}\n")
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if not self.tool_registry:
+            await update.message.reply_text("Tool registry not available.")
+            return
+
+        tools = self.tool_registry.all()
+        if not tools:
+            await update.message.reply_text("No tools registered.")
+            return
+
+        builtin = [t for t in tools if not t.is_generated]
+        generated = [t for t in tools if t.is_generated]
+
+        lines = [f"🔧 *Available Tools* ({len(tools)} total)\n"]
+        if builtin:
+            lines.append("*Built-in:*")
+            for t in builtin:
+                lines.append(f"  • `{t.name}` — {t.description}")
+        if generated:
+            lines.append("\n*Generated:*")
+            for t in generated:
+                lines.append(f"  • `{t.name}` — {t.description}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     async def _cmd_pair(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -191,37 +337,36 @@ class TelegramInterface:
             return
 
         logger.info("Message from user %d: %s", user.id, text[:80])
-        await update.message.reply_text("🔄 Processing…")
+        status_msg = await update.message.reply_text("🔄 Processing…")
+        loop = asyncio.get_event_loop()
 
-        async def reply(msg: str):
-            # Telegram message size limit is 4096 chars; split if needed
-            for chunk in self._split_message(msg):
-                await update.message.reply_text(chunk)
-
-        # progress_callback runs in a sync context inside the agent;
-        # we schedule coroutines via the event loop
         def progress(msg: str):
-            import asyncio
-            loop = ctx.application.update_queue._loop if hasattr(ctx.application.update_queue, "_loop") else None
-            # Best-effort: log only (sending from sync thread is complex)
-            logger.debug("Agent progress: %s", msg)
+            asyncio.run_coroutine_threadsafe(
+                self._safe_edit(status_msg, msg),
+                loop,
+            )
 
         try:
-            result = await ctx.application.run_coroutine(
-                self._run_agent_async(user.id, text, progress)
-            ) if False else self._run_agent_sync(user.id, text, progress)
-            await reply(result)
+            result = await loop.run_in_executor(
+                None,
+                lambda: self.agent_handler(user.id, text, progress),
+            )
+            await self._safe_edit(status_msg, "✅ Done")
+            for chunk in self._split_message(result):
+                await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
-            await update.message.reply_text(f"❌ Error: {exc}")
+            await self._safe_edit(status_msg, f"❌ Error: {exc}")
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _run_agent_sync(self, user_id: int, text: str, progress_cb) -> str:
-        """Delegates to the injected agent_handler (synchronous)."""
-        return self.agent_handler(user_id, text, progress_cb)
+    async def _safe_edit(self, message, text: str) -> None:
+        try:
+            await message.edit_text(text[:4096])
+        except Exception:
+            pass
 
     def _is_authorized(self, user_id: int) -> bool:
         if self.security_mode == "allowlist":
@@ -260,10 +405,8 @@ class TelegramInterface:
     def send_message_to_users(self, text: str) -> None:
         """
         Send a message to all authorized users (used by the scheduler).
-        Must be called from within an async context or wrapped appropriately.
+        Schedules the send on the bot's running event loop.
         """
-        import asyncio
-
         async def _send():
             bot = self._app.bot
             for uid in list(self.allowed_ids):

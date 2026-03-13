@@ -38,7 +38,7 @@ except ImportError:
 
 from agent_controller import AgentController
 from llm_client import LLMClient
-from memory_store import MemoryStore
+from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory
 from scheduler import Scheduler
 from telegram_interface import TelegramInterface
 from tool_creator import ToolCreator
@@ -66,6 +66,9 @@ def main():
     data_dir      = paths.get("data_dir", "data")
     index_path    = paths.get("tool_index_file", "data/tool_index.json")
     memory_path   = paths.get("memory_file", "data/memory.json")
+    longterm_path = paths.get("longterm_memory_file", "data/longterm_memory.json")
+    results_path  = paths.get("results_memory_file", "data/results_memory.json")
+    scheduler_config_path = paths.get("scheduler_config", "scheduler.toml")
 
     os.makedirs(tools_dir, exist_ok=True)
     os.makedirs(gen_tools_dir, exist_ok=True)
@@ -86,6 +89,11 @@ def main():
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
     creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)
 
+    short_term  = ShortTermMemory(max_turns=20)
+    working     = WorkingMemory()
+    long_term   = LongTermMemory(path=longterm_path, llm=llm)
+    results_mem = ResultsMemory(path=results_path, llm=llm)
+
     agent = AgentController(
         llm=llm,
         tool_index=index,
@@ -94,6 +102,10 @@ def main():
         memory=memory,
         max_iterations=max_iter,
         top_tools=top_tools,
+        short_term=short_term,
+        working=working,
+        long_term=long_term,
+        results=results_mem,
     )
 
     logger.info("Building semantic tool index...")
@@ -105,18 +117,35 @@ def main():
     def agent_handler(user_id, text, progress_cb):
         return agent.run(text, progress_callback=progress_cb)
 
-    tg = TelegramInterface(cfg, agent_handler)
-
-    def notify(msg):
-        tg.send_message_to_users(msg)
-
     def run_agent(goal):
         return agent.run(goal)
 
-    scheduler = Scheduler(cfg, notify_fn=notify, agent_fn=run_agent)
-    scheduler.start()
+    # Build TelegramInterface first so notify() can reference it
+    # (scheduler and tg are wired together via forward references in closures)
+    _tg_holder: list = [None]
+
+    def notify(msg):
+        if _tg_holder[0] is not None:
+            _tg_holder[0].send_message_to_users(msg)
+
+    scheduler = Scheduler(
+        cfg, notify_fn=notify, agent_fn=run_agent,
+        scheduler_config_path=scheduler_config_path,
+        data_dir=data_dir,
+        long_term_memory=long_term,
+    )
 
     logger.info("Starting Telegram bot...")
+    tg = TelegramInterface(
+        cfg, agent_handler,
+        agent_reset_fn=agent.reset_task,
+        scheduler=scheduler,
+        tool_registry=registry,
+        llm_client=llm,
+    )
+    _tg_holder[0] = tg
+
+    scheduler.start()
     try:
         tg.run()
     except KeyboardInterrupt:

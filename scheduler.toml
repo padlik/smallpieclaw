@@ -1,0 +1,31 @@
+# scheduler.toml
+# Default scheduled job configurations.
+# Fields per job:
+#   enabled       = true/false
+#   schedule      = "daily" or "interval"
+#   time          = "HH:MM"       (for schedule = "daily")
+#   hours         = N             (for schedule = "interval")
+#   minutes       = N             (for schedule = "interval")
+#   task          = "goal string sent to agent"
+#   notify        = true/false    (send result to Telegram users)
+
+[jobs.nightly_health]
+enabled = true
+schedule = "daily"
+time = "02:00"
+task = "Run a full system health check and summarize the status."
+notify = true
+
+[jobs.disk_check]
+enabled = true
+schedule = "interval"
+hours = 6
+task = "Check disk usage on all mount points. Alert if any mount point is above 80% full."
+notify = true
+
+[jobs.longterm_memory_update]
+enabled = true
+schedule = "daily"
+time = "03:00"
+task = "Summarize the key events, system findings, and actions taken today into a concise paragraph for long-term memory."
+notify = false

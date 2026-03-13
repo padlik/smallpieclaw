@@ -13,6 +13,7 @@ Note on OpenAI reasoning models (o1, o1-mini, o3, o3-mini, o4-mini, gpt-5, etc.)
 import logging
 import math
 import re
+from datetime import date
 from typing import Any
 
 import httpx
@@ -66,8 +67,40 @@ class LLMClient:
     def __init__(self, config: dict):
         self.cfg = config
         self.llm_cfg = config["llm"]
-        self.emb_cfg = config.get("embeddings", config["llm"])
+        emb_cfg = dict(config.get("embeddings", config["llm"]))
+        # Fall back to LLM credentials if embeddings section is missing them
+        if not emb_cfg.get("api_key"):
+            emb_cfg["api_key"] = self.llm_cfg["api_key"]
+        if not emb_cfg.get("base_url"):
+            emb_cfg["base_url"] = self.llm_cfg.get("base_url", "")
+        self.emb_cfg = emb_cfg
         self._http = httpx.Client(timeout=30)
+
+        # Daily token usage tracking
+        self._usage_date: date = date.today()
+        self._prompt_tokens: int = 0
+        self._completion_tokens: int = 0
+
+    # ------------------------------------------------------------------
+    # Token tracking
+    # ------------------------------------------------------------------
+
+    def _track_usage(self, prompt: int, completion: int) -> None:
+        today = date.today()
+        if today != self._usage_date:
+            self._usage_date = today
+            self._prompt_tokens = 0
+            self._completion_tokens = 0
+        self._prompt_tokens += prompt
+        self._completion_tokens += completion
+
+    def get_today_usage(self) -> dict:
+        return {
+            "date": self._usage_date.isoformat(),
+            "prompt_tokens": self._prompt_tokens,
+            "completion_tokens": self._completion_tokens,
+            "total_tokens": self._prompt_tokens + self._completion_tokens,
+        }
 
     # ------------------------------------------------------------------
     # Chat
@@ -128,7 +161,10 @@ class LLMClient:
             json=payload,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        data = resp.json()
+        usage = data.get("usage", {})
+        self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        return data["choices"][0]["message"]["content"]
 
     def _google_chat(self, messages: list[dict], system: str | None) -> str:
         # Convert to Gemini format
@@ -153,7 +189,10 @@ class LLMClient:
             },
         )
         resp.raise_for_status()
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        data = resp.json()
+        meta = data.get("usageMetadata", {})
+        self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
     def _anthropic_chat(self, messages: list[dict], system: str | None) -> str:
         payload: dict[str, Any] = {
@@ -174,7 +213,10 @@ class LLMClient:
             json=payload,
         )
         resp.raise_for_status()
-        return resp.json()["content"][0]["text"]
+        data = resp.json()
+        usage = data.get("usage", {})
+        self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+        return data["content"][0]["text"]
 
     # ------------------------------------------------------------------
     # Embeddings
