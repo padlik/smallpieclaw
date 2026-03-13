@@ -7,7 +7,9 @@ Telegram bot interface with two security modes:
 """
 
 import asyncio
+import html
 import logging
+import re
 import secrets
 import time
 from typing import Callable, Optional
@@ -132,11 +134,11 @@ class TelegramInterface:
         await update.message.reply_text(
             "👋 Home Server Agent ready.\n"
             "Send me a command like:\n"
-            "  • *check disk usage*\n"
-            "  • *show CPU temperature*\n"
-            "  • *are my Docker containers running?*\n\n"
+            "  • <b>check disk usage</b>\n"
+            "  • <b>show CPU temperature</b>\n"
+            "  • <b>are my Docker containers running?</b>\n\n"
             "Use /help for more info.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
 
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,19 +146,19 @@ class TelegramInterface:
             await self._send_unauthorized(update)
             return
         await update.message.reply_text(
-            "🤖 *Home Server Agent*\n\n"
+            "🤖 <b>Home Server Agent</b>\n\n"
             "Just send a natural language request, e.g.:\n"
-            "  `check disk usage`\n"
-            "  `show system health`\n"
-            "  `how much RAM is free?`\n\n"
-            "*Commands:*\n"
+            "  <code>check disk usage</code>\n"
+            "  <code>show system health</code>\n"
+            "  <code>how much RAM is free?</code>\n\n"
+            "<b>Commands:</b>\n"
             "  /status  — agent status, uptime, token usage\n"
             "  /tools   — list available tools\n"
             "  /jobs    — list scheduled jobs\n"
-            "  /reset   — save and clear task context (`/reset discard` to skip saving)\n"
+            "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
             "  /pair    — pairing token management\n"
             "  /myid    — show your Telegram user ID\n",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -178,21 +180,21 @@ class TelegramInterface:
         if self.llm_client:
             usage = self.llm_client.get_today_usage()
             token_line = (
-                f"\n📊 *Token Usage Today:*\n"
+                f"\n📊 <b>Token Usage Today:</b>\n"
                 f"  Prompt: {usage['prompt_tokens']:,}\n"
                 f"  Completion: {usage['completion_tokens']:,}\n"
                 f"  Total: {usage['total_tokens']:,}"
             )
 
         await update.message.reply_text(
-            f"✅ *Agent Status*\n\n"
-            f"⏱ Uptime: `{h}h {m}m {s}s`\n"
-            f"🤖 LLM: `{llm_model}`\n"
-            f"🔍 Embeddings: `{emb_model}` ({emb_key_status})\n"
-            f"🔐 Security: `{self.security_mode}`\n"
+            f"✅ <b>Agent Status</b>\n\n"
+            f"⏱ Uptime: <code>{h}h {m}m {s}s</code>\n"
+            f"🤖 LLM: <code>{html.escape(llm_model)}</code>\n"
+            f"🔍 Embeddings: <code>{html.escape(emb_model)}</code> ({html.escape(emb_key_status)})\n"
+            f"🔐 Security: <code>{html.escape(self.security_mode)}</code>\n"
             f"👥 Authorized users: {len(self.allowed_ids)}"
             f"{token_line}",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
 
     async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -228,16 +230,16 @@ class TelegramInterface:
             await update.message.reply_text("No scheduled jobs configured.")
             return
 
-        lines = [f"📅 *Scheduled Jobs* ({len(jobs)} total)\n"]
+        lines = [f"📅 <b>Scheduled Jobs</b> ({len(jobs)} total)\n"]
         for job in jobs:
             icon = "✅" if job["enabled"] else "⏸"
             last_run = job.get("last_run") or "never"
-            lines.append(f"{icon} `{job['tag']}`")
-            lines.append(f"   Schedule: {job['schedule']}")
-            lines.append(f"   Last run: {last_run}")
-            lines.append(f"   {job['task']}\n")
+            lines.append(f"{icon} <code>{html.escape(job['tag'])}</code>")
+            lines.append(f"   Schedule: {html.escape(job['schedule'])}")
+            lines.append(f"   Last run: {html.escape(str(last_run))}")
+            lines.append(f"   {html.escape(job['task'])}\n")
 
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
@@ -255,17 +257,17 @@ class TelegramInterface:
         builtin = [t for t in tools if not t.is_generated]
         generated = [t for t in tools if t.is_generated]
 
-        lines = [f"🔧 *Available Tools* ({len(tools)} total)\n"]
+        lines = [f"🔧 <b>Available Tools</b> ({len(tools)} total)\n"]
         if builtin:
-            lines.append("*Built-in:*")
+            lines.append("<b>Built-in:</b>")
             for t in builtin:
-                lines.append(f"  • `{t.name}` — {t.description}")
+                lines.append(f"  • <code>{html.escape(t.name)}</code> — {html.escape(t.description)}")
         if generated:
-            lines.append("\n*Generated:*")
+            lines.append("\n<b>Generated:</b>")
             for t in generated:
-                lines.append(f"  • `{t.name}` — {t.description}")
+                lines.append(f"  • <code>{html.escape(t.name)}</code> — {html.escape(t.description)}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_pair(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -300,10 +302,10 @@ class TelegramInterface:
         self._pending_pairs[token] = user.id
         logger.info("Pairing token generated by user %d: %s", user.id, token)
         await update.message.reply_text(
-            f"🔑 Pairing token (valid until used):\n`{token}`\n\n"
+            f"🔑 Pairing token (valid until used):\n<code>{html.escape(token)}</code>\n\n"
             "Share this with the user who should gain access. "
-            "They should run: `/pair <token>`",
-            parse_mode=ParseMode.MARKDOWN,
+            "They should run: <code>/pair &lt;token&gt;</code>",
+            parse_mode=ParseMode.HTML,
         )
 
     async def _cmd_unpair(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -324,7 +326,7 @@ class TelegramInterface:
 
     async def _cmd_myid(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id
-        await update.message.reply_text(f"Your Telegram user ID: `{uid}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"Your Telegram user ID: <code>{uid}</code>", parse_mode=ParseMode.HTML)
 
     async def _on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -353,7 +355,7 @@ class TelegramInterface:
             )
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
-                await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                await self._send_safe(update.message, chunk)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
@@ -364,9 +366,20 @@ class TelegramInterface:
 
     async def _safe_edit(self, message, text: str) -> None:
         try:
-            await message.edit_text(text[:4096])
+            await message.edit_text(_md_to_html(text)[:4096], parse_mode=ParseMode.HTML)
         except Exception:
-            pass
+            try:
+                await message.edit_text(text[:4096])
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _send_safe(message, text: str) -> None:
+        """Convert Markdown to HTML and send; fall back to plain text on any error."""
+        try:
+            await message.reply_text(_md_to_html(text), parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(text)
 
     def _is_authorized(self, user_id: int) -> bool:
         if self.security_mode == "allowlist":
@@ -382,14 +395,14 @@ class TelegramInterface:
             await update.message.reply_text(
                 "🔒 Access denied.\n"
                 "Ask an authorized user for a pairing token and run:\n"
-                "`/pair <token>`",
-                parse_mode=ParseMode.MARKDOWN,
+                "<code>/pair &lt;token&gt;</code>",
+                parse_mode=ParseMode.HTML,
             )
         else:
             await update.message.reply_text(
-                f"🔒 Access denied. Your ID is `{uid}`.\n"
+                f"🔒 Access denied. Your ID is <code>{uid}</code>.\n"
                 "Ask the admin to add it to the allowed list.",
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
             )
 
     @staticmethod
@@ -411,8 +424,8 @@ class TelegramInterface:
             bot = self._app.bot
             for uid in list(self.allowed_ids):
                 try:
-                    for chunk in self._split_message(text):
-                        await bot.send_message(chat_id=uid, text=chunk)
+                    for chunk in self._split_message(_md_to_html(text)):
+                        await bot.send_message(chat_id=uid, text=chunk, parse_mode=ParseMode.HTML)
                 except Exception as exc:
                     logger.warning("Could not send scheduled message to %d: %s", uid, exc)
 
@@ -424,3 +437,65 @@ class TelegramInterface:
                 loop.run_until_complete(_send())
         except Exception as exc:
             logger.error("send_message_to_users failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Markdown → Telegram HTML converter
+# ---------------------------------------------------------------------------
+
+def _md_to_html(text: str) -> str:
+    """
+    Convert a Markdown-flavoured string to Telegram HTML (ParseMode.HTML).
+
+    Handles:
+      - Fenced code blocks  ```lang\\ncode\\n```  →  <pre><code>…</code></pre>
+      - Inline code         `code`                →  <code>…</code>
+      - Bold                **text** or __text__  →  <b>…</b>
+      - Italic              *text*  or _text_     →  <i>…</i>
+      - Strikethrough       ~~text~~              →  <s>…</s>
+
+    All prose is HTML-escaped so that <, >, & never break the parser.
+    Code block contents are also HTML-escaped so that shell/Python snippets
+    with <, >, & display correctly inside <pre><code>.
+    """
+    # ---- Step 1: extract fenced code blocks to protect them ----
+    # We replace them with placeholders, process the rest, then reinsert.
+    placeholders: list[str] = []
+
+    def _extract_fence(m: re.Match) -> str:
+        lang = (m.group(1) or "").strip()
+        code = html.escape(m.group(2))
+        lang_attr = f' class="language-{html.escape(lang)}"' if lang else ""
+        block = f"<pre><code{lang_attr}>{code}</code></pre>"
+        placeholders.append(block)
+        return f"\x00BLOCK{len(placeholders) - 1}\x00"
+
+    text = re.sub(r"```(\w*)\n?(.*?)```", _extract_fence, text, flags=re.DOTALL)
+
+    # ---- Step 2: extract inline code spans ----
+    def _extract_inline(m: re.Match) -> str:
+        code = html.escape(m.group(1))
+        placeholders.append(f"<code>{code}</code>")
+        return f"\x00BLOCK{len(placeholders) - 1}\x00"
+
+    text = re.sub(r"`([^`\n]+)`", _extract_inline, text)
+
+    # ---- Step 3: HTML-escape the remaining prose ----
+    text = html.escape(text)
+
+    # ---- Step 4: apply inline formatting to prose ----
+    # Bold: **text** or __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
+    # Italic: *text* or _text_ (single, not already consumed by bold)
+    text = re.sub(r"\*(?!\*)(.+?)(?<!\*)\*", r"<i>\1</i>", text, flags=re.DOTALL)
+    text = re.sub(r"_(?!_)(.+?)(?<!_)_", r"<i>\1</i>", text, flags=re.DOTALL)
+    # Strikethrough: ~~text~~
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
+
+    # ---- Step 5: reinsert extracted blocks ----
+    for i, block in enumerate(placeholders):
+        text = text.replace(f"\x00BLOCK{i}\x00", block)
+
+    return text
+
