@@ -8,17 +8,69 @@ Note on OpenAI reasoning models (o1, o1-mini, o3, o3-mini, o4-mini, gpt-5, etc.)
   These models do NOT accept a `temperature` parameter — passing any value causes
   a 400 "Unsupported parameter" error. The client detects these models by name
   and omits temperature (and other unsupported sampling params) automatically.
+
+Retry behaviour:
+  Transient errors (timeouts, connection resets, 5xx responses) are retried with
+  exponential backoff. Configure via config.toml:
+    [llm]
+    request_timeout = 120   # seconds per attempt (default: 120)
+    max_retries     = 3     # attempts before giving up (default: 3)
+    retry_delay     = 2     # base delay in seconds; doubles each attempt (default: 2)
 """
 
 import logging
 import math
 import re
+import time
 from datetime import date
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+# HTTP status codes that are safe to retry
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _with_retry(fn, max_retries: int, base_delay: float):
+    """
+    Call fn(), retrying on transient httpx errors and retryable HTTP status codes.
+    Uses exponential backoff: base_delay, base_delay*2, base_delay*4, …
+    Non-retryable exceptions (e.g. 400 Bad Request) propagate immediately.
+    """
+    last_exc: Exception = RuntimeError("No attempts made")
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+            logger.warning("Request timed out (attempt %d/%d): %s", attempt, max_retries, exc)
+        except httpx.RemoteProtocolError as exc:
+            last_exc = exc
+            logger.warning("Remote protocol error (attempt %d/%d): %s", attempt, max_retries, exc)
+        except httpx.ConnectError as exc:
+            last_exc = exc
+            logger.warning("Connection error (attempt %d/%d): %s", attempt, max_retries, exc)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in _RETRYABLE_STATUS:
+                last_exc = exc
+                logger.warning(
+                    "HTTP %d (attempt %d/%d): %s",
+                    exc.response.status_code, attempt, max_retries, exc,
+                )
+            else:
+                raise  # 4xx errors are not retryable
+        if attempt < max_retries:
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.info("Retrying in %.1fs…", delay)
+            time.sleep(delay)
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +126,15 @@ class LLMClient:
         if not emb_cfg.get("base_url"):
             emb_cfg["base_url"] = self.llm_cfg.get("base_url", "")
         self.emb_cfg = emb_cfg
-        self._http = httpx.Client(timeout=30)
+
+        # Retry / timeout settings (can be overridden in [llm] section of config)
+        self._max_retries: int = self.llm_cfg.get("max_retries", 3)
+        self._retry_delay: float = float(self.llm_cfg.get("retry_delay", 2))
+        timeout_secs: float = float(self.llm_cfg.get("request_timeout", 120))
+        # Generous read timeout for slow LLM responses; short connect timeout
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(timeout_secs, connect=10.0)
+        )
 
         # Daily token usage tracking
         self._usage_date: date = date.today()
@@ -152,13 +212,16 @@ class LLMClient:
         else:
             payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
 
-        resp = self._http.post(
-            f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.llm_cfg['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
+        resp = _with_retry(
+            lambda: self._http.post(
+                f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.llm_cfg['api_key']}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ),
+            self._max_retries, self._retry_delay,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -178,15 +241,18 @@ class LLMClient:
 
         api_key = self.llm_cfg["api_key"]
         model = self.llm_cfg["model"]
-        resp = self._http.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            json={
-                "contents": contents,
-                "generationConfig": {
-                    "maxOutputTokens": self.llm_cfg.get("max_tokens", 1024),
-                    "temperature": self.llm_cfg.get("temperature", 0.2),
+        resp = _with_retry(
+            lambda: self._http.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                json={
+                    "contents": contents,
+                    "generationConfig": {
+                        "maxOutputTokens": self.llm_cfg.get("max_tokens", 1024),
+                        "temperature": self.llm_cfg.get("temperature", 0.2),
+                    },
                 },
-            },
+            ),
+            self._max_retries, self._retry_delay,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -203,14 +269,17 @@ class LLMClient:
         if system:
             payload["system"] = system
 
-        resp = self._http.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self.llm_cfg["api_key"],
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json=payload,
+        resp = _with_retry(
+            lambda: self._http.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.llm_cfg["api_key"],
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            ),
+            self._max_retries, self._retry_delay,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -238,13 +307,16 @@ class LLMClient:
             raise
 
     def _openai_embed(self, text: str) -> list[float]:
-        resp = self._http.post(
-            f"{self.emb_cfg['base_url'].rstrip('/')}/embeddings",
-            headers={
-                "Authorization": f"Bearer {self.emb_cfg['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={"model": self.emb_cfg["model"], "input": text},
+        resp = _with_retry(
+            lambda: self._http.post(
+                f"{self.emb_cfg['base_url'].rstrip('/')}/embeddings",
+                headers={
+                    "Authorization": f"Bearer {self.emb_cfg['api_key']}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": self.emb_cfg["model"], "input": text},
+            ),
+            self._max_retries, self._retry_delay,
         )
         resp.raise_for_status()
         return resp.json()["data"][0]["embedding"]
@@ -252,9 +324,12 @@ class LLMClient:
     def _google_embed(self, text: str) -> list[float]:
         api_key = self.emb_cfg["api_key"]
         model = self.emb_cfg.get("model", "models/text-embedding-004")
-        resp = self._http.post(
-            f"https://generativelanguage.googleapis.com/v1beta/{model}:embedContent?key={api_key}",
-            json={"content": {"parts": [{"text": text}]}},
+        resp = _with_retry(
+            lambda: self._http.post(
+                f"https://generativelanguage.googleapis.com/v1beta/{model}:embedContent?key={api_key}",
+                json={"content": {"parts": [{"text": text}]}},
+            ),
+            self._max_retries, self._retry_delay,
         )
         resp.raise_for_status()
         return resp.json()["embedding"]["values"]
