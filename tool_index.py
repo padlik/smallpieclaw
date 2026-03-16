@@ -73,6 +73,33 @@ class ToolIndex:
         if changed:
             self._save()
 
+    def rebuild(self) -> dict:
+        """
+        Force re-embed ALL registered tools, ignoring any cached vectors.
+        Refreshes the registry first, then re-indexes everything from scratch.
+        Returns a summary dict: {total, embedded, failed, removed}.
+        """
+        self._index.clear()
+        embedded = 0
+        failed = 0
+        for tool in self.registry.all():
+            try:
+                vector = self.llm.embed(tool.description)
+                self._index[tool.name] = {
+                    "description": tool.description,
+                    "vector": vector,
+                }
+                embedded += 1
+            except Exception as exc:
+                logger.error("rebuild: failed to embed '%s': %s", tool.name, exc)
+                failed += 1
+
+        removed = len([n for n in list(self._index) if self.registry.get(n) is None])
+        self._save()
+        total = embedded + failed
+        logger.info("Tool index rebuilt: %d embedded, %d failed", embedded, failed)
+        return {"total": total, "embedded": embedded, "failed": failed, "removed": removed}
+
     def add_tool(self, tool: Tool) -> None:
         """Embed and index a single newly created tool."""
         try:

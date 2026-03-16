@@ -11,11 +11,14 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **ReAct agent loop** — reasons step-by-step, executes tools, and loops until done
 - **Semantic tool search** — finds the right tool using embedding-based cosine similarity
 - **Self-building tools** — the LLM can create new `.sh`/`.py` tools when a capability is missing; creation is reported to the user immediately
+- **Built-in tools** — `shell`, `file_read`, `file_write` always available; dangerous ops require inline-button confirmation
 - **Secure Telegram bot** — allowlist or pairing-token access control
 - **4-tier memory architecture** — short-term conversation history, working task context, long-term vector knowledge index, and results history
 - **Configurable scheduler** — jobs defined in `scheduler.toml`; manage jobs from chat or via `/jobs`
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
+- **Multi-model LLM** — define multiple models with hint keywords; agent auto-selects; switch via `/models`
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude
+- **Context compaction** — auto-summarises older messages when the token budget is near the configured limit
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
 
 ---
@@ -26,8 +29,8 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 main.py                  # Entry point
 config.toml              # All configuration
 scheduler.toml           # Scheduled job definitions
-llm_client.py            # LLM + embeddings client (multi-provider, token tracking)
-agent_controller.py      # ReAct agent loop with 4-tier memory
+llm_client.py            # LLM + embeddings client (multi-provider, multi-model, token tracking)
+agent_controller.py      # ReAct agent loop with 4-tier memory and context compaction
 telegram_interface.py    # Telegram bot with security and streaming
 tool_registry.py         # Discovers and registers tools
 tool_executor.py         # Runs tools in subprocess
@@ -35,6 +38,7 @@ tool_index.py            # Semantic search over tool descriptions
 tool_creator.py          # LLM-generated tools with safety validation
 scheduler.py             # Background task scheduler
 memory_store.py          # Short-term, working, long-term, and results memory
+builtin_executor.py      # Always-available built-in tools (shell, file_read, file_write)
 tools/                   # Built-in tools (.sh and .py)
 tools_generated/         # Tools created by the LLM at runtime
 data/
@@ -92,6 +96,38 @@ Required settings:
 | `embeddings.model` | e.g. `text-embedding-3-small` |
 
 > **Tip:** To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
+
+### 5. (Optional) Configure multiple LLM models
+
+You can define multiple models in `config.toml` using `[[models]]` TOML array-of-tables.
+The agent auto-selects a model based on `hint` keywords in the user's message, and users
+can switch manually with `/models`.
+
+```toml
+[[models]]
+name        = "default"
+provider    = "openai"
+api_key     = "sk-..."
+model       = "gpt-4o-mini"
+base_url    = "https://api.openai.com/v1"
+max_tokens  = 1024
+temperature = 0.2
+hint        = "general quick default"
+active      = true
+
+[[models]]
+name        = "smart"
+provider    = "anthropic"
+api_key     = "sk-ant-..."
+model       = "claude-3-5-sonnet-20241022"
+base_url    = ""
+max_tokens  = 8192
+temperature = 0.2
+hint        = "complex analyze reason large file code review"
+active      = false
+```
+
+When `[[models]]` is present it overrides the single `[llm]` block.
 
 ### 5. (Optional) Configure the scheduler
 
@@ -171,6 +207,28 @@ allowed_user_ids = [123456789]
 
 ---
 
+## Built-in Tools
+
+Three tools are always available to the agent regardless of the `tools/` directory:
+
+| Tool | Description | Dangerous? |
+|------|-------------|-----------|
+| `shell` | Execute a shell command | Yes — if command matches destructive patterns (`rm -rf`, `dd`, `mkfs`, etc.) |
+| `file_read` | Read a file from the filesystem | Yes — if path is sensitive (`/etc/passwd`, `.env`, `*.key`, etc.) |
+| `file_write` | Write content to a file | Always — requires confirmation |
+
+When a dangerous operation is requested, the bot sends an inline confirmation prompt:
+
+> ⚠️ **Confirm operation**
+> `rm -rf /tmp/test`
+> [✅ Yes, execute] [❌ No, cancel]
+
+The agent loop blocks until the user confirms or cancels (5-minute timeout).
+
+The agent always prefers built-in tools over creating new scripts for shell, file read, and file write operations.
+
+---
+
 ## Writing Custom Tools
 
 Create a `.sh` or `.py` file in the `tools/` directory.
@@ -202,6 +260,9 @@ Restart the agent (or wait for the next query) to pick up new tools.
 | Tool timeout | 10 s | `agent.tool_timeout` |
 | Max tool output | 4000 chars | `agent.max_output_size` |
 | Semantic top-K tools | 3 | `agent.top_tools` |
+| Max context tokens | 90 000 | `agent.ctx_max_tokens` |
+
+Context compaction fires automatically at 85% of `ctx_max_tokens`. Older messages are summarised by the LLM and replaced with a compact bullet-point summary before the next request.
 
 ---
 
@@ -226,9 +287,11 @@ Embeddings can use a different provider/key than the main LLM. If `embeddings.ap
 | `/help` | Full command reference |
 | `/status` | Uptime, LLM model, embeddings status, and today's token usage |
 | `/tools` | List all built-in and generated tools |
+| `/models` | List available LLM models and switch the active one |
 | `/jobs` | List all scheduled jobs with last-run times |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
+| `/reindex` | Force re-embed all tools in the semantic index |
 | `/pair` | Generate or submit pairing token |
 | `/unpair <id>` | Remove a user from the allowlist |
 | `/myid` | Show your Telegram user ID |

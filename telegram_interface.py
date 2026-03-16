@@ -14,10 +14,11 @@ import secrets
 import time
 from typing import Callable, Optional
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -41,6 +42,7 @@ class TelegramInterface:
         scheduler=None,
         tool_registry=None,
         llm_client=None,
+        tool_index=None,
     ):
         tg_cfg = config["telegram"]
         self._config = config
@@ -50,14 +52,19 @@ class TelegramInterface:
         self.pairing_timeout: int = tg_cfg.get("pairing_timeout", 300)
         self.agent_handler = agent_handler
         self.agent_reset_fn = agent_reset_fn
+        self.agent = None  # Set by main.py for resume() support
         self.scheduler = scheduler
         self.tool_registry = tool_registry
         self.llm_client = llm_client
+        self._tool_index = tool_index
         self._start_time = time.time()
 
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
         self._pairing_token: Optional[str] = None
+
+        # Confirmation state: {token: asyncio.Future}
+        self._pending_confirmations: dict[str, asyncio.Future] = {}
 
         self._app: Optional[Application] = None
 
@@ -96,8 +103,10 @@ class TelegramInterface:
             BotCommand("help", "Help and command reference"),
             BotCommand("status", "Agent status, uptime, and token usage"),
             BotCommand("tools", "List available tools"),
+            BotCommand("models", "List and switch LLM models"),
             BotCommand("jobs", "List scheduled jobs"),
             BotCommand("reset", "Save and clear current task context"),
+            BotCommand("reindex", "Re-embed all tools in the semantic index"),
             BotCommand("pair", "Generate or submit pairing token"),
             BotCommand("unpair", "Remove a user from access list"),
             BotCommand("myid", "Show your Telegram user ID"),
@@ -120,9 +129,14 @@ class TelegramInterface:
         app.add_handler(CommandHandler("reset", self._cmd_reset))
         app.add_handler(CommandHandler("jobs", self._cmd_jobs))
         app.add_handler(CommandHandler("tools", self._cmd_tools))
+        app.add_handler(CommandHandler("models", self._cmd_models))
+        app.add_handler(CommandHandler("reindex", self._cmd_reindex))
         app.add_handler(CommandHandler("pair", self._cmd_pair))
         app.add_handler(CommandHandler("unpair", self._cmd_unpair))
         app.add_handler(CommandHandler("myid", self._cmd_myid))
+        # Inline button callbacks
+        app.add_handler(CallbackQueryHandler(self._cb_model_switch, pattern=r"^model:"))
+        app.add_handler(CallbackQueryHandler(self._cb_confirm, pattern=r"^confirm_(yes|no):"))
         # Catch-all text messages
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
 
@@ -154,6 +168,7 @@ class TelegramInterface:
             "<b>Commands:</b>\n"
             "  /status  — agent status, uptime, token usage\n"
             "  /tools   — list available tools\n"
+            "  /models  — list and switch LLM models\n"
             "  /jobs    — list scheduled jobs\n"
             "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
             "  /pair    — pairing token management\n"
@@ -269,6 +284,26 @@ class TelegramInterface:
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+    async def _cmd_reindex(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if not self._tool_index:
+            await update.message.reply_text("⚠️ Tool index not available.")
+            return
+
+        status_msg = await update.message.reply_text("⏳ Reindexing tools…")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._tool_index.rebuild)
+
+        msg = (
+            f"✅ <b>Reindex complete</b>\n"
+            f"  Embedded: {result['embedded']}\n"
+            f"  Failed: {result['failed']}\n"
+            f"  Total: {result['total']}"
+        )
+        await status_msg.edit_text(msg, parse_mode=ParseMode.HTML)
+
     async def _cmd_pair(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """
         In pairing mode: if the caller is already authorized, generate a
@@ -343,6 +378,14 @@ class TelegramInterface:
         loop = asyncio.get_event_loop()
 
         def progress(msg: str):
+            # Check for confirmation request marker from agent
+            if msg.startswith("__CONFIRM__:"):
+                _, token, description = msg.split(":", 2)
+                asyncio.run_coroutine_threadsafe(
+                    self._send_confirmation_prompt(update.message, token, description),
+                    loop,
+                )
+                return
             asyncio.run_coroutine_threadsafe(
                 self._safe_edit(status_msg, msg),
                 loop,
@@ -359,6 +402,87 @@ class TelegramInterface:
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
+
+    async def _send_confirmation_prompt(self, message, token: str, description: str) -> None:
+        """Send an inline-button confirmation prompt for a dangerous operation."""
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, execute", callback_data=f"confirm_yes:{token}"),
+            InlineKeyboardButton("❌ No, cancel",  callback_data=f"confirm_no:{token}"),
+        ]])
+        await message.reply_text(
+            f"⚠️ <b>Confirmation required</b>\n\n{_md_to_html(description)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+    async def _cb_confirm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Yes/No confirmation button presses."""
+        query = update.callback_query
+        await query.answer()
+        data = query.data  # "confirm_yes:<token>" or "confirm_no:<token>"
+        confirmed = data.startswith("confirm_yes:")
+        token = data.split(":", 1)[1]
+
+        result_text = "✅ Confirmed — executing…" if confirmed else "❌ Cancelled."
+        try:
+            await query.edit_message_text(
+                f"⚠️ <b>Confirmation</b>\n\n{result_text}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        if self.agent:
+            self.agent.resume(token, confirmed)
+
+    async def _cmd_models(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if not self.llm_client or not hasattr(self.llm_client, "list_models"):
+            await update.message.reply_text("Multi-model support not available.")
+            return
+
+        models = self.llm_client.list_models()
+        lines = [f"🤖 <b>LLM Models</b> ({len(models)} configured)\n"]
+        buttons = []
+        for m in models:
+            icon = "✅" if m["active"] else "⬜"
+            hint_str = f" — hint: <i>{html.escape(m['hint'])}</i>" if m["hint"] else ""
+            lines.append(
+                f"{icon} <b>{html.escape(m['name'])}</b>: <code>{html.escape(m['model'])}</code>"
+                f"{hint_str}"
+            )
+            if not m["active"]:
+                buttons.append([InlineKeyboardButton(
+                    f"Switch to {m['name']}",
+                    callback_data=f"model:{m['name']}",
+                )])
+
+        keyboard = InlineKeyboardMarkup(buttons) if buttons else None
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+    async def _cb_model_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle model switch button presses."""
+        query = update.callback_query
+        await query.answer()
+        model_name = query.data.split(":", 1)[1]
+
+        if self.llm_client and hasattr(self.llm_client, "set_model"):
+            success = self.llm_client.set_model(model_name)
+            text = f"✅ Switched to model <b>{html.escape(model_name)}</b>." if success \
+                   else f"❌ Model <code>{html.escape(model_name)}</code> not found."
+        else:
+            text = "❌ Model switching not available."
+
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Helpers

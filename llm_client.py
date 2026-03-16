@@ -23,7 +23,7 @@ import math
 import re
 import time
 from datetime import date
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -65,6 +65,12 @@ def _with_retry(fn, max_retries: int, base_delay: float):
                     exc.response.status_code, attempt, max_retries, exc,
                 )
             else:
+                # Log full response body to aid debugging (e.g. "invalid parameter" messages)
+                logger.error(
+                    "HTTP %d error — response body: %s",
+                    exc.response.status_code,
+                    exc.response.text[:2000],
+                )
                 raise  # 4xx errors are not retryable
         if attempt < max_retries:
             delay = base_delay * (2 ** (attempt - 1))
@@ -114,24 +120,43 @@ class LLMClient:
       - OpenAI  (and any OpenAI-compatible endpoint such as OpenRouter)
       - Google Gemini (via generateContent REST API)
       - Anthropic Claude
+
+    Multi-model support:
+      Define [[models]] in config.toml (array of tables). Each entry may have:
+        name, provider, api_key, model, base_url, max_tokens, temperature,
+        hint (keywords for auto-selection), active (bool).
+      Falls back to the single [llm] block for backward compatibility.
     """
 
     def __init__(self, config: dict):
         self.cfg = config
-        self.llm_cfg = config["llm"]
-        emb_cfg = dict(config.get("embeddings", config["llm"]))
-        # Fall back to LLM credentials if embeddings section is missing them
+
+        # Build models list from [[models]] (preferred) or [llm] (legacy)
+        if "models" in config and isinstance(config["models"], list) and config["models"]:
+            self._models: list[dict] = config["models"]
+        else:
+            self._models = [config["llm"]]
+
+        # Find active model index (first with active=true, else 0)
+        self._active_idx: int = 0
+        for i, m in enumerate(self._models):
+            if m.get("active", False):
+                self._active_idx = i
+                break
+
+        # Embeddings config (with fallback to active LLM key)
+        emb_cfg = dict(config.get("embeddings", self._models[self._active_idx]))
         if not emb_cfg.get("api_key"):
-            emb_cfg["api_key"] = self.llm_cfg["api_key"]
+            emb_cfg["api_key"] = self._models[self._active_idx].get("api_key", "")
         if not emb_cfg.get("base_url"):
-            emb_cfg["base_url"] = self.llm_cfg.get("base_url", "")
+            emb_cfg["base_url"] = self._models[self._active_idx].get("base_url", "")
         self.emb_cfg = emb_cfg
 
-        # Retry / timeout settings (can be overridden in [llm] section of config)
-        self._max_retries: int = self.llm_cfg.get("max_retries", 3)
-        self._retry_delay: float = float(self.llm_cfg.get("retry_delay", 2))
-        timeout_secs: float = float(self.llm_cfg.get("request_timeout", 120))
-        # Generous read timeout for slow LLM responses; short connect timeout
+        # Retry / timeout from active model config (or global [llm] if present)
+        _ref = config.get("llm", self._models[self._active_idx])
+        self._max_retries: int = _ref.get("max_retries", 3)
+        self._retry_delay: float = float(_ref.get("retry_delay", 2))
+        timeout_secs: float = float(_ref.get("request_timeout", 120))
         self._http = httpx.Client(
             timeout=httpx.Timeout(timeout_secs, connect=10.0)
         )
@@ -140,6 +165,56 @@ class LLMClient:
         self._usage_date: date = date.today()
         self._prompt_tokens: int = 0
         self._completion_tokens: int = 0
+
+    # ------------------------------------------------------------------
+    # Multi-model API
+    # ------------------------------------------------------------------
+
+    @property
+    def llm_cfg(self) -> dict:
+        """Return the currently active model config."""
+        return self._models[self._active_idx]
+
+    def list_models(self) -> list[dict]:
+        """Return summary of all configured models."""
+        result = []
+        for i, m in enumerate(self._models):
+            result.append({
+                "name": m.get("name", f"model_{i}"),
+                "model": m.get("model", "?"),
+                "provider": m.get("provider", "?"),
+                "hint": m.get("hint", ""),
+                "active": i == self._active_idx,
+            })
+        return result
+
+    def set_model(self, name: str) -> bool:
+        """Switch the active model by name. Returns False if not found."""
+        for i, m in enumerate(self._models):
+            if m.get("name", "") == name:
+                self._active_idx = i
+                logger.info("Switched active model to '%s' (%s)", name, m.get("model", "?"))
+                return True
+        logger.warning("Model '%s' not found in configured models", name)
+        return False
+
+    def select_model_by_hint(self, goal: str) -> Optional[str]:
+        """
+        Check if any word in the goal matches any hint keyword of a non-active model.
+        If a match is found, switch to that model and return its name.
+        Returns None if no switch was made.
+        """
+        goal_words = set(re.findall(r"\w+", goal.lower()))
+        for i, m in enumerate(self._models):
+            if i == self._active_idx:
+                continue
+            hint_words = set(re.findall(r"\w+", m.get("hint", "").lower()))
+            if goal_words & hint_words:
+                self._active_idx = i
+                name = m.get("name", f"model_{i}")
+                logger.info("Auto-selected model '%s' based on hint match", name)
+                return name
+        return None
 
     # ------------------------------------------------------------------
     # Token tracking

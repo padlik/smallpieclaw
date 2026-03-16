@@ -37,6 +37,7 @@ except ImportError:
     import tomllib as tomli  # Python 3.11+
 
 from agent_controller import AgentController
+from builtin_executor import BuiltinExecutor
 from llm_client import LLMClient
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory
 from scheduler import Scheduler
@@ -79,6 +80,7 @@ def main():
     timeout    = agent_cfg.get("tool_timeout", 10)
     max_output = agent_cfg.get("max_output_size", 4000)
     top_tools  = agent_cfg.get("top_tools", 3)
+    ctx_max_tokens = agent_cfg.get("ctx_max_tokens", 90_000)
 
     logger.info("Initialising components...")
 
@@ -88,6 +90,7 @@ def main():
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
     creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)
+    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output)
 
     short_term  = ShortTermMemory(max_turns=20)
     working     = WorkingMemory()
@@ -102,10 +105,12 @@ def main():
         memory=memory,
         max_iterations=max_iter,
         top_tools=top_tools,
+        ctx_max_tokens=ctx_max_tokens,
         short_term=short_term,
         working=working,
         long_term=long_term,
         results=results_mem,
+        builtin_executor=builtin,
     )
 
     logger.info("Building semantic tool index...")
@@ -142,7 +147,9 @@ def main():
         scheduler=scheduler,
         tool_registry=registry,
         llm_client=llm,
+        tool_index=index,
     )
+    tg.agent = agent  # wire agent for confirm/resume and /models
     _tg_holder[0] = tg
 
     scheduler.start()

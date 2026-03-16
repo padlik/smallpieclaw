@@ -14,6 +14,7 @@ Workflow for each user request:
 import json
 import logging
 import re
+import threading
 from typing import Any, Callable, Optional
 
 from llm_client import LLMClient
@@ -23,6 +24,21 @@ from tool_executor import ToolExecutor
 from tool_index import ToolIndex
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Token estimation
+# ---------------------------------------------------------------------------
+
+def _estimate_tokens(text: str) -> int:
+    """Conservative character-to-token estimate (4 chars ≈ 1 token)."""
+    return len(text) // 4
+
+
+def _estimate_messages_tokens(messages: list[dict], system: str = "") -> int:
+    total = _estimate_tokens(system)
+    for m in messages:
+        total += _estimate_tokens(m.get("content", ""))
+    return total
 
 # ---------------------------------------------------------------------------
 # System prompt template
@@ -41,6 +57,11 @@ RECENT CONVERSATION:
 RELEVANT PAST RESULTS:
 {past_results}
 
+BUILT-IN TOOLS (always available — prefer these before creating new tools):
+  shell      — execute any shell command on the host system
+  file_read  — read a file from the filesystem
+  file_write — write content to a file on the filesystem
+
 AVAILABLE TOOLS:
 {tools}
 
@@ -49,22 +70,25 @@ No markdown, no prose, just JSON.
 
 Possible actions:
 
-1. Execute a tool:
+1. Execute a tool (built-in or registered):
    {{"action": "tool", "tool": "<tool_name>", "args": {{}}}}
 
-2. Create a new tool when the capability is missing:
+2. Create a new tool only when built-ins and registered tools cannot fulfil the request:
    {{"action": "create_tool", "name": "<snake_case_name>", "language": "bash", "code": "<script>", "description": "<one line>"}}
 
 3. Finish and return an answer to the user:
    {{"action": "finish", "result": "<your answer>"}}
 
 Rules:
-- Prefer existing tools over creating new ones.
+- Always try shell / file_read / file_write before creating a new tool.
 - When creating a tool, write only safe, minimal shell or Python code.
 - Never include dangerous commands (rm -rf /, sudo, eval, reverse shells, etc.).
 - If a tool fails, try a different approach or explain the issue.
 - Always end with a "finish" action.
 """.strip()
+
+# Marker prefix used to request user confirmation through the progress callback
+_CONFIRM_PREFIX = "__CONFIRM__"
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +109,12 @@ class AgentController:
         memory: MemoryStore,
         max_iterations: int = 8,
         top_tools: int = 3,
-        short_term=None,   # Optional[ShortTermMemory]
-        working=None,      # Optional[WorkingMemory]
-        long_term=None,    # Optional[LongTermMemory]
-        results=None,      # Optional[ResultsMemory]
+        ctx_max_tokens: int = 90_000,
+        short_term=None,       # Optional[ShortTermMemory]
+        working=None,          # Optional[WorkingMemory]
+        long_term=None,        # Optional[LongTermMemory]
+        results=None,          # Optional[ResultsMemory]
+        builtin_executor=None, # Optional[BuiltinExecutor]
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -97,10 +123,16 @@ class AgentController:
         self.memory = memory
         self.max_iterations = max_iterations
         self.top_tools = top_tools
+        self.ctx_max_tokens = ctx_max_tokens
         self.short_term = short_term
         self.working = working
         self.long_term = long_term
         self.results = results
+        self.builtin_executor = builtin_executor
+
+        # Confirmation state: token -> threading.Event and result holder
+        self._confirm_events: dict[str, threading.Event] = {}
+        self._confirm_results: dict[str, bool] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -119,6 +151,12 @@ class AgentController:
             if progress_callback:
                 progress_callback(msg)
             logger.debug("Agent progress: %s", msg)
+
+        # Auto-select model based on goal hint
+        if hasattr(self.llm, "select_model_by_hint"):
+            switched = self.llm.select_model_by_hint(user_goal)
+            if switched:
+                logger.info("Auto-selected model '%s' based on goal hint", switched)
 
         # Start working memory task tracking
         if self.working:
@@ -146,6 +184,9 @@ class AgentController:
             logger.info("Agent step %d/%d", step, self.max_iterations)
             _progress(f"⚙️ Thinking… (step {step})")
 
+            # Context compaction check
+            messages = self._maybe_compact(messages, system)
+
             # LLM call
             try:
                 raw = self.llm.chat(messages, system=system)
@@ -171,11 +212,9 @@ class AgentController:
             if action == "finish":
                 result = action_obj.get("result", "Done.")
                 self.memory.record_event(f"Agent finished: {result[:80]}")
-                # Update short-term memory
                 if self.short_term:
                     self.short_term.add("user", user_goal)
                     self.short_term.add("assistant", result)
-                # Save to results memory
                 if self.results and self.working and self.working.has_content():
                     tools_used = [
                         s["details"].get("tool", "")
@@ -194,8 +233,36 @@ class AgentController:
             elif action == "tool":
                 tool_name = action_obj.get("tool", "")
                 args = action_obj.get("args", {})
-                _progress(f"🔧 Running tool: `{tool_name}`")
-                outcome = self.executor.execute(tool_name, args)
+                _progress(f"🔧 Running tool: <code>{tool_name}</code>")
+
+                # Built-in tools take priority
+                if self.builtin_executor and self.builtin_executor.is_builtin(tool_name):
+                    outcome = self.builtin_executor.execute(tool_name, args)
+
+                    if outcome.get("requires_confirmation"):
+                        token = outcome["token"]
+                        description = outcome.get("description", tool_name)
+                        # Set up blocking event
+                        event = threading.Event()
+                        self._confirm_events[token] = event
+                        self._confirm_results[token] = False
+                        # Signal the UI to show confirmation buttons
+                        _progress(f"{_CONFIRM_PREFIX}:{token}:{description}")
+                        # Block until user responds (timeout 5 min)
+                        confirmed = event.wait(timeout=300)
+                        result_confirmed = self._confirm_results.pop(token, False) if confirmed else False
+                        self._confirm_events.pop(token, None)
+
+                        if result_confirmed:
+                            outcome = self.builtin_executor.confirm(token)
+                            _progress(f"✅ Confirmed — executing <code>{tool_name}</code>")
+                        else:
+                            self.builtin_executor.cancel(token)
+                            outcome = {"success": False, "output": "", "error": "Cancelled by user.", "exit_code": -1}
+                            _progress("❌ Cancelled by user.")
+                else:
+                    outcome = self.executor.execute(tool_name, args)
+
                 if self.working:
                     self.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
                 tool_result = self._format_tool_result(tool_name, outcome)
@@ -207,7 +274,7 @@ class AgentController:
                 language = action_obj.get("language", "bash")
                 code = action_obj.get("code", "")
                 description = action_obj.get("description", "")
-                _progress(f"🛠️ Creating new tool: `{tool_name}`")
+                _progress(f"🛠️ Creating new tool: <code>{tool_name}</code>")
                 result = self.creator.create(tool_name, language, code, description)
                 if self.working:
                     self.working.add_step("create_tool", {"name": tool_name, "success": result["success"]})
@@ -216,10 +283,10 @@ class AgentController:
                         f"Tool '{result['name']}' was created successfully at {result['path']}. "
                         "You can now use it with the 'tool' action."
                     )
-                    _progress(f"🔧 *Tool Created:* `{result['name']}`\n✅ Status: Success\n📝 Description: {description}")
+                    _progress(f"🔧 Tool Created: <code>{result['name']}</code>\n✅ Success\n📝 {description}")
                 else:
                     feedback = f"Tool creation failed: {result['error']}"
-                    _progress(f"🔧 *Tool Creation Failed:* `{tool_name}`\n❌ Error: {result['error']}")
+                    _progress(f"🔧 Tool Creation Failed: <code>{tool_name}</code>\n❌ {result['error']}")
                 logger.info("Tool creation '%s': %s", tool_name, result)
                 messages.append({"role": "user", "content": feedback})
 
@@ -233,6 +300,13 @@ class AgentController:
         # Max iterations reached
         self.memory.record_event("Agent hit max iterations")
         return "⚠️ Agent reached maximum steps without a final answer. Please rephrase your request."
+
+    def resume(self, token: str, confirmed: bool) -> None:
+        """Called by TelegramInterface when user responds to a confirmation prompt."""
+        self._confirm_results[token] = confirmed
+        event = self._confirm_events.get(token)
+        if event:
+            event.set()
 
     def reset_task(self, save: bool = True) -> str:
         """Save (optionally) and clear the current working + short-term context."""
@@ -264,13 +338,60 @@ class AgentController:
         return msg
 
     # ------------------------------------------------------------------
+    # Context compaction
+    # ------------------------------------------------------------------
+
+    def _maybe_compact(self, messages: list[dict], system: str) -> list[dict]:
+        """
+        If estimated context tokens exceed 85% of ctx_max_tokens, summarise
+        the middle portion of the conversation to reduce size.
+        """
+        total = _estimate_messages_tokens(messages, system)
+        threshold = int(self.ctx_max_tokens * 0.85)
+        if total <= threshold:
+            return messages
+        if len(messages) <= 3:
+            return messages  # too short to compact meaningfully
+
+        logger.warning(
+            "Context size ~%d tokens exceeds threshold %d — compacting…",
+            total, threshold,
+        )
+        # Keep first message (user goal) and last 2 messages; summarise the middle
+        first = messages[:1]
+        middle = messages[1:-2]
+        last = messages[-2:]
+
+        middle_text = "\n".join(
+            f"[{m['role']}]: {m['content'][:500]}" for m in middle
+        )
+        try:
+            summary = self.llm.chat([{
+                "role": "user",
+                "content": (
+                    "Summarize these intermediate agent steps concisely in bullet points "
+                    "(preserve tool names, key outputs, and decisions):\n\n" + middle_text
+                ),
+            }])
+        except Exception as exc:
+            logger.error("Compaction LLM call failed: %s", exc)
+            return messages  # fall back to uncompacted
+
+        compacted = first + [
+            {"role": "user", "content": f"[Compacted context — earlier steps summary]\n{summary}"}
+        ] + last
+        new_total = _estimate_messages_tokens(compacted, system)
+        logger.info("Compacted context: %d → ~%d tokens", total, new_total)
+        return compacted
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     @staticmethod
     def _format_tools(tools) -> str:
         if not tools:
-            return "No tools available."
+            return "No additional tools registered."
         lines = [f"  {t.name}: {t.description}" for t in tools]
         return "\n".join(lines)
 
@@ -280,10 +401,10 @@ class AgentController:
             output = outcome["output"] or "(no output)"
             return f"Tool '{tool_name}' succeeded:\n{output}"
         else:
-            parts = [f"Tool '{tool_name}' failed (exit {outcome['exit_code']})."]
-            if outcome["error"]:
+            parts = [f"Tool '{tool_name}' failed (exit {outcome.get('exit_code', '?')})."]
+            if outcome.get("error"):
                 parts.append(f"stderr: {outcome['error']}")
-            if outcome["output"]:
+            if outcome.get("output"):
                 parts.append(f"stdout: {outcome['output']}")
             return "\n".join(parts)
 
@@ -291,19 +412,16 @@ class AgentController:
     def _parse_json(text: str) -> Optional[dict]:
         """Extract and parse the first JSON object found in the text."""
         text = text.strip()
-        # Try direct parse first
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
-        # Strip markdown code fences
         fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if fence_match:
             try:
                 return json.loads(fence_match.group(1))
             except json.JSONDecodeError:
                 pass
-        # Find first {...} block
         brace_match = re.search(r"\{.*\}", text, re.DOTALL)
         if brace_match:
             try:
@@ -311,3 +429,4 @@ class AgentController:
             except json.JSONDecodeError:
                 pass
         return None
+

@@ -9,6 +9,37 @@ allowed_user_ids = []
 # Pairing timeout in seconds (for pairing mode)
 pairing_timeout = 300
 
+# ---------------------------------------------------------------------------
+# Multi-model configuration (recommended — replaces the single [llm] block).
+# Define one or more [[models]] entries. The one with active = true is used
+# by default. The agent can auto-switch based on the 'hint' keywords, and
+# users can switch manually with /models.
+# ---------------------------------------------------------------------------
+# [[models]]
+# name        = "default"
+# provider    = "openai"           # openai | openrouter | google | anthropic
+# api_key     = "YOUR_API_KEY"
+# model       = "gpt-4o-mini"
+# base_url    = "https://api.openai.com/v1"
+# max_tokens  = 1024
+# temperature = 0.2
+# hint        = "general quick default"   # keywords for auto-selection
+# active      = true
+#
+# [[models]]
+# name        = "smart"
+# provider    = "anthropic"
+# api_key     = "YOUR_ANTHROPIC_KEY"
+# model       = "claude-3-5-sonnet-20241022"
+# base_url    = ""
+# max_tokens  = 8192
+# temperature = 0.2
+# hint        = "complex analyze reason large file code review"
+# active      = false
+
+# ---------------------------------------------------------------------------
+# Legacy single-model config — used when no [[models]] entries are defined.
+# ---------------------------------------------------------------------------
 [llm]
 # Provider: "openai", "openrouter", "google", "anthropic"
 provider = "openai"
@@ -36,6 +67,9 @@ max_iterations = 8
 tool_timeout = 10
 max_output_size = 4000
 top_tools = 3
+# Maximum estimated context tokens per LLM request (4 chars ≈ 1 token).
+# When 85% is reached the agent auto-summarises older messages before the next call.
+ctx_max_tokens = 90000
 
 [scheduler]
 enabled = true
