@@ -233,7 +233,7 @@ class AgentController:
             elif action == "tool":
                 tool_name = action_obj.get("tool", "")
                 args = action_obj.get("args", {})
-                _progress(f"🔧 Running tool: <code>{tool_name}</code>")
+                _progress(f"🔧 Running tool: <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
 
                 # Built-in tools take priority
                 if self.builtin_executor and self.builtin_executor.is_builtin(tool_name):
@@ -255,7 +255,7 @@ class AgentController:
 
                         if result_confirmed:
                             outcome = self.builtin_executor.confirm(token)
-                            _progress(f"✅ Confirmed — executing <code>{tool_name}</code>")
+                            _progress(f"✅ Confirmed — executing <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
                         else:
                             self.builtin_executor.cancel(token)
                             outcome = {"success": False, "output": "", "error": "Cancelled by user.", "exit_code": -1}
@@ -267,6 +267,7 @@ class AgentController:
                     self.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
                 tool_result = self._format_tool_result(tool_name, outcome)
                 logger.info("Tool '%s' result: success=%s", tool_name, outcome["success"])
+                _progress(self._fmt_tool_result_progress(tool_name, args, outcome))
                 messages.append({"role": "user", "content": tool_result})
 
             elif action == "create_tool":
@@ -394,6 +395,47 @@ class AgentController:
             return "No additional tools registered."
         lines = [f"  {t.name}: {t.description}" for t in tools]
         return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_tool_call(tool_name: str, args: dict) -> str:
+        """Format a tool call as a compact, readable string for progress display."""
+        if tool_name == "shell":
+            cmd = args.get("command", "")
+            return f"<blockquote>$ {cmd}</blockquote>"
+        if tool_name == "file_read":
+            return f"<blockquote>read: {args.get('path', '?')}</blockquote>"
+        if tool_name == "file_write":
+            path = args.get("path", "?")
+            size = len(args.get("content", ""))
+            return f"<blockquote>write: {path} ({size} bytes)</blockquote>"
+        # Generic: show args as compact JSON, truncated
+        import json as _json
+        try:
+            arg_str = _json.dumps(args, ensure_ascii=False)
+        except Exception:
+            arg_str = str(args)
+        if len(arg_str) > 200:
+            arg_str = arg_str[:197] + "…"
+        return f"<blockquote>{arg_str}</blockquote>" if arg_str and arg_str != "{}" else ""
+
+    @staticmethod
+    def _fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
+        """Format a tool result as a short progress update."""
+        call = AgentController._fmt_tool_call(tool_name, args)
+        if outcome["success"]:
+            out = (outcome.get("output") or "").strip()
+            if out:
+                lines = out.splitlines()
+                preview = "\n".join(lines[:8])
+                if len(lines) > 8 or len(preview) > 400:
+                    preview = preview[:400] + "\n…"
+                return f"🔧 <b>{tool_name}</b> ✅\n{call}\n<blockquote>{preview}</blockquote>"
+            return f"🔧 <b>{tool_name}</b> ✅\n{call}\n<i>(no output)</i>"
+        else:
+            err = (outcome.get("error") or outcome.get("output") or "failed").strip()
+            if len(err) > 300:
+                err = err[:297] + "…"
+            return f"🔧 <b>{tool_name}</b> ❌\n{call}\n<blockquote>{err}</blockquote>"
 
     @staticmethod
     def _format_tool_result(tool_name: str, outcome: dict) -> str:
