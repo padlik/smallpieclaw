@@ -48,7 +48,7 @@ class TelegramInterface:
         self._config = config
         self.token: str = tg_cfg["bot_token"]
         self.security_mode: str = tg_cfg.get("security_mode", "allowlist")
-        self.allowed_ids: set[int] = set(tg_cfg.get("allowed_user_ids", []))
+        self.allowed_ids: set[int] = {int(uid) for uid in tg_cfg.get("allowed_user_ids", [])}
         self.pairing_timeout: int = tg_cfg.get("pairing_timeout", 300)
         self.agent_handler = agent_handler
         self.agent_reset_fn = agent_reset_fn
