@@ -186,10 +186,14 @@ class TelegramInterface:
         m = (uptime_secs % 3600) // 60
         s = uptime_secs % 60
 
-        llm_model = self._config["llm"]["model"]
+        if self.llm_client:
+            active = self.llm_client.llm_cfg
+            llm_model = f"{active.get('name', '')} / {active.get('model', 'N/A')}".lstrip("/ ")
+        else:
+            llm_model = "N/A"
         emb_cfg = self._config.get("embeddings", {})
         emb_model = emb_cfg.get("model", "N/A")
-        emb_key_status = "own key" if emb_cfg.get("api_key") else "using LLM key (fallback)"
+        emb_key_status = "own key" if emb_cfg.get("api_key") else "using active model key (fallback)"
 
         token_line = ""
         if self.llm_client:
