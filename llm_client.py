@@ -122,29 +122,40 @@ class LLMClient:
       - Anthropic Claude
 
     Multi-model support:
-      Define [[models]] in config.toml (array of tables). Each entry may have:
-        name, provider, api_key, model, base_url, max_tokens, temperature,
-        hint (keywords for auto-selection), active (bool).
-      Falls back to the single [llm] block for backward compatibility.
+      Define [[models]] in config.toml (array of tables). Each entry must have:
+        name, provider, api_key, model, base_url, max_tokens, temperature, hint,
+        request_timeout, max_retries, retry_delay.
+      Set agent.default_model to the 'model' value of the entry to use by default.
     """
 
     def __init__(self, config: dict):
         self.cfg = config
 
-        # Build models list from [[models]] (preferred) or [llm] (legacy)
-        if "models" in config and isinstance(config["models"], list) and config["models"]:
-            self._models: list[dict] = config["models"]
-        else:
-            self._models = [config["llm"]]
+        # Require [[models]] — no legacy [llm] fallback
+        models = config.get("models")
+        if not models or not isinstance(models, list):
+            raise ValueError(
+                "config.toml must define at least one [[models]] entry. "
+                "The legacy [llm] block is no longer supported."
+            )
+        self._models: list[dict] = models
 
-        # Find active model index (first with active=true, else 0)
+        # Resolve default model from agent.default_model
+        default_model: str = config.get("agent", {}).get("default_model", "")
         self._active_idx: int = 0
-        for i, m in enumerate(self._models):
-            if m.get("active", False):
-                self._active_idx = i
-                break
+        if default_model:
+            for i, m in enumerate(self._models):
+                if m.get("model") == default_model:
+                    self._active_idx = i
+                    break
+            else:
+                raise ValueError(
+                    f"agent.default_model = {default_model!r} does not match "
+                    f"any [[models]] entry. Available: "
+                    f"{[m.get('model') for m in self._models]}"
+                )
 
-        # Embeddings config (with fallback to active LLM key)
+        # Embeddings config (with fallback to active LLM key/base_url)
         emb_cfg = dict(config.get("embeddings", self._models[self._active_idx]))
         if not emb_cfg.get("api_key"):
             emb_cfg["api_key"] = self._models[self._active_idx].get("api_key", "")
@@ -152,8 +163,8 @@ class LLMClient:
             emb_cfg["base_url"] = self._models[self._active_idx].get("base_url", "")
         self.emb_cfg = emb_cfg
 
-        # Retry / timeout from active model config (or global [llm] if present)
-        _ref = config.get("llm", self._models[self._active_idx])
+        # Retry / timeout from active model config
+        _ref = self._models[self._active_idx]
         self._max_retries: int = _ref.get("max_retries", 3)
         self._retry_delay: float = float(_ref.get("retry_delay", 2))
         timeout_secs: float = float(_ref.get("request_timeout", 120))

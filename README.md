@@ -89,47 +89,65 @@ Required settings:
 | `telegram.bot_token` | From [@BotFather](https://t.me/BotFather) |
 | `telegram.security_mode` | `"allowlist"` or `"pairing"` |
 | `telegram.allowed_user_ids` | Your Telegram user IDs (for allowlist mode) |
-| `llm.api_key` | Your LLM provider API key |
-| `llm.provider` | `openai`, `openrouter`, `google`, or `anthropic` |
-| `llm.model` | e.g. `gpt-4o-mini`, `gemini-1.5-flash`, `claude-3-haiku-20240307` |
-| `embeddings.api_key` | API key for embeddings — if empty, falls back to `llm.api_key` |
+| `agent.default_model` | Must match the `model` field of one `[[models]]` entry |
+| `embeddings.api_key` | API key for embeddings — if empty, falls back to the active model's key |
 | `embeddings.model` | e.g. `text-embedding-3-small` |
 
 > **Tip:** To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
 
-### 5. (Optional) Configure multiple LLM models
+### 5. Configure LLM models
 
-You can define multiple models in `config.toml` using `[[models]]` TOML array-of-tables.
-The agent auto-selects a model based on `hint` keywords in the user's message, and users
-can switch manually with `/models`.
+Models are defined as `[[models]]` TOML array-of-tables. At least one entry is required.
+The active model is chosen by matching `agent.default_model` to the `model` field of an entry.
+
+| Field | Description |
+|-------|-------------|
+| `name` | Display name shown in `/models` |
+| `provider` | `openai` \| `openrouter` \| `google` \| `anthropic` |
+| `api_key` | Provider API key |
+| `model` | Exact model identifier (e.g. `gpt-4o-mini`) |
+| `base_url` | API base URL (leave empty for Anthropic/Google) |
+| `max_tokens` | Max tokens in the LLM response |
+| `temperature` | Sampling temperature |
+| `hint` | Space-separated keywords for auto-selection at runtime |
+| `request_timeout` | Per-request timeout in seconds (default: 120) |
+| `max_retries` | Retry attempts on timeout/connection errors (default: 3) |
+| `retry_delay` | Base retry delay in seconds, doubles each attempt (default: 2) |
 
 ```toml
 [[models]]
-name        = "default"
-provider    = "openai"
-api_key     = "sk-..."
-model       = "gpt-4o-mini"
-base_url    = "https://api.openai.com/v1"
-max_tokens  = 1024
-temperature = 0.2
-hint        = "general quick default"
-active      = true
+name            = "default"
+provider        = "openai"
+api_key         = "sk-..."
+model           = "gpt-4o-mini"
+base_url        = "https://api.openai.com/v1"
+max_tokens      = 1024
+temperature     = 0.2
+hint            = "general quick default"
+request_timeout = 120
+max_retries     = 3
+retry_delay     = 2
 
 [[models]]
-name        = "smart"
-provider    = "anthropic"
-api_key     = "sk-ant-..."
-model       = "claude-3-5-sonnet-20241022"
-base_url    = ""
-max_tokens  = 8192
-temperature = 0.2
-hint        = "complex analyze reason large file code review"
-active      = false
+name            = "smart"
+provider        = "anthropic"
+api_key         = "sk-ant-..."
+model           = "claude-3-5-sonnet-20241022"
+base_url        = ""
+max_tokens      = 8192
+temperature     = 0.2
+hint            = "complex analyze reason large file code review"
+request_timeout = 180
+max_retries     = 3
+retry_delay     = 2
+
+[agent]
+default_model = "gpt-4o-mini"   # must match one of the model = "..." values above
 ```
 
-When `[[models]]` is present it overrides the single `[llm]` block.
+The agent auto-selects a model when `hint` keywords appear in the user's message, and users can switch manually with `/models`.
 
-### 5. (Optional) Configure the scheduler
+### 6. (Optional) Configure the scheduler
 
 Edit `scheduler.toml` to enable/disable jobs or change their schedule:
 
@@ -158,7 +176,7 @@ notify = false
 
 You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `manage_scheduler` tool), or use `/jobs` to see all active jobs.
 
-### 5. Run
+### 7. Run
 
 ```bash
 python main.py
@@ -260,6 +278,7 @@ Restart the agent (or wait for the next query) to pick up new tools.
 | Tool timeout | 10 s | `agent.tool_timeout` |
 | Max tool output | 4000 chars | `agent.max_output_size` |
 | Semantic top-K tools | 3 | `agent.top_tools` |
+| Default model | _(first `[[models]]` entry)_ | `agent.default_model` |
 | Max context tokens | 90 000 | `agent.ctx_max_tokens` |
 
 Context compaction fires automatically at 85% of `ctx_max_tokens`. Older messages are summarised by the LLM and replaced with a compact bullet-point summary before the next request.
@@ -275,7 +294,7 @@ Context compaction fires automatically at 85% of `ctx_max_tokens`. Older message
 | Google | `google` | Gemini models |
 | Anthropic | `anthropic` | Claude models |
 
-Embeddings can use a different provider/key than the main LLM. If `embeddings.api_key` is empty, the agent falls back to `llm.api_key` automatically.
+Embeddings can use a different provider/key than the main LLM. If `embeddings.api_key` is empty, the agent falls back to the active model's `api_key` automatically.
 
 ---
 
