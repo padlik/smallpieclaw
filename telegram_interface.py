@@ -379,7 +379,7 @@ class TelegramInterface:
 
         logger.info("Message from user %d: %s", user.id, text[:80])
         status_msg = await update.message.reply_text("🔄 Processing…")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def progress(msg: str):
             # Check for confirmation request marker from agent
@@ -422,22 +422,34 @@ class TelegramInterface:
     async def _cb_confirm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle Yes/No confirmation button presses."""
         query = update.callback_query
-        await query.answer()
         data = query.data  # "confirm_yes:<token>" or "confirm_no:<token>"
         confirmed = data.startswith("confirm_yes:")
         token = data.split(":", 1)[1]
 
+        logger.info("Confirmation callback: confirmed=%s token=%s agent=%s",
+                    confirmed, token[:8], "set" if self.agent else "None")
+
+        # Resume the agent FIRST — before any Telegram API calls that might fail
+        if self.agent:
+            self.agent.resume(token, confirmed)
+        else:
+            logger.warning("_cb_confirm: self.agent is None — cannot resume agent")
+
+        # Acknowledge the button press (best-effort; Telegram requires this within ~10s)
+        try:
+            await query.answer()
+        except Exception as exc:
+            logger.warning("query.answer() failed (button may show spinner): %s", exc)
+
+        # Edit the message to reflect the decision (best-effort)
         result_text = "✅ Confirmed — executing…" if confirmed else "❌ Cancelled."
         try:
             await query.edit_message_text(
                 f"⚠️ <b>Confirmation</b>\n\n{result_text}",
                 parse_mode=ParseMode.HTML,
             )
-        except Exception:
-            pass
-
-        if self.agent:
-            self.agent.resume(token, confirmed)
+        except Exception as exc:
+            logger.debug("Could not edit confirmation message: %s", exc)
 
     async def _cmd_models(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):

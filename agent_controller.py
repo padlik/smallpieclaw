@@ -304,10 +304,14 @@ class AgentController:
 
     def resume(self, token: str, confirmed: bool) -> None:
         """Called by TelegramInterface when user responds to a confirmation prompt."""
+        logger.info("resume() called: token=%s confirmed=%s event_found=%s",
+                    token[:8], confirmed, token in self._confirm_events)
         self._confirm_results[token] = confirmed
         event = self._confirm_events.get(token)
         if event:
             event.set()
+        else:
+            logger.warning("resume(): no event found for token=%s (already resolved or timed out?)", token[:8])
 
     def reset_task(self, save: bool = True) -> str:
         """Save (optionally) and clear the current working + short-term context."""
