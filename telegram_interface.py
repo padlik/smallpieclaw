@@ -76,6 +76,7 @@ class TelegramInterface:
         self._app = (
             Application.builder()
             .token(self.token)
+            .concurrent_updates(True)  # allow callback queries while agent is running
             .post_init(self._post_init)
             .build()
         )
