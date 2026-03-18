@@ -157,6 +157,7 @@ class AgentController:
             switched = self.llm.select_model_by_hint(user_goal)
             if switched:
                 logger.info("Auto-selected model '%s' based on goal hint", switched)
+                _progress(f"🤖 Auto-selected model: <b>{switched}</b>")
 
         # Start working memory task tracking
         if self.working:

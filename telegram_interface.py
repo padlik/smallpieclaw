@@ -490,8 +490,18 @@ class TelegramInterface:
 
         if self.llm_client and hasattr(self.llm_client, "set_model"):
             success = self.llm_client.set_model(model_name)
-            text = f"✅ Switched to model <b>{html.escape(model_name)}</b>." if success \
-                   else f"❌ Model <code>{html.escape(model_name)}</code> not found."
+            if success:
+                # Show hint keywords so the user knows when auto-select will pick this model
+                active = self.llm_client.llm_cfg
+                hint = active.get("hint", "")
+                hint_line = f"\n🔑 Hint keywords: <i>{html.escape(hint)}</i>" if hint else ""
+                text = (
+                    f"✅ Switched to <b>{html.escape(active.get('name', model_name))}</b>"
+                    f" (<code>{html.escape(model_name)}</code>){hint_line}\n"
+                    f"<i>Takes effect from your next message.</i>"
+                )
+            else:
+                text = f"❌ Model <code>{html.escape(model_name)}</code> not found."
         else:
             text = "❌ Model switching not available."
 
