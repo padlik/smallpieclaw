@@ -15,7 +15,7 @@ import time
 from typing import Callable, Optional
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -380,6 +380,18 @@ class TelegramInterface:
         logger.info("Message from user %d: %s", user.id, text[:80])
         status_msg = await update.message.reply_text("🔄 Processing…")
         loop = asyncio.get_running_loop()
+        chat_id = update.effective_chat.id
+
+        # Keep "typing…" indicator alive while the agent is working
+        async def _typing_loop():
+            while True:
+                try:
+                    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(_typing_loop())
 
         def progress(msg: str):
             # Check for confirmation request marker from agent
@@ -406,6 +418,8 @@ class TelegramInterface:
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
+        finally:
+            typing_task.cancel()
 
     async def _send_confirmation_prompt(self, message, token: str, description: str) -> None:
         """Send an inline-button confirmation prompt for a dangerous operation."""
