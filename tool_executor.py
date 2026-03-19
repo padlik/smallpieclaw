@@ -54,7 +54,7 @@ class ToolExecutor:
         if not self._path_is_safe(tool):
             return self._error(f"Tool path '{tool.path}' is outside allowed directories.")
 
-        cmd = self._build_command(tool, args or {})
+        cmd = self._build_command(tool, args if isinstance(args, dict) else {})
         logger.info("Executing tool '%s': %s", tool_name, " ".join(cmd))
 
         try:

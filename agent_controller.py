@@ -235,6 +235,9 @@ class AgentController:
             elif action == "tool":
                 tool_name = action_obj.get("tool", "")
                 args = action_obj.get("args", {})
+                # Normalize: LLM sometimes emits args as a list instead of a dict
+                if isinstance(args, list):
+                    args = {str(i): v for i, v in enumerate(args)}
                 _progress(f"🔧 Running tool: <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
 
                 # Built-in tools take priority
