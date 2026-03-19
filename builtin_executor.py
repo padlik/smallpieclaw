@@ -353,8 +353,8 @@ class BuiltinExecutor:
                 schedule_type=str(args.get("schedule_type", args.get("schedule", "interval"))),
                 task=str(args.get("task", "")),
                 notify=bool(args.get("notify", True)),
-                hours=args.get("hours"),
-                minutes=args.get("minutes"),
+                hours=int(args["hours"]) if args.get("hours") is not None else None,
+                minutes=int(args["minutes"]) if args.get("minutes") is not None else None,
                 time_str=str(args.get("time", "")) or None,
                 run_at=str(args.get("run_at", "")) or None,
             )

@@ -98,12 +98,21 @@ class Scheduler:
         schedule_type: str,
         task: str,
         notify: bool = True,
-        hours: int = None,
-        minutes: int = None,
+        hours=None,
+        minutes=None,
         time_str: str = None,
         run_at: str = None,
         source: str = "dynamic",
     ) -> dict:
+        # Coerce hours/minutes to int — LLM may pass them as strings
+        try:
+            hours = int(hours) if hours is not None else None
+        except (ValueError, TypeError):
+            hours = None
+        try:
+            minutes = int(minutes) if minutes is not None else None
+        except (ValueError, TypeError):
+            minutes = None
         if tag in self._jobs_meta:
             return {"success": False, "error": f"Job '{tag}' already exists."}
         if schedule_type not in ("daily", "interval", "once"):
