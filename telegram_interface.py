@@ -259,12 +259,16 @@ class TelegramInterface:
         for job in jobs:
             icon = "✅" if job["enabled"] else "⏸"
             last_run = job.get("last_run") or "never"
+            stype = job.get("schedule_type", "interval")
+            task_label = "🔔 Message" if stype == "once" else "📝 Task"
+            task_text = job.get("task", "")
+            task_display = html.escape(task_text[:300] + ("…" if len(task_text) > 300 else ""))
             lines.append(f"{icon} <code>{html.escape(job['tag'])}</code>")
             lines.append(f"   Schedule: {html.escape(job['schedule'])}")
             lines.append(f"   Last run: {html.escape(str(last_run))}")
             if job.get("last_error"):
                 lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
-            lines.append(f"   {html.escape(job['task'])}\n")
+            lines.append(f"   {task_label}: {task_display}\n")
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 

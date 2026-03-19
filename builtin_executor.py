@@ -330,10 +330,12 @@ class BuiltinExecutor:
             lines = []
             for j in jobs:
                 status = "✅" if j["enabled"] else "⏸"
-                err = f" ⚠️ last error: {j['last_error'][:60]}" if j.get("last_error") else ""
+                stype = j.get("schedule_type", "interval")
+                task_label = "Message" if stype == "once" else "Task"
+                err = f"\n   ⚠️ last error: {j['last_error'][:120]}" if j.get("last_error") else ""
                 lines.append(
                     f"{status} {j['tag']} ({j['schedule']})\n"
-                    f"   Task: {j['task']}\n"
+                    f"   {task_label}: {j['task']}\n"
                     f"   Last run: {j['last_run'] or 'never'}{err}"
                 )
             return {"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}

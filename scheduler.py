@@ -181,10 +181,12 @@ class Scheduler:
             entry = {
                 "tag": tag,
                 "schedule": self._describe_schedule(meta),
+                "schedule_type": meta.get("schedule_type", "interval"),
                 "enabled": meta.get("enabled", True),
                 "last_run": meta.get("last_run"),
                 "last_error": meta.get("last_error"),
-                "task": meta.get("task", "")[:80],
+                "task": meta.get("task", ""),   # full text — display layer truncates
+                "notify": meta.get("notify", True),
                 "source": meta.get("source", "config"),
             }
             result.append(entry)
