@@ -105,6 +105,16 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
         name="file_write",
         description="Write content to a file on the filesystem. Args: path (str), content (str), mode (str: 'w' or 'a', default 'w').",
     ),
+    "schedule": BuiltinTool(
+        name="schedule",
+        description=(
+            "Manage scheduled jobs and reminders. "
+            "Args: action (str: list|add|remove|pause|resume|run_now), "
+            "tag (str), task (str), schedule_type (str: daily|interval|once), "
+            "time (HH:MM for daily/once), run_at (HH:MM for once), "
+            "hours (int), minutes (int), notify (bool, default true)."
+        ),
+    ),
 }
 
 
@@ -124,9 +134,10 @@ class BuiltinExecutor:
       5. On user rejection: call cancel(token)  → cleans up state.
     """
 
-    def __init__(self, default_timeout: int = 30, max_output: int = 4000):
+    def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None):
         self.default_timeout = default_timeout
         self.max_output = max_output
+        self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
 
@@ -152,6 +163,8 @@ class BuiltinExecutor:
             return self._exec_file_read(args)
         elif tool_name == "file_write":
             return self._exec_file_write(args)
+        elif tool_name == "schedule":
+            return self._exec_schedule(args)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -301,3 +314,69 @@ class BuiltinExecutor:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
         except Exception as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+    # ---- schedule ----
+
+    def _exec_schedule(self, args: dict) -> dict:
+        if not self.scheduler:
+            return {"success": False, "output": "", "error": "Scheduler not available.", "exit_code": -1}
+        action = str(args.get("action", "list")).lower()
+        tag = str(args.get("tag", "")).strip()
+
+        if action == "list":
+            jobs = self.scheduler.list_jobs()
+            if not jobs:
+                return {"success": True, "output": "No scheduled jobs.", "error": "", "exit_code": 0}
+            lines = []
+            for j in jobs:
+                status = "✅" if j["enabled"] else "⏸"
+                err = f" ⚠️ last error: {j['last_error'][:60]}" if j.get("last_error") else ""
+                lines.append(
+                    f"{status} {j['tag']} ({j['schedule']})\n"
+                    f"   Task: {j['task']}\n"
+                    f"   Last run: {j['last_run'] or 'never'}{err}"
+                )
+            return {"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}
+
+        if action == "add":
+            if not tag:
+                return {"success": False, "output": "", "error": "tag is required for add", "exit_code": -1}
+            result = self.scheduler.add_job(
+                tag=tag,
+                schedule_type=str(args.get("schedule_type", args.get("schedule", "interval"))),
+                task=str(args.get("task", "")),
+                notify=bool(args.get("notify", True)),
+                hours=args.get("hours"),
+                minutes=args.get("minutes"),
+                time_str=str(args.get("time", "")) or None,
+                run_at=str(args.get("run_at", "")) or None,
+            )
+            if result["success"]:
+                return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}
+            return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
+
+        if action == "remove":
+            ok = self.scheduler.remove_job(tag)
+            if ok:
+                return {"success": True, "output": f"Job '{tag}' removed.", "error": "", "exit_code": 0}
+            return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
+
+        if action == "pause":
+            ok = self.scheduler.pause_job(tag)
+            if ok:
+                return {"success": True, "output": f"Job '{tag}' paused.", "error": "", "exit_code": 0}
+            return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
+
+        if action == "resume":
+            ok = self.scheduler.resume_job(tag)
+            if ok:
+                return {"success": True, "output": f"Job '{tag}' resumed.", "error": "", "exit_code": 0}
+            return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
+
+        if action == "run_now":
+            result = self.scheduler.run_now(tag)
+            if result["success"]:
+                return {"success": True, "output": f"Job '{tag}' triggered.", "error": "", "exit_code": 0}
+            return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
+
+        return {"success": False, "output": "", "error": f"Unknown action '{action}'. Use: list, add, remove, pause, resume, run_now", "exit_code": -1}

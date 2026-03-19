@@ -139,6 +139,7 @@ def main():
         data_dir=data_dir,
         long_term_memory=long_term,
     )
+    builtin.scheduler = scheduler  # wire scheduler into built-in tool
 
     logger.info("Starting Telegram bot...")
     tg = TelegramInterface(

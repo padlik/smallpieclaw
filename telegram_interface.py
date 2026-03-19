@@ -67,6 +67,8 @@ class TelegramInterface:
         self._pending_confirmations: dict[str, asyncio.Future] = {}
 
         self._app: Optional[Application] = None
+        # Saved when run() starts — used by send_message_to_users() from threads
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -92,6 +94,9 @@ class TelegramInterface:
         """Start polling (blocking)."""
         app = self.build()
         logger.info("Starting Telegram bot polling…")
+        # Save the event loop before run_polling takes over — needed for
+        # send_message_to_users() which is called from the scheduler thread.
+        self._loop = asyncio.get_event_loop()
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
     # ------------------------------------------------------------------
@@ -257,6 +262,8 @@ class TelegramInterface:
             lines.append(f"{icon} <code>{html.escape(job['tag'])}</code>")
             lines.append(f"   Schedule: {html.escape(job['schedule'])}")
             lines.append(f"   Last run: {html.escape(str(last_run))}")
+            if job.get("last_error"):
+                lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
             lines.append(f"   {html.escape(job['task'])}\n")
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -582,9 +589,14 @@ class TelegramInterface:
 
     def send_message_to_users(self, text: str) -> None:
         """
-        Send a message to all authorized users (used by the scheduler).
-        Schedules the send on the bot's running event loop.
+        Send a message to all authorized users (used by the scheduler / built-in tools).
+        Safe to call from any thread — uses run_coroutine_threadsafe to post onto the
+        bot's event loop.
         """
+        if not self._app:
+            logger.warning("send_message_to_users: app not built yet, dropping message")
+            return
+
         async def _send():
             bot = self._app.bot
             for uid in list(self.allowed_ids):
@@ -592,16 +604,17 @@ class TelegramInterface:
                     for chunk in self._split_message(_md_to_html(text)):
                         await bot.send_message(chat_id=uid, text=chunk, parse_mode=ParseMode.HTML)
                 except Exception as exc:
-                    logger.warning("Could not send scheduled message to %d: %s", uid, exc)
+                    logger.warning("Could not send message to %d: %s", uid, exc)
 
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(_send())
-            else:
-                loop.run_until_complete(_send())
-        except Exception as exc:
-            logger.error("send_message_to_users failed: %s", exc)
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        else:
+            # Fallback for edge cases (e.g. called before run() or in tests)
+            try:
+                asyncio.run(_send())
+            except Exception as exc:
+                logger.error("send_message_to_users fallback failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

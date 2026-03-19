@@ -61,6 +61,7 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   shell      — execute any shell command on the host system
   file_read  — read a file from the filesystem
   file_write — write content to a file on the filesystem
+  schedule   — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
 
 AVAILABLE TOOLS:
 {tools}

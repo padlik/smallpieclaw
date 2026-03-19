@@ -101,21 +101,24 @@ class Scheduler:
         hours: int = None,
         minutes: int = None,
         time_str: str = None,
+        run_at: str = None,
         source: str = "dynamic",
     ) -> dict:
         if tag in self._jobs_meta:
             return {"success": False, "error": f"Job '{tag}' already exists."}
-        if schedule_type not in ("daily", "interval"):
-            return {"success": False, "error": "schedule_type must be 'daily' or 'interval'"}
+        if schedule_type not in ("daily", "interval", "once"):
+            return {"success": False, "error": "schedule_type must be 'daily', 'interval', or 'once'"}
         if schedule_type == "daily" and not time_str:
             return {"success": False, "error": "'time' is required for daily jobs (HH:MM)"}
         if schedule_type == "interval" and not hours and not minutes:
             return {"success": False, "error": "'hours' or 'minutes' required for interval jobs"}
+        effective_run_at = run_at or time_str
         meta = {
             "tag": tag,
             "task": task,
             "schedule_type": schedule_type,
             "time": time_str,
+            "run_at": effective_run_at if schedule_type == "once" else None,
             "hours": hours,
             "minutes": minutes,
             "notify": notify,
@@ -163,18 +166,28 @@ class Scheduler:
         logger.info("Job resumed: %s", tag)
         return True
 
+    def run_now(self, tag: str) -> dict:
+        """Trigger a job immediately in a background thread."""
+        if tag not in self._jobs_meta:
+            return {"success": False, "error": f"Job '{tag}' not found."}
+        import threading as _threading
+        _threading.Thread(target=self._run_job, kwargs={"tag": tag}, daemon=True).start()
+        logger.info("Job '%s' triggered manually (run_now)", tag)
+        return {"success": True}
+
     def list_jobs(self) -> list:
         result = []
         for tag, meta in self._jobs_meta.items():
-            last_run = meta.get("last_run")
-            result.append({
+            entry = {
                 "tag": tag,
                 "schedule": self._describe_schedule(meta),
                 "enabled": meta.get("enabled", True),
-                "last_run": last_run,
+                "last_run": meta.get("last_run"),
+                "last_error": meta.get("last_error"),
                 "task": meta.get("task", "")[:80],
                 "source": meta.get("source", "config"),
-            })
+            }
+            result.append(entry)
         return result
 
     # ------------------------------------------------------------------
@@ -182,8 +195,12 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _describe_schedule(self, meta: dict) -> str:
-        if meta.get("schedule_type") == "daily":
+        stype = meta.get("schedule_type", "interval")
+        if stype == "daily":
             return f"daily at {meta.get('time', '?')}"
+        if stype == "once":
+            run_at = meta.get("run_at") or meta.get("time")
+            return f"once at {run_at}" if run_at else "once (ASAP)"
         hours = meta.get("hours")
         minutes = meta.get("minutes")
         if hours:
@@ -198,6 +215,14 @@ class Scheduler:
         if stype == "daily":
             t = meta.get("time", "02:00")
             schedule.every().day.at(t).do(self._run_job, tag=tag).tag(tag)
+        elif stype == "once":
+            # Run at a specific HH:MM today (or tomorrow if that time has passed)
+            run_at = meta.get("run_at") or meta.get("time")
+            if run_at:
+                schedule.every().day.at(run_at).do(self._run_job, tag=tag).tag(tag)
+            else:
+                # Run as soon as possible (next scheduler tick)
+                schedule.every(1).minutes.do(self._run_job, tag=tag).tag(tag)
         else:
             hours = meta.get("hours")
             minutes = meta.get("minutes")
@@ -213,23 +238,37 @@ class Scheduler:
             return
         task = meta.get("task", "")
         logger.info("Running scheduled job: %s", tag)
+        now = datetime.utcnow().isoformat()
         result = ""
+        error_occurred = False
         try:
             if self.agent:
                 result = self.agent(task)
             else:
-                result = f"Agent not available for task: {task}"
+                result = "Agent not available for task."
+            # Agent may return an error string (starts with ❌) — treat as error
+            if result.startswith("❌"):
+                error_occurred = True
         except Exception as exc:
             logger.error("Job '%s' failed: %s", tag, exc)
             result = f"Job failed: {exc}"
-            if meta.get("notify", True):
-                self.notify(f"⚠️ Scheduled job *{tag}* failed: {exc}")
-            return
+            error_occurred = True
 
-        meta["last_run"] = datetime.utcnow().isoformat()
+        # Always update last_run (regardless of success/failure)
+        meta["last_run"] = now
+        if error_occurred:
+            meta["last_error"] = result
+        else:
+            meta.pop("last_error", None)
+
         if meta.get("source") == "dynamic":
             self._save_dynamic_jobs()
         self._save_state()
+
+        if error_occurred:
+            if meta.get("notify", True):
+                self.notify(f"⚠️ <b>Scheduled job failed:</b> <code>{tag}</code>\n\n{result}")
+            return
 
         if tag == "longterm_memory_update" and self.long_term_memory:
             try:
@@ -238,8 +277,17 @@ class Scheduler:
             except Exception as exc:
                 logger.warning("Failed to update long-term memory from job '%s': %s", tag, exc)
 
+        # Auto-remove once/reminder jobs after successful execution
+        if meta.get("schedule_type") == "once":
+            logger.info("Once job '%s' completed — removing", tag)
+            schedule.clear(tag)
+            self._jobs_meta.pop(tag, None)
+            self._save_state()
+            if meta.get("source") == "dynamic":
+                self._save_dynamic_jobs()
+
         if meta.get("notify", True):
-            self.notify(f"📅 *Scheduled: {tag}*\n\n{result}")
+            self.notify(f"📅 <b>Scheduled: {tag}</b>\n\n{result}")
 
     def _process_pending_commands(self) -> None:
         if not os.path.exists(self._commands_file):
