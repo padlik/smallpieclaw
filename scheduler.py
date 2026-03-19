@@ -67,7 +67,7 @@ class Scheduler:
 
         os.makedirs(data_dir, exist_ok=True)
         self._load_config_jobs(scheduler_config_path, sched_cfg)
-        self._load_dynamic_jobs()
+        self._load_dynamic_jobs()   # migration: imports old JSON, deletes it, writes to TOML
         self._save_state()
 
     # ------------------------------------------------------------------
@@ -130,9 +130,8 @@ class Scheduler:
         self._jobs_meta[tag] = meta
         if self.enabled and self._thread and self._thread.is_alive():
             self._register_job(tag, meta)
-        if source == "dynamic":
-            self._save_dynamic_jobs()
         self._save_state()
+        self._save_scheduler_toml()
         logger.info("Job added: %s (%s)", tag, self._describe_schedule(meta))
         return {"success": True}
 
@@ -141,8 +140,8 @@ class Scheduler:
             return False
         schedule.clear(tag)
         del self._jobs_meta[tag]
-        self._save_dynamic_jobs()
         self._save_state()
+        self._save_scheduler_toml()
         logger.info("Job removed: %s", tag)
         return True
 
@@ -151,8 +150,8 @@ class Scheduler:
             return False
         self._jobs_meta[tag]["enabled"] = False
         schedule.clear(tag)
-        self._save_dynamic_jobs()
         self._save_state()
+        self._save_scheduler_toml()
         logger.info("Job paused: %s", tag)
         return True
 
@@ -161,8 +160,8 @@ class Scheduler:
             return False
         self._jobs_meta[tag]["enabled"] = True
         self._register_job(tag, self._jobs_meta[tag])
-        self._save_dynamic_jobs()
         self._save_state()
+        self._save_scheduler_toml()
         logger.info("Job resumed: %s", tag)
         return True
 
@@ -238,9 +237,27 @@ class Scheduler:
         meta = self._jobs_meta.get(tag)
         if not meta or not meta.get("enabled", True):
             return
-        task = meta.get("task", "")
+        task = meta.get("task", "").strip()
         logger.info("Running scheduled job: %s", tag)
         now = datetime.utcnow().isoformat()
+        is_once = meta.get("schedule_type") == "once"
+
+        # --- Empty task guard ---
+        if not task:
+            logger.warning("Job '%s' has no task — sending direct notification", tag)
+            friendly = tag.replace("_", " ")
+            meta["last_run"] = now
+            self._save_state()
+            self._save_scheduler_toml()
+            if is_once:
+                schedule.clear(tag)
+                self._jobs_meta.pop(tag, None)
+                self._save_state()
+                self._save_scheduler_toml()
+            if meta.get("notify", True):
+                self.notify(f"🔔 <b>Reminder:</b> {friendly}")
+            return
+
         result = ""
         error_occurred = False
         try:
@@ -263,9 +280,8 @@ class Scheduler:
         else:
             meta.pop("last_error", None)
 
-        if meta.get("source") == "dynamic":
-            self._save_dynamic_jobs()
         self._save_state()
+        self._save_scheduler_toml()
 
         if error_occurred:
             if meta.get("notify", True):
@@ -280,13 +296,12 @@ class Scheduler:
                 logger.warning("Failed to update long-term memory from job '%s': %s", tag, exc)
 
         # Auto-remove once/reminder jobs after successful execution
-        if meta.get("schedule_type") == "once":
+        if is_once:
             logger.info("Once job '%s' completed — removing", tag)
             schedule.clear(tag)
             self._jobs_meta.pop(tag, None)
             self._save_state()
-            if meta.get("source") == "dynamic":
-                self._save_dynamic_jobs()
+            self._save_scheduler_toml()
 
         if meta.get("notify", True):
             self.notify(f"📅 <b>Scheduled: {tag}</b>\n\n{result}")
@@ -355,34 +370,69 @@ class Scheduler:
             logger.warning("Could not save scheduler state: %s", exc)
 
     def _load_dynamic_jobs(self) -> None:
+        """Migration: import old scheduled_jobs.json into TOML, then delete the JSON file."""
         if not os.path.exists(self._dynamic_jobs_file):
             return
         try:
             with open(self._dynamic_jobs_file) as f:
                 jobs = json.load(f)
+            imported = 0
             for tag, meta in jobs.items():
-                meta["source"] = "dynamic"
                 if tag not in self._jobs_meta:
+                    meta["source"] = "dynamic"
                     self._jobs_meta[tag] = meta
+                    imported += 1
+            if imported:
+                logger.info("Migrated %d jobs from %s → scheduler.toml", imported, self._dynamic_jobs_file)
+                self._save_scheduler_toml()
+            os.remove(self._dynamic_jobs_file)
+            logger.info("Removed legacy %s after migration", self._dynamic_jobs_file)
         except Exception as exc:
-            logger.warning("Could not load dynamic jobs: %s", exc)
+            logger.warning("Could not migrate dynamic jobs: %s", exc)
 
-    def _save_dynamic_jobs(self) -> None:
-        dynamic = {
-            tag: meta
-            for tag, meta in self._jobs_meta.items()
-            if meta.get("source") == "dynamic"
-        }
-        tmp = self._dynamic_jobs_file + ".tmp"
+    def _save_scheduler_toml(self) -> None:
+        """Persist all current jobs to scheduler.toml (auto-managed file)."""
+        def _toml_str(v: str) -> str:
+            return '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+        lines = [
+            "# scheduler.toml — auto-managed by scheduler\n",
+            "# Edit this file to add static jobs; dynamic/user jobs are appended here.\n",
+            "\n",
+        ]
+        for tag, meta in self._jobs_meta.items():
+            lines.append(f"[jobs.{tag}]\n")
+            lines.append(f"enabled = {str(meta.get('enabled', True)).lower()}\n")
+            stype = meta.get("schedule_type", "interval")
+            lines.append(f'schedule = "{stype}"\n')
+            if meta.get("time"):
+                lines.append(f'time = "{meta["time"]}"\n')
+            if meta.get("run_at"):
+                lines.append(f'run_at = "{meta["run_at"]}"\n')
+            if meta.get("hours") is not None:
+                lines.append(f"hours = {meta['hours']}\n")
+            if meta.get("minutes") is not None:
+                lines.append(f"minutes = {meta['minutes']}\n")
+            lines.append(f"task = {_toml_str(meta.get('task', ''))}\n")
+            lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
+            source = meta.get("source", "config")
+            if source != "config":
+                lines.append(f'source = "{source}"\n')
+            if meta.get("created_at"):
+                lines.append(f'created_at = "{meta["created_at"]}"\n')
+            lines.append("\n")
+
+        tmp = self._scheduler_config_path + ".tmp"
         try:
-            with open(tmp, "w") as f:
-                json.dump(dynamic, f, indent=2)
-            os.replace(tmp, self._dynamic_jobs_file)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            os.replace(tmp, self._scheduler_config_path)
+            logger.debug("Saved %d jobs to %s", len(self._jobs_meta), self._scheduler_config_path)
         except Exception as exc:
-            logger.warning("Could not save dynamic jobs: %s", exc)
+            logger.warning("Could not save scheduler.toml: %s", exc)
 
     def _load_config_jobs(self, config_path: str, sched_cfg: dict) -> None:
-        """Load jobs from scheduler.toml, falling back to hardcoded defaults."""
+        """Load all jobs from scheduler.toml, falling back to hardcoded defaults."""
         if os.path.exists(config_path):
             try:
                 with open(config_path, "rb") as f:
@@ -395,20 +445,21 @@ class Scheduler:
                         "task": job_cfg.get("task", ""),
                         "schedule_type": stype,
                         "time": job_cfg.get("time"),
+                        "run_at": job_cfg.get("run_at"),
                         "hours": job_cfg.get("hours"),
                         "minutes": job_cfg.get("minutes"),
                         "notify": job_cfg.get("notify", True),
                         "enabled": job_cfg.get("enabled", True),
-                        "source": "config",
+                        "source": job_cfg.get("source", "config"),
                         "last_run": None,
-                        "created_at": datetime.utcnow().isoformat(),
+                        "created_at": job_cfg.get("created_at", datetime.utcnow().isoformat()),
                     }
                 logger.info("Loaded %d jobs from %s", len(self._jobs_meta), config_path)
                 return
             except Exception as exc:
                 logger.warning("Could not load %s: %s — using hardcoded defaults", config_path, exc)
 
-        # Hardcoded defaults
+        # Hardcoded defaults (used only when scheduler.toml is missing)
         health_time = sched_cfg.get("nightly_health_check", "02:00")
         disk_hours = sched_cfg.get("disk_check_interval_hours", 6)
         self._jobs_meta = {
@@ -417,6 +468,7 @@ class Scheduler:
                 "task": "Run a full system health check and summarize the status.",
                 "schedule_type": "daily",
                 "time": health_time,
+                "run_at": None,
                 "hours": None,
                 "minutes": None,
                 "notify": True,
@@ -430,6 +482,7 @@ class Scheduler:
                 "task": "Check disk usage on all mount points. Alert if any mount point is above 80% full.",
                 "schedule_type": "interval",
                 "time": None,
+                "run_at": None,
                 "hours": disk_hours,
                 "minutes": None,
                 "notify": True,

@@ -110,9 +110,14 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
         description=(
             "Manage scheduled jobs and reminders. "
             "Args: action (str: list|add|remove|pause|resume|run_now), "
-            "tag (str), task (str), schedule_type (str: daily|interval|once), "
-            "time (HH:MM for daily/once), run_at (HH:MM for once), "
-            "hours (int), minutes (int), notify (bool, default true)."
+            "tag (str, unique job name), "
+            "task (str, REQUIRED for add — the natural-language goal or reminder text; "
+            "for once/reminder jobs this is the message delivered to the user, e.g. "
+            "'Remind the user to check the tennis scores'), "
+            "schedule_type (str: daily|interval|once), "
+            "time (HH:MM for daily), run_at (HH:MM for once), "
+            "hours (int), minutes (int), notify (bool, default true). "
+            "Always provide a non-empty task when adding any job."
         ),
     ),
 }
