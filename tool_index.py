@@ -6,6 +6,9 @@ search to find the most relevant tools for a given natural-language query.
 
 Vectors are persisted in data/tool_index.json to avoid re-embedding on restart.
 Heavy ML libraries (numpy, faiss, etc.) are intentionally avoided.
+
+Built-in tools (shell, file_read, file_write, schedule) are indexed alongside
+registered tools so the semantic search considers them for relevance scoring.
 """
 
 import json
@@ -19,20 +22,33 @@ from tool_registry import Tool, ToolRegistry
 logger = logging.getLogger(__name__)
 
 
+def _builtin_as_tool(name: str, description: str) -> Tool:
+    """Wrap a built-in tool description as a Tool object for uniform handling."""
+    return Tool(name=name, path="", language="builtin", description=description)
+
+
 class ToolIndex:
     """
-    Maintains an embedding-based index over registered tools.
+    Maintains an embedding-based index over all tools: registered (file-based)
+    and built-in (shell, file_read, file_write, schedule).
 
     Workflow:
         1. On startup, load persisted vectors from disk.
-        2. Embed any tools not yet in the index.
-        3. For each query, embed the query and rank tools by cosine similarity.
+        2. Embed any tools not yet in the index (or whose description changed).
+        3. For each query, embed the query and rank ALL tools by cosine similarity.
     """
 
-    def __init__(self, registry: ToolRegistry, llm: LLMClient, index_path: str):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        llm: LLMClient,
+        index_path: str,
+        builtin_executor=None,   # Optional[BuiltinExecutor] — avoids circular import
+    ):
         self.registry = registry
         self.llm = llm
         self.index_path = index_path
+        self.builtin_executor = builtin_executor
         # { tool_name: {"description": str, "vector": list[float]} }
         self._index: dict[str, dict] = {}
         self._load()
@@ -43,29 +59,23 @@ class ToolIndex:
 
     def build(self) -> None:
         """
-        Ensure all currently registered tools have embeddings.
+        Ensure all currently registered and built-in tools have embeddings.
         Skips tools already in the index (no description change detected).
         Persists updated index to disk.
         """
         changed = False
-        for tool in self.registry.all():
-            existing = self._index.get(tool.name)
-            # Re-embed if missing or description changed
-            if existing is None or existing.get("description") != tool.description:
-                logger.info("Embedding tool: %s", tool.name)
-                try:
-                    vector = self.llm.embed(tool.description)
-                    self._index[tool.name] = {
-                        "description": tool.description,
-                        "vector": vector,
-                    }
-                    changed = True
-                except Exception as exc:
-                    logger.error("Failed to embed tool '%s': %s", tool.name, exc)
 
-        # Remove stale entries for tools no longer registered
-        registered_names = {t.name for t in self.registry.all()}
-        stale = [n for n in self._index if n not in registered_names]
+        # Registered (file-based) tools
+        for tool in self.registry.all():
+            changed |= self._embed_if_needed(tool.name, tool.description)
+
+        # Built-in tools
+        for bt in self._builtin_tools():
+            changed |= self._embed_if_needed(bt.name, bt.description)
+
+        # Remove stale entries for tools no longer present
+        valid_names = {t.name for t in self.registry.all()} | {bt.name for bt in self._builtin_tools()}
+        stale = [n for n in self._index if n not in valid_names]
         for name in stale:
             del self._index[name]
             changed = True
@@ -75,14 +85,16 @@ class ToolIndex:
 
     def rebuild(self) -> dict:
         """
-        Force re-embed ALL registered tools, ignoring any cached vectors.
+        Force re-embed ALL tools (registered + built-in), ignoring cached vectors.
         Refreshes the registry first, then re-indexes everything from scratch.
         Returns a summary dict: {total, embedded, failed, removed}.
         """
         self._index.clear()
         embedded = 0
         failed = 0
-        for tool in self.registry.all():
+
+        all_tools = list(self.registry.all()) + self._builtin_tools()
+        for tool in all_tools:
             try:
                 vector = self.llm.embed(tool.description)
                 self._index[tool.name] = {
@@ -94,11 +106,10 @@ class ToolIndex:
                 logger.error("rebuild: failed to embed '%s': %s", tool.name, exc)
                 failed += 1
 
-        removed = len([n for n in list(self._index) if self.registry.get(n) is None])
         self._save()
         total = embedded + failed
         logger.info("Tool index rebuilt: %d embedded, %d failed", embedded, failed)
-        return {"total": total, "embedded": embedded, "failed": failed, "removed": removed}
+        return {"total": total, "embedded": embedded, "failed": failed, "removed": 0}
 
     def add_tool(self, tool: Tool) -> None:
         """Embed and index a single newly created tool."""
@@ -116,7 +127,7 @@ class ToolIndex:
     def search(self, query: str, top_k: int = 3) -> list[Tool]:
         """
         Return the top-k most semantically relevant tools for a query.
-        Returns fewer results if fewer tools are indexed.
+        Results may include both registered and built-in tools.
         """
         if not self._index:
             logger.warning("Tool index is empty — returning all registered tools")
@@ -128,10 +139,14 @@ class ToolIndex:
             logger.error("Failed to embed query: %s — falling back to all tools", exc)
             return self.registry.all()[:top_k]
 
+        # Build a name→Tool lookup that covers both registered and built-in tools
+        tool_lookup: dict[str, Tool] = {t.name: t for t in self.registry.all()}
+        for bt in self._builtin_tools():
+            tool_lookup[bt.name] = bt
+
         scores: list[tuple[float, str]] = []
         for name, entry in self._index.items():
-            tool = self.registry.get(name)
-            if tool is None:
+            if name not in tool_lookup:
                 continue
             sim = self.llm.cosine_similarity(query_vec, entry["vector"])
             scores.append((sim, name))
@@ -139,7 +154,7 @@ class ToolIndex:
         scores.sort(reverse=True)
         results: list[Tool] = []
         for _, name in scores[:top_k]:
-            t = self.registry.get(name)
+            t = tool_lookup.get(name)
             if t:
                 results.append(t)
 
@@ -153,6 +168,29 @@ class ToolIndex:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _builtin_tools(self) -> list[Tool]:
+        """Return built-in tools as Tool objects if a builtin_executor is wired in."""
+        if self.builtin_executor is None:
+            return []
+        return [
+            _builtin_as_tool(bt.name, bt.description)
+            for bt in self.builtin_executor.all_tools()
+        ]
+
+    def _embed_if_needed(self, name: str, description: str) -> bool:
+        """Embed a tool if missing or description changed. Returns True if index was updated."""
+        existing = self._index.get(name)
+        if existing is not None and existing.get("description") == description:
+            return False
+        logger.info("Embedding tool: %s", name)
+        try:
+            vector = self.llm.embed(description)
+            self._index[name] = {"description": description, "vector": vector}
+            return True
+        except Exception as exc:
+            logger.error("Failed to embed tool '%s': %s", name, exc)
+            return False
 
     def _load(self) -> None:
         if os.path.exists(self.index_path):

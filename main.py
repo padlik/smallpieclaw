@@ -91,10 +91,10 @@ def main():
     llm      = LLMClient(cfg)
     memory   = MemoryStore(memory_path)
     registry = ToolRegistry(tools_dirs=[tools_dir, gen_tools_dir])
-    index    = ToolIndex(registry=registry, llm=llm, index_path=index_path)
+    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output)
+    index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
     creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)
-    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output)
 
     short_term  = ShortTermMemory(max_turns=20)
     working     = WorkingMemory()
