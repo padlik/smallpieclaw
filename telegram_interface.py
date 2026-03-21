@@ -108,6 +108,7 @@ class TelegramInterface:
             BotCommand("start", "Introduction and usage examples"),
             BotCommand("help", "Help and command reference"),
             BotCommand("status", "Agent status, uptime, and token usage"),
+            BotCommand("health", "Run self-health diagnosis and rotate logs"),
             BotCommand("tools", "List available tools"),
             BotCommand("models", "List and switch LLM models"),
             BotCommand("jobs", "List scheduled jobs"),
@@ -132,6 +133,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("start", self._cmd_start))
         app.add_handler(CommandHandler("help", self._cmd_help))
         app.add_handler(CommandHandler("status", self._cmd_status))
+        app.add_handler(CommandHandler("health", self._cmd_health))
         app.add_handler(CommandHandler("reset", self._cmd_reset))
         app.add_handler(CommandHandler("jobs", self._cmd_jobs))
         app.add_handler(CommandHandler("tools", self._cmd_tools))
@@ -143,6 +145,8 @@ class TelegramInterface:
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(self._cb_model_switch, pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(self._cb_confirm, pattern=r"^confirm_(yes|no):"))
+        app.add_handler(CallbackQueryHandler(self._cb_extend, pattern=r"^extend_(yes|no):"))
+        app.add_handler(CallbackQueryHandler(self._cb_tool_create, pattern=r"^tool_create_"))
         # Catch-all text messages
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
 
@@ -379,17 +383,38 @@ class TelegramInterface:
         uid = update.effective_user.id
         await update.message.reply_text(f"Your Telegram user ID: <code>{uid}</code>", parse_mode=ParseMode.HTML)
 
+    async def _cmd_health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        health_task = (
+            "Perform a self-health diagnosis: "
+            "(1) Read the last 500 lines of agent.log using file_read. "
+            "(2) Analyze for errors, warnings, repeated failures, and anomalies. "
+            "(3) Identify root causes and provide actionable suggestions for each issue. "
+            "(4) After analysis, rotate the log file by running the shell command: "
+            "mv agent.log agent.log.$(date +%Y%m%d_%H%M%S) "
+            "(5) Report findings as a structured summary. "
+            "Long-term memory will be updated automatically via the finish action."
+        )
+        await self._run_agent_task(update, ctx, health_task)
+
     async def _on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
         text = (update.message.text or "").strip()
         if not text:
             return
-
         if not self._is_authorized(user.id):
             await self._send_unauthorized(update)
             return
-
         logger.info("Message from user %d: %s", user.id, text[:80])
+        await self._run_agent_task(update, ctx, text)
+
+    async def _run_agent_task(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str
+    ) -> None:
+        """Run the agent with a given task, showing streaming progress."""
+        user = update.effective_user
         status_msg = await update.message.reply_text("🔄 Processing…")
         loop = asyncio.get_running_loop()
         chat_id = update.effective_chat.id
@@ -406,11 +431,26 @@ class TelegramInterface:
         typing_task = asyncio.create_task(_typing_loop())
 
         def progress(msg: str):
-            # Check for confirmation request marker from agent
             if msg.startswith("__CONFIRM__:"):
                 _, token, description = msg.split(":", 2)
                 asyncio.run_coroutine_threadsafe(
                     self._send_confirmation_prompt(update.message, token, description),
+                    loop,
+                )
+                return
+            if msg.startswith("__EXTEND__:"):
+                parts = msg.split(":", 2)
+                token = parts[1]
+                current_steps = parts[2] if len(parts) > 2 else "?"
+                asyncio.run_coroutine_threadsafe(
+                    self._send_extend_prompt(update.message, token, current_steps),
+                    loop,
+                )
+                return
+            if msg.startswith("__TOOL_CREATE__:"):
+                token = msg.split(":", 1)[1]
+                asyncio.run_coroutine_threadsafe(
+                    self._send_tool_create_prompt(update.message, token),
                     loop,
                 )
                 return
@@ -422,7 +462,7 @@ class TelegramInterface:
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda: self.agent_handler(user.id, text, progress),
+                lambda: self.agent_handler(user.id, task_text, progress),
             )
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
@@ -476,6 +516,106 @@ class TelegramInterface:
             )
         except Exception as exc:
             logger.debug("Could not edit confirmation message: %s", exc)
+
+    async def _send_extend_prompt(self, message, token: str, current_steps: str) -> None:
+        """Send inline buttons asking whether to extend the agent step limit."""
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏩ Extend 10 more steps", callback_data=f"extend_yes:{token}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"extend_no:{token}"),
+        ]])
+        await message.reply_text(
+            f"⏱ <b>Max steps reached</b> ({current_steps} steps)\n\n"
+            "The agent hasn't finished yet. Extend by 10 more steps?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+    async def _cb_extend(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Extend / Cancel button presses for max-steps extension."""
+        query = update.callback_query
+        confirmed = query.data.startswith("extend_yes:")
+        token = query.data.split(":", 1)[1]
+
+        if self.agent:
+            self.agent.resume_extend(token, confirmed)
+        else:
+            logger.warning("_cb_extend: agent is None")
+
+        try:
+            await query.answer()
+        except Exception as exc:
+            logger.warning("query.answer() failed: %s", exc)
+
+        result_text = "⏩ Extending…" if confirmed else "❌ Cancelled."
+        try:
+            await query.edit_message_text(
+                f"⏱ <b>Max steps</b>\n\n{result_text}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.debug("Could not edit extend message: %s", exc)
+
+    async def _send_tool_create_prompt(self, message, token: str) -> None:
+        """Show tool code to operator with 3-way choice: Create / Run Once / Cancel."""
+        if not self.agent:
+            return
+        data = self.agent.get_pending_tool_create(token)
+        if not data:
+            return
+        name = html.escape(data.get("name", "?"))
+        lang = html.escape(data.get("language", "?"))
+        desc = html.escape(data.get("description", ""))
+        code = html.escape(data.get("code", ""))
+        # Truncate code display to avoid Telegram message size limit
+        code_display = code[:2000] + ("\n…(truncated)" if len(code) > 2000 else "")
+        text = (
+            f"🛠️ <b>Tool creation request</b>\n\n"
+            f"<b>Name:</b> <code>{name}</code>\n"
+            f"<b>Language:</b> {lang}\n"
+            f"<b>Description:</b> {desc}\n\n"
+            f"<b>Code:</b>\n<pre><code>{code_display}</code></pre>"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Create Tool", callback_data=f"tool_create_yes:{token}"),
+            InlineKeyboardButton("⚡ Run Once",   callback_data=f"tool_create_run:{token}"),
+            InlineKeyboardButton("❌ Cancel",      callback_data=f"tool_create_no:{token}"),
+        ]])
+        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    async def _cb_tool_create(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Create Tool / Run Once / Cancel button presses."""
+        query = update.callback_query
+        data = query.data
+        if data.startswith("tool_create_yes:"):
+            action = "create"
+            token = data.split(":", 1)[1]
+            label = "✅ Creating tool…"
+        elif data.startswith("tool_create_run:"):
+            action = "run"
+            token = data.split(":", 1)[1]
+            label = "⚡ Running as one-off script…"
+        else:
+            action = "cancel"
+            token = data.split(":", 1)[1]
+            label = "❌ Cancelled."
+
+        if self.agent:
+            self.agent.resume_tool_create(token, action)
+        else:
+            logger.warning("_cb_tool_create: agent is None")
+
+        try:
+            await query.answer()
+        except Exception as exc:
+            logger.warning("query.answer() failed: %s", exc)
+
+        try:
+            await query.edit_message_text(
+                f"🛠️ <b>Tool creation</b>\n\n{label}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.debug("Could not edit tool_create message: %s", exc)
 
     async def _cmd_models(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):

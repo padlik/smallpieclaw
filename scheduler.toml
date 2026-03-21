@@ -29,3 +29,10 @@ schedule = "daily"
 time = "03:00"
 task = "Summarize the key events, system findings, and actions taken today into a concise paragraph for long-term memory."
 notify = false
+
+[jobs.agent_health]
+enabled = true
+schedule = "interval"
+hours = 4
+task = "Perform a self-health diagnosis: (1) Read the last 500 lines of agent.log using file_read. (2) Analyze for errors, warnings, repeated failures, and anomalies. (3) Identify root causes and provide actionable suggestions. (4) Rotate the log file by running: mv agent.log agent.log.$(date +%Y%m%d_%H%M%S). (5) Report findings as a structured summary."
+notify = true

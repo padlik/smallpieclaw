@@ -26,6 +26,10 @@ logging.basicConfig(
         logging.FileHandler("agent.log", encoding="utf-8"),
     ],
 )
+# Suppress high-volume INFO noise from HTTP/Telegram internals
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
