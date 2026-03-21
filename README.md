@@ -10,16 +10,20 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 
 - **ReAct agent loop** — reasons step-by-step, executes tools, and loops until done
 - **Semantic tool search** — finds the right tool using embedding-based cosine similarity
-- **Self-building tools** — the LLM can create new `.sh`/`.py` tools when a capability is missing; creation is reported to the user immediately
-- **Built-in tools** — `shell`, `file_read`, `file_write` always available; dangerous ops require inline-button confirmation
+- **Self-building tools** — the LLM can propose new `.py`/`.sh` tools; operator reviews code and chooses **Create**, **Run Once**, or **Cancel** via inline buttons
+- **Built-in tools** — `shell`, `file_read`, `file_write`, `schedule` always available; dangerous ops require inline-button confirmation
 - **Secure Telegram bot** — allowlist or pairing-token access control
 - **4-tier memory architecture** — short-term conversation history, working task context, long-term vector knowledge index, and results history
-- **Configurable scheduler** — jobs defined in `scheduler.toml`; manage jobs from chat or via `/jobs`
+- **Configurable scheduler** — jobs defined in `scheduler.toml` (auto-updated at runtime); manage jobs from chat or via `/jobs`; supports recurring (daily/interval) and one-time reminders
+- **Self-health diagnosis** — `/health` command and automatic 4-hour periodic job: reads log file, analyzes errors, suggests fixes, rotates logs
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
+- **Typing indicator** — Telegram shows "typing…" while the agent is reasoning
+- **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps or cancel
 - **Multi-model LLM** — define multiple models with hint keywords; agent auto-selects; switch via `/models`
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude
 - **Context compaction** — auto-summarises older messages when the token budget is near the configured limit
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
+- **Quiet logs** — httpx and Telegram internals suppressed to WARNING; log file stays readable
 
 ---
 
@@ -46,7 +50,7 @@ data/
     memory.json              # Persistent agent key-value memory
     longterm_memory.json     # Long-term vector knowledge index
     results_memory.json      # Past task summaries and results
-    scheduler_state.json     # Current scheduler job state (read by manage_scheduler tool)
+    scheduler_state.json     # Current scheduler job state snapshot
 ```
 
 ---
@@ -174,7 +178,13 @@ task = "Summarize the key events and findings from today into long-term memory."
 notify = false
 ```
 
-You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `manage_scheduler` tool), or use `/jobs` to see all active jobs.
+You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `schedule` built-in tool), or use `/jobs` to see all active jobs.
+
+Scheduler features:
+- **Recurring jobs**: `daily` (at a fixed time) or `interval` (every N hours/minutes)
+- **One-time reminders**: `once` type with `run_at = "HH:MM"` — auto-removed after execution
+- **Persistence**: all jobs (including user-added reminders) are written back to `scheduler.toml` — survives crashes and restarts
+- **Error tracking**: job failures are reported in the Telegram chat and shown in `/jobs`
 
 ### 7. Run
 
@@ -227,13 +237,14 @@ allowed_user_ids = [123456789]
 
 ## Built-in Tools
 
-Three tools are always available to the agent regardless of the `tools/` directory:
+Four tools are always available to the agent regardless of the `tools/` directory:
 
 | Tool | Description | Dangerous? |
 |------|-------------|-----------|
 | `shell` | Execute a shell command | Yes — if command matches destructive patterns (`rm -rf`, `dd`, `mkfs`, etc.) |
 | `file_read` | Read a file from the filesystem | Yes — if path is sensitive (`/etc/passwd`, `.env`, `*.key`, etc.) |
 | `file_write` | Write content to a file | Always — requires confirmation |
+| `schedule` | Manage scheduled jobs and reminders | No |
 
 When a dangerous operation is requested, the bot sends an inline confirmation prompt:
 
@@ -249,8 +260,18 @@ The agent always prefers built-in tools over creating new scripts for shell, fil
 
 ## Writing Custom Tools
 
-Create a `.sh` or `.py` file in the `tools/` directory.
-The file **must** include a `description:` comment in the first 10 lines:
+Create a `.py` or `.sh` file in the `tools/` directory.
+The file **must** include a `description:` comment in the first 10 lines.
+
+**Tool creation policy:** Tools must follow the **UNIX paradigm** — one tool, one task.
+A tool should be reusable across many scenarios, not a single-use script. For one-off
+tasks, the agent uses the `shell` built-in directly.
+
+When the LLM proposes creating a tool, the operator receives the full source code and
+can choose:
+- **✅ Create Tool** — save to `tools_generated/` for permanent reuse
+- **⚡ Run Once** — execute the code immediately as a one-off script (not saved)
+- **❌ Cancel** — reject the proposal; agent tries a different approach
 
 ```bash
 #!/bin/bash
@@ -281,6 +302,10 @@ Restart the agent (or wait for the next query) to pick up new tools.
 | Default model | _(first `[[models]]` entry)_ | `agent.default_model` |
 | Max context tokens | 90 000 | `agent.ctx_max_tokens` |
 
+When the agent reaches `max_iterations`, inline buttons appear in the chat:
+**⏩ Extend 10 more steps** or **❌ Cancel** (2-minute timeout). This prevents
+silent failures while still giving the operator control over runaway tasks.
+
 Context compaction fires automatically at 85% of `ctx_max_tokens`. Older messages are summarised by the LLM and replaced with a compact bullet-point summary before the next request.
 
 ---
@@ -305,9 +330,10 @@ Embeddings can use a different provider/key than the main LLM. If `embeddings.ap
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
 | `/status` | Uptime, LLM model, embeddings status, and today's token usage |
+| `/health` | Run self-health diagnosis, analyze logs, rotate log file |
 | `/tools` | List all built-in and generated tools |
 | `/models` | List available LLM models and switch the active one |
-| `/jobs` | List all scheduled jobs with last-run times |
+| `/jobs` | List all scheduled jobs with last-run times and task descriptions |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
 | `/reindex` | Force re-embed all tools in the semantic index |
