@@ -400,6 +400,8 @@ class TelegramInterface:
         await self._run_agent_task(update, ctx, health_task)
 
     async def _on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message:
+            return
         user = update.effective_user
         text = (update.message.text or "").strip()
         if not text:
