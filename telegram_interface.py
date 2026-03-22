@@ -633,6 +633,9 @@ class TelegramInterface:
                 )
         except Exception:
             pass
+
+    async def _cmd_models(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """List configured LLM models and allow switching."""
         if not self._is_authorized(update.effective_user.id):
             await self._send_unauthorized(update)
             return
