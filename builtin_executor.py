@@ -105,6 +105,14 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
         name="file_write",
         description="Write content to a file on the filesystem. Args: path (str), content (str), mode (str: 'w' or 'a', default 'w').",
     ),
+    "file_send": BuiltinTool(
+        name="file_send",
+        description=(
+            "Send a local file or photo from the server to the Telegram chat. "
+            "Args: path (str, required — absolute or relative path to the file), "
+            "caption (str, optional — text shown below the file/photo)."
+        ),
+    ),
     "schedule": BuiltinTool(
         name="schedule",
         description=(
@@ -168,6 +176,8 @@ class BuiltinExecutor:
             return self._exec_file_read(args)
         elif tool_name == "file_write":
             return self._exec_file_write(args)
+        elif tool_name == "file_send":
+            return self._exec_file_send(args)
         elif tool_name == "schedule":
             return self._exec_schedule(args)
         else:
@@ -319,6 +329,36 @@ class BuiltinExecutor:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
         except Exception as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+    # ---- file_send ----
+
+    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+    _MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (Telegram bot API limit)
+
+    def _exec_file_send(self, args: dict) -> dict:
+        path = os.path.expanduser(str(args.get("path", "")).strip())
+        caption = str(args.get("caption", "")).strip()
+        if not path:
+            return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
+        if not os.path.exists(path):
+            return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
+        if not os.path.isfile(path):
+            return {"success": False, "output": "", "error": f"Not a file: {path}", "exit_code": 1}
+        size = os.path.getsize(path)
+        if size > self._MAX_FILE_SIZE:
+            return {
+                "success": False, "output": "",
+                "error": f"File too large ({size // 1024 // 1024} MB). Max 50 MB.", "exit_code": 1,
+            }
+        logger.info("Built-in file_send: %s (%d bytes)", path, size)
+        return {
+            "success": True,
+            "output": f"Sending {os.path.basename(path)} to chat…",
+            "error": "",
+            "exit_code": 0,
+            "send_file": path,
+            "caption": caption,
+        }
 
     # ---- schedule ----
 

@@ -7,6 +7,7 @@ Telegram bot interface with two security modes:
 """
 
 import asyncio
+import base64
 import html
 import logging
 import re
@@ -458,6 +459,19 @@ class TelegramInterface:
                     loop,
                 )
                 return
+            if msg.startswith("__FILE__:"):
+                _, path_b64, caption_b64 = msg.split(":", 2)
+                try:
+                    file_path = base64.b64decode(path_b64).decode()
+                    caption = base64.b64decode(caption_b64).decode()
+                except Exception:
+                    file_path, caption = "", ""
+                if file_path:
+                    asyncio.run_coroutine_threadsafe(
+                        self._send_file_to_chat(update.message, file_path, caption),
+                        loop,
+                    )
+                return
             asyncio.run_coroutine_threadsafe(
                 self._safe_edit(status_msg, msg),
                 loop,
@@ -476,6 +490,29 @@ class TelegramInterface:
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
+
+    async def _send_file_to_chat(self, message, file_path: str, caption: str) -> None:
+        """Send a local file or photo to the chat (called from the progress callback)."""
+        import os
+        _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+        ext = os.path.splitext(file_path)[1].lower()
+        try:
+            with open(file_path, "rb") as f:
+                if ext in _IMAGE_EXTS:
+                    await message.reply_photo(photo=f, caption=caption or None)
+                else:
+                    await message.reply_document(document=f, caption=caption or None)
+        except FileNotFoundError:
+            await message.reply_text(
+                f"❌ File not found: <code>{html.escape(file_path)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.error("Failed to send file %s: %s", file_path, exc)
+            await message.reply_text(
+                f"❌ Could not send file: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
 
     async def _send_confirmation_prompt(self, message, token: str, description: str) -> None:
         """Send an inline-button confirmation prompt for a dangerous operation."""

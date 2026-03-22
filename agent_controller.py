@@ -11,6 +11,7 @@ Workflow for each user request:
   5. Feed result back to LLM and repeat (max N iterations)
 """
 
+import base64
 import json
 import logging
 import re
@@ -316,6 +317,13 @@ class AgentController:
 
                     if self.working:
                         self.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
+
+                    # If the tool produced a file to send, trigger async upload via progress prefix
+                    if outcome.get("send_file"):
+                        path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
+                        caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
+                        _progress(f"__FILE__:{path_b64}:{caption_b64}")
+
                     tool_result = self._format_tool_result(tool_name, outcome)
                     logger.info("Tool '%s' result: success=%s", tool_name, outcome["success"])
                     _progress(self._fmt_tool_result_progress(tool_name, args, outcome))
