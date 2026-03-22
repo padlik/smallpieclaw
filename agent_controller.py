@@ -69,13 +69,19 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
 AVAILABLE TOOLS:
 {tools}
 
-RESPONSE FORMAT — you must ALWAYS respond with a single valid JSON object.
-No markdown, no prose, just JSON.
+RESPONSE FORMAT — CRITICAL:
+- You MUST respond with ONLY a single valid JSON object. Nothing else.
+- No markdown, no prose, no explanation, no ```json fences. Just the raw JSON object.
+- Invalid responses waste a step and delay the user.
 
 Possible actions:
 
 1. Execute a tool (built-in or registered):
    {{"action": "tool", "tool": "<tool_name>", "args": {{}}}}
+
+   CORRECT:   {{"action": "tool", "tool": "shell", "args": {{"command": "df -h"}}}}
+   WRONG:     {{"action": "shell", "command": "df -h"}}
+   WRONG:     {{"action": "tool", "tool": "shell", "args": ["df -h"]}}
 
 2. Propose creating a new tool (requires operator approval — see rules):
    {{"action": "create_tool", "name": "<snake_case_name>", "language": "python", "code": "<code>", "description": "<one line>"}}
@@ -227,12 +233,24 @@ class AgentController:
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({
                         "role": "user",
-                        "content": 'Please respond with a valid JSON object only (no markdown, no prose).'
+                        "content": (
+                            'ERROR: Your response was not valid JSON. '
+                            'You MUST respond with ONLY a raw JSON object — no markdown, '
+                            'no prose, no ```json fences. Example: '
+                            '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
+                        )
                     })
                     continue
 
                 messages.append({"role": "assistant", "content": raw})
                 action = action_obj.get("action", "")
+
+                # Normalize shorthand: {"action": "shell"} → {"action": "tool", "tool": "shell"}
+                _BUILTIN_NAMES = {"shell", "file_read", "file_write", "schedule"}
+                if action in _BUILTIN_NAMES:
+                    logger.warning("LLM used shorthand action '%s' — normalizing to tool call", action)
+                    action_obj = {"action": "tool", "tool": action, "args": {k: v for k, v in action_obj.items() if k != "action"}}
+                    action = "tool"
 
                 # ---- Dispatch ----
 

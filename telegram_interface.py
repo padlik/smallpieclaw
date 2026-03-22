@@ -149,6 +149,8 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(self._cb_tool_create, pattern=r"^tool_create_"))
         # Catch-all text messages
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
+        # Global error handler — catches unhandled exceptions in any handler
+        app.add_error_handler(self._error_handler)
 
     async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -619,7 +621,18 @@ class TelegramInterface:
         except Exception as exc:
             logger.debug("Could not edit tool_create message: %s", exc)
 
-    async def _cmd_models(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _error_handler(self, update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Global PTB error handler — logs with full context and notifies users."""
+        logger.error("Unhandled exception in update handler", exc_info=ctx.error)
+        # Try to notify the user who triggered the error
+        try:
+            if isinstance(update, Update) and update.effective_message:
+                await update.effective_message.reply_text(
+                    "❌ An unexpected error occurred. Please try again or use /reset.",
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception:
+            pass
         if not self._is_authorized(update.effective_user.id):
             await self._send_unauthorized(update)
             return
