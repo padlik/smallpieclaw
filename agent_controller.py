@@ -229,7 +229,10 @@ class AgentController:
                 # Parse JSON
                 action_obj = self._parse_json(raw)
                 if action_obj is None:
-                    logger.warning("LLM returned non-JSON: %s", raw[:200])
+                    logger.warning(
+                        "LLM returned non-JSON (step %d/%d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
+                        step, max_steps, len(raw), raw[:1000],
+                    )
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({
                         "role": "user",
