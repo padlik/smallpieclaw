@@ -747,7 +747,7 @@ class TelegramInterface:
             bot = self._app.bot
             for uid in list(self.allowed_ids):
                 try:
-                    for chunk in self._split_message(_md_to_html(text)):
+                    for chunk in self._split_message(text):
                         await bot.send_message(chat_id=uid, text=chunk, parse_mode=ParseMode.HTML)
                 except Exception as exc:
                     logger.warning("Could not send message to %d: %s", uid, exc)

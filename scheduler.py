@@ -12,6 +12,7 @@ Commands written to data/scheduler_commands.json by manage_scheduler.py
 are picked up on each poll cycle.
 """
 
+import html as _html
 import json
 import logging
 import os
@@ -264,7 +265,7 @@ class Scheduler:
                 self._save_state()
                 self._save_scheduler_toml()
             if meta.get("notify", True):
-                self.notify(f"🔔 <b>Reminder:</b> {friendly}")
+                self.notify(f"🔔 <b>Reminder:</b> {_html.escape(friendly)}")
             return
 
         result = ""
@@ -294,7 +295,7 @@ class Scheduler:
 
         if error_occurred:
             if meta.get("notify", True):
-                self.notify(f"⚠️ <b>Scheduled job failed:</b> <code>{tag}</code>\n\n{result}")
+                self.notify(f"⚠️ <b>Scheduled job failed:</b> <code>{_html.escape(tag)}</code>\n\n{_html.escape(result)}")
             return
 
         if tag == "longterm_memory_update" and self.long_term_memory:
@@ -313,7 +314,7 @@ class Scheduler:
             self._save_scheduler_toml()
 
         if meta.get("notify", True):
-            self.notify(f"📅 <b>Scheduled: {tag}</b>\n\n{result}")
+            self.notify(f"📅 <b>Scheduled: {_html.escape(tag)}</b>\n\n{_html.escape(result)}")
 
     def _process_pending_commands(self) -> None:
         if not os.path.exists(self._commands_file):
