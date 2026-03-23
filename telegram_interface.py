@@ -257,9 +257,25 @@ class TelegramInterface:
             await update.message.reply_text("Scheduler not available.")
             return
 
+        # /jobs reload — hot-reload scheduler.toml from disk
+        args = ctx.args or []
+        if args and args[0].lower() == "reload":
+            result = self.scheduler.reload()
+            await update.message.reply_text(
+                f"🔄 Scheduler reloaded.\n"
+                f"  ✅ Active jobs: <b>{result['reloaded']}</b>\n"
+                f"  ❌ Failed: <b>{result['failed']}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         jobs = self.scheduler.list_jobs()
         if not jobs:
-            await update.message.reply_text("No scheduled jobs configured.")
+            await update.message.reply_text(
+                "No scheduled jobs configured.\n"
+                "<i>Tip: use /jobs reload to reload scheduler.toml</i>",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         lines = [f"📅 <b>Scheduled Jobs</b> ({len(jobs)} total)\n"]
@@ -277,6 +293,7 @@ class TelegramInterface:
                 lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
             lines.append(f"   {task_label}: {task_display}\n")
 
+        lines.append("<i>Tip: /jobs reload to reload scheduler.toml</i>")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

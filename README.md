@@ -181,9 +181,13 @@ notify = false
 You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `schedule` built-in tool), or use `/jobs` to see all active jobs.
 
 Scheduler features:
+- **`scheduler.toml` is the single source of truth** — all jobs (including user-added reminders) live in this file; no hardcoded defaults exist in code
 - **Recurring jobs**: `daily` (at a fixed time) or `interval` (every N hours/minutes)
 - **One-time reminders**: `once` type with `run_at = "HH:MM"` — auto-removed after execution
-- **Persistence**: all jobs (including user-added reminders) are written back to `scheduler.toml` — survives crashes and restarts
+- **Persistence**: every change writes back to `scheduler.toml` — survives crashes and restarts
+- **Automatic backups**: before each write, the previous `scheduler.toml` is copied to `scheduler.toml.bak.YYYYMMDD_HHMMSS`; the last 5 backups are kept
+- **Hot-reload**: adding a job via the built-in tool immediately reloads `scheduler.toml` into the live scheduler — no restart needed
+- **Manual reload**: `/jobs reload` re-reads `scheduler.toml` from disk at any time
 - **Error tracking**: job failures are reported in the Telegram chat and shown in `/jobs`
 
 ### 7. Run
@@ -237,13 +241,14 @@ allowed_user_ids = [123456789]
 
 ## Built-in Tools
 
-Four tools are always available to the agent regardless of the `tools/` directory:
+Five tools are always available to the agent regardless of the `tools/` directory:
 
 | Tool | Description | Dangerous? |
 |------|-------------|-----------|
 | `shell` | Execute a shell command | Yes — if command matches destructive patterns (`rm -rf`, `dd`, `mkfs`, etc.) |
 | `file_read` | Read a file from the filesystem | Yes — if path is sensitive (`/etc/passwd`, `.env`, `*.key`, etc.) |
 | `file_write` | Write content to a file | Always — requires confirmation |
+| `file_send` | Send a local file or photo to the Telegram chat | No |
 | `schedule` | Manage scheduled jobs and reminders | No |
 
 When a dangerous operation is requested, the bot sends an inline confirmation prompt:
@@ -255,6 +260,19 @@ When a dangerous operation is requested, the bot sends an inline confirmation pr
 The agent loop blocks until the user confirms or cancels (5-minute timeout).
 
 The agent always prefers built-in tools over creating new scripts for shell, file read, and file write operations.
+
+### `file_send` tool
+
+Sends any local file or photo from the server to the Telegram chat:
+
+```
+file_send(path="/home/pi/documents/photo.png", caption="Here you go")
+```
+
+- Images (`.jpg`, `.png`, `.gif`, `.webp`, `.bmp`) are sent as photos
+- All other files are sent as documents
+- Files larger than 50 MB are rejected with a clear error
+- `~` home paths are expanded automatically
 
 ---
 
@@ -321,6 +339,15 @@ Context compaction fires automatically at 85% of `ctx_max_tokens`. Older message
 
 Embeddings can use a different provider/key than the main LLM. If `embeddings.api_key` is empty, the agent falls back to the active model's `api_key` automatically.
 
+### LLM Resilience
+
+The client handles transient failures transparently:
+
+- **Timeout/connection retries** — exponential backoff (`retry_delay` doubles each attempt); live retry status shown in Telegram (`⏳ LLM request failed (timeout), retry 1/3…`)
+- **Empty responses** — if the provider returns an empty string (network glitch), it is retried at the HTTP level before the agent sees it
+- **Non-JSON prose** — if the LLM returns prose instead of a JSON action, the agent retries in-place up to 2 times without consuming a step or polluting the message history
+- **Multiple JSON objects** — a brace-counting parser extracts the correct `{"action":…}` object even when the model wraps it in explanatory text or emits multiple objects
+
 ---
 
 ## Telegram Commands
@@ -333,7 +360,7 @@ Embeddings can use a different provider/key than the main LLM. If `embeddings.ap
 | `/health` | Run self-health diagnosis, analyze logs, rotate log file |
 | `/tools` | List all built-in and generated tools |
 | `/models` | List available LLM models and switch the active one |
-| `/jobs` | List all scheduled jobs with last-run times and task descriptions |
+| `/jobs` | List all scheduled jobs; `/jobs reload` to reload scheduler.toml from disk |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
 | `/reindex` | Force re-embed all tools in the semantic index |
@@ -371,9 +398,11 @@ When you send `/reset`, the working memory is summarised by the LLM and persiste
 
 ```
 python-telegram-bot==20.7
-httpx==0.26.0
+httpx~=0.25.2
 tomli==2.0.1
 schedule==1.2.1
 ```
 
 Python 3.9+ required. Python 3.11+ uses the built-in `tomllib` (no `tomli` needed).
+
+> **Note for Python 3.10 (Raspberry Pi default):** `tomllib` is only stdlib in 3.11+. The `tomli` package in `requirements.txt` provides it. Run `pip install -r requirements.txt` to ensure it is installed.

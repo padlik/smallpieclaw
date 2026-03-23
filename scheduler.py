@@ -16,6 +16,7 @@ import html as _html
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -138,10 +139,10 @@ class Scheduler:
             "created_at": datetime.utcnow().isoformat(),
         }
         self._jobs_meta[tag] = meta
-        if self.enabled and self._thread and self._thread.is_alive():
-            self._register_job(tag, meta)
         self._save_state()
         self._save_scheduler_toml()
+        if self.enabled and self._thread and self._thread.is_alive():
+            self.reload()
         logger.info("Job added: %s (%s)", tag, self._describe_schedule(meta))
         return {"success": True}
 
@@ -400,6 +401,46 @@ class Scheduler:
         except Exception as exc:
             logger.warning("Could not migrate dynamic jobs: %s", exc)
 
+    _MAX_BACKUPS = 5
+
+    def _prune_backups(self) -> None:
+        """Keep only the last _MAX_BACKUPS backup files for scheduler.toml."""
+        base = self._scheduler_config_path + ".bak."
+        dir_ = os.path.dirname(os.path.abspath(self._scheduler_config_path))
+        fname = os.path.basename(self._scheduler_config_path)
+        prefix = fname + ".bak."
+        try:
+            baks = sorted(
+                f for f in os.listdir(dir_) if f.startswith(prefix)
+            )
+            for old in baks[: max(0, len(baks) - self._MAX_BACKUPS)]:
+                os.remove(os.path.join(dir_, old))
+        except Exception as exc:
+            logger.debug("Could not prune scheduler backups: %s", exc)
+
+    def reload(self) -> dict:
+        """
+        Hot-reload scheduler.toml: clear all registered jobs, re-read the file,
+        and re-register all enabled jobs. Safe to call while the scheduler is running.
+        Returns {"reloaded": N, "failed": N}.
+        """
+        logger.info("Reloading scheduler.toml…")
+        schedule.clear()
+        self._jobs_meta = {}
+        self._load_config_jobs(self._scheduler_config_path)
+        reloaded = 0
+        failed = 0
+        for tag, meta in self._jobs_meta.items():
+            if meta.get("enabled", True):
+                try:
+                    self._register_job(tag, meta)
+                    reloaded += 1
+                except Exception as exc:
+                    logger.warning("Failed to register job '%s' on reload: %s", tag, exc)
+                    failed += 1
+        logger.info("Scheduler reloaded: %d active, %d failed", reloaded, failed)
+        return {"reloaded": reloaded, "failed": failed}
+
     def _save_scheduler_toml(self) -> None:
         """Persist all current jobs to scheduler.toml (auto-managed file)."""
         def _toml_str(v: str) -> str:
@@ -436,13 +477,19 @@ class Scheduler:
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 f.writelines(lines)
+            # Backup existing file before overwriting
+            if os.path.exists(self._scheduler_config_path):
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                bak = self._scheduler_config_path + f".bak.{ts}"
+                shutil.copy2(self._scheduler_config_path, bak)
+                self._prune_backups()
             os.replace(tmp, self._scheduler_config_path)
             logger.debug("Saved %d jobs to %s", len(self._jobs_meta), self._scheduler_config_path)
         except Exception as exc:
             logger.warning("Could not save scheduler.toml: %s", exc)
 
-    def _load_config_jobs(self, config_path: str, sched_cfg: dict) -> None:
-        """Load all jobs from scheduler.toml, falling back to hardcoded defaults."""
+    def _load_config_jobs(self, config_path: str, sched_cfg: dict = None) -> None:
+        """Load all jobs from scheduler.toml. scheduler.toml is the single source of truth."""
         if os.path.exists(config_path):
             try:
                 with open(config_path, "rb") as f:
@@ -467,42 +514,13 @@ class Scheduler:
                 logger.info("Loaded %d jobs from %s", len(self._jobs_meta), config_path)
                 return
             except Exception as exc:
-                logger.warning("Could not load %s: %s — using hardcoded defaults", config_path, exc)
-
-        # Hardcoded defaults (used only when scheduler.toml is missing)
-        health_time = sched_cfg.get("nightly_health_check", "02:00")
-        disk_hours = sched_cfg.get("disk_check_interval_hours", 6)
-        self._jobs_meta = {
-            "nightly_health": {
-                "tag": "nightly_health",
-                "task": "Run a full system health check and summarize the status.",
-                "schedule_type": "daily",
-                "time": health_time,
-                "run_at": None,
-                "hours": None,
-                "minutes": None,
-                "notify": True,
-                "enabled": True,
-                "source": "config",
-                "last_run": None,
-                "created_at": datetime.utcnow().isoformat(),
-            },
-            "disk_check": {
-                "tag": "disk_check",
-                "task": "Check disk usage on all mount points. Alert if any mount point is above 80% full.",
-                "schedule_type": "interval",
-                "time": None,
-                "run_at": None,
-                "hours": disk_hours,
-                "minutes": None,
-                "notify": True,
-                "enabled": True,
-                "source": "config",
-                "last_run": None,
-                "created_at": datetime.utcnow().isoformat(),
-            },
-        }
-        logger.info("Using hardcoded default scheduler jobs.")
+                logger.warning("Could not load %s: %s — starting with no jobs", config_path, exc)
+        else:
+            logger.warning(
+                "scheduler.toml not found at %s — no jobs loaded. "
+                "Create the file to configure scheduled jobs.",
+                config_path,
+            )
 
     def _run_loop(self) -> None:
         """Poll the schedule every 30 seconds until stopped."""
