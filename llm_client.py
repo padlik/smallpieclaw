@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
+class LLMEmptyResponseError(RuntimeError):
+    """Raised when the LLM provider returns an empty or whitespace-only response."""
+
+
 def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None):
     """
     Call fn(), retrying on transient httpx errors and retryable HTTP status codes.
@@ -54,6 +58,11 @@ def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None):
             logger.warning("Request timed out (attempt %d/%d): %s", attempt, max_retries, exc)
             if on_retry:
                 on_retry(attempt, max_retries, f"timeout: {exc}")
+        except LLMEmptyResponseError as exc:
+            last_exc = exc
+            logger.warning("Empty LLM response (attempt %d/%d)", attempt, max_retries)
+            if on_retry:
+                on_retry(attempt, max_retries, "empty response")
         except httpx.RemoteProtocolError as exc:
             last_exc = exc
             logger.warning("Remote protocol error (attempt %d/%d): %s", attempt, max_retries, exc)
@@ -325,7 +334,10 @@ class LLMClient:
         data = resp.json()
         usage = data.get("usage", {})
         self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-        return data["choices"][0]["message"]["content"]
+        text = data["choices"][0]["message"]["content"] or ""
+        if not text.strip():
+            raise LLMEmptyResponseError("OpenAI returned empty content")
+        return text
 
     def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         # Convert to Gemini format
@@ -359,7 +371,10 @@ class LLMClient:
         data = resp.json()
         meta = data.get("usageMetadata", {})
         self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        text = data["candidates"][0]["content"]["parts"][0]["text"] or ""
+        if not text.strip():
+            raise LLMEmptyResponseError("Google returned empty content")
+        return text
 
     def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         payload: dict[str, Any] = {
@@ -389,7 +404,10 @@ class LLMClient:
         data = resp.json()
         usage = data.get("usage", {})
         self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
-        return data["content"][0]["text"]
+        text = data["content"][0]["text"] or ""
+        if not text.strip():
+            raise LLMEmptyResponseError("Anthropic returned empty content")
+        return text
 
     # ------------------------------------------------------------------
     # Embeddings

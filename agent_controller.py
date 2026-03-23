@@ -221,13 +221,24 @@ class AgentController:
                 # Context compaction check
                 messages = self._maybe_compact(messages, system)
 
-                # LLM call
-                try:
-                    raw = self.llm.chat(messages, system=system, progress_cb=_progress)
-                except Exception as exc:
-                    err = f"❌ LLM error: {type(exc).__name__}: {exc}"
-                    _progress(err)
-                    return err
+                # LLM call — with in-place retry on empty response (network glitch)
+                _MAX_EMPTY_RETRIES = 2
+                raw = ""
+                for _attempt in range(1 + _MAX_EMPTY_RETRIES):
+                    try:
+                        raw = self.llm.chat(messages, system=system, progress_cb=_progress)
+                    except Exception as exc:
+                        err = f"❌ LLM error: {type(exc).__name__}: {exc}"
+                        _progress(err)
+                        return err
+                    if raw.strip():
+                        break
+                    if _attempt < _MAX_EMPTY_RETRIES:
+                        logger.warning(
+                            "LLM returned empty response (step %d/%d), retrying in-place (%d/%d)…",
+                            step, max_steps, _attempt + 1, _MAX_EMPTY_RETRIES,
+                        )
+                        _progress(f"⏳ Empty LLM response, retrying ({_attempt + 1}/{_MAX_EMPTY_RETRIES})…")
 
                 # Parse JSON
                 action_obj = self._parse_json(raw)
@@ -604,24 +615,82 @@ class AgentController:
             return "\n".join(parts)
 
     @staticmethod
+    @staticmethod
+    def _extract_json_candidates(text: str) -> list[str]:
+        """
+        Brace-counting extractor: returns all balanced {…} substrings found in text.
+        Handles multiple JSON objects in a single response and prose-wrapped objects.
+        """
+        candidates = []
+        depth = 0
+        start = -1
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(text):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start != -1:
+                    candidates.append(text[start:i + 1])
+                    start = -1
+        return candidates
+
+    @staticmethod
     def _parse_json(text: str) -> Optional[dict]:
-        """Extract and parse the first JSON object found in the text."""
+        """Extract and parse the first valid JSON action object found in the text."""
         text = text.strip()
+        if not text:
+            return None
+
+        # 1. Try the whole text as-is
         try:
-            return json.loads(text)
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
             pass
-        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+
+        # 2. Strip markdown code fences then try again
+        fence_match = re.search(r"```(?:json)?\s*(\{.*?})\s*```", text, re.DOTALL)
         if fence_match:
             try:
-                return json.loads(fence_match.group(1))
+                obj = json.loads(fence_match.group(1))
+                if isinstance(obj, dict):
+                    return obj
             except json.JSONDecodeError:
                 pass
-        brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if brace_match:
+
+        # 3. Brace-counting extractor — handles multiple objects and prose wrappers.
+        #    Prefer the first candidate that has an "action" key; fall back to first parseable dict.
+        candidates = AgentController._extract_json_candidates(text)
+        first_valid: Optional[dict] = None
+        for candidate in candidates:
             try:
-                return json.loads(brace_match.group(0))
+                obj = json.loads(candidate)
+                if not isinstance(obj, dict):
+                    continue
+                if first_valid is None:
+                    first_valid = obj
+                if "action" in obj:
+                    return obj
             except json.JSONDecodeError:
-                pass
+                continue
+        if first_valid is not None:
+            return first_valid
+
         return None
 
