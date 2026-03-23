@@ -38,11 +38,12 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
-def _with_retry(fn, max_retries: int, base_delay: float):
+def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None):
     """
     Call fn(), retrying on transient httpx errors and retryable HTTP status codes.
     Uses exponential backoff: base_delay, base_delay*2, base_delay*4, …
     Non-retryable exceptions (e.g. 400 Bad Request) propagate immediately.
+    on_retry(attempt, max_retries, exc_str) is called before each retry delay.
     """
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(1, max_retries + 1):
@@ -51,12 +52,18 @@ def _with_retry(fn, max_retries: int, base_delay: float):
         except httpx.TimeoutException as exc:
             last_exc = exc
             logger.warning("Request timed out (attempt %d/%d): %s", attempt, max_retries, exc)
+            if on_retry:
+                on_retry(attempt, max_retries, f"timeout: {exc}")
         except httpx.RemoteProtocolError as exc:
             last_exc = exc
             logger.warning("Remote protocol error (attempt %d/%d): %s", attempt, max_retries, exc)
+            if on_retry:
+                on_retry(attempt, max_retries, f"protocol error: {exc}")
         except httpx.ConnectError as exc:
             last_exc = exc
             logger.warning("Connection error (attempt %d/%d): %s", attempt, max_retries, exc)
+            if on_retry:
+                on_retry(attempt, max_retries, f"connection error: {exc}")
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in _RETRYABLE_STATUS:
                 last_exc = exc
@@ -64,6 +71,8 @@ def _with_retry(fn, max_retries: int, base_delay: float):
                     "HTTP %d (attempt %d/%d): %s",
                     exc.response.status_code, attempt, max_retries, exc,
                 )
+                if on_retry:
+                    on_retry(attempt, max_retries, f"HTTP {exc.response.status_code}")
             else:
                 # Log full response body to aid debugging (e.g. "invalid parameter" messages)
                 logger.error(
@@ -252,23 +261,23 @@ class LLMClient:
     # Chat
     # ------------------------------------------------------------------
 
-    def chat(self, messages: list[dict], system: str | None = None) -> str:
+    def chat(self, messages: list[dict], system: str | None = None, progress_cb=None) -> str:
         """Send a chat request and return the assistant text."""
         provider = self.llm_cfg["provider"]
         try:
             if provider in ("openai", "openrouter"):
-                return self._openai_chat(messages, system)
+                return self._openai_chat(messages, system, progress_cb=progress_cb)
             elif provider == "google":
-                return self._google_chat(messages, system)
+                return self._google_chat(messages, system, progress_cb=progress_cb)
             elif provider == "anthropic":
-                return self._anthropic_chat(messages, system)
+                return self._anthropic_chat(messages, system, progress_cb=progress_cb)
             else:
                 raise ValueError(f"Unknown LLM provider: {provider}")
         except Exception as exc:
             logger.error("LLM chat error: %s", exc)
             raise
 
-    def _openai_chat(self, messages: list[dict], system: str | None) -> str:
+    def _openai_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         model = self.llm_cfg["model"]
         reasoning = _is_reasoning_model(model)
 
@@ -298,6 +307,9 @@ class LLMClient:
         else:
             payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
 
+        def _on_retry(attempt, max_retries, reason):
+            if progress_cb:
+                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
         resp = _with_retry(
             lambda: self._http.post(
                 f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions",
@@ -307,7 +319,7 @@ class LLMClient:
                 },
                 json=payload,
             ),
-            self._max_retries, self._retry_delay,
+            self._max_retries, self._retry_delay, on_retry=_on_retry,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -315,7 +327,7 @@ class LLMClient:
         self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
         return data["choices"][0]["message"]["content"]
 
-    def _google_chat(self, messages: list[dict], system: str | None) -> str:
+    def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         # Convert to Gemini format
         contents = []
         if system:
@@ -327,6 +339,9 @@ class LLMClient:
 
         api_key = self.llm_cfg["api_key"]
         model = self.llm_cfg["model"]
+        def _on_retry(attempt, max_retries, reason):
+            if progress_cb:
+                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
         resp = _with_retry(
             lambda: self._http.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
@@ -338,7 +353,7 @@ class LLMClient:
                     },
                 },
             ),
-            self._max_retries, self._retry_delay,
+            self._max_retries, self._retry_delay, on_retry=_on_retry,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -346,7 +361,7 @@ class LLMClient:
         self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
-    def _anthropic_chat(self, messages: list[dict], system: str | None) -> str:
+    def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         payload: dict[str, Any] = {
             "model": self.llm_cfg["model"],
             "max_tokens": self.llm_cfg.get("max_tokens", 1024),
@@ -355,6 +370,9 @@ class LLMClient:
         if system:
             payload["system"] = system
 
+        def _on_retry(attempt, max_retries, reason):
+            if progress_cb:
+                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
         resp = _with_retry(
             lambda: self._http.post(
                 "https://api.anthropic.com/v1/messages",
@@ -365,7 +383,7 @@ class LLMClient:
                 },
                 json=payload,
             ),
-            self._max_retries, self._retry_delay,
+            self._max_retries, self._retry_delay, on_retry=_on_retry,
         )
         resp.raise_for_status()
         data = resp.json()

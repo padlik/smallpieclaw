@@ -223,9 +223,11 @@ class AgentController:
 
                 # LLM call
                 try:
-                    raw = self.llm.chat(messages, system=system)
+                    raw = self.llm.chat(messages, system=system, progress_cb=_progress)
                 except Exception as exc:
-                    return f"❌ LLM error: {exc}"
+                    err = f"❌ LLM error: {type(exc).__name__}: {exc}"
+                    _progress(err)
+                    return err
 
                 # Parse JSON
                 action_obj = self._parse_json(raw)
