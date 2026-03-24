@@ -70,6 +70,7 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
 AVAILABLE TOOLS:
 {tools}
 
+{skills_section}
 RESPONSE FORMAT — CRITICAL:
 - You MUST respond with ONLY a single valid JSON object. Nothing else.
 - No markdown, no prose, no explanation, no ```json fences. Just the raw JSON object.
@@ -92,6 +93,7 @@ Possible actions:
 
 Rules:
 - Always try shell / file_read / file_write before proposing a new tool.
+- If the user says "use skill <name>" or the task clearly matches a listed skill, read its SKILL.md first using file_read, then follow the instructions inside.
 - Use the shell tool for one-off or task-specific scripts — do NOT create a tool for single-use tasks.
 - Propose a new tool ONLY when it would be genuinely reusable across many different scenarios.
 - Tools must follow the UNIX paradigm: one tool, one task. Keep tools compact and composable.
@@ -134,6 +136,7 @@ class AgentController:
         long_term=None,        # Optional[LongTermMemory]
         results=None,          # Optional[ResultsMemory]
         builtin_executor=None, # Optional[BuiltinExecutor]
+        skill_registry=None,   # Optional[SkillRegistry]
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -148,6 +151,7 @@ class AgentController:
         self.long_term = long_term
         self.results = results
         self.builtin_executor = builtin_executor
+        self.skill_registry = skill_registry
 
         # Confirmation state: token -> threading.Event and result holder
         self._confirm_events: dict[str, threading.Event] = {}
@@ -197,12 +201,14 @@ class AgentController:
         memory_text = self.memory.as_prompt_text()
         short_term_text = self.short_term.as_prompt_text() if self.short_term else "No recent conversation."
         past_results_text = self.results.as_prompt_text(user_goal, top_k=2) if self.results else "No past results."
+        skills_section = self._format_skills()
 
         system = _SYSTEM_PROMPT.format(
             memory=memory_text,
             short_term=short_term_text,
             past_results=past_results_text,
             tools=tools_text,
+            skills_section=skills_section,
         )
         messages: list[dict] = [{"role": "user", "content": user_goal}]
 
@@ -560,6 +566,20 @@ class AgentController:
         lines = [f"  {t.name}: {t.description}" for t in tools]
         return "\n".join(lines)
 
+    def _format_skills(self) -> str:
+        """Return the AVAILABLE SKILLS prompt section, or empty string if no skills."""
+        if not self.skill_registry:
+            return ""
+        skills = self.skill_registry.all()
+        if not skills:
+            return ""
+        lines = ["AVAILABLE SKILLS (read SKILL.md via file_read to activate a skill):"]
+        for s in skills:
+            lines.append(f"  {s.name} [{s.skill_md_path}]")
+            lines.append(f"    {s.description}")
+        lines.append("")
+        return "\n".join(lines)
+
     @staticmethod
     def _fmt_tool_call(tool_name: str, args: dict) -> str:
         """Format a tool call as a compact, readable string for progress display."""
@@ -614,7 +634,6 @@ class AgentController:
                 parts.append(f"stdout: {outcome['output']}")
             return "\n".join(parts)
 
-    @staticmethod
     @staticmethod
     def _extract_json_candidates(text: str) -> list[str]:
         """

@@ -23,6 +23,7 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude
 - **Context compaction** — auto-summarises older messages when the token budget is near the configured limit
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
+- **Agent Skills** — autonomous skill system (per [agentskills.io](https://agentskills.io/specification)) with progressive disclosure; skills listed via `/skills`
 - **Quiet logs** — httpx and Telegram internals suppressed to WARNING; log file stays readable
 
 ---
@@ -43,8 +44,12 @@ tool_creator.py          # LLM-generated tools with safety validation
 scheduler.py             # Background task scheduler
 memory_store.py          # Short-term, working, long-term, and results memory
 builtin_executor.py      # Always-available built-in tools (shell, file_read, file_write)
+skill_registry.py        # Agent Skills discovery and registry
 tools/                   # Built-in tools (.sh and .py)
 tools_generated/         # Tools created by the LLM at runtime
+skills/                  # Agent Skills (each skill is a subdirectory with SKILL.md)
+    system-health/
+        SKILL.md         # Example skill
 data/
     tool_index.json          # Persisted embedding vectors for tools
     memory.json              # Persistent agent key-value memory
@@ -359,6 +364,7 @@ The client handles transient failures transparently:
 | `/status` | Uptime, LLM model, embeddings status, and today's token usage |
 | `/health` | Run self-health diagnosis, analyze logs, rotate log file |
 | `/tools` | List all built-in and generated tools |
+| `/skills` | List all available agent skills |
 | `/models` | List available LLM models and switch the active one |
 | `/jobs` | List all scheduled jobs; `/jobs reload` to reload scheduler.toml from disk |
 | `/reset` | Save current task context to results memory and start fresh |
@@ -391,6 +397,73 @@ The agent uses a four-tier memory system:
 | **Results** | `data/results_memory.json` (vector index) | Past task summaries saved on `/reset` or task completion |
 
 When you send `/reset`, the working memory is summarised by the LLM and persisted to results memory before being cleared. Use `/reset discard` to skip saving.
+
+---
+
+## Agent Skills
+
+The agent supports **Agent Skills** — reusable task guides following the [agentskills.io specification](https://agentskills.io/specification).
+
+### What is a Skill?
+
+A skill is a directory inside `skills/` containing a `SKILL.md` file with YAML frontmatter and Markdown instructions. Skills are *not* tools — they are instructions that guide the agent on how to approach a specific type of task.
+
+```
+skills/
+    system-health/
+        SKILL.md          ← Required: YAML frontmatter + Markdown instructions
+        scripts/          ← Optional: helper scripts
+        references/       ← Optional: reference documents
+        assets/           ← Optional: templates, data files
+```
+
+### SKILL.md format
+
+```markdown
+---
+name: system-health
+description: Comprehensive system health diagnostics for Linux/Raspberry Pi.
+license: MIT
+compatibility: Linux
+---
+
+# Skill instructions (Markdown)
+...
+```
+
+Required fields: `name` (must match directory name, lowercase + hyphens), `description`.
+
+### How it works
+
+1. **Startup** — all skill names and descriptions are injected into the agent's system prompt
+2. **Activation** — when a task matches a skill, the agent reads the full `SKILL.md` via `file_read`
+3. **Execution** — the agent follows the skill's instructions, using available tools
+
+To explicitly trigger a skill: *"use skill system-health"*
+
+### Adding a skill
+
+Create a directory with a valid `SKILL.md`:
+
+```bash
+mkdir skills/my-skill
+cat > skills/my-skill/SKILL.md << 'EOF'
+---
+name: my-skill
+description: What this skill does and when to use it.
+---
+
+# My Skill
+
+Instructions for the agent...
+EOF
+```
+
+The skill will be available on next agent startup (or after `/reset`).
+
+### Managing skills
+
+- `/skills` — list all available skills with name, description, and file path
 
 ---
 

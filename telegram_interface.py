@@ -44,6 +44,7 @@ class TelegramInterface:
         tool_registry=None,
         llm_client=None,
         tool_index=None,
+        skill_registry=None,
     ):
         tg_cfg = config["telegram"]
         self._config = config
@@ -58,6 +59,7 @@ class TelegramInterface:
         self.tool_registry = tool_registry
         self.llm_client = llm_client
         self._tool_index = tool_index
+        self.skill_registry = skill_registry
         self._start_time = time.time()
 
         # Pairing state: {token: user_id}
@@ -111,6 +113,7 @@ class TelegramInterface:
             BotCommand("status", "Agent status, uptime, and token usage"),
             BotCommand("health", "Run self-health diagnosis and rotate logs"),
             BotCommand("tools", "List available tools"),
+            BotCommand("skills", "List available agent skills"),
             BotCommand("models", "List and switch LLM models"),
             BotCommand("jobs", "List scheduled jobs"),
             BotCommand("reset", "Save and clear current task context"),
@@ -138,6 +141,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("reset", self._cmd_reset))
         app.add_handler(CommandHandler("jobs", self._cmd_jobs))
         app.add_handler(CommandHandler("tools", self._cmd_tools))
+        app.add_handler(CommandHandler("skills", self._cmd_skills))
         app.add_handler(CommandHandler("models", self._cmd_models))
         app.add_handler(CommandHandler("reindex", self._cmd_reindex))
         app.add_handler(CommandHandler("pair", self._cmd_pair))
@@ -208,6 +212,9 @@ class TelegramInterface:
         emb_model = emb_cfg.get("model", "N/A")
         emb_key_status = "own key" if emb_cfg.get("api_key") else "using active model key (fallback)"
 
+        tools_count = len(self.tool_registry.all()) if self.tool_registry else 0
+        skills_count = self.skill_registry.count() if self.skill_registry else 0
+
         token_line = ""
         if self.llm_client:
             usage = self.llm_client.get_today_usage()
@@ -224,7 +231,8 @@ class TelegramInterface:
             f"🤖 LLM: <code>{html.escape(llm_model)}</code>\n"
             f"🔍 Embeddings: <code>{html.escape(emb_model)}</code> ({html.escape(emb_key_status)})\n"
             f"🔐 Security: <code>{html.escape(self.security_mode)}</code>\n"
-            f"👥 Authorized users: {len(self.allowed_ids)}"
+            f"👥 Authorized users: {len(self.allowed_ids)}\n"
+            f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
             f"{token_line}",
             parse_mode=ParseMode.HTML,
         )
@@ -322,6 +330,25 @@ class TelegramInterface:
             for t in generated:
                 lines.append(f"  • <code>{html.escape(t.name)}</code> — {html.escape(t.description)}")
 
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    async def _cmd_skills(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if not self.skill_registry:
+            await update.message.reply_text("Skills not available.")
+            return
+
+        skills = self.skill_registry.all()
+        if not skills:
+            await update.message.reply_text("📚 No skills found. Add skill directories under the <code>skills/</code> folder.", parse_mode=ParseMode.HTML)
+            return
+
+        lines = [f"📚 <b>Available Skills</b> ({len(skills)} total)\n"]
+        for s in skills:
+            lines.append(f"  • <b>{html.escape(s.name)}</b> — {html.escape(s.description)}")
+            lines.append(f"    <code>{html.escape(s.skill_md_path)}</code>")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_reindex(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

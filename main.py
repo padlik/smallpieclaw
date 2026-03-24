@@ -45,6 +45,7 @@ from builtin_executor import BuiltinExecutor
 from llm_client import LLMClient
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory
 from scheduler import Scheduler
+from skill_registry import SkillRegistry
 from telegram_interface import TelegramInterface
 from tool_creator import ToolCreator
 from tool_executor import ToolExecutor
@@ -74,10 +75,12 @@ def main():
     longterm_path = paths.get("longterm_memory_file", "data/longterm_memory.json")
     results_path  = paths.get("results_memory_file", "data/results_memory.json")
     scheduler_config_path = paths.get("scheduler_config", "scheduler.toml")
+    skills_dir    = paths.get("skills_dir", "skills")
 
     os.makedirs(tools_dir, exist_ok=True)
     os.makedirs(gen_tools_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(skills_dir, exist_ok=True)
 
     agent_cfg  = cfg.get("agent", {})
     max_iter   = agent_cfg.get("max_iterations", 8)
@@ -101,6 +104,9 @@ def main():
     long_term   = LongTermMemory(path=longterm_path, llm=llm)
     results_mem = ResultsMemory(path=results_path, llm=llm)
 
+    skills = SkillRegistry(skills_dir=skills_dir)
+    logger.info("Loaded %d skill(s) from %s", skills.count(), skills_dir)
+
     agent = AgentController(
         llm=llm,
         tool_index=index,
@@ -115,6 +121,7 @@ def main():
         long_term=long_term,
         results=results_mem,
         builtin_executor=builtin,
+        skill_registry=skills,
     )
 
     logger.info("Building semantic tool index...")
@@ -153,6 +160,7 @@ def main():
         tool_registry=registry,
         llm_client=llm,
         tool_index=index,
+        skill_registry=skills,
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
     _tg_holder[0] = tg
