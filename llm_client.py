@@ -319,25 +319,26 @@ class LLMClient:
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-        resp = _with_retry(
-            lambda: self._http.post(
+
+        def _do_request():
+            r = self._http.post(
                 f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {self.llm_cfg['api_key']}",
                     "Content-Type": "application/json",
                 },
                 json=payload,
-            ),
-            self._max_retries, self._retry_delay, on_retry=_on_retry,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        usage = data.get("usage", {})
-        self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-        text = data["choices"][0]["message"]["content"] or ""
-        if not text.strip():
-            raise LLMEmptyResponseError("OpenAI returned empty content")
-        return text
+            )
+            r.raise_for_status()
+            d = r.json()
+            usage = d.get("usage", {})
+            self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+            text = (d["choices"][0]["message"]["content"] or "").strip()
+            if not text:
+                raise LLMEmptyResponseError("OpenAI returned empty content")
+            return text
+
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
 
     def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         # Convert to Gemini format
@@ -354,8 +355,9 @@ class LLMClient:
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-        resp = _with_retry(
-            lambda: self._http.post(
+
+        def _do_request():
+            r = self._http.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
                 json={
                     "contents": contents,
@@ -364,17 +366,17 @@ class LLMClient:
                         "temperature": self.llm_cfg.get("temperature", 0.2),
                     },
                 },
-            ),
-            self._max_retries, self._retry_delay, on_retry=_on_retry,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        meta = data.get("usageMetadata", {})
-        self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
-        text = data["candidates"][0]["content"]["parts"][0]["text"] or ""
-        if not text.strip():
-            raise LLMEmptyResponseError("Google returned empty content")
-        return text
+            )
+            r.raise_for_status()
+            d = r.json()
+            meta = d.get("usageMetadata", {})
+            self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
+            text = (d["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
+            if not text:
+                raise LLMEmptyResponseError("Google returned empty content")
+            return text
+
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
 
     def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         payload: dict[str, Any] = {
@@ -388,8 +390,9 @@ class LLMClient:
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-        resp = _with_retry(
-            lambda: self._http.post(
+
+        def _do_request():
+            r = self._http.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
                     "x-api-key": self.llm_cfg["api_key"],
@@ -397,17 +400,17 @@ class LLMClient:
                     "Content-Type": "application/json",
                 },
                 json=payload,
-            ),
-            self._max_retries, self._retry_delay, on_retry=_on_retry,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        usage = data.get("usage", {})
-        self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
-        text = data["content"][0]["text"] or ""
-        if not text.strip():
-            raise LLMEmptyResponseError("Anthropic returned empty content")
-        return text
+            )
+            r.raise_for_status()
+            d = r.json()
+            usage = d.get("usage", {})
+            self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+            text = (d["content"][0]["text"] or "").strip()
+            if not text:
+                raise LLMEmptyResponseError("Anthropic returned empty content")
+            return text
+
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
 
     # ------------------------------------------------------------------
     # Embeddings
