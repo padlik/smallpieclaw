@@ -259,12 +259,11 @@ class Scheduler:
             friendly = tag.replace("_", " ")
             meta["last_run"] = now
             self._save_state()
-            self._save_scheduler_toml()
             if is_once:
                 schedule.clear(tag)
                 self._jobs_meta.pop(tag, None)
                 self._save_state()
-                self._save_scheduler_toml()
+                self._save_scheduler_toml()  # structural change: job removed
             if meta.get("notify", True):
                 self.notify(f"🔔 <b>Reminder:</b> {_html.escape(friendly)}")
             return
@@ -291,8 +290,8 @@ class Scheduler:
         else:
             meta.pop("last_error", None)
 
+        # Save runtime state only — last_run/last_error are not written to scheduler.toml
         self._save_state()
-        self._save_scheduler_toml()
 
         if error_occurred:
             if meta.get("notify", True):
@@ -312,7 +311,7 @@ class Scheduler:
             schedule.clear(tag)
             self._jobs_meta.pop(tag, None)
             self._save_state()
-            self._save_scheduler_toml()
+            self._save_scheduler_toml()  # structural change: job removed
 
         if meta.get("notify", True):
             self.notify(f"📅 <b>Scheduled: {_html.escape(tag)}</b>\n\n{_html.escape(result)}")
