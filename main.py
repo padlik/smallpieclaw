@@ -76,11 +76,17 @@ def main():
     results_path  = paths.get("results_memory_file", "data/results_memory.json")
     scheduler_config_path = paths.get("scheduler_config", "scheduler.toml")
     skills_dir    = paths.get("skills_dir", "skills")
+    downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
+    _agent_name   = os.path.basename(os.path.abspath("."))
+    tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
 
     os.makedirs(tools_dir, exist_ok=True)
     os.makedirs(gen_tools_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(skills_dir, exist_ok=True)
+    os.makedirs(downloads_dir, exist_ok=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+    logger.info("Downloads dir: %s | Tmp dir: %s", downloads_dir, tmp_dir)
 
     agent_cfg  = cfg.get("agent", {})
     max_iter   = agent_cfg.get("max_iterations", 8)
@@ -122,6 +128,8 @@ def main():
         results=results_mem,
         builtin_executor=builtin,
         skill_registry=skills,
+        tmp_dir=tmp_dir,
+        downloads_dir=downloads_dir,
     )
 
     logger.info("Building semantic tool index...")

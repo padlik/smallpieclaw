@@ -71,6 +71,9 @@ AVAILABLE TOOLS:
 {tools}
 
 {skills_section}
+FILE STORAGE:
+{file_storage}
+
 RESPONSE FORMAT — CRITICAL:
 - You MUST respond with ONLY a single valid JSON object. Nothing else.
 - No markdown, no prose, no explanation, no ```json fences. Just the raw JSON object.
@@ -137,6 +140,8 @@ class AgentController:
         results=None,          # Optional[ResultsMemory]
         builtin_executor=None, # Optional[BuiltinExecutor]
         skill_registry=None,   # Optional[SkillRegistry]
+        tmp_dir: str = "/tmp/agent",
+        downloads_dir: str = "downloads",
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -152,6 +157,8 @@ class AgentController:
         self.results = results
         self.builtin_executor = builtin_executor
         self.skill_registry = skill_registry
+        self.tmp_dir = tmp_dir
+        self.downloads_dir = downloads_dir
 
         # Confirmation state: token -> threading.Event and result holder
         self._confirm_events: dict[str, threading.Event] = {}
@@ -202,6 +209,15 @@ class AgentController:
         short_term_text = self.short_term.as_prompt_text() if self.short_term else "No recent conversation."
         past_results_text = self.results.as_prompt_text(user_goal, top_k=2) if self.results else "No past results."
         skills_section = self._format_skills()
+        file_storage = (
+            f"- Temporary files (downloads, intermediate outputs, anything only needed for this task):\n"
+            f"    {self.tmp_dir}  ← cleaned by OS on reboot\n"
+            f"- Permanent downloads (files the user wants to keep):\n"
+            f"    {self.downloads_dir}\n"
+            f"- Use tmp for QR codes, generated images, fetched configs, etc.\n"
+            f"- Use downloads for files the operator explicitly wants to keep.\n"
+            f"- Never write files to the agent script directory."
+        )
 
         system = _SYSTEM_PROMPT.format(
             memory=memory_text,
@@ -209,6 +225,7 @@ class AgentController:
             past_results=past_results_text,
             tools=tools_text,
             skills_section=skills_section,
+            file_storage=file_storage,
         )
         messages: list[dict] = [{"role": "user", "content": user_goal}]
 

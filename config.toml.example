@@ -88,3 +88,6 @@ data_dir           = "data"
 tool_index_file    = "data/tool_index.json"
 memory_file        = "data/memory.json"
 skills_dir         = "skills"
+downloads_dir      = "downloads"
+# tmp_dir defaults to /tmp/<working_dir_name> if not set
+# tmp_dir = "/tmp/agent"
