@@ -335,7 +335,7 @@ class LLMClient:
             self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
             text = (d["choices"][0]["message"]["content"] or "").strip()
             if not text:
-                raise LLMEmptyResponseError("OpenAI returned empty content")
+                raise LLMEmptyResponseError(f"OpenAI returned empty content (model: {self.llm_cfg['model']})")
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
@@ -373,7 +373,7 @@ class LLMClient:
             self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
             text = (d["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
             if not text:
-                raise LLMEmptyResponseError("Google returned empty content")
+                raise LLMEmptyResponseError(f"Google returned empty content (model: {model})")
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
@@ -407,7 +407,7 @@ class LLMClient:
             self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
             text = (d["content"][0]["text"] or "").strip()
             if not text:
-                raise LLMEmptyResponseError("Anthropic returned empty content")
+                raise LLMEmptyResponseError(f"Anthropic returned empty content (model: {self.llm_cfg['model']})")
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
