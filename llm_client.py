@@ -339,7 +339,22 @@ class LLMClient:
             d = r.json()
             usage = d.get("usage", {})
             self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-            text = (d["choices"][0]["message"]["content"] or "").strip()
+            msg = d["choices"][0]["message"]
+            text = (msg.get("content") or "").strip()
+
+            # Some reasoning/thinking models (DeepSeek-R1, Kimi K2.5, QwQ, etc.)
+            # leave "content" empty and put the actual response in "reasoning" or
+            # "reasoning_content". Fall back to those fields transparently.
+            if not text:
+                for fallback_key in ("reasoning", "reasoning_content"):
+                    fallback = (msg.get(fallback_key) or "").strip()
+                    if fallback:
+                        logger.warning(
+                            "Model '%s': content field is empty, using '%s' field as fallback",
+                            model, fallback_key,
+                        )
+                        return fallback
+
             if not text:
                 if self._diagnose_empty:
                     curl_cmd = [
