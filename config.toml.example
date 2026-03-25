@@ -74,6 +74,9 @@ default_model  = "gpt-4o-mini"
 # Maximum estimated context tokens per LLM request (4 chars ≈ 1 token).
 # When 85% is reached the agent auto-summarises older messages before the next call.
 ctx_max_tokens = 90000
+# Enable verbose diagnostics when the LLM returns empty content (default: false).
+# Logs full HTTP response, checks stream/non-stream mismatch, finish_reason, and runs a curl probe.
+diagnose_empty_responses = false
 
 [scheduler]
 enabled = true

@@ -18,9 +18,11 @@ Retry behaviour:
     retry_delay     = 2     # base delay in seconds; doubles each attempt (default: 2)
 """
 
+import json
 import logging
 import math
 import re
+import subprocess
 import time
 from datetime import date
 from typing import Any, Optional
@@ -190,6 +192,11 @@ class LLMClient:
             timeout=httpx.Timeout(timeout_secs, connect=10.0)
         )
 
+        # Diagnostic mode for empty responses
+        self._diagnose_empty: bool = bool(
+            config.get("agent", {}).get("diagnose_empty_responses", False)
+        )
+
         # Daily token usage tracking
         self._usage_date: date = date.today()
         self._prompt_tokens: int = 0
@@ -320,22 +327,32 @@ class LLMClient:
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
 
+        url = f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.llm_cfg['api_key']}",
+            "Content-Type": "application/json",
+        }
+
         def _do_request():
-            r = self._http.post(
-                f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.llm_cfg['api_key']}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
+            r = self._http.post(url, headers=headers, json=payload)
             r.raise_for_status()
             d = r.json()
             usage = d.get("usage", {})
             self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
             text = (d["choices"][0]["message"]["content"] or "").strip()
             if not text:
-                raise LLMEmptyResponseError(f"OpenAI returned empty content (model: {self.llm_cfg['model']})")
+                if self._diagnose_empty:
+                    curl_cmd = [
+                        "curl", "-s", "-X", "POST", url,
+                        "-H", f"Authorization: Bearer {self.llm_cfg['api_key']}",
+                        "-H", "Content-Type: application/json",
+                        "-d", json.dumps(payload),
+                    ]
+                    report = self._diagnose_empty_response(r, "openai", model, curl_cmd=curl_cmd)
+                    raise LLMEmptyResponseError(
+                        f"OpenAI returned empty content (model: {model})\n{report}"
+                    )
+                raise LLMEmptyResponseError(f"OpenAI returned empty content (model: {model})")
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
@@ -352,65 +369,183 @@ class LLMClient:
 
         api_key = self.llm_cfg["api_key"]
         model = self.llm_cfg["model"]
+        google_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        google_payload = {
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": self.llm_cfg.get("max_tokens", 1024),
+                "temperature": self.llm_cfg.get("temperature", 0.2),
+            },
+        }
+
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
 
         def _do_request():
-            r = self._http.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-                json={
-                    "contents": contents,
-                    "generationConfig": {
-                        "maxOutputTokens": self.llm_cfg.get("max_tokens", 1024),
-                        "temperature": self.llm_cfg.get("temperature", 0.2),
-                    },
-                },
-            )
+            r = self._http.post(google_url, json=google_payload)
             r.raise_for_status()
             d = r.json()
             meta = d.get("usageMetadata", {})
             self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
             text = (d["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
             if not text:
+                if self._diagnose_empty:
+                    curl_cmd = [
+                        "curl", "-s", "-X", "POST", google_url,
+                        "-H", "Content-Type: application/json",
+                        "-d", json.dumps(google_payload),
+                    ]
+                    report = self._diagnose_empty_response(r, "google", model, curl_cmd=curl_cmd)
+                    raise LLMEmptyResponseError(
+                        f"Google returned empty content (model: {model})\n{report}"
+                    )
                 raise LLMEmptyResponseError(f"Google returned empty content (model: {model})")
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
 
     def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
+        model = self.llm_cfg["model"]
         payload: dict[str, Any] = {
-            "model": self.llm_cfg["model"],
+            "model": model,
             "max_tokens": self.llm_cfg.get("max_tokens", 1024),
             "messages": messages,
         }
         if system:
             payload["system"] = system
 
+        anthropic_url = "https://api.anthropic.com/v1/messages"
+        anthropic_headers = {
+            "x-api-key": self.llm_cfg["api_key"],
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
 
         def _do_request():
-            r = self._http.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": self.llm_cfg["api_key"],
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
+            r = self._http.post(anthropic_url, headers=anthropic_headers, json=payload)
             r.raise_for_status()
             d = r.json()
             usage = d.get("usage", {})
             self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
             text = (d["content"][0]["text"] or "").strip()
             if not text:
-                raise LLMEmptyResponseError(f"Anthropic returned empty content (model: {self.llm_cfg['model']})")
+                if self._diagnose_empty:
+                    curl_cmd = [
+                        "curl", "-s", "-X", "POST", anthropic_url,
+                        "-H", f"x-api-key: {self.llm_cfg['api_key']}",
+                        "-H", "anthropic-version: 2023-06-01",
+                        "-H", "Content-Type: application/json",
+                        "-d", json.dumps(payload),
+                    ]
+                    report = self._diagnose_empty_response(r, "anthropic", model, curl_cmd=curl_cmd)
+                    raise LLMEmptyResponseError(
+                        f"Anthropic returned empty content (model: {model})\n{report}"
+                    )
+                raise LLMEmptyResponseError(f"Anthropic returned empty content (model: {model})")
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
+
+    # ------------------------------------------------------------------
+    # Empty-response diagnostics
+    # ------------------------------------------------------------------
+
+    def _diagnose_empty_response(
+        self,
+        raw_response,   # httpx.Response captured before raising
+        provider: str,
+        model: str,
+        curl_cmd: Optional[list] = None,
+    ) -> str:
+        """
+        Run diagnostic checks after an empty LLM response and return a
+        human-readable report string. Also logs at ERROR level.
+        """
+        lines = [
+            "=== Empty LLM Response Diagnostics ===",
+            f"Provider: {provider} | Model: {model}",
+        ]
+
+        # 1. Raw HTTP response
+        status = getattr(raw_response, "status_code", "N/A")
+        lines.append(f"HTTP status: {status}")
+
+        try:
+            hdrs = dict(raw_response.headers)
+            hdr_str = ", ".join(f"{k}={v}" for k, v in list(hdrs.items())[:10])
+            lines.append(f"Headers: {hdr_str}")
+        except Exception:
+            lines.append("Headers: (unavailable)")
+
+        try:
+            raw_body = raw_response.text[:4000]
+        except Exception:
+            raw_body = "(could not read body)"
+        lines.append(f"Raw body (first 4000 chars):\n{raw_body}")
+
+        # 2. Stream/non-stream mismatch check
+        lines.append("--- Checks ---")
+        stripped_body = raw_body.lstrip()
+        if stripped_body.startswith("data:"):
+            lines.append(
+                "[STREAM MISMATCH] ⚠️  Raw body starts with 'data:' — this is SSE/streaming format. "
+                "The client is not configured for streaming but received a streaming response. "
+                "Set stream=false in your API payload or enable streaming in the client."
+            )
+        else:
+            lines.append("[STREAM MISMATCH] OK — body does not look like SSE stream")
+
+        # 3. finish_reason check
+        finish_reason = None
+        try:
+            parsed = json.loads(raw_body)
+            choices = parsed.get("choices") or []
+            if choices:
+                finish_reason = choices[0].get("finish_reason")
+            # Anthropic uses stop_reason
+            if finish_reason is None:
+                finish_reason = parsed.get("stop_reason")
+        except Exception:
+            pass
+
+        if finish_reason is not None:
+            reason_note = {
+                "stop": "normal completion",
+                "length": "⚠️  max_tokens reached — response truncated",
+                "content_filter": "⚠️  content blocked by provider safety filter",
+                "null": "⚠️  still streaming or incomplete response",
+                "end_turn": "normal completion (Anthropic)",
+                "max_tokens": "⚠️  max_tokens reached",
+            }.get(str(finish_reason).lower(), "unknown reason")
+            lines.append(f"[FINISH REASON]   finish_reason = '{finish_reason}' — {reason_note}")
+        else:
+            lines.append("[FINISH REASON]   finish_reason not found in response body")
+
+        # 4. curl fallback attempt
+        if curl_cmd:
+            lines.append("--- curl attempt ---")
+            try:
+                result = subprocess.run(
+                    curl_cmd,
+                    capture_output=True, text=True, timeout=30
+                )
+                curl_out = (result.stdout + result.stderr)[:2000]
+                lines.append(f"curl exit code: {result.returncode}")
+                lines.append(f"curl output:\n{curl_out}")
+            except subprocess.TimeoutExpired:
+                lines.append("curl attempt timed out after 30s")
+            except Exception as exc:
+                lines.append(f"curl attempt failed: {exc}")
+
+        lines.append("=======================================")
+        report = "\n".join(lines)
+        logger.error("Empty LLM response diagnostic:\n%s", report)
+        return report
 
     # ------------------------------------------------------------------
     # Embeddings
