@@ -16,10 +16,11 @@ import html as _html
 import json
 import logging
 import os
+import random
 import shutil
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Optional
 
 import schedule
@@ -221,6 +222,9 @@ class Scheduler:
             return f"every {minutes}m"
         return "interval"
 
+    # Maximum jitter window: ±5 minutes (in seconds)
+    _JITTER_MAX_SECS = 5 * 60
+
     def _register_job(self, tag: str, meta: dict) -> None:
         schedule.clear(tag)
         stype = meta.get("schedule_type", "interval")
@@ -228,20 +232,36 @@ class Scheduler:
             t = meta.get("time", "02:00")
             schedule.every().day.at(t).do(self._run_job, tag=tag).tag(tag)
         elif stype == "once":
-            # Run at a specific HH:MM today (or tomorrow if that time has passed)
             run_at = meta.get("run_at") or meta.get("time")
             if run_at:
                 schedule.every().day.at(run_at).do(self._run_job, tag=tag).tag(tag)
             else:
-                # Run as soon as possible (next scheduler tick)
                 schedule.every(1).minutes.do(self._run_job, tag=tag).tag(tag)
         else:
             hours = meta.get("hours")
             minutes = meta.get("minutes")
             if hours:
-                schedule.every(hours).hours.do(self._run_job, tag=tag).tag(tag)
+                job = schedule.every(hours).hours.do(self._run_job, tag=tag).tag(tag)
+                interval_secs = int(hours) * 3600
             elif minutes:
-                schedule.every(minutes).minutes.do(self._run_job, tag=tag).tag(tag)
+                job = schedule.every(minutes).minutes.do(self._run_job, tag=tag).tag(tag)
+                interval_secs = int(minutes) * 60
+            else:
+                logger.warning("Job '%s' has no interval configured — skipping", tag)
+                return
+
+            # Apply ±jitter (capped at 25% of interval or _JITTER_MAX_SECS, whichever is smaller)
+            max_jitter = min(self._JITTER_MAX_SECS, interval_secs // 4)
+            if max_jitter > 0:
+                jitter_secs = random.randint(-max_jitter, max_jitter)
+                job.next_run += timedelta(seconds=jitter_secs)
+                sign = "+" if jitter_secs >= 0 else ""
+                logger.debug(
+                    "Registered job: %s (%s, jitter %s%ds)",
+                    tag, self._describe_schedule(meta), sign, jitter_secs,
+                )
+                return
+
         logger.debug("Registered job: %s (%s)", tag, self._describe_schedule(meta))
 
     def _run_job(self, tag: str) -> None:

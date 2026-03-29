@@ -99,7 +99,7 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
     ),
     "file_read": BuiltinTool(
         name="file_read",
-        description="Read a file from the filesystem. Args: path (str), max_bytes (int, default 50000), offset (int, default 0).",
+        description="Read a file from the filesystem. Args: path (str), max_bytes (int, default 50000), offset (int, default 0). Negative offset counts from end of file (e.g. -5000 reads last 5000 bytes, like tail).",
     ),
     "file_write": BuiltinTool(
         name="file_write",
@@ -286,6 +286,9 @@ class BuiltinExecutor:
             if not os.path.exists(path):
                 return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
             size = os.path.getsize(path)
+            # Negative offset = from end of file (tail semantics)
+            if offset < 0:
+                offset = max(0, size + offset)
             with open(path, "r", errors="replace") as f:
                 if offset:
                     f.seek(offset)
