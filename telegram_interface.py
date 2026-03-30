@@ -6,6 +6,8 @@ Telegram bot interface with two security modes:
   - pairing:   users request access; owner approves via /pair command
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import html

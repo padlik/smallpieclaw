@@ -5,6 +5,8 @@ Safely executes registered tools via subprocess.
 Enforces timeout, output size limits, and allowlist checks.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import subprocess

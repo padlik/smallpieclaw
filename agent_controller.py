@@ -11,6 +11,8 @@ Workflow for each user request:
   5. Feed result back to LLM and repeat (max N iterations)
 """
 
+from __future__ import annotations
+
 import base64
 import json
 import logging

@@ -18,6 +18,8 @@ Retry behaviour:
     retry_delay     = 2     # base delay in seconds; doubles each attempt (default: 2)
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import math

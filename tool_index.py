@@ -11,6 +11,8 @@ Built-in tools (shell, file_read, file_write, schedule) are indexed alongside
 registered tools so the semantic search considers them for relevance scoring.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os

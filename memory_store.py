@@ -12,6 +12,8 @@ Also provides 4-tier memory architecture:
   ResultsMemory    — persisted vector index of past task results
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import math

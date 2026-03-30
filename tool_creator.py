@@ -5,6 +5,8 @@ Handles dynamic tool creation requested by the LLM agent.
 Validates generated code for dangerous patterns before writing to disk.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import re

@@ -23,6 +23,8 @@ SKILL.md frontmatter fields:
     metadata      (optional) — arbitrary key-value pairs
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import re
