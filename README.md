@@ -11,20 +11,21 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **ReAct agent loop** — reasons step-by-step, executes tools, and loops until done
 - **Semantic tool search** — finds the right tool using embedding-based cosine similarity
 - **Self-building tools** — the LLM can propose new `.py`/`.sh` tools; operator reviews code and chooses **Create**, **Run Once**, or **Cancel** via inline buttons
-- **Built-in tools** — `shell`, `file_read`, `file_write`, `schedule` always available; dangerous ops require inline-button confirmation
+- **Built-in tools** — `shell`, `file_read`, `file_write`, `file_send`, `schedule` always available; dangerous ops require inline-button confirmation
 - **Secure Telegram bot** — allowlist or pairing-token access control
 - **4-tier memory architecture** — short-term conversation history, working task context, long-term vector knowledge index, and results history
-- **Configurable scheduler** — jobs defined in `scheduler.toml` (auto-updated at runtime); manage jobs from chat or via `/jobs`; supports recurring (daily/interval) and one-time reminders
+- **Configurable scheduler** — jobs defined in `scheduler.toml` (auto-updated at runtime); manage jobs from chat or via `/jobs`; supports recurring (daily/interval) and one-time reminders; interval jobs staggered with ±5 min jitter to avoid thundering herd
 - **Self-health diagnosis** — `/health` command and automatic 4-hour periodic job: reads log file, analyzes errors, suggests fixes, rotates logs
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
 - **Typing indicator** — Telegram shows "typing…" while the agent is reasoning
 - **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps or cancel
 - **Multi-model LLM** — define multiple models with hint keywords; agent auto-selects; switch via `/models`
-- **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude
+- **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude; reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
 - **Context compaction** — auto-summarises older messages when the token budget is near the configured limit
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
 - **Agent Skills** — autonomous skill system (per [agentskills.io](https://agentskills.io/specification)) with progressive disclosure; skills listed via `/skills`
-- **Quiet logs** — httpx and Telegram internals suppressed to WARNING; log file stays readable
+- **File storage guidance** — agent directed to use `/tmp/<agent>` for temporary files and `downloads/` for files the user wants to keep
+- **Log rotation safe** — uses `WatchedFileHandler`; re-opens log file automatically after `logrotate` without restart
 
 ---
 
@@ -189,7 +190,8 @@ Scheduler features:
 - **`scheduler.toml` is the single source of truth** — all jobs (including user-added reminders) live in this file; no hardcoded defaults exist in code
 - **Recurring jobs**: `daily` (at a fixed time) or `interval` (every N hours/minutes)
 - **One-time reminders**: `once` type with `run_at = "HH:MM"` — auto-removed after execution
-- **Persistence**: every change writes back to `scheduler.toml` — survives crashes and restarts
+- **Jitter**: interval jobs get a random ±5 min offset at startup to avoid thundering herd when multiple jobs share the same interval
+- **Persistence**: every structural change (add/remove/enable/disable) writes back to `scheduler.toml` — survives crashes and restarts
 - **Automatic backups**: before each write, the previous `scheduler.toml` is copied to `scheduler.toml.bak.YYYYMMDD_HHMMSS`; the last 5 backups are kept
 - **Hot-reload**: adding a job via the built-in tool immediately reloads `scheduler.toml` into the live scheduler — no restart needed
 - **Manual reload**: `/jobs reload` re-reads `scheduler.toml` from disk at any time
@@ -251,7 +253,7 @@ Five tools are always available to the agent regardless of the `tools/` director
 | Tool | Description | Dangerous? |
 |------|-------------|-----------|
 | `shell` | Execute a shell command | Yes — if command matches destructive patterns (`rm -rf`, `dd`, `mkfs`, etc.) |
-| `file_read` | Read a file from the filesystem | Yes — if path is sensitive (`/etc/passwd`, `.env`, `*.key`, etc.) |
+| `file_read` | Read a file. Supports `offset` (negative = from end, e.g. `-5000` reads last 5 KB like `tail`) | Yes — if path is sensitive (`/etc/passwd`, `.env`, `*.key`, etc.) |
 | `file_write` | Write content to a file | Always — requires confirmation |
 | `file_send` | Send a local file or photo to the Telegram chat | No |
 | `schedule` | Manage scheduled jobs and reminders | No |
@@ -278,6 +280,27 @@ file_send(path="/home/pi/documents/photo.png", caption="Here you go")
 - All other files are sent as documents
 - Files larger than 50 MB are rejected with a clear error
 - `~` home paths are expanded automatically
+
+---
+
+## File Storage
+
+The agent is instructed to use specific directories for different file types:
+
+| Directory | Purpose | Config key |
+|-----------|---------|------------|
+| `/tmp/<agent_name>` | Temporary files — QR codes, downloaded configs, intermediate outputs. Cleaned by OS on reboot. | `paths.tmp_dir` |
+| `downloads/` | Permanent downloads — files the user wants to keep and access later. | `paths.downloads_dir` |
+
+Both directories are created automatically at startup. The agent is told never to write files into the script directory.
+
+Override in `config.toml`:
+
+```toml
+[paths]
+downloads_dir = "/home/pi/agent-downloads"
+tmp_dir       = "/tmp/myagent"
+```
 
 ---
 
@@ -324,6 +347,7 @@ Restart the agent (or wait for the next query) to pick up new tools.
 | Semantic top-K tools | 3 | `agent.top_tools` |
 | Default model | _(first `[[models]]` entry)_ | `agent.default_model` |
 | Max context tokens | 90 000 | `agent.ctx_max_tokens` |
+| Empty-response diagnostics | off | `agent.diagnose_empty_responses` |
 
 When the agent reaches `max_iterations`, inline buttons appear in the chat:
 **⏩ Extend 10 more steps** or **❌ Cancel** (2-minute timeout). This prevents
@@ -352,6 +376,24 @@ The client handles transient failures transparently:
 - **Empty responses** — if the provider returns an empty string (network glitch), it is retried at the HTTP level before the agent sees it
 - **Non-JSON prose** — if the LLM returns prose instead of a JSON action, the agent retries in-place up to 2 times without consuming a step or polluting the message history
 - **Multiple JSON objects** — a brace-counting parser extracts the correct `{"action":…}` object even when the model wraps it in explanatory text or emits multiple objects
+- **Reasoning model support** — if `content` is empty but `reasoning` or `reasoning_content` is populated (DeepSeek-R1, Kimi K2.5, QwQ, etc.), the agent uses that field transparently and logs a warning
+
+#### Empty-response diagnostics
+
+When empty responses persist through all retries, enable diagnostic mode to identify the root cause:
+
+```toml
+[agent]
+diagnose_empty_responses = true
+```
+
+This logs at `ERROR` level and includes:
+1. Full HTTP response — status code, headers, raw body
+2. Stream/non-stream mismatch check — detects SSE responses sent to a non-streaming client
+3. `finish_reason` check — surfaces `content_filter`, `length` truncation, etc.
+4. `curl` probe — re-runs the same request via subprocess and logs the output
+
+Disable after diagnosing to keep logs clean.
 
 ---
 
@@ -361,7 +403,7 @@ The client handles transient failures transparently:
 |---------|-------------|
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
-| `/status` | Uptime, LLM model, embeddings status, and today's token usage |
+| `/status` | Uptime, LLM model, embeddings status, tools/skills count, and today's token usage |
 | `/health` | Run self-health diagnosis, analyze logs, rotate log file |
 | `/tools` | List all built-in and generated tools |
 | `/skills` | List all available agent skills |
@@ -464,6 +506,37 @@ The skill will be available on next agent startup (or after `/reset`).
 ### Managing skills
 
 - `/skills` — list all available skills with name, description, and file path
+
+---
+
+## Logging
+
+The agent uses `logging.handlers.WatchedFileHandler` so it survives log rotation without a restart. On every log emit the handler checks the file's inode; if `logrotate` has renamed or replaced the file it re-opens `agent.log` automatically.
+
+Log file location is configurable:
+
+```toml
+[paths]
+log_file = "agent.log"           # default: <agent_dir>/agent.log
+# log_file = "/var/log/piclaw/agent.log"
+```
+
+The default is always anchored to the directory containing `main.py`, regardless of the working directory the process is launched from.
+
+Sample `logrotate` config (`/etc/logrotate.d/telegram-agent`):
+
+```
+/home/pi/piclaw/agent.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 0640 pi pi
+}
+```
+
+No `postrotate`/`copytruncate` required — `WatchedFileHandler` handles it.
 
 ---
 
