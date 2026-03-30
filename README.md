@@ -511,32 +511,31 @@ The skill will be available on next agent startup (or after `/reset`).
 
 ## Logging
 
-The agent uses `logging.handlers.WatchedFileHandler` so it survives log rotation without a restart. On every log emit the handler checks the file's inode; if `logrotate` has renamed or replaced the file it re-opens `agent.log` automatically.
+The agent handles log rotation internally — no `logrotate` or external tooling required.
 
-Log file location is configurable:
+### How it works
+
+- **Active log**: always `agent.log` (or the path set in config) — the agent writes here continuously
+- **Rotation**: every night at **00:00 local time** the active log is rotated
+- **Linux-style numbered suffixes** — same convention as logrotate without `dateext`:
+
+```
+agent.log        ← always the active log (today)
+agent.log.1      ← yesterday
+agent.log.2      ← 2 days ago
+…
+agent.log.30     ← oldest (deleted when limit is reached)
+```
+
+### Configuration
 
 ```toml
 [paths]
-log_file = "agent.log"           # default: <agent_dir>/agent.log
-# log_file = "/var/log/piclaw/agent.log"
+log_file         = "agent.log"   # default: <agent_dir>/agent.log
+log_backup_count = 30            # number of rotated files to keep (default: 30)
 ```
 
-The default is always anchored to the directory containing `main.py`, regardless of the working directory the process is launched from.
-
-Sample `logrotate` config (`/etc/logrotate.d/telegram-agent`):
-
-```
-/home/pi/piclaw/agent.log {
-    daily
-    rotate 7
-    compress
-    missingok
-    notifempty
-    create 0640 pi pi
-}
-```
-
-No `postrotate`/`copytruncate` required — `WatchedFileHandler` handles it.
+The `log_file` default is always anchored to the directory containing `main.py`, regardless of the working directory the process is launched from.
 
 ---
 

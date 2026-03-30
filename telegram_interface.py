@@ -111,7 +111,7 @@ class TelegramInterface:
             BotCommand("start", "Introduction and usage examples"),
             BotCommand("help", "Help and command reference"),
             BotCommand("status", "Agent status, uptime, and token usage"),
-            BotCommand("health", "Run self-health diagnosis and rotate logs"),
+        BotCommand("health", "Run self-health diagnosis"),
             BotCommand("tools", "List available tools"),
             BotCommand("skills", "List available agent skills"),
             BotCommand("models", "List and switch LLM models"),
@@ -436,13 +436,10 @@ class TelegramInterface:
             return
         health_task = (
             "Perform a self-health diagnosis: "
-            "(1) Read the last 500 lines of agent.log using file_read. "
+            "(1) Read the last 500 lines of agent.log using file_read with offset=-25000. "
             "(2) Analyze for errors, warnings, repeated failures, and anomalies. "
             "(3) Identify root causes and provide actionable suggestions for each issue. "
-            "(4) After analysis, rotate the log file by running the shell command: "
-            "mv agent.log agent.log.$(date +%Y%m%d_%H%M%S) "
-            "(5) Report findings as a structured summary. "
-            "Long-term memory will be updated automatically via the finish action."
+            "(4) Report findings as a structured summary."
         )
         await self._run_agent_task(update, ctx, health_task)
 

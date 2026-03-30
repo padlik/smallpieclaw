@@ -20,19 +20,68 @@ import sys
 _AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_LOG = os.path.join(_AGENT_DIR, "agent.log")
 
+
 # ---------------------------------------------------------------------------
-# Logging — configured after reading config so log_file path is honoured
+# Nightly log rotation — Linux-style numbered suffixes
 # ---------------------------------------------------------------------------
-def _setup_logging(log_file: str = _DEFAULT_LOG) -> None:
+class _NightlyRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """
+    Rotates at midnight using Linux-style numbered suffixes:
+      agent.log.30 (oldest, deleted)
+      agent.log.N  → agent.log.(N+1)
+      agent.log.1  → agent.log.2
+      agent.log    → agent.log.1   (active log renamed)
+      (new empty)  → agent.log     (agent always writes here)
+    """
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        base = self.baseFilename
+
+        # Shift numbered backups: .N → .(N+1), oldest removed
+        for i in range(self.backupCount - 1, 0, -1):
+            src = f"{base}.{i}"
+            dst = f"{base}.{i + 1}"
+            if os.path.exists(dst):
+                os.remove(dst)
+            if os.path.exists(src):
+                os.rename(src, dst)
+
+        # Rotate active log: agent.log → agent.log.1
+        dst1 = f"{base}.1"
+        if os.path.exists(dst1):
+            os.remove(dst1)
+        if os.path.exists(base):
+            os.rename(base, dst1)
+
+        # Open fresh agent.log (always the active log)
+        self.mode = "a"
+        self.stream = self._open()
+
+        # Advance the next rollover time
+        self.rolloverAt += self.interval
+
+
+def _setup_logging(log_file: str = _DEFAULT_LOG, backup_count: int = 30) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     stream_h = logging.StreamHandler(sys.stdout)
     stream_h.setFormatter(fmt)
 
-    # WatchedFileHandler re-opens the log file when its inode changes,
-    # so log rotation (logrotate create/copytruncate) works correctly.
-    file_h = logging.handlers.WatchedFileHandler(log_file, encoding="utf-8")
+    # Rotate at 00:00 local time; keep last backup_count daily files.
+    # Active log is always log_file; rotated copies become .1, .2, …
+    file_h = _NightlyRotatingFileHandler(
+        log_file,
+        when="midnight",
+        interval=1,
+        backupCount=backup_count,
+        encoding="utf-8",
+        utc=False,
+    )
     file_h.setFormatter(fmt)
 
     root = logging.getLogger()
@@ -44,6 +93,7 @@ def _setup_logging(log_file: str = _DEFAULT_LOG) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 
 # Bootstrap with default path; reconfigured after config load if needed
 _setup_logging()
@@ -96,13 +146,14 @@ def main():
     downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
     _agent_name   = os.path.basename(os.path.abspath("."))
     tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
-    log_file      = paths.get("log_file", _DEFAULT_LOG)
+    log_file         = paths.get("log_file", _DEFAULT_LOG)
+    log_backup_count = int(paths.get("log_backup_count", 30))
 
     # Re-initialise logging with the configured path (replaces the bootstrap handler)
     for h in logging.root.handlers[:]:
         logging.root.removeHandler(h)
         h.close()
-    _setup_logging(log_file)
+    _setup_logging(log_file, backup_count=log_backup_count)
 
     os.makedirs(tools_dir, exist_ok=True)
     os.makedirs(gen_tools_dir, exist_ok=True)
