@@ -16,10 +16,14 @@ import logging.handlers
 import os
 import sys
 
+# Directory containing main.py — used as the agent's base directory
+_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_LOG = os.path.join(_AGENT_DIR, "agent.log")
+
 # ---------------------------------------------------------------------------
 # Logging — configured after reading config so log_file path is honoured
 # ---------------------------------------------------------------------------
-def _setup_logging(log_file: str = "agent.log") -> None:
+def _setup_logging(log_file: str = _DEFAULT_LOG) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
@@ -92,7 +96,7 @@ def main():
     downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
     _agent_name   = os.path.basename(os.path.abspath("."))
     tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
-    log_file      = paths.get("log_file", "agent.log")
+    log_file      = paths.get("log_file", _DEFAULT_LOG)
 
     # Re-initialise logging with the configured path (replaces the bootstrap handler)
     for h in logging.root.handlers[:]:
