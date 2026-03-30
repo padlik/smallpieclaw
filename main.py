@@ -12,24 +12,37 @@ Boot sequence:
 """
 
 import logging
+import logging.handlers
 import os
 import sys
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — configured after reading config so log_file path is honoured
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("agent.log", encoding="utf-8"),
-    ],
-)
-# Suppress high-volume INFO noise from HTTP/Telegram internals
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+def _setup_logging(log_file: str = "agent.log") -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    stream_h = logging.StreamHandler(sys.stdout)
+    stream_h.setFormatter(fmt)
+
+    # WatchedFileHandler re-opens the log file when its inode changes,
+    # so log rotation (logrotate create/copytruncate) works correctly.
+    file_h = logging.handlers.WatchedFileHandler(log_file, encoding="utf-8")
+    file_h.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(stream_h)
+    root.addHandler(file_h)
+
+    # Suppress high-volume INFO noise from HTTP/Telegram internals
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
+# Bootstrap with default path; reconfigured after config load if needed
+_setup_logging()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -79,6 +92,13 @@ def main():
     downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
     _agent_name   = os.path.basename(os.path.abspath("."))
     tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
+    log_file      = paths.get("log_file", "agent.log")
+
+    # Re-initialise logging with the configured path (replaces the bootstrap handler)
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
+        h.close()
+    _setup_logging(log_file)
 
     os.makedirs(tools_dir, exist_ok=True)
     os.makedirs(gen_tools_dir, exist_ok=True)
