@@ -3,10 +3,16 @@ tool_registry.py
 ----------------
 Discovers and registers executable tools (.sh, .py) from the tools directories.
 Each tool file must contain a "description:" comment on any line near the top.
+Multi-line descriptions are supported by continuing the comment on the next lines:
 
-Example tool header:
+Example tool header (single-line):
     #!/bin/bash
     # description: check disk usage across all mount points
+
+Example tool header (multi-line):
+    #!/bin/bash
+    # description: check disk usage across all mount points
+    #   and report any volumes above 90% capacity
 """
 
 from __future__ import annotations
@@ -19,8 +25,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Regex to extract description from tool file header (first 10 lines)
-_DESC_RE = re.compile(r"(?:#\s*)?description:\s*(.+)", re.IGNORECASE)
+# Regex to match the "description:" key line in tool file header
+_DESC_START_RE = re.compile(r"(?:#\s*)?description:\s*(.+)", re.IGNORECASE)
+# Regex to match a continuation comment line (e.g. "#   more text") — no new key
+_DESC_CONT_RE = re.compile(r"^#\s{2,}(.+)$")
 
 
 @dataclass
@@ -98,16 +106,24 @@ class ToolRegistry:
         """Extract tool metadata from a script file."""
         try:
             with open(path, "r", errors="replace") as f:
-                head = [next(f, "") for _ in range(10)]
+                head = [next(f, "") for _ in range(15)]
         except Exception as exc:
             logger.warning("Could not read tool file %s: %s", path, exc)
             return None
 
         description = ""
-        for line in head:
-            m = _DESC_RE.search(line)
+        for i, line in enumerate(head):
+            m = _DESC_START_RE.search(line)
             if m:
-                description = m.group(1).strip()
+                parts = [m.group(1).strip()]
+                # Collect continuation comment lines immediately following
+                for cont in head[i + 1:]:
+                    cm = _DESC_CONT_RE.match(cont.rstrip())
+                    if cm:
+                        parts.append(cm.group(1).strip())
+                    else:
+                        break
+                description = " ".join(parts)
                 break
 
         if not description:

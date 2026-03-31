@@ -322,15 +322,20 @@ class TelegramInterface:
         builtin = [t for t in tools if not t.is_generated]
         generated = [t for t in tools if t.is_generated]
 
+        def _tool_entry(t) -> str:
+            # Normalize multi-line descriptions: join lines with a space
+            desc = " ".join(html.escape(t.description).split())
+            return f"  • <code>{html.escape(t.name)}</code>\n    {desc}"
+
         lines = [f"🔧 <b>Available Tools</b> ({len(tools)} total)\n"]
         if builtin:
             lines.append("<b>Built-in:</b>")
             for t in builtin:
-                lines.append(f"  • <code>{html.escape(t.name)}</code> — {html.escape(t.description)}")
+                lines.append(_tool_entry(t))
         if generated:
             lines.append("\n<b>Generated:</b>")
             for t in generated:
-                lines.append(f"  • <code>{html.escape(t.name)}</code> — {html.escape(t.description)}")
+                lines.append(_tool_entry(t))
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -349,7 +354,10 @@ class TelegramInterface:
 
         lines = [f"📚 <b>Available Skills</b> ({len(skills)} total)\n"]
         for s in skills:
-            lines.append(f"  • <b>{html.escape(s.name)}</b> — {html.escape(s.description)}")
+            # Normalize multi-line descriptions
+            desc = " ".join(html.escape(s.description).split())
+            lines.append(f"  • <b>{html.escape(s.name)}</b>")
+            lines.append(f"    {desc}")
             lines.append(f"    <code>{html.escape(s.skill_md_path)}</code>")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 

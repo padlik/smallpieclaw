@@ -193,13 +193,6 @@ class AgentController:
                 progress_callback(msg)
             logger.debug("Agent progress: %s", msg)
 
-        # Auto-select model based on goal hint
-        if hasattr(self.llm, "select_model_by_hint"):
-            switched = self.llm.select_model_by_hint(user_goal)
-            if switched:
-                logger.info("Auto-selected model '%s' based on goal hint", switched)
-                _progress(f"🤖 Auto-selected model: <b>{switched}</b>")
-
         # Start working memory task tracking
         if self.working:
             self.working.start_task(user_goal)

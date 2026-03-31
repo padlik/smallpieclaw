@@ -101,20 +101,49 @@ class SkillRegistry:
     @staticmethod
     def _parse_frontmatter(text: str) -> dict:
         """
-        Minimal YAML frontmatter parser. Handles simple key: value pairs and
-        multi-line strings (block scalars and quoted strings are not supported
-        beyond basic line continuation). Good enough for SKILL.md frontmatter.
+        Minimal YAML frontmatter parser. Handles simple key: value pairs,
+        and multi-line block scalars for the description field:
+
+            description: >
+              This is a multi-line
+              description that spans lines.
+
+            description: |
+              Line one.
+              Line two.
+
+        Continuation lines (indented) after a block scalar indicator are joined
+        with a space (for >) or newline (for |).
         """
         result: dict = {}
-        for line in text.splitlines():
-            line = line.rstrip()
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].rstrip()
+            i += 1
             if not line or line.startswith("#"):
                 continue
             if ":" not in line:
                 continue
             key, _, value = line.partition(":")
             key = key.strip().lower()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+
+            # Detect YAML block scalar indicators (> or |)
+            if value in (">", "|"):
+                sep = " " if value == ">" else "\n"
+                parts = []
+                while i < len(lines):
+                    cont = lines[i]
+                    # Continuation lines are indented
+                    if cont and not cont[0].isspace():
+                        break
+                    parts.append(cont.strip())
+                    i += 1
+                value = sep.join(p for p in parts if p)
+            else:
+                value = value.strip('"').strip("'")
+
             if key:
                 result[key] = value
         return result
