@@ -491,6 +491,31 @@ class AgentController:
         else:
             logger.warning("resume_tool_create(): no event for token=%s", token[:8])
 
+    def build_system_prompt(self, user_goal: str = "(context snapshot)") -> tuple[str, int]:
+        """Build the full system prompt as it would be sent to the LLM.
+
+        Returns (prompt_text, estimated_tokens).
+        """
+        relevant_tools = self.tool_index.search(user_goal, top_k=self.top_tools)
+        tools_text = self._format_tools(relevant_tools)
+        memory_text = self.memory.as_prompt_text()
+        short_term_text = self.short_term.as_prompt_text() if self.short_term else "No recent conversation."
+        past_results_text = self.results.as_prompt_text(user_goal, top_k=2) if self.results else "No past results."
+        skills_section = self._format_skills()
+        file_storage = (
+            f"- Temporary files:\n    {self.tmp_dir}\n"
+            f"- Permanent downloads:\n    {self.downloads_dir}"
+        )
+        prompt = _SYSTEM_PROMPT.format(
+            memory=memory_text,
+            short_term=short_term_text,
+            past_results=past_results_text,
+            tools=tools_text,
+            skills_section=skills_section,
+            file_storage=file_storage,
+        )
+        return prompt, _estimate_tokens(prompt)
+
     def reset_task(self, save: bool = True) -> str:
         """Save (optionally) and clear the current working + short-term context."""
         msg = "✅ Context cleared."

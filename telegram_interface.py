@@ -11,9 +11,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
+import io
 import logging
+import os
+import platform
 import re
 import secrets
+import shutil
 import time
 from typing import Callable, Optional
 
@@ -149,6 +153,9 @@ class TelegramInterface:
         app.add_handler(CommandHandler("pair", self._cmd_pair))
         app.add_handler(CommandHandler("unpair", self._cmd_unpair))
         app.add_handler(CommandHandler("myid", self._cmd_myid))
+        # Hidden diagnostic commands (not registered with BotFather)
+        app.add_handler(CommandHandler("show_ctx", self._cmd_show_ctx))
+        app.add_handler(CommandHandler("show_env", self._cmd_show_env))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(self._cb_model_switch, pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(self._cb_confirm, pattern=r"^confirm_(yes|no):"))
@@ -452,6 +459,72 @@ class TelegramInterface:
             "(4) Report findings as a structured summary."
         )
         await self._run_agent_task(update, ctx, health_task)
+
+    async def _cmd_show_ctx(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Hidden command: send the current LLM system prompt as a file attachment."""
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if not self.agent:
+            await update.message.reply_text("Agent not available.")
+            return
+        try:
+            prompt, tokens = self.agent.build_system_prompt()
+        except Exception as exc:
+            await update.message.reply_text(f"Error building context: {exc}")
+            return
+        buf = io.BytesIO(prompt.encode("utf-8"))
+        buf.name = "context.md"
+        await update.message.reply_document(
+            document=buf,
+            filename="context.md",
+            caption=f"📋 Current agent context (~{tokens:,} tokens)",
+        )
+
+    async def _cmd_show_env(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Hidden command: show the shell environment available to the agent."""
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+
+        _REDACT = {"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "API", "CREDENTIAL", "AUTH"}
+
+        def _redact(name: str, value: str) -> str:
+            if any(kw in name.upper() for kw in _REDACT):
+                return "***"
+            return value
+
+        env = os.environ
+        lines = ["<b>🌐 Shell Environment</b>\n"]
+
+        # PATH — one entry per line
+        path_val = env.get("PATH", "")
+        if path_val:
+            lines.append("<b>PATH:</b>")
+            for entry in path_val.split(os.pathsep):
+                lines.append(f"  {html.escape(entry)}")
+            lines.append("")
+
+        # All other variables (sorted, secrets redacted)
+        lines.append("<b>Environment variables:</b>")
+        for key in sorted(env.keys()):
+            if key == "PATH":
+                continue
+            val = _redact(key, env[key])
+            lines.append(f"  <code>{html.escape(key)}</code> = {html.escape(val)}")
+
+        # Agent-configured paths
+        paths_cfg = self._config.get("paths", {})
+        if paths_cfg:
+            lines.append("\n<b>Agent paths (from config):</b>")
+            for k, v in paths_cfg.items():
+                lines.append(f"  <code>{html.escape(k)}</code> = {html.escape(str(v))}")
+
+        text = "\n".join(lines)
+        # Telegram max message length is 4096; split if needed
+        chunk_size = 4096
+        for i in range(0, len(text), chunk_size):
+            await update.message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
 
     async def _on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message:
