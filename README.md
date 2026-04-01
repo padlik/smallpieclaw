@@ -56,7 +56,7 @@ data/
     memory.json              # Persistent agent key-value memory
     longterm_memory.json     # Long-term vector knowledge index
     results_memory.json      # Past task summaries and results
-    scheduler_state.json     # Current scheduler job state snapshot
+    scheduler_state.json     # Scheduler run history (last_run + last_error for all jobs ever executed)
 ```
 
 ---
@@ -119,7 +119,7 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 | `base_url` | API base URL (leave empty for Anthropic/Google) |
 | `max_tokens` | Max tokens in the LLM response |
 | `temperature` | Sampling temperature |
-| `hint` | Space-separated keywords for auto-selection at runtime |
+| `hint` | Space-separated keywords; model is **not** auto-selected — only used for display purposes. Switch models manually with `/models` |
 | `request_timeout` | Per-request timeout in seconds (default: 120) |
 | `max_retries` | Retry attempts on timeout/connection errors (default: 3) |
 | `retry_delay` | Base retry delay in seconds, doubles each attempt (default: 2) |
@@ -155,7 +155,7 @@ retry_delay     = 2
 default_model = "gpt-4o-mini"   # must match one of the model = "..." values above
 ```
 
-The agent auto-selects a model when `hint` keywords appear in the user's message, and users can switch manually with `/models`.
+The agent does **not** auto-switch models based on message content. Switch models manually with `/models`.
 
 ### 6. (Optional) Configure the scheduler
 
@@ -192,6 +192,8 @@ Scheduler features:
 - **One-time reminders**: `once` type with `run_at = "HH:MM"` — auto-removed after execution
 - **Jitter**: interval jobs get a random ±5 min offset at startup to avoid thundering herd when multiple jobs share the same interval
 - **Persistence**: every structural change (add/remove/enable/disable) writes back to `scheduler.toml` — survives crashes and restarts
+- **Run history**: `scheduler_state.json` stores `last_run` and `last_error` for every job ever executed (including removed and one-time jobs); history is restored on restart and survives `/jobs reload`
+- **Tag resolution**: job tags are normalized (spaces, hyphens, and underscores are interchangeable), so `longterm-memory-update` and `longterm_memory_update` refer to the same job
 - **Automatic backups**: before each write, the previous `scheduler.toml` is copied to `scheduler.toml.bak.YYYYMMDD_HHMMSS`; the last 5 backups are kept
 - **Hot-reload**: adding a job via the built-in tool immediately reloads `scheduler.toml` into the live scheduler — no restart needed
 - **Manual reload**: `/jobs reload` re-reads `scheduler.toml` from disk at any time
@@ -307,7 +309,15 @@ tmp_dir       = "/tmp/myagent"
 ## Writing Custom Tools
 
 Create a `.py` or `.sh` file in the `tools/` directory.
-The file **must** include a `description:` comment in the first 10 lines.
+The file **must** include a `description:` comment near the top (first 15 lines).
+Multi-line descriptions are supported by continuing the comment with extra indentation:
+
+```bash
+#!/bin/bash
+# description: check disk usage across all mount points
+#   and alert if any volume exceeds 90% capacity
+df -h
+```
 
 **Tool creation policy:** Tools must follow the **UNIX paradigm** — one tool, one task.
 A tool should be reusable across many scenarios, not a single-use script. For one-off

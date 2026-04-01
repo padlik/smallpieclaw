@@ -65,12 +65,14 @@ class Scheduler:
         self._dynamic_jobs_file = os.path.join(data_dir, "scheduled_jobs.json")
 
         self._jobs_meta: dict = {}
+        self._run_history: dict = {}  # tag → {last_run, last_error} — persisted forever
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
         os.makedirs(data_dir, exist_ok=True)
         self._load_config_jobs(scheduler_config_path, sched_cfg)
         self._load_dynamic_jobs()   # migration: imports old JSON, deletes it, writes to TOML
+        self._load_state()          # overlay last_run/last_error onto active jobs from history
         self._save_state()
 
     # ------------------------------------------------------------------
@@ -95,6 +97,33 @@ class Scheduler:
         schedule.clear()
         logger.info("Scheduler stopped.")
 
+    def _resolve_tag(self, tag: str) -> Optional[str]:
+        """Normalize tag and resolve to a canonical stored key.
+
+        Accepts underscores, hyphens, and spaces interchangeably so that
+        'longterm-memory-update', 'longterm memory update', and
+        'longterm_memory_update' all resolve to the same stored key.
+        Returns the canonical tag string or None if not found.
+        """
+        if not tag:
+            return None
+        # Exact match first
+        if tag in self._jobs_meta:
+            return tag
+        # Normalize: strip, lowercase, collapse spaces/hyphens/dots to underscores
+        normalized = tag.strip().lower()
+        normalized = normalized.replace("-", "_").replace(" ", "_").replace(".", "_")
+        while "__" in normalized:
+            normalized = normalized.replace("__", "_")
+        if normalized in self._jobs_meta:
+            return normalized
+        # Last resort: compare normalized versions of all stored keys
+        for stored in self._jobs_meta:
+            stored_norm = stored.lower().replace("-", "_").replace(" ", "_")
+            if stored_norm == normalized:
+                return stored
+        return None
+
     def add_job(
         self,
         tag: str,
@@ -107,6 +136,10 @@ class Scheduler:
         run_at: str = None,
         source: str = "dynamic",
     ) -> dict:
+        # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
+        tag = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+        while "__" in tag:
+            tag = tag.replace("__", "_")
         # Coerce hours/minutes to int — LLM may pass them as strings
         try:
             hours = int(hours) if hours is not None else None
@@ -148,6 +181,7 @@ class Scheduler:
         return {"success": True}
 
     def remove_job(self, tag: str) -> bool:
+        tag = self._resolve_tag(tag) or tag
         if tag not in self._jobs_meta:
             return False
         schedule.clear(tag)
@@ -158,6 +192,7 @@ class Scheduler:
         return True
 
     def pause_job(self, tag: str) -> bool:
+        tag = self._resolve_tag(tag) or tag
         if tag not in self._jobs_meta:
             return False
         self._jobs_meta[tag]["enabled"] = False
@@ -168,6 +203,7 @@ class Scheduler:
         return True
 
     def resume_job(self, tag: str) -> bool:
+        tag = self._resolve_tag(tag) or tag
         if tag not in self._jobs_meta:
             return False
         self._jobs_meta[tag]["enabled"] = True
@@ -179,11 +215,14 @@ class Scheduler:
 
     def run_now(self, tag: str) -> dict:
         """Trigger a job immediately in a background thread."""
-        if tag not in self._jobs_meta:
-            return {"success": False, "error": f"Job '{tag}' not found."}
+        resolved = self._resolve_tag(tag)
+        if not resolved:
+            # Build a helpful error listing known tags
+            known = ", ".join(self._jobs_meta.keys()) or "none"
+            return {"success": False, "error": f"Job '{tag}' not found. Known jobs: {known}"}
         import threading as _threading
-        _threading.Thread(target=self._run_job, kwargs={"tag": tag}, daemon=True).start()
-        logger.info("Job '%s' triggered manually (run_now)", tag)
+        _threading.Thread(target=self._run_job, kwargs={"tag": resolved}, daemon=True).start()
+        logger.info("Job '%s' triggered manually (run_now)", resolved)
         return {"success": True}
 
     def list_jobs(self) -> list:
@@ -278,6 +317,7 @@ class Scheduler:
             logger.warning("Job '%s' has no task — sending direct notification", tag)
             friendly = tag.replace("_", " ")
             meta["last_run"] = now
+            self._run_history[tag] = {"last_run": now, "last_error": None}
             self._save_state()
             if is_once:
                 schedule.clear(tag)
@@ -309,6 +349,12 @@ class Scheduler:
             meta["last_error"] = result
         else:
             meta.pop("last_error", None)
+
+        # Persist to run history (survives job removal and restarts)
+        self._run_history[tag] = {
+            "last_run": meta["last_run"],
+            "last_error": meta.get("last_error"),
+        }
 
         # Save runtime state only — last_run/last_error are not written to scheduler.toml
         self._save_state()
@@ -382,6 +428,13 @@ class Scheduler:
                 logger.error("Error processing scheduler command %s: %s", cmd, exc)
 
     def _save_state(self) -> None:
+        # Merge current job states into run_history so history is never lost
+        for tag, meta in self._jobs_meta.items():
+            if meta.get("last_run") or meta.get("last_error"):
+                self._run_history[tag] = {
+                    "last_run": meta.get("last_run"),
+                    "last_error": meta.get("last_error"),
+                }
         state = {
             "jobs": {
                 tag: {
@@ -389,7 +442,8 @@ class Scheduler:
                     "schedule_description": self._describe_schedule(meta),
                 }
                 for tag, meta in self._jobs_meta.items()
-            }
+            },
+            "history": self._run_history,
         }
         tmp = self._state_file + ".tmp"
         try:
@@ -398,6 +452,42 @@ class Scheduler:
             os.replace(tmp, self._state_file)
         except Exception as exc:
             logger.warning("Could not save scheduler state: %s", exc)
+
+    def _load_state(self) -> None:
+        """Load run history from state file and overlay last_run/last_error onto active jobs."""
+        if not os.path.exists(self._state_file):
+            return
+        try:
+            with open(self._state_file) as f:
+                state = json.load(f)
+        except Exception as exc:
+            logger.warning("Could not load scheduler state: %s", exc)
+            return
+
+        # Restore run history (all jobs ever run, including removed ones)
+        self._run_history = state.get("history", {})
+
+        # Fall back to reading history from old-format state (jobs section had last_run)
+        if not self._run_history:
+            for tag, data in state.get("jobs", {}).items():
+                if data.get("last_run") or data.get("last_error"):
+                    self._run_history[tag] = {
+                        "last_run": data.get("last_run"),
+                        "last_error": data.get("last_error"),
+                    }
+
+        # Overlay historical last_run/last_error onto currently active jobs
+        for tag, meta in self._jobs_meta.items():
+            if tag in self._run_history:
+                hist = self._run_history[tag]
+                if hist.get("last_run"):
+                    meta["last_run"] = hist["last_run"]
+                if hist.get("last_error"):
+                    meta["last_error"] = hist["last_error"]
+
+        loaded = len(self._run_history)
+        if loaded:
+            logger.debug("Restored run history for %d jobs from %s", loaded, self._state_file)
 
     def _load_dynamic_jobs(self) -> None:
         """Migration: import old scheduled_jobs.json into TOML, then delete the JSON file."""
@@ -447,6 +537,14 @@ class Scheduler:
         schedule.clear()
         self._jobs_meta = {}
         self._load_config_jobs(self._scheduler_config_path)
+        # Re-overlay run history so last_run/last_error survive a reload
+        for tag, meta in self._jobs_meta.items():
+            if tag in self._run_history:
+                hist = self._run_history[tag]
+                if hist.get("last_run"):
+                    meta["last_run"] = hist["last_run"]
+                if hist.get("last_error"):
+                    meta["last_error"] = hist["last_error"]
         reloaded = 0
         failed = 0
         for tag, meta in self._jobs_meta.items():
