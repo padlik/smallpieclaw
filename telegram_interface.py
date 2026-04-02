@@ -330,9 +330,11 @@ class TelegramInterface:
         generated = [t for t in tools if t.is_generated]
 
         def _tool_entry(t) -> str:
-            # Normalize multi-line descriptions: join lines with a space
+            # Normalize and truncate description
             desc = " ".join(html.escape(t.description).split())
-            return f"  • <code>{html.escape(t.name)}</code>\n    {desc}"
+            if len(desc) > 80:
+                desc = desc[:77] + "…"
+            return f"  • <code>{html.escape(t.name)}</code> — {desc}"
 
         lines = [f"🔧 <b>Available Tools</b> ({len(tools)} total)\n"]
         if builtin:
@@ -361,11 +363,11 @@ class TelegramInterface:
 
         lines = [f"📚 <b>Available Skills</b> ({len(skills)} total)\n"]
         for s in skills:
-            # Normalize multi-line descriptions
+            # Normalize and truncate description
             desc = " ".join(html.escape(s.description).split())
-            lines.append(f"  • <b>{html.escape(s.name)}</b>")
-            lines.append(f"    {desc}")
-            lines.append(f"    <code>{html.escape(s.skill_md_path)}</code>")
+            if len(desc) > 80:
+                desc = desc[:77] + "…"
+            lines.append(f"  • <b>{html.escape(s.name)}</b> — {desc}")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_reindex(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
