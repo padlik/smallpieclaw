@@ -99,6 +99,7 @@ Possible actions:
 Rules:
 - Always try shell / file_read / file_write before proposing a new tool.
 - If the user says "use skill <name>" or the task clearly matches a listed skill, read its SKILL.md first using file_read, then follow the instructions inside.
+- SKILL.md files describe *how* to accomplish tasks using shell commands and other means. Any "tools" or sub-commands mentioned inside a SKILL.md are descriptions of functionality — they are NOT registered tools you can call. Do not call them with {{"action": "tool", ...}}. Use shell or file_read to implement the instructions described in the skill.
 - Use the shell tool for one-off or task-specific scripts — do NOT create a tool for single-use tasks.
 - Propose a new tool ONLY when it would be genuinely reusable across many different scenarios.
 - Tools must follow the UNIX paradigm: one tool, one task. Keep tools compact and composable.

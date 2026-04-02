@@ -50,7 +50,15 @@ class ToolExecutor:
         """
         tool = self.registry.get(tool_name)
         if tool is None:
-            return self._error(f"Tool '{tool_name}' is not registered.")
+            known = ", ".join(sorted(self.registry._registry.keys())) or "none"
+            logger.warning("Tool '%s' is not registered. Known tools: %s", tool_name, known)
+            return self._error(
+                f"Tool '{tool_name}' is not registered. "
+                f"NOTE: names mentioned inside SKILL.md files are capability descriptions, "
+                f"not callable tools — do not try to call them directly. "
+                f"Only call tools from BUILT-IN TOOLS (shell, file_read, file_write, schedule) "
+                f"or AVAILABLE TOOLS. Currently registered tools: [{known}]"
+            )
 
         # Extra path-safety: ensure the resolved path is inside an allowed dir
         if not self._path_is_safe(tool):
