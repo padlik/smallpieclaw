@@ -428,6 +428,15 @@ Disable after diagnosing to keep logs clean.
 
 Typing `/` in Telegram shows the full command list with descriptions (registered via BotFather's `setMyCommands`).
 
+### Hidden diagnostic commands
+
+These commands are not shown in the Telegram menu but are available to authorized users:
+
+| Command | Description |
+|---------|-------------|
+| `/show_ctx` | Download the current LLM system prompt as `context.md` (with estimated token count) |
+| `/show_env` | Show the shell environment the agent runs commands in — all env vars (secrets redacted), PATH entries per line, and configured agent paths |
+
 Or just send a natural language message:
 - *"check disk usage"*
 - *"is Docker running?"*
@@ -515,7 +524,11 @@ The skill will be available on next agent startup (or after `/reset`).
 
 ### Managing skills
 
-- `/skills` — list all available skills with name, description, and file path
+- `/skills` — list all available skills with name and description (truncated to 80 chars)
+
+### Important: skill-described capabilities are not tools
+
+SKILL.md files may describe sub-commands, binary flags, or helper operations using the word "tools". These are **documentation only** — the agent must implement them via `shell`, `file_read`, or other registered tools. The agent will not call names from a SKILL.md as if they were registered tools.
 
 ---
 
