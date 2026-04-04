@@ -19,6 +19,7 @@ import re
 import secrets
 import shutil
 import time
+from datetime import datetime
 from typing import Callable, Optional
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -299,13 +300,21 @@ class TelegramInterface:
         for job in jobs:
             icon = "✅" if job["enabled"] else "⏸"
             last_run = job.get("last_run") or "never"
-            stype = job.get("schedule_type", "interval")
+            next_run = job.get("next_run")
+            stype = job.get("schedule_type", "cron")
             task_label = "🔔 Message" if stype == "once" else "📝 Task"
             task_text = job.get("task", "")
             task_display = html.escape(task_text[:300] + ("…" if len(task_text) > 300 else ""))
             lines.append(f"{icon} <code>{html.escape(job['tag'])}</code>")
             lines.append(f"   Schedule: {html.escape(job['schedule'])}")
             lines.append(f"   Last run: {html.escape(str(last_run))}")
+            if next_run:
+                # Format next_run: strip seconds for readability
+                try:
+                    nr = datetime.fromisoformat(next_run).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    nr = next_run
+                lines.append(f"   Next run: {html.escape(nr)}")
             if job.get("last_error"):
                 lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
             lines.append(f"   {task_label}: {task_display}\n")

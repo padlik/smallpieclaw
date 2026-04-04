@@ -121,13 +121,12 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Manage scheduled jobs and reminders. "
             "Args: action (str: list|add|remove|pause|resume|run_now), "
             "tag (str, unique job name), "
-            "task (str, REQUIRED for add — the natural-language goal or reminder text; "
-            "for once/reminder jobs this is the message delivered to the user, e.g. "
-            "'Remind the user to check the tennis scores'), "
-            "schedule_type (str: daily|interval|once), "
-            "time (HH:MM for daily), run_at (HH:MM for once), "
-            "hours (int), minutes (int), notify (bool, default true). "
-            "Always provide a non-empty task when adding any job."
+            "task (str, REQUIRED for add — the natural-language goal or reminder text), "
+            "cron (str, 5-field cron expression in local time, e.g. '0 */6 * * *' = every 6h, "
+            "'0 2 * * *' = daily at 02:00, '*/30 * * * *' = every 30 min). "
+            "For one-time reminders use schedule_type='once' with run_at='HH:MM'. "
+            "Legacy fields hours/minutes/time are still accepted and auto-converted to cron. "
+            "notify (bool, default true). Always provide a non-empty task when adding any job."
         ),
     ),
 }
@@ -395,13 +394,14 @@ class BuiltinExecutor:
                 return {"success": False, "output": "", "error": "tag is required for add", "exit_code": -1}
             result = self.scheduler.add_job(
                 tag=tag,
-                schedule_type=str(args.get("schedule_type", args.get("schedule", "interval"))),
+                schedule_type=str(args.get("schedule_type", args.get("schedule", "cron"))),
                 task=str(args.get("task", "")),
                 notify=bool(args.get("notify", True)),
                 hours=int(args["hours"]) if args.get("hours") is not None else None,
                 minutes=int(args["minutes"]) if args.get("minutes") is not None else None,
                 time_str=str(args.get("time", "")) or None,
                 run_at=str(args.get("run_at", "")) or None,
+                cron=str(args.get("cron", "")) or None,
             )
             if result["success"]:
                 return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}

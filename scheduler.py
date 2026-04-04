@@ -8,8 +8,14 @@ Job sources:
   - scheduler.toml     static, config-managed jobs
   - data/scheduled_jobs.json  dynamic, runtime-managed jobs
 
-Commands written to data/scheduler_commands.json by manage_scheduler.py
-are picked up on each poll cycle.
+Scheduling uses cron expressions (5-field: minute hour day month weekday).
+Old-style config fields (schedule=daily/interval, time=, hours=, minutes=) are
+automatically migrated to equivalent cron expressions on load.
+
+Examples:
+  cron = "0 2 * * *"     → daily at 02:00
+  cron = "0 */6 * * *"   → every 6 hours (00:00, 06:00, 12:00, 18:00)
+  cron = "*/30 * * * *"  → every 30 minutes
 """
 
 import html as _html
@@ -24,6 +30,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Optional
 
 import schedule
+from croniter import croniter, CroniterBadCronError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +38,35 @@ try:
     import tomli
 except ImportError:
     import tomllib as tomli  # Python 3.11+
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _legacy_to_cron(stype: str, time_str: str = None, hours=None, minutes=None, run_at: str = None) -> Optional[str]:
+    """Convert old schedule_type fields to a cron expression. Returns None for 'once'."""
+    if stype == "once":
+        return None  # handled separately
+    if stype == "daily":
+        t = time_str or "02:00"
+        try:
+            h, m = t.split(":")
+            return f"{int(m)} {int(h)} * * *"
+        except Exception:
+            return "0 2 * * *"
+    if stype == "interval":
+        if hours:
+            h = int(hours)
+            if h == 1:
+                return "0 * * * *"
+            return f"0 */{h} * * *"
+        if minutes:
+            m = int(minutes)
+            if m == 1:
+                return "* * * * *"
+            return f"*/{m} * * * *"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +78,9 @@ class Scheduler:
     Manages recurring background tasks loaded from scheduler.toml and dynamic storage.
     `notify_fn` is called with a message string whenever a task with notify=True completes.
     `agent_fn`  is called with a goal string to invoke the agent for scheduled tasks.
+
+    All repeating jobs use cron expressions (local server time).
+    One-time jobs use schedule_type='once' with a run_at time string (HH:MM).
     """
 
     def __init__(
@@ -134,6 +173,7 @@ class Scheduler:
         minutes=None,
         time_str: str = None,
         run_at: str = None,
+        cron: str = None,
         source: str = "dynamic",
     ) -> dict:
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
@@ -149,23 +189,40 @@ class Scheduler:
             minutes = int(minutes) if minutes is not None else None
         except (ValueError, TypeError):
             minutes = None
+
         if tag in self._jobs_meta:
             return {"success": False, "error": f"Job '{tag}' already exists."}
-        if schedule_type not in ("daily", "interval", "once"):
-            return {"success": False, "error": "schedule_type must be 'daily', 'interval', or 'once'"}
-        if schedule_type == "daily" and not time_str:
-            return {"success": False, "error": "'time' is required for daily jobs (HH:MM)"}
-        if schedule_type == "interval" and not hours and not minutes:
-            return {"success": False, "error": "'hours' or 'minutes' required for interval jobs"}
+
+        # Resolve cron expression
+        if cron:
+            expr = cron.strip()
+            schedule_type = "cron"
+        elif schedule_type == "once":
+            expr = None  # once jobs don't use cron
+        else:
+            # Convert legacy style to cron
+            expr = _legacy_to_cron(schedule_type, time_str, hours, minutes)
+            if not expr:
+                return {"success": False, "error": "Could not determine schedule. Provide a 'cron' expression (e.g. '0 */6 * * *') or legacy fields."}
+            schedule_type = "cron"
+
+        # Validate cron expression
+        if expr:
+            try:
+                croniter(expr)
+            except (CroniterBadCronError, ValueError) as exc:
+                return {"success": False, "error": f"Invalid cron expression '{expr}': {exc}"}
+
+        if schedule_type == "once" and not (run_at or time_str):
+            return {"success": False, "error": "'run_at' (HH:MM) is required for once jobs"}
+
         effective_run_at = run_at or time_str
         meta = {
             "tag": tag,
             "task": task,
             "schedule_type": schedule_type,
-            "time": time_str,
+            "cron": expr,
             "run_at": effective_run_at if schedule_type == "once" else None,
-            "hours": hours,
-            "minutes": minutes,
             "notify": notify,
             "enabled": True,
             "source": source,
@@ -231,11 +288,13 @@ class Scheduler:
             entry = {
                 "tag": tag,
                 "schedule": self._describe_schedule(meta),
-                "schedule_type": meta.get("schedule_type", "interval"),
+                "schedule_type": meta.get("schedule_type", "cron"),
+                "cron": meta.get("cron"),
+                "next_run": meta.get("_next_run"),
                 "enabled": meta.get("enabled", True),
                 "last_run": meta.get("last_run"),
                 "last_error": meta.get("last_error"),
-                "task": meta.get("task", ""),   # full text — display layer truncates
+                "task": meta.get("task", ""),
                 "notify": meta.get("notify", True),
                 "source": meta.get("source", "config"),
             }
@@ -247,61 +306,66 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _describe_schedule(self, meta: dict) -> str:
-        stype = meta.get("schedule_type", "interval")
-        if stype == "daily":
-            return f"daily at {meta.get('time', '?')}"
+        stype = meta.get("schedule_type", "cron")
         if stype == "once":
             run_at = meta.get("run_at") or meta.get("time")
             return f"once at {run_at}" if run_at else "once (ASAP)"
-        hours = meta.get("hours")
-        minutes = meta.get("minutes")
-        if hours:
-            return f"every {hours}h"
-        if minutes:
-            return f"every {minutes}m"
-        return "interval"
+        expr = meta.get("cron", "")
+        if expr:
+            # Append a human hint for common patterns
+            hints = {
+                "0 * * * *": "hourly",
+                "0 0 * * *": "daily at 00:00",
+                "0 2 * * *": "daily at 02:00",
+                "0 3 * * *": "daily at 03:00",
+                "0 */6 * * *": "every 6h",
+                "0 */4 * * *": "every 4h",
+                "0 */12 * * *": "every 12h",
+                "*/30 * * * *": "every 30m",
+            }
+            hint = hints.get(expr)
+            return f"cron: {expr}" + (f" ({hint})" if hint else "")
+        return "cron (no expression)"
 
     # Maximum jitter window: ±5 minutes (in seconds)
     _JITTER_MAX_SECS = 5 * 60
 
     def _register_job(self, tag: str, meta: dict) -> None:
+        """Compute and store the next_run timestamp for cron jobs.
+        Once jobs are registered with the schedule library (HH:MM trigger).
+        """
         schedule.clear(tag)
-        stype = meta.get("schedule_type", "interval")
-        if stype == "daily":
-            t = meta.get("time", "02:00")
-            schedule.every().day.at(t).do(self._run_job, tag=tag).tag(tag)
-        elif stype == "once":
+        stype = meta.get("schedule_type", "cron")
+
+        if stype == "once":
             run_at = meta.get("run_at") or meta.get("time")
             if run_at:
                 schedule.every().day.at(run_at).do(self._run_job, tag=tag).tag(tag)
             else:
                 schedule.every(1).minutes.do(self._run_job, tag=tag).tag(tag)
-        else:
-            hours = meta.get("hours")
-            minutes = meta.get("minutes")
-            if hours:
-                job = schedule.every(hours).hours.do(self._run_job, tag=tag).tag(tag)
-                interval_secs = int(hours) * 3600
-            elif minutes:
-                job = schedule.every(minutes).minutes.do(self._run_job, tag=tag).tag(tag)
-                interval_secs = int(minutes) * 60
-            else:
-                logger.warning("Job '%s' has no interval configured — skipping", tag)
-                return
+            logger.debug("Registered once job: %s at %s", tag, run_at)
+            return
 
-            # Apply ±jitter (capped at 25% of interval or _JITTER_MAX_SECS, whichever is smaller)
-            max_jitter = min(self._JITTER_MAX_SECS, interval_secs // 4)
-            if max_jitter > 0:
-                jitter_secs = random.randint(-max_jitter, max_jitter)
-                job.next_run += timedelta(seconds=jitter_secs)
-                sign = "+" if jitter_secs >= 0 else ""
-                logger.debug(
-                    "Registered job: %s (%s, jitter %s%ds)",
-                    tag, self._describe_schedule(meta), sign, jitter_secs,
-                )
-                return
-
-        logger.debug("Registered job: %s (%s)", tag, self._describe_schedule(meta))
+        # Cron job — compute next_run using local time
+        expr = meta.get("cron")
+        if not expr:
+            logger.warning("Job '%s' has no cron expression — skipping", tag)
+            return
+        try:
+            now_local = datetime.now()
+            cron = croniter(expr, now_local)
+            next_run = cron.get_next(datetime)
+            # Apply ±jitter (capped at _JITTER_MAX_SECS)
+            jitter_secs = random.randint(-self._JITTER_MAX_SECS, self._JITTER_MAX_SECS)
+            next_run += timedelta(seconds=jitter_secs)
+            meta["_next_run"] = next_run.isoformat()
+            sign = "+" if jitter_secs >= 0 else ""
+            logger.debug(
+                "Registered cron job: %s (%s) → next run %s (jitter %s%ds)",
+                tag, expr, next_run.strftime("%Y-%m-%d %H:%M:%S"), sign, jitter_secs,
+            )
+        except Exception as exc:
+            logger.warning("Could not compute next_run for job '%s' (%s): %s", tag, expr, exc)
 
     def _run_job(self, tag: str) -> None:
         meta = self._jobs_meta.get(tag)
@@ -566,21 +630,23 @@ class Scheduler:
         lines = [
             "# scheduler.toml — auto-managed by scheduler\n",
             "# Edit this file to add static jobs; dynamic/user jobs are appended here.\n",
+            "# Schedules use cron expressions (5-field, local server time):\n",
+            "#   minute hour day month weekday\n",
+            "#   Examples: '0 2 * * *' = daily at 02:00, '0 */6 * * *' = every 6h\n",
             "\n",
         ]
         for tag, meta in self._jobs_meta.items():
             lines.append(f"[jobs.{tag}]\n")
             lines.append(f"enabled = {str(meta.get('enabled', True)).lower()}\n")
-            stype = meta.get("schedule_type", "interval")
-            lines.append(f'schedule = "{stype}"\n')
-            if meta.get("time"):
-                lines.append(f'time = "{meta["time"]}"\n')
-            if meta.get("run_at"):
-                lines.append(f'run_at = "{meta["run_at"]}"\n')
-            if meta.get("hours") is not None:
-                lines.append(f"hours = {meta['hours']}\n")
-            if meta.get("minutes") is not None:
-                lines.append(f"minutes = {meta['minutes']}\n")
+            stype = meta.get("schedule_type", "cron")
+            if stype == "once":
+                lines.append('schedule = "once"\n')
+                if meta.get("run_at"):
+                    lines.append(f'run_at = "{meta["run_at"]}"\n')
+            else:
+                lines.append('schedule = "cron"\n')
+                if meta.get("cron"):
+                    lines.append(f'cron = "{meta["cron"]}"\n')
             lines.append(f"task = {_toml_str(meta.get('task', ''))}\n")
             lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
             source = meta.get("source", "config")
@@ -606,42 +672,94 @@ class Scheduler:
             logger.warning("Could not save scheduler.toml: %s", exc)
 
     def _load_config_jobs(self, config_path: str, sched_cfg: dict = None) -> None:
-        """Load all jobs from scheduler.toml. scheduler.toml is the single source of truth."""
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "rb") as f:
-                    toml_data = tomli.load(f)
-                jobs_section = toml_data.get("jobs", {})
-                for tag, job_cfg in jobs_section.items():
-                    stype = job_cfg.get("schedule", "interval")
-                    self._jobs_meta[tag] = {
-                        "tag": tag,
-                        "task": job_cfg.get("task", ""),
-                        "schedule_type": stype,
-                        "time": job_cfg.get("time"),
-                        "run_at": job_cfg.get("run_at"),
-                        "hours": job_cfg.get("hours"),
-                        "minutes": job_cfg.get("minutes"),
-                        "notify": job_cfg.get("notify", True),
-                        "enabled": job_cfg.get("enabled", True),
-                        "source": job_cfg.get("source", "config"),
-                        "last_run": None,
-                        "created_at": job_cfg.get("created_at", datetime.utcnow().isoformat()),
-                    }
-                logger.info("Loaded %d jobs from %s", len(self._jobs_meta), config_path)
-                return
-            except Exception as exc:
-                logger.warning("Could not load %s: %s — starting with no jobs", config_path, exc)
-        else:
+        """Load all jobs from scheduler.toml. Migrates legacy daily/interval fields to cron."""
+        if not os.path.exists(config_path):
             logger.warning(
                 "scheduler.toml not found at %s — no jobs loaded. "
                 "Create the file to configure scheduled jobs.",
                 config_path,
             )
+            return
+        try:
+            with open(config_path, "rb") as f:
+                toml_data = tomli.load(f)
+        except Exception as exc:
+            logger.warning("Could not load %s: %s — starting with no jobs", config_path, exc)
+            return
+
+        jobs_section = toml_data.get("jobs", {})
+        migrated = 0
+        for tag, job_cfg in jobs_section.items():
+            stype = job_cfg.get("schedule", "cron")
+            cron_expr = job_cfg.get("cron")
+
+            # Migrate legacy schedule types to cron
+            if stype in ("daily", "interval") and not cron_expr:
+                cron_expr = _legacy_to_cron(
+                    stype,
+                    time_str=job_cfg.get("time"),
+                    hours=job_cfg.get("hours"),
+                    minutes=job_cfg.get("minutes"),
+                )
+                if cron_expr:
+                    migrated += 1
+                    logger.info(
+                        "Migrated job '%s' from schedule=%s to cron='%s'",
+                        tag, stype, cron_expr,
+                    )
+                stype = "cron"
+
+            self._jobs_meta[tag] = {
+                "tag": tag,
+                "task": job_cfg.get("task", ""),
+                "schedule_type": stype,
+                "cron": cron_expr,
+                "run_at": job_cfg.get("run_at") or job_cfg.get("time") if stype == "once" else None,
+                "notify": job_cfg.get("notify", True),
+                "enabled": job_cfg.get("enabled", True),
+                "source": job_cfg.get("source", "config"),
+                "last_run": None,
+                "created_at": job_cfg.get("created_at", datetime.utcnow().isoformat()),
+            }
+
+        logger.info(
+            "Loaded %d jobs from %s%s",
+            len(self._jobs_meta), config_path,
+            f" ({migrated} migrated to cron)" if migrated else "",
+        )
+        if migrated:
+            # Write back migrated cron expressions
+            self._save_scheduler_toml()
 
     def _run_loop(self) -> None:
-        """Poll the schedule every 30 seconds until stopped."""
+        """Poll every 30 seconds. Fire cron jobs whose next_run has passed; run once-jobs via schedule lib."""
         while not self._stop_event.is_set():
             self._process_pending_commands()
+            # Cron job check (local time)
+            now_local = datetime.now()
+            for tag, meta in list(self._jobs_meta.items()):
+                if not meta.get("enabled", True):
+                    continue
+                if meta.get("schedule_type") not in ("cron", "daily", "interval", None):
+                    continue
+                next_run_str = meta.get("_next_run")
+                if not next_run_str:
+                    continue
+                try:
+                    next_run = datetime.fromisoformat(next_run_str)
+                except Exception:
+                    continue
+                if now_local >= next_run:
+                    # Fire in background thread
+                    threading.Thread(target=self._run_job, kwargs={"tag": tag}, daemon=True).start()
+                    # Schedule next occurrence (no jitter on subsequent runs)
+                    try:
+                        expr = meta.get("cron")
+                        if expr:
+                            cron = croniter(expr, now_local)
+                            meta["_next_run"] = cron.get_next(datetime).isoformat()
+                    except Exception as exc:
+                        logger.warning("Could not compute next_run for '%s': %s", tag, exc)
+            # Once-jobs handled by schedule library
             schedule.run_pending()
             self._stop_event.wait(timeout=30)

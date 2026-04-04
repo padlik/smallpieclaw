@@ -1,38 +1,48 @@
 # scheduler.toml
-# Default scheduled job configurations.
-# Fields per job:
-#   enabled       = true/false
-#   schedule      = "daily" or "interval"
-#   time          = "HH:MM"       (for schedule = "daily")
-#   hours         = N             (for schedule = "interval")
-#   minutes       = N             (for schedule = "interval")
-#   task          = "goal string sent to agent"
-#   notify        = true/false    (send result to Telegram users)
+# Scheduled job configurations.
+#
+# Schedules use 5-field cron expressions (local server time):
+#   cron = "minute hour day month weekday"
+#
+# Common examples:
+#   "0 2 * * *"    → daily at 02:00
+#   "0 */6 * * *"  → every 6 hours (00:00, 06:00, 12:00, 18:00)
+#   "0 */4 * * *"  → every 4 hours
+#   "*/30 * * * *" → every 30 minutes
+#   "0 9 * * 1"    → every Monday at 09:00
+#
+# Other fields per job:
+#   enabled  = true/false
+#   schedule = "cron"        (or "once" for one-time jobs)
+#   cron     = "<expression>"
+#   run_at   = "HH:MM"      (for schedule = "once")
+#   task     = "goal string sent to agent"
+#   notify   = true/false    (send result to Telegram users)
 
 [jobs.nightly_health]
 enabled = true
-schedule = "daily"
-time = "02:00"
+schedule = "cron"
+cron = "0 2 * * *"
 task = "Run a full system health check and summarize the status."
 notify = true
 
 [jobs.disk_check]
 enabled = true
-schedule = "interval"
-hours = 6
+schedule = "cron"
+cron = "0 */6 * * *"
 task = "Check disk usage on all mount points. Alert if any mount point is above 80% full."
 notify = true
 
 [jobs.longterm_memory_update]
 enabled = true
-schedule = "daily"
-time = "03:00"
+schedule = "cron"
+cron = "0 3 * * *"
 task = "Summarize the key events, system findings, and actions taken today into a concise paragraph for long-term memory."
 notify = false
 
 [jobs.agent_health]
 enabled = true
-schedule = "interval"
-hours = 4
-task = "Perform a self-health diagnosis: (1) Read the last 500 lines of agent.log using file_read. (2) Analyze for errors, warnings, repeated failures, and anomalies. (3) Identify root causes and provide actionable suggestions. (4) Rotate the log file by running: mv agent.log agent.log.$(date +%Y%m%d_%H%M%S). (5) Report findings as a structured summary."
+schedule = "cron"
+cron = "0 */4 * * *"
+task = "Perform a self-health diagnosis: (1) Read the last 500 lines of agent.log using file_read. (2) Analyze for errors, warnings, repeated failures, and anomalies. (3) Identify root causes and provide actionable suggestions. (4) Report findings as a structured summary."
 notify = true
