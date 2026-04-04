@@ -14,7 +14,7 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Built-in tools** — `shell`, `file_read`, `file_write`, `file_send`, `schedule` always available; dangerous ops require inline-button confirmation
 - **Secure Telegram bot** — allowlist or pairing-token access control
 - **4-tier memory architecture** — short-term conversation history, working task context, long-term vector knowledge index, and results history
-- **Configurable scheduler** — jobs defined in `scheduler.toml` (auto-updated at runtime); manage jobs from chat or via `/jobs`; supports recurring (daily/interval) and one-time reminders; interval jobs staggered with ±5 min jitter to avoid thundering herd
+- **Configurable scheduler** — jobs defined in `scheduler.toml` (auto-updated at runtime); manage jobs from chat or via `/jobs`; supports cron-style schedules and one-time reminders; jobs staggered with ±5 min jitter to avoid thundering herd
 - **Self-health diagnosis** — `/health` command and automatic 4-hour periodic job: reads log file, analyzes errors, suggests fixes, rotates logs
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
 - **Typing indicator** — Telegram shows "typing…" while the agent is reasoning
@@ -159,38 +159,50 @@ The agent does **not** auto-switch models based on message content. Switch model
 
 ### 6. (Optional) Configure the scheduler
 
-Edit `scheduler.toml` to enable/disable jobs or change their schedule:
+Edit `scheduler.toml` to enable/disable jobs or change their schedule. All schedules use **5-field cron expressions** (local server time):
+
+```
+minute  hour  day  month  weekday
+  0      2     *     *       *     → daily at 02:00
+  0    */6     *     *       *     → every 6 hours (00:00, 06:00, 12:00, 18:00)
+*/30    *      *     *       *     → every 30 minutes
+  0      9     *     *       1     → every Monday at 09:00
+```
 
 ```toml
 [jobs.nightly_health]
 enabled = true
-schedule = "daily"
-time = "02:00"
+schedule = "cron"
+cron = "0 2 * * *"
 task = "Run a full system health check and summarize the status."
 notify = true
 
 [jobs.disk_check]
 enabled = true
-schedule = "interval"
-hours = 6
+schedule = "cron"
+cron = "0 */6 * * *"
 task = "Check disk usage on all mount points. Alert if any mount point is above 80% full."
 notify = true
 
 [jobs.longterm_memory_update]
 enabled = true
-schedule = "daily"
-time = "03:00"
+schedule = "cron"
+cron = "0 3 * * *"
 task = "Summarize the key events and findings from today into long-term memory."
 notify = false
 ```
 
-You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `schedule` built-in tool), or use `/jobs` to see all active jobs.
+For one-time reminders, use `schedule = "once"` with `run_at = "HH:MM"` — auto-removed after execution.
+
+You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `schedule` built-in tool), or use `/jobs` to see all active jobs and next scheduled run times.
 
 Scheduler features:
 - **`scheduler.toml` is the single source of truth** — all jobs (including user-added reminders) live in this file; no hardcoded defaults exist in code
-- **Recurring jobs**: `daily` (at a fixed time) or `interval` (every N hours/minutes)
+- **Cron scheduling**: all recurring jobs use 5-field cron expressions (local server time) via `croniter`
+- **Backward compatibility**: old `schedule = "daily"` / `schedule = "interval"` configs are automatically migrated to cron on first load
 - **One-time reminders**: `once` type with `run_at = "HH:MM"` — auto-removed after execution
-- **Jitter**: interval jobs get a random ±5 min offset at startup to avoid thundering herd when multiple jobs share the same interval
+- **Next-run visibility**: `/jobs` shows the next scheduled run time for each job
+- **Jitter**: a random ±5 min offset is applied to the first run of each cron job to avoid thundering herd
 - **Persistence**: every structural change (add/remove/enable/disable) writes back to `scheduler.toml` — survives crashes and restarts
 - **Run history**: `scheduler_state.json` stores `last_run` and `last_error` for every job ever executed (including removed and one-time jobs); history is restored on restart and survives `/jobs reload`
 - **Tag resolution**: job tags are normalized (spaces, hyphens, and underscores are interchangeable), so `longterm-memory-update` and `longterm_memory_update` refer to the same job
