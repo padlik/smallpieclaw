@@ -91,11 +91,13 @@ class Scheduler:
         scheduler_config_path: str = "scheduler.toml",
         data_dir: str = "data",
         long_term_memory=None,
+        builtin_executor=None,
     ):
         sched_cfg = config.get("scheduler", {})
         self.enabled: bool = sched_cfg.get("enabled", True)
         self.notify = notify_fn
         self.agent = agent_fn
+        self.builtin_executor = builtin_executor  # Optional[BuiltinExecutor]
         self.long_term_memory = long_term_memory
         self._data_dir = data_dir
         self._scheduler_config_path = scheduler_config_path
@@ -107,6 +109,10 @@ class Scheduler:
         self._run_history: dict = {}  # tag → {last_run, last_error} — persisted forever
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+
+        # Overlap detection: tracks tags of currently executing jobs
+        self._running_jobs: set = set()
+        self._running_lock = threading.Lock()
 
         os.makedirs(data_dir, exist_ok=True)
         self._load_config_jobs(scheduler_config_path, sched_cfg)
@@ -175,6 +181,10 @@ class Scheduler:
         run_at: str = None,
         cron: str = None,
         source: str = "dynamic",
+        model: str = None,
+        preserve_context: bool = False,
+        context_max_messages: int = 50,
+        overlap_policy: str = "skip",
     ) -> dict:
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
         tag = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
@@ -229,6 +239,14 @@ class Scheduler:
             "last_run": None,
             "created_at": datetime.utcnow().isoformat(),
         }
+        if model:
+            meta["model"] = model
+        if preserve_context:
+            meta["preserve_context"] = preserve_context
+            meta["context_max_messages"] = context_max_messages
+        if overlap_policy != "skip":
+            meta["overlap_policy"] = overlap_policy
+
         self._jobs_meta[tag] = meta
         self._save_state()
         self._save_scheduler_toml()
@@ -283,6 +301,8 @@ class Scheduler:
         return {"success": True}
 
     def list_jobs(self) -> list:
+        with self._running_lock:
+            running = set(self._running_jobs)
         result = []
         for tag, meta in self._jobs_meta.items():
             entry = {
@@ -297,6 +317,9 @@ class Scheduler:
                 "task": meta.get("task", ""),
                 "notify": meta.get("notify", True),
                 "source": meta.get("source", "config"),
+                "model": meta.get("model"),
+                "preserve_context": meta.get("preserve_context", False),
+                "is_running": tag in running,
             }
             result.append(entry)
         return result
@@ -367,10 +390,28 @@ class Scheduler:
         except Exception as exc:
             logger.warning("Could not compute next_run for job '%s' (%s): %s", tag, expr, exc)
 
+    def _mark_job_finished(self, tag: str) -> None:
+        """Called by sub-agent thread when a scheduled job's sub-agent completes."""
+        with self._running_lock:
+            self._running_jobs.discard(tag)
+
     def _run_job(self, tag: str) -> None:
         meta = self._jobs_meta.get(tag)
         if not meta or not meta.get("enabled", True):
             return
+
+        # Overlap detection
+        overlap_policy = meta.get("overlap_policy", "skip")
+        with self._running_lock:
+            if tag in self._running_jobs:
+                if overlap_policy == "skip":
+                    logger.warning(
+                        "Job '%s' skipped — previous run still in progress (policy: skip)", tag
+                    )
+                    return
+                # else: parallel — allow multiple instances
+            self._running_jobs.add(tag)
+
         task = meta.get("task", "").strip()
         logger.info("Running scheduled job: %s", tag)
         now = datetime.utcnow().isoformat()
@@ -383,6 +424,8 @@ class Scheduler:
             meta["last_run"] = now
             self._run_history[tag] = {"last_run": now, "last_error": None}
             self._save_state()
+            with self._running_lock:
+                self._running_jobs.discard(tag)
             if is_once:
                 schedule.clear(tag)
                 self._jobs_meta.pop(tag, None)
@@ -392,6 +435,50 @@ class Scheduler:
                 self.notify(f"🔔 <b>Reminder:</b> {_html.escape(friendly)}")
             return
 
+        # Prefer spawn_agent via builtin_executor if available
+        if self.builtin_executor is not None and hasattr(self.builtin_executor, '_exec_spawn_agent'):
+            # Register finish callback so _running_jobs is cleaned up
+            self.builtin_executor._scheduler_finish_cb = self._mark_job_finished
+
+            job_model = meta.get("model") or None
+            preserve_ctx = meta.get("preserve_context", False)
+            ctx_max = meta.get("context_max_messages", 50)
+            context_key = tag if preserve_ctx else None
+
+            spawn_args = {"task": task}
+            if job_model:
+                spawn_args["model"] = job_model
+            if context_key:
+                spawn_args["context_key"] = context_key
+
+            # Update last_run before spawning (we know it started)
+            meta["last_run"] = now
+            self._run_history.setdefault(tag, {})["last_run"] = now
+            self._save_state()
+
+            result = self.builtin_executor._exec_spawn_agent(spawn_args)
+            if not result.get("success"):
+                logger.error("Job '%s' spawn failed: %s", tag, result.get("error"))
+                meta["last_error"] = result.get("error", "spawn failed")
+                self._run_history[tag]["last_error"] = meta["last_error"]
+                self._save_state()
+                # Always notify on error
+                self.notify(
+                    f"⚠️ <b>Job {_html.escape(tag)} failed to spawn</b>\n{_html.escape(str(meta['last_error']))}"
+                )
+                with self._running_lock:
+                    self._running_jobs.discard(tag)
+            else:
+                # _running_jobs will be cleaned up by _mark_job_finished callback
+                # Auto-remove once jobs (spawn_agent will still deliver result)
+                if is_once:
+                    schedule.clear(tag)
+                    self._jobs_meta.pop(tag, None)
+                    self._save_state()
+                    self._save_scheduler_toml()
+            return
+
+        # Fallback: direct agent_fn call (legacy / no builtin_executor)
         result = ""
         error_occurred = False
         try:
@@ -399,28 +486,26 @@ class Scheduler:
                 result = self.agent(task)
             else:
                 result = "Agent not available for task."
-            # Agent may return an error string (starts with ❌) — treat as error
             if result.startswith("❌"):
                 error_occurred = True
         except Exception as exc:
             logger.error("Job '%s' failed: %s", tag, exc)
             result = f"Job failed: {exc}"
             error_occurred = True
+        finally:
+            with self._running_lock:
+                self._running_jobs.discard(tag)
 
-        # Always update last_run (regardless of success/failure)
         meta["last_run"] = now
         if error_occurred:
             meta["last_error"] = result
         else:
             meta.pop("last_error", None)
 
-        # Persist to run history (survives job removal and restarts)
         self._run_history[tag] = {
             "last_run": meta["last_run"],
             "last_error": meta.get("last_error"),
         }
-
-        # Save runtime state only — last_run/last_error are not written to scheduler.toml
         self._save_state()
 
         if error_occurred:
@@ -649,6 +734,15 @@ class Scheduler:
                     lines.append(f'cron = "{meta["cron"]}"\n')
             lines.append(f"task = {_toml_str(meta.get('task', ''))}\n")
             lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
+            if meta.get("model"):
+                lines.append(f'model = "{meta["model"]}"\n')
+            if meta.get("preserve_context"):
+                lines.append(f'preserve_context = true\n')
+                ctx_max = meta.get("context_max_messages", 50)
+                if ctx_max != 50:
+                    lines.append(f'context_max_messages = {ctx_max}\n')
+            if meta.get("overlap_policy", "skip") != "skip":
+                lines.append(f'overlap_policy = "{meta["overlap_policy"]}"\n')
             source = meta.get("source", "config")
             if source != "config":
                 lines.append(f'source = "{source}"\n')
@@ -720,6 +814,10 @@ class Scheduler:
                 "source": job_cfg.get("source", "config"),
                 "last_run": None,
                 "created_at": job_cfg.get("created_at", datetime.utcnow().isoformat()),
+                "model": job_cfg.get("model") or None,
+                "preserve_context": bool(job_cfg.get("preserve_context", False)),
+                "context_max_messages": int(job_cfg.get("context_max_messages", 50)),
+                "overlap_policy": job_cfg.get("overlap_policy", "skip"),
             }
 
         logger.info(

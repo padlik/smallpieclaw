@@ -11,13 +11,17 @@
 #   "*/30 * * * *" → every 30 minutes
 #   "0 9 * * 1"    → every Monday at 09:00
 #
-# Other fields per job:
-#   enabled  = true/false
-#   schedule = "cron"        (or "once" for one-time jobs)
-#   cron     = "<expression>"
-#   run_at   = "HH:MM"      (for schedule = "once")
-#   task     = "goal string sent to agent"
-#   notify   = true/false    (send result to Telegram users)
+# Fields per job:
+#   enabled              = true/false
+#   schedule             = "cron"        (or "once" for one-time jobs)
+#   cron                 = "<expression>"
+#   run_at               = "HH:MM"       (for schedule = "once")
+#   task                 = "goal string sent to agent"
+#   notify               = true/false    (send result to Telegram users)
+#   model                = "<model>"     (optional: override background_model for this job)
+#   preserve_context     = true/false    (keep ShortTermMemory between runs; default: false)
+#   context_max_messages = N             (sliding window size when preserve_context=true; default: 50)
+#   overlap_policy       = "skip"|"parallel"  (what to do if previous run is still active; default: skip)
 
 [jobs.nightly_health]
 enabled = true
@@ -46,3 +50,7 @@ schedule = "cron"
 cron = "0 */4 * * *"
 task = "Perform a self-health diagnosis: (1) Read the last 500 lines of agent.log using file_read. (2) Analyze for errors, warnings, repeated failures, and anomalies. (3) Identify root causes and provide actionable suggestions. (4) Report findings as a structured summary."
 notify = true
+# Use a smarter model for deep log analysis; preserve context to track trends over time
+# model = "claude-3-5-sonnet-20241022"
+# preserve_context = true
+# context_max_messages = 50

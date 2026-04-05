@@ -107,13 +107,14 @@ try:
 except ImportError:
     import tomllib as tomli  # Python 3.11+
 
-from agent_controller import AgentController
-from builtin_executor import BuiltinExecutor
+from agent_controller import AgentController, SubAgentRunner
+from builtin_executor import BuiltinExecutor, _load_context
 from llm_client import LLMClient
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory
 from scheduler import Scheduler
 from skill_registry import SkillRegistry
 from telegram_interface import TelegramInterface
+from token_usage import get_registry as get_token_registry
 from tool_creator import ToolCreator
 from tool_executor import ToolExecutor
 from tool_index import ToolIndex
@@ -172,10 +173,10 @@ def main():
 
     logger.info("Initialising components...")
 
-    llm      = LLMClient(cfg)
+    llm      = LLMClient(cfg, usage_registry=get_token_registry())
     memory   = MemoryStore(memory_path)
     registry = ToolRegistry(tools_dirs=[tools_dir, gen_tools_dir])
-    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output)
+    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output, data_dir=data_dir)
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
     creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)
@@ -227,11 +228,72 @@ def main():
         if _tg_holder[0] is not None:
             _tg_holder[0].send_message_to_users(msg)
 
+    # Resolve background_model for sub-agents
+    background_model_id = agent_cfg.get("background_model") or agent_cfg.get("default_model", "")
+    all_models = cfg.get("models", [])
+    background_model_cfg = next(
+        (m for m in all_models if m.get("model") == background_model_id),
+        all_models[0] if all_models else {},
+    )
+    if background_model_id and background_model_cfg.get("model") != background_model_id:
+        logger.warning(
+            "background_model '%s' not found in [[models]]. Falling back to '%s'.",
+            background_model_id,
+            background_model_cfg.get("model", "none"),
+        )
+
+    def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None):
+        """Create an isolated SubAgentRunner with the requested model override."""
+        # Resolve model config
+        if model:
+            model_cfg = next((m for m in all_models if m.get("model") == model), None)
+            if model_cfg is None:
+                raise ValueError(
+                    f"Model '{model}' not found in [[models]]. "
+                    f"Available: {[m.get('model') for m in all_models]}"
+                )
+        else:
+            model_cfg = background_model_cfg
+
+        ctx_max_turns = 50
+        pre_loaded_ctx = None
+        if context_key:
+            pre_loaded_ctx = _load_context(context_key, data_dir, max_turns=ctx_max_turns)
+
+        runner = SubAgentRunner(
+            model_cfg=model_cfg,
+            config=cfg,
+            tool_index=index,
+            executor=executor,
+            creator=creator,
+            base_memory=memory,
+            builtin_executor=builtin,
+            skill_registry=skills,
+            long_term=long_term,
+            results=results_mem,
+            short_term=pre_loaded_ctx,
+            notify_fn=notify_fn or notify,
+            context_key=context_key,
+            label=label,
+            max_iterations=max_iter,
+            top_tools=top_tools,
+            ctx_max_tokens=ctx_max_tokens,
+            tmp_dir=tmp_dir,
+            downloads_dir=downloads_dir,
+            usage_registry=get_token_registry(),
+            depth=1,
+        )
+        return runner
+
+    # Wire sub_agent_factory into builtin executor
+    builtin._sub_agent_factory = sub_agent_factory
+
     scheduler = Scheduler(
-        cfg, notify_fn=notify, agent_fn=run_agent,
+        cfg, notify_fn=notify,
         scheduler_config_path=scheduler_config_path,
         data_dir=data_dir,
         long_term_memory=long_term,
+        builtin_executor=builtin,
     )
     builtin.scheduler = scheduler  # wire scheduler into built-in tool
 
@@ -244,6 +306,7 @@ def main():
         llm_client=llm,
         tool_index=index,
         skill_registry=skills,
+        usage_registry=get_token_registry(),
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
     _tg_holder[0] = tg

@@ -150,7 +150,12 @@ class LLMClient:
       Set agent.default_model to the 'model' value of the entry to use by default.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, usage_registry=None):
+        """
+        Args:
+            config: full agent config dict
+            usage_registry: optional TokenUsageRegistry for cross-instance token aggregation
+        """
         self.cfg = config
 
         # Require [[models]] — no legacy [llm] fallback
@@ -199,10 +204,13 @@ class LLMClient:
             config.get("agent", {}).get("diagnose_empty_responses", False)
         )
 
-        # Daily token usage tracking
+        # Daily token usage tracking (per-instance)
         self._usage_date: date = date.today()
         self._prompt_tokens: int = 0
         self._completion_tokens: int = 0
+
+        # Cross-instance token registry (shared across main + sub-agents)
+        self._usage_registry = usage_registry
 
     # ------------------------------------------------------------------
     # Multi-model API
@@ -266,6 +274,10 @@ class LLMClient:
             self._completion_tokens = 0
         self._prompt_tokens += prompt
         self._completion_tokens += completion
+        # Also record in the shared cross-instance registry
+        if self._usage_registry is not None:
+            model_name = self._models[self._active_idx].get("model", "unknown")
+            self._usage_registry.record(model_name, prompt, completion)
 
     def get_today_usage(self) -> dict:
         return {

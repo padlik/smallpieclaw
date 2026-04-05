@@ -64,16 +64,16 @@ RELEVANT PAST RESULTS:
 {past_results}
 
 BUILT-IN TOOLS (always available — prefer these before creating new tools):
-  shell      — execute any shell command on the host system
-  file_read  — read a file from the filesystem
-  file_write — write content to a file on the filesystem
-  schedule   — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
+  shell       — execute any shell command on the host system
+  file_read   — read a file from the filesystem
+  file_write  — write content to a file on the filesystem
+  schedule    — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
+  spawn_agent — spawn an isolated sub-agent in the background for long-running or model-specific tasks
 
 AVAILABLE TOOLS:
 {tools}
 
-{skills_section}
-FILE STORAGE:
+{skills_section}{models_section}FILE STORAGE:
 {file_storage}
 
 RESPONSE FORMAT — CRITICAL:
@@ -145,6 +145,8 @@ class AgentController:
         skill_registry=None,   # Optional[SkillRegistry]
         tmp_dir: str = "/tmp/agent",
         downloads_dir: str = "downloads",
+        cancel_event: Optional[threading.Event] = None,
+        depth: int = 0,
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -162,6 +164,8 @@ class AgentController:
         self.skill_registry = skill_registry
         self.tmp_dir = tmp_dir
         self.downloads_dir = downloads_dir
+        self._cancel_event = cancel_event
+        self._depth = depth
 
         # Confirmation state: token -> threading.Event and result holder
         self._confirm_events: dict[str, threading.Event] = {}
@@ -205,6 +209,7 @@ class AgentController:
         short_term_text = self.short_term.as_prompt_text() if self.short_term else "No recent conversation."
         past_results_text = self.results.as_prompt_text(user_goal, top_k=2) if self.results else "No past results."
         skills_section = self._format_skills()
+        models_section = self._format_models()
         file_storage = (
             f"- Temporary files (downloads, intermediate outputs, anything only needed for this task):\n"
             f"    {self.tmp_dir}  ← cleaned by OS on reboot\n"
@@ -221,6 +226,7 @@ class AgentController:
             past_results=past_results_text,
             tools=tools_text,
             skills_section=skills_section,
+            models_section=models_section,
             file_storage=file_storage,
         )
         messages: list[dict] = [{"role": "user", "content": user_goal}]
@@ -233,6 +239,11 @@ class AgentController:
 
         while True:  # outer loop: allows step-count extension by user
             while step < max_steps:
+                # Cooperative cancellation check (sub-agents)
+                if self._cancel_event and self._cancel_event.is_set():
+                    logger.warning("Agent cancelled at step %d/%d", step, max_steps)
+                    return "[Cancelled]"
+
                 step += 1
                 logger.info("Agent step %d/%d", step, max_steps)
                 _progress(f"⚙️ Thinking… (step {step})")
@@ -503,6 +514,7 @@ class AgentController:
         short_term_text = self.short_term.as_prompt_text() if self.short_term else "No recent conversation."
         past_results_text = self.results.as_prompt_text(user_goal, top_k=2) if self.results else "No past results."
         skills_section = self._format_skills()
+        models_section = self._format_models()
         file_storage = (
             f"- Temporary files:\n    {self.tmp_dir}\n"
             f"- Permanent downloads:\n    {self.downloads_dir}"
@@ -513,6 +525,7 @@ class AgentController:
             past_results=past_results_text,
             tools=tools_text,
             skills_section=skills_section,
+            models_section=models_section,
             file_storage=file_storage,
         )
         return prompt, _estimate_tokens(prompt)
@@ -617,6 +630,37 @@ class AgentController:
             lines.append(f"    {s.description}")
         lines.append("")
         return "\n".join(lines)
+
+    def _format_models(self) -> str:
+        """Return the AVAILABLE MODELS prompt section listing all configured models."""
+        try:
+            models = self.llm._models
+        except AttributeError:
+            return ""
+        if not models:
+            return ""
+        active_model = self.llm.llm_cfg.get("model", "")
+        lines = ["AVAILABLE MODELS (use the 'model' parameter in spawn_agent to select):"]
+        for m in models:
+            name = m.get("name", "")
+            model_id = m.get("model", "")
+            hint = m.get("hint", "")
+            marker = " ← active" if model_id == active_model else ""
+            hint_str = f"  [{hint}]" if hint else ""
+            display = f"  {model_id}"
+            if name:
+                display += f" ({name})"
+            display += hint_str + marker
+            lines.append(display)
+        lines.append("")
+        return "\n".join(lines) + "\n"
+
+    def list_models(self) -> list[dict]:
+        """Return all configured models as a list of dicts."""
+        try:
+            return list(self.llm._models)
+        except AttributeError:
+            return []
 
     @staticmethod
     def _fmt_tool_call(tool_name: str, args: dict) -> str:
@@ -751,3 +795,130 @@ class AgentController:
 
         return None
 
+
+
+# ---------------------------------------------------------------------------
+# SubAgentRunner
+# ---------------------------------------------------------------------------
+
+class SubAgentRunner:
+    """
+    An isolated agent instance for background task execution.
+
+    Each runner has its own LLMClient, ShortTermMemory, and WorkingMemory.
+    It shares ToolIndex, ToolExecutor, ToolCreator, BuiltinExecutor,
+    SkillRegistry, LongTermMemory, and ResultsMemory with the main agent.
+
+    Results are delivered via notify_fn (Telegram) and written to long_term memory.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_cfg: dict,              # single [[models]] entry dict
+        config: dict,                 # full agent config (for LLMClient)
+        tool_index,                   # ToolIndex (shared)
+        executor,                     # ToolExecutor (shared)
+        creator,                      # ToolCreator (shared)
+        base_memory,                  # MemoryStore (shared long-term facts)
+        builtin_executor,             # BuiltinExecutor (shared)
+        skill_registry=None,          # SkillRegistry (shared)
+        long_term=None,               # LongTermMemory (shared)
+        results=None,                 # ResultsMemory (shared)
+        short_term=None,              # ShortTermMemory — pre-loaded context (optional)
+        notify_fn=None,               # Callable[[str], None]
+        context_key: str = None,      # for context persistence
+        label: str = "on-demand",     # label for logging/display
+        max_iterations: int = 8,
+        top_tools: int = 3,
+        ctx_max_tokens: int = 90_000,
+        tmp_dir: str = "/tmp/agent",
+        downloads_dir: str = "downloads",
+        usage_registry=None,          # TokenUsageRegistry
+        depth: int = 1,
+    ):
+        import uuid
+        from memory_store import ShortTermMemory, WorkingMemory
+
+        self.agent_id = "sa-" + uuid.uuid4().hex[:6]
+        self.label = label
+        self.context_key = context_key
+        self.notify_fn = notify_fn or (lambda msg: None)
+        self._log = logging.getLogger("agent").getChild(f"sub.{label}")
+
+        # Build a sub-config that uses the overridden model as default
+        sub_config = dict(config)
+        # Place the chosen model first so it becomes default
+        other_models = [m for m in config.get("models", []) if m.get("model") != model_cfg.get("model")]
+        sub_config["models"] = [model_cfg] + other_models
+        agent_section = dict(config.get("agent", {}))
+        agent_section["default_model"] = model_cfg.get("model", "")
+        sub_config["agent"] = agent_section
+
+        self._cancel_event = threading.Event()
+
+        # Own LLM instance with model override + shared token registry
+        self._llm = LLMClient(sub_config, usage_registry=usage_registry)
+
+        # Own blank memory (working context for this task)
+        self._short_term = short_term if short_term is not None else ShortTermMemory()
+        self._working = WorkingMemory()
+
+        # Build the isolated AgentController — headless (no confirm callbacks)
+        self._agent = AgentController(
+            llm=self._llm,
+            tool_index=tool_index,
+            executor=executor,
+            creator=creator,
+            memory=base_memory,
+            max_iterations=max_iterations,
+            top_tools=top_tools,
+            ctx_max_tokens=ctx_max_tokens,
+            short_term=self._short_term,
+            working=self._working,
+            long_term=long_term,
+            results=results,
+            builtin_executor=builtin_executor,
+            skill_registry=skill_registry,
+            tmp_dir=tmp_dir,
+            downloads_dir=downloads_dir,
+            cancel_event=self._cancel_event,
+            depth=depth,
+        )
+
+        self._model_id = model_cfg.get("model", "unknown")
+
+    # ------------------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Signal cooperative cancellation. Takes effect between iterations."""
+        self._cancel_event.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def run(self, task: str) -> str:
+        """
+        Run the sub-agent synchronously in the calling thread.
+        Returns the final result string (or an error/cancellation message).
+        Should be called from a background thread.
+        """
+        import time
+        start = time.time()
+        self._log.info(
+            "Starting (model: %s, context_key: %s)",
+            self._model_id,
+            self.context_key or "none",
+        )
+        try:
+            result = self._agent.run(task)
+            elapsed = time.time() - start
+            self._log.info("Done in %.1fs | model: %s", elapsed, self._model_id)
+            return result
+        except Exception as exc:
+            elapsed = time.time() - start
+            self._log.error(
+                "Failed after %.1fs: %s", elapsed, exc, exc_info=True
+            )
+            raise

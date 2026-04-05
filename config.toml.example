@@ -71,6 +71,9 @@ max_output_size = 4000
 top_tools      = 3
 # Must match the 'model' field of one [[models]] entry.
 default_model  = "gpt-4o-mini"
+# Model used by sub-agents (scheduled jobs and spawn_agent tool).
+# Must match the 'model' field of a [[models]] entry. Defaults to default_model if not set.
+# background_model = "gpt-4o-mini"
 # Maximum estimated context tokens per LLM request (4 chars ≈ 1 token).
 # When 85% is reached the agent auto-summarises older messages before the next call.
 ctx_max_tokens = 90000

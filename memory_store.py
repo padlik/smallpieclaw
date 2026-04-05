@@ -152,6 +152,23 @@ class ShortTermMemory:
     def clear(self) -> None:
         self._buffer.clear()
 
+    def to_dict(self) -> list:
+        """Serialise message buffer to a JSON-serialisable list."""
+        return list(self._buffer)
+
+    @classmethod
+    def from_dict(cls, data: list, max_turns: int = 20) -> "ShortTermMemory":
+        """Deserialise from a list of {role, content} dicts.
+
+        Silently ignores malformed entries so a corrupted context file
+        does not crash the sub-agent.
+        """
+        obj = cls(max_turns=max_turns)
+        for msg in data:
+            if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                obj._buffer.append({"role": str(msg["role"]), "content": str(msg["content"])})
+        return obj
+
 
 # ---------------------------------------------------------------------------
 # WorkingMemory

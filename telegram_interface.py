@@ -52,6 +52,7 @@ class TelegramInterface:
         llm_client=None,
         tool_index=None,
         skill_registry=None,
+        usage_registry=None,
     ):
         tg_cfg = config["telegram"]
         self._config = config
@@ -67,6 +68,7 @@ class TelegramInterface:
         self.llm_client = llm_client
         self._tool_index = tool_index
         self.skill_registry = skill_registry
+        self._usage_registry = usage_registry  # TokenUsageRegistry
         self._start_time = time.time()
 
         # Pairing state: {token: user_id}
@@ -118,11 +120,12 @@ class TelegramInterface:
             BotCommand("start", "Introduction and usage examples"),
             BotCommand("help", "Help and command reference"),
             BotCommand("status", "Agent status, uptime, and token usage"),
-        BotCommand("health", "Run self-health diagnosis"),
+            BotCommand("health", "Run self-health diagnosis"),
             BotCommand("tools", "List available tools"),
             BotCommand("skills", "List available agent skills"),
             BotCommand("models", "List and switch LLM models"),
             BotCommand("jobs", "List scheduled jobs"),
+            BotCommand("agents", "List and manage active sub-agents"),
             BotCommand("reset", "Save and clear current task context"),
             BotCommand("reindex", "Re-embed all tools in the semantic index"),
             BotCommand("pair", "Generate or submit pairing token"),
@@ -154,6 +157,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("pair", self._cmd_pair))
         app.add_handler(CommandHandler("unpair", self._cmd_unpair))
         app.add_handler(CommandHandler("myid", self._cmd_myid))
+        app.add_handler(CommandHandler("agents", self._cmd_agents))
         # Hidden diagnostic commands (not registered with BotFather)
         app.add_handler(CommandHandler("show_ctx", self._cmd_show_ctx))
         app.add_handler(CommandHandler("show_env", self._cmd_show_env))
@@ -225,8 +229,33 @@ class TelegramInterface:
         tools_count = len(self.tool_registry.all()) if self.tool_registry else 0
         skills_count = self.skill_registry.count() if self.skill_registry else 0
 
+        # Sub-agent count
+        from sub_agent_registry import get_registry as _get_agents
+        active_agents = _get_agents().count()
+        agents_line = f"\n🤖 Sub-agents: {active_agents} running" if active_agents > 0 else ""
+
+        # Per-model token usage from shared registry
         token_line = ""
-        if self.llm_client:
+        if self._usage_registry:
+            today_usage = self._usage_registry.get_today()
+            if today_usage:
+                rows = []
+                max_model_len = max(len(m) for m in today_usage) if today_usage else 10
+                col = max(max_model_len, 10)
+                for model_name, u in sorted(today_usage.items()):
+                    pad = col - len(model_name)
+                    rows.append(
+                        f"  {html.escape(model_name)}{' ' * pad}  "
+                        f"{u['prompt']:,} + {u['completion']:,} = {u['total']:,}"
+                    )
+                totals = self._usage_registry.get_today_totals()
+                rows.append(
+                    f"  {'─' * (col + 2)}\n"
+                    f"  {'Total':<{col}}  "
+                    f"{totals['prompt']:,} + {totals['completion']:,} = {totals['total']:,}"
+                )
+                token_line = "\n📊 <b>Token Usage Today (prompt + completion = total):</b>\n<pre>" + "\n".join(rows) + "</pre>"
+        elif self.llm_client:
             usage = self.llm_client.get_today_usage()
             token_line = (
                 f"\n📊 <b>Token Usage Today:</b>\n"
@@ -243,6 +272,7 @@ class TelegramInterface:
             f"🔐 Security: <code>{html.escape(self.security_mode)}</code>\n"
             f"👥 Authorized users: {len(self.allowed_ids)}\n"
             f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
+            f"{agents_line}"
             f"{token_line}",
             parse_mode=ParseMode.HTML,
         )
@@ -298,28 +328,93 @@ class TelegramInterface:
 
         lines = [f"📅 <b>Scheduled Jobs</b> ({len(jobs)} total)\n"]
         for job in jobs:
-            icon = "✅" if job["enabled"] else "⏸"
+            is_running = job.get("is_running", False)
+            if is_running:
+                icon = "🔄"
+            elif job["enabled"]:
+                icon = "✅"
+            else:
+                icon = "⏸"
             last_run = job.get("last_run") or "never"
             next_run = job.get("next_run")
             stype = job.get("schedule_type", "cron")
             task_label = "🔔 Message" if stype == "once" else "📝 Task"
             task_text = job.get("task", "")
             task_display = html.escape(task_text[:300] + ("…" if len(task_text) > 300 else ""))
-            lines.append(f"{icon} <code>{html.escape(job['tag'])}</code>")
+            tag_line = f"{icon} <code>{html.escape(job['tag'])}</code>"
+            if is_running:
+                tag_line += " <i>[running]</i>"
+            lines.append(tag_line)
             lines.append(f"   Schedule: {html.escape(job['schedule'])}")
             lines.append(f"   Last run: {html.escape(str(last_run))}")
             if next_run:
-                # Format next_run: strip seconds for readability
                 try:
                     nr = datetime.fromisoformat(next_run).strftime("%Y-%m-%d %H:%M")
                 except Exception:
                     nr = next_run
                 lines.append(f"   Next run: {html.escape(nr)}")
+            if job.get("model"):
+                lines.append(f"   Model: <code>{html.escape(job['model'])}</code>")
+            if job.get("preserve_context"):
+                lines.append("   🧠 Context: preserved between runs")
             if job.get("last_error"):
                 lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
             lines.append(f"   {task_label}: {task_display}\n")
 
         lines.append("<i>Tip: /jobs reload to reload scheduler.toml</i>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    async def _cmd_agents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+
+        from sub_agent_registry import get_registry as _get_agent_registry
+
+        args = ctx.args or []
+
+        # /agents cancel <id>
+        if args and args[0].lower() == "cancel":
+            agent_id = args[1] if len(args) > 1 else ""
+            if not agent_id:
+                await update.message.reply_text("Usage: /agents cancel <id>")
+                return
+            ok = _get_agent_registry().cancel(agent_id)
+            if ok:
+                await update.message.reply_text(
+                    f"🛑 Cancellation requested for <code>{html.escape(agent_id)}</code>.\n"
+                    f"The sub-agent will stop at the next iteration boundary.",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ No active sub-agent with id <code>{html.escape(agent_id)}</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+
+        active = _get_agent_registry().list_active()
+        if not active:
+            await update.message.reply_text(
+                "🤖 No sub-agents currently running.\n"
+                "<i>Tip: /agents cancel <id> to cancel a running agent</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        lines = [f"🤖 <b>Active Sub-Agents</b> ({len(active)})\n"]
+        for rec in active:
+            source_label = "📅 scheduled" if rec.source == "scheduled" else "💬 on-demand"
+            lines.append(f"<code>{html.escape(rec.agent_id)}</code> [{source_label}]")
+            lines.append(f"   Model:   <code>{html.escape(rec.model)}</code>")
+            lines.append(f"   Task:    {html.escape(rec.task_preview)}{'…' if len(rec.task_preview) >= 80 else ''}")
+            lines.append(f"   Started: {rec.elapsed_str()} ago")
+            lines.append(f"   Step:    {rec.iteration}/{rec.max_iterations}")
+            if rec.is_cancelled:
+                lines.append("   <i>⚠️ Cancellation requested…</i>")
+            lines.append("")
+
+        lines.append("<i>Tip: /agents cancel &lt;id&gt; to stop a sub-agent</i>")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

@@ -129,6 +129,19 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "notify (bool, default true). Always provide a non-empty task when adding any job."
         ),
     ),
+    "spawn_agent": BuiltinTool(
+        name="spawn_agent",
+        description=(
+            "Spawn an isolated sub-agent in the background for a long-running task "
+            "or a task requiring a different model. Returns immediately — result is delivered "
+            "via Telegram when done. "
+            "Args: task (str, required — goal for the sub-agent), "
+            "model (str, optional — model identifier from AVAILABLE MODELS, default: background_model), "
+            "context_key (str, optional — key for persisting conversation history between calls). "
+            "Example: spawn a Docker log analysis on a smarter model: "
+            "{\"task\": \"Analyze Docker logs\", \"model\": \"claude-3-5-sonnet-20241022\"}."
+        ),
+    ),
 }
 
 
@@ -148,10 +161,14 @@ class BuiltinExecutor:
       5. On user rejection: call cancel(token)  → cleans up state.
     """
 
-    def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None):
+    def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
+                 sub_agent_factory=None, data_dir: str = "data", agent_depth: int = 0):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
+        self._sub_agent_factory = sub_agent_factory  # Callable[[model, context_key, label, notify_fn], SubAgentRunner]
+        self._data_dir = data_dir
+        self._agent_depth = agent_depth  # 0 = main agent, 1 = sub-agent (no nested spawning)
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
 
@@ -181,6 +198,8 @@ class BuiltinExecutor:
             return self._exec_file_send(args)
         elif tool_name == "schedule":
             return self._exec_schedule(args)
+        elif tool_name == "spawn_agent":
+            return self._exec_spawn_agent(args)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -432,3 +451,151 @@ class BuiltinExecutor:
             return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
 
         return {"success": False, "output": "", "error": f"Unknown action '{action}'. Use: list, add, remove, pause, resume, run_now", "exit_code": -1}
+
+    # ------------------------------------------------------------------
+    # spawn_agent
+    # ------------------------------------------------------------------
+
+    def _exec_spawn_agent(self, args: dict) -> dict:
+        """
+        Spawn an isolated sub-agent in a background thread.
+
+        The sub-agent runs to completion then delivers its result via
+        notify_fn (Telegram) and writes to long-term memory.
+        Returns immediately with {status: "spawned", agent_id: "sa-..."}.
+        """
+        import threading
+        import json as _json
+        import os
+
+        from sub_agent_registry import get_registry as get_agent_registry
+
+        task = args.get("task", "").strip()
+        if not task:
+            return {"success": False, "output": "", "error": "spawn_agent: 'task' is required.", "exit_code": -1}
+
+        # Depth guard — prevent recursive sub-agent spawning
+        if self._agent_depth >= 1:
+            return {
+                "success": False, "output": "",
+                "error": "spawn_agent cannot be called from within a sub-agent (max depth: 1).",
+                "exit_code": -1,
+            }
+
+        if self._sub_agent_factory is None:
+            return {"success": False, "output": "", "error": "spawn_agent: sub_agent_factory not configured.", "exit_code": -1}
+
+        model = args.get("model") or None
+        context_key = args.get("context_key") or None
+        label = context_key or "on-demand"
+
+        # Build the sub-agent via factory
+        try:
+            runner = self._sub_agent_factory(
+                model=model,
+                context_key=context_key,
+                label=label,
+                notify_fn=None,   # factory sets this from main notify_fn
+            )
+        except ValueError as exc:
+            return {"success": False, "output": "", "error": f"spawn_agent: {exc}", "exit_code": -1}
+
+        from sub_agent_registry import SubAgentRecord
+        import time
+
+        record = SubAgentRecord(
+            agent_id=runner.agent_id,
+            label=label,
+            model=runner._model_id,
+            task_preview=task[:80],
+            started_at=time.time(),
+            source="on-demand",
+            max_iterations=runner._agent.max_iterations,
+        )
+        # Share cancel_event with the registry record
+        record._cancel_event = runner._cancel_event
+
+        get_agent_registry().register(record)
+
+        def _run_and_notify():
+            try:
+                result = runner.run(task)
+                # Persist context if requested
+                if context_key:
+                    _save_context(context_key, runner._short_term, self._data_dir)
+                # Write to long-term memory
+                if runner._agent.long_term and result and result != "[Cancelled]":
+                    try:
+                        runner._agent.long_term.add(
+                            f"[Sub-agent {label}] {result[:500]}", source="sub_agent"
+                        )
+                    except Exception:
+                        pass
+                if result == "[Cancelled]":
+                    runner.notify_fn(
+                        f"🛑 Sub-agent {runner.agent_id} cancelled\n"
+                        f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
+                    )
+                else:
+                    elapsed = int(time.time() - record.started_at)
+                    runner.notify_fn(
+                        f"✅ Sub-agent {runner.agent_id} finished ({elapsed}s)\n"
+                        f"Model: {runner._model_id}\n\n"
+                        + (result[:3000] + "\n\n…(truncated)" if len(result) > 3000 else result)
+                    )
+            except Exception as exc:
+                elapsed = int(time.time() - record.started_at)
+                runner.notify_fn(
+                    f"❌ Sub-agent {runner.agent_id} failed ({elapsed}s)\n"
+                    f"Model: {runner._model_id}\n"
+                    f"Error: {exc}\n"
+                    f"Task: {task[:100]}"
+                )
+            finally:
+                get_agent_registry().unregister(runner.agent_id)
+                # Notify scheduler (if this was a scheduled job)
+                if hasattr(self, '_scheduler_finish_cb') and self._scheduler_finish_cb:
+                    self._scheduler_finish_cb(label)
+
+        t = threading.Thread(target=_run_and_notify, daemon=True, name=f"sub-agent-{label}")
+        t.start()
+
+        return {
+            "success": True,
+            "output": f"Sub-agent spawned (id: {runner.agent_id}, model: {runner._model_id}). Result will be delivered when done.",
+            "error": "",
+            "exit_code": 0,
+            "agent_id": runner.agent_id,
+        }
+
+
+def _save_context(context_key: str, short_term, data_dir: str) -> None:
+    """Persist ShortTermMemory to data/job_contexts/<key>.json."""
+    import json as _json, os, threading
+
+    ctx_dir = os.path.join(data_dir, "job_contexts")
+    os.makedirs(ctx_dir, exist_ok=True)
+    path = os.path.join(ctx_dir, f"{context_key}.json")
+    try:
+        data = short_term.to_dict()
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.warning("Failed to save context for %s", context_key, exc_info=True)
+
+
+def _load_context(context_key: str, data_dir: str, max_turns: int = 50):
+    """Load ShortTermMemory from data/job_contexts/<key>.json. Returns fresh on error."""
+    import json as _json, os
+    from memory_store import ShortTermMemory
+
+    path = os.path.join(data_dir, "job_contexts", f"{context_key}.json")
+    if not os.path.exists(path):
+        return ShortTermMemory(max_turns=max_turns)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return ShortTermMemory.from_dict(data, max_turns=max_turns)
+    except Exception:
+        logger.warning("Context file corrupted for %s — starting fresh", context_key, exc_info=True)
+        return ShortTermMemory(max_turns=max_turns)
