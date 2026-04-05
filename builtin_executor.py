@@ -142,6 +142,22 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "{\"task\": \"Analyze Docker logs\", \"model\": \"claude-3-5-sonnet-20241022\"}."
         ),
     ),
+    "memory_write": BuiltinTool(
+        name="memory_write",
+        description=(
+            "Read or write the agent's persistent memory (data/memory.json). "
+            "Actions: "
+            "  set    — store any value under a key: args: key (str), value (any). "
+            "  append — append an item to a list key (creates the list if needed): args: key (str), value (any). "
+            "  delete — remove a key: args: key (str). "
+            "  get    — retrieve a single key: args: key (str). "
+            "Use 'append' on key 'notes' to add a persistent note. "
+            "Examples: "
+            "{\"action\":\"append\",\"key\":\"notes\",\"value\":\"Disk replaced 2025-04-01\"}, "
+            "{\"action\":\"set\",\"key\":\"last_backup\",\"value\":\"2025-04-05\"}, "
+            "{\"action\":\"delete\",\"key\":\"old_key\"}."
+        ),
+    ),
 }
 
 
@@ -162,13 +178,15 @@ class BuiltinExecutor:
     """
 
     def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
-                 sub_agent_factory=None, data_dir: str = "data", agent_depth: int = 0):
+                 sub_agent_factory=None, data_dir: str = "data", agent_depth: int = 0,
+                 memory=None):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
         self._sub_agent_factory = sub_agent_factory  # Callable[[model, context_key, label, notify_fn], SubAgentRunner]
         self._data_dir = data_dir
         self._agent_depth = agent_depth  # 0 = main agent, 1 = sub-agent (no nested spawning)
+        self._memory = memory  # Optional[MemoryStore] — for memory_write built-in
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
 
@@ -200,6 +218,8 @@ class BuiltinExecutor:
             return self._exec_schedule(args)
         elif tool_name == "spawn_agent":
             return self._exec_spawn_agent(args)
+        elif tool_name == "memory_write":
+            return self._exec_memory_write(args)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -567,6 +587,57 @@ class BuiltinExecutor:
             "exit_code": 0,
             "agent_id": runner.agent_id,
         }
+
+
+    def _exec_memory_write(self, args: dict) -> dict:
+        """Read or update persistent MemoryStore (data/memory.json)."""
+        if self._memory is None:
+            return {
+                "success": False, "output": "",
+                "error": "memory_write: MemoryStore is not available in this context.",
+                "exit_code": -1,
+            }
+
+        action = args.get("action", "").strip().lower()
+        key = args.get("key", "").strip()
+
+        if action == "get":
+            if not key:
+                return {"success": False, "output": "", "error": "memory_write get: 'key' is required.", "exit_code": -1}
+            import json as _json
+            value = self._memory.get(key)
+            return {"success": True, "output": _json.dumps(value), "error": "", "exit_code": 0}
+
+        if not key:
+            return {"success": False, "output": "", "error": "memory_write: 'key' is required.", "exit_code": -1}
+
+        if action == "set":
+            value = args.get("value")
+            self._memory.set(key, value)
+            logger.info("memory_write set: key=%s", key)
+            return {"success": True, "output": f"Memory key '{key}' updated.", "error": "", "exit_code": 0}
+
+        elif action == "append":
+            value = args.get("value")
+            current = self._memory.get(key)
+            if not isinstance(current, list):
+                current = []
+            current.append(value)
+            self._memory.set(key, current)
+            logger.info("memory_write append: key=%s (now %d items)", key, len(current))
+            return {"success": True, "output": f"Appended to '{key}' ({len(current)} items total).", "error": "", "exit_code": 0}
+
+        elif action == "delete":
+            self._memory.delete(key)
+            logger.info("memory_write delete: key=%s", key)
+            return {"success": True, "output": f"Memory key '{key}' deleted.", "error": "", "exit_code": 0}
+
+        else:
+            return {
+                "success": False, "output": "",
+                "error": f"memory_write: unknown action '{action}'. Valid: set, append, delete, get.",
+                "exit_code": -1,
+            }
 
 
 def _save_context(context_key: str, short_term, data_dir: str) -> None:

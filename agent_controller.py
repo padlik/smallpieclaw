@@ -64,11 +64,12 @@ RELEVANT PAST RESULTS:
 {past_results}
 
 BUILT-IN TOOLS (always available — prefer these before creating new tools):
-  shell       — execute any shell command on the host system
-  file_read   — read a file from the filesystem
-  file_write  — write content to a file on the filesystem
-  schedule    — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
-  spawn_agent — spawn an isolated sub-agent in the background for long-running or model-specific tasks
+  shell        — execute any shell command on the host system
+  file_read    — read a file from the filesystem
+  file_write   — write content to a file on the filesystem
+  schedule     — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
+  spawn_agent  — spawn an isolated sub-agent in the background for long-running or model-specific tasks
+  memory_write — read/write the agent's persistent memory (actions: set, append, delete, get)
 
 AVAILABLE TOOLS:
 {tools}
@@ -293,7 +294,7 @@ class AgentController:
                 action = action_obj.get("action", "")
 
                 # Normalize shorthand: {"action": "shell"} → {"action": "tool", "tool": "shell"}
-                _BUILTIN_NAMES = {"shell", "file_read", "file_write", "schedule"}
+                _BUILTIN_NAMES = {"shell", "file_read", "file_write", "schedule", "spawn_agent", "memory_write"}
                 if action in _BUILTIN_NAMES:
                     logger.warning("LLM used shorthand action '%s' — normalizing to tool call", action)
                     action_obj = {"action": "tool", "tool": action, "args": {k: v for k, v in action_obj.items() if k != "action"}}

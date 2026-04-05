@@ -176,7 +176,7 @@ def main():
     llm      = LLMClient(cfg, usage_registry=get_token_registry())
     memory   = MemoryStore(memory_path)
     registry = ToolRegistry(tools_dirs=[tools_dir, gen_tools_dir])
-    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output, data_dir=data_dir)
+    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory)
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
     creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)
