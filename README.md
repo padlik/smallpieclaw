@@ -266,7 +266,7 @@ allowed_user_ids = [123456789]
 
 ## Built-in Tools
 
-Five tools are always available to the agent regardless of the `tools/` directory:
+Six tools are always available to the agent regardless of the `tools/` directory:
 
 | Tool | Description | Dangerous? |
 |------|-------------|-----------|
@@ -275,6 +275,8 @@ Five tools are always available to the agent regardless of the `tools/` director
 | `file_write` | Write content to a file | Always — requires confirmation |
 | `file_send` | Send a local file or photo to the Telegram chat | No |
 | `schedule` | Manage scheduled jobs and reminders | No |
+| `spawn_agent` | Spawn an isolated background sub-agent | No |
+| `memory_write` | Read/write the agent's persistent memory (`data/memory.json`) | No |
 
 When a dangerous operation is requested, the bot sends an inline confirmation prompt:
 
@@ -298,6 +300,27 @@ file_send(path="/home/pi/documents/photo.png", caption="Here you go")
 - All other files are sent as documents
 - Files larger than 50 MB are rejected with a clear error
 - `~` home paths are expanded automatically
+
+### `memory_write` tool
+
+Reads or writes the agent's persistent memory store (`data/memory.json`) — the key-value facts visible in the `PERSISTENT MEMORY` section of the system prompt.
+
+| Action | Args | Description |
+|--------|------|-------------|
+| `set` | `key`, `value` | Store any value under a key |
+| `append` | `key`, `value` | Append an item to a list key (creates the list if needed) |
+| `delete` | `key` | Remove a key |
+| `get` | `key` | Read a single key without parsing the full prompt |
+
+Examples:
+```json
+{"action": "append", "key": "notes",       "value": "Disk replaced 2025-04-01"}
+{"action": "set",    "key": "last_backup", "value": "2025-04-05"}
+{"action": "delete", "key": "old_service"}
+{"action": "get",    "key": "notes"}
+```
+
+Memory is shared across all sessions and persisted immediately to disk after every write.
 
 ---
 
