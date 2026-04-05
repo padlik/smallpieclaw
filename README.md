@@ -202,6 +202,10 @@ Scheduler features:
 - **Backward compatibility**: old `schedule = "daily"` / `schedule = "interval"` configs are automatically migrated to cron on first load
 - **One-time reminders**: `once` type with `run_at = "HH:MM"` — auto-removed after execution
 - **Next-run visibility**: `/jobs` shows the next scheduled run time for each job
+- **Running badge**: `/jobs` shows `🔄 Running` next to jobs currently executing as a sub-agent
+- **Per-job model**: each job can specify its own `model` (defaults to `background_model`)
+- **Context persistence**: set `preserve_context = true` to carry conversation history between runs (useful for trend analysis)
+- **Overlap policy**: `overlap_policy = "skip"` (default) or `"parallel"` per job
 - **Jitter**: a random ±5 min offset is applied to the first run of each cron job to avoid thundering herd
 - **Persistence**: every structural change (add/remove/enable/disable) writes back to `scheduler.toml` — survives crashes and restarts
 - **Run history**: `scheduler_state.json` stores `last_run` and `last_error` for every job ever executed (including removed and one-time jobs); history is restored on restart and survives `/jobs reload`
@@ -425,12 +429,13 @@ Disable after diagnosing to keep logs clean.
 |---------|-------------|
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
-| `/status` | Uptime, LLM model, embeddings status, tools/skills count, and today's token usage |
+| `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, and per-model token usage today |
 | `/health` | Run self-health diagnosis, analyze logs, rotate log file |
 | `/tools` | List all built-in and generated tools |
 | `/skills` | List all available agent skills |
 | `/models` | List available LLM models and switch the active one |
-| `/jobs` | List all scheduled jobs; `/jobs reload` to reload scheduler.toml from disk |
+| `/jobs` | List all scheduled jobs with running status; `/jobs reload` to reload scheduler.toml from disk |
+| `/agents` | List all active background sub-agents; `/agents cancel <id>` to stop one |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
 | `/reindex` | Force re-embed all tools in the semantic index |
@@ -470,6 +475,131 @@ The agent uses a four-tier memory system:
 | **Results** | `data/results_memory.json` (vector index) | Past task summaries saved on `/reset` or task completion |
 
 When you send `/reset`, the working memory is summarised by the LLM and persisted to results memory before being cleared. Use `/reset discard` to skip saving.
+
+---
+
+## Sub-Agents
+
+The agent can spawn **isolated background sub-agents** — separate ReAct loops running in their own threads with a dedicated LLM context. Sub-agents are used for:
+
+- **Non-blocking tasks** — long-running jobs (log analysis, multi-step diagnostics) run in the background while chat stays responsive
+- **Model selection** — use a smarter or cheaper model for a specific task without changing the main agent's model
+- **Scheduler jobs** — every scheduled job is executed as a sub-agent
+
+### How it works
+
+Sub-agents are always **asynchronous**. The main agent's `spawn_agent` tool returns immediately with a spawned status. Results are delivered via Telegram when the sub-agent finishes and written to long-term memory.
+
+```
+Main agent                          Sub-agent thread
+──────────                          ────────────────
+spawn_agent(task="...",             SubAgentRunner.run(task)
+            model="gpt-4o")          ├── own LLMClient (model override)
+→ {status: "spawned",                ├── own ShortTermMemory (blank or loaded)
+   agent_id: "sa-a1b2c3"}            ├── own WorkingMemory (blank)
+                                      └── shared: tools, skills, long-term memory
+                                              │
+                                     on finish:
+                                       ├── notify user via Telegram
+                                       └── write result to long-term memory
+```
+
+### spawn_agent tool
+
+The LLM can call `spawn_agent` when it decides a task is long-running or requires a different model:
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `task` | ✓ | Natural-language description of the task for the sub-agent |
+| `model` | — | Model ID from `[[models]]` config; defaults to `background_model` |
+| `context_key` | — | Key for persisting sub-agent context across runs (useful for recurrent jobs) |
+
+Sub-agents cannot call `spawn_agent` themselves (max depth: 1).
+
+### Notifications
+
+**On start** (main agent reply):
+```
+🤖 Sub-agent started
+ID: sa-a1b2c3 | Model: gpt-4o-mini
+Task: Analyze Docker container logs for errors...
+I'll notify you when it's done.
+```
+
+**On success**:
+```
+✅ Sub-agent sa-a1b2c3 finished (42s)
+Model: gpt-4o-mini
+
+[result text, up to 3000 chars]
+```
+
+**On failure** (always notified, even for silent jobs):
+```
+❌ Sub-agent sa-a1b2c3 failed (12s)
+Error: LLM timeout after 3 retries
+```
+
+### Configuration
+
+Add to `config.toml`:
+
+```toml
+[agent]
+# Model used by background tasks and scheduled jobs (defaults to default_model)
+background_model = "gpt-4o-mini"
+```
+
+### Scheduler integration
+
+Each scheduled job runs as a sub-agent. Per-job model and context options can be set in `scheduler.toml`:
+
+```toml
+[jobs.agent_health]
+enabled = true
+cron = "0 */4 * * *"
+task = "Perform a self-health check: analyze agent.log for errors and summarize status."
+notify = true
+model = "gpt-4o-mini"           # optional: override model for this job
+preserve_context = true          # optional: persist context between runs (default: false)
+context_max_messages = 50        # optional: cap on saved messages (default: 50)
+overlap_policy = "skip"          # optional: skip|parallel when previous run is still active
+```
+
+When `preserve_context = true`, the sub-agent's conversation history is saved to
+`data/job_contexts/<job_tag>.json` after each run and reloaded on the next. This lets
+recurrent jobs track progress and spot trends over time.
+
+### Overlap handling
+
+If a scheduled job hasn't finished when its next run time arrives, the default policy is `skip`:
+- Logged at WARNING level in `agent.log`
+- Next run is skipped silently (no Telegram notification)
+- `/jobs` shows `🔄 Running` next to the job name
+
+Use `overlap_policy = "parallel"` to allow concurrent instances (advanced use only).
+
+### Managing sub-agents
+
+```
+/agents                    → list all active sub-agents with model, task preview, elapsed time
+/agents cancel sa-a1b2c3   → cooperatively cancel a sub-agent (takes effect between iterations)
+/agents cancel agent_health → cancel a scheduled job's sub-agent by job tag
+```
+
+Cancellation is cooperative — a running LLM call completes before the cancel is checked. The sub-agent stops at the next iteration boundary.
+
+### Token usage
+
+`/status` shows a per-model token breakdown across all active LLM clients (main agent + all sub-agents):
+
+```
+📊 Token Usage Today:
+  gpt-4o-mini          2,341 + 456  =  2,797 total
+  gpt-4o               8,234 + 1,203 = 9,437 total
+  ──────────────────────────────────────────
+  Total               10,575 + 1,659 = 12,234 total
+```
 
 ---
 
