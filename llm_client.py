@@ -46,6 +46,10 @@ class LLMEmptyResponseError(RuntimeError):
     """Raised when the LLM provider returns an empty or whitespace-only response."""
 
 
+class LLMError(RuntimeError):
+    """Raised when the LLM provider returns an API-level error (HTTP 200 with error body)."""
+
+
 def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None):
     """
     Call fn(), retrying on transient httpx errors and retryable HTTP status codes.
@@ -353,7 +357,41 @@ class LLMClient:
             d = r.json()
             usage = d.get("usage", {})
             self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-            msg = d["choices"][0]["message"]
+
+            # Some APIs return HTTP 200 with an error body (e.g. rate limit, content filter).
+            # Detect this before trying to access 'choices'.
+            if "error" in d and "choices" not in d:
+                err = d["error"]
+                err_msg = err.get("message") or err.get("msg") or str(err)
+                err_code = err.get("code") or err.get("type") or ""
+                raise LLMError(
+                    f"API error from model '{model}'"
+                    + (f" [{err_code}]" if err_code else "")
+                    + f": {err_msg}"
+                )
+
+            choices = d.get("choices") or []
+            if not choices:
+                logger.error(
+                    "Model '%s': response missing 'choices'. Raw body: %s",
+                    model, str(d)[:500],
+                )
+                if self._diagnose_empty:
+                    curl_cmd = [
+                        "curl", "-s", "-X", "POST", url,
+                        "-H", f"Authorization: Bearer {self.llm_cfg['api_key']}",
+                        "-H", "Content-Type: application/json",
+                        "-d", json.dumps(payload),
+                    ]
+                    report = self._diagnose_empty_response(r, "openai", model, curl_cmd=curl_cmd)
+                    raise LLMEmptyResponseError(
+                        f"Model '{model}' returned no choices.\n{report}"
+                    )
+                raise LLMEmptyResponseError(
+                    f"Model '{model}' returned no choices. Body: {str(d)[:300]}"
+                )
+
+            msg = choices[0].get("message") or {}
             text = (msg.get("content") or "").strip()
 
             # Some reasoning/thinking models (DeepSeek-R1, Kimi K2.5, QwQ, etc.)
