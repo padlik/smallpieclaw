@@ -377,7 +377,7 @@ class TelegramInterface:
         if args and args[0].lower() == "cancel":
             agent_id = args[1] if len(args) > 1 else ""
             if not agent_id:
-                await update.message.reply_text("Usage: /agents cancel <id>")
+                await update.message.reply_text("Usage: /agents cancel &lt;id&gt;", parse_mode=ParseMode.HTML)
                 return
             ok = _get_agent_registry().cancel(agent_id)
             if ok:
@@ -397,7 +397,7 @@ class TelegramInterface:
         if not active:
             await update.message.reply_text(
                 "🤖 No sub-agents currently running.\n"
-                "<i>Tip: /agents cancel <id> to cancel a running agent</i>",
+                "<i>Tip: /agents cancel &lt;id&gt; to cancel a running agent</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
