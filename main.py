@@ -206,6 +206,8 @@ def main():
         skill_registry=skills,
         tmp_dir=tmp_dir,
         downloads_dir=downloads_dir,
+        log_file=log_file,
+        log_backup_count=log_backup_count,
     )
 
     logger.info("Building semantic tool index...")

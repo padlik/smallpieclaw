@@ -77,6 +77,9 @@ AVAILABLE TOOLS:
 {skills_section}{models_section}FILE STORAGE:
 {file_storage}
 
+AGENT LOG:
+{log_section}
+
 RESPONSE FORMAT — CRITICAL:
 - You MUST respond with ONLY a single valid JSON object. Nothing else.
 - No markdown, no prose, no explanation, no ```json fences. Just the raw JSON object.
@@ -146,6 +149,8 @@ class AgentController:
         skill_registry=None,   # Optional[SkillRegistry]
         tmp_dir: str = "/tmp/agent",
         downloads_dir: str = "downloads",
+        log_file: str = "agent.log",
+        log_backup_count: int = 30,
         cancel_event: Optional[threading.Event] = None,
         depth: int = 0,
     ):
@@ -165,6 +170,8 @@ class AgentController:
         self.skill_registry = skill_registry
         self.tmp_dir = tmp_dir
         self.downloads_dir = downloads_dir
+        self.log_file = log_file
+        self.log_backup_count = log_backup_count
         self._cancel_event = cancel_event
         self._depth = depth
 
@@ -220,6 +227,7 @@ class AgentController:
             f"- Use downloads for files the operator explicitly wants to keep.\n"
             f"- Never write files to the agent script directory."
         )
+        log_section = self._format_log_section()
 
         system = _SYSTEM_PROMPT.format(
             memory=memory_text,
@@ -229,6 +237,7 @@ class AgentController:
             skills_section=skills_section,
             models_section=models_section,
             file_storage=file_storage,
+            log_section=log_section,
         )
         messages: list[dict] = [{"role": "user", "content": user_goal}]
 
@@ -528,6 +537,7 @@ class AgentController:
             skills_section=skills_section,
             models_section=models_section,
             file_storage=file_storage,
+            log_section=self._format_log_section(),
         )
         return prompt, _estimate_tokens(prompt)
 
@@ -662,6 +672,23 @@ class AgentController:
             return list(self.llm._models)
         except AttributeError:
             return []
+
+    def _format_log_section(self) -> str:
+        """Build the AGENT LOG section for the system prompt."""
+        import os
+        log_abs = os.path.abspath(self.log_file)
+        lines = [
+            f"- Active log (always current session): {log_abs}",
+            f"- Rotation: nightly at 00:00 local time. Rotated files use numbered suffixes:",
+            f"    {log_abs}    ← today (active)",
+            f"    {log_abs}.1  ← yesterday",
+            f"    {log_abs}.2  ← 2 days ago  … up to .{self.log_backup_count}",
+            f"- To read recent log entries:  file_read(path='{log_abs}', offset=-10000)",
+            f"- To read yesterday's log:     file_read(path='{log_abs}.1')",
+            f"- Always use file_read with a negative offset (e.g. -20000) to read the tail of large logs.",
+            f"- Do NOT use 'tail' or 'journalctl' for agent logs — use file_read on the paths above.",
+        ]
+        return "\n".join(lines)
 
     @staticmethod
     def _fmt_tool_call(tool_name: str, args: dict) -> str:
