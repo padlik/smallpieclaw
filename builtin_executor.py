@@ -569,12 +569,13 @@ class BuiltinExecutor:
                     )
                 else:
                     elapsed = int(time.time() - record.started_at)
-                    runner.notify_fn(
+                    header = (
                         f"✅ Sub-agent {runner.agent_id} finished ({elapsed}s)\n"
                         f"Job: <b>{_he(label)}</b> | Model: {_he(runner._model_id)}\n"
-                        f"Task: {_he(task[:120])}\n\n"
-                        + (result[:3000] + "\n\n…(truncated)" if len(result) > 3000 else result)
+                        f"Task: {_he(task[:120])}"
                     )
+                    # Send header + full result; send_message_to_users paginates automatically
+                    runner.notify_fn(header + "\n\n" + result)
             except Exception as exc:
                 elapsed = int(time.time() - record.started_at)
                 runner.notify_fn(

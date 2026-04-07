@@ -1007,13 +1007,43 @@ class TelegramInterface:
             )
 
     @staticmethod
+    @staticmethod
     def _split_message(text: str, limit: int = 4000) -> list[str]:
+        """
+        Split text into chunks of at most `limit` characters.
+        Tries to split at paragraph boundaries (\\n\\n), then line boundaries (\\n),
+        then word boundaries, to avoid cutting mid-sentence or mid-HTML-tag.
+        """
         if len(text) <= limit:
             return [text]
+
         parts = []
-        while text:
+        while len(text) > limit:
+            chunk = text[:limit]
+            # Try to split at a paragraph break
+            split_at = chunk.rfind("\n\n")
+            if split_at > limit // 2:
+                parts.append(text[:split_at].rstrip())
+                text = text[split_at:].lstrip("\n")
+                continue
+            # Try to split at a line break
+            split_at = chunk.rfind("\n")
+            if split_at > limit // 2:
+                parts.append(text[:split_at].rstrip())
+                text = text[split_at:].lstrip("\n")
+                continue
+            # Try to split at a word boundary
+            split_at = chunk.rfind(" ")
+            if split_at > limit // 2:
+                parts.append(text[:split_at].rstrip())
+                text = text[split_at:].lstrip(" ")
+                continue
+            # Hard split — no good boundary found
             parts.append(text[:limit])
             text = text[limit:]
+
+        if text:
+            parts.append(text)
         return parts
 
     def send_message_to_users(self, text: str) -> None:
