@@ -445,7 +445,7 @@ class Scheduler:
             ctx_max = meta.get("context_max_messages", 50)
             context_key = tag if preserve_ctx else None
 
-            spawn_args = {"task": task}
+            spawn_args = {"task": task, "_job_tag": tag}
             if job_model:
                 spawn_args["model"] = job_model
             if context_key:

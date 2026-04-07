@@ -507,7 +507,8 @@ class BuiltinExecutor:
 
         model = args.get("model") or None
         context_key = args.get("context_key") or None
-        label = context_key or "on-demand"
+        job_tag = args.get("_job_tag") or None       # set by scheduler; used for finish callback
+        label = job_tag or context_key or "on-demand"
 
         # Build the sub-agent via factory
         try:
@@ -536,6 +537,12 @@ class BuiltinExecutor:
         record._cancel_event = runner._cancel_event
 
         get_agent_registry().register(record)
+
+        # Capture scheduler finish callback now (at spawn time) to avoid race
+        # conditions when multiple jobs are spawned concurrently — each thread
+        # gets its own snapshot of the callback bound to the correct job tag.
+        _finish_cb = getattr(self, '_scheduler_finish_cb', None)
+        _finish_tag = job_tag or label
 
         def _run_and_notify():
             try:
@@ -573,9 +580,8 @@ class BuiltinExecutor:
                 )
             finally:
                 get_agent_registry().unregister(runner.agent_id)
-                # Notify scheduler (if this was a scheduled job)
-                if hasattr(self, '_scheduler_finish_cb') and self._scheduler_finish_cb:
-                    self._scheduler_finish_cb(label)
+                if _finish_cb:
+                    _finish_cb(_finish_tag)
 
         t = threading.Thread(target=_run_and_notify, daemon=True, name=f"sub-agent-{label}")
         t.start()
