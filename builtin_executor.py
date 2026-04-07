@@ -22,6 +22,7 @@ import re
 import secrets
 import subprocess
 from dataclasses import dataclass
+from html import escape as _he
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -561,22 +562,24 @@ class BuiltinExecutor:
                 if result == "[Cancelled]":
                     runner.notify_fn(
                         f"🛑 Sub-agent {runner.agent_id} cancelled\n"
+                        f"Job: <b>{_he(label)}</b>\n"
                         f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
                     )
                 else:
                     elapsed = int(time.time() - record.started_at)
                     runner.notify_fn(
                         f"✅ Sub-agent {runner.agent_id} finished ({elapsed}s)\n"
-                        f"Model: {runner._model_id}\n\n"
+                        f"Job: <b>{_he(label)}</b> | Model: {_he(runner._model_id)}\n"
+                        f"Task: {_he(task[:120])}\n\n"
                         + (result[:3000] + "\n\n…(truncated)" if len(result) > 3000 else result)
                     )
             except Exception as exc:
                 elapsed = int(time.time() - record.started_at)
                 runner.notify_fn(
                     f"❌ Sub-agent {runner.agent_id} failed ({elapsed}s)\n"
-                    f"Model: {runner._model_id}\n"
-                    f"Error: {exc}\n"
-                    f"Task: {task[:100]}"
+                    f"Job: <b>{_he(label)}</b> | Model: {_he(runner._model_id)}\n"
+                    f"Task: {_he(task[:120])}\n"
+                    f"Error: {_he(str(exc))}"
                 )
             finally:
                 get_agent_registry().unregister(runner.agent_id)
