@@ -383,7 +383,7 @@ class TelegramInterface:
             if ok:
                 await update.message.reply_text(
                     f"🛑 Cancellation requested for <code>{html.escape(agent_id)}</code>.\n"
-                    f"The sub-agent will stop at the next iteration boundary.",
+                    f"Any in-progress LLM call will be interrupted immediately.",
                     parse_mode=ParseMode.HTML,
                 )
             else:

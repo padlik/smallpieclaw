@@ -23,7 +23,7 @@ import sys
 import threading
 from typing import Any, Callable, Optional
 
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMCancelledError
 from memory_store import MemoryStore
 from tool_creator import ToolCreator
 from tool_executor import ToolExecutor
@@ -267,6 +267,9 @@ class AgentController:
                 for _attempt in range(1 + _MAX_EMPTY_RETRIES):
                     try:
                         raw = self.llm.chat(messages, system=system, progress_cb=_progress)
+                    except LLMCancelledError:
+                        logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
+                        return "[Cancelled]"
                     except Exception as exc:
                         err = f"❌ LLM error: {type(exc).__name__}: {exc}"
                         _progress(err)
@@ -885,8 +888,9 @@ class SubAgentRunner:
 
         self._cancel_event = threading.Event()
 
-        # Own LLM instance with model override + shared token registry
-        self._llm = LLMClient(sub_config, usage_registry=usage_registry)
+        # Own LLM instance with model override + shared token registry + cancellation
+        self._llm = LLMClient(sub_config, usage_registry=usage_registry,
+                              cancel_event=self._cancel_event)
 
         # Own blank memory (working context for this task)
         self._short_term = short_term if short_term is not None else ShortTermMemory()

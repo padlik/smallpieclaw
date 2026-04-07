@@ -23,9 +23,17 @@ class SubAgentRecord:
     iteration: int = 0
     max_iterations: int = 8
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _llm_client: object = field(default=None, repr=False)  # LLMClient — for immediate HTTP interrupt
 
     def cancel(self) -> None:
         self._cancel_event.set()
+        # Close the HTTP client to immediately interrupt any in-progress LLM request.
+        # The resulting transport exception is caught as LLMCancelledError in _with_retry.
+        if self._llm_client is not None:
+            try:
+                self._llm_client._http.close()
+            except Exception:
+                pass
 
     @property
     def is_cancelled(self) -> bool:

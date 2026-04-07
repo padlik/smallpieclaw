@@ -50,7 +50,11 @@ class LLMError(RuntimeError):
     """Raised when the LLM provider returns an API-level error (HTTP 200 with error body)."""
 
 
-def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None):
+class LLMCancelledError(RuntimeError):
+    """Raised when the LLM request is cancelled via cancel_event."""
+
+
+def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_event=None):
     """
     Call fn(), retrying on transient httpx errors and retryable HTTP status codes.
     Uses exponential backoff: base_delay, base_delay*2, base_delay*4, …
@@ -59,8 +63,13 @@ def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None):
     """
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(1, max_retries + 1):
+        # Check cancellation before each attempt (including before the first)
+        if cancel_event and cancel_event.is_set():
+            raise LLMCancelledError("LLM request cancelled")
         try:
             return fn()
+        except LLMCancelledError:
+            raise  # propagate immediately — never retry a cancel
         except httpx.TimeoutException as exc:
             last_exc = exc
             logger.warning("Request timed out (attempt %d/%d): %s", attempt, max_retries, exc)
@@ -72,15 +81,26 @@ def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None):
             if on_retry:
                 on_retry(attempt, max_retries, "empty response")
         except httpx.RemoteProtocolError as exc:
+            if cancel_event and cancel_event.is_set():
+                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
             last_exc = exc
             logger.warning("Remote protocol error (attempt %d/%d): %s", attempt, max_retries, exc)
             if on_retry:
                 on_retry(attempt, max_retries, f"protocol error: {exc}")
         except httpx.ConnectError as exc:
+            if cancel_event and cancel_event.is_set():
+                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
             last_exc = exc
             logger.warning("Connection error (attempt %d/%d): %s", attempt, max_retries, exc)
             if on_retry:
                 on_retry(attempt, max_retries, f"connection error: {exc}")
+        except (httpx.TransportError, httpx.PoolTimeout) as exc:
+            if cancel_event and cancel_event.is_set():
+                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
+            last_exc = exc
+            logger.warning("Transport error (attempt %d/%d): %s", attempt, max_retries, exc)
+            if on_retry:
+                on_retry(attempt, max_retries, f"transport error: {exc}")
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in _RETRYABLE_STATUS:
                 last_exc = exc
@@ -100,8 +120,15 @@ def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None):
                 raise  # 4xx errors are not retryable
         if attempt < max_retries:
             delay = base_delay * (2 ** (attempt - 1))
-            logger.info("Retrying in %.1fs…", delay)
-            time.sleep(delay)
+            # Don't sleep if already cancelled
+            if cancel_event:
+                # Use event.wait() so cancellation wakes us up immediately
+                cancelled = cancel_event.wait(timeout=delay)
+                if cancelled:
+                    raise LLMCancelledError("LLM request cancelled during retry delay")
+            else:
+                logger.info("Retrying in %.1fs…", delay)
+                time.sleep(delay)
     raise last_exc
 
 
@@ -154,11 +181,12 @@ class LLMClient:
       Set agent.default_model to the 'model' value of the entry to use by default.
     """
 
-    def __init__(self, config: dict, usage_registry=None):
+    def __init__(self, config: dict, usage_registry=None, cancel_event=None):
         """
         Args:
             config: full agent config dict
             usage_registry: optional TokenUsageRegistry for cross-instance token aggregation
+            cancel_event: optional threading.Event; when set, in-progress LLM calls raise LLMCancelledError
         """
         self.cfg = config
 
@@ -215,6 +243,9 @@ class LLMClient:
 
         # Cross-instance token registry (shared across main + sub-agents)
         self._usage_registry = usage_registry
+
+        # Cancellation support (for sub-agents)
+        self._cancel_event = cancel_event  # Optional[threading.Event]
 
     # ------------------------------------------------------------------
     # Multi-model API
@@ -422,7 +453,8 @@ class LLMClient:
                 raise LLMEmptyResponseError(f"OpenAI returned empty content (model: {model})")
             return text
 
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
+                           cancel_event=self._cancel_event)
 
     def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         # Convert to Gemini format
@@ -470,7 +502,8 @@ class LLMClient:
                 raise LLMEmptyResponseError(f"Google returned empty content (model: {model})")
             return text
 
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
+                           cancel_event=self._cancel_event)
 
     def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         model = self.llm_cfg["model"]
@@ -516,7 +549,8 @@ class LLMClient:
                 raise LLMEmptyResponseError(f"Anthropic returned empty content (model: {model})")
             return text
 
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry)
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
+                           cancel_event=self._cancel_event)
 
     # ------------------------------------------------------------------
     # Empty-response diagnostics

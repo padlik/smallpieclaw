@@ -534,8 +534,10 @@ class BuiltinExecutor:
             source="on-demand",
             max_iterations=runner._agent.max_iterations,
         )
-        # Share cancel_event with the registry record
+        # Share cancel_event and LLM client with the registry record so that
+        # /agents cancel can immediately interrupt any in-progress HTTP request.
         record._cancel_event = runner._cancel_event
+        record._llm_client = runner._llm
 
         get_agent_registry().register(record)
 
