@@ -176,7 +176,7 @@ class TelegramInterface:
         if not self._is_authorized(user.id):
             await self._send_unauthorized(update)
             return
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "👋 Home Server Agent ready.\n"
             "Send me a command like:\n"
             "  • <b>check disk usage</b>\n"
@@ -190,7 +190,7 @@ class TelegramInterface:
         if not self._is_authorized(update.effective_user.id):
             await self._send_unauthorized(update)
             return
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "🤖 <b>Home Server Agent</b>\n\n"
             "Just send a natural language request, e.g.:\n"
             "  <code>check disk usage</code>\n"
@@ -264,7 +264,7 @@ class TelegramInterface:
                 f"  Total: {usage['total_tokens']:,}"
             )
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"✅ <b>Agent Status</b>\n\n"
             f"⏱ Uptime: <code>{h}h {m}m {s}s</code>\n"
             f"🤖 LLM: <code>{html.escape(llm_model)}</code>\n"
@@ -284,7 +284,7 @@ class TelegramInterface:
         args = ctx.args or []
         discard = "discard" in [a.lower() for a in args]
 
-        status_msg = await update.message.reply_text(
+        status_msg = await update.effective_message.reply_text(
             "🗑️ Discarding task context…" if discard else "💾 Saving task context…"
         )
 
@@ -302,14 +302,14 @@ class TelegramInterface:
             await self._send_unauthorized(update)
             return
         if not self.scheduler:
-            await update.message.reply_text("Scheduler not available.")
+            await update.effective_message.reply_text("Scheduler not available.")
             return
 
         # /jobs reload — hot-reload scheduler.toml from disk
         args = ctx.args or []
         if args and args[0].lower() == "reload":
             result = self.scheduler.reload()
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"🔄 Scheduler reloaded.\n"
                 f"  ✅ Active jobs: <b>{result['reloaded']}</b>\n"
                 f"  ❌ Failed: <b>{result['failed']}</b>",
@@ -319,7 +319,7 @@ class TelegramInterface:
 
         jobs = self.scheduler.list_jobs()
         if not jobs:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "No scheduled jobs configured.\n"
                 "<i>Tip: use /jobs reload to reload scheduler.toml</i>",
                 parse_mode=ParseMode.HTML,
@@ -362,7 +362,7 @@ class TelegramInterface:
             lines.append(f"   {task_label}: {task_display}\n")
 
         lines.append("<i>Tip: /jobs reload to reload scheduler.toml</i>")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_agents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
@@ -377,17 +377,17 @@ class TelegramInterface:
         if args and args[0].lower() == "cancel":
             agent_id = args[1] if len(args) > 1 else ""
             if not agent_id:
-                await update.message.reply_text("Usage: /agents cancel &lt;id&gt;", parse_mode=ParseMode.HTML)
+                await update.effective_message.reply_text("Usage: /agents cancel &lt;id&gt;", parse_mode=ParseMode.HTML)
                 return
             ok = _get_agent_registry().cancel(agent_id)
             if ok:
-                await update.message.reply_text(
+                await update.effective_message.reply_text(
                     f"🛑 Cancellation requested for <code>{html.escape(agent_id)}</code>.\n"
                     f"Any in-progress LLM call will be interrupted immediately.",
                     parse_mode=ParseMode.HTML,
                 )
             else:
-                await update.message.reply_text(
+                await update.effective_message.reply_text(
                     f"❌ No active sub-agent with id <code>{html.escape(agent_id)}</code>.",
                     parse_mode=ParseMode.HTML,
                 )
@@ -395,7 +395,7 @@ class TelegramInterface:
 
         active = _get_agent_registry().list_active()
         if not active:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "🤖 No sub-agents currently running.\n"
                 "<i>Tip: /agents cancel &lt;id&gt; to cancel a running agent</i>",
                 parse_mode=ParseMode.HTML,
@@ -415,19 +415,19 @@ class TelegramInterface:
             lines.append("")
 
         lines.append("<i>Tip: /agents cancel &lt;id&gt; to stop a sub-agent</i>")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
             await self._send_unauthorized(update)
             return
         if not self.tool_registry:
-            await update.message.reply_text("Tool registry not available.")
+            await update.effective_message.reply_text("Tool registry not available.")
             return
 
         tools = self.tool_registry.all()
         if not tools:
-            await update.message.reply_text("No tools registered.")
+            await update.effective_message.reply_text("No tools registered.")
             return
 
         builtin = [t for t in tools if not t.is_generated]
@@ -450,19 +450,19 @@ class TelegramInterface:
             for t in generated:
                 lines.append(_tool_entry(t))
 
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_skills(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
             await self._send_unauthorized(update)
             return
         if not self.skill_registry:
-            await update.message.reply_text("Skills not available.")
+            await update.effective_message.reply_text("Skills not available.")
             return
 
         skills = self.skill_registry.all()
         if not skills:
-            await update.message.reply_text("📚 No skills found. Add skill directories under the <code>skills/</code> folder.", parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text("📚 No skills found. Add skill directories under the <code>skills/</code> folder.", parse_mode=ParseMode.HTML)
             return
 
         lines = [f"📚 <b>Available Skills</b> ({len(skills)} total)\n"]
@@ -472,17 +472,17 @@ class TelegramInterface:
             if len(desc) > 80:
                 desc = desc[:77] + "…"
             lines.append(f"  • <b>{html.escape(s.name)}</b> — {desc}")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_reindex(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
             await self._send_unauthorized(update)
             return
         if not self._tool_index:
-            await update.message.reply_text("⚠️ Tool index not available.")
+            await update.effective_message.reply_text("⚠️ Tool index not available.")
             return
 
-        status_msg = await update.message.reply_text("⏳ Reindexing tools…")
+        status_msg = await update.effective_message.reply_text("⏳ Reindexing tools…")
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, self._tool_index.rebuild)
 
@@ -501,7 +501,7 @@ class TelegramInterface:
         """
         user = update.effective_user
         if self.security_mode != "pairing":
-            await update.message.reply_text("Pairing mode is not enabled.")
+            await update.effective_message.reply_text("Pairing mode is not enabled.")
             return
 
         args = ctx.args or []
@@ -513,9 +513,9 @@ class TelegramInterface:
                 self.allowed_ids.add(user.id)
                 del self._pending_pairs[token]
                 logger.info("User %d authorized via pairing token", user.id)
-                await update.message.reply_text("✅ Pairing successful! You can now use the agent.")
+                await update.effective_message.reply_text("✅ Pairing successful! You can now use the agent.")
             else:
-                await update.message.reply_text("❌ Invalid or expired pairing token.")
+                await update.effective_message.reply_text("❌ Invalid or expired pairing token.")
             return
 
         # Generate a new token (only for already-authorized users)
@@ -526,7 +526,7 @@ class TelegramInterface:
         token = secrets.token_hex(8)
         self._pending_pairs[token] = user.id
         logger.info("Pairing token generated by user %d: %s", user.id, token)
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"🔑 Pairing token (valid until used):\n<code>{html.escape(token)}</code>\n\n"
             "Share this with the user who should gain access. "
             "They should run: <code>/pair &lt;token&gt;</code>",
@@ -539,19 +539,19 @@ class TelegramInterface:
             return
         args = ctx.args or []
         if not args:
-            await update.message.reply_text("Usage: /unpair <user_id>")
+            await update.effective_message.reply_text("Usage: /unpair <user_id>")
             return
         try:
             target = int(args[0])
         except ValueError:
-            await update.message.reply_text("Invalid user ID.")
+            await update.effective_message.reply_text("Invalid user ID.")
             return
         self.allowed_ids.discard(target)
-        await update.message.reply_text(f"User {target} removed from allowed list.")
+        await update.effective_message.reply_text(f"User {target} removed from allowed list.")
 
     async def _cmd_myid(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id
-        await update.message.reply_text(f"Your Telegram user ID: <code>{uid}</code>", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(f"Your Telegram user ID: <code>{uid}</code>", parse_mode=ParseMode.HTML)
 
     async def _cmd_health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
@@ -572,16 +572,16 @@ class TelegramInterface:
             await self._send_unauthorized(update)
             return
         if not self.agent:
-            await update.message.reply_text("Agent not available.")
+            await update.effective_message.reply_text("Agent not available.")
             return
         try:
             prompt, tokens = self.agent.build_system_prompt()
         except Exception as exc:
-            await update.message.reply_text(f"Error building context: {exc}")
+            await update.effective_message.reply_text(f"Error building context: {exc}")
             return
         buf = io.BytesIO(prompt.encode("utf-8"))
         buf.name = "context.md"
-        await update.message.reply_document(
+        await update.effective_message.reply_document(
             document=buf,
             filename="context.md",
             caption=f"📋 Current agent context (~{tokens:,} tokens)",
@@ -630,13 +630,13 @@ class TelegramInterface:
         # Telegram max message length is 4096; split if needed
         chunk_size = 4096
         for i in range(0, len(text), chunk_size):
-            await update.message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
 
     async def _on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.message:
+        if not update.effective_message:
             return
         user = update.effective_user
-        text = (update.message.text or "").strip()
+        text = (update.effective_message.text or "").strip()
         if not text:
             return
         if not self._is_authorized(user.id):
@@ -650,7 +650,7 @@ class TelegramInterface:
     ) -> None:
         """Run the agent with a given task, showing streaming progress."""
         user = update.effective_user
-        status_msg = await update.message.reply_text("🔄 Processing…")
+        status_msg = await update.effective_message.reply_text("🔄 Processing…")
         loop = asyncio.get_running_loop()
         chat_id = update.effective_chat.id
 
@@ -669,7 +669,7 @@ class TelegramInterface:
             if msg.startswith("__CONFIRM__:"):
                 _, token, description = msg.split(":", 2)
                 asyncio.run_coroutine_threadsafe(
-                    self._send_confirmation_prompt(update.message, token, description),
+                    self._send_confirmation_prompt(update.effective_message, token, description),
                     loop,
                 )
                 return
@@ -678,14 +678,14 @@ class TelegramInterface:
                 token = parts[1]
                 current_steps = parts[2] if len(parts) > 2 else "?"
                 asyncio.run_coroutine_threadsafe(
-                    self._send_extend_prompt(update.message, token, current_steps),
+                    self._send_extend_prompt(update.effective_message, token, current_steps),
                     loop,
                 )
                 return
             if msg.startswith("__TOOL_CREATE__:"):
                 token = msg.split(":", 1)[1]
                 asyncio.run_coroutine_threadsafe(
-                    self._send_tool_create_prompt(update.message, token),
+                    self._send_tool_create_prompt(update.effective_message, token),
                     loop,
                 )
                 return
@@ -698,7 +698,7 @@ class TelegramInterface:
                     file_path, caption = "", ""
                 if file_path:
                     asyncio.run_coroutine_threadsafe(
-                        self._send_file_to_chat(update.message, file_path, caption),
+                        self._send_file_to_chat(update.effective_message, file_path, caption),
                         loop,
                     )
                 return
@@ -714,7 +714,7 @@ class TelegramInterface:
             )
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
-                await self._send_safe(update.message, chunk)
+                await self._send_safe(update.effective_message, chunk)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
@@ -907,7 +907,7 @@ class TelegramInterface:
             await self._send_unauthorized(update)
             return
         if not self.llm_client or not hasattr(self.llm_client, "list_models"):
-            await update.message.reply_text("Multi-model support not available.")
+            await update.effective_message.reply_text("Multi-model support not available.")
             return
 
         models = self.llm_client.list_models()
@@ -927,7 +927,7 @@ class TelegramInterface:
                 )])
 
         keyboard = InlineKeyboardMarkup(buttons) if buttons else None
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "\n".join(lines),
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
@@ -993,14 +993,14 @@ class TelegramInterface:
         uid = update.effective_user.id
         logger.warning("Unauthorized access attempt from user %d", uid)
         if self.security_mode == "pairing":
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "🔒 Access denied.\n"
                 "Ask an authorized user for a pairing token and run:\n"
                 "<code>/pair &lt;token&gt;</code>",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"🔒 Access denied. Your ID is <code>{uid}</code>.\n"
                 "Ask the admin to add it to the allowed list.",
                 parse_mode=ParseMode.HTML,
