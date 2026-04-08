@@ -377,10 +377,14 @@ class Scheduler:
         try:
             now_local = datetime.now()
             cron = croniter(expr, now_local)
-            next_run = cron.get_next(datetime)
-            # Apply ±jitter (capped at _JITTER_MAX_SECS)
+            natural_next = cron.get_next(datetime)
+            # Store the natural (un-jittered) fire time so the rescheduling base is
+            # always at or after the real cron tick — prevents double-execution when
+            # negative jitter fires the job before the natural tick time.
+            meta["_natural_next_run"] = natural_next.isoformat()
+            # Apply ±jitter (capped at _JITTER_MAX_SECS) only for the first run
             jitter_secs = random.randint(-self._JITTER_MAX_SECS, self._JITTER_MAX_SECS)
-            next_run += timedelta(seconds=jitter_secs)
+            next_run = natural_next + timedelta(seconds=jitter_secs)
             meta["_next_run"] = next_run.isoformat()
             sign = "+" if jitter_secs >= 0 else ""
             logger.debug(
@@ -850,12 +854,18 @@ class Scheduler:
                 if now_local >= next_run:
                     # Fire in background thread
                     threading.Thread(target=self._run_job, kwargs={"tag": tag}, daemon=True).start()
-                    # Schedule next occurrence (no jitter on subsequent runs)
+                    # Schedule next occurrence using the natural (un-jittered) fire time as
+                    # the croniter base. Using now_local would return the same tick when the
+                    # job fired early due to negative startup jitter (double-execution bug).
                     try:
                         expr = meta.get("cron")
                         if expr:
-                            cron = croniter(expr, now_local)
-                            meta["_next_run"] = cron.get_next(datetime).isoformat()
+                            natural_str = meta.get("_natural_next_run") or next_run_str
+                            base_dt = datetime.fromisoformat(natural_str)
+                            cron_iter = croniter(expr, base_dt)
+                            next_dt = cron_iter.get_next(datetime)
+                            meta["_natural_next_run"] = next_dt.isoformat()
+                            meta["_next_run"] = next_dt.isoformat()
                     except Exception as exc:
                         logger.warning("Could not compute next_run for '%s': %s", tag, exc)
             # Once-jobs handled by schedule library
