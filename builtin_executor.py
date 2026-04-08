@@ -127,7 +127,10 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "'0 2 * * *' = daily at 02:00, '*/30 * * * *' = every 30 min). "
             "For one-time reminders use schedule_type='once' with run_at='HH:MM'. "
             "Legacy fields hours/minutes/time are still accepted and auto-converted to cron. "
-            "notify (bool, default true). Always provide a non-empty task when adding any job."
+            "notify (bool, default true). "
+            "model (str, optional — model identifier to use for this job's sub-agent, e.g. 'gpt-4o'). "
+            "preserve_context (bool, default false — if true, conversation history is kept between runs). "
+            "Always provide a non-empty task when adding any job."
         ),
     ),
     "spawn_agent": BuiltinTool(
@@ -468,6 +471,8 @@ class BuiltinExecutor:
                 time_str=str(args.get("time", "")) or None,
                 run_at=str(args.get("run_at", "")) or None,
                 cron=str(args.get("cron", "")) or None,
+                model=str(args["model"]) if args.get("model") else None,
+                preserve_context=bool(args.get("preserve_context", False)),
             )
             if result["success"]:
                 return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}
