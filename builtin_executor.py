@@ -242,6 +242,32 @@ class BuiltinExecutor:
     # ------------------------------------------------------------------
 
     def _requires_confirmation(self, tool_name: str, args: dict, description: str) -> dict:
+        # In headless mode (sub-agents), there is no user to confirm — auto-handle:
+        #   shell/dangerous → deny (too risky to run destructive commands unattended)
+        #   file_read/sensitive, file_write → approve (non-destructive or expected by task)
+        if self._agent_depth >= 1:
+            if tool_name == "shell":
+                command = args.get("command", "")
+                logger.warning(
+                    "Headless sub-agent: dangerous shell command blocked (requires confirmation): %s",
+                    command[:120],
+                )
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": (
+                        f"Command blocked in headless mode (would require confirmation): {command[:200]}\n"
+                        "Tip: use a safer alternative, or break the command into non-destructive steps."
+                    ),
+                    "exit_code": -1,
+                }
+            else:
+                # file_read sensitive or file_write — auto-approve
+                logger.info(
+                    "Headless sub-agent: auto-approving %s (no user confirmation available)", tool_name
+                )
+                return self._run(tool_name, args)
+
         token = secrets.token_hex(12)
         self._pending[token] = (tool_name, args)
         logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
