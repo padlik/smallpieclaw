@@ -324,7 +324,7 @@ class AgentController:
                     if self.results and self.working and self.working.has_content():
                         tools_used = [
                             s["details"].get("tool", "")
-                            for s in self.working._steps
+                            for s in self.working.steps
                             if s["action"] == "tool"
                         ]
                         self.results.add_result(
@@ -359,7 +359,9 @@ class AgentController:
                             _progress(f"{_CONFIRM_PREFIX}:{token}:{description}")
                             # Block until user responds (timeout 5 min)
                             confirmed = event.wait(timeout=300)
-                            result_confirmed = self._confirm_results.pop(token, False) if confirmed else False
+                            # Always read the actual result — handles the race where
+                            # resume() fires between timeout-return and this pop.
+                            result_confirmed = self._confirm_results.pop(token, False)
                             self._confirm_events.pop(token, None)
 
                             if result_confirmed:
@@ -559,11 +561,11 @@ class AgentController:
             if self.results:
                 tools_used = [
                     s["details"].get("tool", "")
-                    for s in self.working._steps
+                    for s in self.working.steps
                     if s["action"] == "tool"
                 ]
                 self.results.add_result(
-                    goal=self.working._goal,
+                    goal=self.working.goal,
                     summary=summary,
                     tools_used=list(filter(None, tools_used)),
                 )

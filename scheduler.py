@@ -257,10 +257,11 @@ class Scheduler:
 
     def remove_job(self, tag: str) -> bool:
         tag = self._resolve_tag(tag) or tag
-        if tag not in self._jobs_meta:
-            return False
-        schedule.clear(tag)
-        del self._jobs_meta[tag]
+        with self._running_lock:
+            if tag not in self._jobs_meta:
+                return False
+            schedule.clear(tag)
+            del self._jobs_meta[tag]
         self._save_state()
         self._save_scheduler_toml()
         logger.info("Job removed: %s", tag)
@@ -268,9 +269,10 @@ class Scheduler:
 
     def pause_job(self, tag: str) -> bool:
         tag = self._resolve_tag(tag) or tag
-        if tag not in self._jobs_meta:
-            return False
-        self._jobs_meta[tag]["enabled"] = False
+        with self._running_lock:
+            if tag not in self._jobs_meta:
+                return False
+            self._jobs_meta[tag]["enabled"] = False
         schedule.clear(tag)
         self._save_state()
         self._save_scheduler_toml()
@@ -279,10 +281,11 @@ class Scheduler:
 
     def resume_job(self, tag: str) -> bool:
         tag = self._resolve_tag(tag) or tag
-        if tag not in self._jobs_meta:
-            return False
-        self._jobs_meta[tag]["enabled"] = True
-        self._register_job(tag, self._jobs_meta[tag])
+        with self._running_lock:
+            if tag not in self._jobs_meta:
+                return False
+            self._jobs_meta[tag]["enabled"] = True
+            self._register_job(tag, self._jobs_meta[tag])
         self._save_state()
         self._save_scheduler_toml()
         logger.info("Job resumed: %s", tag)

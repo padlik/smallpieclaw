@@ -206,7 +206,7 @@ class ToolIndex:
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.index_path) or ".", exist_ok=True)
-        tmp = self.index_path + ".tmp"
+        tmp = f"{self.index_path}.tmp.{os.getpid()}.{id(self)}"
         try:
             with open(tmp, "w") as f:
                 json.dump(self._index, f, indent=2)

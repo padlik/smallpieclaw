@@ -509,9 +509,9 @@ class TelegramInterface:
         if args:
             # Someone submitting a token
             token = args[0].strip()
-            if token in self._pending_pairs:
+            redeemed_by = self._pending_pairs.pop(token, None)
+            if redeemed_by is not None:
                 self.allowed_ids.add(user.id)
-                del self._pending_pairs[token]
                 logger.info("User %d authorized via pairing token", user.id)
                 await update.effective_message.reply_text("✅ Pairing successful! You can now use the agent.")
             else:
@@ -725,7 +725,10 @@ class TelegramInterface:
         """Send a local file or photo to the chat (called from the progress callback)."""
         import os
         _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+        _MAX_CAPTION = 1024
         ext = os.path.splitext(file_path)[1].lower()
+        if caption and len(caption) > _MAX_CAPTION:
+            caption = caption[:_MAX_CAPTION - 3] + "…"
         try:
             with open(file_path, "rb") as f:
                 if ext in _IMAGE_EXTS:
@@ -1006,7 +1009,6 @@ class TelegramInterface:
                 parse_mode=ParseMode.HTML,
             )
 
-    @staticmethod
     @staticmethod
     def _split_message(text: str, limit: int = 4000) -> list[str]:
         """

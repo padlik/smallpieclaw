@@ -468,7 +468,11 @@ class LLMClient:
 
         api_key = self.llm_cfg["api_key"]
         model = self.llm_cfg["model"]
-        google_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        google_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        google_headers = {
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        }
         google_payload = {
             "contents": contents,
             "generationConfig": {
@@ -482,16 +486,26 @@ class LLMClient:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
 
         def _do_request():
-            r = self._http.post(google_url, json=google_payload)
+            r = self._http.post(google_url, headers=google_headers, json=google_payload)
             r.raise_for_status()
             d = r.json()
+            if "error" in d:
+                err = d["error"]
+                raise LLMError(f"Google API error (model: {model}): {err.get('message', err)}")
             meta = d.get("usageMetadata", {})
             self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
-            text = (d["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
+            candidates = d.get("candidates") or []
+            if not candidates:
+                logger.error("Google model '%s': response missing 'candidates'. Raw: %s", model, str(d)[:500])
+                raise LLMEmptyResponseError(f"Google model '{model}' returned no candidates. Body: {str(d)[:300]}")
+            content = candidates[0].get("content") or {}
+            parts = content.get("parts") or []
+            text = (parts[0].get("text", "") if parts else "").strip()
             if not text:
                 if self._diagnose_empty:
                     curl_cmd = [
                         "curl", "-s", "-X", "POST", google_url,
+                        "-H", f"x-goog-api-key: {api_key}",
                         "-H", "Content-Type: application/json",
                         "-d", json.dumps(google_payload),
                     ]
@@ -530,9 +544,16 @@ class LLMClient:
             r = self._http.post(anthropic_url, headers=anthropic_headers, json=payload)
             r.raise_for_status()
             d = r.json()
+            if "error" in d:
+                err = d["error"]
+                raise LLMError(f"Anthropic API error (model: {model}): {err.get('message', err)}")
             usage = d.get("usage", {})
             self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
-            text = (d["content"][0]["text"] or "").strip()
+            content_blocks = d.get("content") or []
+            if not content_blocks:
+                logger.error("Anthropic model '%s': response missing 'content'. Raw: %s", model, str(d)[:500])
+                raise LLMEmptyResponseError(f"Anthropic model '{model}' returned no content. Body: {str(d)[:300]}")
+            text = (content_blocks[0].get("text", "") or "").strip()
             if not text:
                 if self._diagnose_empty:
                     curl_cmd = [

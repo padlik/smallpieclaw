@@ -116,7 +116,7 @@ class MemoryStore:
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
+        tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
         try:
             with open(tmp, "w") as f:
                 json.dump(self._data, f, indent=2)
@@ -211,6 +211,14 @@ class WorkingMemory:
     def has_content(self) -> bool:
         return bool(self._goal)
 
+    @property
+    def goal(self) -> str:
+        return self._goal
+
+    @property
+    def steps(self) -> list:
+        return self._steps
+
     def clear(self) -> None:
         self._goal = ""
         self._steps = []
@@ -290,7 +298,7 @@ class LongTermMemory:
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
+        tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
         try:
             with open(tmp, "w") as f:
                 json.dump(self._data, f, indent=2)
@@ -374,7 +382,7 @@ class ResultsMemory:
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
+        tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
         try:
             with open(tmp, "w") as f:
                 json.dump(self._data, f, indent=2)
