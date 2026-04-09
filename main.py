@@ -11,9 +11,11 @@ Boot sequence:
   5. Start the Telegram bot (blocking)
 """
 
+import fcntl
 import logging
 import logging.handlers
 import os
+import signal
 import sys
 
 # Directory containing main.py — used as the agent's base directory
@@ -99,6 +101,68 @@ def _setup_logging(log_file: str = _DEFAULT_LOG, backup_count: int = 30) -> None
 _setup_logging()
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# PID file locking — prevents multiple concurrent instances
+# ---------------------------------------------------------------------------
+class _PidFileLock:
+    """
+    Advisory exclusive lock on a PID file using fcntl.flock().
+
+    The OS releases the lock automatically when the process exits (even on
+    crash), so stale PID files left by a previous crash are handled without
+    any PID-alive check — if flock() succeeds, the previous holder is gone.
+
+    Usage::
+
+        with _PidFileLock("/run/agent.pid"):
+            ...  # only one process can hold this at a time
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_PidFileLock":
+        os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
+        try:
+            fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError as exc:
+            logger.error("Cannot open PID file %s: %s", self._path, exc)
+            sys.exit(1)
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                existing_pid = open(self._path).read().strip()
+            except OSError:
+                existing_pid = "unknown"
+            logger.error(
+                "Another instance is already running (PID %s). Aborting.", existing_pid
+            )
+            os.close(fd)
+            sys.exit(1)
+
+        # Lock acquired — write our PID
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        self._fd = fd
+        return self
+
+    def __exit__(self, *_) -> None:
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        try:
+            os.unlink(self._path)
+        except OSError:
+            pass
+
 # ---------------------------------------------------------------------------
 # Third-party & local imports
 # ---------------------------------------------------------------------------
@@ -149,7 +213,35 @@ def main():
     tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
     log_file         = paths.get("log_file", _DEFAULT_LOG)
     log_backup_count = int(paths.get("log_backup_count", 30))
+    pid_file      = os.path.join(
+        _AGENT_DIR,
+        paths.get("pid_file", os.path.join(data_dir, "agent.pid")),
+    ) if not os.path.isabs(paths.get("pid_file", "")) else paths["pid_file"]
 
+    # SIGTERM → clean exit so the finally: block always runs (e.g. systemctl stop)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    with _PidFileLock(pid_file):
+        _run(
+            cfg=cfg, paths=paths,
+            tools_dir=tools_dir, gen_tools_dir=gen_tools_dir, data_dir=data_dir,
+            index_path=index_path, memory_path=memory_path,
+            longterm_path=longterm_path, results_path=results_path,
+            scheduler_config_path=scheduler_config_path, skills_dir=skills_dir,
+            downloads_dir=downloads_dir, tmp_dir=tmp_dir,
+            log_file=log_file, log_backup_count=log_backup_count,
+        )
+
+
+def _run(
+    cfg, paths,
+    tools_dir, gen_tools_dir, data_dir,
+    index_path, memory_path, longterm_path, results_path,
+    scheduler_config_path, skills_dir,
+    downloads_dir, tmp_dir,
+    log_file, log_backup_count,
+):
+    """Core startup after PID lock is acquired."""
     # Re-initialise logging with the configured path (replaces the bootstrap handler)
     for h in logging.root.handlers[:]:
         logging.root.removeHandler(h)

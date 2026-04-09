@@ -97,5 +97,6 @@ skills_dir         = "skills"
 downloads_dir      = "downloads"
 log_file           = "agent.log"
 log_backup_count   = 30         # number of daily rotated files to keep
+pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate instances
 # tmp_dir defaults to /tmp/<working_dir_name> if not set
 # tmp_dir = "/tmp/agent"
