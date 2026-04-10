@@ -18,6 +18,8 @@ import json
 import logging
 import math
 import os
+import threading
+import time
 import uuid
 from collections import deque
 from datetime import datetime
@@ -43,12 +45,14 @@ def _cosine_similarity(a: list, b: list) -> float:
 class MemoryStore:
     """
     Simple persistent memory backed by a JSON file.
-    Thread-safe for single-process use (file rewritten on every mutation).
+    Thread-safe: all mutations are protected by an RLock so parallel
+    sub-agents can call memory_write concurrently without data races.
     """
 
     def __init__(self, path: str):
         self.path = path
         self._data: dict[str, Any] = {}
+        self._lock = threading.RLock()
         self._load()
 
     # ------------------------------------------------------------------
@@ -56,73 +60,94 @@ class MemoryStore:
     # ------------------------------------------------------------------
 
     def get(self, key: str, default: Any = None) -> Any:
-        return self._data.get(key, default)
+        with self._lock:
+            return self._data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
-        self._data[key] = value
-        self._save()
+        with self._lock:
+            self._data[key] = value
+            self._save_with_retry()
 
     def delete(self, key: str) -> None:
-        self._data.pop(key, None)
-        self._save()
+        with self._lock:
+            self._data.pop(key, None)
+            self._save_with_retry()
 
     def all(self) -> dict[str, Any]:
         """Return a copy of all stored key-value pairs."""
-        return dict(self._data)
+        with self._lock:
+            return dict(self._data)
 
     def update(self, updates: dict[str, Any]) -> None:
         """Batch-update multiple keys."""
-        self._data.update(updates)
-        self._save()
+        with self._lock:
+            self._data.update(updates)
+            self._save_with_retry()
 
     def as_prompt_text(self) -> str:
         """Format memory as a short text block suitable for LLM context."""
-        if not self._data:
-            return "No persistent memory entries."
-        lines = []
-        for k, v in self._data.items():
-            lines.append(f"  {k}: {json.dumps(v)}")
-        return "\n".join(lines)
+        with self._lock:
+            if not self._data:
+                return "No persistent memory entries."
+            lines = []
+            for k, v in self._data.items():
+                lines.append(f"  {k}: {json.dumps(v)}")
+            return "\n".join(lines)
 
     def record_event(self, event: str) -> None:
         """Append a timestamped event to the event log."""
-        log: list = self._data.setdefault("_event_log", [])
-        log.append({"time": datetime.utcnow().isoformat(), "event": event})
-        # Keep only last 50 events to avoid unbounded growth
-        self._data["_event_log"] = log[-50:]
-        self._save()
+        with self._lock:
+            log: list = self._data.setdefault("_event_log", [])
+            log.append({"time": datetime.utcnow().isoformat(), "event": event})
+            # Keep only last 50 events to avoid unbounded growth
+            self._data["_event_log"] = log[-50:]
+            self._save_with_retry()
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     def _load(self) -> None:
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, "r") as f:
-                    self._data = json.load(f)
-                logger.debug("Memory loaded from %s (%d keys)", self.path, len(self._data))
-            except Exception as exc:
-                logger.warning("Could not load memory from %s: %s — starting fresh", self.path, exc)
-                self._data = {}
-        else:
-            # Seed with useful defaults
-            self._data = {
-                "known_services": [],
-                "last_health_check": None,
-                "notes": [],
-            }
-            self._save()
+        with self._lock:
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path, "r") as f:
+                        self._data = json.load(f)
+                    logger.debug("Memory loaded from %s (%d keys)", self.path, len(self._data))
+                except Exception as exc:
+                    logger.warning("Could not load memory from %s: %s — starting fresh", self.path, exc)
+                    self._data = {}
+            else:
+                # Seed with useful defaults
+                self._data = {
+                    "known_services": [],
+                    "last_health_check": None,
+                    "notes": [],
+                }
+                self._save_with_retry()
 
-    def _save(self) -> None:
+    def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
+        """Write to disk with exponential-backoff retry. Caller must hold _lock."""
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
-        try:
-            with open(tmp, "w") as f:
-                json.dump(self._data, f, indent=2)
-            os.replace(tmp, self.path)
-        except Exception as exc:
-            logger.error("Could not save memory: %s", exc)
+        delay = base_delay
+        for attempt in range(1, attempts + 1):
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(self._data, f, indent=2)
+                os.replace(tmp, self.path)
+                return
+            except Exception as exc:
+                if attempt < attempts:
+                    logger.warning("MemoryStore save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error("MemoryStore save failed after %d attempts: %s", attempts, exc)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +261,7 @@ class LongTermMemory:
         self.path = path
         self.llm = llm
         self._data: dict = {}
+        self._lock = threading.RLock()
         self._load()
 
     def add(self, content: str, source: str = "manual") -> str:
@@ -246,39 +272,41 @@ class LongTermMemory:
                 vector = self.llm.embed(content)
             except Exception as exc:
                 logger.warning("LongTermMemory embed failed: %s", exc)
-        self._data[entry_id] = {
-            "content": content,
-            "source": source,
-            "timestamp": datetime.utcnow().isoformat(),
-            "vector": vector,
-        }
-        self._save()
+        with self._lock:
+            self._data[entry_id] = {
+                "content": content,
+                "source": source,
+                "timestamp": datetime.utcnow().isoformat(),
+                "vector": vector,
+            }
+            self._save_with_retry()
         return entry_id
 
     def search(self, query: str, top_k: int = 3) -> list:
-        if not self._data:
-            return []
+        with self._lock:
+            if not self._data:
+                return []
         query_vec = []
         if self.llm:
             try:
                 query_vec = self.llm.embed(query)
             except Exception as exc:
                 logger.warning("LongTermMemory search embed failed: %s", exc)
-        if not query_vec:
-            # Fall back to latest N entries
-            entries = sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)
-            return entries[:top_k]
-        scored = []
-        for entry_id, entry in self._data.items():
-            vec = entry.get("vector", [])
-            if vec:
-                score = _cosine_similarity(query_vec, vec)
-                scored.append((score, entry))
+        with self._lock:
+            if not query_vec:
+                entries = sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)
+                return entries[:top_k]
+            scored = []
+            for entry_id, entry in self._data.items():
+                vec = entry.get("vector", [])
+                if vec:
+                    score = _cosine_similarity(query_vec, vec)
+                    scored.append((score, entry))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in scored[:top_k]]
 
     def as_prompt_text(self, query: str = "", top_k: int = 3) -> str:
-        entries = self.search(query, top_k) if query else list(self._data.values())[-top_k:]
+        entries = self.search(query, top_k) if query else self._latest(top_k)
         if not entries:
             return "No long-term memory entries."
         lines = []
@@ -287,24 +315,42 @@ class LongTermMemory:
             lines.append(f"  [{ts}] {entry['content']}")
         return "\n".join(lines)
 
-    def _load(self) -> None:
-        if os.path.exists(self.path):
-            try:
-                with open(self.path) as f:
-                    self._data = json.load(f)
-            except Exception as exc:
-                logger.warning("LongTermMemory load failed: %s", exc)
-                self._data = {}
+    def _latest(self, top_k: int) -> list:
+        with self._lock:
+            return sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)[:top_k]
 
-    def _save(self) -> None:
+    def _load(self) -> None:
+        with self._lock:
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path) as f:
+                        self._data = json.load(f)
+                except Exception as exc:
+                    logger.warning("LongTermMemory load failed: %s", exc)
+                    self._data = {}
+
+    def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
+        """Write to disk with exponential-backoff retry. Caller must hold _lock."""
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
-        try:
-            with open(tmp, "w") as f:
-                json.dump(self._data, f, indent=2)
-            os.replace(tmp, self.path)
-        except Exception as exc:
-            logger.error("LongTermMemory save failed: %s", exc)
+        delay = base_delay
+        for attempt in range(1, attempts + 1):
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(self._data, f, indent=2)
+                os.replace(tmp, self.path)
+                return
+            except Exception as exc:
+                if attempt < attempts:
+                    logger.warning("LongTermMemory save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error("LongTermMemory save failed after %d attempts: %s", attempts, exc)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +364,7 @@ class ResultsMemory:
         self.path = path
         self.llm = llm
         self._data: dict = {}
+        self._lock = threading.RLock()
         self._load()
 
     def add_result(self, goal: str, summary: str, tools_used: list = None) -> str:
@@ -329,39 +376,42 @@ class ResultsMemory:
                 vector = self.llm.embed(content)
             except Exception as exc:
                 logger.warning("ResultsMemory embed failed: %s", exc)
-        self._data[result_id] = {
-            "goal": goal,
-            "summary": summary,
-            "tools_used": tools_used or [],
-            "timestamp": datetime.utcnow().isoformat(),
-            "vector": vector,
-        }
-        self._save()
+        with self._lock:
+            self._data[result_id] = {
+                "goal": goal,
+                "summary": summary,
+                "tools_used": tools_used or [],
+                "timestamp": datetime.utcnow().isoformat(),
+                "vector": vector,
+            }
+            self._save_with_retry()
         return result_id
 
     def search(self, query: str, top_k: int = 3) -> list:
-        if not self._data:
-            return []
+        with self._lock:
+            if not self._data:
+                return []
         query_vec = []
         if self.llm:
             try:
                 query_vec = self.llm.embed(query)
             except Exception as exc:
                 logger.warning("ResultsMemory search embed failed: %s", exc)
-        if not query_vec:
-            entries = sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)
-            return entries[:top_k]
-        scored = []
-        for entry_id, entry in self._data.items():
-            vec = entry.get("vector", [])
-            if vec:
-                score = _cosine_similarity(query_vec, vec)
-                scored.append((score, entry))
+        with self._lock:
+            if not query_vec:
+                entries = sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)
+                return entries[:top_k]
+            scored = []
+            for entry_id, entry in self._data.items():
+                vec = entry.get("vector", [])
+                if vec:
+                    score = _cosine_similarity(query_vec, vec)
+                    scored.append((score, entry))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in scored[:top_k]]
 
     def as_prompt_text(self, query: str = "", top_k: int = 3) -> str:
-        entries = self.search(query, top_k) if query else list(self._data.values())[-top_k:]
+        entries = self.search(query, top_k) if query else self._latest(top_k)
         if not entries:
             return "No past results."
         lines = []
@@ -371,21 +421,39 @@ class ResultsMemory:
             lines.append(f"    Result: {entry['summary']}")
         return "\n".join(lines)
 
-    def _load(self) -> None:
-        if os.path.exists(self.path):
-            try:
-                with open(self.path) as f:
-                    self._data = json.load(f)
-            except Exception as exc:
-                logger.warning("ResultsMemory load failed: %s", exc)
-                self._data = {}
+    def _latest(self, top_k: int) -> list:
+        with self._lock:
+            return sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)[:top_k]
 
-    def _save(self) -> None:
+    def _load(self) -> None:
+        with self._lock:
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path) as f:
+                        self._data = json.load(f)
+                except Exception as exc:
+                    logger.warning("ResultsMemory load failed: %s", exc)
+                    self._data = {}
+
+    def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
+        """Write to disk with exponential-backoff retry. Caller must hold _lock."""
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
-        try:
-            with open(tmp, "w") as f:
-                json.dump(self._data, f, indent=2)
-            os.replace(tmp, self.path)
-        except Exception as exc:
-            logger.error("ResultsMemory save failed: %s", exc)
+        delay = base_delay
+        for attempt in range(1, attempts + 1):
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(self._data, f, indent=2)
+                os.replace(tmp, self.path)
+                return
+            except Exception as exc:
+                if attempt < attempts:
+                    logger.warning("ResultsMemory save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error("ResultsMemory save failed after %d attempts: %s", attempts, exc)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
