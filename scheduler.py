@@ -18,6 +18,8 @@ Examples:
   cron = "*/30 * * * *"  → every 30 minutes
 """
 
+from __future__ import annotations
+
 import html as _html
 import json
 import logging

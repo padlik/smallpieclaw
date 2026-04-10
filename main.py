@@ -11,6 +11,8 @@ Boot sequence:
   5. Start the Telegram bot (blocking)
 """
 
+from __future__ import annotations
+
 import fcntl
 import logging
 import logging.handlers

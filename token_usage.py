@@ -5,6 +5,8 @@ All LLMClient instances (main agent + sub-agents) record usage here.
 /status reads the aggregated per-model totals for today.
 """
 
+from __future__ import annotations
+
 import threading
 from datetime import date
 
