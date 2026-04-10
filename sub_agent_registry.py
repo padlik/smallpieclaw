@@ -5,6 +5,8 @@ Tracks all running SubAgentRunner instances so they can be listed
 (/agents command) and cancelled (/agents cancel <id>).
 """
 
+from __future__ import annotations
+
 import threading
 import time
 from dataclasses import dataclass, field
