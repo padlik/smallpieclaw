@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # description: comprehensive system health report including CPU, memory, disk, uptime and temperature
-import os
 import subprocess
 import time
 

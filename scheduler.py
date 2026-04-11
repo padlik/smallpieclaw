@@ -27,7 +27,6 @@ import os
 import random
 import shutil
 import threading
-import time
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
@@ -451,7 +450,6 @@ class Scheduler:
 
             job_model = meta.get("model") or None
             preserve_ctx = meta.get("preserve_context", False)
-            ctx_max = meta.get("context_max_messages", 50)
             context_key = tag if preserve_ctx else None
 
             spawn_args = {"task": task, "_job_tag": tag}
@@ -672,7 +670,6 @@ class Scheduler:
 
     def _prune_backups(self) -> None:
         """Keep only the last _MAX_BACKUPS backup files for scheduler.toml."""
-        base = self._scheduler_config_path + ".bak."
         dir_ = os.path.dirname(os.path.abspath(self._scheduler_config_path))
         fname = os.path.basename(self._scheduler_config_path)
         prefix = fname + ".bak."
@@ -746,7 +743,7 @@ class Scheduler:
             if meta.get("model"):
                 lines.append(f'model = "{meta["model"]}"\n')
             if meta.get("preserve_context"):
-                lines.append(f'preserve_context = true\n')
+                lines.append('preserve_context = true\n')
                 ctx_max = meta.get("context_max_messages", 50)
                 if ctx_max != 50:
                     lines.append(f'context_max_messages = {ctx_max}\n')

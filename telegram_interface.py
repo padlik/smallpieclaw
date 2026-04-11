@@ -14,10 +14,8 @@ import html
 import io
 import logging
 import os
-import platform
 import re
 import secrets
-import shutil
 import time
 from datetime import datetime
 from typing import Callable, Optional

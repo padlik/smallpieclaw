@@ -21,7 +21,7 @@ import secrets
 import subprocess
 import sys
 import threading
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from llm_client import LLMClient, LLMCancelledError
 from memory_store import MemoryStore
@@ -358,7 +358,7 @@ class AgentController:
                             # Signal the UI to show confirmation buttons
                             _progress(f"{_CONFIRM_PREFIX}:{token}:{description}")
                             # Block until user responds (timeout 5 min)
-                            confirmed = event.wait(timeout=300)
+                            event.wait(timeout=300)
                             # Always read the actual result — handles the race where
                             # resume() fires between timeout-return and this pop.
                             result_confirmed = self._confirm_results.pop(token, False)
@@ -695,14 +695,14 @@ class AgentController:
         log_abs = os.path.abspath(self.log_file)
         lines = [
             f"- Active log (always current session): {log_abs}",
-            f"- Rotation: nightly at 00:00 local time. Rotated files use numbered suffixes:",
+            "- Rotation: nightly at 00:00 local time. Rotated files use numbered suffixes:",
             f"    {log_abs}    ← today (active)",
             f"    {log_abs}.1  ← yesterday",
             f"    {log_abs}.2  ← 2 days ago  … up to .{self.log_backup_count}",
             f"- To read recent log entries:  file_read(path='{log_abs}', offset=-10000)",
             f"- To read yesterday's log:     file_read(path='{log_abs}.1')",
-            f"- Always use file_read with a negative offset (e.g. -20000) to read the tail of large logs.",
-            f"- Do NOT use 'tail' or 'journalctl' for agent logs — use file_read on the paths above.",
+            "- Always use file_read with a negative offset (e.g. -20000) to read the tail of large logs.",
+            "- Do NOT use 'tail' or 'journalctl' for agent logs — use file_read on the paths above.",
         ]
         return "\n".join(lines)
 

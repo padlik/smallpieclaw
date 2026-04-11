@@ -173,18 +173,18 @@ try:
 except ImportError:
     import tomllib as tomli  # Python 3.11+
 
-from agent_controller import AgentController, SubAgentRunner
-from builtin_executor import BuiltinExecutor, _load_context
-from llm_client import LLMClient
-from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory
-from scheduler import Scheduler
-from skill_registry import SkillRegistry
-from telegram_interface import TelegramInterface
-from token_usage import get_registry as get_token_registry
-from tool_creator import ToolCreator
-from tool_executor import ToolExecutor
-from tool_index import ToolIndex
-from tool_registry import ToolRegistry
+from agent_controller import AgentController, SubAgentRunner  # noqa: E402
+from builtin_executor import BuiltinExecutor, _load_context  # noqa: E402
+from llm_client import LLMClient  # noqa: E402
+from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory  # noqa: E402
+from scheduler import Scheduler  # noqa: E402
+from skill_registry import SkillRegistry  # noqa: E402
+from telegram_interface import TelegramInterface  # noqa: E402
+from token_usage import get_registry as get_token_registry  # noqa: E402
+from tool_creator import ToolCreator  # noqa: E402
+from tool_executor import ToolExecutor  # noqa: E402
+from tool_index import ToolIndex  # noqa: E402
+from tool_registry import ToolRegistry  # noqa: E402
 
 
 def load_config(path="config.toml"):

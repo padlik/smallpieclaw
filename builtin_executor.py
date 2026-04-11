@@ -517,8 +517,6 @@ class BuiltinExecutor:
         Returns immediately with {status: "spawned", agent_id: "sa-..."}.
         """
         import threading
-        import json as _json
-        import os
 
         from sub_agent_registry import get_registry as get_agent_registry
 
@@ -700,7 +698,8 @@ class BuiltinExecutor:
 
 def _save_context(context_key: str, short_term, data_dir: str) -> None:
     """Persist ShortTermMemory to data/job_contexts/<key>.json."""
-    import json as _json, os, threading
+    import json as _json
+    import os
 
     ctx_dir = os.path.join(data_dir, "job_contexts")
     os.makedirs(ctx_dir, exist_ok=True)
@@ -715,7 +714,8 @@ def _save_context(context_key: str, short_term, data_dir: str) -> None:
 
 def _load_context(context_key: str, data_dir: str, max_turns: int = 50):
     """Load ShortTermMemory from data/job_contexts/<key>.json. Returns fresh on error."""
-    import json as _json, os
+    import json as _json
+    import os
     from memory_store import ShortTermMemory
 
     path = os.path.join(data_dir, "job_contexts", f"{context_key}.json")

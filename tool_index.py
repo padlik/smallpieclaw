@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
 
 from llm_client import LLMClient
 from tool_registry import Tool, ToolRegistry
