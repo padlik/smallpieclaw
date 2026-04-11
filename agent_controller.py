@@ -69,7 +69,7 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   file_write   — write content to a file on the filesystem
   schedule     — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
   spawn_agent  — spawn an isolated sub-agent in the background for long-running or model-specific tasks
-  memory_write — read/write the agent's persistent memory (actions: set, append, delete, get)
+  memory_write — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string
 
 AVAILABLE TOOLS:
 {tools}
@@ -384,7 +384,15 @@ class AgentController:
                         _progress(f"__FILE__:{path_b64}:{caption_b64}")
 
                     tool_result = self._format_tool_result(tool_name, outcome)
-                    logger.info("Tool '%s' result: success=%s", tool_name, outcome["success"])
+                    if outcome["success"]:
+                        logger.info("Tool '%s' result: success=True", tool_name)
+                    else:
+                        logger.warning(
+                            "Tool '%s' result: success=False | error=%s | args=%s",
+                            tool_name,
+                            outcome.get("error", ""),
+                            {k: str(v)[:120] for k, v in args.items()},
+                        )
                     _progress(self._fmt_tool_result_progress(tool_name, args, outcome))
                     messages.append({"role": "user", "content": tool_result})
 

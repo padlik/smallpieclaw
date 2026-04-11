@@ -656,8 +656,23 @@ class BuiltinExecutor:
 
         if action == "set":
             value = args.get("value")
+            # Guard against LLM pre-serializing the value as a JSON string.
+            # e.g. value="{\"count\":7}" → stored as {"count": 7} not a raw string.
+            if isinstance(value, str):
+                try:
+                    import json as _json
+                    parsed = _json.loads(value)
+                    # Only replace if it decoded to a non-string type (object, list, number, bool, None)
+                    if not isinstance(parsed, str):
+                        logger.warning(
+                            "memory_write set key=%s: value was a JSON string — auto-parsed to %s",
+                            key, type(parsed).__name__,
+                        )
+                        value = parsed
+                except Exception:
+                    pass  # Keep original string value
             self._memory.set(key, value)
-            logger.info("memory_write set: key=%s", key)
+            logger.info("memory_write set: key=%s type=%s", key, type(value).__name__)
             return {"success": True, "output": f"Memory key '{key}' updated.", "error": "", "exit_code": 0}
 
         elif action == "append":
