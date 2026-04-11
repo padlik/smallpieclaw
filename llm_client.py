@@ -14,7 +14,7 @@ Retry behaviour:
   exponential backoff. Configure via config.toml:
     [llm]
     request_timeout = 120   # seconds per attempt (default: 120)
-    max_retries     = 3     # attempts before giving up (default: 3)
+    max_retries     = 5     # attempts before giving up (default: 5)
     retry_delay     = 2     # base delay in seconds; doubles each attempt (default: 2)
 """
 
@@ -50,17 +50,48 @@ class LLMError(RuntimeError):
     """Raised when the LLM provider returns an API-level error (HTTP 200 with error body)."""
 
 
+class LLMPermanentError(LLMError):
+    """
+    Raised for API-level errors that should never be retried — e.g. content filter
+    violations, invalid API keys, bad request parameters.  Propagates immediately out
+    of _with_retry without consuming any retry attempts.
+    """
+
+
+# Error codes (from OpenAI / OpenRouter / Anthropic) that are permanent — retrying
+# them wastes quota, burns time, and can trigger duplicate billing on some providers.
+_PERMANENT_ERROR_CODES = frozenset({
+    # OpenAI / OpenRouter
+    "content_filter",
+    "content_policy_violation",
+    "invalid_request_error",
+    "invalid_api_key",
+    "authentication_error",
+    "model_not_found",
+    # Anthropic
+    "invalid_api_key",
+    "permission_error",
+    "not_found_error",
+    "invalid_request",
+})
+
+
 class LLMCancelledError(RuntimeError):
     """Raised when the LLM request is cancelled via cancel_event."""
 
 
-def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_event=None):
+def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_event=None,
+                model_name: str | None = None):
     """
-    Call fn(), retrying on transient httpx errors and retryable HTTP status codes.
+    Call fn(), retrying on transient httpx errors, retryable HTTP status codes,
+    and LLMError (e.g. OpenRouter 200-OK with error body for server overload).
+    LLMPermanentError propagates immediately without consuming retries.
     Uses exponential backoff: base_delay, base_delay*2, base_delay*4, …
     Non-retryable exceptions (e.g. 400 Bad Request) propagate immediately.
     on_retry(attempt, max_retries, exc_str) is called before each retry delay.
+    model_name is included in log messages when provided.
     """
+    _model_tag = f"[{model_name.strip()}] " if (model_name and model_name.strip()) else ""
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(1, max_retries + 1):
         # Check cancellation before each attempt (including before the first)
@@ -70,51 +101,58 @@ def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_e
             return fn()
         except LLMCancelledError:
             raise  # propagate immediately — never retry a cancel
+        except LLMError as exc:
+            if isinstance(exc, LLMPermanentError):
+                raise  # permanent errors are never retried
+            last_exc = exc
+            logger.warning("%sAPI error body (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
+            if on_retry:
+                on_retry(attempt, max_retries, f"api error: {exc}")
         except httpx.TimeoutException as exc:
             last_exc = exc
-            logger.warning("Request timed out (attempt %d/%d): %s", attempt, max_retries, exc)
+            logger.warning("%sRequest timed out (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
             if on_retry:
                 on_retry(attempt, max_retries, f"timeout: {exc}")
         except LLMEmptyResponseError as exc:
             last_exc = exc
-            logger.warning("Empty LLM response (attempt %d/%d)", attempt, max_retries)
+            logger.warning("%sEmpty LLM response (attempt %d/%d)", _model_tag, attempt, max_retries)
             if on_retry:
                 on_retry(attempt, max_retries, "empty response")
         except httpx.RemoteProtocolError as exc:
             if cancel_event and cancel_event.is_set():
                 raise LLMCancelledError("LLM request cancelled (connection interrupted)")
             last_exc = exc
-            logger.warning("Remote protocol error (attempt %d/%d): %s", attempt, max_retries, exc)
+            logger.warning("%sRemote protocol error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
             if on_retry:
                 on_retry(attempt, max_retries, f"protocol error: {exc}")
         except httpx.ConnectError as exc:
             if cancel_event and cancel_event.is_set():
                 raise LLMCancelledError("LLM request cancelled (connection interrupted)")
             last_exc = exc
-            logger.warning("Connection error (attempt %d/%d): %s", attempt, max_retries, exc)
+            logger.warning("%sConnection error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
             if on_retry:
                 on_retry(attempt, max_retries, f"connection error: {exc}")
         except (httpx.TransportError, httpx.PoolTimeout) as exc:
             if cancel_event and cancel_event.is_set():
                 raise LLMCancelledError("LLM request cancelled (connection interrupted)")
             last_exc = exc
-            logger.warning("Transport error (attempt %d/%d): %s", attempt, max_retries, exc)
+            logger.warning("%sTransport error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
             if on_retry:
                 on_retry(attempt, max_retries, f"transport error: {exc}")
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in _RETRYABLE_STATUS:
                 last_exc = exc
                 logger.warning(
-                    "HTTP %d (attempt %d/%d): %s",
-                    exc.response.status_code, attempt, max_retries, exc,
+                    "%sHTTP %d (attempt %d/%d): %s",
+                    _model_tag, exc.response.status_code, attempt, max_retries, exc,
                 )
                 if on_retry:
                     on_retry(attempt, max_retries, f"HTTP {exc.response.status_code}")
             else:
                 # Log full response body to aid debugging (e.g. "invalid parameter" messages)
                 logger.error(
-                    "HTTP %d error — response body: %s",
-                    exc.response.status_code,
+                    "%sHTTP %d error — response body: %s",
+                    _model_tag, exc.response.status_code,
                     exc.response.text[:2000],
                 )
                 raise  # 4xx errors are not retryable
@@ -127,7 +165,7 @@ def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_e
                 if cancelled:
                     raise LLMCancelledError("LLM request cancelled during retry delay")
             else:
-                logger.info("Retrying in %.1fs…", delay)
+                logger.info("%sRetrying in %.1fs…", _model_tag, delay)
                 time.sleep(delay)
     raise last_exc
 
@@ -224,7 +262,7 @@ class LLMClient:
 
         # Retry / timeout from active model config
         _ref = self._models[self._active_idx]
-        self._max_retries: int = _ref.get("max_retries", 3)
+        self._max_retries: int = _ref.get("max_retries", 5)
         self._retry_delay: float = float(_ref.get("retry_delay", 2))
         timeout_secs: float = float(_ref.get("request_timeout", 120))
         self._http = httpx.Client(
@@ -394,8 +432,9 @@ class LLMClient:
             if "error" in d and "choices" not in d:
                 err = d["error"]
                 err_msg = err.get("message") or err.get("msg") or str(err)
-                err_code = err.get("code") or err.get("type") or ""
-                raise LLMError(
+                err_code = str(err.get("code") or err.get("type") or "").lower()
+                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
+                raise exc_class(
                     f"API error from model '{model}'"
                     + (f" [{err_code}]" if err_code else "")
                     + f": {err_msg}"
@@ -454,7 +493,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event)
+                           cancel_event=self._cancel_event, model_name=model)
 
     def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         # Convert to Gemini format
@@ -491,7 +530,9 @@ class LLMClient:
             d = r.json()
             if "error" in d:
                 err = d["error"]
-                raise LLMError(f"Google API error (model: {model}): {err.get('message', err)}")
+                err_code = str(err.get("code") or err.get("status") or "").lower()
+                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
+                raise exc_class(f"Google API error (model: {model}): {err.get('message', err)}")
             meta = d.get("usageMetadata", {})
             self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
             candidates = d.get("candidates") or []
@@ -517,7 +558,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event)
+                           cancel_event=self._cancel_event, model_name=model)
 
     def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         model = self.llm_cfg["model"]
@@ -546,7 +587,9 @@ class LLMClient:
             d = r.json()
             if "error" in d:
                 err = d["error"]
-                raise LLMError(f"Anthropic API error (model: {model}): {err.get('message', err)}")
+                err_code = str(err.get("type") or err.get("code") or "").lower()
+                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
+                raise exc_class(f"Anthropic API error (model: {model}): {err.get('message', err)}")
             usage = d.get("usage", {})
             self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
             content_blocks = d.get("content") or []
@@ -571,7 +614,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event)
+                           cancel_event=self._cancel_event, model_name=model)
 
     # ------------------------------------------------------------------
     # Empty-response diagnostics

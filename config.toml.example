@@ -26,7 +26,7 @@ pairing_timeout = 300
 #   temperature      — sampling temperature
 #   hint             — space-separated keywords for auto-selection
 #   request_timeout  — per-request timeout in seconds (default: 120)
-#   max_retries      — retry attempts on timeout/connection errors (default: 3)
+#   max_retries      — retry attempts on timeout/connection errors (default: 5)
 #   retry_delay      — base retry delay in seconds, doubles each attempt (default: 2)
 # ---------------------------------------------------------------------------
 [[models]]
@@ -39,10 +39,10 @@ max_tokens      = 1024
 temperature     = 0.2
 hint            = "general quick default"
 request_timeout = 120
-max_retries     = 3
+max_retries     = 5
 retry_delay     = 2
 
-# Example second model — uncomment and fill in to enable
+# Example second model
 # [[models]]
 # name            = "smart"
 # provider        = "anthropic"
@@ -53,7 +53,7 @@ retry_delay     = 2
 # temperature     = 0.2
 # hint            = "complex analyze reason large file code review"
 # request_timeout = 180
-# max_retries     = 3
+# max_retries     = 5
 # retry_delay     = 2
 
 [embeddings]
