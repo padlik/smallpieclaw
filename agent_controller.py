@@ -310,7 +310,32 @@ class AgentController:
                 _BUILTIN_NAMES = {"shell", "file_read", "file_write", "schedule", "spawn_agent", "memory_write"}
                 if action in _BUILTIN_NAMES:
                     logger.warning("LLM used shorthand action '%s' — normalizing to tool call", action)
-                    action_obj = {"action": "tool", "tool": action, "args": {k: v for k, v in action_obj.items() if k != "action"}}
+                    # If the LLM already provided an "args" key, use it directly to avoid
+                    # double-nesting ({"args": {"args": ...}} → 'key' is required errors).
+                    # Fall back to extracting all non-"action" keys as a flat args dict.
+                    if "args" in action_obj:
+                        shorthand_args = action_obj["args"]
+                        if isinstance(shorthand_args, str):
+                            # LLM emitted args as a JSON string — attempt to parse it.
+                            # Only accept dict/list results; primitives (str, int, bool, None)
+                            # would crash callers that expect a dict.
+                            try:
+                                parsed = json.loads(shorthand_args)
+                                if isinstance(parsed, (dict, list)):
+                                    shorthand_args = parsed
+                                else:
+                                    logger.warning(
+                                        "Shorthand action '%s' args parsed to non-dict type %s — keeping string",
+                                        action, type(parsed).__name__,
+                                    )
+                            except (ValueError, TypeError):
+                                logger.warning(
+                                    "Shorthand action '%s' args is a non-JSON string — keeping as-is: %s",
+                                    action, shorthand_args[:200],
+                                )
+                    else:
+                        shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
+                    action_obj = {"action": "tool", "tool": action, "args": shorthand_args}
                     action = "tool"
 
                 # ---- Dispatch ----
