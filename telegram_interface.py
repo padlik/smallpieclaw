@@ -1148,12 +1148,14 @@ def _md_to_html(text: str) -> str:
     text = html.escape(text)
 
     # ---- Step 4: apply inline formatting to prose ----
-    # Bold: **text** or __text__
+    # Bold: **text** only — __text__ is intentionally not supported to avoid
+    # corrupting Python dunder names like __init__ or __all__ in agent output.
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
     # Italic: *text* or _text_ (single, not already consumed by bold)
+    # _text_ requires non-word-char boundaries so snake_case identifiers like
+    # ollama_health_check are never split into italic fragments.
     text = re.sub(r"\*(?!\*)(.+?)(?<!\*)\*", r"<i>\1</i>", text, flags=re.DOTALL)
-    text = re.sub(r"_(?!_)(.+?)(?<!_)_", r"<i>\1</i>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)", r"<i>\1</i>", text, flags=re.DOTALL)
     # Strikethrough: ~~text~~
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
 
