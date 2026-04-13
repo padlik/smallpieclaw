@@ -22,6 +22,8 @@
 #   preserve_context     = true/false    (keep ShortTermMemory between runs; default: false)
 #   context_max_messages = N             (sliding window size when preserve_context=true; default: 50)
 #   overlap_policy       = "skip"|"parallel"  (what to do if previous run is still active; default: skip)
+#   fallback_models      = ["<model>"]   (optional: fallback models for this job; [] disables fallback;
+#                                         omit to inherit agent.fallback_models)
 
 [jobs.nightly_health]
 enabled = true

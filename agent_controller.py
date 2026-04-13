@@ -267,7 +267,7 @@ class AgentController:
                 raw = ""
                 for _attempt in range(1 + _MAX_EMPTY_RETRIES):
                     try:
-                        raw = self.llm.chat(messages, system=system, progress_cb=_progress)
+                        raw = self.llm.chat_with_fallback(messages, system=system, progress_cb=_progress)
                     except LLMCancelledError:
                         logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
                         return "[Cancelled]"
@@ -905,6 +905,7 @@ class SubAgentRunner:
         downloads_dir: str = "downloads",
         usage_registry=None,          # TokenUsageRegistry
         depth: int = 1,
+        fallback_models: list[str] | None = None,  # None = inherit from parent config
     ):
         import uuid
         from memory_store import ShortTermMemory, WorkingMemory
@@ -927,8 +928,10 @@ class SubAgentRunner:
         self._cancel_event = threading.Event()
 
         # Own LLM instance with model override + shared token registry + cancellation
+        # fallback_models=None means inherit from sub_config (which inherited from parent config)
         self._llm = LLMClient(sub_config, usage_registry=usage_registry,
-                              cancel_event=self._cancel_event)
+                              cancel_event=self._cancel_event,
+                              fallback_models=fallback_models)
 
         # Own blank memory (working context for this task)
         self._short_term = short_term if short_term is not None else ShortTermMemory()

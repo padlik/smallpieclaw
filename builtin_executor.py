@@ -537,6 +537,7 @@ class BuiltinExecutor:
 
         model = args.get("model") or None
         context_key = args.get("context_key") or None
+        fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
         job_tag = args.get("_job_tag") or None       # set by scheduler; used for finish callback
         label = job_tag or context_key or "on-demand"
 
@@ -547,6 +548,7 @@ class BuiltinExecutor:
                 context_key=context_key,
                 label=label,
                 notify_fn=None,   # factory sets this from main notify_fn
+                fallback_models=fallback_models,
             )
         except ValueError as exc:
             return {"success": False, "output": "", "error": f"spawn_agent: {exc}", "exit_code": -1}

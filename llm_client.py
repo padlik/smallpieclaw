@@ -219,12 +219,16 @@ class LLMClient:
       Set agent.default_model to the 'model' value of the entry to use by default.
     """
 
-    def __init__(self, config: dict, usage_registry=None, cancel_event=None):
+    def __init__(self, config: dict, usage_registry=None, cancel_event=None,
+                 fallback_models: list[str] | None = None):
         """
         Args:
             config: full agent config dict
             usage_registry: optional TokenUsageRegistry for cross-instance token aggregation
             cancel_event: optional threading.Event; when set, in-progress LLM calls raise LLMCancelledError
+            fallback_models: optional list of model IDs (matching [[models]] entries) to try
+                             in order when the primary model fails. Overrides config
+                             agent.fallback_models when provided (even as empty list).
         """
         self.cfg = config
 
@@ -250,6 +254,22 @@ class LLMClient:
                     f"agent.default_model = {default_model!r} does not match "
                     f"any [[models]] entry. Available: "
                     f"{[m.get('model') for m in self._models]}"
+                )
+
+        # Resolve fallback model indices
+        # Explicit param overrides config; None means use config; [] disables fallback
+        if fallback_models is None:
+            fallback_models = config.get("agent", {}).get("fallback_models", [])
+        self._fallback_indices: list[int] = []
+        for fb_model_id in (fallback_models or []):
+            for i, m in enumerate(self._models):
+                if m.get("model") == fb_model_id:
+                    self._fallback_indices.append(i)
+                    break
+            else:
+                logger.warning(
+                    "fallback_models: model %r not found in [[models]] — ignoring",
+                    fb_model_id,
                 )
 
         # Embeddings config (with fallback to active LLM key/base_url)
@@ -379,6 +399,45 @@ class LLMClient:
         except Exception as exc:
             logger.error("LLM chat error: %s", exc)
             raise
+
+    def chat_with_fallback(self, messages: list[dict], system: str | None = None,
+                           progress_cb=None) -> str:
+        """
+        Like chat(), but tries each fallback model in order if the primary fails
+        with a transient error. LLMPermanentError is never retried via fallback.
+        The active model index is restored after the call (stateless switching).
+        """
+        primary_idx = self._active_idx
+        last_exc: Exception | None = None
+
+        candidates = [primary_idx] + self._fallback_indices
+        for seq, idx in enumerate(candidates):
+            self._active_idx = idx
+            model_id = self._models[idx].get("model", f"model_{idx}")
+            if seq > 0:
+                logger.warning(
+                    "Falling back to model '%s' after error: %s",
+                    model_id, last_exc,
+                )
+                if progress_cb:
+                    progress_cb(f"⚠️ Switching to fallback model '{model_id}'…")
+            try:
+                return self.chat(messages, system, progress_cb=progress_cb)
+            except LLMPermanentError:
+                raise  # permanent errors — no point trying fallbacks
+            except Exception as exc:
+                last_exc = exc
+                if seq < len(candidates) - 1:
+                    logger.warning(
+                        "Model '%s' failed (will try next fallback): %s",
+                        model_id, exc,
+                    )
+                else:
+                    logger.error("All models (primary + %d fallback(s)) failed.", len(self._fallback_indices))
+            finally:
+                self._active_idx = primary_idx  # always restore primary
+
+        raise last_exc  # type: ignore[misc]
 
     def _openai_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         model = self.llm_cfg["model"]

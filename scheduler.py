@@ -457,6 +457,10 @@ class Scheduler:
                 spawn_args["model"] = job_model
             if context_key:
                 spawn_args["context_key"] = context_key
+            # fallback_models: if key present in meta (even as []), pass it through;
+            # if absent, omit so sub-agent inherits from parent config
+            if "fallback_models" in meta:
+                spawn_args["fallback_models"] = meta["fallback_models"]
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now

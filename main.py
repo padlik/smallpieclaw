@@ -338,7 +338,8 @@ def _run(
             background_model_cfg.get("model", "none"),
         )
 
-    def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None):
+    def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
+                          fallback_models=None):
         """Create an isolated SubAgentRunner with the requested model override."""
         # Resolve model config
         if model:
@@ -378,6 +379,7 @@ def _run(
             downloads_dir=downloads_dir,
             usage_registry=get_token_registry(),
             depth=1,
+            fallback_models=fallback_models,
         )
         return runner
 
