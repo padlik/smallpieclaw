@@ -1091,10 +1091,14 @@ def _md_to_html(text: str) -> str:
       - Bold                **text** or __text__  →  <b>…</b>
       - Italic              *text*  or _text_     →  <i>…</i>
       - Strikethrough       ~~text~~              →  <s>…</s>
+      - Markdown links      [text](url)           →  <a href="url">text</a>
+      - Bare URLs           https://…             →  <a href="url">url</a>
 
     All prose is HTML-escaped so that <, >, & never break the parser.
     Code block contents are also HTML-escaped so that shell/Python snippets
     with <, >, & display correctly inside <pre><code>.
+    URLs are extracted before HTML-escaping so that underscores and ampersands
+    in query parameters are never misinterpreted as italic/bold markers.
     """
     # ---- Step 1: extract fenced code blocks to protect them ----
     # We replace them with placeholders, process the rest, then reinsert.
@@ -1117,6 +1121,28 @@ def _md_to_html(text: str) -> str:
         return f"\x00BLOCK{len(placeholders) - 1}\x00"
 
     text = re.sub(r"`([^`\n]+)`", _extract_inline, text)
+
+    # ---- Step 2.5: extract URLs before html.escape / markdown processing ----
+    # Markdown links [label](url) first so they aren't also matched as bare URLs.
+    def _extract_md_link(m: re.Match) -> str:
+        label = html.escape(m.group(1))
+        esc_url = html.escape(m.group(2))
+        placeholders.append(f'<a href="{esc_url}">{label}</a>')
+        return f"\x00BLOCK{len(placeholders) - 1}\x00"
+
+    text = re.sub(r'\[([^\]\n]+)\]\((https?://[^)\s]+)\)', _extract_md_link, text)
+
+    # Bare https?:// URLs: wrap in <a> so underscores/& in query params are
+    # never touched by the italic regex. Strip common trailing punctuation that
+    # is not part of the URL (e.g. "See https://example.com.")
+    def _extract_bare_url(m: re.Match) -> str:
+        url = m.group(0).rstrip(".,;:!?)'\"")
+        esc_url = html.escape(url)
+        placeholders.append(f'<a href="{esc_url}">{esc_url}</a>')
+        tail = m.group(0)[len(url):]
+        return f"\x00BLOCK{len(placeholders) - 1}\x00{tail}"
+
+    text = re.sub(r'https?://[^\s<>"\'`\x00]+', _extract_bare_url, text)
 
     # ---- Step 3: HTML-escape the remaining prose ----
     text = html.escape(text)
