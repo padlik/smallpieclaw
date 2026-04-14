@@ -322,6 +322,7 @@ class Scheduler:
                 "notify": meta.get("notify", True),
                 "source": meta.get("source", "config"),
                 "model": meta.get("model"),
+                "fallback_models": meta.get("fallback_models"),
                 "preserve_context": meta.get("preserve_context", False),
                 "is_running": tag in running,
             }
@@ -421,7 +422,12 @@ class Scheduler:
             self._running_jobs.add(tag)
 
         task = meta.get("task", "").strip()
-        logger.info("Running scheduled job: %s", tag)
+        job_model = meta.get("model") or None
+        job_fallbacks = meta.get("fallback_models")
+        _log_extra = f" | model={job_model}" if job_model else ""
+        if job_fallbacks is not None:
+            _log_extra += f" | fallback_models={job_fallbacks}"
+        logger.info("Running scheduled job: %s%s", tag, _log_extra)
         now = datetime.utcnow().isoformat()
         is_once = meta.get("schedule_type") == "once"
 
@@ -448,7 +454,6 @@ class Scheduler:
             # Register finish callback so _running_jobs is cleaned up
             self.builtin_executor._scheduler_finish_cb = self._mark_job_finished
 
-            job_model = meta.get("model") or None
             preserve_ctx = meta.get("preserve_context", False)
             context_key = tag if preserve_ctx else None
 

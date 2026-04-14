@@ -353,6 +353,11 @@ class TelegramInterface:
                 lines.append(f"   Next run: {html.escape(nr)}")
             if job.get("model"):
                 lines.append(f"   Model: <code>{html.escape(job['model'])}</code>")
+            if job.get("fallback_models"):
+                fb_str = ", ".join(f"<code>{html.escape(m)}</code>" for m in job["fallback_models"])
+                lines.append(f"   Fallbacks: {fb_str}")
+            elif job.get("fallback_models") == []:
+                lines.append("   Fallbacks: <i>disabled</i>")
             if job.get("preserve_context"):
                 lines.append("   🧠 Context: preserved between runs")
             if job.get("last_error"):

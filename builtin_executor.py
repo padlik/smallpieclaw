@@ -22,7 +22,6 @@ import re
 import secrets
 import subprocess
 from dataclasses import dataclass
-from html import escape as _he
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -595,15 +594,15 @@ class BuiltinExecutor:
                 if result == "[Cancelled]":
                     runner.notify_fn(
                         f"🛑 Sub-agent {runner.agent_id} cancelled\n"
-                        f"Job: <b>{_he(label)}</b>\n"
+                        f"Job: **{label}**\n"
                         f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
                     )
                 else:
                     elapsed = int(time.time() - record.started_at)
                     header = (
                         f"✅ Sub-agent {runner.agent_id} finished ({elapsed}s)\n"
-                        f"Job: <b>{_he(label)}</b> | Model: {_he(runner._model_id)}\n"
-                        f"Task: {_he(task[:120])}"
+                        f"Job: **{label}** | Model: {runner._model_id}\n"
+                        f"Task: {task[:120]}"
                     )
                     # Send header + full result; send_message_to_users paginates automatically
                     runner.notify_fn(header + "\n\n" + result)
@@ -611,9 +610,9 @@ class BuiltinExecutor:
                 elapsed = int(time.time() - record.started_at)
                 runner.notify_fn(
                     f"❌ Sub-agent {runner.agent_id} failed ({elapsed}s)\n"
-                    f"Job: <b>{_he(label)}</b> | Model: {_he(runner._model_id)}\n"
-                    f"Task: {_he(task[:120])}\n"
-                    f"Error: {_he(str(exc))}"
+                    f"Job: **{label}** | Model: {runner._model_id}\n"
+                    f"Task: {task[:120]}\n"
+                    f"Error: {exc}"
                 )
             finally:
                 get_agent_registry().unregister(runner.agent_id)
