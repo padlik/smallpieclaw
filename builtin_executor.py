@@ -138,7 +138,8 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Spawn an isolated sub-agent in the background for a long-running task "
             "or a task requiring a different model. Returns immediately — result is delivered "
             "via Telegram when done. "
-            "Args: task (str, required — goal for the sub-agent), "
+            "Args: task (str, REQUIRED — the goal/instructions for the sub-agent; "
+            "MUST be named 'task', NOT 'prompt', 'goal', or 'description'), "
             "model (str, optional — model identifier from AVAILABLE MODELS, default: background_model), "
             "context_key (str, optional — key for persisting conversation history between calls). "
             "Example: spawn a Docker log analysis on a smarter model: "
@@ -520,6 +521,16 @@ class BuiltinExecutor:
         from sub_agent_registry import get_registry as get_agent_registry
 
         task = args.get("task", "").strip()
+        # Accept common LLM aliases for the 'task' parameter
+        if not task:
+            for _alias in ("prompt", "goal", "description"):
+                _v = args.get(_alias, "").strip()
+                if _v:
+                    logger.warning(
+                        "spawn_agent: received '%s' instead of 'task' — treating as task (fix your prompt)", _alias
+                    )
+                    task = _v
+                    break
         if not task:
             return {"success": False, "output": "", "error": "spawn_agent: 'task' is required.", "exit_code": -1}
 
