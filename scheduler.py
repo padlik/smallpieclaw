@@ -830,6 +830,7 @@ class Scheduler:
                 "last_run": None,
                 "created_at": job_cfg.get("created_at", datetime.utcnow().isoformat()),
                 "model": job_cfg.get("model") or None,
+                "fallback_models": job_cfg.get("fallback_models"),
                 "preserve_context": bool(job_cfg.get("preserve_context", False)),
                 "context_max_messages": int(job_cfg.get("context_max_messages", 50)),
                 "overlap_policy": job_cfg.get("overlap_policy", "skip"),
