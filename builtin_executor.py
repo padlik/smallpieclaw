@@ -582,6 +582,13 @@ class BuiltinExecutor:
 
         get_agent_registry().register(record)
 
+        # Log spawn params for observability
+        _fb_log = str(fallback_models) if fallback_models is not None else "inherited"
+        logger.info(
+            "spawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
+            runner.agent_id, label, runner._model_id, _fb_log, task[:100],
+        )
+
         # Capture scheduler finish callback now (at spawn time) to avoid race
         # conditions when multiple jobs are spawned concurrently — each thread
         # gets its own snapshot of the callback bound to the correct job tag.
@@ -603,6 +610,7 @@ class BuiltinExecutor:
                     except Exception:
                         pass
                 if result == "[Cancelled]":
+                    logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
                     runner.notify_fn(
                         f"🛑 Sub-agent {runner.agent_id} cancelled\n"
                         f"Job: **{label}**\n"
@@ -610,6 +618,10 @@ class BuiltinExecutor:
                     )
                 else:
                     elapsed = int(time.time() - record.started_at)
+                    logger.info(
+                        "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
+                        label, runner.agent_id, runner._model_id, elapsed,
+                    )
                     header = (
                         f"✅ Sub-agent {runner.agent_id} finished ({elapsed}s)\n"
                         f"Job: **{label}** | Model: {runner._model_id}\n"
@@ -619,6 +631,10 @@ class BuiltinExecutor:
                     runner.notify_fn(header + "\n\n" + result)
             except Exception as exc:
                 elapsed = int(time.time() - record.started_at)
+                logger.error(
+                    "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
+                    label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
+                )
                 runner.notify_fn(
                     f"❌ Sub-agent {runner.agent_id} failed ({elapsed}s)\n"
                     f"Job: **{label}** | Model: {runner._model_id}\n"

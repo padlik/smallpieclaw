@@ -154,6 +154,7 @@ class AgentController:
         log_backup_count: int = 30,
         cancel_event: Optional[threading.Event] = None,
         depth: int = 0,
+        label: str = "main",   # identifies this agent in log lines
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -175,6 +176,8 @@ class AgentController:
         self.log_backup_count = log_backup_count
         self._cancel_event = cancel_event
         self._depth = depth
+        self.label = label
+        self._log_prefix = f"[{label}] "
 
         # Confirmation state: token -> threading.Event and result holder
         self._confirm_events: dict[str, threading.Event] = {}
@@ -202,10 +205,18 @@ class AgentController:
         Process a user goal and return the final answer string.
         Optionally calls progress_callback(msg) for intermediate updates.
         """
+        import time as _time
+        _run_start = _time.time()
+        _pfx = self._log_prefix
+
         def _progress(msg: str):
             if progress_callback:
                 progress_callback(msg)
-            logger.debug("Agent progress: %s", msg)
+            logger.debug("%sAgent progress: %s", _pfx, msg)
+
+        # Log start with model and goal preview
+        _active_model = self.llm.llm_cfg.get("model", "?")
+        logger.info("%sstart | model: %s | goal: %s", _pfx, _active_model, user_goal[:80])
 
         # Start working memory task tracking
         if self.working:
@@ -252,11 +263,12 @@ class AgentController:
             while step < max_steps:
                 # Cooperative cancellation check (sub-agents)
                 if self._cancel_event and self._cancel_event.is_set():
-                    logger.warning("Agent cancelled at step %d/%d", step, max_steps)
+                    logger.warning("%scancelled at step %d/%d", _pfx, step, max_steps)
                     return "[Cancelled]"
 
                 step += 1
-                logger.info("Agent step %d/%d", step, max_steps)
+                _active_model = self.llm.llm_cfg.get("model", "?")
+                logger.info("%sstep %d/%d | model: %s", _pfx, step, max_steps, _active_model)
                 _progress(f"⚙️ Thinking… (step {step})")
 
                 # Context compaction check
@@ -279,8 +291,8 @@ class AgentController:
                         break
                     if _attempt < _MAX_EMPTY_RETRIES:
                         logger.warning(
-                            "LLM returned empty response (step %d/%d), retrying in-place (%d/%d)…",
-                            step, max_steps, _attempt + 1, _MAX_EMPTY_RETRIES,
+                            "%sLLM returned empty response (step %d/%d), retrying in-place (%d/%d)…",
+                            _pfx, step, max_steps, _attempt + 1, _MAX_EMPTY_RETRIES,
                         )
                         _progress(f"⏳ Empty LLM response, retrying ({_attempt + 1}/{_MAX_EMPTY_RETRIES})…")
 
@@ -288,8 +300,8 @@ class AgentController:
                 action_obj = self._parse_json(raw)
                 if action_obj is None:
                     logger.warning(
-                        "LLM returned non-JSON (step %d/%d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
-                        step, max_steps, len(raw), raw[:1000],
+                        "%sLLM returned non-JSON (step %d/%d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
+                        _pfx, step, max_steps, len(raw), raw[:1000],
                     )
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({
@@ -309,7 +321,7 @@ class AgentController:
                 # Normalize shorthand: {"action": "shell"} → {"action": "tool", "tool": "shell"}
                 _BUILTIN_NAMES = {"shell", "file_read", "file_write", "schedule", "spawn_agent", "memory_write"}
                 if action in _BUILTIN_NAMES:
-                    logger.warning("LLM used shorthand action '%s' — normalizing to tool call", action)
+                    logger.warning("%sLLM used shorthand action '%s' — normalizing to tool call", _pfx, action)
                     # If the LLM already provided an "args" key, use it directly to avoid
                     # double-nesting ({"args": {"args": ...}} → 'key' is required errors).
                     # Fall back to extracting all non-"action" keys as a flat args dict.
@@ -342,6 +354,9 @@ class AgentController:
 
                 if action == "finish":
                     result = action_obj.get("result", "Done.")
+                    _elapsed = _time.time() - _run_start
+                    _active_model = self.llm.llm_cfg.get("model", "?")
+                    logger.info("%sfinish | model: %s | steps: %d | elapsed: %.1fs", _pfx, _active_model, step, _elapsed)
                     self.memory.record_event(f"Agent finished: {result[:80]}")
                     if self.short_term:
                         self.short_term.add("user", user_goal)
@@ -410,11 +425,11 @@ class AgentController:
 
                     tool_result = self._format_tool_result(tool_name, outcome)
                     if outcome["success"]:
-                        logger.info("Tool '%s' result: success=True", tool_name)
+                        logger.info("%sTool '%s' result: success=True", _pfx, tool_name)
                     else:
                         logger.warning(
-                            "Tool '%s' result: success=False | error=%s | args=%s",
-                            tool_name,
+                            "%sTool '%s' result: success=False | error=%s | args=%s",
+                            _pfx, tool_name,
                             outcome.get("error", ""),
                             {k: str(v)[:120] for k, v in args.items()},
                         )
@@ -488,7 +503,7 @@ class AgentController:
                     messages.append({"role": "user", "content": feedback})
 
                 else:
-                    logger.warning("Unknown action '%s' from LLM", action)
+                    logger.warning("%sUnknown action '%s' from LLM", _pfx, action)
                     messages.append({
                         "role": "user",
                         "content": f'Unknown action "{action}". Use "tool", "create_tool", or "finish".',
@@ -506,7 +521,7 @@ class AgentController:
 
             if should_extend:
                 max_steps += 10
-                logger.info("Agent steps extended to %d by user", max_steps)
+                logger.info("%sAgent steps extended to %d by user", _pfx, max_steps)
                 _progress(f"⏩ Extended — continuing to step {max_steps}…")
                 continue  # back to outer while → re-enters inner while
 
@@ -957,6 +972,7 @@ class SubAgentRunner:
             downloads_dir=downloads_dir,
             cancel_event=self._cancel_event,
             depth=depth,
+            label=f"sub:{label}",
         )
 
         self._model_id = model_cfg.get("model", "unknown")
