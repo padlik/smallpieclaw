@@ -264,13 +264,18 @@ def _run(
     max_output = agent_cfg.get("max_output_size", 4000)
     top_tools  = agent_cfg.get("top_tools", 3)
     ctx_max_tokens = agent_cfg.get("ctx_max_tokens", 90_000)
+    max_subagents = agent_cfg.get("max_subagents", 6)
+    subagent_result_timeout = agent_cfg.get("subagent_result_timeout", 300)
 
     logger.info("Initialising components...")
 
     llm      = LLMClient(cfg, usage_registry=get_token_registry())
     memory   = MemoryStore(memory_path)
     registry = ToolRegistry(tools_dirs=[tools_dir, gen_tools_dir])
-    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory)
+    builtin  = BuiltinExecutor(
+        default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,
+        max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
+    )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
     creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)

@@ -136,14 +136,28 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
         name="spawn_agent",
         description=(
             "Spawn an isolated sub-agent in the background for a long-running task "
-            "or a task requiring a different model. Returns immediately — result is delivered "
-            "via Telegram when done. "
+            "or a task requiring a different model. Returns immediately with agent_id — "
+            "use get_agent_result(agent_id) to retrieve the result when needed. "
             "Args: task (str, REQUIRED — the goal/instructions for the sub-agent; "
             "MUST be named 'task', NOT 'prompt', 'goal', or 'description'), "
             "model (str, optional — model identifier from AVAILABLE MODELS, default: background_model), "
-            "context_key (str, optional — key for persisting conversation history between calls). "
+            "context_key (str, optional — key for persisting conversation history between calls), "
+            "response_format (str, optional — 'text' (default), 'json' (sub-agent returns JSON object), "
+            "or 'file' (sub-agent writes output to a file and returns the path)). "
             "Example: spawn a Docker log analysis on a smarter model: "
-            "{\"task\": \"Analyze Docker logs\", \"model\": \"claude-3-5-sonnet-20241022\"}."
+            "{\"task\": \"Analyze Docker logs\", \"model\": \"claude-3-5-sonnet-20241022\", \"response_format\": \"json\"}."
+        ),
+    ),
+    "get_agent_result": BuiltinTool(
+        name="get_agent_result",
+        description=(
+            "Wait for a sub-agent to finish and retrieve its result. "
+            "Blocks until the sub-agent completes or the timeout is reached. "
+            "Args: agent_id (str, REQUIRED — the id returned by spawn_agent), "
+            "timeout (int, optional — seconds to wait, default: configured subagent_result_timeout). "
+            "Returns: {status: 'done'|'failed'|'cancelled'|'timeout'|'not_found', "
+            "result_type: 'text'|'json'|'file', result: <output>}. "
+            "Example: {\"agent_id\": \"sa-abc123\"}"
         ),
     ),
     "memory_write": BuiltinTool(
@@ -183,7 +197,7 @@ class BuiltinExecutor:
 
     def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
                  sub_agent_factory=None, data_dir: str = "data", agent_depth: int = 0,
-                 memory=None):
+                 memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -191,6 +205,8 @@ class BuiltinExecutor:
         self._data_dir = data_dir
         self._agent_depth = agent_depth  # 0 = main agent, 1 = sub-agent (no nested spawning)
         self._memory = memory  # Optional[MemoryStore] — for memory_write built-in
+        self._max_subagents = max_subagents
+        self._subagent_result_timeout = subagent_result_timeout
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
 
@@ -222,6 +238,8 @@ class BuiltinExecutor:
             return self._exec_schedule(args)
         elif tool_name == "spawn_agent":
             return self._exec_spawn_agent(args)
+        elif tool_name == "get_agent_result":
+            return self._exec_get_agent_result(args)
         elif tool_name == "memory_write":
             return self._exec_memory_write(args)
         else:
@@ -545,6 +563,27 @@ class BuiltinExecutor:
         if self._sub_agent_factory is None:
             return {"success": False, "output": "", "error": "spawn_agent: sub_agent_factory not configured.", "exit_code": -1}
 
+        # Concurrency cap — only count on-demand (managed) agents, not scheduler jobs
+        current_managed = get_agent_registry().count_managed()
+        if current_managed >= self._max_subagents:
+            return {
+                "success": False, "output": "",
+                "error": (
+                    f"spawn_agent: max_subagents cap reached ({current_managed}/{self._max_subagents}). "
+                    "Wait for a managed sub-agent to finish or cancel one with /agents cancel managed."
+                ),
+                "exit_code": -1,
+            }
+
+        # response_format — how the sub-agent should return its result
+        response_format = args.get("response_format", "text").lower()
+        if response_format not in ("text", "json", "file"):
+            response_format = "text"
+        if response_format == "json":
+            task = task + "\n\nReturn your entire answer as a single valid JSON object. Do not include any prose or markdown fences."
+        elif response_format == "file":
+            task = task + "\n\nWrite your output to a file and return only the absolute file path as your answer."
+
         model = args.get("model") or None
         context_key = args.get("context_key") or None
         fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
@@ -574,6 +613,7 @@ class BuiltinExecutor:
             started_at=time.time(),
             source="on-demand",
             max_iterations=runner._agent.max_iterations,
+            result_type=response_format,
         )
         # Share cancel_event and LLM client with the registry record so that
         # /agents cancel can immediately interrupt any in-progress HTTP request.
@@ -615,6 +655,9 @@ class BuiltinExecutor:
                     except Exception:
                         pass
                 if result == "[Cancelled]":
+                    record.status = "cancelled"
+                    record.result = "[Cancelled]"
+                    record._result_event.set()
                     logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
                     try:
                         runner.notify_fn(
@@ -625,6 +668,9 @@ class BuiltinExecutor:
                     except Exception as notify_exc:
                         logger.warning("spawn_agent: [%s] notify failed (cancelled): %s", label, notify_exc)
                 else:
+                    record.status = "done"
+                    record.result = result
+                    record._result_event.set()
                     elapsed = int(time.time() - record.started_at)
                     logger.info(
                         "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
@@ -641,6 +687,9 @@ class BuiltinExecutor:
                         logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
             except Exception as exc:
                 _agent_exc = exc
+                record.status = "failed"
+                record.result = str(exc)
+                record._result_event.set()
                 elapsed = int(time.time() - record.started_at)
                 logger.error(
                     "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
@@ -665,10 +714,66 @@ class BuiltinExecutor:
 
         return {
             "success": True,
-            "output": f"Sub-agent spawned (id: {runner.agent_id}, model: {runner._model_id}). Result will be delivered when done.",
+            "output": (
+                f"Sub-agent spawned (id: {runner.agent_id}, model: {runner._model_id}, "
+                f"response_format: {response_format}). "
+                f"Call get_agent_result(\"{runner.agent_id}\") to retrieve the result when needed."
+            ),
             "error": "",
             "exit_code": 0,
             "agent_id": runner.agent_id,
+            "response_format": response_format,
+        }
+
+
+    def _exec_get_agent_result(self, args: dict) -> dict:
+        """
+        Wait for a sub-agent to finish and return its result.
+
+        Blocks until the agent's _result_event is set or timeout expires.
+        """
+        from sub_agent_registry import get_registry as get_agent_registry
+
+        agent_id = args.get("agent_id", "").strip()
+        if not agent_id:
+            return {"success": False, "output": "", "error": "get_agent_result: 'agent_id' is required.", "exit_code": -1}
+
+        timeout = args.get("timeout", self._subagent_result_timeout)
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            timeout = self._subagent_result_timeout
+
+        record = get_agent_registry().get(agent_id)
+        if record is None:
+            return {
+                "success": False, "output": "",
+                "error": f"get_agent_result: no active sub-agent with id '{agent_id}'.",
+                "exit_code": -1,
+                "status": "not_found",
+            }
+
+        # If already finished (event already set), return immediately
+        finished = record._result_event.wait(timeout=timeout)
+        if not finished:
+            return {
+                "success": False,
+                "output": f"get_agent_result: timed out after {timeout}s waiting for agent '{agent_id}'.",
+                "error": "",
+                "exit_code": 0,
+                "status": "timeout",
+                "agent_id": agent_id,
+            }
+
+        return {
+            "success": record.status == "done",
+            "output": record.result or "",
+            "error": record.result if record.status == "failed" else "",
+            "exit_code": 0 if record.status == "done" else -1,
+            "status": record.status,
+            "result_type": record.result_type,
+            "result": record.result,
+            "agent_id": agent_id,
         }
 
 

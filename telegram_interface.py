@@ -371,11 +371,31 @@ class TelegramInterface:
 
         args = ctx.args or []
 
+        # /agents cancel managed  — atomically cancel all on-demand agents
+        if len(args) >= 2 and args[0].lower() == "cancel" and args[1].lower() == "managed":
+            count = _get_agent_registry().cancel_all_managed()
+            if count == 0:
+                await update.effective_message.reply_text(
+                    "ℹ️ No managed sub-agents are currently running.",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.effective_message.reply_text(
+                    f"🛑 Cancellation requested for <b>{count}</b> managed sub-agent(s).\n"
+                    f"Any in-progress LLM calls will be interrupted immediately.",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+
         # /agents cancel <id>
         if args and args[0].lower() == "cancel":
             agent_id = args[1] if len(args) > 1 else ""
             if not agent_id:
-                await update.effective_message.reply_text("Usage: /agents cancel &lt;id&gt;", parse_mode=ParseMode.HTML)
+                await update.effective_message.reply_text(
+                    "Usage: /agents cancel &lt;id&gt;\n"
+                    "       /agents cancel managed",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
             ok = _get_agent_registry().cancel(agent_id)
             if ok:
@@ -395,15 +415,16 @@ class TelegramInterface:
         if not active:
             await update.effective_message.reply_text(
                 "🤖 No sub-agents currently running.\n"
-                "<i>Tip: /agents cancel &lt;id&gt; to cancel a running agent</i>",
+                "<i>Tip: /agents cancel &lt;id&gt; — cancel specific agent\n"
+                "/agents cancel managed — cancel all managed agents</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
 
         lines = [f"🤖 <b>Active Sub-Agents</b> ({len(active)})\n"]
         for rec in active:
-            source_label = "📅 scheduled" if rec.source == "scheduled" else "💬 on-demand"
-            lines.append(f"<code>{html.escape(rec.agent_id)}</code> [{source_label}]")
+            tag = "[autonomous]" if rec.source == "scheduled" else "[managed]"
+            lines.append(f"<code>{html.escape(rec.agent_id)}</code> <b>{tag}</b>")
             lines.append(f"   Model:   <code>{html.escape(rec.model)}</code>")
             lines.append(f"   Task:    {html.escape(rec.task_preview)}{'…' if len(rec.task_preview) >= 80 else ''}")
             lines.append(f"   Started: {rec.elapsed_str()} ago")
@@ -412,7 +433,10 @@ class TelegramInterface:
                 lines.append("   <i>⚠️ Cancellation requested…</i>")
             lines.append("")
 
-        lines.append("<i>Tip: /agents cancel &lt;id&gt; to stop a sub-agent</i>")
+        lines.append(
+            "<i>Tip: /agents cancel &lt;id&gt; — cancel specific agent\n"
+            "/agents cancel managed — cancel all managed agents</i>"
+        )
         await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def _cmd_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

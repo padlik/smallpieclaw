@@ -81,6 +81,11 @@ ctx_max_tokens = 90000
 # Enable verbose diagnostics when the LLM returns empty content (default: false).
 # Logs full HTTP response, checks stream/non-stream mismatch, finish_reason, and runs a curl probe.
 diagnose_empty_responses = false
+# Hard cap on concurrent managed (on-demand) sub-agents. Scheduler jobs do not count toward this cap.
+# Attempting to spawn beyond this limit returns a hard error. Default: 6.
+max_subagents = 6
+# Timeout in seconds for get_agent_result tool when waiting for a sub-agent to finish. Default: 300.
+subagent_result_timeout = 300
 
 [scheduler]
 enabled = true
