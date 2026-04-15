@@ -34,11 +34,13 @@ class SubAgentRecord:
 
     def cancel(self) -> None:
         self._cancel_event.set()
-        # Close the HTTP client to immediately interrupt any in-progress LLM request.
+        # Close the HTTP transport to immediately interrupt any in-progress LLM request.
+        # For openai/google/anthropic: closes self._http (httpx.Client).
+        # For ollama: also closes the ollama Client's internal httpx transport.
         # The resulting transport exception is caught as LLMCancelledError in _with_retry.
         if self._llm_client is not None:
             try:
-                self._llm_client._http.close()
+                self._llm_client.close_http()
             except Exception:
                 pass
 

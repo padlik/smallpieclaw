@@ -1,7 +1,7 @@
 """
 llm_client.py
 -------------
-Unified LLM client supporting OpenAI-compatible APIs, Google Gemini, and Anthropic.
+Unified LLM client supporting OpenAI-compatible APIs, Google Gemini, Anthropic, and Ollama.
 Handles both chat completions and embeddings, configured separately.
 
 Note on OpenAI reasoning models (o1, o1-mini, o3, o3-mini, o4-mini, gpt-5, etc.):
@@ -30,6 +30,7 @@ from datetime import date
 from typing import Any, Optional
 
 import httpx
+import ollama as _ollama_lib
 
 logger = logging.getLogger(__name__)
 
@@ -211,10 +212,11 @@ class LLMClient:
       - OpenAI  (and any OpenAI-compatible endpoint such as OpenRouter)
       - Google Gemini (via generateContent REST API)
       - Anthropic Claude
+      - Ollama (cloud API at https://ollama.com or local at http://localhost:11434)
 
     Multi-model support:
       Define [[models]] in config.toml (array of tables). Each entry must have:
-        name, provider, api_key, model, base_url, max_tokens, temperature, hint,
+        name, provider, api_key, model, base_url, max_tokens, temperature,
         request_timeout, max_retries, retry_delay.
       Set agent.default_model to the 'model' value of the entry to use by default.
     """
@@ -289,6 +291,21 @@ class LLMClient:
             timeout=httpx.Timeout(timeout_secs, connect=10.0)
         )
 
+        # Build one ollama.Client per ollama-provider model entry (None for others).
+        # Stored in a list parallel to self._models so lookups are O(1) by index.
+        self._ollama_clients: list[Optional[_ollama_lib.Client]] = []
+        for m in self._models:
+            if m.get("provider") == "ollama":
+                host = m.get("base_url") or "http://localhost:11434"
+                api_key = m.get("api_key", "")
+                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                timeout_val = float(m.get("request_timeout", 120))
+                oc = _ollama_lib.Client(host=host, headers=headers,
+                                        timeout=timeout_val)
+                self._ollama_clients.append(oc)
+            else:
+                self._ollama_clients.append(None)
+
         # Diagnostic mode for empty responses
         self._diagnose_empty: bool = bool(
             config.get("agent", {}).get("diagnose_empty_responses", False)
@@ -336,6 +353,26 @@ class LLMClient:
         logger.warning("Model '%s' not found in configured models", name)
         return False
 
+    def close_http(self) -> None:
+        """
+        Close the HTTP transport for the currently active model.
+
+        Used by SubAgentRecord.cancel() to interrupt an in-flight LLM request
+        immediately rather than waiting for it to time out.
+        """
+        # Always close the shared httpx client (used by openai/google/anthropic)
+        try:
+            self._http.close()
+        except Exception:
+            pass
+        # Also close the ollama client's internal httpx transport if active
+        oc = self._ollama_clients[self._active_idx] if self._ollama_clients else None
+        if oc is not None:
+            try:
+                oc._client.close()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Token tracking
     # ------------------------------------------------------------------
@@ -375,6 +412,8 @@ class LLMClient:
                 return self._google_chat(messages, system, progress_cb=progress_cb)
             elif provider == "anthropic":
                 return self._anthropic_chat(messages, system, progress_cb=progress_cb)
+            elif provider == "ollama":
+                return self._ollama_chat(messages, system, progress_cb=progress_cb)
             else:
                 raise ValueError(f"Unknown LLM provider: {provider}")
         except Exception as exc:
@@ -666,9 +705,88 @@ class LLMClient:
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
                            cancel_event=self._cancel_event, model_name=model)
 
-    # ------------------------------------------------------------------
-    # Empty-response diagnostics
-    # ------------------------------------------------------------------
+    def _ollama_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
+        """
+        Chat via the Ollama Python library.
+
+        Supports both the Ollama Cloud API (https://ollama.com) and a local Ollama
+        instance. The host and optional bearer token come from the model's base_url
+        and api_key config fields.
+
+        Streaming is used when progress_cb is provided so the callback receives
+        incremental text as the model generates its response.
+        """
+        model = self.llm_cfg["model"]
+        client = self._ollama_clients[self._active_idx]
+        if client is None:
+            raise RuntimeError(
+                f"_ollama_chat called but no ollama.Client found for model '{model}' "
+                f"(index {self._active_idx}). This is a bug — check _ollama_clients init."
+            )
+
+        # Build message list (Ollama supports the system role natively)
+        payload_messages: list[dict] = []
+        if system:
+            payload_messages.append({"role": "system", "content": system})
+        payload_messages.extend(messages)
+
+        options = {
+            "num_predict": self.llm_cfg.get("max_tokens", 1024),
+            "temperature": self.llm_cfg.get("temperature", 0.2),
+        }
+
+        def _on_retry(attempt, max_retries, reason):
+            if progress_cb:
+                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
+
+        def _do_request():
+            try:
+                if progress_cb:
+                    # Streaming path: accumulate and forward chunks
+                    stream = client.chat(
+                        model=model,
+                        messages=payload_messages,
+                        options=options,
+                        stream=True,
+                    )
+                    parts: list[str] = []
+                    for chunk in stream:
+                        piece = chunk.message.content or ""
+                        if piece:
+                            parts.append(piece)
+                            progress_cb(piece)
+                    text = "".join(parts).strip()
+                else:
+                    response = client.chat(
+                        model=model,
+                        messages=payload_messages,
+                        options=options,
+                    )
+                    text = (response.message.content or "").strip()
+                    # Track token usage from response metadata if available
+                    _eval_count = getattr(response, "eval_count", None) or 0
+                    _prompt_eval_count = getattr(response, "prompt_eval_count", None) or 0
+                    if _prompt_eval_count or _eval_count:
+                        self._track_usage(_prompt_eval_count, _eval_count)
+
+            except _ollama_lib.ResponseError as exc:
+                # Map to our error hierarchy so _with_retry handles retries correctly
+                status = exc.status_code
+                _PERMANENT_STATUSES = {401, 403, 404}
+                if status in _PERMANENT_STATUSES:
+                    raise LLMPermanentError(
+                        f"Ollama permanent error (HTTP {status}) for model '{model}': {exc.error}"
+                    ) from exc
+                raise LLMError(
+                    f"Ollama API error (HTTP {status}) for model '{model}': {exc.error}"
+                ) from exc
+
+            if not text:
+                raise LLMEmptyResponseError(f"Ollama returned empty content (model: {model})")
+            return text
+
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
+                           cancel_event=self._cancel_event, model_name=model)
 
     def _diagnose_empty_response(
         self,

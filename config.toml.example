@@ -52,6 +52,38 @@ retry_delay     = 2
 # max_retries     = 5
 # retry_delay     = 2
 
+# Ollama Cloud API (https://ollama.com) — hosted cloud models.
+# Requires the 'ollama' Python package (pip install ollama>=0.4.0).
+# Create an API key at https://ollama.com/settings/keys.
+# Available cloud models: https://ollama.com/search?c=cloud
+# Examples: gpt-oss:120b-cloud, deepseek-v3.1:671b-cloud, kimi-k2:1t-cloud
+# [[models]]
+# name            = "ollama-cloud"
+# provider        = "ollama"
+# api_key         = "YOUR_OLLAMA_API_KEY"
+# model           = "gpt-oss:120b-cloud"
+# base_url        = "https://ollama.com"
+# max_tokens      = 4096
+# temperature     = 0.2
+# request_timeout = 300
+# max_retries     = 3
+# retry_delay     = 2
+
+# Ollama local instance (no API key required).
+# Make sure Ollama is running: https://ollama.com/download
+# Pull a model first: ollama pull gemma3:27b
+# [[models]]
+# name            = "ollama-local"
+# provider        = "ollama"
+# api_key         = ""
+# model           = "gemma3:27b"
+# base_url        = "http://localhost:11434"
+# max_tokens      = 4096
+# temperature     = 0.2
+# request_timeout = 120
+# max_retries     = 3
+# retry_delay     = 2
+
 [embeddings]
 # Use same provider as LLM or configure separately.
 # If api_key is empty, falls back to the active model's api_key.
