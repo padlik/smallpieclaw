@@ -57,7 +57,6 @@ class TelegramInterface:
         self.token: str = tg_cfg["bot_token"]
         self.security_mode: str = tg_cfg.get("security_mode", "allowlist")
         self.allowed_ids: set[int] = {int(uid) for uid in tg_cfg.get("allowed_user_ids", [])}
-        self.pairing_timeout: int = tg_cfg.get("pairing_timeout", 300)
         self.agent_handler = agent_handler
         self.agent_reset_fn = agent_reset_fn
         self.agent = None  # Set by main.py for resume() support
@@ -71,10 +70,6 @@ class TelegramInterface:
 
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
-        self._pairing_token: Optional[str] = None
-
-        # Confirmation state: {token: asyncio.Future}
-        self._pending_confirmations: dict[str, asyncio.Future] = {}
 
         self._app: Optional[Application] = None
         # Saved when run() starts — used by send_message_to_users() from threads

@@ -176,7 +176,6 @@ class AgentController:
         self.log_file = log_file
         self.log_backup_count = log_backup_count
         self._cancel_event = cancel_event
-        self._depth = depth
         self.label = label
         self._log_prefix = f"[{label}] "
         self._on_step = on_step

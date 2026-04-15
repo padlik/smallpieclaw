@@ -313,9 +313,6 @@ def _run(
     def agent_handler(user_id, text, progress_cb):
         return agent.run(text, progress_callback=progress_cb)
 
-    def run_agent(goal):
-        return agent.run(goal)
-
     # Build TelegramInterface first so notify() can reference it
     # (scheduler and tg are wired together via forward references in closures)
     _tg_holder: list = [None]
