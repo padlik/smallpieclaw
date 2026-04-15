@@ -425,6 +425,8 @@ class LLMClient:
                 return self.chat(messages, system, progress_cb=progress_cb)
             except LLMPermanentError:
                 raise  # permanent errors — no point trying fallbacks
+            except LLMCancelledError:
+                raise  # user cancelled — don't waste quota on fallbacks
             except Exception as exc:
                 last_exc = exc
                 if seq < len(candidates) - 1:

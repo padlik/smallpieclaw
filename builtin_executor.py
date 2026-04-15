@@ -596,6 +596,7 @@ class BuiltinExecutor:
         _finish_tag = job_tag or label
 
         def _run_and_notify():
+            _agent_exc: Exception | None = None
             try:
                 result = runner.run(task)
                 # Persist context if requested
@@ -611,11 +612,14 @@ class BuiltinExecutor:
                         pass
                 if result == "[Cancelled]":
                     logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
-                    runner.notify_fn(
-                        f"🛑 Sub-agent {runner.agent_id} cancelled\n"
-                        f"Job: **{label}**\n"
-                        f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
-                    )
+                    try:
+                        runner.notify_fn(
+                            f"🛑 Sub-agent {runner.agent_id} cancelled\n"
+                            f"Job: **{label}**\n"
+                            f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
+                        )
+                    except Exception as notify_exc:
+                        logger.warning("spawn_agent: [%s] notify failed (cancelled): %s", label, notify_exc)
                 else:
                     elapsed = int(time.time() - record.started_at)
                     logger.info(
@@ -627,20 +631,26 @@ class BuiltinExecutor:
                         f"Job: **{label}** | Model: {runner._model_id}\n"
                         f"Task: {task[:120]}"
                     )
-                    # Send header + full result; send_message_to_users paginates automatically
-                    runner.notify_fn(header + "\n\n" + result)
+                    try:
+                        runner.notify_fn(header + "\n\n" + result)
+                    except Exception as notify_exc:
+                        logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
             except Exception as exc:
+                _agent_exc = exc
                 elapsed = int(time.time() - record.started_at)
                 logger.error(
                     "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
                     label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
                 )
-                runner.notify_fn(
-                    f"❌ Sub-agent {runner.agent_id} failed ({elapsed}s)\n"
-                    f"Job: **{label}** | Model: {runner._model_id}\n"
-                    f"Task: {task[:120]}\n"
-                    f"Error: {exc}"
-                )
+                try:
+                    runner.notify_fn(
+                        f"❌ Sub-agent {runner.agent_id} failed ({elapsed}s)\n"
+                        f"Job: **{label}** | Model: {runner._model_id}\n"
+                        f"Task: {task[:120]}\n"
+                        f"Error: {exc}"
+                    )
+                except Exception as notify_exc:
+                    logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
             finally:
                 get_agent_registry().unregister(runner.agent_id)
                 if _finish_cb:
