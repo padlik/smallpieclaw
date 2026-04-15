@@ -405,7 +405,13 @@ class LLMClient:
         """
         Like chat(), but tries each fallback model in order if the primary fails
         with a transient error. LLMPermanentError is never retried via fallback.
-        The active model index is restored after the call (stateless switching).
+
+        On success the active model index is NOT restored — the working model
+        persists for subsequent calls within this job/run() lifetime.
+        AgentController.run() restores _active_idx when the job ends so the
+        next job always starts with the primary model.
+
+        On error _active_idx is always restored to primary before propagating.
         """
         primary_idx = self._active_idx
         last_exc: Exception | None = None
@@ -423,12 +429,16 @@ class LLMClient:
                     progress_cb(f"⚠️ Switching to fallback model '{model_id}'…")
             try:
                 return self.chat(messages, system, progress_cb=progress_cb)
+                # On success: _active_idx stays at idx so next step reuses same model
             except LLMPermanentError:
+                self._active_idx = primary_idx  # restore before propagating
                 raise  # permanent errors — no point trying fallbacks
             except LLMCancelledError:
+                self._active_idx = primary_idx  # restore before propagating
                 raise  # user cancelled — don't waste quota on fallbacks
             except Exception as exc:
                 last_exc = exc
+                self._active_idx = primary_idx  # reset before trying next candidate
                 if seq < len(candidates) - 1:
                     logger.warning(
                         "Model '%s' failed (will try next fallback): %s",
@@ -436,8 +446,6 @@ class LLMClient:
                     )
                 else:
                     logger.error("All models (primary + %d fallback(s)) failed.", len(self._fallback_indices))
-            finally:
-                self._active_idx = primary_idx  # always restore primary
 
         raise last_exc  # type: ignore[misc]
 

@@ -580,6 +580,10 @@ class BuiltinExecutor:
         record._cancel_event = runner._cancel_event
         record._llm_client = runner._llm
 
+        # Wire iteration tracking: update registry on each step
+        _agent_id = runner.agent_id
+        runner._agent._on_step = lambda s: get_agent_registry().update_iteration(_agent_id, s)
+
         get_agent_registry().register(record)
 
         # Log spawn params for observability

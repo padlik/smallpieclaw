@@ -155,6 +155,7 @@ class AgentController:
         cancel_event: Optional[threading.Event] = None,
         depth: int = 0,
         label: str = "main",   # identifies this agent in log lines
+        on_step=None,          # Optional[Callable[[int], None]] — called after each step
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -178,6 +179,7 @@ class AgentController:
         self._depth = depth
         self.label = label
         self._log_prefix = f"[{label}] "
+        self._on_step = on_step
 
         # Confirmation state: token -> threading.Event and result holder
         self._confirm_events: dict[str, threading.Event] = {}
@@ -267,6 +269,11 @@ class AgentController:
                     return "[Cancelled]"
 
                 step += 1
+                if self._on_step:
+                    try:
+                        self._on_step(step)
+                    except Exception:
+                        pass
                 _active_model = self.llm.llm_cfg.get("model", "?")
                 logger.info("%sstep %d/%d | model: %s", _pfx, step, max_steps, _active_model)
                 _progress(f"⚙️ Thinking… (step {step})")
@@ -921,6 +928,7 @@ class SubAgentRunner:
         usage_registry=None,          # TokenUsageRegistry
         depth: int = 1,
         fallback_models: list[str] | None = None,  # None = inherit from parent config
+        on_step=None,                 # Optional[Callable[[int], None]] — for iteration tracking
     ):
         import uuid
         from memory_store import ShortTermMemory, WorkingMemory
@@ -973,6 +981,7 @@ class SubAgentRunner:
             cancel_event=self._cancel_event,
             depth=depth,
             label=f"sub:{label}",
+            on_step=on_step,
         )
 
         self._model_id = model_cfg.get("model", "unknown")
@@ -1000,6 +1009,8 @@ class SubAgentRunner:
             self._model_id,
             self.context_key or "none",
         )
+        # Save primary model index; restore after run() so next job starts fresh
+        _primary_idx = self._llm._active_idx
         try:
             result = self._agent.run(task)
             elapsed = time.time() - start
@@ -1011,3 +1022,5 @@ class SubAgentRunner:
                 "Failed after %.1fs: %s", elapsed, exc, exc_info=True
             )
             raise
+        finally:
+            self._llm._active_idx = _primary_idx  # reset to primary for next job
