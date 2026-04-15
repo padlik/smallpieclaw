@@ -19,8 +19,8 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
 - **Typing indicator** — Telegram shows "typing…" while the agent is reasoning
 - **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps or cancel
-- **Multi-model LLM** — define multiple models with hint keywords; agent auto-selects; switch via `/models`
-- **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude; reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
+- **Multi-model LLM** — define multiple models; switch via `/models`
+- **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama (cloud & local); reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
 - **Context compaction** — auto-summarises older messages when the token budget is near the configured limit
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
 - **Agent Skills** — autonomous skill system (per [agentskills.io](https://agentskills.io/specification)) with progressive disclosure; skills listed via `/skills`
@@ -113,15 +113,14 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 | Field | Description |
 |-------|-------------|
 | `name` | Display name shown in `/models` |
-| `provider` | `openai` \| `openrouter` \| `google` \| `anthropic` |
-| `api_key` | Provider API key |
+| `provider` | `openai` \| `openrouter` \| `google` \| `anthropic` \| `ollama` |
+| `api_key` | Provider API key (empty string for local Ollama) |
 | `model` | Exact model identifier (e.g. `gpt-4o-mini`) |
-| `base_url` | API base URL (leave empty for Anthropic/Google) |
+| `base_url` | API base URL (leave empty for Anthropic/Google; Ollama: `https://ollama.com` or `http://localhost:11434`) |
 | `max_tokens` | Max tokens in the LLM response |
 | `temperature` | Sampling temperature |
-| `hint` | Space-separated keywords; model is **not** auto-selected — only used for display purposes. Switch models manually with `/models` |
 | `request_timeout` | Per-request timeout in seconds (default: 120) |
-| `max_retries` | Retry attempts on timeout/connection errors (default: 3) |
+| `max_retries` | Retry attempts on timeout/connection errors (default: 5) |
 | `retry_delay` | Base retry delay in seconds, doubles each attempt (default: 2) |
 
 ```toml
@@ -133,9 +132,8 @@ model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
 temperature     = 0.2
-hint            = "general quick default"
 request_timeout = 120
-max_retries     = 3
+max_retries     = 5
 retry_delay     = 2
 
 [[models]]
@@ -146,8 +144,21 @@ model           = "claude-3-5-sonnet-20241022"
 base_url        = ""
 max_tokens      = 8192
 temperature     = 0.2
-hint            = "complex analyze reason large file code review"
 request_timeout = 180
+max_retries     = 5
+retry_delay     = 2
+
+# Ollama Cloud — requires: pip install ollama>=0.4.0
+# API key from https://ollama.com/settings/keys
+[[models]]
+name            = "ollama-cloud"
+provider        = "ollama"
+api_key         = "YOUR_OLLAMA_API_KEY"
+model           = "gpt-oss:120b-cloud"
+base_url        = "https://ollama.com"
+max_tokens      = 4096
+temperature     = 0.2
+request_timeout = 300
 max_retries     = 3
 retry_delay     = 2
 
@@ -414,8 +425,44 @@ Context compaction fires automatically at 85% of `ctx_max_tokens`. Older message
 | OpenRouter | `openrouter` | Set `base_url = "https://openrouter.ai/api/v1"` |
 | Google | `google` | Gemini models |
 | Anthropic | `anthropic` | Claude models |
+| Ollama Cloud | `ollama` | `base_url = "https://ollama.com"` — hosted cloud models (gpt-oss, deepseek, kimi-k2, etc.) |
+| Ollama Local | `ollama` | `base_url = "http://localhost:11434"` — local instance, no API key needed |
 
 Embeddings can use a different provider/key than the main LLM. If `embeddings.api_key` is empty, the agent falls back to the active model's `api_key` automatically.
+
+### Ollama Setup
+
+Requires the official `ollama` Python package:
+
+```bash
+pip install "ollama>=0.4.0"
+```
+
+**Cloud API** — access hosted large models directly:
+
+1. Create an API key at [ollama.com/settings/keys](https://ollama.com/settings/keys)
+2. Browse available cloud models at [ollama.com/search?c=cloud](https://ollama.com/search?c=cloud)
+3. Configure in `config.toml`:
+
+```toml
+[[models]]
+name     = "ollama-cloud"
+provider = "ollama"
+api_key  = "YOUR_OLLAMA_API_KEY"
+model    = "gpt-oss:120b-cloud"
+base_url = "https://ollama.com"
+```
+
+**Local instance** — run models on your own hardware:
+
+```toml
+[[models]]
+name     = "ollama-local"
+provider = "ollama"
+api_key  = ""
+model    = "gemma3:27b"
+base_url = "http://localhost:11434"
+```
 
 ### LLM Resilience
 
