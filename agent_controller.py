@@ -718,13 +718,11 @@ class AgentController:
         for m in models:
             name = m.get("name", "")
             model_id = m.get("model", "")
-            hint = m.get("hint", "")
             marker = " ← active" if model_id == active_model else ""
-            hint_str = f"  [{hint}]" if hint else ""
             display = f"  {model_id}"
             if name:
                 display += f" ({name})"
-            display += hint_str + marker
+            display += marker
             lines.append(display)
         lines.append("")
         return "\n".join(lines) + "\n"

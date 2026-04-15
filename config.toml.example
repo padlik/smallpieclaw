@@ -13,8 +13,7 @@ pairing_timeout = 300
 # LLM Models
 # Define one or more [[models]] entries. The active model is chosen by
 # matching agent.default_model against the 'model' field of each entry.
-# The agent can also auto-switch based on 'hint' keywords, and users can
-# switch manually with /models.
+# Users can switch manually with /models.
 #
 # Fields per model:
 #   name             — display name shown in /models
@@ -24,7 +23,6 @@ pairing_timeout = 300
 #   base_url         — API base URL (leave empty for Anthropic/Google defaults)
 #   max_tokens       — max tokens in LLM response
 #   temperature      — sampling temperature
-#   hint             — space-separated keywords for auto-selection
 #   request_timeout  — per-request timeout in seconds (default: 120)
 #   max_retries      — retry attempts on timeout/connection errors (default: 5)
 #   retry_delay      — base retry delay in seconds, doubles each attempt (default: 2)
@@ -37,7 +35,6 @@ model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
 temperature     = 0.2
-hint            = "general quick default"
 request_timeout = 120
 max_retries     = 5
 retry_delay     = 2
@@ -51,7 +48,6 @@ retry_delay     = 2
 # base_url        = ""
 # max_tokens      = 8192
 # temperature     = 0.2
-# hint            = "complex analyze reason large file code review"
 # request_timeout = 180
 # max_retries     = 5
 # retry_delay     = 2

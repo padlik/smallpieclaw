@@ -322,7 +322,6 @@ class LLMClient:
                 "name": m.get("name", f"model_{i}"),
                 "model": m.get("model", "?"),
                 "provider": m.get("provider", "?"),
-                "hint": m.get("hint", ""),
                 "active": i == self._active_idx,
             })
         return result
@@ -336,24 +335,6 @@ class LLMClient:
                 return True
         logger.warning("Model '%s' not found in configured models", name)
         return False
-
-    def select_model_by_hint(self, goal: str) -> Optional[str]:
-        """
-        Check if any word in the goal matches any hint keyword of a non-active model.
-        If a match is found, switch to that model and return its name.
-        Returns None if no switch was made.
-        """
-        goal_words = set(re.findall(r"\w+", goal.lower()))
-        for i, m in enumerate(self._models):
-            if i == self._active_idx:
-                continue
-            hint_words = set(re.findall(r"\w+", m.get("hint", "").lower()))
-            if goal_words & hint_words:
-                self._active_idx = i
-                name = m.get("name", f"model_{i}")
-                logger.info("Auto-selected model '%s' based on hint match", name)
-                return name
-        return None
 
     # ------------------------------------------------------------------
     # Token tracking
