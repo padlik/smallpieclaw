@@ -640,7 +640,6 @@ class BuiltinExecutor:
         _finish_tag = job_tag or label
 
         def _run_and_notify():
-            _agent_exc: Exception | None = None
             try:
                 result = runner.run(task)
                 # Persist context if requested
@@ -686,7 +685,6 @@ class BuiltinExecutor:
                     except Exception as notify_exc:
                         logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
             except Exception as exc:
-                _agent_exc = exc
                 record.status = "failed"
                 record.result = str(exc)
                 record._result_event.set()

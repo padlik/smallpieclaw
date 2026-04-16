@@ -939,4 +939,3 @@ class LLMClient:
 
     def close(self):
         self._http.close()
-

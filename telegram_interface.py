@@ -1187,4 +1187,3 @@ def _md_to_html(text: str) -> str:
         text = text.replace(f"\x00BLOCK{i}\x00", block)
 
     return text
-
