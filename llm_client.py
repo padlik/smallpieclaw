@@ -81,6 +81,19 @@ class LLMCancelledError(RuntimeError):
     """Raised when the LLM request is cancelled via cancel_event."""
 
 
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking_tags(text: str) -> str:
+    """Remove <think>…</think> reasoning blocks from LLM output.
+
+    Reasoning models (DeepSeek-R1, QwQ, etc.) sometimes embed chain-of-thought
+    inside these tags. Strip them before returning so thinking tokens never reach
+    the caller or the Telegram UI.
+    """
+    return _THINK_TAG_RE.sub("", text).strip()
+
+
 def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_event=None,
                 model_name: str | None = None):
     """
@@ -552,6 +565,8 @@ class LLMClient:
 
             msg = choices[0].get("message") or {}
             text = (msg.get("content") or "").strip()
+            # Strip inline <think>…</think> reasoning blocks before any further checks
+            text = _strip_thinking_tags(text)
 
             # Some reasoning/thinking models (DeepSeek-R1, Kimi K2.5, QwQ, etc.)
             # leave "content" empty and put the actual response in "reasoning" or
@@ -713,8 +728,9 @@ class LLMClient:
         instance. The host and optional bearer token come from the model's base_url
         and api_key config fields.
 
-        Streaming is used when progress_cb is provided so the callback receives
-        incremental text as the model generates its response.
+        progress_cb is used only for retry status messages, never for raw content
+        tokens. Reasoning/thinking content wrapped in <think>…</think> tags is
+        stripped from the final response before returning.
         """
         model = self.llm_cfg["model"]
         client = self._ollama_clients[self._active_idx]
@@ -741,34 +757,17 @@ class LLMClient:
 
         def _do_request():
             try:
-                if progress_cb:
-                    # Streaming path: accumulate and forward chunks
-                    stream = client.chat(
-                        model=model,
-                        messages=payload_messages,
-                        options=options,
-                        stream=True,
-                    )
-                    parts: list[str] = []
-                    for chunk in stream:
-                        piece = chunk.message.content or ""
-                        if piece:
-                            parts.append(piece)
-                            progress_cb(piece)
-                    text = "".join(parts).strip()
-                else:
-                    response = client.chat(
-                        model=model,
-                        messages=payload_messages,
-                        options=options,
-                    )
-                    text = (response.message.content or "").strip()
-                    # Track token usage from response metadata if available
-                    _eval_count = getattr(response, "eval_count", None) or 0
-                    _prompt_eval_count = getattr(response, "prompt_eval_count", None) or 0
-                    if _prompt_eval_count or _eval_count:
-                        self._track_usage(_prompt_eval_count, _eval_count)
-
+                response = client.chat(
+                    model=model,
+                    messages=payload_messages,
+                    options=options,
+                )
+                text = (response.message.content or "").strip()
+                # Track token usage from response metadata if available
+                _eval_count = getattr(response, "eval_count", None) or 0
+                _prompt_eval_count = getattr(response, "prompt_eval_count", None) or 0
+                if _prompt_eval_count or _eval_count:
+                    self._track_usage(_prompt_eval_count, _eval_count)
             except _ollama_lib.ResponseError as exc:
                 # Map to our error hierarchy so _with_retry handles retries correctly
                 status = exc.status_code
@@ -780,6 +779,9 @@ class LLMClient:
                 raise LLMError(
                     f"Ollama API error (HTTP {status}) for model '{model}': {exc.error}"
                 ) from exc
+
+            # Strip inline <think>…</think> reasoning blocks (DeepSeek-R1, QwQ, etc.)
+            text = _strip_thinking_tags(text)
 
             if not text:
                 raise LLMEmptyResponseError(f"Ollama returned empty content (model: {model})")
