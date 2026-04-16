@@ -23,6 +23,7 @@ pairing_timeout = 300
 #   base_url         — API base URL (leave empty for Anthropic/Google defaults)
 #   max_tokens       — max tokens in LLM response
 #   temperature      — sampling temperature
+#   top_p            — nucleus sampling (optional; omit to use provider default)
 #   request_timeout  — per-request timeout in seconds (default: 120)
 #   max_retries      — retry attempts on timeout/connection errors (default: 5)
 #   retry_delay      — base retry delay in seconds, doubles each attempt (default: 2)
@@ -35,6 +36,7 @@ model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
 temperature     = 0.2
+# top_p         = 0.9  # optional: nucleus sampling (omit to use provider default)
 request_timeout = 120
 max_retries     = 5
 retry_delay     = 2

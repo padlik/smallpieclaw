@@ -511,6 +511,9 @@ class LLMClient:
             logger.debug("Reasoning model detected (%s) — omitting sampling params", model)
         else:
             payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
+            top_p = self.llm_cfg.get("top_p")
+            if top_p is not None:
+                payload["top_p"] = top_p
 
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
@@ -623,6 +626,9 @@ class LLMClient:
                 "temperature": self.llm_cfg.get("temperature", 0.2),
             },
         }
+        top_p = self.llm_cfg.get("top_p")
+        if top_p is not None:
+            google_payload["generationConfig"]["topP"] = top_p
 
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
@@ -673,6 +679,9 @@ class LLMClient:
         }
         if system:
             payload["system"] = system
+        top_p = self.llm_cfg.get("top_p")
+        if top_p is not None:
+            payload["top_p"] = top_p
 
         anthropic_url = "https://api.anthropic.com/v1/messages"
         anthropic_headers = {
@@ -750,6 +759,9 @@ class LLMClient:
             "num_predict": self.llm_cfg.get("max_tokens", 1024),
             "temperature": self.llm_cfg.get("temperature", 0.2),
         }
+        top_p = self.llm_cfg.get("top_p")
+        if top_p is not None:
+            options["top_p"] = top_p
 
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:

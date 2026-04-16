@@ -119,6 +119,7 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 | `base_url` | API base URL (leave empty for Anthropic/Google; Ollama: `https://ollama.com` or `http://localhost:11434`) |
 | `max_tokens` | Max tokens in the LLM response |
 | `temperature` | Sampling temperature |
+| `top_p` | Nucleus sampling probability (optional; omit to use provider default; ignored by OpenAI reasoning models) |
 | `request_timeout` | Per-request timeout in seconds (default: 120) |
 | `max_retries` | Retry attempts on timeout/connection errors (default: 5) |
 | `retry_delay` | Base retry delay in seconds, doubles each attempt (default: 2) |
