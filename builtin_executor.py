@@ -196,14 +196,13 @@ class BuiltinExecutor:
     """
 
     def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
-                 sub_agent_factory=None, data_dir: str = "data", agent_depth: int = 0,
+                 sub_agent_factory=None, data_dir: str = "data",
                  memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
         self._sub_agent_factory = sub_agent_factory  # Callable[[model, context_key, label, notify_fn], SubAgentRunner]
         self._data_dir = data_dir
-        self._agent_depth = agent_depth  # 0 = main agent, 1 = sub-agent (no nested spawning)
         self._memory = memory  # Optional[MemoryStore] — for memory_write built-in
         self._max_subagents = max_subagents
         self._subagent_result_timeout = subagent_result_timeout
@@ -220,24 +219,27 @@ class BuiltinExecutor:
     def all_tools(self) -> list[BuiltinTool]:
         return list(BUILTIN_TOOLS.values())
 
-    def execute(self, tool_name: str, args: Optional[dict] = None) -> dict:
+    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0) -> dict:
         """
         Execute a built-in tool. Returns standard result dict, or a
         requires_confirmation dict if the operation needs user approval.
+
+        caller_depth is the depth of the AgentController invoking this tool
+        (0 = main agent, 1 = sub-agent). Used to enforce the no-nested-spawn rule.
         """
         args = args or {}
         if tool_name == "shell":
-            return self._exec_shell(args)
+            return self._exec_shell(args, caller_depth=caller_depth)
         elif tool_name == "file_read":
-            return self._exec_file_read(args)
+            return self._exec_file_read(args, caller_depth=caller_depth)
         elif tool_name == "file_write":
-            return self._exec_file_write(args)
+            return self._exec_file_write(args, caller_depth=caller_depth)
         elif tool_name == "file_send":
             return self._exec_file_send(args)
         elif tool_name == "schedule":
             return self._exec_schedule(args)
         elif tool_name == "spawn_agent":
-            return self._exec_spawn_agent(args)
+            return self._exec_spawn_agent(args, caller_depth=caller_depth)
         elif tool_name == "get_agent_result":
             return self._exec_get_agent_result(args)
         elif tool_name == "memory_write":
@@ -262,11 +264,12 @@ class BuiltinExecutor:
     # Internals
     # ------------------------------------------------------------------
 
-    def _requires_confirmation(self, tool_name: str, args: dict, description: str) -> dict:
+    def _requires_confirmation(self, tool_name: str, args: dict, description: str,
+                               caller_depth: int = 0) -> dict:
         # In headless mode (sub-agents), there is no user to confirm — auto-handle:
         #   shell/dangerous → deny (too risky to run destructive commands unattended)
         #   file_read/sensitive, file_write → approve (non-destructive or expected by task)
-        if self._agent_depth >= 1:
+        if caller_depth >= 1:
             if tool_name == "shell":
                 command = args.get("command", "")
                 logger.warning(
@@ -310,7 +313,7 @@ class BuiltinExecutor:
 
     # ---- shell ----
 
-    def _exec_shell(self, args: dict) -> dict:
+    def _exec_shell(self, args: dict, caller_depth: int = 0) -> dict:
         command = str(args.get("command", "")).strip()
         if not command:
             return {"success": False, "output": "", "error": "No command provided.", "exit_code": -1}
@@ -318,7 +321,7 @@ class BuiltinExecutor:
         dangerous, reason = _is_dangerous_shell(command)
         if dangerous:
             desc = f"Run shell command: <code>{command}</code>\n⚠️ Reason for confirmation: {reason}"
-            return self._requires_confirmation("shell", args, desc)
+            return self._requires_confirmation("shell", args, desc, caller_depth=caller_depth)
 
         return self._run_shell(args)
 
@@ -353,7 +356,7 @@ class BuiltinExecutor:
 
     # ---- file_read ----
 
-    def _exec_file_read(self, args: dict) -> dict:
+    def _exec_file_read(self, args: dict, caller_depth: int = 0) -> dict:
         path = str(args.get("path", "")).strip()
         if not path:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
@@ -361,7 +364,7 @@ class BuiltinExecutor:
         sensitive, reason = _is_sensitive_path(path)
         if sensitive:
             desc = f"Read file: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
-            return self._requires_confirmation("file_read", args, desc)
+            return self._requires_confirmation("file_read", args, desc, caller_depth=caller_depth)
 
         return self._run_file_read(args)
 
@@ -391,7 +394,7 @@ class BuiltinExecutor:
 
     # ---- file_write ----
 
-    def _exec_file_write(self, args: dict) -> dict:
+    def _exec_file_write(self, args: dict, caller_depth: int = 0) -> dict:
         path = str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
         mode = str(args.get("mode", "w"))
@@ -402,7 +405,7 @@ class BuiltinExecutor:
 
         action = "append to" if mode == "a" else "overwrite"
         desc = f"{action.capitalize()} file: <code>{path}</code> ({len(content)} chars)"
-        return self._requires_confirmation("file_write", args, desc)
+        return self._requires_confirmation("file_write", args, desc, caller_depth=caller_depth)
 
     def _run_file_write(self, args: dict) -> dict:
         path = str(args.get("path", "")).strip()
@@ -526,13 +529,16 @@ class BuiltinExecutor:
     # spawn_agent
     # ------------------------------------------------------------------
 
-    def _exec_spawn_agent(self, args: dict) -> dict:
+    def _exec_spawn_agent(self, args: dict, caller_depth: int = 0) -> dict:
         """
         Spawn an isolated sub-agent in a background thread.
 
         The sub-agent runs to completion then delivers its result via
         notify_fn (Telegram) and writes to long-term memory.
         Returns immediately with {status: "spawned", agent_id: "sa-..."}.
+
+        caller_depth is the depth of the AgentController that invoked this tool.
+        Sub-agents (depth ≥ 1) are not allowed to spawn further sub-agents.
         """
         import threading
 
@@ -552,11 +558,11 @@ class BuiltinExecutor:
         if not task:
             return {"success": False, "output": "", "error": "spawn_agent: 'task' is required.", "exit_code": -1}
 
-        # Depth guard — prevent recursive sub-agent spawning
-        if self._agent_depth >= 1:
+        # Depth guard — prevent recursive sub-agent spawning (hard error, not a silent no-op)
+        if caller_depth >= 1:
             return {
                 "success": False, "output": "",
-                "error": "spawn_agent cannot be called from within a sub-agent (max depth: 1).",
+                "error": "spawn_agent cannot be called from within a sub-agent (max nesting depth: 1).",
                 "exit_code": -1,
             }
 

@@ -180,6 +180,7 @@ class AgentController:
         self.label = label
         self._log_prefix = f"[{label}] "
         self._on_step = on_step
+        self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
 
         # Confirmation state: token -> threading.Event and result holder
         self._confirm_events: dict[str, threading.Event] = {}
@@ -393,7 +394,7 @@ class AgentController:
 
                     # Built-in tools take priority
                     if self.builtin_executor and self.builtin_executor.is_builtin(tool_name):
-                        outcome = self.builtin_executor.execute(tool_name, args)
+                        outcome = self.builtin_executor.execute(tool_name, args, caller_depth=self._depth)
 
                         if outcome.get("requires_confirmation"):
                             token = outcome["token"]
