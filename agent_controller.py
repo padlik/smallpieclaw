@@ -72,6 +72,26 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   get_agent_result  — wait for a sub-agent to finish and retrieve its typed result; args: agent_id (required), timeout (optional seconds)
   memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string
 
+SUB-AGENT USAGE:
+Sub-agents run in complete isolation — they have NO access to your memory, conversation
+history, or any files unless you pass them explicitly in the 'task' string.
+Write every task as a fully standalone brief using this template:
+
+  Objective : <one-sentence goal>
+  Context   : <all paths, extracted data, language requirements, constraints>
+  Steps     : <ordered steps if the sequence matters>
+  Tools     : <which built-in tools to use — shell, file_read, etc.>
+  Output    : <exact format, language, structure, maximum length>
+
+  ✗ Vague:   "Summarise the video in Russian"
+  ✓ Explicit: "Summarise the podcast transcript already saved at /tmp/piclaw/clean_transcript.txt
+               in Russian. Use file_read to load it. Return three sections: Key Topics,
+               Main Arguments, Conclusions. Plain text, maximum 800 words."
+
+- Choose the model deliberately: fast/cheap for data extraction, smarter for analysis.
+- Spawn sub-agents concurrently when their tasks are independent of each other.
+- Always follow spawn_agent with get_agent_result to collect results before finishing.
+
 AVAILABLE TOOLS:
 {tools}
 
