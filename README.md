@@ -26,6 +26,7 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Agent Skills** — autonomous skill system (per [agentskills.io](https://agentskills.io/specification)) with progressive disclosure; skills listed via `/skills`
 - **File storage guidance** — agent directed to use `/tmp/<agent>` for temporary files and `downloads/` for files the user wants to keep
 - **Log rotation safe** — uses `WatchedFileHandler`; re-opens log file automatically after `logrotate` without restart
+- **Structured log source tags** — every log line carries a `[source]` or `[source/model]` prefix so concurrent agents, sub-agents, and scheduled jobs are unambiguous in a single log file
 
 ---
 
@@ -748,6 +749,24 @@ SKILL.md files may describe sub-commands, binary flags, or helper operations usi
 ## Logging
 
 The agent handles log rotation internally — no `logrotate` or external tooling required.
+
+### Source tags
+
+Every log line carries a consistent source prefix so concurrent agents, sub-agents, and scheduler jobs are unambiguous in a shared log file.
+
+| Source | Tag format | Example |
+|--------|-----------|---------|
+| Main agent | `[main]` | `[main] step 2/25 \| model: gemma4:27b` |
+| Sub-agent | `[sa-<id>]` | `[sa-fcf85d] step 4/10 \| model: kimi-k2.5:cloud` |
+| Built-in tool (shell, file_read, …) | `[<caller>]` | `[sa-fcf85d] Built-in shell executing: yt-dlp …` |
+| LLM retries / errors | `[<caller>/<model>]` | `[sa-fcf85d/kimi-k2.5:cloud] Empty LLM response (attempt 1/3)` |
+| Scheduled job | `[sched/<tag>]` | `[sched/morning-report] Running scheduled job` |
+
+This makes it straightforward to `grep` a single sub-agent's full activity:
+
+```bash
+grep '\[sa-fcf85d\]' agent.log
+```
 
 ### How it works
 
