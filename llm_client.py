@@ -82,6 +82,7 @@ class LLMCancelledError(RuntimeError):
 
 
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_thinking_tags(text: str) -> str:
@@ -92,6 +93,16 @@ def _strip_thinking_tags(text: str) -> str:
     the caller or the Telegram UI.
     """
     return _THINK_TAG_RE.sub("", text).strip()
+
+
+def _extract_thinking_content(text: str) -> str:
+    """Extract and concatenate text inside all <think>…</think> blocks.
+
+    Last-resort fallback when a model places its entire answer inside thinking
+    tags with nothing outside. Returns empty string if no blocks are found.
+    """
+    parts = [m.strip() for m in _THINK_CONTENT_RE.findall(text) if m.strip()]
+    return " ".join(parts)
 
 
 def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_event=None,
@@ -801,7 +812,32 @@ class LLMClient:
                 ) from exc
 
             # Strip inline <think>…</think> reasoning blocks (DeepSeek-R1, QwQ, etc.)
-            text = _strip_thinking_tags(text)
+            raw_text = text
+            text = _strip_thinking_tags(raw_text)
+
+            # Some Ollama thinking models (Kimi K2.5, DeepSeek-R1, QwQ, etc.) leave
+            # "content" empty or wrap their entire answer in <think> tags. Apply the
+            # same two-level fallback as the OpenAI path:
+            #   1. response.message.thinking — dedicated field (populated when
+            #      the Ollama server separates thinking from content)
+            #   2. content of the <think> tags themselves — when the model
+            #      placed its answer inside the tags with nothing outside
+            if not text:
+                _tag = f"[{self._caller_tag}/{model}]" if self._caller_tag else f"[{model}]"
+                thinking_field = (getattr(response.message, "thinking", None) or "").strip()
+                if thinking_field:
+                    logger.warning(
+                        "%s content field is empty — using 'thinking' field as fallback",
+                        _tag,
+                    )
+                    return thinking_field
+                think_content = _extract_thinking_content(raw_text)
+                if think_content:
+                    logger.warning(
+                        "%s content empty after stripping — using <think> block content as fallback",
+                        _tag,
+                    )
+                    return think_content
 
             if not text:
                 raise LLMEmptyResponseError(f"Ollama returned empty content (model: {model})")
