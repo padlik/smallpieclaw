@@ -409,13 +409,15 @@ class Scheduler:
         if not meta or not meta.get("enabled", True):
             return
 
+        _spfx = f"[sched/{tag}] "
+
         # Overlap detection
         overlap_policy = meta.get("overlap_policy", "skip")
         with self._running_lock:
             if tag in self._running_jobs:
                 if overlap_policy == "skip":
                     logger.warning(
-                        "Job '%s' skipped — previous run still in progress (policy: skip)", tag
+                        "%sJob skipped — previous run still in progress (policy: skip)", _spfx
                     )
                     return
                 # else: parallel — allow multiple instances
@@ -427,13 +429,13 @@ class Scheduler:
         _log_extra = f" | model={job_model}" if job_model else ""
         if job_fallbacks is not None:
             _log_extra += f" | fallback_models={job_fallbacks}"
-        logger.info("Running scheduled job: %s%s", tag, _log_extra)
+        logger.info("%sRunning scheduled job%s", _spfx, _log_extra)
         now = datetime.utcnow().isoformat()
         is_once = meta.get("schedule_type") == "once"
 
         # --- Empty task guard ---
         if not task:
-            logger.warning("Job '%s' has no task — sending direct notification", tag)
+            logger.warning("%sNo task — sending direct notification", _spfx)
             friendly = tag.replace("_", " ")
             meta["last_run"] = now
             self._run_history[tag] = {"last_run": now, "last_error": None}
@@ -474,7 +476,7 @@ class Scheduler:
 
             result = self.builtin_executor._exec_spawn_agent(spawn_args)
             if not result.get("success"):
-                logger.error("Job '%s' spawn failed: %s", tag, result.get("error"))
+                logger.error("%sSpawn failed: %s", _spfx, result.get("error"))
                 meta["last_error"] = result.get("error", "spawn failed")
                 self._run_history[tag]["last_error"] = meta["last_error"]
                 self._save_state()
@@ -505,7 +507,7 @@ class Scheduler:
             if result.startswith("❌"):
                 error_occurred = True
         except Exception as exc:
-            logger.error("Job '%s' failed: %s", tag, exc)
+            logger.error("%sFailed: %s", _spfx, exc)
             result = f"Job failed: {exc}"
             error_occurred = True
         finally:
@@ -532,13 +534,13 @@ class Scheduler:
         if tag == "longterm_memory_update" and self.long_term_memory:
             try:
                 self.long_term_memory.add(result, source="scheduled")
-                logger.info("Long-term memory updated from job '%s'", tag)
+                logger.info("%sLong-term memory updated", _spfx)
             except Exception as exc:
-                logger.warning("Failed to update long-term memory from job '%s': %s", tag, exc)
+                logger.warning("%sFailed to update long-term memory: %s", _spfx, exc)
 
         # Auto-remove once/reminder jobs after successful execution
         if is_once:
-            logger.info("Once job '%s' completed — removing", tag)
+            logger.info("%sOnce job completed — removing", _spfx)
             schedule.clear(tag)
             self._jobs_meta.pop(tag, None)
             self._save_state()

@@ -234,31 +234,32 @@ class BuiltinExecutor:
     def all_tools(self) -> list[BuiltinTool]:
         return list(BUILTIN_TOOLS.values())
 
-    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0) -> dict:
+    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "") -> dict:
         """
         Execute a built-in tool. Returns standard result dict, or a
         requires_confirmation dict if the operation needs user approval.
 
         caller_depth is the depth of the AgentController invoking this tool
         (0 = main agent, 1 = sub-agent). Used to enforce the no-nested-spawn rule.
+        caller_tag is a human-readable label for logging (e.g. "[main]", "[sa-fcf85d]").
         """
         args = args or {}
         if tool_name == "shell":
-            return self._exec_shell(args, caller_depth=caller_depth)
+            return self._exec_shell(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "file_read":
-            return self._exec_file_read(args, caller_depth=caller_depth)
+            return self._exec_file_read(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "file_write":
-            return self._exec_file_write(args, caller_depth=caller_depth)
+            return self._exec_file_write(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "file_send":
-            return self._exec_file_send(args)
+            return self._exec_file_send(args, caller_tag=caller_tag)
         elif tool_name == "schedule":
             return self._exec_schedule(args)
         elif tool_name == "spawn_agent":
-            return self._exec_spawn_agent(args, caller_depth=caller_depth)
+            return self._exec_spawn_agent(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "get_agent_result":
-            return self._exec_get_agent_result(args)
+            return self._exec_get_agent_result(args, caller_tag=caller_tag)
         elif tool_name == "memory_write":
-            return self._exec_memory_write(args)
+            return self._exec_memory_write(args, caller_tag=caller_tag)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -280,7 +281,8 @@ class BuiltinExecutor:
     # ------------------------------------------------------------------
 
     def _requires_confirmation(self, tool_name: str, args: dict, description: str,
-                               caller_depth: int = 0) -> dict:
+                               caller_depth: int = 0, caller_tag: str = "") -> dict:
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
         # In headless mode (sub-agents), there is no user to confirm — auto-handle:
         #   shell/dangerous → deny (too risky to run destructive commands unattended)
         #   file_read/sensitive, file_write → approve (non-destructive or expected by task)
@@ -288,8 +290,8 @@ class BuiltinExecutor:
             if tool_name == "shell":
                 command = args.get("command", "")
                 logger.warning(
-                    "Headless sub-agent: dangerous shell command blocked (requires confirmation): %s",
-                    command[:120],
+                    "%sHeadless sub-agent: dangerous shell command blocked (requires confirmation): %s",
+                    _pfx, command[:120],
                 )
                 return {
                     "success": False,
@@ -303,32 +305,32 @@ class BuiltinExecutor:
             else:
                 # file_read sensitive or file_write — auto-approve
                 logger.info(
-                    "Headless sub-agent: auto-approving %s (no user confirmation available)", tool_name
+                    "%sHeadless sub-agent: auto-approving %s (no user confirmation available)", _pfx, tool_name
                 )
-                return self._run(tool_name, args)
+                return self._run(tool_name, args, caller_tag=caller_tag)
 
         token = secrets.token_hex(12)
         self._pending[token] = (tool_name, args)
-        logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
+        logger.info("%sBuilt-in '%s' requires confirmation, token=%s", _pfx, tool_name, token[:8])
         return {
             "requires_confirmation": True,
             "token": token,
             "description": description,
         }
 
-    def _run(self, tool_name: str, args: dict) -> dict:
+    def _run(self, tool_name: str, args: dict, caller_tag: str = "") -> dict:
         """Actually execute without any confirmation check."""
         if tool_name == "shell":
-            return self._run_shell(args)
+            return self._run_shell(args, caller_tag=caller_tag)
         elif tool_name == "file_read":
-            return self._run_file_read(args)
+            return self._run_file_read(args, caller_tag=caller_tag)
         elif tool_name == "file_write":
-            return self._run_file_write(args)
+            return self._run_file_write(args, caller_tag=caller_tag)
         return {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1}
 
     # ---- shell ----
 
-    def _exec_shell(self, args: dict, caller_depth: int = 0) -> dict:
+    def _exec_shell(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         if not command:
             return {"success": False, "output": "", "error": "No command provided.", "exit_code": -1}
@@ -336,14 +338,15 @@ class BuiltinExecutor:
         dangerous, reason = _is_dangerous_shell(command)
         if dangerous:
             desc = f"Run shell command: <code>{command}</code>\n⚠️ Reason for confirmation: {reason}"
-            return self._requires_confirmation("shell", args, desc, caller_depth=caller_depth)
+            return self._requires_confirmation("shell", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
-        return self._run_shell(args)
+        return self._run_shell(args, caller_tag=caller_tag)
 
-    def _run_shell(self, args: dict) -> dict:
+    def _run_shell(self, args: dict, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self.default_timeout))
-        logger.info("Built-in shell executing: %s", command[:120])
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in shell executing: %s", _pfx, command[:120])
         try:
             proc = subprocess.run(
                 command,
@@ -371,7 +374,7 @@ class BuiltinExecutor:
 
     # ---- file_read ----
 
-    def _exec_file_read(self, args: dict, caller_depth: int = 0) -> dict:
+    def _exec_file_read(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         path = str(args.get("path", "")).strip()
         if not path:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
@@ -379,15 +382,16 @@ class BuiltinExecutor:
         sensitive, reason = _is_sensitive_path(path)
         if sensitive:
             desc = f"Read file: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
-            return self._requires_confirmation("file_read", args, desc, caller_depth=caller_depth)
+            return self._requires_confirmation("file_read", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
-        return self._run_file_read(args)
+        return self._run_file_read(args, caller_tag=caller_tag)
 
-    def _run_file_read(self, args: dict) -> dict:
+    def _run_file_read(self, args: dict, caller_tag: str = "") -> dict:
         path = str(args.get("path", "")).strip()
         max_bytes = int(args.get("max_bytes", 50_000))
         offset = int(args.get("offset", 0))
-        logger.info("Built-in file_read: %s (offset=%d, max=%d)", path, offset, max_bytes)
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_read: %s (offset=%d, max=%d)", _pfx, path, offset, max_bytes)
         try:
             if not os.path.exists(path):
                 return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
@@ -409,7 +413,7 @@ class BuiltinExecutor:
 
     # ---- file_write ----
 
-    def _exec_file_write(self, args: dict, caller_depth: int = 0) -> dict:
+    def _exec_file_write(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         path = str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
         mode = str(args.get("mode", "w"))
@@ -420,15 +424,16 @@ class BuiltinExecutor:
 
         action = "append to" if mode == "a" else "overwrite"
         desc = f"{action.capitalize()} file: <code>{path}</code> ({len(content)} chars)"
-        return self._requires_confirmation("file_write", args, desc, caller_depth=caller_depth)
+        return self._requires_confirmation("file_write", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
-    def _run_file_write(self, args: dict) -> dict:
+    def _run_file_write(self, args: dict, caller_tag: str = "") -> dict:
         path = str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
         mode = str(args.get("mode", "w"))
         if mode not in ("w", "a"):
             mode = "w"
-        logger.info("Built-in file_write: %s (mode=%s, len=%d)", path, mode, len(content))
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_write: %s (mode=%s, len=%d)", _pfx, path, mode, len(content))
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, mode) as f:
@@ -444,7 +449,7 @@ class BuiltinExecutor:
     _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
     _MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (Telegram bot API limit)
 
-    def _exec_file_send(self, args: dict) -> dict:
+    def _exec_file_send(self, args: dict, caller_tag: str = "") -> dict:
         path = os.path.expanduser(str(args.get("path", "")).strip())
         caption = str(args.get("caption", "")).strip()
         if not path:
@@ -459,7 +464,8 @@ class BuiltinExecutor:
                 "success": False, "output": "",
                 "error": f"File too large ({size // 1024 // 1024} MB). Max 50 MB.", "exit_code": 1,
             }
-        logger.info("Built-in file_send: %s (%d bytes)", path, size)
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_send: %s (%d bytes)", _pfx, path, size)
         return {
             "success": True,
             "output": f"Sending {os.path.basename(path)} to chat…",
@@ -544,7 +550,7 @@ class BuiltinExecutor:
     # spawn_agent
     # ------------------------------------------------------------------
 
-    def _exec_spawn_agent(self, args: dict, caller_depth: int = 0) -> dict:
+    def _exec_spawn_agent(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         """
         Spawn an isolated sub-agent in a background thread.
 
@@ -648,10 +654,11 @@ class BuiltinExecutor:
         get_agent_registry().register(record)
 
         # Log spawn params for observability
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
         _fb_log = str(fallback_models) if fallback_models is not None else "inherited"
         logger.info(
-            "spawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
-            runner.agent_id, label, runner._model_id, _fb_log, task[:100],
+            "%sspawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
+            _pfx, runner.agent_id, label, runner._model_id, _fb_log, task[:100],
         )
 
         # Capture scheduler finish callback now (at spawn time) to avoid race
@@ -745,7 +752,7 @@ class BuiltinExecutor:
         }
 
 
-    def _exec_get_agent_result(self, args: dict) -> dict:
+    def _exec_get_agent_result(self, args: dict, caller_tag: str = "") -> dict:
         """
         Wait for a sub-agent to finish and return its result.
 
@@ -796,7 +803,7 @@ class BuiltinExecutor:
         }
 
 
-    def _exec_memory_write(self, args: dict) -> dict:
+    def _exec_memory_write(self, args: dict, caller_tag: str = "") -> dict:
         """Read or update persistent MemoryStore (data/memory.json)."""
         if self._memory is None:
             return {

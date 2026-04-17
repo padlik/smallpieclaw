@@ -414,7 +414,7 @@ class AgentController:
 
                     # Built-in tools take priority
                     if self.builtin_executor and self.builtin_executor.is_builtin(tool_name):
-                        outcome = self.builtin_executor.execute(tool_name, args, caller_depth=self._depth)
+                        outcome = self.builtin_executor.execute(tool_name, args, caller_depth=self._depth, caller_tag=self.label)
 
                         if outcome.get("requires_confirmation"):
                             token = outcome["token"]
@@ -956,7 +956,7 @@ class SubAgentRunner:
         self.label = label
         self.context_key = context_key
         self.notify_fn = notify_fn or (lambda msg: None)
-        self._log = logging.getLogger("agent").getChild(f"sub.{label}")
+        self._log = logging.getLogger("agent").getChild(self.agent_id)
 
         # Build a sub-config that uses the overridden model as default
         sub_config = dict(config)
@@ -973,7 +973,8 @@ class SubAgentRunner:
         # fallback_models=None means inherit from sub_config (which inherited from parent config)
         self._llm = LLMClient(sub_config, usage_registry=usage_registry,
                               cancel_event=self._cancel_event,
-                              fallback_models=fallback_models)
+                              fallback_models=fallback_models,
+                              caller_tag=self.agent_id)
 
         # Own blank memory (working context for this task)
         self._short_term = short_term if short_term is not None else ShortTermMemory()
@@ -999,7 +1000,7 @@ class SubAgentRunner:
             downloads_dir=downloads_dir,
             cancel_event=self._cancel_event,
             depth=depth,
-            label=f"sub:{label}",
+            label=self.agent_id,
             on_step=on_step,
         )
 

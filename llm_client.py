@@ -95,7 +95,7 @@ def _strip_thinking_tags(text: str) -> str:
 
 
 def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_event=None,
-                model_name: str | None = None):
+                model_name: str | None = None, caller_tag: str | None = None):
     """
     Call fn(), retrying on transient httpx errors, retryable HTTP status codes,
     and LLMError (e.g. OpenRouter 200-OK with error body for server overload).
@@ -103,9 +103,14 @@ def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_e
     Uses exponential backoff: base_delay, base_delay*2, base_delay*4, …
     Non-retryable exceptions (e.g. 400 Bad Request) propagate immediately.
     on_retry(attempt, max_retries, exc_str) is called before each retry delay.
-    model_name is included in log messages when provided.
+    model_name and caller_tag are included in log messages when provided.
     """
-    _model_tag = f"[{model_name.strip()}] " if (model_name and model_name.strip()) else ""
+    _parts = []
+    if caller_tag and caller_tag.strip():
+        _parts.append(caller_tag.strip())
+    if model_name and model_name.strip():
+        _parts.append(model_name.strip())
+    _model_tag = f"[{'/'.join(_parts)}] " if _parts else ""
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(1, max_retries + 1):
         # Check cancellation before each attempt (including before the first)
@@ -235,7 +240,7 @@ class LLMClient:
     """
 
     def __init__(self, config: dict, usage_registry=None, cancel_event=None,
-                 fallback_models: list[str] | None = None):
+                 fallback_models: list[str] | None = None, caller_tag: str | None = None):
         """
         Args:
             config: full agent config dict
@@ -244,8 +249,11 @@ class LLMClient:
             fallback_models: optional list of model IDs (matching [[models]] entries) to try
                              in order when the primary model fails. Overrides config
                              agent.fallback_models when provided (even as empty list).
+            caller_tag: optional label for log messages (e.g. "main", "sa-fcf85d"). Used to
+                        identify which agent triggered an LLM call in concurrent log streams.
         """
         self.cfg = config
+        self._caller_tag = caller_tag or ""
 
         # Require [[models]] — no legacy [llm] fallback
         models = config.get("models")
@@ -600,7 +608,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=model)
+                           cancel_event=self._cancel_event, model_name=model, caller_tag=self._caller_tag)
 
     def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         # Convert to Gemini format
@@ -668,7 +676,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=model)
+                           cancel_event=self._cancel_event, model_name=model, caller_tag=self._caller_tag)
 
     def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         model = self.llm_cfg["model"]
@@ -727,7 +735,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=model)
+                           cancel_event=self._cancel_event, model_name=model, caller_tag=self._caller_tag)
 
     def _ollama_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         """
@@ -800,7 +808,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=model)
+                           cancel_event=self._cancel_event, model_name=model, caller_tag=self._caller_tag)
 
     def _diagnose_empty_response(
         self,

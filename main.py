@@ -269,7 +269,7 @@ def _run(
 
     logger.info("Initialising components...")
 
-    llm      = LLMClient(cfg, usage_registry=get_token_registry())
+    llm      = LLMClient(cfg, usage_registry=get_token_registry(), caller_tag="main")
     memory   = MemoryStore(memory_path)
     registry = ToolRegistry(tools_dirs=[tools_dir, gen_tools_dir])
     builtin  = BuiltinExecutor(
