@@ -755,11 +755,11 @@ class Scheduler:
             lines.append(f"task = {_toml_str(meta.get('task', ''))}\n")
             lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
             if meta.get("model"):
-                lines.append(f'model = "{meta["model"]}"\n')
+                lines.append(f"model = {_toml_str(meta['model'])}\n")
             if meta.get("fallback_models") is not None:
                 fb = meta["fallback_models"]
-                # Serialize as TOML inline array: ["a", "b"] or []
-                items = ", ".join(f'"{m}"' for m in fb)
+                # Serialize as TOML inline array using the same escaping as _toml_str
+                items = ", ".join(_toml_str(m) for m in fb)
                 lines.append(f"fallback_models = [{items}]\n")
             if meta.get("preserve_context"):
                 lines.append('preserve_context = true\n')

@@ -237,7 +237,11 @@ class AgentController:
                 progress_callback(msg)
             logger.debug("%sAgent progress: %s", _pfx, msg)
 
-        # Reset cancel event so a new run() after /stop works normally
+        # If /stop was called before this run() started, honour it immediately.
+        # Otherwise clear any stale cancellation from a previous run.
+        if self._cancel_event.is_set():
+            logger.warning("%sCancellation pending at run() start — aborting immediately", _pfx)
+            return "[Cancelled]"
         self._cancel_event.clear()
 
         # Log start with model and goal preview
