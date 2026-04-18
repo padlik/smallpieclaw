@@ -196,7 +196,7 @@ class AgentController:
         self.downloads_dir = downloads_dir
         self.log_file = log_file
         self.log_backup_count = log_backup_count
-        self._cancel_event = cancel_event
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self.label = label
         self._log_prefix = f"[{label}] "
         self._on_step = on_step
@@ -236,6 +236,9 @@ class AgentController:
             if progress_callback:
                 progress_callback(msg)
             logger.debug("%sAgent progress: %s", _pfx, msg)
+
+        # Reset cancel event so a new run() after /stop works normally
+        self._cancel_event.clear()
 
         # Log start with model and goal preview
         _active_model = self.llm.llm_cfg.get("model", "?")
@@ -286,7 +289,7 @@ class AgentController:
         while True:  # outer loop: allows step-count extension by user
             while step < max_steps:
                 # Cooperative cancellation check (sub-agents)
-                if self._cancel_event and self._cancel_event.is_set():
+                if self._cancel_event.is_set():
                     logger.warning("%scancelled at step %d/%d", _pfx, step, max_steps)
                     return "[Cancelled]"
 
@@ -582,6 +585,11 @@ class AgentController:
         # Max iterations reached and user declined to extend
         self.memory.record_event("Agent hit max iterations")
         return "⚠️ Agent reached maximum steps. Operation cancelled."
+
+    def cancel(self) -> None:
+        """Cancel the currently-running task. Safe to call from any thread."""
+        self._cancel_event.set()
+        logger.info("%sCancel requested by operator", self._log_prefix)
 
     def resume(self, token: str, confirmed: bool) -> None:
         """Called by TelegramInterface when user responds to a file_write/shell confirmation."""

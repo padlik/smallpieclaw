@@ -137,6 +137,7 @@ class TelegramInterface:
 
     def _register_handlers(self) -> None:
         app = self._app
+        app.add_handler(CommandHandler("stop", self._cmd_stop))
         app.add_handler(CommandHandler("start", self._cmd_start))
         app.add_handler(CommandHandler("help", self._cmd_help))
         app.add_handler(CommandHandler("status", self._cmd_status))
@@ -269,6 +270,18 @@ class TelegramInterface:
             f"{token_line}",
             parse_mode=ParseMode.HTML,
         )
+
+    async def _cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if self.agent:
+            self.agent.cancel()
+            await update.effective_message.reply_text(
+                "🛑 Stop signal sent — current task will end after the current step."
+            )
+        else:
+            await update.effective_message.reply_text("ℹ️ No active agent to stop.")
 
     async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
