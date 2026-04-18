@@ -314,6 +314,12 @@ class LLMClient:
             emb_cfg["base_url"] = self._models[self._active_idx].get("base_url", "")
         self.emb_cfg = emb_cfg
 
+        # Embedding cache: keyed on text, bounded to avoid unbounded growth in long sessions.
+        # Avoids redundant API round-trips when the same text is embedded multiple times
+        # (e.g. tool-index queries repeated across user turns).
+        self._embed_cache: dict[str, list[float]] = {}
+        self._embed_cache_max: int = 512
+
         # Retry / timeout from active model config
         _ref = self._models[self._active_idx]
         self._max_retries: int = _ref.get("max_retries", 5)
@@ -943,19 +949,34 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     def embed(self, text: str) -> list[float]:
-        """Return an embedding vector for the given text."""
+        """Return an embedding vector for the given text.
+
+        Results are cached in-memory (up to _embed_cache_max entries) so repeated
+        calls with the same text — common during tool-index searches across turns —
+        skip the API round-trip entirely.
+        """
+        if text in self._embed_cache:
+            return self._embed_cache[text]
+
         provider = self.emb_cfg.get("provider", "openai")
         try:
             if provider in ("openai", "openrouter"):
-                return self._openai_embed(text)
+                vector = self._openai_embed(text)
             elif provider == "google":
-                return self._google_embed(text)
+                vector = self._google_embed(text)
             else:
                 # Fallback: OpenAI-compatible
-                return self._openai_embed(text)
+                vector = self._openai_embed(text)
         except Exception as exc:
             logger.error("Embedding error: %s", exc)
             raise
+
+        # Evict oldest entry when full (FIFO via dict insertion order, Python 3.7+)
+        if len(self._embed_cache) >= self._embed_cache_max:
+            oldest = next(iter(self._embed_cache))
+            del self._embed_cache[oldest]
+        self._embed_cache[text] = vector
+        return vector
 
     def _openai_embed(self, text: str) -> list[float]:
         resp = _with_retry(
