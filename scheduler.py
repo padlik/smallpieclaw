@@ -183,6 +183,7 @@ class Scheduler:
         cron: str = None,
         source: str = "dynamic",
         model: str = None,
+        fallback_models: list = None,
         preserve_context: bool = False,
         context_max_messages: int = 50,
         overlap_policy: str = "skip",
@@ -242,6 +243,8 @@ class Scheduler:
         }
         if model:
             meta["model"] = model
+        if fallback_models is not None:
+            meta["fallback_models"] = fallback_models
         if preserve_context:
             meta["preserve_context"] = preserve_context
             meta["context_max_messages"] = context_max_messages
@@ -753,6 +756,11 @@ class Scheduler:
             lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
             if meta.get("model"):
                 lines.append(f'model = "{meta["model"]}"\n')
+            if meta.get("fallback_models") is not None:
+                fb = meta["fallback_models"]
+                # Serialize as TOML inline array: ["a", "b"] or []
+                items = ", ".join(f'"{m}"' for m in fb)
+                lines.append(f"fallback_models = [{items}]\n")
             if meta.get("preserve_context"):
                 lines.append('preserve_context = true\n')
                 ctx_max = meta.get("context_max_messages", 50)

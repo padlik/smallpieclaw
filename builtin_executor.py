@@ -517,6 +517,7 @@ class BuiltinExecutor:
                 run_at=str(args.get("run_at", "")) or None,
                 cron=str(args.get("cron", "")) or None,
                 model=str(args["model"]) if args.get("model") else None,
+                fallback_models=args.get("fallback_models"),
                 preserve_context=bool(args.get("preserve_context", False)),
             )
             if result["success"]:
