@@ -281,6 +281,7 @@ class AgentController:
         # 2. ReAct loop — supports dynamic extension when max steps are reached
         max_steps = self.max_iterations
         step = 0
+        _operator_cancelled = False
 
         while True:  # outer loop: allows step-count extension by user
             while step < max_steps:
@@ -437,8 +438,16 @@ class AgentController:
                                 _progress(f"✅ Confirmed — executing <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
                             else:
                                 self.builtin_executor.cancel(token)
-                                outcome = {"success": False, "output": "", "error": "Cancelled by user.", "exit_code": -1}
-                                _progress("❌ Cancelled by user.")
+                                outcome = {
+                                    "success": False, "output": "", "exit_code": -1,
+                                    "error": (
+                                        "Operation cancelled by the operator. "
+                                        "Do not retry this operation via any other tool or method. "
+                                        "Respond with a finish action now."
+                                    ),
+                                }
+                                _progress("❌ Cancelled by operator — stopping task.")
+                                _operator_cancelled = True
                     else:
                         outcome = self.executor.execute(tool_name, args)
 
@@ -463,6 +472,8 @@ class AgentController:
                         )
                     _progress(self._fmt_tool_result_progress(tool_name, args, outcome))
                     messages.append({"role": "user", "content": tool_result})
+                    if _operator_cancelled:
+                        break  # stop the inner loop — operator cancelled this operation
 
                 elif action == "create_tool":
                     tool_name = action_obj.get("name", "unnamed_tool")
@@ -525,10 +536,17 @@ class AgentController:
                             _progress(f"❌ Script failed: {exc}")
 
                     else:  # cancel
-                        feedback = "Tool creation was cancelled by operator. Try a different approach or use shell."
-                        _progress("❌ Tool creation cancelled by operator.")
+                        feedback = (
+                            "Tool creation was cancelled by the operator. "
+                            "Do not attempt to create, write, or execute this code via shell, "
+                            "file_write, or any other method. Respond with a finish action now."
+                        )
+                        _progress("❌ Tool creation cancelled by operator — stopping task.")
+                        _operator_cancelled = True
 
                     messages.append({"role": "user", "content": feedback})
+                    if _operator_cancelled:
+                        break  # stop the inner loop — operator cancelled this operation
 
                 else:
                     logger.warning("%sUnknown action '%s' from LLM", _pfx, action)
@@ -537,7 +555,12 @@ class AgentController:
                         "content": f'Unknown action "{action}". Use "tool", "create_tool", or "finish".',
                     })
 
-            # Inner while exited — max steps reached. Ask user to extend.
+            # Inner while exited — check if operator cancelled the task.
+            if _operator_cancelled:
+                self.memory.record_event("Task cancelled by operator")
+                return "⚠️ Task stopped by operator."
+
+            # Max steps reached. Ask user to extend.
             ext_token = secrets.token_hex(4)
             ext_event = threading.Event()
             self._extend_events[ext_token] = ext_event
