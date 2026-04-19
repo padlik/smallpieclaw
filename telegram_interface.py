@@ -258,8 +258,22 @@ class TelegramInterface:
                 f"  Total: {usage['total_tokens']:,}"
             )
 
+        # Scheduler state
+        scheduler_line = ""
+        if self.scheduler:
+            jobs = self.scheduler.list_jobs()
+            enabled = sum(1 for j in jobs if j.get("enabled", True))
+            total = len(jobs)
+            sched_state = "enabled" if self.scheduler.enabled else "disabled"
+            scheduler_line = f"\n📅 Scheduler: <code>{sched_state}</code> | {enabled}/{total} jobs active"
+
+        # Current server time
+        from datetime import datetime as _dt
+        now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+
         await update.effective_message.reply_text(
             f"✅ <b>Agent Status</b>\n\n"
+            f"🕐 Time: <code>{now_str}</code>\n"
             f"⏱ Uptime: <code>{h}h {m}m {s}s</code>\n"
             f"🤖 LLM: <code>{html.escape(llm_model)}</code>\n"
             f"🔍 Embeddings: <code>{html.escape(emb_model)}</code> ({html.escape(emb_key_status)})\n"
@@ -267,6 +281,7 @@ class TelegramInterface:
             f"👥 Authorized users: {len(self.allowed_ids)}\n"
             f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
             f"{agents_line}"
+            f"{scheduler_line}"
             f"{token_line}",
             parse_mode=ParseMode.HTML,
         )
