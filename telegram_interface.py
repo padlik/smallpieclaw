@@ -51,6 +51,7 @@ class TelegramInterface:
         tool_index=None,
         skill_registry=None,
         usage_registry=None,
+        downloads_dir: str = "downloads",
     ):
         tg_cfg = config["telegram"]
         self._config = config
@@ -66,6 +67,7 @@ class TelegramInterface:
         self._tool_index = tool_index
         self.skill_registry = skill_registry
         self._usage_registry = usage_registry  # TokenUsageRegistry
+        self._downloads_dir = os.path.abspath(downloads_dir)
         self._start_time = time.time()
 
         # Pairing state: {token: user_id}
@@ -160,6 +162,12 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(self._cb_confirm, pattern=r"^confirm_(yes|no):"))
         app.add_handler(CallbackQueryHandler(self._cb_extend, pattern=r"^extend_(yes|no):"))
         app.add_handler(CallbackQueryHandler(self._cb_tool_create, pattern=r"^tool_create_"))
+        # File upload handlers (document, photo, audio, video, voice)
+        app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
+        app.add_handler(MessageHandler(filters.PHOTO, self._on_file))
+        app.add_handler(MessageHandler(filters.AUDIO, self._on_file))
+        app.add_handler(MessageHandler(filters.VIDEO, self._on_file))
+        app.add_handler(MessageHandler(filters.VOICE, self._on_file))
         # Catch-all text messages
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         # Global error handler — catches unhandled exceptions in any handler
@@ -681,6 +689,68 @@ class TelegramInterface:
         chunk_size = 4096
         for i in range(0, len(text), chunk_size):
             await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
+
+    async def _on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle incoming files (documents, photos, audio, video, voice)."""
+        if not update.effective_message:
+            return
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            await self._send_unauthorized(update)
+            return
+
+        msg = update.effective_message
+        os.makedirs(self._downloads_dir, exist_ok=True)
+
+        # Determine telegram file object + desired filename
+        tg_file_id: str | None = None
+        filename: str | None = None
+
+        if msg.document:
+            tg_file_id = msg.document.file_id
+            filename = msg.document.file_name or f"document_{msg.document.file_unique_id}"
+        elif msg.photo:
+            # Telegram sends multiple resolutions; take the largest (last entry)
+            best = msg.photo[-1]
+            tg_file_id = best.file_id
+            filename = f"photo_{best.file_unique_id}.jpg"
+        elif msg.audio:
+            tg_file_id = msg.audio.file_id
+            filename = msg.audio.file_name or f"audio_{msg.audio.file_unique_id}"
+        elif msg.video:
+            tg_file_id = msg.video.file_id
+            filename = msg.video.file_name or f"video_{msg.video.file_unique_id}.mp4"
+        elif msg.voice:
+            tg_file_id = msg.voice.file_id
+            filename = f"voice_{msg.voice.file_unique_id}.ogg"
+
+        if not tg_file_id or not filename:
+            await msg.reply_text("⚠️ Unsupported file type.")
+            return
+
+        # Deduplicate: foo.pdf → foo_2.pdf → foo_3.pdf …
+        dest = os.path.join(self._downloads_dir, filename)
+        if os.path.exists(dest):
+            base, ext = os.path.splitext(filename)
+            counter = 2
+            while os.path.exists(dest):
+                dest = os.path.join(self._downloads_dir, f"{base}_{counter}{ext}")
+                counter += 1
+
+        status_msg = await msg.reply_text("📥 Downloading…")
+        try:
+            tg_file = await ctx.bot.get_file(tg_file_id)
+            await tg_file.download_to_drive(dest)
+            size_kb = os.path.getsize(dest) / 1024
+            size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024:.1f} MB"
+            await self._safe_edit(
+                status_msg,
+                f"📥 Saved: <code>{html.escape(dest)}</code> ({size_str})",
+            )
+            logger.info("File upload from user %d: %s (%s)", user.id, dest, size_str)
+        except Exception as exc:
+            logger.exception("File download failed for user %d", user.id)
+            await self._safe_edit(status_msg, f"❌ Download failed: {html.escape(str(exc))}")
 
     async def _on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:

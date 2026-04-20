@@ -407,6 +407,7 @@ def _run(
         tool_index=index,
         skill_registry=skills,
         usage_registry=get_token_registry(),
+        downloads_dir=downloads_dir,
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
     _tg_holder[0] = tg
