@@ -114,6 +114,9 @@ class Scheduler:
         # Overlap detection: tracks tags of currently executing jobs
         self._running_jobs: set = set()
         self._running_lock = threading.Lock()
+        # Serializes all writes to scheduler.toml and scheduler_state.json,
+        # preventing race conditions when two jobs finish simultaneously.
+        self._save_lock = threading.Lock()
 
         os.makedirs(data_dir, exist_ok=True)
         self._load_config_jobs(scheduler_config_path, sched_cfg)
@@ -598,6 +601,10 @@ class Scheduler:
                 logger.error("Error processing scheduler command %s: %s", cmd, exc)
 
     def _save_state(self) -> None:
+        with self._save_lock:
+            self._save_state_locked()
+
+    def _save_state_locked(self) -> None:
         # Merge current job states into run_history so history is never lost
         for tag, meta in self._jobs_meta.items():
             if meta.get("last_run") or meta.get("last_error"):
@@ -729,6 +736,11 @@ class Scheduler:
 
     def _save_scheduler_toml(self) -> None:
         """Persist all current jobs to scheduler.toml (auto-managed file)."""
+        with self._save_lock:
+            self._save_scheduler_toml_locked()
+
+    def _save_scheduler_toml_locked(self) -> None:
+        """Inner (lock-free) implementation — always called under _save_lock."""
         def _toml_str(v: str) -> str:
             return '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
