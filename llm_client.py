@@ -538,64 +538,80 @@ class LLMClient:
         raise last_exc  # type: ignore[misc]
 
     def _openai_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
-        model = self.llm_cfg["model"]
-        reasoning = _is_reasoning_model(model)
+        _initial_model = self.llm_cfg["model"]
 
-        payload_messages = []
-        if system:
-            if reasoning:
-                # o-series models don't support the "system" role — embed it as
-                # the first user turn so context is still passed through.
-                payload_messages.append({
-                    "role": "user",
-                    "content": f"[Instructions]\n{system}",
-                })
-            else:
-                payload_messages.append({"role": "system", "content": system})
-        # Encode images for any messages that carry them; build multipart content
-        # for providers that support vision (all 4 providers use the same path here).
+        # Pre-encode images once — this is pure data transformation that does not
+        # depend on the active model. Results are reused across retries.
+        encoded_messages: list[dict] = []
         for m in messages:
             imgs = m.get("images")
             if imgs:
                 encoded = _encode_images(imgs)
                 if encoded:
-                    img_content: list[Any] = [{"type": "text", "text": m.get("content", "")}]
-                    for b64, mime in encoded:
-                        img_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime};base64,{b64}"},
-                        })
-                    payload_messages.append({"role": m["role"], "content": img_content})
+                    encoded_messages.append({
+                        "_role": m["role"],
+                        "_content": m.get("content", ""),
+                        "_encoded": encoded,
+                    })
                     continue
-            payload_messages.append({"role": m["role"], "content": m.get("content", "")})
-
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": payload_messages,
-            "max_completion_tokens": self.llm_cfg.get("max_tokens", 1024),
-        }
-
-        if reasoning:
-            # Reasoning models (o1, o3, o4-mini, gpt-5, …) reject temperature,
-            # top_p, frequency_penalty, and presence_penalty entirely.
-            logger.debug("Reasoning model detected (%s) — omitting sampling params", model)
-        else:
-            payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
-            top_p = self.llm_cfg.get("top_p")
-            if top_p is not None:
-                payload["top_p"] = top_p
+            encoded_messages.append({"_role": m["role"], "_content": m.get("content", ""), "_encoded": None})
 
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
 
-        url = f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.llm_cfg['api_key']}",
-            "Content-Type": "application/json",
-        }
-
         def _do_request():
+            # Re-read active model config on every attempt so that a mid-flight
+            # model switch (set_model) is picked up by subsequent retries.
+            model = self.llm_cfg["model"]
+            reasoning = _is_reasoning_model(model)
+
+            # Rebuild payload_messages each attempt: the system role format depends
+            # on whether the (potentially new) model is a reasoning model.
+            payload_messages = []
+            if system:
+                if reasoning:
+                    # o-series models don't support the "system" role — embed it as
+                    # the first user turn so context is still passed through.
+                    payload_messages.append({
+                        "role": "user",
+                        "content": f"[Instructions]\n{system}",
+                    })
+                else:
+                    payload_messages.append({"role": "system", "content": system})
+            # Encode images for any messages that carry them; build multipart content
+            # for providers that support vision (all 4 providers use the same path here).
+            for em in encoded_messages:
+                if em["_encoded"]:
+                    img_content: list[Any] = [{"type": "text", "text": em["_content"]}]
+                    for b64, mime in em["_encoded"]:
+                        img_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        })
+                    payload_messages.append({"role": em["_role"], "content": img_content})
+                else:
+                    payload_messages.append({"role": em["_role"], "content": em["_content"]})
+
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": payload_messages,
+                "max_completion_tokens": self.llm_cfg.get("max_tokens", 1024),
+            }
+            if reasoning:
+                # Reasoning models (o1, o3, o4-mini, gpt-5, …) reject temperature,
+                # top_p, frequency_penalty, and presence_penalty entirely.
+                logger.debug("Reasoning model detected (%s) — omitting sampling params", model)
+            else:
+                payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
+                top_p = self.llm_cfg.get("top_p")
+                if top_p is not None:
+                    payload["top_p"] = top_p
+            url = f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.llm_cfg['api_key']}",
+                "Content-Type": "application/json",
+            }
             r = self._http.post(url, headers=headers, json=payload)
             r.raise_for_status()
             d = r.json()
@@ -670,7 +686,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=model, caller_tag=self._caller_tag)
+                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
 
     def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         # Convert to Gemini format
@@ -691,29 +707,32 @@ class LLMClient:
                     continue
             contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
 
-        api_key = self.llm_cfg["api_key"]
-        model = self.llm_cfg["model"]
-        google_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        google_headers = {
-            "x-goog-api-key": api_key,
-            "Content-Type": "application/json",
-        }
-        google_payload = {
-            "contents": contents,
-            "generationConfig": {
-                "maxOutputTokens": self.llm_cfg.get("max_tokens", 1024),
-                "temperature": self.llm_cfg.get("temperature", 0.2),
-            },
-        }
-        top_p = self.llm_cfg.get("top_p")
-        if top_p is not None:
-            google_payload["generationConfig"]["topP"] = top_p
+        _initial_model = self.llm_cfg["model"]
 
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
 
         def _do_request():
+            # Re-read active model config on every attempt so that a mid-flight
+            # model switch (set_model) is picked up by subsequent retries.
+            api_key = self.llm_cfg["api_key"]
+            model = self.llm_cfg["model"]
+            google_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            google_headers = {
+                "x-goog-api-key": api_key,
+                "Content-Type": "application/json",
+            }
+            google_payload = {
+                "contents": contents,
+                "generationConfig": {
+                    "maxOutputTokens": self.llm_cfg.get("max_tokens", 1024),
+                    "temperature": self.llm_cfg.get("temperature", 0.2),
+                },
+            }
+            top_p = self.llm_cfg.get("top_p")
+            if top_p is not None:
+                google_payload["generationConfig"]["topP"] = top_p
             r = self._http.post(google_url, headers=google_headers, json=google_payload)
             r.raise_for_status()
             d = r.json()
@@ -747,10 +766,10 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=model, caller_tag=self._caller_tag)
+                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
 
     def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
-        model = self.llm_cfg["model"]
+        _initial_model = self.llm_cfg["model"]
         anthropic_messages: list[dict] = []
         for m in messages:
             imgs = m.get("images")
@@ -766,29 +785,31 @@ class LLMClient:
                     anthropic_messages.append({"role": m["role"], "content": ant_content})
                     continue
             anthropic_messages.append({"role": m["role"], "content": m.get("content", "")})
-        payload: dict[str, Any] = {
-            "model": model,
-            "max_tokens": self.llm_cfg.get("max_tokens", 1024),
-            "messages": anthropic_messages,
-        }
-        if system:
-            payload["system"] = system
-        top_p = self.llm_cfg.get("top_p")
-        if top_p is not None:
-            payload["top_p"] = top_p
-
-        anthropic_url = "https://api.anthropic.com/v1/messages"
-        anthropic_headers = {
-            "x-api-key": self.llm_cfg["api_key"],
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        }
 
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
 
         def _do_request():
+            # Re-read active model config on every attempt so that a mid-flight
+            # model switch (set_model) is picked up by subsequent retries.
+            model = self.llm_cfg["model"]
+            payload: dict[str, Any] = {
+                "model": model,
+                "max_tokens": self.llm_cfg.get("max_tokens", 1024),
+                "messages": anthropic_messages,
+            }
+            if system:
+                payload["system"] = system
+            top_p = self.llm_cfg.get("top_p")
+            if top_p is not None:
+                payload["top_p"] = top_p
+            anthropic_url = "https://api.anthropic.com/v1/messages"
+            anthropic_headers = {
+                "x-api-key": self.llm_cfg["api_key"],
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
             r = self._http.post(anthropic_url, headers=anthropic_headers, json=payload)
             r.raise_for_status()
             d = r.json()
@@ -821,7 +842,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=model, caller_tag=self._caller_tag)
+                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
 
     def _ollama_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         """
@@ -835,13 +856,7 @@ class LLMClient:
         tokens. Reasoning/thinking content wrapped in <think>…</think> tags is
         stripped from the final response before returning.
         """
-        model = self.llm_cfg["model"]
-        client = self._ollama_clients[self._active_idx]
-        if client is None:
-            raise RuntimeError(
-                f"_ollama_chat called but no ollama.Client found for model '{model}' "
-                f"(index {self._active_idx}). This is a bug — check _ollama_clients init."
-            )
+        _initial_model = self.llm_cfg["model"]
 
         # Build message list (Ollama supports the system role natively)
         payload_messages: list[dict] = []
@@ -861,19 +876,34 @@ class LLMClient:
                     continue
             payload_messages.append({"role": m["role"], "content": m.get("content", "")})
 
-        options = {
-            "num_predict": self.llm_cfg.get("max_tokens", 1024),
-            "temperature": self.llm_cfg.get("temperature", 0.2),
-        }
-        top_p = self.llm_cfg.get("top_p")
-        if top_p is not None:
-            options["top_p"] = top_p
-
         def _on_retry(attempt, max_retries, reason):
             if progress_cb:
                 progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
 
         def _do_request():
+            # Re-read active model config and client on every attempt so that a
+            # mid-flight model switch (set_model) is picked up by subsequent retries.
+            model = self.llm_cfg["model"]
+            # If set_model switched to a non-Ollama provider mid-retry, abort
+            # immediately rather than attempting to use a None client.
+            if self.llm_cfg.get("provider") != "ollama":
+                raise LLMPermanentError(
+                    f"Active model switched away from Ollama provider during retry "
+                    f"(now '{self.llm_cfg.get('provider')}' / '{model}'). Aborting."
+                )
+            client = self._ollama_clients[self._active_idx]
+            if client is None:
+                raise RuntimeError(
+                    f"_ollama_chat called but no ollama.Client found for model '{model}' "
+                    f"(index {self._active_idx}). This is a bug — check _ollama_clients init."
+                )
+            options = {
+                "num_predict": self.llm_cfg.get("max_tokens", 1024),
+                "temperature": self.llm_cfg.get("temperature", 0.2),
+            }
+            top_p = self.llm_cfg.get("top_p")
+            if top_p is not None:
+                options["top_p"] = top_p
             try:
                 response = client.chat(
                     model=model,
@@ -931,7 +961,7 @@ class LLMClient:
             return text
 
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=model, caller_tag=self._caller_tag)
+                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
 
     def _diagnose_empty_response(
         self,
