@@ -24,7 +24,7 @@ import sys
 import threading
 from typing import Callable, Optional
 
-from llm_client import LLMClient, LLMCancelledError
+from llm_client import LLMClient, LLMCancelledError, _encode_images
 from memory_store import MemoryStore
 from tool_creator import ToolCreator
 from tool_executor import ToolExecutor
@@ -88,6 +88,7 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   spawn_agent       — spawn an isolated sub-agent in the background; accepts response_format ("text"|"json"|"file"); returns agent_id immediately
   get_agent_result  — wait for a sub-agent to finish and retrieve its typed result; args: agent_id (required), timeout (optional seconds)
   memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string
+  vision_query      — ask the LLM to analyse an image file on disk. Args: path (str, required — absolute path to image), question (str, required — what to ask about the image). Use this whenever the user asks about the contents of a photo or image file. Do NOT use shell to base64-encode or manually analyse images.
 
 SUB-AGENT USAGE:
 Sub-agents run in complete isolation — they have NO access to your memory, conversation
@@ -443,8 +444,11 @@ class AgentController:
                         args = {str(i): v for i, v in enumerate(args)}
                     _progress(f"🔧 Running tool: <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
 
+                    # vision_query is handled directly here (needs LLM access)
+                    if tool_name == "vision_query":
+                        outcome = self._exec_vision_query(args)
                     # Built-in tools take priority
-                    if self.builtin_executor and self.builtin_executor.is_builtin(tool_name):
+                    elif self.builtin_executor and self.builtin_executor.is_builtin(tool_name):
                         outcome = self.builtin_executor.execute(tool_name, args, caller_depth=self._depth, caller_tag=self.label)
 
                         if outcome.get("requires_confirmation"):
@@ -612,6 +616,26 @@ class AgentController:
         # Max iterations reached and user declined to extend
         self.memory.record_event("Agent hit max iterations")
         return "⚠️ Agent reached maximum steps. Operation cancelled."
+
+    def _exec_vision_query(self, args: dict) -> dict:
+        """Execute a vision_query built-in: ask the LLM to analyse a local image file."""
+        path = args.get("path", "")
+        question = args.get("question", "What is in this image?")
+        if not path:
+            return {"success": False, "output": "", "error": "vision_query: 'path' argument is required."}
+        encoded = _encode_images([path])
+        if not encoded:
+            return {
+                "success": False, "output": "",
+                "error": f"vision_query: could not read or encode image at '{path}'. "
+                         "Check that the path is correct and the file exists.",
+            }
+        messages = [{"role": "user", "content": question, "images": [path]}]
+        try:
+            answer = self.llm.chat(messages, system=None)
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "output": "", "error": f"vision_query LLM call failed: {exc}"}
+        return {"success": True, "output": answer, "error": ""}
 
     def cancel(self) -> None:
         """Cancel the currently-running task. Safe to call from any thread."""

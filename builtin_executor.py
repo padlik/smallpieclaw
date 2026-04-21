@@ -194,6 +194,18 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "{\"action\":\"delete\",\"key\":\"old_key\"}."
         ),
     ),
+    "vision_query": BuiltinTool(
+        name="vision_query",
+        description=(
+            "Ask the active LLM to analyse a local image file. "
+            "Use this whenever the user asks about the contents of an image or photo. "
+            "Args: path (str, required — absolute path to the image file on disk), "
+            "question (str, required — what to ask about the image, e.g. 'Who is in this photo?'). "
+            "Returns the LLM's text description/answer. "
+            "Only works with vision-capable models (GPT-4o, Claude 3+, Gemini, LLaVA, etc.). "
+            "Example: {\"path\": \"/home/pi/downloads/photo.jpg\", \"question\": \"What is in this image?\"}"
+        ),
+    ),
 }
 
 
