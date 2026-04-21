@@ -27,6 +27,7 @@ pairing_timeout = 300
 #   request_timeout  — per-request timeout in seconds (default: 120)
 #   max_retries      — retry attempts on timeout/connection errors (default: 5)
 #   retry_delay      — base retry delay in seconds, doubles each attempt (default: 2)
+#   vision           — true if the model accepts image input (informational; shown in /models)
 # ---------------------------------------------------------------------------
 [[models]]
 name            = "default"
@@ -36,6 +37,7 @@ model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
 temperature     = 0.2
+vision          = true   # gpt-4o-mini supports image input
 # top_p         = 0.9  # optional: nucleus sampling (omit to use provider default)
 request_timeout = 120
 max_retries     = 5

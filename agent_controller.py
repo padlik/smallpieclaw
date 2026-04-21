@@ -43,7 +43,16 @@ def _estimate_tokens(text: str) -> int:
 def _estimate_messages_tokens(messages: list[dict], system: str = "") -> int:
     total = _estimate_tokens(system)
     for m in messages:
-        total += _estimate_tokens(m.get("content", ""))
+        content = m.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += _estimate_tokens(part.get("text", ""))
+        else:
+            total += _estimate_tokens(content)
+        # Rough estimate: each attached image ≈ 1000 tokens
+        if m.get("images"):
+            total += 1000 * len(m["images"])
     return total
 
 # ---------------------------------------------------------------------------
@@ -223,10 +232,13 @@ class AgentController:
         self,
         user_goal: str,
         progress_callback: Optional[Callable[[str], None]] = None,
+        images: Optional[list[str]] = None,
     ) -> str:
         """
         Process a user goal and return the final answer string.
         Optionally calls progress_callback(msg) for intermediate updates.
+        Pass images=["/path/to/file.jpg", ...] to include images in the first
+        user message for vision-capable models.
         """
         import time as _time
         _run_start = _time.time()
@@ -280,7 +292,11 @@ class AgentController:
             file_storage=file_storage,
             log_section=log_section,
         )
-        messages: list[dict] = [{"role": "user", "content": user_goal}]
+        first_msg: dict = {"role": "user", "content": user_goal}
+        if images:
+            first_msg["images"] = images
+            logger.info("%s%d image(s) attached to request", _pfx, len(images))
+        messages: list[dict] = [first_msg]
 
         self.memory.record_event(f"User request: {user_goal[:100]}")
 

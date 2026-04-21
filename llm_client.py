@@ -20,9 +20,11 @@ Retry behaviour:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
+import mimetypes
 import re
 import subprocess
 import time
@@ -230,6 +232,31 @@ def _is_reasoning_model(model_name: str) -> bool:
     return bool(_REASONING_MODEL_RE.match(model_name.strip()))
 
 
+def _encode_images(paths: list[str]) -> list[tuple[str, str]]:
+    """
+    Load image files and return [(base64_data, mime_type), ...].
+    Files that cannot be read or are too large (> 20 MB) are skipped with a
+    warning. Telegram photos are typically ≤ 1 MB so the size guard rarely fires.
+    """
+    result = []
+    for path in paths:
+        try:
+            mime, _ = mimetypes.guess_type(path)
+            if not mime or not mime.startswith("image/"):
+                mime = "image/jpeg"  # reasonable default for Telegram photos
+            with open(path, "rb") as fh:
+                data = fh.read()
+            if len(data) > 20 * 1024 * 1024:
+                logger.warning(
+                    "Image too large to encode (%d bytes), skipping: %s", len(data), path
+                )
+                continue
+            result.append((base64.b64encode(data).decode("ascii"), mime))
+        except Exception as exc:
+            logger.warning("Could not encode image %s: %s", path, exc)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # LLM Client
 # ---------------------------------------------------------------------------
@@ -373,12 +400,15 @@ class LLMClient:
         """Return summary of all configured models."""
         result = []
         for i, m in enumerate(self._models):
-            result.append({
+            entry: dict = {
                 "name": m.get("name", f"model_{i}"),
                 "model": m.get("model", "?"),
                 "provider": m.get("provider", "?"),
                 "active": i == self._active_idx,
-            })
+            }
+            if m.get("vision"):
+                entry["vision"] = True
+            result.append(entry)
         return result
 
     def set_model(self, name: str) -> bool:
@@ -522,7 +552,22 @@ class LLMClient:
                 })
             else:
                 payload_messages.append({"role": "system", "content": system})
-        payload_messages.extend(messages)
+        # Encode images for any messages that carry them; build multipart content
+        # for providers that support vision (all 4 providers use the same path here).
+        for m in messages:
+            imgs = m.get("images")
+            if imgs:
+                encoded = _encode_images(imgs)
+                if encoded:
+                    img_content: list[Any] = [{"type": "text", "text": m.get("content", "")}]
+                    for b64, mime in encoded:
+                        img_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        })
+                    payload_messages.append({"role": m["role"], "content": img_content})
+                    continue
+            payload_messages.append({"role": m["role"], "content": m.get("content", "")})
 
         payload: dict[str, Any] = {
             "model": model,
@@ -635,7 +680,16 @@ class LLMClient:
             contents.append({"role": "model", "parts": [{"text": "Understood."}]})
         for m in messages:
             role = "user" if m["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+            imgs = m.get("images")
+            if imgs:
+                encoded = _encode_images(imgs)
+                if encoded:
+                    parts: list[Any] = [{"text": m.get("content", "")}]
+                    for b64, mime in encoded:
+                        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+                    contents.append({"role": role, "parts": parts})
+                    continue
+            contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
 
         api_key = self.llm_cfg["api_key"]
         model = self.llm_cfg["model"]
@@ -697,10 +751,25 @@ class LLMClient:
 
     def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
         model = self.llm_cfg["model"]
+        anthropic_messages: list[dict] = []
+        for m in messages:
+            imgs = m.get("images")
+            if imgs:
+                encoded = _encode_images(imgs)
+                if encoded:
+                    ant_content: list[Any] = [{"type": "text", "text": m.get("content", "")}]
+                    for b64, mime in encoded:
+                        ant_content.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime, "data": b64},
+                        })
+                    anthropic_messages.append({"role": m["role"], "content": ant_content})
+                    continue
+            anthropic_messages.append({"role": m["role"], "content": m.get("content", "")})
         payload: dict[str, Any] = {
             "model": model,
             "max_tokens": self.llm_cfg.get("max_tokens", 1024),
-            "messages": messages,
+            "messages": anthropic_messages,
         }
         if system:
             payload["system"] = system
@@ -778,7 +847,19 @@ class LLMClient:
         payload_messages: list[dict] = []
         if system:
             payload_messages.append({"role": "system", "content": system})
-        payload_messages.extend(messages)
+        for m in messages:
+            imgs = m.get("images")
+            if imgs:
+                encoded = _encode_images(imgs)
+                if encoded:
+                    # Ollama vision: pass base64 strings in the "images" field
+                    payload_messages.append({
+                        "role": m["role"],
+                        "content": m.get("content", ""),
+                        "images": [b64 for b64, _ in encoded],
+                    })
+                    continue
+            payload_messages.append({"role": m["role"], "content": m.get("content", "")})
 
         options = {
             "num_predict": self.llm_cfg.get("max_tokens", 1024),

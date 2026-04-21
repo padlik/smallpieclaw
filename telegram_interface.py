@@ -743,11 +743,22 @@ class TelegramInterface:
             await tg_file.download_to_drive(dest)
             size_kb = os.path.getsize(dest) / 1024
             size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024:.1f} MB"
-            await self._safe_edit(
-                status_msg,
-                f"📥 Saved: <code>{html.escape(dest)}</code> ({size_str})",
-            )
             logger.info("File upload from user %d: %s (%s)", user.id, dest, size_str)
+
+            # If the message is an image (photo or image document) with a caption,
+            # forward the caption + image to the agent instead of just confirming save.
+            caption = (msg.caption or "").strip()
+            is_image = bool(msg.photo) or (
+                msg.document and (msg.document.mime_type or "").startswith("image/")
+            )
+            if caption and is_image:
+                await self._safe_edit(status_msg, f"📥 Saved ({size_str}) — sending to agent…")
+                await self._run_agent_task(update, ctx, caption, images=[dest])
+            else:
+                await self._safe_edit(
+                    status_msg,
+                    f"📥 Saved: <code>{html.escape(dest)}</code> ({size_str})",
+                )
         except Exception as exc:
             logger.exception("File download failed for user %d", user.id)
             await self._safe_edit(status_msg, f"❌ Download failed: {html.escape(str(exc))}")
@@ -766,7 +777,8 @@ class TelegramInterface:
         await self._run_agent_task(update, ctx, text)
 
     async def _run_agent_task(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str,
+        images: Optional[list[str]] = None,
     ) -> None:
         """Run the agent with a given task, showing streaming progress."""
         user = update.effective_user
@@ -830,7 +842,7 @@ class TelegramInterface:
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda: self.agent_handler(user.id, task_text, progress),
+                lambda: self.agent_handler(user.id, task_text, progress, images=images),
             )
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
@@ -1038,8 +1050,9 @@ class TelegramInterface:
         buttons = []
         for m in models:
             icon = "✅" if m["active"] else "⬜"
+            vision_tag = " 👁" if m.get("vision") else ""
             lines.append(
-                f"{icon} <b>{html.escape(m['name'])}</b>: <code>{html.escape(m['model'])}</code>"
+                f"{icon} <b>{html.escape(m['name'])}</b>: <code>{html.escape(m['model'])}</code>{vision_tag}"
             )
             if not m["active"]:
                 buttons.append([InlineKeyboardButton(

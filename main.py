@@ -315,8 +315,8 @@ def _run(
     except Exception as exc:
         logger.warning("Tool index build failed (check embeddings API config): %s", exc)
 
-    def agent_handler(user_id, text, progress_cb):
-        return agent.run(text, progress_callback=progress_cb)
+    def agent_handler(user_id, text, progress_cb, images=None):
+        return agent.run(text, progress_callback=progress_cb, images=images or None)
 
     # Build TelegramInterface first so notify() can reference it
     # (scheduler and tg are wired together via forward references in closures)
