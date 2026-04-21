@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -50,9 +51,16 @@ def _estimate_messages_tokens(messages: list[dict], system: str = "") -> int:
                     total += _estimate_tokens(part.get("text", ""))
         else:
             total += _estimate_tokens(content)
-        # Rough estimate: each attached image ≈ 1000 tokens
-        if m.get("images"):
-            total += 1000 * len(m["images"])
+        # Count only images that will actually be encodable (exist and ≤ 20 MB),
+        # mirroring the skip logic in llm_client._encode_images(). Phantom tokens
+        # from unreadable files would inflate the estimate and trigger premature
+        # context compaction.
+        for img_path in m.get("images") or []:
+            try:
+                if os.path.getsize(img_path) <= 20 * 1024 * 1024:
+                    total += 1000  # rough per-image token cost
+            except OSError:
+                pass  # file missing or unreadable — skip
     return total
 
 # ---------------------------------------------------------------------------
