@@ -21,10 +21,13 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps or cancel
 - **Multi-model LLM** — define multiple models; switch via `/models`
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama (cloud & local); reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
+- **Multimodal vision** — send a photo with a caption and the agent forwards both the image and text to vision-capable models (GPT-4o, Claude, Gemini, LLaVA, etc.)
+- **File uploads** — send any file (document, photo, audio, video, voice) via Telegram to save it to the agent's `downloads/` folder; photos with a caption are automatically routed to the agent
 - **Context compaction** — auto-summarises older messages when the token budget is near the configured limit
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
 - **Agent Skills** — autonomous skill system (per [agentskills.io](https://agentskills.io/specification)) with progressive disclosure; skills listed via `/skills`
 - **File storage guidance** — agent directed to use `/tmp/<agent>` for temporary files and `downloads/` for files the user wants to keep
+- **`/stop` command** — immediately cancels the currently running agent task
 - **Log rotation safe** — uses `WatchedFileHandler`; re-opens log file automatically after `logrotate` without restart
 - **Structured log source tags** — every log line carries a `[source]` or `[source/model]` prefix so concurrent agents, sub-agents, and scheduled jobs are unambiguous in a single log file
 
@@ -124,6 +127,7 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 | `request_timeout` | Per-request timeout in seconds (default: 120) |
 | `max_retries` | Retry attempts on timeout/connection errors (default: 5) |
 | `retry_delay` | Base retry delay in seconds, doubles each attempt (default: 2) |
+| `vision` | Set to `true` for vision-capable models; shown with 👁 badge in `/models` (optional) |
 
 ```toml
 [[models]]
@@ -337,6 +341,70 @@ Memory is shared across all sessions and persisted immediately to disk after eve
 
 ---
 
+## File Uploads
+
+Send any file directly in the Telegram chat to save it to the agent's `downloads/` folder:
+
+| File type | Behaviour |
+|-----------|-----------|
+| **Photo with caption** | File is saved **and** caption + image are forwarded to the agent |
+| **Photo without caption** | File is saved; bot confirms path and size |
+| **Document, audio, video, voice** | File is saved; bot confirms path and size |
+
+Photos with a caption are the primary way to trigger multimodal tasks:
+
+> **Send:** 📷 *(screenshot of an error message)* + caption: *"What does this error mean?"*
+> **Agent:** Reads the screenshot and explains the error.
+
+Files saved this way are accessible by the agent at their full path for subsequent tasks.
+
+---
+
+## Multimodal Vision
+
+For models that support image input (GPT-4o, Claude 3+, Gemini, LLaVA, etc.), the agent can analyse photos you send directly from Telegram.
+
+### How to use
+
+1. **Send a photo with a caption** — the image is saved and the caption becomes the agent's task:
+   - *📷 + "What's in this image?"*
+   - *📷 + "Read the text in this screenshot"*
+   - *📷 + "Is there anything wrong with this network diagram?"*
+
+2. **Reference a saved file** — after uploading any file, you can ask the agent to process it:
+   - *"Analyse the file at /home/pi/downloads/photo_abc123.jpg"*
+
+### Configuration
+
+Mark models as vision-capable in `config.toml` to display the 👁 badge in `/models`:
+
+```toml
+[[models]]
+name    = "vision"
+model   = "gpt-4o"
+vision  = true      # informational — enables 👁 badge in /models
+provider = "openai"
+api_key  = "sk-..."
+base_url = "https://api.openai.com/v1"
+max_tokens = 2048
+temperature = 0.2
+```
+
+The `vision` flag is **informational only** — image encoding is always attempted when images are present. Models without vision support will return an API error which is shown to the user.
+
+### Supported providers
+
+| Provider | Vision support |
+|----------|---------------|
+| OpenAI (`gpt-4o`, `gpt-4o-mini`) | ✅ inline `data:` URL |
+| Anthropic (`claude-3+`) | ✅ base64 source block |
+| Google Gemini | ✅ `inline_data` part |
+| Ollama (LLaVA, llama3.2-vision, etc.) | ✅ `images` field |
+
+Files > 20 MB are skipped with a warning (Telegram photos are typically ≤ 1 MB so this limit is rarely reached).
+
+---
+
 ## File Storage
 
 The agent is instructed to use specific directories for different file types:
@@ -501,13 +569,14 @@ Disable after diagnosing to keep logs clean.
 |---------|-------------|
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
-| `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, and per-model token usage today |
+| `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, scheduler state, system time, and per-model token usage today |
 | `/health` | Run self-health diagnosis, analyze logs, rotate log file |
 | `/tools` | List all built-in and generated tools |
 | `/skills` | List all available agent skills |
-| `/models` | List available LLM models and switch the active one |
+| `/models` | List available LLM models and switch the active one (👁 badge marks vision-capable models) |
 | `/jobs` | List all scheduled jobs with running status; `/jobs reload` to reload scheduler.toml from disk |
 | `/agents` | List all active background sub-agents; `/agents cancel <id>` to stop one |
+| `/stop` | Cancel the currently running agent task |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
 | `/reindex` | Force re-embed all tools in the semantic index |
@@ -532,6 +601,11 @@ Or just send a natural language message:
 - *"show me the CPU temperature"*
 - *"create a tool that lists all open ports"*
 - *"remind me every day at 9am to check the backup logs"*
+
+Or send a **photo with a caption**:
+- 📷 *"What does this error message say?"*
+- 📷 *"Is this network diagram correct?"*
+- 📷 *"Read the text from this screenshot"*
 
 ---
 
@@ -797,10 +871,12 @@ The `log_file` default is always anchored to the directory containing `main.py`,
 ## Requirements
 
 ```
-python-telegram-bot==20.7
-httpx~=0.25.2
+python-telegram-bot>=21.0
+httpx~=0.27
 tomli==2.0.1
 schedule==1.2.1
+croniter>=1.4
+ollama>=0.4.0
 ```
 
 Python 3.9+ required. Python 3.11+ uses the built-in `tomllib` (no `tomli` needed).
