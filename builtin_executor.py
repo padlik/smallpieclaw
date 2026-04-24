@@ -206,6 +206,24 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Example: {\"path\": \"/home/pi/downloads/photo.jpg\", \"question\": \"What is in this image?\"}"
         ),
     ),
+    "file_patch": BuiltinTool(
+        name="file_patch",
+        description=(
+            "Make a surgical search-and-replace edit to a file. "
+            "Prefer this over file_read + file_write when making small targeted changes. "
+            "Args: "
+            "  path       (str, required) — absolute path to the file. "
+            "  old_str    (str, required) — exact text to find in the file; include enough surrounding "
+            "                              context (e.g. the whole line) to be unambiguous. "
+            "  new_str    (str, required) — replacement text (may be empty string to delete old_str). "
+            "  occurrence (int, optional, default 1) — which occurrence to replace (1 = first); "
+            "                                          0 = replace all occurrences. "
+            "Returns an error (no changes made) if old_str is not found or matches more than one "
+            "occurrence when occurrence=1. "
+            "Always requires operator confirmation — confirmation shows a diff-style preview. "
+            "Example: {\"path\": \"/etc/app/config.toml\", \"old_str\": \"port = 8080\", \"new_str\": \"port = 9090\"}"
+        ),
+    ),
 }
 
 
@@ -275,6 +293,8 @@ class BuiltinExecutor:
             return self._exec_get_agent_result(args, caller_tag=caller_tag)
         elif tool_name == "memory_write":
             return self._exec_memory_write(args, caller_tag=caller_tag)
+        elif tool_name == "file_patch":
+            return self._exec_file_patch(args, caller_depth=caller_depth, caller_tag=caller_tag)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -341,6 +361,8 @@ class BuiltinExecutor:
             return self._run_file_read(args, caller_tag=caller_tag)
         elif tool_name == "file_write":
             return self._run_file_write(args, caller_tag=caller_tag)
+        elif tool_name == "file_patch":
+            return self._run_file_patch(args, caller_tag=caller_tag)
         return {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1}
 
     # ---- shell ----
@@ -454,6 +476,108 @@ class BuiltinExecutor:
             with open(path, mode) as f:
                 f.write(content)
             return {"success": True, "output": f"Written {len(content)} chars to {path}.", "error": "", "exit_code": 0}
+        except PermissionError as exc:
+            return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
+        except Exception as exc:
+            return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+    # ---- file_patch ----
+
+    def _exec_file_patch(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+        path = str(args.get("path", "")).strip()
+        old_str = str(args.get("old_str", ""))
+        new_str = str(args.get("new_str", ""))
+        occurrence = int(args.get("occurrence", 1))
+
+        if not path:
+            return {"success": False, "output": "", "error": "file_patch: 'path' is required.", "exit_code": -1}
+        if not old_str:
+            return {"success": False, "output": "", "error": "file_patch: 'old_str' is required.", "exit_code": -1}
+        if not os.path.exists(path):
+            return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
+
+        # Validate the match before staging for confirmation
+        try:
+            with open(path, "r", errors="replace") as fh:
+                content = fh.read()
+        except PermissionError as exc:
+            return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
+        except Exception as exc:
+            return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+        count = content.count(old_str)
+        if count == 0:
+            return {
+                "success": False, "output": "",
+                "error": (
+                    f"file_patch: 'old_str' not found in {path}. "
+                    "Make sure the text matches exactly (including whitespace and indentation). "
+                    "Use file_read to inspect the file if needed."
+                ),
+                "exit_code": 1,
+            }
+        if occurrence == 1 and count > 1:
+            return {
+                "success": False, "output": "",
+                "error": (
+                    f"file_patch: 'old_str' matches {count} occurrences in {path} but occurrence=1 (ambiguous). "
+                    "Include more surrounding context in 'old_str' to make it unique, "
+                    "or set occurrence=0 to replace all."
+                ),
+                "exit_code": 1,
+            }
+
+        # Build a human-readable diff summary for the confirmation prompt
+        old_lines = old_str.splitlines()
+        new_lines = new_str.splitlines()
+        removed = "\n".join(f"  - {ln}" for ln in old_lines[:8])
+        added = "\n".join(f"  + {ln}" for ln in new_lines[:8])
+        if len(old_lines) > 8:
+            removed += f"\n  - … ({len(old_lines) - 8} more lines)"
+        if len(new_lines) > 8:
+            added += f"\n  + … ({len(new_lines) - 8} more lines)"
+        replace_note = f" (replacing all {count} occurrences)" if occurrence == 0 else ""
+        desc = (
+            f"Patch file: <code>{path}</code>{replace_note}\n"
+            f"{removed}\n{added}"
+        )
+
+        sensitive, _ = _is_sensitive_path(path)
+        if sensitive:
+            desc += "\n⚠️ Sensitive file"
+
+        return self._requires_confirmation("file_patch", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
+
+    def _run_file_patch(self, args: dict, caller_tag: str = "") -> dict:
+        path = str(args.get("path", "")).strip()
+        old_str = str(args.get("old_str", ""))
+        new_str = str(args.get("new_str", ""))
+        occurrence = int(args.get("occurrence", 1))
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_patch: %s (occurrence=%d)", _pfx, path, occurrence)
+        try:
+            with open(path, "r", errors="replace") as fh:
+                content = fh.read()
+            if occurrence == 0:
+                patched = content.replace(old_str, new_str)
+                n_replaced = content.count(old_str)
+            else:
+                idx = content.find(old_str)
+                if idx == -1:
+                    return {
+                        "success": False, "output": "",
+                        "error": f"file_patch: 'old_str' not found in {path} at execution time.",
+                        "exit_code": 1,
+                    }
+                patched = content[:idx] + new_str + content[idx + len(old_str):]
+                n_replaced = 1
+            with open(path, "w") as fh:
+                fh.write(patched)
+            return {
+                "success": True,
+                "output": f"Patched {path}: replaced {n_replaced} occurrence(s).",
+                "error": "", "exit_code": 0,
+            }
         except PermissionError as exc:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
         except Exception as exc:
