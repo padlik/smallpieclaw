@@ -487,7 +487,12 @@ class BuiltinExecutor:
         path = str(args.get("path", "")).strip()
         old_str = str(args.get("old_str", ""))
         new_str = str(args.get("new_str", ""))
-        occurrence = int(args.get("occurrence", 1))
+        try:
+            occurrence = int(args.get("occurrence", 1))
+        except (ValueError, TypeError):
+            return {"success": False, "output": "", "error": "file_patch: 'occurrence' must be an integer.", "exit_code": -1}
+        if occurrence < 0:
+            return {"success": False, "output": "", "error": "file_patch: 'occurrence' must be >= 0 (0 = replace all).", "exit_code": -1}
 
         if not path:
             return {"success": False, "output": "", "error": "file_patch: 'path' is required.", "exit_code": -1}
@@ -552,23 +557,40 @@ class BuiltinExecutor:
         path = str(args.get("path", "")).strip()
         old_str = str(args.get("old_str", ""))
         new_str = str(args.get("new_str", ""))
-        occurrence = int(args.get("occurrence", 1))
+        try:
+            occurrence = int(args.get("occurrence", 1))
+        except (ValueError, TypeError):
+            occurrence = 1
         _pfx = f"[{caller_tag}] " if caller_tag else ""
         logger.info("%sBuilt-in file_patch: %s (occurrence=%d)", _pfx, path, occurrence)
         try:
             with open(path, "r", errors="replace") as fh:
                 content = fh.read()
             if occurrence == 0:
-                patched = content.replace(old_str, new_str)
-                n_replaced = content.count(old_str)
-            else:
-                idx = content.find(old_str)
-                if idx == -1:
+                count = content.count(old_str)
+                if count == 0:
                     return {
                         "success": False, "output": "",
                         "error": f"file_patch: 'old_str' not found in {path} at execution time.",
                         "exit_code": 1,
                     }
+                patched = content.replace(old_str, new_str)
+                n_replaced = count
+            else:
+                # Find the Nth occurrence (occurrence >= 1)
+                pos = 0
+                for _ in range(occurrence):
+                    idx = content.find(old_str, pos)
+                    if idx == -1:
+                        return {
+                            "success": False, "output": "",
+                            "error": (
+                                f"file_patch: occurrence {occurrence} of 'old_str' not found in {path} "
+                                "at execution time (file may have changed after validation)."
+                            ),
+                            "exit_code": 1,
+                        }
+                    pos = idx + 1
                 patched = content[:idx] + new_str + content[idx + len(old_str):]
                 n_replaced = 1
             with open(path, "w") as fh:

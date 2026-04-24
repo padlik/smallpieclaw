@@ -634,6 +634,8 @@ class AgentController:
         messages = [{"role": "user", "content": question, "images": [path]}]
         try:
             answer = self.llm.chat(messages, system=None)
+        except LLMCancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "output": "", "error": f"vision_query LLM call failed: {exc}"}
         return {"success": True, "output": answer, "error": ""}
