@@ -132,6 +132,8 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "notify (bool, default true). "
             "model (str, optional — model identifier to use for this job's sub-agent, e.g. 'gpt-4o'). "
             "preserve_context (bool, default false — if true, conversation history is kept between runs). "
+            "max_iterations (int, optional — override the step limit for this job; "
+            "default: scheduled_max_iterations from config, 0 = unlimited). "
             "Always provide a non-empty task when adding any job."
         ),
     ),
@@ -677,6 +679,7 @@ class BuiltinExecutor:
                 model=str(args["model"]) if args.get("model") else None,
                 fallback_models=args.get("fallback_models"),
                 preserve_context=bool(args.get("preserve_context", False)),
+                max_iterations=int(args["max_iterations"]) if args.get("max_iterations") is not None else None,
             )
             if result["success"]:
                 return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}
@@ -780,6 +783,14 @@ class BuiltinExecutor:
         label = job_tag or context_key or "on-demand"
 
         # Build the sub-agent via factory
+        max_iterations = args.get("max_iterations")  # None = use factory default (scheduled_max_iter)
+        if max_iterations is not None:
+            try:
+                max_iterations = int(max_iterations)
+                if max_iterations <= 0:
+                    max_iterations = None  # treat 0/negative as "use default"
+            except (ValueError, TypeError):
+                max_iterations = None
         try:
             runner = self._sub_agent_factory(
                 model=model,
@@ -787,6 +798,7 @@ class BuiltinExecutor:
                 label=label,
                 notify_fn=None,   # factory sets this from main notify_fn
                 fallback_models=fallback_models,
+                max_iterations=max_iterations,
             )
         except ValueError as exc:
             return {"success": False, "output": "", "error": f"spawn_agent: {exc}", "exit_code": -1}

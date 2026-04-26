@@ -122,6 +122,11 @@ diagnose_empty_responses = false
 max_subagents = 6
 # Timeout in seconds for get_agent_result tool when waiting for a sub-agent to finish. Default: 300.
 subagent_result_timeout = 300
+# Max steps for scheduled/background sub-agents (independent of max_iterations for chat sessions).
+# Set to 0 for no limit (capped internally at 500). Default: 100.
+scheduled_max_iterations = 100
+# Warn in chat when a sub-agent has been running longer than this many minutes. 0 = disabled.
+long_run_warn_minutes = 30
 
 [scheduler]
 enabled = true

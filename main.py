@@ -266,6 +266,9 @@ def _run(
     ctx_max_tokens = agent_cfg.get("ctx_max_tokens", 90_000)
     max_subagents = agent_cfg.get("max_subagents", 6)
     subagent_result_timeout = agent_cfg.get("subagent_result_timeout", 300)
+    # Separate step cap for scheduled/background agents (chat sessions use max_iter)
+    _raw_sched_max = agent_cfg.get("scheduled_max_iterations", 100)
+    scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
 
     logger.info("Initialising components...")
 
@@ -341,7 +344,7 @@ def _run(
         )
 
     def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
-                          fallback_models=None):
+                          fallback_models=None, max_iterations=None):
         """Create an isolated SubAgentRunner with the requested model override."""
         # Resolve model config
         if model:
@@ -353,6 +356,9 @@ def _run(
                 )
         else:
             model_cfg = background_model_cfg
+
+        # max_iterations: explicit override > scheduled default (never use chat max_iter here)
+        effective_max_iter = max_iterations if max_iterations is not None else scheduled_max_iter
 
         ctx_max_turns = 50
         pre_loaded_ctx = None
@@ -374,7 +380,7 @@ def _run(
             notify_fn=notify_fn or notify,
             context_key=context_key,
             label=label,
-            max_iterations=max_iter,
+            max_iterations=effective_max_iter,
             top_tools=top_tools,
             ctx_max_tokens=ctx_max_tokens,
             tmp_dir=tmp_dir,

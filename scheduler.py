@@ -95,6 +95,7 @@ class Scheduler:
         builtin_executor=None,
     ):
         sched_cfg = config.get("scheduler", {})
+        agent_cfg = config.get("agent", {})
         self.enabled: bool = sched_cfg.get("enabled", True)
         self.notify = notify_fn
         self.agent = agent_fn
@@ -105,6 +106,10 @@ class Scheduler:
         self._commands_file = os.path.join(data_dir, "scheduler_commands.json")
         self._state_file = os.path.join(data_dir, "scheduler_state.json")
         self._dynamic_jobs_file = os.path.join(data_dir, "scheduled_jobs.json")
+
+        # Long-running agent watcher
+        self._warn_minutes: int = int(agent_cfg.get("long_run_warn_minutes", 30))
+        self._warned_agent_ids: set = set()
 
         self._jobs_meta: dict = {}
         self._run_history: dict = {}  # tag → {last_run, last_error} — persisted forever
@@ -190,6 +195,7 @@ class Scheduler:
         preserve_context: bool = False,
         context_max_messages: int = 50,
         overlap_policy: str = "skip",
+        max_iterations: int = None,
     ) -> dict:
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
         tag = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
@@ -253,6 +259,11 @@ class Scheduler:
             meta["context_max_messages"] = context_max_messages
         if overlap_policy != "skip":
             meta["overlap_policy"] = overlap_policy
+        if max_iterations is not None:
+            try:
+                meta["max_iterations"] = int(max_iterations)
+            except (ValueError, TypeError):
+                pass
 
         self._jobs_meta[tag] = meta
         self._save_state()
@@ -474,6 +485,9 @@ class Scheduler:
             # if absent, omit so sub-agent inherits from parent config
             if "fallback_models" in meta:
                 spawn_args["fallback_models"] = meta["fallback_models"]
+            # max_iterations: per-job override; None = factory uses scheduled_max_iterations
+            if "max_iterations" in meta:
+                spawn_args["max_iterations"] = meta["max_iterations"]
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now
@@ -780,6 +794,8 @@ class Scheduler:
                     lines.append(f'context_max_messages = {ctx_max}\n')
             if meta.get("overlap_policy", "skip") != "skip":
                 lines.append(f'overlap_policy = "{meta["overlap_policy"]}"\n')
+            if meta.get("max_iterations") is not None:
+                lines.append(f'max_iterations = {int(meta["max_iterations"])}\n')
             source = meta.get("source", "config")
             if source != "config":
                 lines.append(f'source = "{source}"\n')
@@ -857,6 +873,12 @@ class Scheduler:
                 "context_max_messages": int(job_cfg.get("context_max_messages", 50)),
                 "overlap_policy": job_cfg.get("overlap_policy", "skip"),
             }
+            # Optional per-job step cap
+            if job_cfg.get("max_iterations") is not None:
+                try:
+                    self._jobs_meta[tag]["max_iterations"] = int(job_cfg["max_iterations"])
+                except (ValueError, TypeError):
+                    pass
 
         logger.info(
             "Loaded %d jobs from %s%s",
@@ -904,4 +926,45 @@ class Scheduler:
                         logger.warning("Could not compute next_run for '%s': %s", tag, exc)
             # Once-jobs handled by schedule library
             schedule.run_pending()
+            if self._warn_minutes > 0:
+                self._check_long_running_agents()
             self._stop_event.wait(timeout=30)
+
+    def _check_long_running_agents(self) -> None:
+        """Warn once in chat when a sub-agent has been running longer than _warn_minutes."""
+        try:
+            from sub_agent_registry import get_registry as _get_reg
+        except Exception:
+            return
+
+        registry = _get_reg()
+        threshold = self._warn_minutes * 60
+        active_ids: set = set()
+
+        for record in registry.list_active():
+            active_ids.add(record.agent_id)
+            if record.elapsed_seconds < threshold:
+                continue
+            if record.agent_id in self._warned_agent_ids:
+                continue
+            self._warned_agent_ids.add(record.agent_id)
+            elapsed = record.elapsed_str()
+            msg = (
+                f"⏱ <b>Sub-agent running for {elapsed}</b>\n"
+                f"Job: <code>{_html.escape(record.label)}</code> | "
+                f"Model: <code>{_html.escape(record.model)}</code>\n"
+                f"Task: {_html.escape(record.task_preview)}…\n"
+                f"Agent ID: <code>{record.agent_id}</code> — use /agents to monitor or cancel"
+            )
+            logger.warning(
+                "Long-running sub-agent detected: id=%s label=%s elapsed=%s",
+                record.agent_id, record.label, elapsed,
+            )
+            try:
+                self.notify(msg)
+            except Exception as exc:
+                logger.warning("_check_long_running_agents: notify failed: %s", exc)
+
+        # Clean up ids for agents that have since finished
+        self._warned_agent_ids &= active_ids
+

@@ -471,7 +471,9 @@ Restart the agent (or wait for the next query) to pick up new tools.
 
 | Parameter | Default | Config key |
 |-----------|---------|------------|
-| Max agent steps | 8 | `agent.max_iterations` |
+| Max agent steps (interactive) | 8 | `agent.max_iterations` |
+| Max agent steps (scheduled/sub-agents) | 100 | `agent.scheduled_max_iterations` |
+| Long-run watcher threshold | 30 min | `agent.long_run_warn_minutes` |
 | Tool timeout | 10 s | `agent.tool_timeout` |
 | Max tool output | 4000 chars | `agent.max_output_size` |
 | Semantic top-K tools | 3 | `agent.top_tools` |
@@ -482,6 +484,10 @@ Restart the agent (or wait for the next query) to pick up new tools.
 When the agent reaches `max_iterations`, inline buttons appear in the chat:
 **⏩ Extend 10 more steps** or **❌ Cancel** (2-minute timeout). This prevents
 silent failures while still giving the operator control over runaway tasks.
+
+Scheduled jobs and sub-agents use `scheduled_max_iterations` (default 100) instead of the
+interactive limit. Set to `0` for no limit (internal safety ceiling: 500). Individual jobs
+can override this with a `max_iterations` field in `scheduler.toml`.
 
 Context compaction fires automatically at 85% of `ctx_max_tokens`. Older messages are summarised by the LLM and replaced with a compact bullet-point summary before the next request.
 
@@ -710,7 +716,26 @@ model = "gpt-4o-mini"           # optional: override model for this job
 preserve_context = true          # optional: persist context between runs (default: false)
 context_max_messages = 50        # optional: cap on saved messages (default: 50)
 overlap_policy = "skip"          # optional: skip|parallel when previous run is still active
+max_iterations = 50              # optional: per-job step cap (overrides scheduled_max_iterations)
 ```
+
+**Step limits** — scheduled jobs use `scheduled_max_iterations` (default 100) to allow
+complex multi-step automation that would be too long for an interactive session. Override
+per-job with `max_iterations` in the TOML or when creating a job from chat.
+
+### Long-running agent watcher
+
+When a sub-agent or scheduled job runs longer than `long_run_warn_minutes` (default 30),
+the operator receives a Telegram notification:
+
+```
+⏱ Sub-agent running for 35m
+Job: disk_check | Model: gpt-4o-mini
+Task: Check disk usage and alert if above 85%...
+Agent ID: sa-abc123 — use /agents to monitor or cancel
+```
+
+Each agent is warned only once. Set `long_run_warn_minutes = 0` to disable the watcher.
 
 When `preserve_context = true`, the sub-agent's conversation history is saved to
 `data/job_contexts/<job_tag>.json` after each run and reloaded on the next. This lets
