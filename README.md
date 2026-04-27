@@ -23,7 +23,7 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama (cloud & local); reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
 - **Multimodal vision** — send a photo with a caption and the agent forwards both the image and text to vision-capable models (GPT-4o, Claude, Gemini, LLaVA, etc.)
 - **File uploads** — send any file (document, photo, audio, video, voice) via Telegram to save it to the agent's `downloads/` folder; photos with a caption are automatically routed to the agent
-- **Context compaction** — auto-summarises older messages when the token budget is near the configured limit
+- **Context compaction** — auto-summarises older messages when the token budget is near the configured limit; `/compress` lets the operator trigger manual compaction at any time
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
 - **Agent Skills** — autonomous skill system (per [agentskills.io](https://agentskills.io/specification)) with progressive disclosure; skills listed via `/skills`
 - **File storage guidance** — agent directed to use `/tmp/<agent>` for temporary files and `downloads/` for files the user wants to keep
@@ -585,6 +585,7 @@ Disable after diagnosing to keep logs clean.
 | `/stop` | Cancel the currently running agent task |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
+| `/compress` | Summarise the current conversation history in place to reduce context size |
 | `/reindex` | Force re-embed all tools in the semantic index |
 | `/pair` | Generate or submit pairing token |
 | `/unpair <id>` | Remove a user from the allowlist |

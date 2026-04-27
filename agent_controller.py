@@ -737,6 +737,61 @@ class AgentController:
             self.short_term.clear()
         return msg
 
+    def compress_context(self) -> str:
+        """Summarise the short-term conversation history in place.
+
+        Uses the LLM to condense all current messages into a single compact
+        summary entry so the next agent run starts with a smaller context.
+        Unlike reset_task(), working memory is not cleared and nothing is
+        discarded — only the short_term ring buffer is replaced.
+
+        Returns a human-readable status string with token estimates.
+        """
+        if not self.short_term:
+            return "ℹ️ No short-term memory available."
+
+        messages = self.short_term.get_messages()
+        if len(messages) < 2:
+            return "ℹ️ Context is already minimal — nothing to compress."
+
+        before_tokens = _estimate_tokens(
+            "\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
+        )
+
+        history_text = "\n".join(
+            f"[{m['role']}]: {m['content'][:600]}" for m in messages
+        )
+        try:
+            summary = self.llm.chat([{
+                "role": "user",
+                "content": (
+                    "Summarize this conversation history as concise bullet points. "
+                    "Preserve key facts, decisions, tool names, outcomes, and any "
+                    "unresolved items. Omit pleasantries and repetition:\n\n"
+                    + history_text
+                ),
+            }])
+        except Exception as exc:
+            logger.error("compress_context: LLM call failed: %s", exc)
+            return f"❌ Compression failed: {exc}"
+
+        self.short_term.clear()
+        self.short_term.add("assistant", f"[Compressed context summary]\n{summary}")
+
+        after_tokens = _estimate_tokens(summary)
+        saved = max(0, before_tokens - after_tokens)
+        pct = int(saved / before_tokens * 100) if before_tokens else 0
+        logger.info(
+            "compress_context: %d → ~%d tokens (%d%% reduction, %d messages → 1)",
+            before_tokens, after_tokens, pct, len(messages),
+        )
+        return (
+            f"✅ Context compressed.\n"
+            f"  Messages: {len(messages)} → 1\n"
+            f"  Tokens: ~{before_tokens:,} → ~{after_tokens:,} "
+            f"(−{saved:,}, {pct}% smaller)"
+        )
+
     # ------------------------------------------------------------------
     # Context compaction
     # ------------------------------------------------------------------

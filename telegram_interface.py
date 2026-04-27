@@ -45,6 +45,7 @@ class TelegramInterface:
         config: dict,
         agent_handler: Callable,
         agent_reset_fn: Optional[Callable] = None,
+        agent_compress_fn: Optional[Callable] = None,
         scheduler=None,
         tool_registry=None,
         llm_client=None,
@@ -60,6 +61,7 @@ class TelegramInterface:
         self.allowed_ids: set[int] = {int(uid) for uid in tg_cfg.get("allowed_user_ids", [])}
         self.agent_handler = agent_handler
         self.agent_reset_fn = agent_reset_fn
+        self.agent_compress_fn = agent_compress_fn
         self.agent = None  # Set by main.py for resume() support
         self.scheduler = scheduler
         self.tool_registry = tool_registry
@@ -122,6 +124,7 @@ class TelegramInterface:
             BotCommand("jobs", "List scheduled jobs"),
             BotCommand("agents", "List and manage active sub-agents"),
             BotCommand("reset", "Save and clear current task context"),
+            BotCommand("compress", "Summarise and compress agent context"),
             BotCommand("reindex", "Re-embed all tools in the semantic index"),
             BotCommand("pair", "Generate or submit pairing token"),
             BotCommand("unpair", "Remove a user from access list"),
@@ -145,6 +148,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("status", self._cmd_status))
         app.add_handler(CommandHandler("health", self._cmd_health))
         app.add_handler(CommandHandler("reset", self._cmd_reset))
+        app.add_handler(CommandHandler("compress", self._cmd_compress))
         app.add_handler(CommandHandler("jobs", self._cmd_jobs))
         app.add_handler(CommandHandler("tools", self._cmd_tools))
         app.add_handler(CommandHandler("skills", self._cmd_skills))
@@ -325,6 +329,20 @@ class TelegramInterface:
             await self._safe_edit(status_msg, result)
         else:
             await self._safe_edit(status_msg, "✅ Context cleared.")
+
+    async def _cmd_compress(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+
+        status_msg = await update.effective_message.reply_text("🗜️ Compressing context…")
+
+        if self.agent_compress_fn:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self.agent_compress_fn)
+            await self._safe_edit(status_msg, result)
+        else:
+            await self._safe_edit(status_msg, "ℹ️ Compress not available.")
 
     async def _cmd_jobs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):

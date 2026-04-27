@@ -407,6 +407,7 @@ def _run(
     tg = TelegramInterface(
         cfg, agent_handler,
         agent_reset_fn=agent.reset_task,
+        agent_compress_fn=agent.compress_context,
         scheduler=scheduler,
         tool_registry=registry,
         llm_client=llm,
