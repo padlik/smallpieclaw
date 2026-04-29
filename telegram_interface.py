@@ -1315,4 +1315,78 @@ def _md_to_html(text: str) -> str:
     for i, block in enumerate(placeholders):
         text = text.replace(f"\x00BLOCK{i}\x00", block)
 
-    return text
+    return _sanitize_html(text)
+
+
+# ---------------------------------------------------------------------------
+# HTML tag balancer
+# ---------------------------------------------------------------------------
+
+# Telegram HTML only recognises these tags; anything else is rejected.
+_TELEGRAM_TAGS = frozenset({"b", "i", "s", "u", "code", "pre", "a"})
+# Self-contained pattern that matches any opening or closing tag we care about.
+_TAG_RE = re.compile(r"<(/?)(\w+)(\s[^>]*)?>", re.DOTALL)
+
+
+def _sanitize_html(text: str) -> str:
+    """Ensure all Telegram-HTML tags are properly balanced.
+
+    Walks *text* character-by-character via a regex tag scanner and:
+    - keeps every opening tag in ``_TELEGRAM_TAGS``, pushing it onto a stack
+    - keeps every closing tag only when it matches the current top of the stack
+      (drops unmatched / misnested close tags instead of forwarding them)
+    - after the full string is consumed, appends synthetic close tags for any
+      tags that were opened but never closed (in reverse order)
+
+    Tags outside ``_TELEGRAM_TAGS`` (e.g. ``<div>``) are passed through
+    unchanged because they were either already HTML-escaped prose that slipped
+    through, or placeholders — altering them would corrupt code blocks.
+
+    Inputs that are already valid pass through with zero mutations.
+
+    Examples::
+
+        >>> _sanitize_html("<b>hello</b>")
+        '<b>hello</b>'
+        >>> _sanitize_html("<b>unclosed")
+        '<b>unclosed</b>'
+        >>> _sanitize_html("foo <b>bar</b> <i>baz")
+        'foo <b>bar</b> <i>baz</i>'
+        >>> _sanitize_html("<b><i>ok</i></b>")
+        '<b><i>ok</i></b>'
+    """
+    stack: list[str] = []
+    result: list[str] = []
+    pos = 0
+
+    for m in _TAG_RE.finditer(text):
+        # Append everything between previous match end and this tag
+        result.append(text[pos:m.start()])
+        pos = m.end()
+
+        is_close = bool(m.group(1))
+        tag = m.group(2).lower()
+        attrs = m.group(3) or ""
+
+        if tag not in _TELEGRAM_TAGS:
+            # Not a Telegram formatting tag — pass through verbatim
+            result.append(m.group(0))
+            continue
+
+        if not is_close:
+            stack.append(tag)
+            result.append(f"<{tag}{attrs}>")
+        else:
+            if stack and stack[-1] == tag:
+                stack.pop()
+                result.append(f"</{tag}>")
+            # else: drop the unmatched / misnested close tag
+
+    # Append any trailing text after the last tag
+    result.append(text[pos:])
+
+    # Close any still-open tags (innermost first)
+    for tag in reversed(stack):
+        result.append(f"</{tag}>")
+
+    return "".join(result)
