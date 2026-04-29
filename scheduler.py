@@ -470,9 +470,6 @@ class Scheduler:
 
         # Prefer spawn_agent via builtin_executor if available
         if self.builtin_executor is not None and hasattr(self.builtin_executor, '_exec_spawn_agent'):
-            # Register finish callback so _running_jobs is cleaned up
-            self.builtin_executor._scheduler_finish_cb = self._mark_job_finished
-
             preserve_ctx = meta.get("preserve_context", False)
             context_key = tag if preserve_ctx else None
 
@@ -488,6 +485,9 @@ class Scheduler:
             # max_iterations: per-job override; None = factory uses scheduled_max_iterations
             if "max_iterations" in meta:
                 spawn_args["max_iterations"] = meta["max_iterations"]
+            # Pass finish callback directly in spawn_args to avoid race when
+            # multiple jobs fire concurrently and overwrite the shared attribute.
+            spawn_args["_finish_cb"] = self._mark_job_finished
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now

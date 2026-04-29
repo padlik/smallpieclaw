@@ -754,12 +754,21 @@ class AgentController:
         if len(messages) < 2:
             return "ℹ️ Context is already minimal — nothing to compress."
 
+        def _msg_text(m: dict) -> str:
+            """Extract plain text from a message, handling multimodal list content."""
+            content = m.get("content", "")
+            if isinstance(content, list):
+                return " ".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
+            return str(content)
+
         before_tokens = _estimate_tokens(
-            "\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
+            "\n".join(f"[{m['role']}]: {_msg_text(m)}" for m in messages)
         )
 
         history_text = "\n".join(
-            f"[{m['role']}]: {m['content'][:600]}" for m in messages
+            f"[{m['role']}]: {_msg_text(m)[:600]}" for m in messages
         )
         try:
             summary = self.llm.chat([{

@@ -781,6 +781,10 @@ class BuiltinExecutor:
         fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
         job_tag = args.get("_job_tag") or None       # set by scheduler; used for finish callback
         label = job_tag or context_key or "on-demand"
+        # Finish callback passed directly from scheduler to avoid shared-attribute race
+        # when multiple jobs fire concurrently.
+        _finish_cb = args.get("_finish_cb") or getattr(self, '_scheduler_finish_cb', None)
+        _finish_tag = job_tag or label
 
         # Build the sub-agent via factory
         max_iterations = args.get("max_iterations")  # None = use factory default (scheduled_max_iter)
@@ -834,12 +838,6 @@ class BuiltinExecutor:
             "%sspawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
             _pfx, runner.agent_id, label, runner._model_id, _fb_log, task[:100],
         )
-
-        # Capture scheduler finish callback now (at spawn time) to avoid race
-        # conditions when multiple jobs are spawned concurrently — each thread
-        # gets its own snapshot of the callback bound to the correct job tag.
-        _finish_cb = getattr(self, '_scheduler_finish_cb', None)
-        _finish_tag = job_tag or label
 
         def _run_and_notify():
             try:
