@@ -414,7 +414,8 @@ class TelegramInterface:
             lines.append(f"   {task_label}: {task_display}\n")
 
         lines.append("<i>Tip: /jobs reload to reload scheduler.toml</i>")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        for chunk in self._split_message("\n".join(lines)):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
     async def _cmd_agents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
@@ -491,7 +492,8 @@ class TelegramInterface:
             "<i>Tip: /agents cancel &lt;id&gt; — cancel specific agent\n"
             "/agents cancel managed — cancel all managed agents</i>"
         )
-        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        for chunk in self._split_message("\n".join(lines)):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
     async def _cmd_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
@@ -526,7 +528,8 @@ class TelegramInterface:
             for t in generated:
                 lines.append(_tool_entry(t))
 
-        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        for chunk in self._split_message("\n".join(lines)):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
     async def _cmd_skills(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
@@ -548,7 +551,8 @@ class TelegramInterface:
             if len(desc) > 80:
                 desc = desc[:77] + "…"
             lines.append(f"  • <b>{html.escape(s.name)}</b> — {desc}")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        for chunk in self._split_message("\n".join(lines)):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
     async def _cmd_reindex(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
