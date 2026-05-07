@@ -1274,34 +1274,43 @@ class TelegramInterface:
         Each chunk is passed through ``_sanitize_html`` to close any HTML tags that
         were opened in the chunk but not yet closed (e.g. ``<b>`` split across a
         chunk boundary), preventing Telegram API "can't parse entities" errors.
+
+        ``_sanitize_html`` can append synthetic close tags after the split point,
+        inflating the chunk length.  To guarantee the final chunk never exceeds
+        ``limit``, we split against ``effective`` = ``limit`` minus the worst-case
+        close-tag overhead (all 8 tracked tags open at once: ~46 chars → 48 buffer).
         """
+        # Maximum extra chars _sanitize_html may append (one </tag> per tracked tag)
+        _MAX_TAG_OVERHEAD = 48
+        effective = limit - _MAX_TAG_OVERHEAD
+
         if len(text) <= limit:
             return [_sanitize_html(text)]
 
         parts = []
-        while len(text) > limit:
-            chunk = text[:limit]
+        while len(text) > effective:
+            chunk = text[:effective]
             # Try to split at a paragraph break
             split_at = chunk.rfind("\n\n")
-            if split_at > limit // 2:
+            if split_at > effective // 2:
                 parts.append(_sanitize_html(text[:split_at].rstrip()))
                 text = text[split_at:].lstrip("\n")
                 continue
             # Try to split at a line break
             split_at = chunk.rfind("\n")
-            if split_at > limit // 2:
+            if split_at > effective // 2:
                 parts.append(_sanitize_html(text[:split_at].rstrip()))
                 text = text[split_at:].lstrip("\n")
                 continue
             # Try to split at a word boundary
             split_at = chunk.rfind(" ")
-            if split_at > limit // 2:
+            if split_at > effective // 2:
                 parts.append(_sanitize_html(text[:split_at].rstrip()))
                 text = text[split_at:].lstrip(" ")
                 continue
             # Hard split — no good boundary found
-            parts.append(_sanitize_html(text[:limit]))
-            text = text[limit:]
+            parts.append(_sanitize_html(text[:effective]))
+            text = text[effective:]
 
         if text:
             parts.append(_sanitize_html(text))
