@@ -1284,7 +1284,7 @@ class TelegramInterface:
         _MAX_TAG_OVERHEAD = 48
         effective = limit - _MAX_TAG_OVERHEAD
 
-        if len(text) <= limit:
+        if len(text) <= effective:
             return [_sanitize_html(text)]
 
         parts = []
