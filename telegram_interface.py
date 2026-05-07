@@ -1341,6 +1341,41 @@ class TelegramInterface:
             except Exception as exc:
                 logger.error("send_message_to_users fallback failed: %s", exc)
 
+    def send_html_to_users(self, html_text: str) -> None:
+        """
+        Send pre-formatted Telegram HTML to all authorised users.
+
+        Unlike ``send_message_to_users``, this method skips Markdown conversion —
+        the caller is responsible for providing valid Telegram HTML.  Use this when
+        the message already contains HTML tags (e.g. ``<blockquote expandable>``).
+        Safe to call from any thread.
+        """
+        if not self._app:
+            logger.warning("send_html_to_users: app not built yet, dropping message")
+            return
+
+        async def _send():
+            bot = self._app.bot
+            delivered = 0
+            for uid in list(self.allowed_ids):
+                try:
+                    for chunk in self._split_message(html_text):
+                        await bot.send_message(chat_id=uid, text=chunk, parse_mode=ParseMode.HTML)
+                    delivered += 1
+                except Exception as exc:
+                    logger.warning("Could not send HTML message to %d: %s", uid, exc)
+            if delivered:
+                logger.info("HTML message delivered to %d user(s) (%d chars)", delivered, len(html_text))
+
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        else:
+            try:
+                asyncio.run(_send())
+            except Exception as exc:
+                logger.error("send_html_to_users fallback failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Markdown → Telegram HTML converter
@@ -1436,7 +1471,7 @@ def _md_to_html(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Telegram HTML only recognises these tags; anything else is rejected.
-_TELEGRAM_TAGS = frozenset({"b", "i", "s", "u", "code", "pre", "a"})
+_TELEGRAM_TAGS = frozenset({"b", "i", "s", "u", "code", "pre", "a", "blockquote"})
 # Self-contained pattern that matches any opening or closing tag we care about.
 _TAG_RE = re.compile(r"<(/?)(\w+)(\s[^>]*)?>", re.DOTALL)
 

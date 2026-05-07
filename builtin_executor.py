@@ -16,6 +16,7 @@ user responds.
 
 from __future__ import annotations
 
+import html as _html_mod
 import logging
 import os
 import re
@@ -247,7 +248,8 @@ class BuiltinExecutor:
 
     def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
                  sub_agent_factory=None, data_dir: str = "data",
-                 memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300):
+                 memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300,
+                 notify_html_fn=None):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -256,6 +258,7 @@ class BuiltinExecutor:
         self._memory = memory  # Optional[MemoryStore] — for memory_write built-in
         self._max_subagents = max_subagents
         self._subagent_result_timeout = subagent_result_timeout
+        self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
 
@@ -840,6 +843,18 @@ class BuiltinExecutor:
         )
 
         def _run_and_notify():
+            # Convenience: use HTML notify if available (results in expandable quote blocks)
+            _notify_html = self._notify_html_fn
+
+            def _send_result_html(header_html: str, body: str) -> None:
+                """Send header as plain bold text + body in an expandable blockquote."""
+                escaped = _html_mod.escape(body)
+                msg = f"{header_html}\n<blockquote expandable>{escaped}</blockquote>"
+                if _notify_html:
+                    _notify_html(msg)
+                else:
+                    runner.notify_fn(msg)
+
             try:
                 result = runner.run(task)
                 # Persist context if requested
@@ -875,13 +890,15 @@ class BuiltinExecutor:
                         "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
                         label, runner.agent_id, runner._model_id, elapsed,
                     )
-                    header = (
-                        f"✅ Sub-agent {runner.agent_id} finished ({elapsed}s)\n"
-                        f"Job: **{label}** | Model: {runner._model_id}\n"
-                        f"Task: {task[:120]}"
+                    header_html = (
+                        f"✅ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
+                        f" finished ({elapsed}s)\n"
+                        f"<b>Job:</b> {_html_mod.escape(label)}"
+                        f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
+                        f"<b>Task:</b> {_html_mod.escape(task[:120])}"
                     )
                     try:
-                        runner.notify_fn(header + "\n\n" + result)
+                        _send_result_html(header_html, result)
                     except Exception as notify_exc:
                         logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
             except Exception as exc:
@@ -893,13 +910,15 @@ class BuiltinExecutor:
                     "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
                     label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
                 )
+                header_html = (
+                    f"❌ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
+                    f" failed ({elapsed}s)\n"
+                    f"<b>Job:</b> {_html_mod.escape(label)}"
+                    f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
+                    f"<b>Task:</b> {_html_mod.escape(task[:120])}"
+                )
                 try:
-                    runner.notify_fn(
-                        f"❌ Sub-agent {runner.agent_id} failed ({elapsed}s)\n"
-                        f"Job: **{label}** | Model: {runner._model_id}\n"
-                        f"Task: {task[:120]}\n"
-                        f"Error: {exc}"
-                    )
+                    _send_result_html(header_html, f"Error: {exc}")
                 except Exception as notify_exc:
                     logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
             finally:

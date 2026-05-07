@@ -335,6 +335,10 @@ def _run(
         if _tg_holder[0] is not None:
             _tg_holder[0].send_message_to_users(msg)
 
+    def notify_html(html_msg):
+        if _tg_holder[0] is not None:
+            _tg_holder[0].send_html_to_users(html_msg)
+
     # Resolve background_model for sub-agents
     background_model_id = agent_cfg.get("background_model") or agent_cfg.get("default_model", "")
     all_models = cfg.get("models", [])
@@ -399,6 +403,7 @@ def _run(
 
     # Wire sub_agent_factory into builtin executor
     builtin._sub_agent_factory = sub_agent_factory
+    builtin._notify_html_fn = notify_html
 
     scheduler = Scheduler(
         cfg, notify_fn=notify,
