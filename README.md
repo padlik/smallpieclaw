@@ -211,7 +211,13 @@ notify = false
 
 For one-time reminders, use `schedule = "once"` with `run_at = "HH:MM"` — auto-removed after execution.
 
-You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `schedule` built-in tool), or use `/jobs` to see all active jobs and next scheduled run times.
+You can also add, pause, or remove jobs from the Telegram chat at runtime — either by asking the agent (it uses the `schedule` built-in tool) or directly via `/jobs` sub-commands:
+
+- `/jobs` — list all jobs with status and next run time
+- `/jobs reload` — hot-reload `scheduler.toml` from disk
+- `/jobs remove <tag>` — permanently remove a job (shows refreshed list)
+- `/jobs pause <tag>` — disable a job without removing it
+- `/jobs resume <tag>` — re-enable a paused job
 
 Scheduler features:
 - **`scheduler.toml` is the single source of truth** — all jobs (including user-added reminders) live in this file; no hardcoded defaults exist in code
@@ -580,7 +586,7 @@ Disable after diagnosing to keep logs clean.
 | `/tools` | List all built-in and generated tools |
 | `/skills` | List all available agent skills |
 | `/models` | List available LLM models and switch the active one (👁 badge marks vision-capable models) |
-| `/jobs` | List all scheduled jobs with running status; `/jobs reload` to reload scheduler.toml from disk |
+| `/jobs` | List all scheduled jobs with running status; sub-commands: `reload`, `remove <tag>`, `pause <tag>`, `resume <tag>` |
 | `/agents` | List all active background sub-agents; `/agents cancel <id>` to stop one |
 | `/stop` | Cancel the currently running agent task |
 | `/reset` | Save current task context to results memory and start fresh |

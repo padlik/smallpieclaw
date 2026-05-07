@@ -344,35 +344,11 @@ class TelegramInterface:
         else:
             await self._safe_edit(status_msg, "ℹ️ Compress not available.")
 
-    async def _cmd_jobs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_authorized(update.effective_user.id):
-            await self._send_unauthorized(update)
-            return
-        if not self.scheduler:
-            await update.effective_message.reply_text("Scheduler not available.")
-            return
-
-        # /jobs reload — hot-reload scheduler.toml from disk
-        args = ctx.args or []
-        if args and args[0].lower() == "reload":
-            result = self.scheduler.reload()
-            await update.effective_message.reply_text(
-                f"🔄 Scheduler reloaded.\n"
-                f"  ✅ Active jobs: <b>{result['reloaded']}</b>\n"
-                f"  ❌ Failed: <b>{result['failed']}</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        jobs = self.scheduler.list_jobs()
+    @staticmethod
+    def _format_jobs_list(jobs: list) -> str:
+        """Render a list of job dicts (from scheduler.list_jobs()) as HTML."""
         if not jobs:
-            await update.effective_message.reply_text(
-                "No scheduled jobs configured.\n"
-                "<i>Tip: use /jobs reload to reload scheduler.toml</i>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
+            return "No scheduled jobs configured."
         lines = [f"📅 <b>Scheduled Jobs</b> ({len(jobs)} total)\n"]
         for job in jobs:
             is_running = job.get("is_running", False)
@@ -412,9 +388,85 @@ class TelegramInterface:
             if job.get("last_error"):
                 lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
             lines.append(f"   {task_label}: {task_display}\n")
+        lines.append(
+            "<i>Tip: /jobs reload · /jobs remove &lt;tag&gt; · /jobs pause &lt;tag&gt; · /jobs resume &lt;tag&gt;</i>"
+        )
+        return "\n".join(lines)
 
-        lines.append("<i>Tip: /jobs reload to reload scheduler.toml</i>")
-        for chunk in self._split_message("\n".join(lines)):
+    async def _cmd_jobs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if not self.scheduler:
+            await update.effective_message.reply_text("Scheduler not available.")
+            return
+
+        args = ctx.args or []
+        sub = args[0].lower() if args else ""
+        tag = args[1] if len(args) > 1 else ""
+
+        # /jobs reload — hot-reload scheduler.toml from disk
+        if sub == "reload":
+            result = self.scheduler.reload()
+            await update.effective_message.reply_text(
+                f"🔄 Scheduler reloaded.\n"
+                f"  ✅ Active jobs: <b>{result['reloaded']}</b>\n"
+                f"  ❌ Failed: <b>{result['failed']}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # /jobs remove <tag>
+        if sub == "remove":
+            if not tag:
+                await update.effective_message.reply_text(
+                    "Usage: <code>/jobs remove &lt;tag&gt;</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            ok = self.scheduler.remove_job(tag)
+            status = f"🗑 Job <code>{html.escape(tag)}</code> removed." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
+            await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
+            jobs = self.scheduler.list_jobs()
+            for chunk in self._split_message(self._format_jobs_list(jobs)):
+                await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+            return
+
+        # /jobs pause <tag>
+        if sub == "pause":
+            if not tag:
+                await update.effective_message.reply_text(
+                    "Usage: <code>/jobs pause &lt;tag&gt;</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            ok = self.scheduler.pause_job(tag)
+            status = f"⏸ Job <code>{html.escape(tag)}</code> paused." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
+            await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
+            jobs = self.scheduler.list_jobs()
+            for chunk in self._split_message(self._format_jobs_list(jobs)):
+                await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+            return
+
+        # /jobs resume <tag>
+        if sub == "resume":
+            if not tag:
+                await update.effective_message.reply_text(
+                    "Usage: <code>/jobs resume &lt;tag&gt;</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            ok = self.scheduler.resume_job(tag)
+            status = f"▶️ Job <code>{html.escape(tag)}</code> resumed." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
+            await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
+            jobs = self.scheduler.list_jobs()
+            for chunk in self._split_message(self._format_jobs_list(jobs)):
+                await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+            return
+
+        # Default: list all jobs
+        jobs = self.scheduler.list_jobs()
+        for chunk in self._split_message(self._format_jobs_list(jobs)):
             await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
     async def _cmd_agents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
