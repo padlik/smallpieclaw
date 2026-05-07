@@ -85,17 +85,27 @@ class MemoryStore:
             self._save_with_retry()
 
     def purge_matching(self, *substrings: str) -> int:
-        """Delete all keys whose names contain any of the given substrings (case-insensitive).
+        """Delete keys whose names contain any substring as a whole segment
+        (delimited by underscores, hyphens, or string boundaries; plural 's' allowed).
 
-        Returns the number of keys deleted. Useful at startup to remove stale facts
-        that are authoritatively provided by the system prompt (e.g. model config).
+        Examples: ``purge_matching("model")`` matches ``available_models``,
+        ``active_model``, ``llm_model_config`` but NOT ``remodel_schedule``
+        (the 're' prefix is not a delimiter).
+
         Internal keys starting with '_' are never purged.
+        Returns the number of keys deleted.
         """
-        substrings_lower = [s.lower() for s in substrings]
+        import re
+        pattern = re.compile(
+            r"(?:(?<![a-zA-Z])|^)("
+            + "|".join(re.escape(s) for s in substrings)
+            + r")s?(?:[^a-zA-Z]|$)",
+            re.IGNORECASE,
+        )
         with self._lock:
             to_delete = [
                 k for k in self._data
-                if not k.startswith("_") and any(sub in k.lower() for sub in substrings_lower)
+                if not k.startswith("_") and pattern.search(k)
             ]
             for k in to_delete:
                 del self._data[k]

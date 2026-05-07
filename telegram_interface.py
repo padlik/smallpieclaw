@@ -1270,9 +1270,13 @@ class TelegramInterface:
         Split text into chunks of at most `limit` characters.
         Tries to split at paragraph boundaries (\\n\\n), then line boundaries (\\n),
         then word boundaries, to avoid cutting mid-sentence or mid-HTML-tag.
+
+        Each chunk is passed through ``_sanitize_html`` to close any HTML tags that
+        were opened in the chunk but not yet closed (e.g. ``<b>`` split across a
+        chunk boundary), preventing Telegram API "can't parse entities" errors.
         """
         if len(text) <= limit:
-            return [text]
+            return [_sanitize_html(text)]
 
         parts = []
         while len(text) > limit:
@@ -1280,27 +1284,27 @@ class TelegramInterface:
             # Try to split at a paragraph break
             split_at = chunk.rfind("\n\n")
             if split_at > limit // 2:
-                parts.append(text[:split_at].rstrip())
+                parts.append(_sanitize_html(text[:split_at].rstrip()))
                 text = text[split_at:].lstrip("\n")
                 continue
             # Try to split at a line break
             split_at = chunk.rfind("\n")
             if split_at > limit // 2:
-                parts.append(text[:split_at].rstrip())
+                parts.append(_sanitize_html(text[:split_at].rstrip()))
                 text = text[split_at:].lstrip("\n")
                 continue
             # Try to split at a word boundary
             split_at = chunk.rfind(" ")
             if split_at > limit // 2:
-                parts.append(text[:split_at].rstrip())
+                parts.append(_sanitize_html(text[:split_at].rstrip()))
                 text = text[split_at:].lstrip(" ")
                 continue
             # Hard split — no good boundary found
-            parts.append(text[:limit])
+            parts.append(_sanitize_html(text[:limit]))
             text = text[limit:]
 
         if text:
-            parts.append(text)
+            parts.append(_sanitize_html(text))
         return parts
 
     def send_message_to_users(self, text: str) -> None:
