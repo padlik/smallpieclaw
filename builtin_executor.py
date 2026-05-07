@@ -788,6 +788,9 @@ class BuiltinExecutor:
         # when multiple jobs fire concurrently.
         _finish_cb = args.get("_finish_cb") or getattr(self, '_scheduler_finish_cb', None)
         _finish_tag = job_tag or label
+        # Scheduled jobs set expandable=False so results are shown as plain text,
+        # not collapsed inside an expandable blockquote.
+        _expandable = args.get("expandable", True)
 
         # Build the sub-agent via factory
         max_iterations = args.get("max_iterations")  # None = use factory default (scheduled_max_iter)
@@ -847,9 +850,12 @@ class BuiltinExecutor:
             _notify_html = self._notify_html_fn
 
             def _send_result_html(header_html: str, body: str) -> None:
-                """Send header as plain bold text + body in an expandable blockquote."""
+                """Send header + body, optionally wrapped in an expandable blockquote."""
                 escaped = _html_mod.escape(body)
-                msg = f"{header_html}\n<blockquote expandable>{escaped}</blockquote>"
+                if _expandable:
+                    msg = f"{header_html}\n<blockquote expandable>{escaped}</blockquote>"
+                else:
+                    msg = f"{header_html}\n\n{escaped}"
                 if _notify_html:
                     _notify_html(msg)
                 else:

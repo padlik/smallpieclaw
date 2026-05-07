@@ -488,6 +488,9 @@ class Scheduler:
             # Pass finish callback directly in spawn_args to avoid race when
             # multiple jobs fire concurrently and overwrite the shared attribute.
             spawn_args["_finish_cb"] = self._mark_job_finished
+            # Scheduled job results should be shown as plain text, not in a
+            # collapsed expandable blockquote (which hides the result by default).
+            spawn_args["expandable"] = False
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now
