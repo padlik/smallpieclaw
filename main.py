@@ -274,6 +274,12 @@ def _run(
 
     llm      = LLMClient(cfg, usage_registry=get_token_registry(), caller_tag="main")
     memory   = MemoryStore(memory_path)
+    # Purge any model/provider facts the agent may have written in past sessions.
+    # These are always stale — authoritative model info lives in config.toml and is
+    # injected fresh into every system prompt via _format_models().
+    _purged = memory.purge_matching("model", "provider", "api_key", "available_llm", "active_llm")
+    if _purged:
+        logger.info("Startup: purged %d stale model/provider key(s) from memory store", _purged)
     registry = ToolRegistry(tools_dirs=[tools_dir, gen_tools_dir])
     builtin  = BuiltinExecutor(
         default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,

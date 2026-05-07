@@ -84,6 +84,25 @@ class MemoryStore:
             self._data.update(updates)
             self._save_with_retry()
 
+    def purge_matching(self, *substrings: str) -> int:
+        """Delete all keys whose names contain any of the given substrings (case-insensitive).
+
+        Returns the number of keys deleted. Useful at startup to remove stale facts
+        that are authoritatively provided by the system prompt (e.g. model config).
+        Internal keys starting with '_' are never purged.
+        """
+        substrings_lower = [s.lower() for s in substrings]
+        with self._lock:
+            to_delete = [
+                k for k in self._data
+                if not k.startswith("_") and any(sub in k.lower() for sub in substrings_lower)
+            ]
+            for k in to_delete:
+                del self._data[k]
+            if to_delete:
+                self._save_with_retry()
+        return len(to_delete)
+
     def as_prompt_text(self) -> str:
         """Format memory as a short text block suitable for LLM context."""
         with self._lock:

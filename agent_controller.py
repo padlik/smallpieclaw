@@ -71,8 +71,12 @@ _SYSTEM_PROMPT = """
 You are a home-server management agent running on a Raspberry Pi.
 You help the user control and query their home server via Telegram.
 
+{models_section}
 PERSISTENT MEMORY (facts about this system):
 {memory}
+
+NOTE: Never store model names, providers, or API configuration in persistent memory — that
+information is always injected fresh above and any memory entry about it will be stale.
 
 RECENT CONVERSATION:
 {short_term}
@@ -87,7 +91,7 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   schedule          — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
   spawn_agent       — spawn an isolated sub-agent in the background; accepts response_format ("text"|"json"|"file"); returns agent_id immediately
   get_agent_result  — wait for a sub-agent to finish and retrieve its typed result; args: agent_id (required), timeout (optional seconds)
-  memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string
+  memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string; do NOT store model or provider configuration here
   vision_query      — ask the LLM to analyse an image file on disk. Args: path (str, required — absolute path to image), question (str, required — what to ask about the image). Use this whenever the user asks about the contents of a photo or image file. Do NOT use shell to base64-encode or manually analyse images.
   file_patch        — make a surgical search-and-replace edit to a file. Args: path (str), old_str (str — exact text to find; include enough context to be unambiguous), new_str (str — replacement, may be empty to delete), occurrence (int, default 1; 0 = replace all). Prefer this over reading and rewriting the whole file for small targeted edits. Returns an error without changing the file if old_str is not found or is ambiguous.
 
@@ -114,7 +118,7 @@ Write every task as a fully standalone brief using this template:
 AVAILABLE TOOLS:
 {tools}
 
-{skills_section}{models_section}FILE STORAGE:
+{skills_section}FILE STORAGE:
 {file_storage}
 
 AGENT LOG:
