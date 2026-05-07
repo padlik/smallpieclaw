@@ -75,6 +75,9 @@ class TelegramInterface:
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
 
+        # Verbose mode: send each agent action as a new message instead of editing
+        self._verbose: bool = False
+
         self._app: Optional[Application] = None
         # Saved when run() starts — used by send_message_to_users() from threads
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -125,6 +128,7 @@ class TelegramInterface:
             BotCommand("agents", "List and manage active sub-agents"),
             BotCommand("reset", "Save and clear current task context"),
             BotCommand("compress", "Summarise and compress agent context"),
+            BotCommand("verbose", "Toggle live tool-call progress messages"),
             BotCommand("reindex", "Re-embed all tools in the semantic index"),
             BotCommand("pair", "Generate or submit pairing token"),
             BotCommand("unpair", "Remove a user from access list"),
@@ -149,6 +153,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("health", self._cmd_health))
         app.add_handler(CommandHandler("reset", self._cmd_reset))
         app.add_handler(CommandHandler("compress", self._cmd_compress))
+        app.add_handler(CommandHandler("verbose", self._cmd_verbose))
         app.add_handler(CommandHandler("jobs", self._cmd_jobs))
         app.add_handler(CommandHandler("tools", self._cmd_tools))
         app.add_handler(CommandHandler("skills", self._cmd_skills))
@@ -392,6 +397,34 @@ class TelegramInterface:
             "<i>Tip: /jobs reload · /jobs remove &lt;tag&gt; · /jobs pause &lt;tag&gt; · /jobs resume &lt;tag&gt;</i>"
         )
         return "\n".join(lines)
+
+    async def _cmd_verbose(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        args = ctx.args or []
+        if args:
+            sub = args[0].lower()
+            if sub == "on":
+                self._verbose = True
+            elif sub == "off":
+                self._verbose = False
+            else:
+                await update.effective_message.reply_text(
+                    "Usage: <code>/verbose on</code> or <code>/verbose off</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+        else:
+            self._verbose = not self._verbose  # toggle
+        if self._verbose:
+            text = (
+                "🔊 <b>Verbose mode on</b>\n"
+                "<i>Each tool call and result will be sent as a separate message during task execution.</i>"
+            )
+        else:
+            text = "🔇 <b>Verbose mode off</b>\n<i>Progress updates will edit a single status message.</i>"
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async def _cmd_jobs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update.effective_user.id):
@@ -908,10 +941,16 @@ class TelegramInterface:
                         loop,
                     )
                 return
-            asyncio.run_coroutine_threadsafe(
-                self._safe_edit(status_msg, msg),
-                loop,
-            )
+            if self._verbose and any(msg.startswith(p) for p in _VERBOSE_EVENT_PREFIXES):
+                asyncio.run_coroutine_threadsafe(
+                    self._send_verbose_event(ctx.bot, chat_id, msg),
+                    loop,
+                )
+            else:
+                asyncio.run_coroutine_threadsafe(
+                    self._safe_edit(status_msg, msg),
+                    loop,
+                )
 
         try:
             result = await loop.run_in_executor(
@@ -926,6 +965,20 @@ class TelegramInterface:
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
+
+    async def _send_verbose_event(self, bot, chat_id: int, text: str) -> None:
+        """Send a verbose progress event as a new top-level message (not a reply)."""
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=_md_to_html(text)[:4096],
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text[:4096])
+            except Exception:
+                pass
 
     async def _send_file_to_chat(self, message, file_path: str, caption: str) -> None:
         """Send a local file or photo to the chat (called from the progress callback)."""
@@ -1382,6 +1435,10 @@ def _md_to_html(text: str) -> str:
 _TELEGRAM_TAGS = frozenset({"b", "i", "s", "u", "code", "pre", "a"})
 # Self-contained pattern that matches any opening or closing tag we care about.
 _TAG_RE = re.compile(r"<(/?)(\w+)(\s[^>]*)?>", re.DOTALL)
+
+# Progress message prefixes that represent agent "actions" (tool calls, results,
+# errors, model switches) — shown as new messages in verbose mode.
+_VERBOSE_EVENT_PREFIXES = ("🔧", "✅ C", "❌", "🛠️", "⚡", "⚠️ ")
 
 
 def _sanitize_html(text: str) -> str:

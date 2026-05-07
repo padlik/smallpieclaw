@@ -592,6 +592,7 @@ Disable after diagnosing to keep logs clean.
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
 | `/compress` | Summarise the current conversation history in place to reduce context size |
+| `/verbose` | Toggle live tool-call progress messages; `/verbose on` or `/verbose off` to set explicitly |
 | `/reindex` | Force re-embed all tools in the semantic index |
 | `/pair` | Generate or submit pairing token |
 | `/unpair <id>` | Remove a user from the allowlist |
