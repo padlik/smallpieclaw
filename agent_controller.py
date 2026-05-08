@@ -78,9 +78,6 @@ PERSISTENT MEMORY (facts about this system):
 NOTE: Never store model names, providers, or API configuration in persistent memory — that
 information is always injected fresh above and any memory entry about it will be stale.
 
-RECENT CONVERSATION:
-{short_term}
-
 RELEVANT PAST RESULTS:
 {past_results}
 
@@ -281,7 +278,6 @@ class AgentController:
         relevant_tools = self.tool_index.search(user_goal, top_k=self.top_tools)
         tools_text = self._format_tools(relevant_tools)
         memory_text = self.memory.as_prompt_text()
-        short_term_text = self.short_term.as_prompt_text() if self.short_term else "No recent conversation."
         past_results_text = self.results.as_prompt_text(user_goal, top_k=2) if self.results else "No past results."
         skills_section = self._format_skills()
         models_section = self._format_models()
@@ -298,7 +294,6 @@ class AgentController:
 
         system = _SYSTEM_PROMPT.format(
             memory=memory_text,
-            short_term=short_term_text,
             past_results=past_results_text,
             tools=tools_text,
             skills_section=skills_section,
@@ -310,7 +305,13 @@ class AgentController:
         if images:
             first_msg["images"] = images
             logger.info("%s%d image(s) attached to request", _pfx, len(images))
-        messages: list[dict] = [first_msg]
+
+        # Prepend recent conversation history as actual messages so the LLM maintains
+        # context across turns — the correct way to provide multi-turn context to LLMs.
+        messages: list[dict] = []
+        if self.short_term:
+            messages.extend(self.short_term.get_messages())
+        messages.append(first_msg)
 
         self.memory.record_event(f"User request: {user_goal[:100]}")
 
@@ -692,7 +693,6 @@ class AgentController:
         relevant_tools = self.tool_index.search(user_goal, top_k=self.top_tools)
         tools_text = self._format_tools(relevant_tools)
         memory_text = self.memory.as_prompt_text()
-        short_term_text = self.short_term.as_prompt_text() if self.short_term else "No recent conversation."
         past_results_text = self.results.as_prompt_text(user_goal, top_k=2) if self.results else "No past results."
         skills_section = self._format_skills()
         models_section = self._format_models()
@@ -702,7 +702,6 @@ class AgentController:
         )
         prompt = _SYSTEM_PROMPT.format(
             memory=memory_text,
-            short_term=short_term_text,
             past_results=past_results_text,
             tools=tools_text,
             skills_section=skills_section,
