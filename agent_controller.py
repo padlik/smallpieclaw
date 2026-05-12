@@ -420,6 +420,13 @@ class AgentController:
 
                 if action == "finish":
                     result = action_obj.get("result", "Done.")
+                    # Guard: LLMs sometimes return a dict/list as the result field.
+                    # dict[:80] raises "unhashable type: 'slice'" — coerce to string.
+                    if not isinstance(result, str):
+                        if isinstance(result, (dict, list)):
+                            result = json.dumps(result, ensure_ascii=False)
+                        else:
+                            result = str(result) if result else "Done."
                     _elapsed = _time.time() - _run_start
                     _active_model = self.llm.llm_cfg.get("model", "?")
                     logger.info("%sfinish | model: %s | steps: %d | elapsed: %.1fs", _pfx, _active_model, step, _elapsed)
