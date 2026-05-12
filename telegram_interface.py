@@ -906,9 +906,13 @@ class TelegramInterface:
 
         def progress(msg: str):
             if msg.startswith("__CONFIRM__:"):
-                _, token, description = msg.split(":", 2)
+                # Format: __CONFIRM__:{token}:{tool_name}:{description}
+                parts = msg.split(":", 3)
+                token = parts[1]
+                tool_name = parts[2] if len(parts) > 2 else ""
+                description = parts[3] if len(parts) > 3 else tool_name
                 asyncio.run_coroutine_threadsafe(
-                    self._send_confirmation_prompt(update.effective_message, token, description),
+                    self._send_confirmation_prompt(update.effective_message, token, tool_name, description),
                     loop,
                 )
                 return
@@ -1006,11 +1010,14 @@ class TelegramInterface:
                 parse_mode=ParseMode.HTML,
             )
 
-    async def _send_confirmation_prompt(self, message, token: str, description: str) -> None:
+    async def _send_confirmation_prompt(self, message, token: str, tool_name: str, description: str) -> None:
         """Send an inline-button confirmation prompt for a dangerous operation."""
+        approve_all_label = f"✅✅ Approve all {tool_name}" if tool_name else "✅✅ Approve all"
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Yes, execute", callback_data=f"confirm_yes:{token}"),
-            InlineKeyboardButton("❌ No, cancel",  callback_data=f"confirm_no:{token}"),
+            InlineKeyboardButton("❌ No, cancel",   callback_data=f"confirm_no:{token}"),
+        ], [
+            InlineKeyboardButton(approve_all_label, callback_data=f"confirm_all:{token}:{tool_name}"),
         ]])
         await message.reply_text(
             f"⚠️ <b>Confirmation required</b>\n\n{_md_to_html(description)}",
@@ -1019,9 +1026,34 @@ class TelegramInterface:
         )
 
     async def _cb_confirm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle Yes/No confirmation button presses."""
+        """Handle Yes / No / Approve-all confirmation button presses."""
         query = update.callback_query
-        data = query.data  # "confirm_yes:<token>" or "confirm_no:<token>"
+        data = query.data  # "confirm_yes:<token>" | "confirm_no:<token>" | "confirm_all:<token>:<tool>"
+
+        if data.startswith("confirm_all:"):
+            # Format: confirm_all:{token}:{tool_name}
+            parts = data.split(":", 2)
+            token = parts[1]
+            tool_name = parts[2] if len(parts) > 2 else ""
+            logger.info("Approve-all callback: tool=%s token=%s", tool_name, token[:8])
+            if self.agent:
+                self.agent.resume_approve_all(token, tool_name)
+            else:
+                logger.warning("_cb_confirm: self.agent is None — cannot resume agent")
+            try:
+                await query.answer()
+            except Exception as exc:
+                logger.warning("query.answer() failed: %s", exc)
+            result_text = f"✅✅ All future <code>{html.escape(tool_name)}</code> operations in this task auto-approved."
+            try:
+                await query.edit_message_text(
+                    f"⚠️ <b>Confirmation</b>\n\n{result_text}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc:
+                logger.debug("Could not edit confirmation message: %s", exc)
+            return
+
         confirmed = data.startswith("confirm_yes:")
         token = data.split(":", 1)[1]
 
@@ -1054,23 +1086,36 @@ class TelegramInterface:
         """Send inline buttons asking whether to extend the agent step limit."""
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("⏩ Extend 10 more steps", callback_data=f"extend_yes:{token}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"extend_no:{token}"),
+            InlineKeyboardButton("♾️ Run until done",       callback_data=f"extend_unlimited:{token}"),
+            InlineKeyboardButton("❌ Cancel",               callback_data=f"extend_no:{token}"),
         ]])
         await message.reply_text(
             f"⏱ <b>Max steps reached</b> ({current_steps} steps)\n\n"
-            "The agent hasn't finished yet. Extend by 10 more steps?",
+            "The agent hasn't finished yet. Extend by 10 more steps, run until done, or cancel?",
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
 
     async def _cb_extend(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle Extend / Cancel button presses for max-steps extension."""
+        """Handle Extend / Unlimited / Cancel button presses for max-steps extension."""
         query = update.callback_query
-        confirmed = query.data.startswith("extend_yes:")
-        token = query.data.split(":", 1)[1]
+        data = query.data  # "extend_yes:<token>" | "extend_unlimited:<token>" | "extend_no:<token>"
+
+        if data.startswith("extend_unlimited:"):
+            token = data.split(":", 1)[1]
+            response = "unlimited"
+            result_text = "♾️ Running until done…"
+        elif data.startswith("extend_yes:"):
+            token = data.split(":", 1)[1]
+            response = "yes"
+            result_text = "⏩ Extending…"
+        else:
+            token = data.split(":", 1)[1]
+            response = "no"
+            result_text = "❌ Cancelled."
 
         if self.agent:
-            self.agent.resume_extend(token, confirmed)
+            self.agent.resume_extend(token, response)
         else:
             logger.warning("_cb_extend: agent is None")
 
@@ -1079,7 +1124,6 @@ class TelegramInterface:
         except Exception as exc:
             logger.warning("query.answer() failed: %s", exc)
 
-        result_text = "⏩ Extending…" if confirmed else "❌ Cancelled."
         try:
             await query.edit_message_text(
                 f"⏱ <b>Max steps</b>\n\n{result_text}",

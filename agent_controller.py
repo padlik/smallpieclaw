@@ -226,9 +226,13 @@ class AgentController:
         self._confirm_events: dict[str, threading.Event] = {}
         self._confirm_results: dict[str, bool] = {}
 
-        # Max-steps extension state
+        # Tools approved for the lifetime of this task (no further confirmation needed).
+        # Populated via resume_approve_all(); cleared in reset_task().
+        self._auto_approve_tools: set[str] = set()
+
+        # Max-steps extension state; values: "yes" | "no" | "unlimited"
         self._extend_events: dict[str, threading.Event] = {}
-        self._extend_results: dict[str, bool] = {}
+        self._extend_results: dict[str, str] = {}
 
         # Tool-creation confirmation state
         self._tool_create_events: dict[str, threading.Event] = {}
@@ -467,33 +471,43 @@ class AgentController:
                         if outcome.get("requires_confirmation"):
                             token = outcome["token"]
                             description = outcome.get("description", tool_name)
-                            # Set up blocking event
-                            event = threading.Event()
-                            self._confirm_events[token] = event
-                            self._confirm_results[token] = False
-                            # Signal the UI to show confirmation buttons
-                            _progress(f"{_CONFIRM_PREFIX}:{token}:{description}")
-                            # Block until user responds (timeout 5 min)
-                            event.wait(timeout=300)
-                            # Always read the actual result — handles the race where
-                            # resume() fires between timeout-return and this pop.
-                            result_confirmed = self._confirm_results.pop(token, False)
-                            self._confirm_events.pop(token, None)
 
-                            if result_confirmed:
+                            # Auto-approve if the operator already approved this tool type.
+                            if tool_name in self._auto_approve_tools:
+                                logger.info(
+                                    "%sAuto-approving '%s' (operator approved all %s)",
+                                    _pfx, tool_name, tool_name,
+                                )
                                 outcome = self.builtin_executor.confirm(token)
-                                _progress(f"✅ Confirmed — executing <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
+                                _progress(f"✅ Auto-approved <code>{tool_name}</code> (approve-all active)")
                             else:
-                                self.builtin_executor.cancel(token)
-                                outcome = {
-                                    "success": False, "output": "", "exit_code": -1,
-                                    "error": (
-                                        "Operation cancelled by the operator. "
-                                        "Do not retry this operation via any other tool or method. "
-                                        "Respond with a finish action now."
-                                    ),
-                                }
-                                _progress("❌ Cancelled by operator — stopping task.")
+                                # Set up blocking event
+                                event = threading.Event()
+                                self._confirm_events[token] = event
+                                self._confirm_results[token] = False
+                                # Signal the UI: __CONFIRM__:{token}:{tool_name}:{description}
+                                _progress(f"{_CONFIRM_PREFIX}:{token}:{tool_name}:{description}")
+                                # Block until user responds (timeout 5 min)
+                                event.wait(timeout=300)
+                                # Always read the actual result — handles the race where
+                                # resume() fires between timeout-return and this pop.
+                                result_confirmed = self._confirm_results.pop(token, False)
+                                self._confirm_events.pop(token, None)
+
+                                if result_confirmed:
+                                    outcome = self.builtin_executor.confirm(token)
+                                    _progress(f"✅ Confirmed — executing <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
+                                else:
+                                    self.builtin_executor.cancel(token)
+                                    outcome = {
+                                        "success": False, "output": "", "exit_code": -1,
+                                        "error": (
+                                            "Operation cancelled by the operator. "
+                                            "Do not retry this operation via any other tool or method. "
+                                            "Respond with a finish action now."
+                                        ),
+                                    }
+                                    _progress("❌ Cancelled by operator — stopping task.")
                                 _operator_cancelled = True
                     else:
                         outcome = self.executor.execute(tool_name, args)
@@ -611,13 +625,18 @@ class AgentController:
             ext_token = secrets.token_hex(4)
             ext_event = threading.Event()
             self._extend_events[ext_token] = ext_event
-            self._extend_results[ext_token] = False
+            self._extend_results[ext_token] = "no"
             _progress(f"{_EXTEND_PREFIX}:{ext_token}:{max_steps}")
             ext_event.wait(timeout=120)  # 2-min window to respond
             self._extend_events.pop(ext_token, None)
-            should_extend = self._extend_results.pop(ext_token, False)
+            ext_response = self._extend_results.pop(ext_token, "no")
 
-            if should_extend:
+            if ext_response == "unlimited":
+                max_steps = 10_000_000
+                logger.info("%sAgent steps set to unlimited by user", _pfx)
+                _progress("♾️ Running until done (unlimited steps)…")
+                continue
+            elif ext_response == "yes":
                 max_steps += 10
                 logger.info("%sAgent steps extended to %d by user", _pfx, max_steps)
                 _progress(f"⏩ Extended — continuing to step {max_steps}…")
@@ -668,15 +687,33 @@ class AgentController:
         else:
             logger.warning("resume(): no event found for token=%s (already resolved or timed out?)", token[:8])
 
-    def resume_extend(self, token: str, confirmed: bool) -> None:
-        """Called by TelegramInterface when user responds to a max-steps extension prompt."""
-        logger.info("resume_extend(): token=%s confirmed=%s", token[:8], confirmed)
-        self._extend_results[token] = confirmed
+    def resume_extend(self, token: str, response: str) -> None:
+        """Called by TelegramInterface when user responds to a max-steps extension prompt.
+
+        response: "yes" | "no" | "unlimited"
+        """
+        logger.info("resume_extend(): token=%s response=%s", token[:8], response)
+        self._extend_results[token] = response
         event = self._extend_events.get(token)
         if event:
             event.set()
         else:
             logger.warning("resume_extend(): no event for token=%s", token[:8])
+
+    def resume_approve_all(self, token: str, tool_name: str) -> None:
+        """Called by TelegramInterface when user presses 'Approve all {tool_name}'.
+
+        Confirms the current pending operation AND registers tool_name for
+        automatic approval for the rest of this task.
+        """
+        logger.info("resume_approve_all(): token=%s tool_name=%s", token[:8], tool_name)
+        self._auto_approve_tools.add(tool_name)
+        self._confirm_results[token] = True
+        event = self._confirm_events.get(token)
+        if event:
+            event.set()
+        else:
+            logger.warning("resume_approve_all(): no event for token=%s", token[:8])
 
     def get_pending_tool_create(self, token: str) -> Optional[dict]:
         """Return pending tool-create data for display in Telegram UI."""
@@ -745,6 +782,7 @@ class AgentController:
             self.working.clear()
         if self.short_term:
             self.short_term.clear()
+        self._auto_approve_tools.clear()
         return msg
 
     def compress_context(self) -> str:
