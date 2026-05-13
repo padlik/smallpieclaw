@@ -508,7 +508,7 @@ class AgentController:
                                         ),
                                     }
                                     _progress("❌ Cancelled by operator — stopping task.")
-                                _operator_cancelled = True
+                                    _operator_cancelled = True
                     else:
                         outcome = self.executor.execute(tool_name, args)
 
