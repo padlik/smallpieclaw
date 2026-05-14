@@ -791,6 +791,8 @@ class BuiltinExecutor:
         # Scheduled jobs set expandable=False so results are shown as plain text,
         # not collapsed inside an expandable blockquote.
         _expandable = args.get("expandable", True)
+        # _notify=False suppresses Telegram output for silent scheduled jobs.
+        _notify_result = args.get("_notify", True)
 
         # Build the sub-agent via factory
         max_iterations = args.get("max_iterations")  # None = use factory default (scheduled_max_iter)
@@ -879,14 +881,15 @@ class BuiltinExecutor:
                     record.result = "[Cancelled]"
                     record._result_event.set()
                     logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
-                    try:
-                        runner.notify_fn(
-                            f"🛑 Sub-agent {runner.agent_id} cancelled\n"
-                            f"Job: **{label}**\n"
-                            f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
-                        )
-                    except Exception as notify_exc:
-                        logger.warning("spawn_agent: [%s] notify failed (cancelled): %s", label, notify_exc)
+                    if _notify_result:
+                        try:
+                            runner.notify_fn(
+                                f"🛑 Sub-agent {runner.agent_id} cancelled\n"
+                                f"Job: **{label}**\n"
+                                f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
+                            )
+                        except Exception as notify_exc:
+                            logger.warning("spawn_agent: [%s] notify failed (cancelled): %s", label, notify_exc)
                 else:
                     record.status = "done"
                     record.result = result
@@ -896,17 +899,18 @@ class BuiltinExecutor:
                         "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
                         label, runner.agent_id, runner._model_id, elapsed,
                     )
-                    header_html = (
-                        f"✅ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
-                        f" finished ({elapsed}s)\n"
-                        f"<b>Job:</b> {_html_mod.escape(label)}"
-                        f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
-                        f"<b>Task:</b> {_html_mod.escape(task[:120])}"
-                    )
-                    try:
-                        _send_result_html(header_html, result)
-                    except Exception as notify_exc:
-                        logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
+                    if _notify_result:
+                        header_html = (
+                            f"✅ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
+                            f" finished ({elapsed}s)\n"
+                            f"<b>Job:</b> {_html_mod.escape(label)}"
+                            f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
+                            f"<b>Task:</b> {_html_mod.escape(task[:120])}"
+                        )
+                        try:
+                            _send_result_html(header_html, result)
+                        except Exception as notify_exc:
+                            logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
             except Exception as exc:
                 record.status = "failed"
                 record.result = str(exc)
@@ -916,17 +920,18 @@ class BuiltinExecutor:
                     "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
                     label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
                 )
-                header_html = (
-                    f"❌ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
-                    f" failed ({elapsed}s)\n"
-                    f"<b>Job:</b> {_html_mod.escape(label)}"
-                    f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
-                    f"<b>Task:</b> {_html_mod.escape(task[:120])}"
-                )
-                try:
-                    _send_result_html(header_html, f"Error: {exc}")
-                except Exception as notify_exc:
-                    logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
+                if _notify_result:
+                    header_html = (
+                        f"❌ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
+                        f" failed ({elapsed}s)\n"
+                        f"<b>Job:</b> {_html_mod.escape(label)}"
+                        f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
+                        f"<b>Task:</b> {_html_mod.escape(task[:120])}"
+                    )
+                    try:
+                        _send_result_html(header_html, f"Error: {exc}")
+                    except Exception as notify_exc:
+                        logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
             finally:
                 get_agent_registry().unregister(runner.agent_id)
                 if _finish_cb:

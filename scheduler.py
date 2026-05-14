@@ -491,6 +491,8 @@ class Scheduler:
             # Scheduled job results should be shown as plain text, not in a
             # collapsed expandable blockquote (which hides the result by default).
             spawn_args["expandable"] = False
+            # Honour the job's notify setting — False suppresses Telegram output.
+            spawn_args["_notify"] = meta.get("notify", True)
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now
