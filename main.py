@@ -176,6 +176,7 @@ except ImportError:
 from agent_controller import AgentController, SubAgentRunner  # noqa: E402
 from builtin_executor import BuiltinExecutor, _load_context  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
+from mcp_client import MCPManager  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
@@ -289,6 +290,28 @@ def _run(
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
     creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)
 
+    # Initialise MCP servers (optional — skip if none configured)
+    mcp_manager: MCPManager | None = None
+    mcp_server_cfgs = cfg.get("mcp_servers", [])
+    if mcp_server_cfgs:
+        logger.info("Initialising %d MCP server(s)...", len(mcp_server_cfgs))
+        mcp_manager = MCPManager(mcp_server_cfgs)
+        try:
+            mcp_manager.connect_all()
+            mcp_tools = mcp_manager.get_tools()
+            if mcp_tools:
+                # Group by server and register
+                servers_seen: set[str] = set()
+                for t in mcp_tools:
+                    servers_seen.add(t.server_name)
+                for srv in servers_seen:
+                    srv_tools = [t for t in mcp_tools if t.server_name == srv]
+                    registry.register_mcp_tools(srv, srv_tools)
+                logger.info("MCP: registered %d tool(s) from %d server(s)",
+                            len(mcp_tools), len(servers_seen))
+        except Exception as exc:
+            logger.warning("MCP connect_all failed (agent will start without MCP): %s", exc)
+
     short_term  = ShortTermMemory(max_turns=20)
     working     = WorkingMemory()
     long_term   = LongTermMemory(path=longterm_path, llm=llm)
@@ -312,6 +335,7 @@ def _run(
         results=results_mem,
         builtin_executor=builtin,
         skill_registry=skills,
+        mcp_manager=mcp_manager,
         tmp_dir=tmp_dir,
         downloads_dir=downloads_dir,
         log_file=log_file,
@@ -384,6 +408,7 @@ def _run(
             base_memory=memory,
             builtin_executor=builtin,
             skill_registry=skills,
+            mcp_manager=mcp_manager,
             long_term=long_term,
             results=results_mem,
             short_term=pre_loaded_ctx,
@@ -426,6 +451,7 @@ def _run(
         skill_registry=skills,
         usage_registry=get_token_registry(),
         downloads_dir=downloads_dir,
+        mcp_manager=mcp_manager,
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
     _tg_holder[0] = tg
@@ -438,6 +464,9 @@ def _run(
     finally:
         scheduler.stop()
         llm.close()
+        if mcp_manager:
+            mcp_manager.close_all()
+            logger.info("MCP servers closed.")
         logger.info("Agent stopped.")
 
 

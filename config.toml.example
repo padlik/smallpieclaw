@@ -147,3 +147,29 @@ log_backup_count   = 30         # number of daily rotated files to keep
 pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate instances
 # tmp_dir defaults to /tmp/<working_dir_name> if not set
 # tmp_dir = "/tmp/agent"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP Servers (Model Context Protocol)
+# Use [[mcp_servers]] to configure one or more MCP servers.
+# Two transports are supported: "stdio" (subprocess) and "http" (HTTP/HTTPS).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Example: stdio MCP server (subprocess with JSON-RPC over stdin/stdout)
+# [[mcp_servers]]
+# name      = "filesystem"
+# transport = "stdio"
+# command   = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# enabled   = true
+# timeout   = 30
+# [mcp_servers.env]
+# MY_ENV_VAR = "value"
+
+# Example: HTTP MCP server (JSON-RPC POST to HTTP/HTTPS endpoint)
+# [[mcp_servers]]
+# name      = "my-api"
+# transport = "http"
+# url       = "https://api.example.com/mcp"
+# enabled   = true
+# timeout   = 30
+# [mcp_servers.headers]
+# Authorization = "Bearer your-token-here"

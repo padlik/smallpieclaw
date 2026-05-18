@@ -53,6 +53,7 @@ class TelegramInterface:
         skill_registry=None,
         usage_registry=None,
         downloads_dir: str = "downloads",
+        mcp_manager=None,             # Optional[MCPManager]
     ):
         tg_cfg = config["telegram"]
         self._config = config
@@ -69,6 +70,7 @@ class TelegramInterface:
         self._tool_index = tool_index
         self.skill_registry = skill_registry
         self._usage_registry = usage_registry  # TokenUsageRegistry
+        self.mcp_manager = mcp_manager
         self._downloads_dir = os.path.abspath(downloads_dir)
         self._start_time = time.time()
 
@@ -158,6 +160,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("tools", self._cmd_tools))
         app.add_handler(CommandHandler("skills", self._cmd_skills))
         app.add_handler(CommandHandler("models", self._cmd_models))
+        app.add_handler(CommandHandler("mcp", self._cmd_mcp))
         app.add_handler(CommandHandler("reindex", self._cmd_reindex))
         app.add_handler(CommandHandler("pair", self._cmd_pair))
         app.add_handler(CommandHandler("unpair", self._cmd_unpair))
@@ -211,6 +214,7 @@ class TelegramInterface:
             "  /status  — agent status, uptime, token usage\n"
             "  /tools   — list available tools\n"
             "  /models  — list and switch LLM models\n"
+            "  /mcp     — manage MCP servers (list / on / off / info)\n"
             "  /jobs    — list scheduled jobs\n"
             "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
             "  /pair    — pairing token management\n"
@@ -593,25 +597,36 @@ class TelegramInterface:
             await update.effective_message.reply_text("No tools registered.")
             return
 
-        builtin = [t for t in tools if not t.is_generated]
-        generated = [t for t in tools if t.is_generated]
+        # Split into categories
+        local_tools = [t for t in tools if not t.is_generated and not t.is_mcp]
+        generated = [t for t in tools if t.is_generated and not t.is_mcp]
+        mcp_tools = [t for t in tools if t.is_mcp]
 
         def _tool_entry(t) -> str:
-            # Normalize and truncate description
             desc = " ".join(html.escape(t.description).split())
             if len(desc) > 80:
                 desc = desc[:77] + "…"
             return f"  • <code>{html.escape(t.name)}</code> — {desc}"
 
         lines = [f"🔧 <b>Available Tools</b> ({len(tools)} total)\n"]
-        if builtin:
+        if local_tools:
             lines.append("<b>Built-in:</b>")
-            for t in builtin:
+            for t in local_tools:
                 lines.append(_tool_entry(t))
         if generated:
             lines.append("\n<b>Generated:</b>")
             for t in generated:
                 lines.append(_tool_entry(t))
+        if mcp_tools:
+            # Group by server
+            servers: dict[str, list] = {}
+            for t in mcp_tools:
+                servers.setdefault(t.server_name, []).append(t)
+            lines.append("\n🔌 <b>MCP Tools:</b>")
+            for srv_name, srv_tools in servers.items():
+                lines.append(f"  <i>{html.escape(srv_name)}</i>")
+                for t in srv_tools:
+                    lines.append(_tool_entry(t))
 
         for chunk in self._split_message("\n".join(lines)):
             await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
@@ -636,6 +651,122 @@ class TelegramInterface:
             if len(desc) > 80:
                 desc = desc[:77] + "…"
             lines.append(f"  • <b>{html.escape(s.name)}</b> — {desc}")
+        for chunk in self._split_message("\n".join(lines)):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+    async def _cmd_mcp(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /mcp [list|on|off|info] [name]"""
+        if not self._is_authorized(update.effective_user.id):
+            await self._send_unauthorized(update)
+            return
+        if not self.mcp_manager:
+            await update.effective_message.reply_text(
+                "🔌 No MCP servers configured.\n"
+                "Add <code>[[mcp_servers]]</code> sections to <code>config.toml</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        args = ctx.args or []
+        sub = args[0].lower() if args else "list"
+        name = args[1] if len(args) > 1 else ""
+
+        # /mcp on <name>
+        if sub == "on":
+            if not name:
+                await update.effective_message.reply_text(
+                    "Usage: <code>/mcp on &lt;name&gt;</code>", parse_mode=ParseMode.HTML)
+                return
+            ok = self.mcp_manager.set_enabled(name, True)
+            if not ok:
+                await update.effective_message.reply_text(
+                    f"❌ MCP server <code>{html.escape(name)}</code> not found.",
+                    parse_mode=ParseMode.HTML)
+                return
+            # Sync newly connected tools into tool_registry
+            if self.tool_registry and self.mcp_manager:
+                info = self.mcp_manager.get_server_info(name)
+                if info:
+                    self.tool_registry.register_mcp_tools(name, info["tools"])
+            await update.effective_message.reply_text(
+                f"✅ MCP server <code>{html.escape(name)}</code> enabled.",
+                parse_mode=ParseMode.HTML)
+            return
+
+        # /mcp off <name>
+        if sub == "off":
+            if not name:
+                await update.effective_message.reply_text(
+                    "Usage: <code>/mcp off &lt;name&gt;</code>", parse_mode=ParseMode.HTML)
+                return
+            ok = self.mcp_manager.set_enabled(name, False)
+            if not ok:
+                await update.effective_message.reply_text(
+                    f"❌ MCP server <code>{html.escape(name)}</code> not found.",
+                    parse_mode=ParseMode.HTML)
+                return
+            if self.tool_registry:
+                self.tool_registry.unregister_mcp_server(name)
+            await update.effective_message.reply_text(
+                f"⏹ MCP server <code>{html.escape(name)}</code> disabled.",
+                parse_mode=ParseMode.HTML)
+            return
+
+        # /mcp info <name>
+        if sub == "info":
+            if not name:
+                await update.effective_message.reply_text(
+                    "Usage: <code>/mcp info &lt;name&gt;</code>", parse_mode=ParseMode.HTML)
+                return
+            info = self.mcp_manager.get_server_info(name)
+            if not info:
+                await update.effective_message.reply_text(
+                    f"❌ MCP server <code>{html.escape(name)}</code> not found.",
+                    parse_mode=ParseMode.HTML)
+                return
+            status_icon = {"active": "●", "off": "○", "error": "⚠️"}.get(info["status"], "?")
+            lines = [
+                f"🔌 <b>MCP Server: {html.escape(name)}</b>",
+                f"  Status:    {status_icon} {info['status']}",
+                f"  Transport: {info['transport']}",
+            ]
+            if info["url"]:
+                lines.append(f"  URL:       <code>{html.escape(info['url'])}</code>")
+            if info["command"]:
+                cmd_str = " ".join(info["command"])
+                lines.append(f"  Command:   <code>{html.escape(cmd_str)}</code>")
+            if info["headers"]:
+                lines.append(f"  Headers:   {len(info['headers'])} configured")
+            if info["env"]:
+                lines.append(f"  Env vars:  {len(info['env'])} configured")
+            if info["tools"]:
+                lines.append(f"\n  <b>Tools ({len(info['tools'])}):</b>")
+                for t in info["tools"]:
+                    desc = " ".join(t.description.split())[:60]
+                    lines.append(f"    • <code>{html.escape(t.name)}</code> — {html.escape(desc)}")
+            if info["last_error"]:
+                lines.append(f"\n  ⚠️ <b>Last error:</b> {html.escape(info['last_error'][:300])}")
+            for chunk in self._split_message("\n".join(lines)):
+                await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+            return
+
+        # /mcp list (default)
+        servers = self.mcp_manager.list_servers()
+        if not servers:
+            await update.effective_message.reply_text("🔌 No MCP servers configured.")
+            return
+        lines = ["🔌 <b>MCP Servers</b>\n"]
+        for s in servers:
+            icon = "●" if s["status"] == "active" else ("○" if s["status"] == "off" else "⚠️")
+            tools_str = f"  — {s['tool_count']} tool(s)" if s["tool_count"] else ""
+            err_str = "  ⚠️ error" if s["last_error"] else ""
+            lines.append(
+                f"{icon} <b>{html.escape(s['name'])}</b>"
+                f"  [{s['transport']}]  {s['status']}{tools_str}{err_str}"
+            )
+        lines.append(
+            "\n<i>Tip: /mcp on &lt;name&gt; · /mcp off &lt;name&gt; · /mcp info &lt;name&gt;</i>"
+        )
         for chunk in self._split_message("\n".join(lines)):
             await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 

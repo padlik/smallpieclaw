@@ -189,6 +189,7 @@ class AgentController:
         results=None,          # Optional[ResultsMemory]
         builtin_executor=None, # Optional[BuiltinExecutor]
         skill_registry=None,   # Optional[SkillRegistry]
+        mcp_manager=None,      # Optional[MCPManager]
         tmp_dir: str = "/tmp/agent",
         downloads_dir: str = "downloads",
         log_file: str = "agent.log",
@@ -212,6 +213,7 @@ class AgentController:
         self.results = results
         self.builtin_executor = builtin_executor
         self.skill_registry = skill_registry
+        self.mcp_manager = mcp_manager
         self.tmp_dir = tmp_dir
         self.downloads_dir = downloads_dir
         self.log_file = log_file
@@ -531,6 +533,9 @@ class AgentController:
                                     }
                                     _progress("❌ Cancelled by operator — stopping task.")
                                     _operator_cancelled = True
+                    # MCP tools — route through MCPManager
+                    elif self.mcp_manager and self.mcp_manager.has_tool(tool_name):
+                        outcome = self.mcp_manager.call_tool(tool_name, args)
                     else:
                         outcome = self.executor.execute(tool_name, args)
 
@@ -1152,6 +1157,7 @@ class SubAgentRunner:
         base_memory,                  # MemoryStore (shared long-term facts)
         builtin_executor,             # BuiltinExecutor (shared)
         skill_registry=None,          # SkillRegistry (shared)
+        mcp_manager=None,             # MCPManager (shared, optional)
         long_term=None,               # LongTermMemory (shared)
         results=None,                 # ResultsMemory (shared)
         short_term=None,              # ShortTermMemory — pre-loaded context (optional)
@@ -1215,6 +1221,7 @@ class SubAgentRunner:
             results=results,
             builtin_executor=builtin_executor,
             skill_registry=skill_registry,
+            mcp_manager=mcp_manager,
             tmp_dir=tmp_dir,
             downloads_dir=downloads_dir,
             cancel_event=self._cancel_event,
