@@ -1,5 +1,6 @@
 python-telegram-bot>=21.0
 httpx~=0.27
+requests>=2.31
 tomli==2.0.1
 schedule==1.2.1
 croniter>=1.4

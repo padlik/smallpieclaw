@@ -18,7 +18,9 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Self-health diagnosis** — `/health` command and automatic 4-hour periodic job: reads log file, analyzes errors, suggests fixes, rotates logs
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
 - **Typing indicator** — Telegram shows "typing…" while the agent is reasoning
-- **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps or cancel
+- **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps, extend **unlimited**, or cancel; dangerous built-in actions offer an **Approve All** button to skip future confirmation prompts for the same action type
+- **MCP server support** — connect external tools via [Model Context Protocol](https://modelcontextprotocol.io) servers; supports `stdio` (subprocess) and `http` transports with per-server headers and env variables; manage via `/mcp`
+- **JSON mode enforcement** — the agent instructs the LLM to respond in JSON at the API level (provider-native where supported); non-JSON responses are coerced after 3 consecutive failures
 - **Multi-model LLM** — define multiple models; switch via `/models`
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama (cloud & local); reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
 - **Multimodal vision** — send a photo with a caption and the agent forwards both the image and text to vision-capable models (GPT-4o, Claude, Gemini, LLaVA, etc.)
@@ -50,6 +52,7 @@ scheduler.py             # Background task scheduler
 memory_store.py          # Short-term, working, long-term, and results memory
 builtin_executor.py      # Always-available built-in tools (shell, file_read, file_write)
 skill_registry.py        # Agent Skills discovery and registry
+mcp_client.py            # MCP server client (stdio + http transports)
 tools/                   # Built-in tools (.sh and .py)
 tools_generated/         # Tools created by the LLM at runtime
 skills/                  # Agent Skills (each skill is a subdirectory with SKILL.md)
@@ -488,8 +491,15 @@ Restart the agent (or wait for the next query) to pick up new tools.
 | Empty-response diagnostics | off | `agent.diagnose_empty_responses` |
 
 When the agent reaches `max_iterations`, inline buttons appear in the chat:
-**⏩ Extend 10 more steps** or **❌ Cancel** (2-minute timeout). This prevents
-silent failures while still giving the operator control over runaway tasks.
+**⏩ Extend 10 more steps**, **♾ Unlimited**, or **❌ Cancel** (2-minute timeout).
+Choosing **Unlimited** lets the agent run until the task is complete (internal safety
+ceiling still applies). This prevents silent failures while still giving the operator
+control over runaway tasks.
+
+For dangerous built-in actions that require confirmation (e.g. `shell` with destructive
+commands), an **✅ Approve All** button is offered alongside the per-action **Yes/No**
+buttons. Choosing **Approve All** suppresses further confirmation prompts for the same
+action type for the rest of the current task.
 
 Scheduled jobs and sub-agents use `scheduled_max_iterations` (default 100) instead of the
 interactive limit. Set to `0` for no limit (internal safety ceiling: 500). Individual jobs
@@ -583,11 +593,12 @@ Disable after diagnosing to keep logs clean.
 | `/help` | Full command reference |
 | `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, scheduler state, system time, and per-model token usage today |
 | `/health` | Run self-health diagnosis, analyze logs, rotate log file |
-| `/tools` | List all built-in and generated tools |
+| `/tools` | List all built-in, generated, and MCP tools |
 | `/skills` | List all available agent skills |
 | `/models` | List available LLM models and switch the active one (👁 badge marks vision-capable models) |
 | `/jobs` | List all scheduled jobs with running status; sub-commands: `reload`, `remove <tag>`, `pause <tag>`, `resume <tag>` |
 | `/agents` | List all active background sub-agents; `/agents cancel <id>` to stop one |
+| `/mcp` | Manage MCP servers: `list`, `on <name>`, `off <name>`, `info <name>` |
 | `/stop` | Cancel the currently running agent task |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
@@ -726,6 +737,11 @@ context_max_messages = 50        # optional: cap on saved messages (default: 50)
 overlap_policy = "skip"          # optional: skip|parallel when previous run is still active
 max_iterations = 50              # optional: per-job step cap (overrides scheduled_max_iterations)
 ```
+
+**`notify` flag** — set `notify = false` to suppress Telegram output for a job entirely.
+The job runs silently; results are only written to the log file. Useful for high-frequency
+monitoring jobs that should only alert on anomalies (the agent's task prompt can
+still send explicit messages via the `notify_user` tool when thresholds are exceeded).
 
 **Step limits** — scheduled jobs use `scheduled_max_iterations` (default 100) to allow
 complex multi-step automation that would be too long for an interactive session. Override
@@ -901,11 +917,64 @@ The `log_file` default is always anchored to the directory containing `main.py`,
 
 ---
 
+## MCP Servers
+
+The agent supports external tool servers via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). MCP servers expose additional tools that appear alongside built-in and generated tools in the agent's ReAct loop.
+
+### Transports
+
+| Transport | When to use |
+|-----------|-------------|
+| `stdio` | Subprocess — MCP server is a local command (e.g. `npx …`, Python script) |
+| `http` | HTTP/HTTPS — MCP server is a remote or local HTTP service |
+
+### Configuration (`config.toml`)
+
+```toml
+# Filesystem MCP server via stdio
+[[mcp_servers]]
+name      = "filesystem"
+transport = "stdio"
+command   = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+enabled   = true
+timeout   = 30        # seconds (default: 30)
+
+[mcp_servers.env]     # optional environment variables for the subprocess
+MY_ENV_VAR = "value"
+
+# Remote API MCP server via HTTP
+[[mcp_servers]]
+name      = "my-api"
+transport = "http"
+url       = "https://api.example.com/mcp"
+enabled   = true
+timeout   = 30
+
+[mcp_servers.headers]   # optional HTTP headers (e.g. auth)
+Authorization = "Bearer your-token-here"
+```
+
+`enabled = false` loads the server definition but does not connect at startup. You can activate it later with `/mcp on <name>`.
+
+### Telegram commands
+
+| Command | Description |
+|---------|-------------|
+| `/mcp list` | Show all configured servers with transport type and status |
+| `/mcp on <name>` | Connect a server and register its tools |
+| `/mcp off <name>` | Disconnect a server and remove its tools |
+| `/mcp info <name>` | Show server details, tool list, and last error |
+
+MCP errors and tool calls are written to `agent.log` with the prefix `MCP [<name>]`.
+
+---
+
 ## Requirements
 
 ```
 python-telegram-bot>=21.0
 httpx~=0.27
+requests>=2.31
 tomli==2.0.1
 schedule==1.2.1
 croniter>=1.4
