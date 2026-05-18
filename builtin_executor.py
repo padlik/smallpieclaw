@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
@@ -259,12 +260,19 @@ class BuiltinExecutor:
         self._max_subagents = max_subagents
         self._subagent_result_timeout = subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
+        self._sub_agent_pool = ThreadPoolExecutor(
+            max_workers=max_subagents, thread_name_prefix="sub-agent"
+        )
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def shutdown(self) -> None:
+        """Shut down the sub-agent thread pool (wait for running tasks)."""
+        self._sub_agent_pool.shutdown(wait=False)
 
     def is_builtin(self, name: str) -> bool:
         return name in BUILTIN_TOOLS
@@ -729,8 +737,6 @@ class BuiltinExecutor:
         caller_depth is the depth of the AgentController that invoked this tool.
         Sub-agents (depth ≥ 1) are not allowed to spawn further sub-agents.
         """
-        import threading
-
         from sub_agent_registry import get_registry as get_agent_registry
 
         task = args.get("task", "").strip()
@@ -937,8 +943,7 @@ class BuiltinExecutor:
                 if _finish_cb:
                     _finish_cb(_finish_tag)
 
-        t = threading.Thread(target=_run_and_notify, daemon=True, name=f"sub-agent-{label}")
-        t.start()
+        self._sub_agent_pool.submit(_run_and_notify)
 
         return {
             "success": True,

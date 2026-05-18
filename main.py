@@ -462,6 +462,7 @@ def _run(
         logger.info("Shutdown requested.")
     finally:
         scheduler.stop()
+        builtin.shutdown()
         llm.close()
         if mcp_manager:
             mcp_manager.close_all()
