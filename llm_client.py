@@ -470,18 +470,24 @@ class LLMClient:
     # Chat
     # ------------------------------------------------------------------
 
-    def chat(self, messages: list[dict], system: str | None = None, progress_cb=None) -> str:
-        """Send a chat request and return the assistant text."""
+    def chat(self, messages: list[dict], system: str | None = None, progress_cb=None,
+             json_mode: bool = False) -> str:
+        """Send a chat request and return the assistant text.
+
+        json_mode=True requests the provider to constrain output to valid JSON.
+        Supported by OpenAI/OpenRouter (response_format), Google (responseMimeType),
+        and Ollama (format="json"). Anthropic falls back to prompt-only enforcement.
+        """
         provider = self.llm_cfg["provider"]
         try:
             if provider in ("openai", "openrouter"):
-                return self._openai_chat(messages, system, progress_cb=progress_cb)
+                return self._openai_chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
             elif provider == "google":
-                return self._google_chat(messages, system, progress_cb=progress_cb)
+                return self._google_chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
             elif provider == "anthropic":
                 return self._anthropic_chat(messages, system, progress_cb=progress_cb)
             elif provider == "ollama":
-                return self._ollama_chat(messages, system, progress_cb=progress_cb)
+                return self._ollama_chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
             else:
                 raise ValueError(f"Unknown LLM provider: {provider}")
         except Exception as exc:
@@ -489,7 +495,7 @@ class LLMClient:
             raise
 
     def chat_with_fallback(self, messages: list[dict], system: str | None = None,
-                           progress_cb=None) -> str:
+                           progress_cb=None, json_mode: bool = False) -> str:
         """
         Like chat(), but tries each fallback model in order if the primary fails
         with a transient error. LLMPermanentError is never retried via fallback.
@@ -516,7 +522,7 @@ class LLMClient:
                 if progress_cb:
                     progress_cb(f"⚠️ Switching to fallback model '{model_id}'…")
             try:
-                return self.chat(messages, system, progress_cb=progress_cb)
+                return self.chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
                 # On success: _active_idx stays at idx so next step reuses same model
             except LLMPermanentError:
                 self._active_idx = primary_idx  # restore before propagating
@@ -537,7 +543,8 @@ class LLMClient:
 
         raise last_exc  # type: ignore[misc]
 
-    def _openai_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
+    def _openai_chat(self, messages: list[dict], system: str | None, progress_cb=None,
+                     json_mode: bool = False) -> str:
         _initial_model = self.llm_cfg["model"]
 
         # Pre-encode images once — this is pure data transformation that does not
@@ -607,6 +614,9 @@ class LLMClient:
                 top_p = self.llm_cfg.get("top_p")
                 if top_p is not None:
                     payload["top_p"] = top_p
+                if json_mode:
+                    # Request strict JSON output. Not supported by reasoning models.
+                    payload["response_format"] = {"type": "json_object"}
             url = f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {self.llm_cfg['api_key']}",
@@ -688,7 +698,8 @@ class LLMClient:
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
                            cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
 
-    def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
+    def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None,
+                     json_mode: bool = False) -> str:
         # Convert to Gemini format
         contents = []
         if system:
@@ -730,6 +741,8 @@ class LLMClient:
                     "temperature": self.llm_cfg.get("temperature", 0.2),
                 },
             }
+            if json_mode:
+                google_payload["generationConfig"]["responseMimeType"] = "application/json"
             top_p = self.llm_cfg.get("top_p")
             if top_p is not None:
                 google_payload["generationConfig"]["topP"] = top_p
@@ -844,7 +857,8 @@ class LLMClient:
         return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
                            cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
 
-    def _ollama_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
+    def _ollama_chat(self, messages: list[dict], system: str | None, progress_cb=None,
+                     json_mode: bool = False) -> str:
         """
         Chat via the Ollama Python library.
 
@@ -909,6 +923,7 @@ class LLMClient:
                     model=model,
                     messages=payload_messages,
                     options=options,
+                    **({"format": "json"} if json_mode else {}),
                 )
                 text = (response.message.content or "").strip()
                 # Track token usage from response metadata if available

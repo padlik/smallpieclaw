@@ -323,6 +323,8 @@ class AgentController:
         max_steps = self.max_iterations
         step = 0
         _operator_cancelled = False
+        _json_fail_streak = 0  # consecutive non-JSON responses; triggers coercion at threshold
+        _JSON_FAIL_LIMIT = 3
 
         while True:  # outer loop: allows step-count extension by user
             while step < max_steps:
@@ -349,7 +351,8 @@ class AgentController:
                 raw = ""
                 for _attempt in range(1 + _MAX_EMPTY_RETRIES):
                     try:
-                        raw = self.llm.chat_with_fallback(messages, system=system, progress_cb=_progress)
+                        raw = self.llm.chat_with_fallback(messages, system=system, progress_cb=_progress,
+                                                           json_mode=True)
                     except LLMCancelledError:
                         logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
                         return "[Cancelled]"
@@ -369,21 +372,40 @@ class AgentController:
                 # Parse JSON
                 action_obj = self._parse_json(raw)
                 if action_obj is None:
+                    _json_fail_streak += 1
                     logger.warning(
-                        "%sLLM returned non-JSON (step %d/%d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
-                        _pfx, step, max_steps, len(raw), raw[:1000],
+                        "%sLLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
+                        _pfx, step, max_steps, _json_fail_streak, len(raw), raw[:1000],
                     )
-                    messages.append({"role": "assistant", "content": raw})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            'ERROR: Your response was not valid JSON. '
-                            'You MUST respond with ONLY a raw JSON object — no markdown, '
-                            'no prose, no ```json fences. Example: '
-                            '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
+                    if _json_fail_streak >= _JSON_FAIL_LIMIT:
+                        # Model is stuck producing non-JSON. Coerce to a finish action so
+                        # the run loop terminates cleanly instead of burning remaining steps.
+                        logger.error(
+                            "%sNon-JSON streak reached %d — coercing to finish action",
+                            _pfx, _json_fail_streak,
                         )
-                    })
-                    continue
+                        action_obj = {
+                            "action": "finish",
+                            "result": (
+                                f"⚠️ Model returned non-JSON {_json_fail_streak} times in a row. "
+                                f"Last response (truncated): {raw[:500]}"
+                            ),
+                        }
+                        # Fall through to action dispatch below
+                    else:
+                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                'ERROR: Your response was not valid JSON. '
+                                'You MUST respond with ONLY a raw JSON object — no markdown, '
+                                'no prose, no ```json fences. Example: '
+                                '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
+                            )
+                        })
+                        continue
+
+                _json_fail_streak = 0  # reset on successful parse
 
                 messages.append({"role": "assistant", "content": raw})
                 action = action_obj.get("action", "")
