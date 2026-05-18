@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import subprocess
 import threading
 import time
@@ -234,6 +235,12 @@ class MCPStdioClient(MCPBaseClient):
 
     def _kill_process(self) -> None:
         if self._proc is not None:
+            # Close stderr explicitly to unblock the _drain_stderr daemon thread
+            try:
+                if self._proc.stderr:
+                    self._proc.stderr.close()
+            except Exception:
+                pass
             try:
                 self._proc.terminate()
                 self._proc.wait(timeout=3)
@@ -264,12 +271,17 @@ class MCPStdioClient(MCPBaseClient):
             raise RuntimeError(f"MCP [{self.name}] process not running")
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
-            # Non-blocking readline with timeout check
+            # Fail fast if the process already died before attempting a blocking read
+            if self._proc.poll() is not None:
+                raise RuntimeError(f"MCP [{self.name}] process exited unexpectedly")
+            # Use select() so readline() never blocks longer than 0.1 s
+            ready, _, _ = select.select([self._proc.stdout], [], [], 0.1)
+            if not ready:
+                continue
             line = self._proc.stdout.readline()
             if not line:
                 if self._proc.poll() is not None:
                     raise RuntimeError(f"MCP [{self.name}] process exited unexpectedly")
-                time.sleep(0.01)
                 continue
             try:
                 obj = json.loads(line.decode(errors="replace"))
@@ -304,8 +316,8 @@ class MCPStdioClient(MCPBaseClient):
         resp = self._recv(req_id)
         if "error" in resp:
             raise RuntimeError(f"MCP [{self.name}] initialize error: {resp['error']}")
-        # Acknowledge
-        self._send_notification("notifications/initialized")
+        # Acknowledge (spec requires "initialized", not "notifications/initialized")
+        self._send_notification("initialized")
 
     def _list_tools(self) -> list[dict]:
         req_id = self._next_id()
@@ -352,6 +364,8 @@ class MCPHttpClient(MCPBaseClient):
         except Exception as exc:
             self._last_error = str(exc)
             self._connected = False
+            self._session.close()
+            self._session = requests.Session()  # fresh session for retry
             logger.error("MCP [%s] connect failed: %s", self.name, exc, exc_info=True)
             return []
 
