@@ -198,3 +198,83 @@ def format_jobs_list(jobs: list) -> str:
         "<i>Tip: /jobs reload · /jobs remove &lt;tag&gt; · /jobs pause &lt;tag&gt; · /jobs resume &lt;tag&gt;</i>"
     )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Markdown → Telegram HTML converter
+# ---------------------------------------------------------------------------
+
+def md_to_html(text: str) -> str:
+    """
+    Convert a Markdown-flavoured string to Telegram HTML (ParseMode.HTML).
+
+    Handles:
+      - Fenced code blocks  ```lang\\ncode\\n```  →  <pre><code>…</code></pre>
+      - Inline code         `code`                →  <code>…</code>
+      - Bold                **text**              →  <b>…</b>
+      - Italic              *text*  or _text_     →  <i>…</i>
+      - Strikethrough       ~~text~~              →  <s>…</s>
+      - Markdown links      [text](url)           →  <a href="url">text</a>
+      - Bare URLs           https://…             →  <a href="url">url</a>
+
+    All prose is HTML-escaped so that <, >, & never break the parser.
+    Code block contents are also HTML-escaped so that shell/Python snippets
+    with <, >, & display correctly inside <pre><code>.
+    URLs are extracted before HTML-escaping so that underscores and ampersands
+    in query parameters are never misinterpreted as italic/bold markers.
+    """
+    # ---- Step 1: extract fenced code blocks to protect them ----
+    placeholders: list[str] = []
+
+    def _extract_fence(m: re.Match) -> str:
+        lang = (m.group(1) or "").strip()
+        code = html.escape(m.group(2))
+        lang_attr = f' class="language-{html.escape(lang)}"' if lang else ""
+        block = f"<pre><code{lang_attr}>{code}</code></pre>"
+        placeholders.append(block)
+        return f"\x00BLOCK{len(placeholders) - 1}\x00"
+
+    text = re.sub(r"```(\w*)\n?(.*?)```", _extract_fence, text, flags=re.DOTALL)
+
+    # ---- Step 2: extract inline code spans ----
+    def _extract_inline(m: re.Match) -> str:
+        code = html.escape(m.group(1))
+        placeholders.append(f"<code>{code}</code>")
+        return f"\x00BLOCK{len(placeholders) - 1}\x00"
+
+    text = re.sub(r"`([^`\n]+)`", _extract_inline, text)
+
+    # ---- Step 2.5: extract URLs before html.escape / markdown processing ----
+    def _extract_md_link(m: re.Match) -> str:
+        label = html.escape(m.group(1))
+        esc_url = html.escape(m.group(2))
+        placeholders.append(f'<a href="{esc_url}">{label}</a>')
+        return f"\x00BLOCK{len(placeholders) - 1}\x00"
+
+    text = re.sub(r'\[([^\]\n]+)\]\((https?://[^)\s]+)\)', _extract_md_link, text)
+
+    # Bare URLs: wrap in <a> so underscores/& in query params are never
+    # touched by the italic regex.
+    def _extract_bare_url(m: re.Match) -> str:
+        url = m.group(0).rstrip(".,;:!?)'\"")
+        esc_url = html.escape(url)
+        placeholders.append(f'<a href="{esc_url}">{esc_url}</a>')
+        tail = m.group(0)[len(url):]
+        return f"\x00BLOCK{len(placeholders) - 1}\x00{tail}"
+
+    text = re.sub(r'https?://[^\s<>"\'`\x00]+', _extract_bare_url, text)
+
+    # ---- Step 3: HTML-escape the remaining prose ----
+    text = html.escape(text)
+
+    # ---- Step 4: apply inline formatting to prose ----
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"\*(?!\*)(.+?)(?<!\*)\*", r"<i>\1</i>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)", r"<i>\1</i>", text, flags=re.DOTALL)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
+
+    # ---- Step 5: reinsert extracted blocks ----
+    for i, block in enumerate(placeholders):
+        text = text.replace(f"\x00BLOCK{i}\x00", block)
+
+    return sanitize_html(text)

@@ -13,7 +13,6 @@ import base64
 import html
 import logging
 import os
-import re
 import time
 from functools import partial
 from typing import Callable, Optional
@@ -30,9 +29,9 @@ from telegram.ext import (
 )
 
 from telegram_formatter import (
-    sanitize_html as _sanitize_html,
     split_message as _split_message_impl,
     format_jobs_list as _format_jobs_list_impl,
+    md_to_html as _md_to_html,
 )
 from telegram_commands import (
     cmd_start, cmd_help, cmd_status, cmd_stop, cmd_reset, cmd_compress,
@@ -600,96 +599,6 @@ class TelegramInterface:
                 asyncio.run(_send())
             except Exception as exc:
                 logger.error("send_html_to_users fallback failed: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Markdown → Telegram HTML converter
-# ---------------------------------------------------------------------------
-
-def _md_to_html(text: str) -> str:
-    """
-    Convert a Markdown-flavoured string to Telegram HTML (ParseMode.HTML).
-
-    Handles:
-      - Fenced code blocks  ```lang\\ncode\\n```  →  <pre><code>…</code></pre>
-      - Inline code         `code`                →  <code>…</code>
-      - Bold                **text** or __text__  →  <b>…</b>
-      - Italic              *text*  or _text_     →  <i>…</i>
-      - Strikethrough       ~~text~~              →  <s>…</s>
-      - Markdown links      [text](url)           →  <a href="url">text</a>
-      - Bare URLs           https://…             →  <a href="url">url</a>
-
-    All prose is HTML-escaped so that <, >, & never break the parser.
-    Code block contents are also HTML-escaped so that shell/Python snippets
-    with <, >, & display correctly inside <pre><code>.
-    URLs are extracted before HTML-escaping so that underscores and ampersands
-    in query parameters are never misinterpreted as italic/bold markers.
-    """
-    # ---- Step 1: extract fenced code blocks to protect them ----
-    # We replace them with placeholders, process the rest, then reinsert.
-    placeholders: list[str] = []
-
-    def _extract_fence(m: re.Match) -> str:
-        lang = (m.group(1) or "").strip()
-        code = html.escape(m.group(2))
-        lang_attr = f' class="language-{html.escape(lang)}"' if lang else ""
-        block = f"<pre><code{lang_attr}>{code}</code></pre>"
-        placeholders.append(block)
-        return f"\x00BLOCK{len(placeholders) - 1}\x00"
-
-    text = re.sub(r"```(\w*)\n?(.*?)```", _extract_fence, text, flags=re.DOTALL)
-
-    # ---- Step 2: extract inline code spans ----
-    def _extract_inline(m: re.Match) -> str:
-        code = html.escape(m.group(1))
-        placeholders.append(f"<code>{code}</code>")
-        return f"\x00BLOCK{len(placeholders) - 1}\x00"
-
-    text = re.sub(r"`([^`\n]+)`", _extract_inline, text)
-
-    # ---- Step 2.5: extract URLs before html.escape / markdown processing ----
-    # Markdown links [label](url) first so they aren't also matched as bare URLs.
-    def _extract_md_link(m: re.Match) -> str:
-        label = html.escape(m.group(1))
-        esc_url = html.escape(m.group(2))
-        placeholders.append(f'<a href="{esc_url}">{label}</a>')
-        return f"\x00BLOCK{len(placeholders) - 1}\x00"
-
-    text = re.sub(r'\[([^\]\n]+)\]\((https?://[^)\s]+)\)', _extract_md_link, text)
-
-    # Bare https?:// URLs: wrap in <a> so underscores/& in query params are
-    # never touched by the italic regex. Strip common trailing punctuation that
-    # is not part of the URL (e.g. "See https://example.com.")
-    def _extract_bare_url(m: re.Match) -> str:
-        url = m.group(0).rstrip(".,;:!?)'\"")
-        esc_url = html.escape(url)
-        placeholders.append(f'<a href="{esc_url}">{esc_url}</a>')
-        tail = m.group(0)[len(url):]
-        return f"\x00BLOCK{len(placeholders) - 1}\x00{tail}"
-
-    text = re.sub(r'https?://[^\s<>"\'`\x00]+', _extract_bare_url, text)
-
-    # ---- Step 3: HTML-escape the remaining prose ----
-    text = html.escape(text)
-
-    # ---- Step 4: apply inline formatting to prose ----
-    # Bold: **text** only — __text__ is intentionally not supported to avoid
-    # corrupting Python dunder names like __init__ or __all__ in agent output.
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-    # Italic: *text* or _text_ (single, not already consumed by bold)
-    # _text_ requires non-word-char boundaries so snake_case identifiers like
-    # ollama_health_check are never split into italic fragments.
-    text = re.sub(r"\*(?!\*)(.+?)(?<!\*)\*", r"<i>\1</i>", text, flags=re.DOTALL)
-    text = re.sub(r"(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)", r"<i>\1</i>", text, flags=re.DOTALL)
-    # Strikethrough: ~~text~~
-    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
-
-    # ---- Step 5: reinsert extracted blocks ----
-    for i, block in enumerate(placeholders):
-        text = text.replace(f"\x00BLOCK{i}\x00", block)
-
-    return _sanitize_html(text)
-
 
 # ---------------------------------------------------------------------------
 # Module constants

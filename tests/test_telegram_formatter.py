@@ -1,8 +1,8 @@
-"""Tests for telegram_formatter.py — HTML sanitization and message splitting."""
+"""Tests for telegram_formatter.py — HTML sanitization, message splitting, md_to_html."""
 
 from __future__ import annotations
 
-from telegram_formatter import format_jobs_list, sanitize_html, split_message
+from telegram_formatter import format_jobs_list, md_to_html, sanitize_html, split_message
 
 
 class TestSanitizeHtml:
@@ -167,3 +167,55 @@ class TestFormatJobsList:
         result = format_jobs_list(jobs)
         assert "🔄" in result
         assert "[running]" in result
+
+
+class TestMdToHtml:
+    """Markdown to Telegram HTML conversion."""
+
+    def test_bold(self):
+        assert "<b>hello</b>" in md_to_html("**hello**")
+
+    def test_italic_star(self):
+        assert "<i>world</i>" in md_to_html("*world*")
+
+    def test_italic_underscore(self):
+        assert "<i>text</i>" in md_to_html("_text_")
+
+    def test_strikethrough(self):
+        assert "<s>old</s>" in md_to_html("~~old~~")
+
+    def test_inline_code(self):
+        assert "<code>foo</code>" in md_to_html("`foo`")
+
+    def test_fenced_code_block(self):
+        result = md_to_html("```python\nprint('hi')\n```")
+        assert "<pre><code" in result
+        assert "print(&#x27;hi&#x27;)" in result
+
+    def test_html_entities_escaped(self):
+        result = md_to_html("a < b & c > d")
+        assert "&lt;" in result
+        assert "&amp;" in result
+        assert "&gt;" in result
+
+    def test_markdown_link(self):
+        result = md_to_html("[click](https://example.com)")
+        assert '<a href="https://example.com">click</a>' in result
+
+    def test_bare_url(self):
+        result = md_to_html("Visit https://example.com today")
+        assert '<a href="https://example.com">' in result
+
+    def test_snake_case_not_italicized(self):
+        result = md_to_html("use some_function_name here")
+        assert "<i>" not in result
+
+    def test_dunder_not_bolded(self):
+        result = md_to_html("call __init__ method")
+        # __text__ is intentionally not converted to bold
+        assert "<b>" not in result
+
+    def test_code_block_preserves_content(self):
+        result = md_to_html("```\nif x < 3 && y > 0:\n```")
+        assert "&lt;" in result
+        assert "&amp;&amp;" in result
