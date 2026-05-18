@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from telegram_formatter import format_jobs_list, sanitize_html, split_message
 
 

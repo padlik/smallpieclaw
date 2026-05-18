@@ -7,6 +7,8 @@ from main import _NightlyRotatingFileHandler
 from memory_store import ShortTermMemory
 from sub_agent_registry import SubAgentRegistry
 from skill_registry import Skill
+from interfaces import LLMProvider, ToolBackend, MemoryBackend, NotifyFn  # noqa: E402
+from interfaces import ToolRegistryProtocol, MCPManagerProtocol  # noqa: E402
 
 # _NightlyRotatingFileHandler: overrides logging.handlers.TimedRotatingFileHandler
 # — doRollover and rolloverAt are called by the Python logging framework internals,
@@ -25,3 +27,35 @@ SubAgentRegistry.find_by_label
 Skill.license
 Skill.compatibility
 Skill.metadata
+
+# Protocol interface methods — abstract contracts, not called directly
+LLMProvider.chat
+LLMProvider.chat_with_fallback
+LLMProvider.embed
+ToolBackend.execute
+MemoryBackend.get
+MemoryBackend.set
+MemoryBackend.delete
+MemoryBackend.search
+NotifyFn.__call__
+ToolRegistryProtocol.list_tools
+ToolRegistryProtocol.get_tool
+ToolRegistryProtocol.refresh
+MCPManagerProtocol.has_tool
+MCPManagerProtocol.call_tool
+MCPManagerProtocol.list_servers
+MCPManagerProtocol.get_tools
+
+# config_schema.py — public API classes and functions
+from config_schema import parse_config, AppConfig, TelegramConfig, AgentConfig  # noqa: E402
+from config_schema import ModelConfig, EmbeddingsConfig, SchedulerConfig  # noqa: E402
+from config_schema import PathsConfig, MCPServerConfig  # noqa: E402
+parse_config
+AppConfig
+TelegramConfig
+AgentConfig
+ModelConfig
+EmbeddingsConfig
+SchedulerConfig
+PathsConfig
+MCPServerConfig
