@@ -23,12 +23,8 @@ from typing import Callable, Optional
 
 from llm_client import LLMClient, LLMCancelledError, _encode_images
 from prompt_builder import (
-    SYSTEM_PROMPT_TEMPLATE,
+    build_system_prompt as _build_system_prompt,
     estimate_messages_tokens,
-    format_log_section,
-    format_models,
-    format_skills,
-    format_tools,
 )
 
 logger = logging.getLogger(__name__)
@@ -338,31 +334,18 @@ def react_loop(
         ctx.working.start_task(user_goal)
 
     # 1. Build system prompt
-    relevant_tools = ctx.tool_index.search(user_goal, top_k=ctx.top_tools)
-    tools_text = format_tools(relevant_tools)
-    memory_text = ctx.memory.as_prompt_text()
-    past_results_text = ctx.results.as_prompt_text(user_goal, top_k=2) if ctx.results else "No past results."
-    skills_section = format_skills(ctx.skill_registry)
-    models_section = format_models(ctx.llm)
-    file_storage = (
-        f"- Temporary files (downloads, intermediate outputs, anything only needed for this task):\n"
-        f"    {ctx.tmp_dir}  ← cleaned by OS on reboot\n"
-        f"- Permanent downloads (files the user wants to keep):\n"
-        f"    {ctx.downloads_dir}\n"
-        f"- Use tmp for QR codes, generated images, fetched configs, etc.\n"
-        f"- Use downloads for files the operator explicitly wants to keep.\n"
-        f"- Never write files to the agent script directory."
-    )
-    log_section = format_log_section(ctx.log_file, ctx.log_backup_count)
-
-    system = SYSTEM_PROMPT_TEMPLATE.format(
-        memory=memory_text,
-        past_results=past_results_text,
-        tools=tools_text,
-        skills_section=skills_section,
-        models_section=models_section,
-        file_storage=file_storage,
-        log_section=log_section,
+    system, _ = _build_system_prompt(
+        tool_index=ctx.tool_index,
+        memory=ctx.memory,
+        results=ctx.results,
+        skill_registry=ctx.skill_registry,
+        llm=ctx.llm,
+        tmp_dir=ctx.tmp_dir,
+        downloads_dir=ctx.downloads_dir,
+        log_file=ctx.log_file,
+        log_backup_count=ctx.log_backup_count,
+        top_tools=ctx.top_tools,
+        user_goal=user_goal,
     )
 
     first_msg: dict = {"role": "user", "content": user_goal}
