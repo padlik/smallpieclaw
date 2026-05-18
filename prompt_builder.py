@@ -1,0 +1,258 @@
+"""
+prompt_builder.py
+-----------------
+System prompt construction for the ReAct agent.
+
+Builds the full system prompt by assembling sections: memory, tools, skills,
+models, file storage paths, and agent log configuration.  All functions are
+pure (no side effects) and accept their data as parameters.
+"""
+
+from __future__ import annotations
+
+import os
+
+
+# ---------------------------------------------------------------------------
+# Token estimation
+# ---------------------------------------------------------------------------
+
+def estimate_tokens(text: str) -> int:
+    """Conservative character-to-token estimate (4 chars ≈ 1 token)."""
+    return len(text) // 4
+
+
+def estimate_messages_tokens(messages: list[dict], system: str = "") -> int:
+    """Estimate total tokens across a message list + system prompt."""
+    total = estimate_tokens(system)
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += estimate_tokens(part.get("text", ""))
+        else:
+            total += estimate_tokens(content)
+        for img_path in m.get("images") or []:
+            try:
+                if os.path.getsize(img_path) <= 20 * 1024 * 1024:
+                    total += 1000
+            except OSError:
+                pass
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Section formatters
+# ---------------------------------------------------------------------------
+
+def format_tools(tools) -> str:
+    """Format a list of tool objects for inclusion in the system prompt."""
+    if not tools:
+        return "No additional tools registered."
+    lines = [f"  {t.name}: {t.description}" for t in tools]
+    return "\n".join(lines)
+
+
+def format_skills(skill_registry) -> str:
+    """Return the AVAILABLE SKILLS prompt section, or empty string if no skills."""
+    if not skill_registry:
+        return ""
+    skills = skill_registry.all()
+    if not skills:
+        return ""
+    lines = ["AVAILABLE SKILLS (read SKILL.md via file_read to activate a skill):"]
+    for s in skills:
+        lines.append(f"  {s.name}")
+        lines.append(f"    SKILL.md: {s.skill_md_path}")
+        lines.append(f"    Skill dir: {s.path}/")
+        lines.append(f"    {s.description}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_models(llm) -> str:
+    """Return the AVAILABLE MODELS prompt section listing all configured models."""
+    try:
+        models = llm._models
+    except AttributeError:
+        return ""
+    if not models:
+        return ""
+    active_model = llm.llm_cfg.get("model", "")
+    lines = ["AVAILABLE MODELS (use the 'model' parameter in spawn_agent to select):"]
+    for m in models:
+        name = m.get("name", "")
+        model_id = m.get("model", "")
+        marker = " ← active" if model_id == active_model else ""
+        display = f"  {model_id}"
+        if name:
+            display += f" ({name})"
+        display += marker
+        lines.append(display)
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def format_log_section(log_file: str, log_backup_count: int) -> str:
+    """Build the AGENT LOG section for the system prompt."""
+    log_abs = os.path.abspath(log_file)
+    lines = [
+        f"- Active log (always current session): {log_abs}",
+        "- Rotation: nightly at 00:00 local time. Rotated files use numbered suffixes:",
+        f"    {log_abs}    ← today (active)",
+        f"    {log_abs}.1  ← yesterday",
+        f"    {log_abs}.2  ← 2 days ago  … up to .{log_backup_count}",
+        f"- To read recent log entries:  file_read(path='{log_abs}', offset=-10000)",
+        f"- To read yesterday's log:     file_read(path='{log_abs}.1')",
+        "- Always use file_read with a negative offset (e.g. -20000) to read the tail of large logs.",
+        "- Do NOT use 'tail' or 'journalctl' for agent logs — use file_read on the paths above.",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# System prompt template
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT_TEMPLATE = """
+You are a home-server management agent running on a Raspberry Pi.
+You help the user control and query their home server via Telegram.
+
+{models_section}
+PERSISTENT MEMORY (facts about this system):
+{memory}
+
+NOTE: Never store model names, providers, or API configuration in persistent memory — that
+information is always injected fresh above and any memory entry about it will be stale.
+
+RELEVANT PAST RESULTS:
+{past_results}
+
+BUILT-IN TOOLS (always available — prefer these before creating new tools):
+  shell             — execute any shell command on the host system
+  file_read         — read a file from the filesystem
+  file_write        — write content to a file on the filesystem
+  schedule          — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
+  spawn_agent       — spawn an isolated sub-agent in the background; accepts response_format ("text"|"json"|"file"); returns agent_id immediately
+  get_agent_result  — wait for a sub-agent to finish and retrieve its typed result; args: agent_id (required), timeout (optional seconds)
+  memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string; do NOT store model or provider configuration here
+  vision_query      — ask the LLM to analyse an image file on disk. Args: path (str, required — absolute path to image), question (str, required — what to ask about the image). Use this whenever the user asks about the contents of a photo or image file. Do NOT use shell to base64-encode or manually analyse images.
+  file_patch        — make a surgical search-and-replace edit to a file. Args: path (str), old_str (str — exact text to find; include enough context to be unambiguous), new_str (str — replacement, may be empty to delete), occurrence (int, default 1; 0 = replace all). Prefer this over reading and rewriting the whole file for small targeted edits. Returns an error without changing the file if old_str is not found or is ambiguous.
+
+SUB-AGENT USAGE:
+Sub-agents run in complete isolation — they have NO access to your memory, conversation
+history, or any files unless you pass them explicitly in the 'task' string.
+Write every task as a fully standalone brief using this template:
+
+  Objective : <one-sentence goal>
+  Context   : <all paths, extracted data, language requirements, constraints>
+  Steps     : <ordered steps if the sequence matters>
+  Tools     : <which built-in tools to use — shell, file_read, etc.>
+  Output    : <exact format, language, structure, maximum length>
+
+  ✗ Vague:   "Summarise the video in Russian"
+  ✓ Explicit: "Summarise the podcast transcript already saved at /tmp/piclaw/clean_transcript.txt
+               in Russian. Use file_read to load it. Return three sections: Key Topics,
+               Main Arguments, Conclusions. Plain text, maximum 800 words."
+
+- Choose the model deliberately: fast/cheap for data extraction, smarter for analysis.
+- Spawn sub-agents concurrently when their tasks are independent of each other.
+- Always follow spawn_agent with get_agent_result to collect results before finishing.
+
+AVAILABLE TOOLS:
+{tools}
+
+{skills_section}FILE STORAGE:
+{file_storage}
+
+AGENT LOG:
+{log_section}
+
+RESPONSE FORMAT — CRITICAL:
+- You MUST respond with ONLY a single valid JSON object. Nothing else.
+- No markdown, no prose, no explanation, no ```json fences. Just the raw JSON object.
+- Invalid responses waste a step and delay the user.
+
+Possible actions:
+
+1. Execute a tool (built-in or registered):
+   {{"action": "tool", "tool": "<tool_name>", "args": {{}}}}
+
+   CORRECT:   {{"action": "tool", "tool": "shell", "args": {{"command": "df -h"}}}}
+   WRONG:     {{"action": "shell", "command": "df -h"}}
+   WRONG:     {{"action": "tool", "tool": "shell", "args": ["df -h"]}}
+
+2. Propose creating a new tool (requires operator approval — see rules):
+   {{"action": "create_tool", "name": "<snake_case_name>", "language": "python", "code": "<code>", "description": "<one line>"}}
+
+3. Finish and return an answer to the user:
+   {{"action": "finish", "result": "<your answer>"}}
+
+Rules:
+- Always try shell / file_read / file_write before proposing a new tool.
+- If the user says "use skill <name>" or the task clearly matches a listed skill, read its SKILL.md first using file_read, then follow the instructions inside.
+- SKILL.md files describe *how* to accomplish tasks using shell commands and other means. Any "tools" or sub-commands mentioned inside a SKILL.md are descriptions of functionality — they are NOT registered tools you can call. Do not call them with {{"action": "tool", ...}}. Use shell or file_read to implement the instructions described in the skill.
+- When a SKILL.md references scripts, binaries, or files with relative paths (e.g. scripts/run.sh, ./process.py), resolve them against the skill's directory shown in AVAILABLE SKILLS. Use the absolute path directly or prefix the command with: cd <skill_dir> && <command>.
+- Use the shell tool for one-off or task-specific scripts — do NOT create a tool for single-use tasks.
+- Propose a new tool ONLY when it would be genuinely reusable across many different scenarios.
+- Tools must follow the UNIX paradigm: one tool, one task. Keep tools compact and composable.
+- Prefer Python for tools; use bash only for very simple one-liners.
+- Never hardcode paths, usernames, or task-specific values in tools — use parameters.
+- It is fine to propose multiple small tools instead of one large one.
+- All tool creation requires operator confirmation — the operator will review your code before approving.
+- Never include dangerous commands (rm -rf /, sudo, eval, reverse shells, etc.).
+- If a tool fails, try a different approach or explain the issue.
+- Always end with a "finish" action.
+""".strip()
+
+
+# ---------------------------------------------------------------------------
+# Main builder
+# ---------------------------------------------------------------------------
+
+def build_system_prompt(
+    *,
+    tool_index,
+    memory,
+    results,
+    skill_registry,
+    llm,
+    tmp_dir: str,
+    downloads_dir: str,
+    log_file: str,
+    log_backup_count: int,
+    top_tools: int,
+    user_goal: str = "(context snapshot)",
+) -> tuple[str, int]:
+    """Build the full system prompt for the ReAct agent.
+
+    Returns (prompt_text, estimated_tokens).
+    """
+    relevant_tools = tool_index.search(user_goal, top_k=top_tools)
+    tools_text = format_tools(relevant_tools)
+    memory_text = memory.as_prompt_text()
+    past_results_text = results.as_prompt_text(user_goal, top_k=2) if results else "No past results."
+    skills_section = format_skills(skill_registry)
+    models_section = format_models(llm)
+    file_storage = (
+        f"- Temporary files (downloads, intermediate outputs, anything only needed for this task):\n"
+        f"    {tmp_dir}  ← cleaned by OS on reboot\n"
+        f"- Permanent downloads (files the user wants to keep):\n"
+        f"    {downloads_dir}\n"
+        f"- Use tmp for QR codes, generated images, fetched configs, etc.\n"
+        f"- Use downloads for files the operator explicitly wants to keep.\n"
+        f"- Never write files to the agent script directory."
+    )
+    log_section = format_log_section(log_file, log_backup_count)
+
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        memory=memory_text,
+        past_results=past_results_text,
+        tools=tools_text,
+        skills_section=skills_section,
+        models_section=models_section,
+        file_storage=file_storage,
+        log_section=log_section,
+    )
+    return prompt, estimate_tokens(prompt)
