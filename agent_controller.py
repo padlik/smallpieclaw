@@ -224,6 +224,25 @@ class AgentController:
         self._on_step = on_step
         self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
 
+        # ------------------------------------------------------------------
+        # Cross-thread synchronisation for operator confirmation prompts.
+        #
+        # Pattern: the ReAct loop (run() method) executes on a worker thread
+        # (via run_in_executor in telegram_interface._run_agent_task). When
+        # a dangerous tool call or step-limit extension needs user approval,
+        # the loop creates a threading.Event keyed by a unique token, sends
+        # a progress callback to request UI buttons, then blocks on
+        # event.wait(). The Telegram callback handler (on the asyncio event
+        # loop thread) calls resume()/resume_extend()/resume_tool_create()
+        # which sets the result dict entry and then event.set(), unblocking
+        # the worker thread.
+        #
+        # Thread-safety: Event objects are created by the worker thread
+        # before being waited on; the asyncio thread only calls .set().
+        # Dict mutations are single-key insertions/pops which are atomic
+        # in CPython (GIL). No additional lock is needed.
+        # ------------------------------------------------------------------
+
         # Confirmation state: token -> threading.Event and result holder
         self._confirm_events: dict[str, threading.Event] = {}
         self._confirm_results: dict[str, bool] = {}
