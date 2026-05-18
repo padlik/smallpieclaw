@@ -195,6 +195,16 @@ def load_config(path="config.toml"):
     with open(path, "rb") as f:
         cfg = tomli.load(f)
     logger.info("Configuration loaded from %s", path)
+
+    # Validate config structure early — fail fast with clear error messages
+    from config_schema import parse_config
+    from exceptions import ConfigError
+    try:
+        parse_config(cfg)
+    except ConfigError as exc:
+        logger.error("Configuration error: %s", exc)
+        sys.exit(1)
+
     return cfg
 
 

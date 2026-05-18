@@ -86,6 +86,15 @@ class LLMCancelledError(RuntimeError):
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
+_LLM_CALL_ERRORS = (
+    LLMError,
+    httpx.HTTPError,
+    json.JSONDecodeError,
+    KeyError,
+    ValueError,
+)
+_LLM_CHAT_ERRORS = _LLM_CALL_ERRORS + (LLMCancelledError,)
+
 
 def _strip_thinking_tags(text: str) -> str:
     """Remove <think>…</think> reasoning blocks from LLM output.
@@ -252,7 +261,7 @@ def _encode_images(paths: list[str]) -> list[tuple[str, str]]:
                 )
                 continue
             result.append((base64.b64encode(data).decode("ascii"), mime))
-        except Exception as exc:
+        except OSError as exc:
             logger.warning("Could not encode image %s: %s", path, exc)
     return result
 
@@ -490,7 +499,7 @@ class LLMClient:
                 return self._ollama_chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
             else:
                 raise ValueError(f"Unknown LLM provider: {provider}")
-        except Exception as exc:
+        except _LLM_CHAT_ERRORS as exc:
             logger.error("LLM chat error: %s", exc)
             raise
 
@@ -530,7 +539,7 @@ class LLMClient:
             except LLMCancelledError:
                 self._active_idx = primary_idx  # restore before propagating
                 raise  # user cancelled — don't waste quota on fallbacks
-            except Exception as exc:
+            except _LLM_CALL_ERRORS as exc:
                 last_exc = exc
                 self._active_idx = primary_idx  # reset before trying next candidate
                 if seq < len(candidates) - 1:
@@ -1062,7 +1071,7 @@ class LLMClient:
                 lines.append(f"curl output:\n{curl_out}")
             except subprocess.TimeoutExpired:
                 lines.append("curl attempt timed out after 30s")
-            except Exception as exc:
+            except (subprocess.SubprocessError, OSError) as exc:
                 lines.append(f"curl attempt failed: {exc}")
 
         lines.append("=======================================")
@@ -1093,7 +1102,7 @@ class LLMClient:
             else:
                 # Fallback: OpenAI-compatible
                 vector = self._openai_embed(text)
-        except Exception as exc:
+        except _LLM_CALL_ERRORS as exc:
             logger.error("Embedding error: %s", exc)
             raise
 

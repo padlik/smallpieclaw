@@ -27,6 +27,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_JSON_FILE_ERRORS = (OSError, json.JSONDecodeError)
+
 
 # ---------------------------------------------------------------------------
 # Shared helper
@@ -143,7 +145,7 @@ class MemoryStore:
                     with open(self.path, "r") as f:
                         self._data = json.load(f)
                     logger.debug("Memory loaded from %s (%d keys)", self.path, len(self._data))
-                except Exception as exc:
+                except _JSON_FILE_ERRORS as exc:
                     logger.warning("Could not load memory from %s: %s — starting fresh", self.path, exc)
                     self._data = {}
             else:
@@ -166,7 +168,7 @@ class MemoryStore:
                     json.dump(self._data, f, indent=2)
                 os.replace(tmp, self.path)
                 return
-            except Exception as exc:
+            except OSError as exc:
                 if attempt < attempts:
                     logger.warning("MemoryStore save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
                     time.sleep(delay)
@@ -354,7 +356,7 @@ class LongTermMemory:
                 try:
                     with open(self.path) as f:
                         self._data = json.load(f)
-                except Exception as exc:
+                except _JSON_FILE_ERRORS as exc:
                     logger.warning("LongTermMemory load failed: %s", exc)
                     self._data = {}
 
@@ -369,7 +371,7 @@ class LongTermMemory:
                     json.dump(self._data, f, indent=2)
                 os.replace(tmp, self.path)
                 return
-            except Exception as exc:
+            except OSError as exc:
                 if attempt < attempts:
                     logger.warning("LongTermMemory save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
                     time.sleep(delay)
@@ -460,7 +462,7 @@ class ResultsMemory:
                 try:
                     with open(self.path) as f:
                         self._data = json.load(f)
-                except Exception as exc:
+                except _JSON_FILE_ERRORS as exc:
                     logger.warning("ResultsMemory load failed: %s", exc)
                     self._data = {}
 
@@ -475,7 +477,7 @@ class ResultsMemory:
                     json.dump(self._data, f, indent=2)
                 os.replace(tmp, self.path)
                 return
-            except Exception as exc:
+            except OSError as exc:
                 if attempt < attempts:
                     logger.warning("ResultsMemory save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
                     time.sleep(delay)

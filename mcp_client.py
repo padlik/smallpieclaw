@@ -28,9 +28,26 @@ from typing import Optional
 
 import requests
 
+from exceptions import MCPConnectionError, MCPToolCallError
 from tool_registry import Tool
 
 logger = logging.getLogger(__name__)
+
+_MCP_STDIO_ERRORS = (
+    MCPConnectionError,
+    MCPToolCallError,
+    OSError,
+    ValueError,
+    json.JSONDecodeError,
+    subprocess.SubprocessError,
+)
+_MCP_HTTP_ERRORS = (
+    MCPConnectionError,
+    MCPToolCallError,
+    requests.RequestException,
+    ValueError,
+    json.JSONDecodeError,
+)
 
 # MCP protocol version we advertise in initialize
 _MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -153,7 +170,7 @@ class MCPStdioClient(MCPBaseClient):
             self._connected = True
             logger.info("MCP [%s] connected via stdio: %d tool(s)", self.name, len(self._tools))
             return self._tools
-        except Exception as exc:
+        except _MCP_STDIO_ERRORS as exc:
             self._last_error = str(exc)
             self._connected = False
             logger.error("MCP [%s] connect failed: %s", self.name, exc, exc_info=True)
@@ -168,7 +185,7 @@ class MCPStdioClient(MCPBaseClient):
                 try:
                     self._start_process()
                     self._initialize()
-                except Exception as exc:
+                except _MCP_STDIO_ERRORS as exc:
                     self._last_error = str(exc)
                     return _tool_outcome(error=f"MCP [{self.name}] restart failed: {exc}", success=False)
             try:
@@ -194,7 +211,7 @@ class MCPStdioClient(MCPBaseClient):
                 else:
                     logger.info("MCP [%s] tool '%s' ok (%d chars)", self.name, tool_name, len(text))
                 return _tool_outcome(output=text, success=ok)
-            except Exception as exc:
+            except _MCP_STDIO_ERRORS as exc:
                 self._last_error = str(exc)
                 logger.error("MCP [%s] call_tool '%s' exception: %s", self.name, tool_name, exc, exc_info=True)
                 return _tool_outcome(error=str(exc), success=False)
@@ -260,7 +277,7 @@ class MCPStdioClient(MCPBaseClient):
 
     def _send(self, obj: dict) -> None:
         if self._proc is None or self._proc.stdin is None:
-            raise RuntimeError(f"MCP [{self.name}] process not running")
+            raise MCPConnectionError(f"MCP [{self.name}] process not running")
         line = json.dumps(obj) + "\n"
         self._proc.stdin.write(line.encode())
         self._proc.stdin.flush()
@@ -268,12 +285,12 @@ class MCPStdioClient(MCPBaseClient):
     def _recv(self, expected_id: int) -> dict:
         """Read stdout lines until we get a response for expected_id."""
         if self._proc is None or self._proc.stdout is None:
-            raise RuntimeError(f"MCP [{self.name}] process not running")
+            raise MCPConnectionError(f"MCP [{self.name}] process not running")
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             # Fail fast if the process already died before attempting a blocking read
             if self._proc.poll() is not None:
-                raise RuntimeError(f"MCP [{self.name}] process exited unexpectedly")
+                raise MCPConnectionError(f"MCP [{self.name}] process exited unexpectedly")
             # Use select() so readline() never blocks longer than 0.1 s
             ready, _, _ = select.select([self._proc.stdout], [], [], 0.1)
             if not ready:
@@ -281,7 +298,7 @@ class MCPStdioClient(MCPBaseClient):
             line = self._proc.stdout.readline()
             if not line:
                 if self._proc.poll() is not None:
-                    raise RuntimeError(f"MCP [{self.name}] process exited unexpectedly")
+                    raise MCPConnectionError(f"MCP [{self.name}] process exited unexpectedly")
                 continue
             try:
                 obj = json.loads(line.decode(errors="replace"))
@@ -292,7 +309,7 @@ class MCPStdioClient(MCPBaseClient):
                 return obj
             # Notifications or other ids — log and skip
             logger.debug("MCP [%s] skipping id=%s (want %s)", self.name, obj.get("id"), expected_id)
-        raise TimeoutError(f"MCP [{self.name}] timeout waiting for id={expected_id}")
+        raise MCPConnectionError(f"MCP [{self.name}] timeout waiting for id={expected_id}")
 
     def _send_notification(self, method: str, params: Optional[dict] = None) -> None:
         """Send a JSON-RPC notification (no id, no response expected)."""
@@ -315,7 +332,7 @@ class MCPStdioClient(MCPBaseClient):
         })
         resp = self._recv(req_id)
         if "error" in resp:
-            raise RuntimeError(f"MCP [{self.name}] initialize error: {resp['error']}")
+            raise MCPConnectionError(f"MCP [{self.name}] initialize error: {resp['error']}")
         # Acknowledge (spec requires "initialized", not "notifications/initialized")
         self._send_notification("initialized")
 
@@ -329,7 +346,7 @@ class MCPStdioClient(MCPBaseClient):
         })
         resp = self._recv(req_id)
         if "error" in resp:
-            raise RuntimeError(f"MCP [{self.name}] tools/list error: {resp['error']}")
+            raise MCPConnectionError(f"MCP [{self.name}] tools/list error: {resp['error']}")
         return resp.get("result", {}).get("tools", [])
 
 
@@ -361,7 +378,7 @@ class MCPHttpClient(MCPBaseClient):
             self._connected = True
             logger.info("MCP [%s] connected via http: %d tool(s)", self.name, len(self._tools))
             return self._tools
-        except Exception as exc:
+        except _MCP_HTTP_ERRORS as exc:
             self._last_error = str(exc)
             self._connected = False
             self._session.close()
@@ -392,7 +409,7 @@ class MCPHttpClient(MCPBaseClient):
                 else:
                     logger.info("MCP [%s] tool '%s' ok (%d chars)", self.name, tool_name, len(text))
                 return _tool_outcome(output=text, success=ok)
-            except Exception as exc:
+            except _MCP_HTTP_ERRORS as exc:
                 self._last_error = str(exc)
                 logger.error("MCP [%s] call_tool '%s' exception: %s", self.name, tool_name, exc, exc_info=True)
                 return _tool_outcome(error=str(exc), success=False)
@@ -449,7 +466,7 @@ class MCPHttpClient(MCPBaseClient):
             },
         })
         if "error" in resp:
-            raise RuntimeError(f"MCP [{self.name}] initialize error: {resp['error']}")
+            raise MCPConnectionError(f"MCP [{self.name}] initialize error: {resp['error']}")
 
     def _list_tools(self) -> list[dict]:
         req_id = self._next_id()
@@ -460,7 +477,7 @@ class MCPHttpClient(MCPBaseClient):
             "params": {},
         })
         if "error" in resp:
-            raise RuntimeError(f"MCP [{self.name}] tools/list error: {resp['error']}")
+            raise MCPConnectionError(f"MCP [{self.name}] tools/list error: {resp['error']}")
         return resp.get("result", {}).get("tools", [])
 
 
@@ -512,7 +529,7 @@ class MCPManager:
                     )
                 else:
                     self._tool_to_server[tool.name] = name
-        except Exception as exc:
+        except (OSError, ValueError, subprocess.SubprocessError, requests.RequestException, MCPConnectionError) as exc:
             logger.error("MCP [%s] unexpected error during connect: %s", name, exc, exc_info=True)
 
     def close_all(self) -> None:

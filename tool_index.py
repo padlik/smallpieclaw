@@ -17,10 +17,21 @@ import json
 import logging
 import os
 
-from llm_client import LLMClient
+import httpx
+
+from llm_client import LLMClient, LLMError
 from tool_registry import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+_EMBEDDING_ERRORS = (
+    LLMError,
+    httpx.HTTPError,
+    json.JSONDecodeError,
+    KeyError,
+    ValueError,
+)
+_JSON_INDEX_LOAD_ERRORS = (OSError, json.JSONDecodeError)
 
 
 def _builtin_as_tool(name: str, description: str) -> Tool:
@@ -103,7 +114,7 @@ class ToolIndex:
                     "vector": vector,
                 }
                 embedded += 1
-            except Exception as exc:
+            except _EMBEDDING_ERRORS as exc:
                 logger.error("rebuild: failed to embed '%s': %s", tool.name, exc)
                 failed += 1
 
@@ -122,7 +133,7 @@ class ToolIndex:
             }
             self._save()
             logger.info("Tool '%s' added to semantic index", tool.name)
-        except Exception as exc:
+        except _EMBEDDING_ERRORS as exc:
             logger.error("Failed to index tool '%s': %s", tool.name, exc)
 
     def search(self, query: str, top_k: int = 3) -> list[Tool]:
@@ -136,7 +147,7 @@ class ToolIndex:
 
         try:
             query_vec = self.llm.embed(query)
-        except Exception as exc:
+        except _EMBEDDING_ERRORS as exc:
             logger.error("Failed to embed query: %s — falling back to all tools", exc)
             return self.registry.all()[:top_k]
 
@@ -189,7 +200,7 @@ class ToolIndex:
             vector = self.llm.embed(description)
             self._index[name] = {"description": description, "vector": vector}
             return True
-        except Exception as exc:
+        except _EMBEDDING_ERRORS as exc:
             logger.error("Failed to embed tool '%s': %s", name, exc)
             return False
 
@@ -199,7 +210,7 @@ class ToolIndex:
                 with open(self.index_path, "r") as f:
                     self._index = json.load(f)
                 logger.debug("Tool index loaded: %d entries", len(self._index))
-            except Exception as exc:
+            except _JSON_INDEX_LOAD_ERRORS as exc:
                 logger.warning("Could not load tool index: %s — starting empty", exc)
                 self._index = {}
 
@@ -211,5 +222,5 @@ class ToolIndex:
                 json.dump(self._index, f, indent=2)
             os.replace(tmp, self.index_path)
             logger.debug("Tool index saved: %d entries", len(self._index))
-        except Exception as exc:
+        except OSError as exc:
             logger.error("Could not save tool index: %s", exc)

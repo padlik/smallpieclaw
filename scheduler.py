@@ -54,7 +54,7 @@ def _legacy_to_cron(stype: str, time_str: str = None, hours=None, minutes=None, 
         try:
             h, m = t.split(":")
             return f"{int(m)} {int(h)} * * *"
-        except Exception:
+        except (ValueError, TypeError):
             return "0 2 * * *"
     if stype == "interval":
         if hours:
@@ -413,7 +413,7 @@ class Scheduler:
                 "Registered cron job: %s (%s) → next run %s (jitter %s%ds)",
                 tag, expr, next_run.strftime("%Y-%m-%d %H:%M:%S"), sign, jitter_secs,
             )
-        except Exception as exc:
+        except (CroniterBadCronError, ValueError, TypeError) as exc:
             logger.warning("Could not compute next_run for job '%s' (%s): %s", tag, expr, exc)
 
     def _mark_job_finished(self, tag: str) -> None:
@@ -531,7 +531,7 @@ class Scheduler:
                 result = "Agent not available for task."
             if result.startswith("❌"):
                 error_occurred = True
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             logger.error("%sFailed: %s", _spfx, exc)
             result = f"Job failed: {exc}"
             error_occurred = True
@@ -581,7 +581,7 @@ class Scheduler:
             with open(self._commands_file) as f:
                 commands = json.load(f)
             os.remove(self._commands_file)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Could not read scheduler commands: %s", exc)
             return
 
@@ -616,7 +616,7 @@ class Scheduler:
                     self.resume_job(tag)
                 else:
                     logger.warning("Unknown scheduler command action: %s", action)
-            except Exception as exc:
+            except (KeyError, TypeError, ValueError) as exc:
                 logger.error("Error processing scheduler command %s: %s", cmd, exc)
 
     def _save_state(self) -> None:
@@ -646,7 +646,7 @@ class Scheduler:
             with open(tmp, "w") as f:
                 json.dump(state, f, indent=2)
             os.replace(tmp, self._state_file)
-        except Exception as exc:
+        except OSError as exc:
             logger.warning("Could not save scheduler state: %s", exc)
 
     def _load_state(self) -> None:
@@ -656,7 +656,7 @@ class Scheduler:
         try:
             with open(self._state_file) as f:
                 state = json.load(f)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Could not load scheduler state: %s", exc)
             return
 
@@ -703,7 +703,7 @@ class Scheduler:
                 self._save_scheduler_toml()
             os.remove(self._dynamic_jobs_file)
             logger.info("Removed legacy %s after migration", self._dynamic_jobs_file)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Could not migrate dynamic jobs: %s", exc)
 
     _MAX_BACKUPS = 5
@@ -719,7 +719,7 @@ class Scheduler:
             )
             for old in baks[: max(0, len(baks) - self._MAX_BACKUPS)]:
                 os.remove(os.path.join(dir_, old))
-        except Exception as exc:
+        except OSError as exc:
             logger.debug("Could not prune scheduler backups: %s", exc)
 
     def reload(self) -> dict:
@@ -747,7 +747,7 @@ class Scheduler:
                 try:
                     self._register_job(tag, meta)
                     reloaded += 1
-                except Exception as exc:
+                except (CroniterBadCronError, TypeError, ValueError) as exc:
                     logger.warning("Failed to register job '%s' on reload: %s", tag, exc)
                     failed += 1
         logger.info("Scheduler reloaded: %d active, %d failed", reloaded, failed)
@@ -820,7 +820,7 @@ class Scheduler:
                 self._prune_backups()
             os.replace(tmp, self._scheduler_config_path)
             logger.debug("Saved %d jobs to %s", len(self._jobs_meta), self._scheduler_config_path)
-        except Exception as exc:
+        except OSError as exc:
             logger.warning("Could not save scheduler.toml: %s", exc)
 
     def _load_config_jobs(self, config_path: str, sched_cfg: dict = None) -> None:
@@ -835,7 +835,7 @@ class Scheduler:
         try:
             with open(config_path, "rb") as f:
                 toml_data = tomli.load(f)
-        except Exception as exc:
+        except (OSError, tomli.TOMLDecodeError) as exc:
             logger.warning("Could not load %s: %s — starting with no jobs", config_path, exc)
             return
 
@@ -910,7 +910,7 @@ class Scheduler:
                     continue
                 try:
                     next_run = datetime.fromisoformat(next_run_str)
-                except Exception:
+                except ValueError:
                     continue
                 if now_local >= next_run:
                     # Fire in background thread
@@ -927,7 +927,7 @@ class Scheduler:
                             next_dt = cron_iter.get_next(datetime)
                             meta["_natural_next_run"] = next_dt.isoformat()
                             meta["_next_run"] = next_dt.isoformat()
-                    except Exception as exc:
+                    except (CroniterBadCronError, TypeError, ValueError) as exc:
                         logger.warning("Could not compute next_run for '%s': %s", tag, exc)
             # Once-jobs handled by schedule library
             schedule.run_pending()
@@ -939,7 +939,7 @@ class Scheduler:
         """Warn once in chat when a sub-agent has been running longer than _warn_minutes."""
         try:
             from sub_agent_registry import get_registry as _get_reg
-        except Exception:
+        except ImportError:
             return
 
         registry = _get_reg()

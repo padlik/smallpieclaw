@@ -419,7 +419,7 @@ class BuiltinExecutor:
             }
         except subprocess.TimeoutExpired:
             return {"success": False, "output": "", "error": f"Command timed out after {timeout}s.", "exit_code": -1}
-        except Exception as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
 
     # ---- file_read ----
@@ -458,7 +458,7 @@ class BuiltinExecutor:
             return {"success": True, "output": content + note, "error": "", "exit_code": 0}
         except PermissionError as exc:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
-        except Exception as exc:
+        except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
 
     # ---- file_write ----
@@ -491,7 +491,7 @@ class BuiltinExecutor:
             return {"success": True, "output": f"Written {len(content)} chars to {path}.", "error": "", "exit_code": 0}
         except PermissionError as exc:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
-        except Exception as exc:
+        except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
 
     # ---- file_patch ----
@@ -520,7 +520,7 @@ class BuiltinExecutor:
                 content = fh.read()
         except PermissionError as exc:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
-        except Exception as exc:
+        except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
 
         count = content.count(old_str)
@@ -615,7 +615,7 @@ class BuiltinExecutor:
             }
         except PermissionError as exc:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
-        except Exception as exc:
+        except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
 
     # ---- file_send ----
@@ -1047,7 +1047,7 @@ class BuiltinExecutor:
                             key, type(parsed).__name__,
                         )
                         value = parsed
-                except Exception:
+                except _json.JSONDecodeError:
                     pass  # Keep original string value
             self._memory.set(key, value)
             logger.info("memory_write set: key=%s type=%s", key, type(value).__name__)
@@ -1088,7 +1088,7 @@ def _save_context(context_key: str, short_term, data_dir: str) -> None:
         data = short_term.to_dict()
         with open(path, "w", encoding="utf-8") as f:
             _json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
+    except OSError:
         logger.warning("Failed to save context for %s", context_key, exc_info=True)
 
 
@@ -1105,6 +1105,6 @@ def _load_context(context_key: str, data_dir: str, max_turns: int = 50):
         with open(path, "r", encoding="utf-8") as f:
             data = _json.load(f)
         return ShortTermMemory.from_dict(data, max_turns=max_turns)
-    except Exception:
+    except (OSError, _json.JSONDecodeError):
         logger.warning("Context file corrupted for %s — starting fresh", context_key, exc_info=True)
         return ShortTermMemory(max_turns=max_turns)
