@@ -13,38 +13,34 @@ Workflow for each user request:
 
 from __future__ import annotations
 
-import base64
-import json
 import logging
-import re
-import secrets
-import subprocess
-import sys
 import threading
 from typing import Callable, Optional
 
-from llm_client import LLMClient, LLMCancelledError, _encode_images
+from llm_client import LLMClient
 from memory_store import MemoryStore
 from prompt_builder import (
-    SYSTEM_PROMPT_TEMPLATE as _SYSTEM_PROMPT,
     build_system_prompt as _build_system_prompt,
-    estimate_messages_tokens as _estimate_messages_tokens,
     estimate_tokens as _estimate_tokens,
     format_log_section as _format_log_section_impl,
     format_models as _format_models_impl,
     format_skills as _format_skills_impl,
     format_tools as _format_tools_impl,
 )
+from react_loop import (
+    ReactContext,
+    extract_json_candidates,
+    fmt_tool_call,
+    fmt_tool_result_progress,
+    format_tool_result,
+    parse_json,
+    react_loop,
+)
 from tool_creator import ToolCreator
 from tool_executor import ToolExecutor
 from tool_index import ToolIndex
 
 logger = logging.getLogger(__name__)
-
-# Marker prefixes used to send interactive requests through the progress callback
-_CONFIRM_PREFIX = "__CONFIRM__"
-_EXTEND_PREFIX = "__EXTEND__"
-_TOOL_CREATE_PREFIX = "__TOOL_CREATE__"
 
 
 # ---------------------------------------------------------------------------
@@ -159,446 +155,40 @@ class AgentController:
         Pass images=["/path/to/file.jpg", ...] to include images in the first
         user message for vision-capable models.
         """
-        import time as _time
-        _run_start = _time.time()
-        _pfx = self._log_prefix
-
-        def _progress(msg: str):
-            if progress_callback:
-                progress_callback(msg)
-            logger.debug("%sAgent progress: %s", _pfx, msg)
-
-        # Always clear the cancel event at the start of each run so that a /stop
-        # issued while no task was running (or after a task finished) does not block
-        # the next task. /stop is only meaningful while a task is in progress — a
-        # stale event from a previous stop is simply discarded here.
-        self._cancel_event.clear()
-
-        # Log start with model and goal preview
-        _active_model = self.llm.llm_cfg.get("model", "?")
-        logger.info("%sstart | model: %s | goal: %s", _pfx, _active_model, user_goal[:80])
-
-        # Start working memory task tracking
-        if self.working:
-            self.working.start_task(user_goal)
-
-        # 1. Find relevant tools
-        relevant_tools = self.tool_index.search(user_goal, top_k=self.top_tools)
-        tools_text = self._format_tools(relevant_tools)
-        memory_text = self.memory.as_prompt_text()
-        past_results_text = self.results.as_prompt_text(user_goal, top_k=2) if self.results else "No past results."
-        skills_section = self._format_skills()
-        models_section = self._format_models()
-        file_storage = (
-            f"- Temporary files (downloads, intermediate outputs, anything only needed for this task):\n"
-            f"    {self.tmp_dir}  ← cleaned by OS on reboot\n"
-            f"- Permanent downloads (files the user wants to keep):\n"
-            f"    {self.downloads_dir}\n"
-            f"- Use tmp for QR codes, generated images, fetched configs, etc.\n"
-            f"- Use downloads for files the operator explicitly wants to keep.\n"
-            f"- Never write files to the agent script directory."
+        ctx = ReactContext(
+            llm=self.llm,
+            tool_index=self.tool_index,
+            executor=self.executor,
+            creator=self.creator,
+            memory=self.memory,
+            builtin_executor=self.builtin_executor,
+            mcp_manager=self.mcp_manager,
+            skill_registry=self.skill_registry,
+            max_iterations=self.max_iterations,
+            top_tools=self.top_tools,
+            ctx_max_tokens=self.ctx_max_tokens,
+            tmp_dir=self.tmp_dir,
+            downloads_dir=self.downloads_dir,
+            log_file=self.log_file,
+            log_backup_count=self.log_backup_count,
+            depth=self._depth,
+            label=self.label,
+            short_term=self.short_term,
+            working=self.working,
+            results=self.results,
+            cancel_event=self._cancel_event,
+            on_step=self._on_step,
+            confirm_events=self._confirm_events,
+            confirm_results=self._confirm_results,
+            auto_approve_tools=self._auto_approve_tools,
+            extend_events=self._extend_events,
+            extend_results=self._extend_results,
+            tool_create_events=self._tool_create_events,
+            tool_create_results=self._tool_create_results,
+            tool_create_pending=self._tool_create_pending,
         )
-        log_section = self._format_log_section()
+        return react_loop(ctx, user_goal, progress_callback, images)
 
-        system = _SYSTEM_PROMPT.format(
-            memory=memory_text,
-            past_results=past_results_text,
-            tools=tools_text,
-            skills_section=skills_section,
-            models_section=models_section,
-            file_storage=file_storage,
-            log_section=log_section,
-        )
-        first_msg: dict = {"role": "user", "content": user_goal}
-        if images:
-            first_msg["images"] = images
-            logger.info("%s%d image(s) attached to request", _pfx, len(images))
-
-        # Prepend recent conversation history as actual messages so the LLM maintains
-        # context across turns — the correct way to provide multi-turn context to LLMs.
-        messages: list[dict] = []
-        if self.short_term:
-            messages.extend(self.short_term.get_messages())
-        messages.append(first_msg)
-
-        self.memory.record_event(f"User request: {user_goal[:100]}")
-
-        # 2. ReAct loop — supports dynamic extension when max steps are reached
-        max_steps = self.max_iterations
-        step = 0
-        _operator_cancelled = False
-        _json_fail_streak = 0  # consecutive non-JSON responses; triggers coercion at threshold
-        _JSON_FAIL_LIMIT = 3
-
-        while True:  # outer loop: allows step-count extension by user
-            while step < max_steps:
-                # Cooperative cancellation check (sub-agents)
-                if self._cancel_event.is_set():
-                    logger.warning("%scancelled at step %d/%d", _pfx, step, max_steps)
-                    return "[Cancelled]"
-
-                step += 1
-                if self._on_step:
-                    try:
-                        self._on_step(step)
-                    except Exception:
-                        pass
-                _active_model = self.llm.llm_cfg.get("model", "?")
-                logger.info("%sstep %d/%d | model: %s", _pfx, step, max_steps, _active_model)
-                _progress(f"⚙️ Thinking… (step {step})")
-
-                # Context compaction check
-                messages = self._maybe_compact(messages, system)
-
-                # LLM call — with in-place retry on empty response (network glitch)
-                _MAX_EMPTY_RETRIES = 2
-                raw = ""
-                for _attempt in range(1 + _MAX_EMPTY_RETRIES):
-                    try:
-                        raw = self.llm.chat_with_fallback(messages, system=system, progress_cb=_progress,
-                                                           json_mode=True)
-                    except LLMCancelledError:
-                        logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
-                        return "[Cancelled]"
-                    except Exception as exc:
-                        err = f"❌ LLM error: {type(exc).__name__}: {exc}"
-                        _progress(err)
-                        return err
-                    if raw.strip():
-                        break
-                    if _attempt < _MAX_EMPTY_RETRIES:
-                        logger.warning(
-                            "%sLLM returned empty response (step %d/%d), retrying in-place (%d/%d)…",
-                            _pfx, step, max_steps, _attempt + 1, _MAX_EMPTY_RETRIES,
-                        )
-                        _progress(f"⏳ Empty LLM response, retrying ({_attempt + 1}/{_MAX_EMPTY_RETRIES})…")
-
-                # Parse JSON
-                action_obj = self._parse_json(raw)
-                if action_obj is None:
-                    _json_fail_streak += 1
-                    logger.warning(
-                        "%sLLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
-                        _pfx, step, max_steps, _json_fail_streak, len(raw), raw[:1000],
-                    )
-                    if _json_fail_streak >= _JSON_FAIL_LIMIT:
-                        # Model is stuck producing non-JSON. Coerce to a finish action so
-                        # the run loop terminates cleanly instead of burning remaining steps.
-                        logger.error(
-                            "%sNon-JSON streak reached %d — coercing to finish action",
-                            _pfx, _json_fail_streak,
-                        )
-                        action_obj = {
-                            "action": "finish",
-                            "result": (
-                                f"⚠️ Model returned non-JSON {_json_fail_streak} times in a row. "
-                                f"Last response (truncated): {raw[:500]}"
-                            ),
-                        }
-                        # Fall through to action dispatch below
-                    else:
-                        messages.append({"role": "assistant", "content": raw})
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                'ERROR: Your response was not valid JSON. '
-                                'You MUST respond with ONLY a raw JSON object — no markdown, '
-                                'no prose, no ```json fences. Example: '
-                                '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
-                            )
-                        })
-                        continue
-
-                _json_fail_streak = 0  # reset on successful parse
-
-                messages.append({"role": "assistant", "content": raw})
-                action = action_obj.get("action", "")
-
-                # Normalize shorthand: {"action": "shell"} → {"action": "tool", "tool": "shell"}
-                _BUILTIN_NAMES = {"shell", "file_read", "file_write", "schedule", "spawn_agent", "get_agent_result", "memory_write"}
-                if action in _BUILTIN_NAMES:
-                    logger.warning("%sLLM used shorthand action '%s' — normalizing to tool call", _pfx, action)
-                    # If the LLM already provided an "args" key, use it directly to avoid
-                    # double-nesting ({"args": {"args": ...}} → 'key' is required errors).
-                    # Fall back to extracting all non-"action" keys as a flat args dict.
-                    if "args" in action_obj:
-                        shorthand_args = action_obj["args"]
-                        if isinstance(shorthand_args, str):
-                            # LLM emitted args as a JSON string — attempt to parse it.
-                            # Only accept dict/list results; primitives (str, int, bool, None)
-                            # would crash callers that expect a dict.
-                            try:
-                                parsed = json.loads(shorthand_args)
-                                if isinstance(parsed, (dict, list)):
-                                    shorthand_args = parsed
-                                else:
-                                    logger.warning(
-                                        "Shorthand action '%s' args parsed to non-dict type %s — keeping string",
-                                        action, type(parsed).__name__,
-                                    )
-                            except (ValueError, TypeError):
-                                logger.warning(
-                                    "Shorthand action '%s' args is a non-JSON string — keeping as-is: %s",
-                                    action, shorthand_args[:200],
-                                )
-                    else:
-                        shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
-                    action_obj = {"action": "tool", "tool": action, "args": shorthand_args}
-                    action = "tool"
-
-                # ---- Dispatch ----
-
-                if action == "finish":
-                    result = action_obj.get("result", "Done.")
-                    # Guard: LLMs sometimes return a dict/list as the result field.
-                    # dict[:80] raises "unhashable type: 'slice'" — coerce to string.
-                    if not isinstance(result, str):
-                        if isinstance(result, (dict, list)):
-                            result = json.dumps(result, ensure_ascii=False)
-                        else:
-                            result = str(result) if result else "Done."
-                    _elapsed = _time.time() - _run_start
-                    _active_model = self.llm.llm_cfg.get("model", "?")
-                    logger.info("%sfinish | model: %s | steps: %d | elapsed: %.1fs", _pfx, _active_model, step, _elapsed)
-                    self.memory.record_event(f"Agent finished: {result[:80]}")
-                    if self.short_term:
-                        self.short_term.add("user", user_goal)
-                        self.short_term.add("assistant", result)
-                    if self.results and self.working and self.working.has_content():
-                        tools_used = [
-                            s["details"].get("tool", "")
-                            for s in self.working.steps
-                            if s["action"] == "tool"
-                        ]
-                        self.results.add_result(
-                            goal=user_goal,
-                            summary=result[:500],
-                            tools_used=tools_used,
-                        )
-                    if self.working:
-                        self.working.clear()
-                    return result
-
-                elif action == "tool":
-                    tool_name = action_obj.get("tool", "")
-                    args = action_obj.get("args", {})
-                    # Normalize: LLM sometimes emits args as a list instead of a dict
-                    if isinstance(args, list):
-                        args = {str(i): v for i, v in enumerate(args)}
-                    _progress(f"🔧 Running tool: <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
-
-                    # vision_query is handled directly here (needs LLM access)
-                    if tool_name == "vision_query":
-                        outcome = self._exec_vision_query(args)
-                    # Built-in tools take priority
-                    elif self.builtin_executor and self.builtin_executor.is_builtin(tool_name):
-                        outcome = self.builtin_executor.execute(tool_name, args, caller_depth=self._depth, caller_tag=self.label)
-
-                        if outcome.get("requires_confirmation"):
-                            token = outcome["token"]
-                            description = outcome.get("description", tool_name)
-
-                            # Auto-approve if the operator already approved this tool type.
-                            if tool_name in self._auto_approve_tools:
-                                logger.info(
-                                    "%sAuto-approving '%s' (operator approved all %s)",
-                                    _pfx, tool_name, tool_name,
-                                )
-                                outcome = self.builtin_executor.confirm(token)
-                                _progress(f"✅ Auto-approved <code>{tool_name}</code> (approve-all active)")
-                            else:
-                                # Set up blocking event
-                                event = threading.Event()
-                                self._confirm_events[token] = event
-                                self._confirm_results[token] = False
-                                # Signal the UI: __CONFIRM__:{token}:{tool_name}:{description}
-                                _progress(f"{_CONFIRM_PREFIX}:{token}:{tool_name}:{description}")
-                                # Block until user responds (timeout 5 min)
-                                event.wait(timeout=300)
-                                # Always read the actual result — handles the race where
-                                # resume() fires between timeout-return and this pop.
-                                result_confirmed = self._confirm_results.pop(token, False)
-                                self._confirm_events.pop(token, None)
-
-                                if result_confirmed:
-                                    outcome = self.builtin_executor.confirm(token)
-                                    _progress(f"✅ Confirmed — executing <code>{tool_name}</code>\n{self._fmt_tool_call(tool_name, args)}")
-                                else:
-                                    self.builtin_executor.cancel(token)
-                                    outcome = {
-                                        "success": False, "output": "", "exit_code": -1,
-                                        "error": (
-                                            "Operation cancelled by the operator. "
-                                            "Do not retry this operation via any other tool or method. "
-                                            "Respond with a finish action now."
-                                        ),
-                                    }
-                                    _progress("❌ Cancelled by operator — stopping task.")
-                                    _operator_cancelled = True
-                    # MCP tools — route through MCPManager
-                    elif self.mcp_manager and self.mcp_manager.has_tool(tool_name):
-                        outcome = self.mcp_manager.call_tool(tool_name, args)
-                    else:
-                        outcome = self.executor.execute(tool_name, args)
-
-                    if self.working:
-                        self.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
-
-                    # If the tool produced a file to send, trigger async upload via progress prefix
-                    if outcome.get("send_file"):
-                        path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
-                        caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
-                        _progress(f"__FILE__:{path_b64}:{caption_b64}")
-
-                    tool_result = self._format_tool_result(tool_name, outcome)
-                    if outcome["success"]:
-                        logger.info("%sTool '%s' result: success=True", _pfx, tool_name)
-                    else:
-                        logger.warning(
-                            "%sTool '%s' result: success=False | error=%s | args=%s",
-                            _pfx, tool_name,
-                            outcome.get("error", ""),
-                            {k: str(v)[:120] for k, v in args.items()},
-                        )
-                    _progress(self._fmt_tool_result_progress(tool_name, args, outcome))
-                    messages.append({"role": "user", "content": tool_result})
-                    if _operator_cancelled:
-                        break  # stop the inner loop — operator cancelled this operation
-
-                elif action == "create_tool":
-                    tool_name = action_obj.get("name", "unnamed_tool")
-                    language = action_obj.get("language", "python")
-                    code = action_obj.get("code", "")
-                    description = action_obj.get("description", "")
-
-                    # All tool creation requires operator confirmation
-                    token = secrets.token_hex(4)
-                    self._tool_create_pending[token] = {
-                        "name": tool_name,
-                        "language": language,
-                        "code": code,
-                        "description": description,
-                    }
-                    tc_event = threading.Event()
-                    self._tool_create_events[token] = tc_event
-                    self._tool_create_results[token] = "cancel"
-                    _progress(f"{_TOOL_CREATE_PREFIX}:{token}")
-                    # Block up to 5 min
-                    tc_event.wait(timeout=300)
-                    tc_event = self._tool_create_events.pop(token, None)
-                    tc_action = self._tool_create_results.pop(token, "cancel")
-                    self._tool_create_pending.pop(token, None)
-
-                    if tc_action == "create":
-                        result = self.creator.create(tool_name, language, code, description)
-                        if self.working:
-                            self.working.add_step("create_tool", {"name": tool_name, "success": result["success"]})
-                        if result["success"]:
-                            feedback = (
-                                f"Tool '{result['name']}' was created successfully at {result['path']}. "
-                                "You can now use it with the 'tool' action."
-                            )
-                            _progress(f"🛠️ Tool Created: <code>{result['name']}</code>\n✅ {description}")
-                        else:
-                            feedback = f"Tool creation failed: {result['error']}"
-                            _progress(f"🛠️ Tool Creation Failed: <code>{tool_name}</code>\n❌ {result['error']}")
-                        logger.info("Tool creation '%s': %s", tool_name, result)
-
-                    elif tc_action == "run":
-                        _progress(f"⚡ Running <code>{tool_name}</code> as one-off script…")
-                        try:
-                            if language == "python":
-                                proc = subprocess.run(
-                                    [sys.executable, "-c", code],
-                                    capture_output=True, text=True, timeout=30
-                                )
-                            else:
-                                proc = subprocess.run(
-                                    ["bash", "-c", code],
-                                    capture_output=True, text=True, timeout=30
-                                )
-                            output = (proc.stdout or "") + (proc.stderr or "")
-                            output = output[:2000]
-                            feedback = f"Script executed (exit {proc.returncode}):\n{output}" if output else f"Script executed (exit {proc.returncode}), no output."
-                            _progress(f"⚡ Script result (exit {proc.returncode}):\n<blockquote>{output[:400]}</blockquote>" if output else "⚡ Script ran, no output.")
-                        except Exception as exc:
-                            feedback = f"Script execution failed: {exc}"
-                            _progress(f"❌ Script failed: {exc}")
-
-                    else:  # cancel
-                        feedback = (
-                            "Tool creation was cancelled by the operator. "
-                            "Do not attempt to create, write, or execute this code via shell, "
-                            "file_write, or any other method. Respond with a finish action now."
-                        )
-                        _progress("❌ Tool creation cancelled by operator — stopping task.")
-                        _operator_cancelled = True
-
-                    messages.append({"role": "user", "content": feedback})
-                    if _operator_cancelled:
-                        break  # stop the inner loop — operator cancelled this operation
-
-                else:
-                    logger.warning("%sUnknown action '%s' from LLM", _pfx, action)
-                    messages.append({
-                        "role": "user",
-                        "content": f'Unknown action "{action}". Use "tool", "create_tool", or "finish".',
-                    })
-
-            # Inner while exited — check if operator cancelled the task.
-            if _operator_cancelled:
-                self.memory.record_event("Task cancelled by operator")
-                return "⚠️ Task stopped by operator."
-
-            # Max steps reached. Ask user to extend.
-            ext_token = secrets.token_hex(4)
-            ext_event = threading.Event()
-            self._extend_events[ext_token] = ext_event
-            self._extend_results[ext_token] = "no"
-            _progress(f"{_EXTEND_PREFIX}:{ext_token}:{max_steps}")
-            ext_event.wait(timeout=120)  # 2-min window to respond
-            self._extend_events.pop(ext_token, None)
-            ext_response = self._extend_results.pop(ext_token, "no")
-
-            if ext_response == "unlimited":
-                max_steps = 10_000_000
-                logger.info("%sAgent steps set to unlimited by user", _pfx)
-                _progress("♾️ Running until done (unlimited steps)…")
-                continue
-            elif ext_response == "yes":
-                max_steps += 10
-                logger.info("%sAgent steps extended to %d by user", _pfx, max_steps)
-                _progress(f"⏩ Extended — continuing to step {max_steps}…")
-                continue  # back to outer while → re-enters inner while
-
-            # User declined or timed out
-            break
-
-        # Max iterations reached and user declined to extend
-        self.memory.record_event("Agent hit max iterations")
-        return "⚠️ Agent reached maximum steps. Operation cancelled."
-
-    def _exec_vision_query(self, args: dict) -> dict:
-        """Execute a vision_query built-in: ask the LLM to analyse a local image file."""
-        path = args.get("path", "")
-        question = args.get("question", "What is in this image?")
-        if not path:
-            return {"success": False, "output": "", "error": "vision_query: 'path' argument is required."}
-        encoded = _encode_images([path])
-        if not encoded:
-            return {
-                "success": False, "output": "",
-                "error": f"vision_query: could not read or encode image at '{path}'. "
-                         "Check that the path is correct and the file exists.",
-            }
-        messages = [{"role": "user", "content": question, "images": [path]}]
-        try:
-            answer = self.llm.chat(messages, system=None)
-        except LLMCancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            return {"success": False, "output": "", "error": f"vision_query LLM call failed: {exc}"}
-        return {"success": True, "output": answer, "error": ""}
 
     def cancel(self) -> None:
         """Cancel the currently-running task. Safe to call from any thread."""
@@ -772,54 +362,7 @@ class AgentController:
         )
 
     # ------------------------------------------------------------------
-    # Context compaction
-    # ------------------------------------------------------------------
-
-    def _maybe_compact(self, messages: list[dict], system: str) -> list[dict]:
-        """
-        If estimated context tokens exceed 85% of ctx_max_tokens, summarise
-        the middle portion of the conversation to reduce size.
-        """
-        total = _estimate_messages_tokens(messages, system)
-        threshold = int(self.ctx_max_tokens * 0.85)
-        if total <= threshold:
-            return messages
-        if len(messages) <= 3:
-            return messages  # too short to compact meaningfully
-
-        logger.warning(
-            "Context size ~%d tokens exceeds threshold %d — compacting…",
-            total, threshold,
-        )
-        # Keep first message (user goal) and last 2 messages; summarise the middle
-        first = messages[:1]
-        middle = messages[1:-2]
-        last = messages[-2:]
-
-        middle_text = "\n".join(
-            f"[{m['role']}]: {m['content'][:500]}" for m in middle
-        )
-        try:
-            summary = self.llm.chat([{
-                "role": "user",
-                "content": (
-                    "Summarize these intermediate agent steps concisely in bullet points "
-                    "(preserve tool names, key outputs, and decisions):\n\n" + middle_text
-                ),
-            }])
-        except Exception as exc:
-            logger.error("Compaction LLM call failed: %s", exc)
-            return messages  # fall back to uncompacted
-
-        compacted = first + [
-            {"role": "user", "content": f"[Compacted context — earlier steps summary]\n{summary}"}
-        ] + last
-        new_total = _estimate_messages_tokens(compacted, system)
-        logger.info("Compacted context: %d → ~%d tokens", total, new_total)
-        return compacted
-
-    # ------------------------------------------------------------------
-    # Internals
+    # Internals (delegates to react_loop module)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -847,136 +390,23 @@ class AgentController:
 
     @staticmethod
     def _fmt_tool_call(tool_name: str, args: dict) -> str:
-        """Format a tool call as a compact, readable string for progress display."""
-        if tool_name == "shell":
-            cmd = args.get("command", "")
-            return f"<blockquote>$ {cmd}</blockquote>"
-        if tool_name == "file_read":
-            return f"<blockquote>read: {args.get('path', '?')}</blockquote>"
-        if tool_name == "file_write":
-            path = args.get("path", "?")
-            size = len(args.get("content", ""))
-            return f"<blockquote>write: {path} ({size} bytes)</blockquote>"
-        # Generic: show args as compact JSON, truncated
-        import json as _json
-        try:
-            arg_str = _json.dumps(args, ensure_ascii=False)
-        except Exception:
-            arg_str = str(args)
-        if len(arg_str) > 200:
-            arg_str = arg_str[:197] + "…"
-        return f"<blockquote>{arg_str}</blockquote>" if arg_str and arg_str != "{}" else ""
+        return fmt_tool_call(tool_name, args)
 
     @staticmethod
     def _fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
-        """Format a tool result as a short progress update."""
-        call = AgentController._fmt_tool_call(tool_name, args)
-        if outcome["success"]:
-            out = (outcome.get("output") or "").strip()
-            if out:
-                lines = out.splitlines()
-                preview = "\n".join(lines[:8])
-                if len(lines) > 8 or len(preview) > 400:
-                    preview = preview[:400] + "\n…"
-                return f"🔧 <b>{tool_name}</b> ✅\n{call}\n<blockquote>{preview}</blockquote>"
-            return f"🔧 <b>{tool_name}</b> ✅\n{call}\n<i>(no output)</i>"
-        else:
-            err = (outcome.get("error") or outcome.get("output") or "failed").strip()
-            if len(err) > 300:
-                err = err[:297] + "…"
-            return f"🔧 <b>{tool_name}</b> ❌\n{call}\n<blockquote>{err}</blockquote>"
+        return fmt_tool_result_progress(tool_name, args, outcome)
 
     @staticmethod
     def _format_tool_result(tool_name: str, outcome: dict) -> str:
-        if outcome["success"]:
-            output = outcome["output"] or "(no output)"
-            return f"Tool '{tool_name}' succeeded:\n{output}"
-        else:
-            parts = [f"Tool '{tool_name}' failed (exit {outcome.get('exit_code', '?')})."]
-            if outcome.get("error"):
-                parts.append(f"stderr: {outcome['error']}")
-            if outcome.get("output"):
-                parts.append(f"stdout: {outcome['output']}")
-            return "\n".join(parts)
+        return format_tool_result(tool_name, outcome)
 
     @staticmethod
     def _extract_json_candidates(text: str) -> list[str]:
-        """
-        Brace-counting extractor: returns all balanced {…} substrings found in text.
-        Handles multiple JSON objects in a single response and prose-wrapped objects.
-        """
-        candidates = []
-        depth = 0
-        start = -1
-        in_string = False
-        escape_next = False
-        for i, ch in enumerate(text):
-            if escape_next:
-                escape_next = False
-                continue
-            if ch == "\\" and in_string:
-                escape_next = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "{":
-                if depth == 0:
-                    start = i
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0 and start != -1:
-                    candidates.append(text[start:i + 1])
-                    start = -1
-        return candidates
+        return extract_json_candidates(text)
 
     @staticmethod
     def _parse_json(text: str) -> Optional[dict]:
-        """Extract and parse the first valid JSON action object found in the text."""
-        text = text.strip()
-        if not text:
-            return None
-
-        # 1. Try the whole text as-is
-        try:
-            obj = json.loads(text)
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            pass
-
-        # 2. Strip markdown code fences then try again
-        fence_match = re.search(r"```(?:json)?\s*(\{.*?})\s*```", text, re.DOTALL)
-        if fence_match:
-            try:
-                obj = json.loads(fence_match.group(1))
-                if isinstance(obj, dict):
-                    return obj
-            except json.JSONDecodeError:
-                pass
-
-        # 3. Brace-counting extractor — handles multiple objects and prose wrappers.
-        #    Prefer the first candidate that has an "action" key; fall back to first parseable dict.
-        candidates = AgentController._extract_json_candidates(text)
-        first_valid: Optional[dict] = None
-        for candidate in candidates:
-            try:
-                obj = json.loads(candidate)
-                if not isinstance(obj, dict):
-                    continue
-                if first_valid is None:
-                    first_valid = obj
-                if "action" in obj:
-                    return obj
-            except json.JSONDecodeError:
-                continue
-        if first_valid is not None:
-            return first_valid
-
-        return None
+        return parse_json(text)
 
 
 
