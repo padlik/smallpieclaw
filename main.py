@@ -352,16 +352,16 @@ def _run(
         return agent.run(text, progress_callback=progress_cb, images=images or None)
 
     # Build TelegramInterface first so notify() can reference it
-    # (scheduler and tg are wired together via forward references in closures)
-    _tg_holder: list = [None]
+    # (tg is created after scheduler/sub_agent_factory wiring, so we use nonlocal)
+    tg: TelegramInterface | None = None
 
     def notify(msg):
-        if _tg_holder[0] is not None:
-            _tg_holder[0].send_message_to_users(msg)
+        if tg is not None:
+            tg.send_message_to_users(msg)
 
     def notify_html(html_msg):
-        if _tg_holder[0] is not None:
-            _tg_holder[0].send_html_to_users(html_msg)
+        if tg is not None:
+            tg.send_html_to_users(html_msg)
 
     # Resolve background_model for sub-agents
     background_model_id = agent_cfg.get("background_model") or agent_cfg.get("default_model", "")
@@ -454,7 +454,6 @@ def _run(
         mcp_manager=mcp_manager,
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
-    _tg_holder[0] = tg
 
     scheduler.start()
     try:
