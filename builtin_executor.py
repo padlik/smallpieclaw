@@ -270,9 +270,28 @@ class BuiltinExecutor:
     # Public API
     # ------------------------------------------------------------------
 
-    def shutdown(self) -> None:
-        """Shut down the sub-agent thread pool (wait for running tasks)."""
-        self._sub_agent_pool.shutdown(wait=False)
+    def shutdown(self, graceful_timeout: float = 10.0) -> None:
+        """Shut down the sub-agent thread pool.
+
+        Signals all active sub-agents to cancel, waits up to graceful_timeout
+        seconds for them to finish, then forces shutdown of any stragglers.
+        """
+        from sub_agent_registry import get_registry as _get_registry
+        registry = _get_registry()
+        active = registry.list_active()
+        if active:
+            logger.info("Shutdown: cancelling %d active sub-agent(s)…", len(active))
+            for record in active:
+                record.cancel()
+            # Wait briefly for cancelled agents to wind down before forcing pool shutdown
+            import time as _time
+            deadline = _time.monotonic() + graceful_timeout
+            while _time.monotonic() < deadline:
+                if not any(r.status == "running" for r in registry.list_active()):
+                    break
+                _time.sleep(0.25)
+        self._sub_agent_pool.shutdown(wait=False, cancel_futures=True)
+        logger.debug("Sub-agent pool shut down.")
 
     def is_builtin(self, name: str) -> bool:
         return name in BUILTIN_TOOLS
