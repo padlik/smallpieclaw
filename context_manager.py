@@ -54,7 +54,7 @@ def maybe_compact(
     last = messages[-2:]
 
     middle_text = "\n".join(
-        f"[{m['role']}]: {m['content'][:500]}" for m in middle
+        f"[{m['role']}]: {str(m.get('content') or '')[:500]}" for m in middle
     )
 
     try:

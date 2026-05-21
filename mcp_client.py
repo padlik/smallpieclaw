@@ -441,6 +441,23 @@ class MCPHttpClient(MCPBaseClient):
             return self._parse_sse(r.text)
         return r.json()
 
+    def _post_notification(self, method: str, params: Optional[dict] = None) -> None:
+        """Send a JSON-RPC notification over HTTP (no id, no response expected)."""
+        obj: dict = {"jsonrpc": "2.0", "method": method}
+        if params:
+            obj["params"] = params
+        try:
+            r = self._session.post(
+                self._url,
+                json=obj,
+                headers=self._headers,
+                timeout=self.timeout,
+            )
+            # Servers may return 200 or 204; both are acceptable for notifications
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("MCP [%s] notification '%s' post error (non-fatal): %s", self.name, method, exc)
+
     @staticmethod
     def _parse_sse(text: str) -> dict:
         """Extract the first JSON-RPC response from an SSE body."""
@@ -468,6 +485,9 @@ class MCPHttpClient(MCPBaseClient):
         })
         if "error" in resp:
             raise MCPConnectionError(f"MCP [{self.name}] initialize error: {resp['error']}")
+        # MCP spec (2024-11-05 §3.1): after a successful initialize response,
+        # client MUST send notifications/initialized (no params required)
+        self._post_notification("notifications/initialized")
 
     def _list_tools(self) -> list[dict]:
         req_id = self._next_id()
