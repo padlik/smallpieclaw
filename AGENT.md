@@ -1,11 +1,9 @@
 # Agent Capabilities Reference
 
-> This document describes all features available to the smallpieclaw agent.
-> A compact decision-guidance summary is injected into agent memory at every startup
-> as `_self_knowledge`, so the agent can reason about its capabilities without reading
-> this file first.
+> This document is a static human-readable reference for contributors and operators.
+> It describes all features available in the smallpieclaw agent.
 >
-> **Last updated:** 2026-05-21 16:04 UTC (db8643f)
+> **Last updated:** 2026-05-21
 
 ---
 
@@ -201,9 +199,6 @@ MCP servers provide additional tools beyond the built-ins.
 - `/mcp on <name>` / `/mcp off <name>` — activate/deactivate
 - `/mcp info <name>` — show server details and available tools
 
-**Runtime knowledge:** configured servers and their status are stored in `_mcp_servers`
-memory key at every startup — check it to know what's currently available.
-
 ---
 
 ## Skills
@@ -241,9 +236,3 @@ run unlimited, or stop. The operator has 2 minutes to respond.
 The agent can propose new Python or bash tools for operator approval.
 Approved tools are saved to `tools_generated/` and immediately available.
 One-off scripts can be run without saving.
-
----
-
-<!-- MEMORY_SEED_START -->
-App: smallpieclaw home-server agent. No native web search — use shell+curl. No DB client — use shell+sqlite3/psql. Prefer file_patch over read+rewrite for edits. Use spawn_agent for parallel/long tasks. vision_query for images. schedule for recurring jobs. MCP: stdio+HTTP only, no OAuth; active servers in _mcp_servers. memory_write to persist facts. Do NOT store model config in memory.
-<!-- MEMORY_SEED_END -->
