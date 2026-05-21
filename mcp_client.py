@@ -333,8 +333,9 @@ class MCPStdioClient(MCPBaseClient):
         resp = self._recv(req_id)
         if "error" in resp:
             raise MCPConnectionError(f"MCP [{self.name}] initialize error: {resp['error']}")
-        # Acknowledge (spec requires "initialized", not "notifications/initialized")
-        self._send_notification("initialized")
+        # MCP spec (2024-11-05 §3.1): after a successful initialize response,
+        # client MUST send notifications/initialized (no params required)
+        self._send_notification("notifications/initialized")
 
     def _list_tools(self) -> list[dict]:
         req_id = self._next_id()
