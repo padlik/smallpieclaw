@@ -245,8 +245,15 @@ class MCPStdioClient(MCPBaseClient):
         try:
             for raw in proc.stderr:
                 line = raw.decode(errors="replace").rstrip()
-                if line:
+                if not line:
+                    continue
+                upper = line.upper()
+                if "ERROR" in upper or "CRITICAL" in upper:
                     logger.warning("MCP [%s] stderr: %s", self.name, line)
+                elif "WARNING" in upper or "WARN" in upper:
+                    logger.info("MCP [%s] stderr: %s", self.name, line)
+                else:
+                    logger.debug("MCP [%s] stderr: %s", self.name, line)
         except Exception:
             pass
 
