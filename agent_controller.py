@@ -17,6 +17,7 @@ import logging
 import threading
 from typing import Callable, Optional
 
+from confirmation import ConfirmationManager
 from llm_client import LLMClient
 from memory_store import MemoryStore
 from prompt_builder import (
@@ -109,35 +110,13 @@ class AgentController:
         # Pattern: the ReAct loop (run() method) executes on a worker thread
         # (via run_in_executor in telegram_interface._run_agent_task). When
         # a dangerous tool call or step-limit extension needs user approval,
-        # the loop creates a threading.Event keyed by a unique token, sends
-        # a progress callback to request UI buttons, then blocks on
-        # event.wait(). The Telegram callback handler (on the asyncio event
-        # loop thread) calls resume()/resume_extend()/resume_tool_create()
-        # which sets the result dict entry and then event.set(), unblocking
-        # the worker thread.
-        #
-        # Thread-safety: Event objects are created by the worker thread
-        # before being waited on; the asyncio thread only calls .set().
-        # Dict mutations are single-key insertions/pops which are atomic
-        # in CPython (GIL). No additional lock is needed.
+        # ConfirmationManager creates a threading.Event keyed by a unique
+        # token, sends a progress callback to request UI buttons, then
+        # blocks on event.wait(). The Telegram callback handler (on the
+        # asyncio event loop thread) calls the signal_* methods, which set
+        # the result and unblock the worker thread.
         # ------------------------------------------------------------------
-
-        # Confirmation state: token -> threading.Event and result holder
-        self._confirm_events: dict[str, threading.Event] = {}
-        self._confirm_results: dict[str, bool] = {}
-
-        # Tools approved for the lifetime of this task (no further confirmation needed).
-        # Populated via resume_approve_all(); cleared in reset_task().
-        self._auto_approve_tools: set[str] = set()
-
-        # Max-steps extension state; values: "yes" | "no" | "unlimited"
-        self._extend_events: dict[str, threading.Event] = {}
-        self._extend_results: dict[str, str] = {}
-
-        # Tool-creation confirmation state
-        self._tool_create_events: dict[str, threading.Event] = {}
-        self._tool_create_results: dict[str, str] = {}   # "create" | "run" | "cancel"
-        self._tool_create_pending: dict[str, dict] = {}  # token → {name, language, code, description}
+        self._confirmation = ConfirmationManager()
 
     # ------------------------------------------------------------------
     # Public API
@@ -178,14 +157,7 @@ class AgentController:
             results=self.results,
             cancel_event=self._cancel_event,
             on_step=self._on_step,
-            confirm_events=self._confirm_events,
-            confirm_results=self._confirm_results,
-            auto_approve_tools=self._auto_approve_tools,
-            extend_events=self._extend_events,
-            extend_results=self._extend_results,
-            tool_create_events=self._tool_create_events,
-            tool_create_results=self._tool_create_results,
-            tool_create_pending=self._tool_create_pending,
+            confirmation=self._confirmation,
         )
         return react_loop(ctx, user_goal, progress_callback, images)
 
@@ -197,27 +169,14 @@ class AgentController:
 
     def resume(self, token: str, confirmed: bool) -> None:
         """Called by TelegramInterface when user responds to a file_write/shell confirmation."""
-        logger.info("resume() called: token=%s confirmed=%s event_found=%s",
-                    token[:8], confirmed, token in self._confirm_events)
-        self._confirm_results[token] = confirmed
-        event = self._confirm_events.get(token)
-        if event:
-            event.set()
-        else:
-            logger.warning("resume(): no event found for token=%s (already resolved or timed out?)", token[:8])
+        self._confirmation.signal_confirmation(token, confirmed)
 
     def resume_extend(self, token: str, response: str) -> None:
         """Called by TelegramInterface when user responds to a max-steps extension prompt.
 
         response: "yes" | "no" | "unlimited"
         """
-        logger.info("resume_extend(): token=%s response=%s", token[:8], response)
-        self._extend_results[token] = response
-        event = self._extend_events.get(token)
-        if event:
-            event.set()
-        else:
-            logger.warning("resume_extend(): no event for token=%s", token[:8])
+        self._confirmation.signal_extension(token, response)
 
     def resume_approve_all(self, token: str, tool_name: str) -> None:
         """Called by TelegramInterface when user presses 'Approve all {tool_name}'.
@@ -225,28 +184,15 @@ class AgentController:
         Confirms the current pending operation AND registers tool_name for
         automatic approval for the rest of this task.
         """
-        logger.info("resume_approve_all(): token=%s tool_name=%s", token[:8], tool_name)
-        self._auto_approve_tools.add(tool_name)
-        self._confirm_results[token] = True
-        event = self._confirm_events.get(token)
-        if event:
-            event.set()
-        else:
-            logger.warning("resume_approve_all(): no event for token=%s", token[:8])
+        self._confirmation.signal_approve_all(token, tool_name)
 
     def get_pending_tool_create(self, token: str) -> Optional[dict]:
         """Return pending tool-create data for display in Telegram UI."""
-        return self._tool_create_pending.get(token)
+        return self._confirmation.get_pending_tool_create(token)
 
     def resume_tool_create(self, token: str, action: str) -> None:
         """Called by TelegramInterface with 'create', 'run', or 'cancel'."""
-        logger.info("resume_tool_create(): token=%s action=%s", token[:8], action)
-        self._tool_create_results[token] = action
-        event = self._tool_create_events.get(token)
-        if event:
-            event.set()
-        else:
-            logger.warning("resume_tool_create(): no event for token=%s", token[:8])
+        self._confirmation.signal_tool_create(token, action)
 
     def build_system_prompt(self, user_goal: str = "(context snapshot)") -> tuple[str, int]:
         """Build the full system prompt as it would be sent to the LLM.
@@ -294,7 +240,7 @@ class AgentController:
             self.working.clear()
         if self.short_term:
             self.short_term.clear()
-        self._auto_approve_tools.clear()
+        self._confirmation.clear_auto_approve()
         return msg
 
     def compress_context(self) -> str:

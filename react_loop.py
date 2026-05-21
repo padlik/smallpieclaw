@@ -21,18 +21,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from confirmation import ConfirmationManager
+from context_manager import maybe_compact
 from llm_client import LLMClient, LLMCancelledError, _encode_images
-from prompt_builder import (
-    build_system_prompt as _build_system_prompt,
-    estimate_messages_tokens,
-)
+from prompt_builder import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
-
-# Marker prefixes for interactive UI requests via progress callback
-CONFIRM_PREFIX = "__CONFIRM__"
-EXTEND_PREFIX = "__EXTEND__"
-TOOL_CREATE_PREFIX = "__TOOL_CREATE__"
 
 
 # ---------------------------------------------------------------------------
@@ -76,15 +70,8 @@ class ReactContext:
     # Step callback
     on_step: Optional[Callable[[int], None]] = None
 
-    # Cross-thread confirmation state (shared dicts)
-    confirm_events: dict = field(default_factory=dict)
-    confirm_results: dict = field(default_factory=dict)
-    auto_approve_tools: set = field(default_factory=set)
-    extend_events: dict = field(default_factory=dict)
-    extend_results: dict = field(default_factory=dict)
-    tool_create_events: dict = field(default_factory=dict)
-    tool_create_results: dict = field(default_factory=dict)
-    tool_create_pending: dict = field(default_factory=dict)
+    # Confirmation coordination (shared with AgentController and Telegram)
+    confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
 
     @property
     def log_prefix(self) -> str:
@@ -227,50 +214,6 @@ def format_tool_result(tool_name: str, outcome: dict) -> str:
         return "\n".join(parts)
 
 
-def maybe_compact(ctx: ReactContext, messages: list[dict], system: str) -> list[dict]:
-    """
-    If estimated context tokens exceed 85% of ctx_max_tokens, summarise
-    the middle portion of the conversation to reduce size.
-    """
-    total = estimate_messages_tokens(messages, system)
-    threshold = int(ctx.ctx_max_tokens * 0.85)
-    if total <= threshold:
-        return messages
-    if len(messages) <= 3:
-        return messages
-
-    pfx = ctx.log_prefix
-    logger.warning(
-        "%sContext size ~%d tokens exceeds threshold %d — compacting…",
-        pfx, total, threshold,
-    )
-    first = messages[:1]
-    middle = messages[1:-2]
-    last = messages[-2:]
-
-    middle_text = "\n".join(
-        f"[{m['role']}]: {m['content'][:500]}" for m in middle
-    )
-    try:
-        summary = ctx.llm.chat([{
-            "role": "user",
-            "content": (
-                "Summarize these intermediate agent steps concisely in bullet points "
-                "(preserve tool names, key outputs, and decisions):\n\n" + middle_text
-            ),
-        }])
-    except Exception as exc:
-        logger.error("Compaction LLM call failed: %s", exc)
-        return messages
-
-    compacted = first + [
-        {"role": "user", "content": f"[Compacted context — earlier steps summary]\n{summary}"}
-    ] + last
-    new_total = estimate_messages_tokens(compacted, system)
-    logger.info("%sCompacted context: %d → ~%d tokens", pfx, total, new_total)
-    return compacted
-
-
 def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     """Execute a vision_query built-in: ask the LLM to analyse a local image file."""
     path = args.get("path", "")
@@ -383,7 +326,7 @@ def react_loop(
             _progress(f"⚙️ Thinking… (step {step})")
 
             # Context compaction check
-            messages = maybe_compact(ctx, messages, system)
+            messages = maybe_compact(messages, system, ctx.ctx_max_tokens, pfx, ctx.llm)
 
             # LLM call with retry on empty response
             _MAX_EMPTY_RETRIES = 2
@@ -554,14 +497,7 @@ def react_loop(
             return "⚠️ Task stopped by operator."
 
         # Max steps reached — ask user to extend
-        ext_token = secrets.token_hex(4)
-        ext_event = threading.Event()
-        ctx.extend_events[ext_token] = ext_event
-        ctx.extend_results[ext_token] = "no"
-        _progress(f"{EXTEND_PREFIX}:{ext_token}:{max_steps}")
-        ext_event.wait(timeout=120)
-        ctx.extend_events.pop(ext_token, None)
-        ext_response = ctx.extend_results.pop(ext_token, "no")
+        ext_response = ctx.confirmation.request_extension(max_steps, _progress)
 
         if ext_response == "unlimited":
             max_steps = 10_000_000
@@ -614,7 +550,7 @@ def _dispatch_tool(
             token = outcome["token"]
             description = outcome.get("description", tool_name)
 
-            if tool_name in ctx.auto_approve_tools:
+            if tool_name in ctx.confirmation.auto_approve_tools:
                 logger.info(
                     "%sAuto-approving '%s' (operator approved all %s)",
                     pfx, tool_name, tool_name,
@@ -622,13 +558,9 @@ def _dispatch_tool(
                 outcome = ctx.builtin_executor.confirm(token)
                 _progress(f"✅ Auto-approved <code>{tool_name}</code> (approve-all active)")
             else:
-                event = threading.Event()
-                ctx.confirm_events[token] = event
-                ctx.confirm_results[token] = False
-                _progress(f"{CONFIRM_PREFIX}:{token}:{tool_name}:{description}")
-                event.wait(timeout=300)
-                result_confirmed = ctx.confirm_results.pop(token, False)
-                ctx.confirm_events.pop(token, None)
+                result_confirmed = ctx.confirmation.request_confirmation(
+                    token, tool_name, description, _progress,
+                )
 
                 if result_confirmed:
                     outcome = ctx.builtin_executor.confirm(token)
@@ -667,20 +599,8 @@ def _dispatch_create_tool(
     description = action_obj.get("description", "")
 
     token = secrets.token_hex(4)
-    ctx.tool_create_pending[token] = {
-        "name": tool_name,
-        "language": language,
-        "code": code,
-        "description": description,
-    }
-    tc_event = threading.Event()
-    ctx.tool_create_events[token] = tc_event
-    ctx.tool_create_results[token] = "cancel"
-    _progress(f"{TOOL_CREATE_PREFIX}:{token}")
-    tc_event.wait(timeout=300)
-    ctx.tool_create_events.pop(token, None)
-    tc_action = ctx.tool_create_results.pop(token, "cancel")
-    ctx.tool_create_pending.pop(token, None)
+    tool_info = {"name": tool_name, "language": language, "code": code, "description": description}
+    tc_action = ctx.confirmation.request_tool_create(token, tool_info, _progress)
 
     if tc_action == "create":
         result = ctx.creator.create(tool_name, language, code, description)

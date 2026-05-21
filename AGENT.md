@@ -5,7 +5,7 @@
 > as `_self_knowledge`, so the agent can reason about its capabilities without reading
 > this file first.
 >
-> **Last updated:** 2026-05-21 15:20 UTC (9b24e14)
+> **Last updated:** 2026-05-21 15:28 UTC (398d7e8)
 
 ---
 
