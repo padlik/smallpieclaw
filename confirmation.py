@@ -86,32 +86,32 @@ class ConfirmationManager:
     def signal_confirmation(self, token: str, confirmed: bool) -> None:
         """Called from an external thread to deliver the operator's decision.
 
-        Sets the result and unblocks ``request_confirmation``.
+        Only writes the result and unblocks the waiter if the request has not
+        already timed out (i.e. the event entry still exists).
         """
-        logger.info(
-            "signal_confirmation: token=%s confirmed=%s event_found=%s",
-            token[:8], confirmed, token in self._confirm_events,
-        )
-        self._confirm_results[token] = confirmed
         if event := self._confirm_events.get(token):
+            logger.info("signal_confirmation: token=%s confirmed=%s", token[:8], confirmed)
+            self._confirm_results[token] = confirmed
             event.set()
         else:
             logger.warning(
-                "signal_confirmation: no event for token=%s (already resolved?)", token[:8]
+                "signal_confirmation: token=%s already resolved or timed out", token[:8]
             )
 
     def signal_approve_all(self, token: str, tool_name: str) -> None:
         """Approve-all: register *tool_name* for automatic approval for this
         task, then unblock the current ``request_confirmation`` as confirmed.
+
+        Only acts if the request has not already timed out.
         """
-        logger.info("signal_approve_all: token=%s tool_name=%s", token[:8], tool_name)
         self.auto_approve_tools.add(tool_name)
-        self._confirm_results[token] = True
         if event := self._confirm_events.get(token):
+            logger.info("signal_approve_all: token=%s tool_name=%s", token[:8], tool_name)
+            self._confirm_results[token] = True
             event.set()
         else:
             logger.warning(
-                "signal_approve_all: no event for token=%s", token[:8]
+                "signal_approve_all: token=%s already resolved or timed out", token[:8]
             )
 
     # ------------------------------------------------------------------
@@ -141,13 +141,14 @@ class ConfirmationManager:
         """Called from an external thread with the operator's extension decision.
 
         *response* must be ``'yes'``, ``'unlimited'``, or ``'no'``.
+        Only acts if the request has not already timed out.
         """
-        logger.info("signal_extension: token=%s response=%s", token[:8], response)
-        self._extend_results[token] = response
         if event := self._extend_events.get(token):
+            logger.info("signal_extension: token=%s response=%s", token[:8], response)
+            self._extend_results[token] = response
             event.set()
         else:
-            logger.warning("signal_extension: no event for token=%s", token[:8])
+            logger.warning("signal_extension: token=%s already resolved or timed out", token[:8])
 
     # ------------------------------------------------------------------
     # Tool creation
@@ -182,13 +183,16 @@ class ConfirmationManager:
         return self.tool_create_pending.get(token)
 
     def signal_tool_create(self, token: str, action: str) -> None:
-        """Called from an external thread with ``'create'``, ``'run'``, or ``'cancel'``."""
-        logger.info("signal_tool_create: token=%s action=%s", token[:8], action)
-        self._tool_create_results[token] = action
+        """Called from an external thread with ``'create'``, ``'run'``, or ``'cancel'``.
+
+        Only acts if the request has not already timed out.
+        """
         if event := self._tool_create_events.get(token):
+            logger.info("signal_tool_create: token=%s action=%s", token[:8], action)
+            self._tool_create_results[token] = action
             event.set()
         else:
-            logger.warning("signal_tool_create: no event for token=%s", token[:8])
+            logger.warning("signal_tool_create: token=%s already resolved or timed out", token[:8])
 
     # ------------------------------------------------------------------
     # Lifecycle
