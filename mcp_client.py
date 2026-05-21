@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import select
 import subprocess
 import threading
@@ -54,6 +55,10 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 
 # Client info sent in initialize
 _CLIENT_INFO = {"name": "smallpieclaw", "version": "1.0"}
+
+# Patterns for classifying MCP server stderr lines — word-boundary aware
+_STDERR_ERROR_RE = re.compile(r'\b(ERROR|CRITICAL)\b', re.IGNORECASE)
+_STDERR_WARN_RE  = re.compile(r'\bWARN(?:ING)?\b', re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -247,10 +252,9 @@ class MCPStdioClient(MCPBaseClient):
                 line = raw.decode(errors="replace").rstrip()
                 if not line:
                     continue
-                upper = line.upper()
-                if "ERROR" in upper or "CRITICAL" in upper:
+                if _STDERR_ERROR_RE.search(line):
                     logger.warning("MCP [%s] stderr: %s", self.name, line)
-                elif "WARNING" in upper or "WARN" in upper:
+                elif _STDERR_WARN_RE.search(line):
                     logger.info("MCP [%s] stderr: %s", self.name, line)
                 else:
                     logger.debug("MCP [%s] stderr: %s", self.name, line)
