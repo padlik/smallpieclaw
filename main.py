@@ -188,6 +188,52 @@ from tool_index import ToolIndex  # noqa: E402
 from tool_registry import ToolRegistry  # noqa: E402
 
 
+def _seed_agent_memory(memory, agent_dir: str, mcp_manager=None) -> None:
+    """Seed persistent memory with self-knowledge from AGENT.md.
+
+    Extracts the MEMORY_SEED block and stores it as `_self_knowledge`.
+    If mcp_manager is provided, also stores a compact MCP server summary
+    as `_mcp_servers`.
+
+    Both keys use the `_` prefix so they survive purge_matching() and
+    appear in every system prompt via as_prompt_text().
+    """
+    import re as _re
+
+    agent_md_path = os.path.join(agent_dir, "AGENT.md")
+    if os.path.exists(agent_md_path):
+        try:
+            with open(agent_md_path, encoding="utf-8") as f:
+                content = f.read()
+            match = _re.search(
+                r"<!-- MEMORY_SEED_START -->\s*(.*?)\s*<!-- MEMORY_SEED_END -->",
+                content, _re.DOTALL,
+            )
+            if match:
+                seed = match.group(1).strip()
+                memory.set("_self_knowledge", seed)
+                logger.info("Startup: seeded _self_knowledge from AGENT.md (%d chars)", len(seed))
+            else:
+                logger.warning("Startup: AGENT.md found but no MEMORY_SEED block")
+        except OSError as exc:
+            logger.warning("Startup: could not read AGENT.md: %s", exc)
+    else:
+        logger.info("Startup: AGENT.md not found — skipping memory seed")
+
+    if mcp_manager is not None:
+        try:
+            servers = mcp_manager.list_servers() if hasattr(mcp_manager, "list_servers") else []
+            if servers:
+                parts = [
+                    f"{s['name']}:{s.get('transport','?')}:{s.get('status','?')}"
+                    for s in servers
+                ]
+                memory.set("_mcp_servers", "; ".join(parts))
+                logger.info("Startup: seeded _mcp_servers (%d server(s))", len(parts))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Startup: could not seed _mcp_servers: %s", exc)
+
+
 def load_config(path="config.toml"):
     if not os.path.exists(path):
         logger.error("Config file not found: %s", path)
@@ -321,6 +367,9 @@ def _run(
                             len(mcp_tools), len(servers_seen))
         except Exception as exc:
             logger.warning("MCP connect_all failed (agent will start without MCP): %s", exc)
+
+    # Seed agent memory with self-knowledge from AGENT.md and live MCP config
+    _seed_agent_memory(memory, _AGENT_DIR, mcp_manager=mcp_manager)
 
     short_term  = ShortTermMemory(max_turns=20)
     working     = WorkingMemory()
