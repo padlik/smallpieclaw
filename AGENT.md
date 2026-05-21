@@ -125,8 +125,8 @@ Read/write the agent's persistent memory (`data/memory.json`).
 | `/unpair` | Remove a paired user |
 | `/myid` | Show your Telegram user ID |
 | `/health` | Quick health check (memory, scheduler, MCP status) |
-| `/ctx` | Show current context snapshot (system prompt preview) |
-| `/env` | Show runtime environment (paths, config values) |
+| `/show_ctx` | Show current context snapshot (system prompt preview) |
+| `/show_env` | Show runtime environment (paths, config values) |
 | `/models` | List configured models; switch active model |
 
 ---

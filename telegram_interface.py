@@ -145,6 +145,10 @@ class TelegramInterface:
             BotCommand("pair", "Generate or submit pairing token"),
             BotCommand("unpair", "Remove a user from access list"),
             BotCommand("myid", "Show your Telegram user ID"),
+            BotCommand("mcp", "List and manage MCP servers"),
+            BotCommand("show_ctx", "Show current system prompt snapshot"),
+            BotCommand("show_env", "Show runtime environment info"),
+            BotCommand("stop", "Cancel the currently running task"),
         ]
         try:
             await app.bot.set_my_commands(commands)
