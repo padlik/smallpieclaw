@@ -152,7 +152,6 @@ class MemoryStore:
                 # Seed with useful defaults
                 self._data = {
                     "known_services": [],
-                    "last_health_check": None,
                     "notes": [],
                 }
                 self._save_with_retry()

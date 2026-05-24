@@ -130,9 +130,6 @@ long_run_warn_minutes = 30
 
 [scheduler]
 enabled = true
-# Cron-style: "HH:MM" for daily tasks
-nightly_health_check = "02:00"
-disk_check_interval_hours = 6
 
 [paths]
 tools_dir          = "tools"

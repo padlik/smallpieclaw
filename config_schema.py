@@ -74,8 +74,6 @@ class AgentConfig:
 @dataclass(frozen=True)
 class SchedulerConfig:
     enabled: bool = True
-    nightly_health_check: str = "02:00"
-    disk_check_interval_hours: int = 6
 
 
 @dataclass(frozen=True)
@@ -203,8 +201,6 @@ def _parse_scheduler(raw: dict) -> SchedulerConfig:
     section = raw.get("scheduler") or {}
     return SchedulerConfig(
         enabled=bool(section.get("enabled", True)),
-        nightly_health_check=section.get("nightly_health_check", "02:00"),
-        disk_check_interval_hours=int(section.get("disk_check_interval_hours", 6)),
     )
 
 
