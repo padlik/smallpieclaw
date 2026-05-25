@@ -232,8 +232,8 @@ class TestSubAgentFactoryOverrides:
                 overrides["temperature"] = temperature
             if top_p is not None:
                 overrides["top_p"] = top_p
-            if overrides:
-                model_cfg = {**model_cfg, **overrides}
+            # Always copy — never mutate the shared config
+            model_cfg = {**model_cfg, **overrides}
             return model_cfg  # return for inspection
 
         return factory
@@ -245,12 +245,20 @@ class TestSubAgentFactoryOverrides:
         assert result["max_tokens"] == 256
         assert result["temperature"] == pytest.approx(0.9)
 
-    def test_shared_config_not_mutated(self):
+    def test_shared_config_not_mutated_with_overrides(self):
         original = {"model": "gpt-4o", "max_tokens": 1024, "temperature": 0.2}
         factory = self._make_factory_fn([original], original)
         factory(model="gpt-4o", max_tokens=256)
         # original dict must be unchanged
         assert original["max_tokens"] == 1024
+
+    def test_shared_config_not_mutated_without_overrides(self):
+        """Even with no overrides, the returned cfg must be a copy, not the shared ref."""
+        original = {"model": "gpt-4o", "max_tokens": 1024, "temperature": 0.2}
+        factory = self._make_factory_fn([original], original)
+        result = factory(model="gpt-4o")
+        result["max_tokens"] = 999  # mutate the returned dict
+        assert original["max_tokens"] == 1024  # shared config must be unaffected
 
     def test_no_overrides_uses_config_values(self):
         original = {"model": "gpt-4o", "max_tokens": 1024, "temperature": 0.2}

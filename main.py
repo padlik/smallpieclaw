@@ -402,7 +402,7 @@ def _run(
         else:
             model_cfg = background_model_cfg
 
-        # Apply per-call LLM parameter overrides (shallow copy — never mutate the shared config)
+        # Apply per-call LLM parameter overrides — always shallow-copy to protect shared config
         llm_overrides = {}
         if max_tokens is not None:
             llm_overrides["max_tokens"] = max_tokens
@@ -410,8 +410,7 @@ def _run(
             llm_overrides["temperature"] = temperature
         if top_p is not None:
             llm_overrides["top_p"] = top_p
-        if llm_overrides:
-            model_cfg = {**model_cfg, **llm_overrides}
+        model_cfg = {**model_cfg, **llm_overrides}
 
         # max_iterations: explicit override > scheduled default (never use chat max_iter here)
         effective_max_iter = max_iterations if max_iterations is not None else scheduled_max_iter
