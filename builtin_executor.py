@@ -162,6 +162,9 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "                  json → sub-agent must return a single valid JSON object.\n"
             "                  file → sub-agent writes output to a file and returns the absolute path.\n"
             "  context_key     (str, optional) — key for persisting conversation history between calls.\n"
+            "  max_tokens      (int, optional) — override maximum tokens in the sub-agent's response.\n"
+            "  temperature     (float, optional) — override sampling temperature (0.0–2.0).\n"
+            "  top_p           (float, optional) — override nucleus sampling probability (0.0–1.0).\n"
             "\n"
             "Example (good task — self-contained):\n"
             "{\"task\": \"Summarise the podcast transcript already saved at /tmp/piclaw/clean_transcript.txt "
@@ -828,6 +831,24 @@ class BuiltinExecutor:
                     max_iterations = None  # treat 0/negative as "use default"
             except (ValueError, TypeError):
                 max_iterations = None
+
+        # Optional per-call LLM parameter overrides
+        _raw_max_tokens = args.get("max_tokens")
+        _raw_temperature = args.get("temperature")
+        _raw_top_p = args.get("top_p")
+        try:
+            max_tokens_override = int(_raw_max_tokens) if _raw_max_tokens is not None else None
+        except (ValueError, TypeError):
+            max_tokens_override = None
+        try:
+            temperature_override = float(_raw_temperature) if _raw_temperature is not None else None
+        except (ValueError, TypeError):
+            temperature_override = None
+        try:
+            top_p_override = float(_raw_top_p) if _raw_top_p is not None else None
+        except (ValueError, TypeError):
+            top_p_override = None
+
         try:
             runner = self._sub_agent_factory(
                 model=model,
@@ -836,6 +857,9 @@ class BuiltinExecutor:
                 notify_fn=None,   # factory sets this from main notify_fn
                 fallback_models=fallback_models,
                 max_iterations=max_iterations,
+                max_tokens=max_tokens_override,
+                temperature=temperature_override,
+                top_p=top_p_override,
             )
         except ValueError as exc:
             return {"success": False, "output": "", "error": f"spawn_agent: {exc}", "exit_code": -1}

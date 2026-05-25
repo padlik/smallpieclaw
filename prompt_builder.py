@@ -134,7 +134,7 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   file_read         — read a file from the filesystem
   file_write        — write content to a file on the filesystem
   schedule          — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
-  spawn_agent       — spawn an isolated sub-agent in the background; accepts response_format ("text"|"json"|"file"); returns agent_id immediately
+  spawn_agent       — spawn an isolated sub-agent in the background; accepts response_format ("text"|"json"|"file"), max_tokens, temperature, top_p; returns agent_id immediately
   get_agent_result  — wait for a sub-agent to finish and retrieve its typed result; args: agent_id (required), timeout (optional seconds)
   memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string; do NOT store model or provider configuration here
   vision_query      — ask the LLM to analyse an image file on disk. Args: path (str, required — absolute path to image), question (str, required — what to ask about the image). Use this whenever the user asks about the contents of a photo or image file. Do NOT use shell to base64-encode or manually analyse images.

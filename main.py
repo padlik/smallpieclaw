@@ -388,7 +388,8 @@ def _run(
         )
 
     def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
-                          fallback_models=None, max_iterations=None):
+                          fallback_models=None, max_iterations=None,
+                          max_tokens=None, temperature=None, top_p=None):
         """Create an isolated SubAgentRunner with the requested model override."""
         # Resolve model config
         if model:
@@ -400,6 +401,17 @@ def _run(
                 )
         else:
             model_cfg = background_model_cfg
+
+        # Apply per-call LLM parameter overrides (shallow copy — never mutate the shared config)
+        llm_overrides = {}
+        if max_tokens is not None:
+            llm_overrides["max_tokens"] = max_tokens
+        if temperature is not None:
+            llm_overrides["temperature"] = temperature
+        if top_p is not None:
+            llm_overrides["top_p"] = top_p
+        if llm_overrides:
+            model_cfg = {**model_cfg, **llm_overrides}
 
         # max_iterations: explicit override > scheduled default (never use chat max_iter here)
         effective_max_iter = max_iterations if max_iterations is not None else scheduled_max_iter
