@@ -215,7 +215,7 @@ class RegulatorOrchestrator:
         )
 
         # Valid model IDs for post-selection validation
-        valid_model_ids = {m.get("model", "") for m in configured_models}
+        valid_model_ids = {m.get("model") for m in configured_models if m.get("model")}
 
         enriched = []
         for st in subtasks:
@@ -527,14 +527,25 @@ def validate_models_for_regulator(
 
     for m in configured_models:
         model_id = m.get("model", "")
-        # Match: exact match, prefix match, or substring match
+        if not model_id:
+            continue
+        # Match priority: exact > prefix > bidirectional substring (min 4 chars)
         matched_cap = None
+        best_score = 0
         for cap_name, cap in cap_names.items():
-            if (model_id == cap_name
-                    or cap_name.startswith(model_id)
-                    or model_id in cap_name):
+            if model_id == cap_name:
                 matched_cap = cap
-                break
+                break  # exact match — stop immediately
+            score = 0
+            if cap_name.startswith(model_id):
+                score = 3  # config is prefix of capability
+            elif model_id.startswith(cap_name):
+                score = 2  # capability is prefix of config
+            elif len(model_id) >= 4 and (model_id in cap_name or cap_name in model_id):
+                score = 1  # substring match (require min 4 chars to avoid false positives)
+            if score > best_score:
+                best_score = score
+                matched_cap = cap
 
         entry = {
             "model": model_id,

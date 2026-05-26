@@ -1009,6 +1009,8 @@ async def cb_regulator_plan(iface: "TelegramInterface", update: Update, ctx: Con
         return
 
     if action == "approve":
+        plan = iface._pending_plan
+        iface._pending_plan = None  # clear immediately to prevent double-execution
         try:
             await query.edit_message_text(
                 "⚙️ <b>Executing plan…</b>",
@@ -1016,7 +1018,7 @@ async def cb_regulator_plan(iface: "TelegramInterface", update: Update, ctx: Con
             )
         except Exception:
             pass
-        asyncio.create_task(iface._run_regulator_execute(update, ctx))
+        asyncio.create_task(iface._run_regulator_execute(update, ctx, plan))
         return
 
     if action == "save":
