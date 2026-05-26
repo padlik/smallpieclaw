@@ -51,6 +51,7 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /status  — agent status, uptime, token usage\n"
         "  /tools   — list available tools\n"
         "  /models  — list and switch LLM models\n"
+        "  /mode    — switch between Agent and Regulator modes\n"
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
         "  /jobs    — list scheduled jobs\n"
         "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
@@ -895,6 +896,123 @@ async def cb_tool_create(iface: "TelegramInterface", update: Update, ctx: Contex
         )
     except Exception as exc:
         logger.debug("Could not edit tool_create message: %s", exc)
+
+
+async def cmd_mode(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current agent mode and allow switching between Agent and Regulator."""
+    if not iface._is_authorized(update.effective_user.id):
+        await iface._send_unauthorized(update)
+        return
+
+    current_mode = getattr(iface, "_agent_mode", "agent")
+
+    if current_mode == "agent":
+        text = (
+            "🤖 <b>Agent Mode</b> (active)\n\n"
+            "Standard execution — the agent handles requests directly using available tools.\n\n"
+            "Switch to <b>Regulator mode</b> to orchestrate complex multi-step tasks: "
+            "decompose, route each sub-task to the optimal model, review, then execute."
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🧠 Switch to Regulator", callback_data="mode:regulator"),
+        ]])
+    else:
+        text = (
+            "🧠 <b>Regulator Mode</b> (active)\n\n"
+            "Orchestrator mode — the agent decomposes complex tasks, selects the best model "
+            "per sub-task, presents a plan for approval, then executes sequentially.\n\n"
+            "Switch to <b>Agent mode</b> for direct tool-based execution."
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🤖 Switch to Agent", callback_data="mode:agent"),
+        ]])
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def cb_mode_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Agent ↔ Regulator mode switch button presses."""
+    query = update.callback_query
+    await query.answer()
+    new_mode = query.data.split(":", 1)[1]
+
+    if new_mode not in ("agent", "regulator"):
+        try:
+            await query.edit_message_text("❌ Unknown mode.", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    iface._agent_mode = new_mode
+    icon = "🤖" if new_mode == "agent" else "🧠"
+    name = "Agent" if new_mode == "agent" else "Regulator"
+    text = (
+        f"{icon} Switched to <b>{name} mode</b>.\n"
+        f"<i>Takes effect from your next message.</i>"
+    )
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+async def cb_regulator_plan(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Regulator plan approval / save / discard button presses."""
+    import asyncio
+    import os
+
+    query = update.callback_query
+    await query.answer()
+    action = query.data[len("reg_"):]  # strip "reg_" prefix
+
+    if not iface._pending_plan:
+        try:
+            await query.edit_message_text(
+                "❌ No pending plan (it may have expired).",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "approve":
+        try:
+            await query.edit_message_text(
+                "⚙️ <b>Executing plan…</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        asyncio.create_task(iface._run_regulator_execute(update, ctx))
+        return
+
+    if action == "save":
+        plans_dir = os.path.join(os.getcwd(), "plans")
+        try:
+            from regulator import RegulatorOrchestrator
+            orch = RegulatorOrchestrator()
+            path = orch.save_plan(iface._pending_plan, plans_dir)
+            filename = os.path.basename(path)
+            text = f"💾 Plan saved to <code>{html.escape(filename)}</code>."
+        except Exception as exc:
+            text = f"❌ Failed to save plan: {html.escape(str(exc))}"
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    if action == "discard":
+        iface._pending_plan = None
+        try:
+            await query.edit_message_text("❌ Plan discarded.", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
 
 
 async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

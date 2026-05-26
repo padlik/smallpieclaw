@@ -37,8 +37,9 @@ from telegram_commands import (
     cmd_start, cmd_help, cmd_status, cmd_stop, cmd_reset, cmd_compress,
     cmd_verbose, cmd_jobs, cmd_agents, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid, cmd_health,
-    cmd_show_ctx, cmd_show_env, cmd_models,
+    cmd_show_ctx, cmd_show_env, cmd_models, cmd_mode,
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
+    cb_mode_switch, cb_regulator_plan,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,11 @@ class TelegramInterface:
         # Verbose mode: send each agent action as a new message instead of editing
         self._verbose: bool = False
 
+        # Regulator mode state
+        self._agent_mode: str = "agent"   # "agent" | "regulator"
+        self._pending_plan: dict | None = None
+        self.sub_agent_factory = None     # wired from main.py
+
         self._app: Optional[Application] = None
         # Saved when run() starts — used by send_message_to_users() from threads
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -136,6 +142,7 @@ class TelegramInterface:
             BotCommand("tools", "List available tools"),
             BotCommand("skills", "List available agent skills"),
             BotCommand("models", "List and switch LLM models"),
+            BotCommand("mode", "Switch between Agent and Regulator modes"),
             BotCommand("jobs", "List scheduled jobs"),
             BotCommand("agents", "List and manage active sub-agents"),
             BotCommand("reset", "Save and clear current task context"),
@@ -174,6 +181,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("tools", partial(cmd_tools, self)))
         app.add_handler(CommandHandler("skills", partial(cmd_skills, self)))
         app.add_handler(CommandHandler("models", partial(cmd_models, self)))
+        app.add_handler(CommandHandler("mode", partial(cmd_mode, self)))
         app.add_handler(CommandHandler("mcp", partial(cmd_mcp, self)))
         app.add_handler(CommandHandler("reindex", partial(cmd_reindex, self)))
         app.add_handler(CommandHandler("pair", partial(cmd_pair, self)))
@@ -185,6 +193,8 @@ class TelegramInterface:
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
+        app.add_handler(CallbackQueryHandler(partial(cb_mode_switch, self), pattern=r"^mode:"))
+        app.add_handler(CallbackQueryHandler(partial(cb_regulator_plan, self), pattern=r"^reg_"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
@@ -295,6 +305,11 @@ class TelegramInterface:
         images: Optional[list[str]] = None,
     ) -> None:
         """Run the agent with a given task, showing streaming progress."""
+        # Regulator mode: route to planner instead
+        if self._agent_mode == "regulator":
+            await self._run_regulator_task(update, ctx, task_text, images)
+            return
+
         user = update.effective_user
         status_msg = await update.effective_message.reply_text("🔄 Processing…")
         loop = asyncio.get_running_loop()
@@ -603,6 +618,116 @@ class TelegramInterface:
                 asyncio.run(_send())
             except Exception as exc:
                 logger.error("send_html_to_users fallback failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Regulator mode methods
+    # ------------------------------------------------------------------
+
+    async def _run_regulator_task(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        task_text: str,
+        images: Optional[list[str]] = None,
+    ) -> None:
+        """Plan a task in Regulator mode and present it for approval."""
+        if not self.sub_agent_factory:
+            await update.effective_message.reply_text(
+                "❌ Regulator mode not available (sub_agent_factory not wired).",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if not self.llm_client:
+            await update.effective_message.reply_text(
+                "❌ Regulator mode requires an LLM client.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        status_msg = await update.effective_message.reply_text("🧠 Planning…")
+        loop = asyncio.get_running_loop()
+
+        def _run_planning():
+            from regulator import RegulatorOrchestrator, load_models_capabilities
+            caps = load_models_capabilities(os.path.join(os.getcwd(), "data"))
+            if not caps:
+                raise ValueError("data/models_capabilities.json is missing or empty")
+            return RegulatorOrchestrator().plan_task(task_text, self.llm_client, caps)
+
+        try:
+            plan = await loop.run_in_executor(None, _run_planning)
+            self._pending_plan = plan
+
+            from regulator import RegulatorOrchestrator
+            plan_html = RegulatorOrchestrator().format_plan_html(plan)
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Approve", callback_data="reg_approve")],
+                [
+                    InlineKeyboardButton("💾 Save Plan", callback_data="reg_save"),
+                    InlineKeyboardButton("❌ Discard", callback_data="reg_discard"),
+                ],
+            ])
+            await status_msg.edit_text(
+                plan_html,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            logger.exception("Regulator planning error")
+            await self._safe_edit(status_msg, f"❌ Planning failed: {exc}")
+
+    async def _run_regulator_execute(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Execute the pending Regulator plan after user approval."""
+        if not self._pending_plan:
+            await update.effective_message.reply_text(
+                "❌ No pending plan.", parse_mode=ParseMode.HTML
+            )
+            return
+
+        status_msg = await update.effective_message.reply_text("⚙️ Executing plan…")
+        loop = asyncio.get_running_loop()
+        plan = self._pending_plan
+
+        def _run_execution():
+            from regulator import RegulatorOrchestrator
+            return RegulatorOrchestrator().execute_plan(
+                plan, self.sub_agent_factory, notify_fn=None
+            )
+
+        try:
+            results = await loop.run_in_executor(None, _run_execution)
+            self._pending_plan = None
+
+            lines = ["✅ <b>Plan completed</b>\n"]
+            for res in results:
+                result_text = res.get("result", "")
+                preview = html.escape(result_text[:300])
+                ellipsis = "…" if len(result_text) > 300 else ""
+                lines.append(
+                    f"<b>{html.escape(res['id'])}. {html.escape(res['name'])}</b>\n"
+                    f"  {preview}{ellipsis}\n"
+                )
+            await status_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+        except Exception as exc:
+            logger.exception("Regulator execution error")
+            from regulator import RegulatorExecutionError
+            if isinstance(exc, RegulatorExecutionError):
+                msg = (
+                    f"❌ <b>Sub-task '{html.escape(exc.subtask_id)}' failed</b>\n"
+                    f"Model: <code>{html.escape(exc.model_name)}</code>\n"
+                    f"Error: {html.escape(str(exc.cause))}"
+                )
+            else:
+                msg = f"❌ Execution failed: {html.escape(str(exc))}"
+            await status_msg.edit_text(msg, parse_mode=ParseMode.HTML)
+
 
 # ---------------------------------------------------------------------------
 # Module constants

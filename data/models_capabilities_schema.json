@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.com/agent/model-descriptor.schema.json",
+  "title": "ModelDescriptor",
+  "description": "Schema for an LLM model descriptor used by an agent for model selection.",
+  "type": "object",
+  "required": ["model_name", "specifications", "optimal_configuration", "usage_guidelines", "management_summary"],
+  "additionalProperties": false,
+  "properties": {
+
+    "model_name": {
+      "type": "string",
+      "description": "Unique identifier / slug for the model.",
+      "minLength": 1,
+      "examples": ["grok-4-1-fast-non-reasoning"]
+    },
+
+    "specifications": {
+      "type": "object",
+      "description": "Static technical characteristics of the model.",
+      "required": ["context_window", "relative_speed_rating", "reasoning", "provider", "release_date", "license"],
+      "additionalProperties": false,
+      "properties": {
+        "context_window": {
+          "type": "integer",
+          "description": "Maximum number of tokens the model can process in a single request (prompt + completion).",
+          "minimum": 1,
+          "examples": [2000000]
+        },
+        "relative_speed_rating": {
+          "type": "integer",
+          "description": "Ordinal speed score relative to other models in the registry. Higher is faster.",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "reasoning": {
+          "type": "boolean",
+          "description": "Whether the model exposes an explicit chain-of-thought / reasoning trace."
+        },
+        "provider": {
+          "type": "string",
+          "description": "Organisation that develops and hosts the model.",
+          "minLength": 1,
+          "examples": ["xAI", "Anthropic", "OpenAI", "Google", "Meta"]
+        },
+        "release_date": {
+          "type": "string",
+          "description": "ISO 8601 calendar date on which the model was publicly released.",
+          "format": "date",
+          "examples": ["2025-11-20"]
+        },
+        "license": {
+          "type": "string",
+          "description": "Licensing terms governing model usage.",
+          "examples": ["Proprietary", "MIT", "Apache-2.0", "Llama-3-Community"]
+        }
+      }
+    },
+
+    "optimal_configuration": {
+      "type": "object",
+      "description": "Recommended inference parameters for typical production use.",
+      "required": ["max_tokens", "temperature", "top_p"],
+      "additionalProperties": false,
+      "properties": {
+        "max_tokens": {
+          "type": "integer",
+          "description": "Default ceiling on completion length in tokens.",
+          "minimum": 1,
+          "examples": [16000]
+        },
+        "temperature": {
+          "type": "object",
+          "description": "Sampling temperature guidance.",
+          "required": ["min", "max", "recommended", "rationale"],
+          "additionalProperties": false,
+          "properties": {
+            "min": {
+              "type": "number",
+              "description": "Lower bound of the acceptable temperature range.",
+              "minimum": 0.0,
+              "maximum": 2.0
+            },
+            "max": {
+              "type": "number",
+              "description": "Upper bound of the acceptable temperature range.",
+              "minimum": 0.0,
+              "maximum": 2.0
+            },
+            "recommended": {
+              "type": "number",
+              "description": "Single recommended temperature value within [min, max].",
+              "minimum": 0.0,
+              "maximum": 2.0
+            },
+            "rationale": {
+              "type": "string",
+              "description": "Human-readable explanation for the recommended temperature.",
+              "minLength": 1
+            }
+          }
+        },
+        "top_p": {
+          "type": "number",
+          "description": "Nucleus sampling probability mass cutoff.",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "examples": [0.9]
+        }
+      }
+    },
+
+    "usage_guidelines": {
+      "type": "object",
+      "description": "Qualitative guidance on where the model excels and where it falls short.",
+      "required": ["strengths", "weaknesses"],
+      "additionalProperties": false,
+      "properties": {
+        "strengths": {
+          "type": "array",
+          "description": "Task categories or conditions where this model is the preferred choice.",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "weaknesses": {
+          "type": "array",
+          "description": "Task categories or conditions where a different model should be preferred.",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+
+    "management_summary": {
+      "type": "string",
+      "description": "Concise plain-English deployment guidance covering when to select this model versus alternatives.",
+      "minLength": 1
+    }
+
+  }
+}
