@@ -140,28 +140,35 @@ class TestLoadModelsCapabilities:
 # ---------------------------------------------------------------------------
 
 class TestValidateModels:
-    def test_exact_match(self):
+    def test_exact_match_on_model(self):
         configured = [{"name": "a", "model": "claude-3-5-sonnet", "provider": "anthropic"}]
         result = validate_models_for_regulator(configured, CAPS)
         assert len(result["with_capabilities"]) == 1
-        assert result["with_capabilities"][0]["capabilities"] is not None
+        assert result["with_capabilities"][0]["capabilities"]["model_name"] == "claude-3-5-sonnet"
 
-    def test_prefix_match(self):
-        # "gpt-4o" is a prefix of cap "gpt-4o" but config has "gpt-4o-mini"
-        # capability "gpt-4o" starts with config "gpt-4o" prefix — should match
-        configured = [{"name": "a", "model": "gpt-4o", "provider": "openai"}]
-        result = validate_models_for_regulator(configured, CAPS)
+    def test_exact_match_on_alias(self):
+        configured = [{"name": "a", "model": "kimi-k2:1t-cloud", "provider": "ollama",
+                       "aliases": ["kimi-k2.6", "kimi-k2"]}]
+        caps = [{"model_name": "kimi-k2.6", "specifications": {}, "management_summary": "x"}]
+        result = validate_models_for_regulator(configured, caps)
+        assert len(result["with_capabilities"]) == 1
+        assert result["with_capabilities"][0]["capabilities"]["model_name"] == "kimi-k2.6"
+
+    def test_alias_second_entry_matches(self):
+        configured = [{"name": "a", "model": "qwen3:cloud", "provider": "ollama",
+                       "aliases": ["qwen3-no-match", "qwen3-vl:235b"]}]
+        caps = [{"model_name": "qwen3-vl:235b", "specifications": {}, "management_summary": "x"}]
+        result = validate_models_for_regulator(configured, caps)
         assert len(result["with_capabilities"]) == 1
 
-    def test_bidirectional_match(self):
-        # config has "gpt-4o-mini", capability has "gpt-4o" — "gpt-4o" is prefix of "gpt-4o-mini"
+    def test_no_fuzzy_matching(self):
+        # "gpt-4o-mini" should NOT match "gpt-4o" — no fuzzy/prefix matching
         configured = [{"name": "a", "model": "gpt-4o-mini", "provider": "openai"}]
         result = validate_models_for_regulator(configured, CAPS)
-        # "gpt-4o" (cap) is prefix of "gpt-4o-mini" (config) — should match
-        assert len(result["with_capabilities"]) == 1
+        assert result["with_capabilities"] == []
 
-    def test_no_match(self):
-        configured = [{"name": "a", "model": "llama-3", "provider": "ollama"}]
+    def test_no_match_without_alias(self):
+        configured = [{"name": "a", "model": "llama-3:cloud", "provider": "ollama"}]
         result = validate_models_for_regulator(configured, CAPS)
         assert result["with_capabilities"] == []
         assert len(result["missing_capabilities"]) == 1
@@ -172,25 +179,41 @@ class TestValidateModels:
             {"name": "good", "model": "gpt-4o", "provider": "openai"},
         ]
         result = validate_models_for_regulator(configured, CAPS)
-        # empty model should be skipped
         assert all(e["model"] != "" for e in result["available"])
 
-    def test_short_model_id_no_false_positive(self):
-        # "gpt" alone should NOT match anything (< 4 chars via substring path)
-        configured = [{"name": "a", "model": "gpt", "provider": "openai"}]
-        result = validate_models_for_regulator(configured, CAPS)
-        assert result["with_capabilities"] == []
-
     def test_returns_structure(self):
-        result = validate_models_for_regulator(CONFIGURED_MODELS, CAPS)
+        configured = [
+            {"name": "a", "model": "gpt-4o", "provider": "openai"},
+            {"name": "b", "model": "unknown", "provider": "x"},
+        ]
+        result = validate_models_for_regulator(configured, CAPS)
         assert "available" in result
         assert "with_capabilities" in result
         assert "missing_capabilities" in result
         assert len(result["available"]) == 2
+        assert len(result["with_capabilities"]) == 1
+        assert len(result["missing_capabilities"]) == 1
 
     def test_empty_inputs(self):
         result = validate_models_for_regulator([], [])
         assert result == {"available": [], "with_capabilities": [], "missing_capabilities": []}
+
+    def test_model_field_takes_priority_over_alias(self):
+        # If model field itself matches, don't need aliases
+        configured = [{"name": "a", "model": "gpt-4o", "provider": "openai",
+                       "aliases": ["something-else"]}]
+        result = validate_models_for_regulator(configured, CAPS)
+        assert len(result["with_capabilities"]) == 1
+        assert result["with_capabilities"][0]["capabilities"]["model_name"] == "gpt-4o"
+
+    def test_comma_string_aliases_via_list_models(self):
+        # Simulate what list_models produces from a comma-string config
+        # (list_models normalizes to list, so here we just pass the list)
+        configured = [{"name": "a", "model": "deep:cloud", "provider": "ollama",
+                       "aliases": ["deepseek-v4-pro"]}]
+        caps = [{"model_name": "deepseek-v4-pro", "specifications": {}, "management_summary": "x"}]
+        result = validate_models_for_regulator(configured, caps)
+        assert len(result["with_capabilities"]) == 1
 
 
 # ---------------------------------------------------------------------------

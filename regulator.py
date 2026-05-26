@@ -200,13 +200,15 @@ class RegulatorOrchestrator:
         subtasks = self._parse_decomposition(raw_decomp)
 
         # Step 2: Model selection per sub-task
-        # Build configured models summary for the prompt
+        # Build configured models summary for the prompt (include aliases for mapping)
         configured_models = configured_models or []
-        cfg_summary = [
-            {"model": m.get("model", ""), "name": m.get("name", ""),
-             "provider": m.get("provider", ""), "vision": m.get("vision", False)}
-            for m in configured_models
-        ]
+        cfg_summary = []
+        for m in configured_models:
+            entry = {"model": m.get("model", ""), "name": m.get("name", ""),
+                     "provider": m.get("provider", ""), "vision": m.get("vision", False)}
+            if m.get("aliases"):
+                entry["aliases"] = m["aliases"]
+            cfg_summary.append(entry)
         configured_models_json = json.dumps(cfg_summary, indent=2)
         capabilities_json = json.dumps(models_capabilities, indent=2)
         model_system = _MODEL_SELECT_SYSTEM.format(
@@ -507,10 +509,14 @@ def validate_models_for_regulator(
     capabilities: list[dict],
 ) -> dict:
     """
-    Cross-reference configured models against capabilities data.
+    Cross-reference configured models against capabilities data using exact matching.
+
+    Matching priority:
+    1. Exact match on model field
+    2. Exact match on any alias
 
     Args:
-        configured_models: list from llm_client.list_models() — each has 'name', 'model', 'provider'
+        configured_models: list from llm_client.list_models() — each has 'name', 'model', 'provider', optional 'aliases'
         capabilities: list from load_models_capabilities() — each has 'model_name', 'specifications', etc.
 
     Returns:
@@ -529,26 +535,14 @@ def validate_models_for_regulator(
         model_id = m.get("model", "")
         if not model_id:
             continue
-        # Match priority: exact > prefix > bidirectional substring
-        # Require min 4 chars for any non-exact match to avoid false positives
-        matched_cap = None
-        best_score = 0
-        for cap_name, cap in cap_names.items():
-            if model_id == cap_name:
-                matched_cap = cap
-                break  # exact match — stop immediately
-            if len(model_id) < 4:
-                continue  # too short for reliable non-exact matching
-            score = 0
-            if cap_name.startswith(model_id):
-                score = 3  # config is prefix of capability
-            elif model_id.startswith(cap_name) and len(cap_name) >= 4:
-                score = 2  # capability is prefix of config (also require cap ≥ 4 chars)
-            elif model_id in cap_name or cap_name in model_id:
-                score = 1  # substring match
-            if score > best_score:
-                best_score = score
-                matched_cap = cap
+
+        # Exact match: model field first, then aliases
+        matched_cap = cap_names.get(model_id)
+        if not matched_cap:
+            for alias in m.get("aliases", []):
+                matched_cap = cap_names.get(alias)
+                if matched_cap:
+                    break
 
         entry = {
             "model": model_id,

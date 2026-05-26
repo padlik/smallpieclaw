@@ -417,6 +417,12 @@ class LLMClient:
             }
             if m.get("vision"):
                 entry["vision"] = True
+            # Normalize aliases: accept list or comma-separated string
+            raw_aliases = m.get("aliases", [])
+            if isinstance(raw_aliases, str):
+                raw_aliases = [a.strip() for a in raw_aliases.split(",") if a.strip()]
+            if raw_aliases:
+                entry["aliases"] = raw_aliases
             result.append(entry)
         return result
 
