@@ -74,23 +74,28 @@ _DECOMPOSE_USER_TMPL = "Decompose the following task into atomic sub-tasks:\n\n{
 
 _MODEL_SELECT_SYSTEM = """\
 You are an expert AI model selector. Your goal is to match a task to the most capable \
-and cost-effective model available.
+and cost-effective model from the CONFIGURED models list.
 
-## Step 1 — Load context
-Read model capabilities from the registry provided below.
+IMPORTANT: You MUST select from the "Configured Models" list below. These are the only \
+models available for execution. The "Capabilities Reference" section provides additional \
+context for models that have documented capabilities — use it to make better decisions, \
+but you cannot select a model that is not in the configured list.
+
+## Step 1 — Review available models
+Read the configured models list. For each, check if capabilities data is available.
 
 ## Step 2 — Analyze the task
 Identify the core requirements: reasoning depth, domain knowledge, instruction-following \
 precision, output format, required context length, latency, and cost sensitivity.
 
 ## Step 3 — Select one model
-Choose exactly one model. Ground your selection in specific capability evidence — quote \
-the relevant field from the JSON and explain why it matches the task requirements.
+Choose exactly one model from the configured list. Use its "model" field as the model_name. \
+If capabilities data is available, ground your selection in specific evidence. \
+If no capabilities data exists, select based on model name, provider, and general knowledge.
 
 ## Step 4 — Set parameters
 Specify `temperature`, `top_p`, and `max_tokens` appropriate for the task type \
-(e.g. lower temperature for deterministic extraction, higher for creative synthesis). \
-Use values within the model's optimal_configuration ranges.
+(e.g. lower temperature for deterministic extraction, higher for creative synthesis).
 
 ## Step 5 — Write the execution prompt
 Draft a complete, self-contained prompt for the chosen model. It must:
@@ -100,14 +105,19 @@ Draft a complete, self-contained prompt for the chosen model. It must:
 
 ---
 
-Model registry (JSON):
-{models_json}
+Configured Models (select ONLY from this list):
+{configured_models_json}
+
+---
+
+Capabilities Reference (enrichment data for models that have documented capabilities):
+{capabilities_json}
 
 ---
 
 Respond with a JSON object only (no markdown fences). Schema:
 {{
-  "model_name": "exact model_name from registry",
+  "model_name": "exact 'model' field from the configured models list",
   "temperature": <number>,
   "top_p": <number>,
   "max_tokens": <integer>,
@@ -142,9 +152,18 @@ class RegulatorOrchestrator:
         task: str,
         llm_client,
         models_capabilities: list[dict],
+        configured_models: Optional[list[dict]] = None,
+        images: Optional[list[str]] = None,
     ) -> dict:
         """
         Decompose a task and select models for each sub-task.
+
+        Args:
+            task: the task description text
+            llm_client: LLM client for planning calls
+            models_capabilities: capabilities reference data
+            configured_models: list from llm_client.list_models() — selection is constrained to these
+            images: optional list of image descriptions/references
 
         Returns enriched plan dict:
         {
@@ -166,17 +185,37 @@ class RegulatorOrchestrator:
         }
         """
         # Step 1: Decompose
+        decompose_task = task
+        if images:
+            decompose_task += (
+                f"\n\n[Note: {len(images)} image attachment(s) are available "
+                f"for sub-tasks that require visual analysis.]"
+            )
         logger.info("Regulator: decomposing task (%d chars)", len(task))
         raw_decomp = llm_client.chat(
-            [{"role": "user", "content": _DECOMPOSE_USER_TMPL.format(task=task)}],
+            [{"role": "user", "content": _DECOMPOSE_USER_TMPL.format(task=decompose_task)}],
             system=_DECOMPOSE_SYSTEM,
             json_mode=True,
         )
         subtasks = self._parse_decomposition(raw_decomp)
 
         # Step 2: Model selection per sub-task
-        models_json = json.dumps(models_capabilities, indent=2)
-        model_system = _MODEL_SELECT_SYSTEM.format(models_json=models_json)
+        # Build configured models summary for the prompt
+        configured_models = configured_models or []
+        cfg_summary = [
+            {"model": m.get("model", ""), "name": m.get("name", ""),
+             "provider": m.get("provider", ""), "vision": m.get("vision", False)}
+            for m in configured_models
+        ]
+        configured_models_json = json.dumps(cfg_summary, indent=2)
+        capabilities_json = json.dumps(models_capabilities, indent=2)
+        model_system = _MODEL_SELECT_SYSTEM.format(
+            configured_models_json=configured_models_json,
+            capabilities_json=capabilities_json,
+        )
+
+        # Valid model IDs for post-selection validation
+        valid_model_ids = {m.get("model", "") for m in configured_models}
 
         enriched = []
         for st in subtasks:
@@ -199,11 +238,21 @@ class RegulatorOrchestrator:
                 json_mode=True,
             )
             sel = self._parse_model_selection(raw_sel)
+
+            # Validate selected model is in configured set
+            selected_model = sel.get("model_name", "")
+            if valid_model_ids and selected_model not in valid_model_ids:
+                logger.warning(
+                    "Regulator: LLM selected '%s' which is not configured. "
+                    "Falling back to first configured model.", selected_model,
+                )
+                selected_model = configured_models[0].get("model", "") if configured_models else ""
+
             enriched.append({
                 "id": st["id"],
                 "name": st["name"],
                 "description": st["description"],
-                "model_name": sel.get("model_name", ""),
+                "model_name": selected_model,
                 "params": {
                     "temperature": sel.get("temperature"),
                     "top_p": sel.get("top_p"),
@@ -360,29 +409,44 @@ class RegulatorOrchestrator:
         plan: dict,
         sub_agent_factory: Callable,
         notify_fn: Optional[Callable] = None,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], Optional[dict]]:
         """
         Execute sub-tasks sequentially.
 
         Upstream results are injected into downstream sub-task prompts.
-        On failure raises RegulatorExecutionError.
-        Returns list of {id, name, result} dicts.
+        On failure, returns partial results and failure info instead of raising.
+
+        Returns:
+            (completed_results, failure_info)
+            - completed_results: list of {id, name, result} for successfully completed sub-tasks
+            - failure_info: None if all succeeded, or {subtask_id, model_name, error, remaining}
         """
         results: dict[str, str] = {}
         output: list[dict] = []
+        subtasks = plan.get("subtasks", [])
 
-        for st in plan.get("subtasks", []):
+        for i, st in enumerate(subtasks):
             st_id = st["id"]
             model_name = st.get("model_name", "")
             params = st.get("params", {})
             prompt = st.get("prompt", st.get("description", ""))
 
-            # Inject upstream context
+            # Inject upstream context (with warning for missing deps)
             upstream_parts = []
             for dep_id in st.get("depends_on", []):
                 if dep_id in results:
                     upstream_parts.append(
                         f"## Result of sub-task {dep_id}\n{results[dep_id]}"
+                    )
+                else:
+                    logger.warning(
+                        "Regulator: sub-task '%s' depends on '%s' which has no result",
+                        st_id, dep_id,
+                    )
+                    upstream_parts.append(
+                        f"## Result of sub-task {dep_id}\n"
+                        f"[WARNING: dependency '{dep_id}' has no result — "
+                        f"it may have been skipped or not yet executed]"
                     )
             if upstream_parts:
                 prompt = "\n\n".join(upstream_parts) + "\n\n---\n\n" + prompt
@@ -404,13 +468,22 @@ class RegulatorOrchestrator:
                 )
                 result = runner.run(prompt)
             except Exception as exc:
-                raise RegulatorExecutionError(st_id, model_name, exc) from exc
+                logger.error(
+                    "Regulator: sub-task '%s' failed: %s", st_id, exc
+                )
+                remaining = [s["id"] for s in subtasks[i + 1:]]
+                return output, {
+                    "subtask_id": st_id,
+                    "model_name": model_name,
+                    "error": str(exc),
+                    "remaining": remaining,
+                }
 
             results[st_id] = result
             output.append({"id": st_id, "name": st["name"], "result": result})
             logger.info("Regulator: sub-task '%s' completed", st_id)
 
-        return output
+        return output, None
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +500,60 @@ def load_models_capabilities(data_dir: str) -> list[dict]:
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Regulator: could not load models_capabilities.json: %s", exc)
         return []
+
+
+def validate_models_for_regulator(
+    configured_models: list[dict],
+    capabilities: list[dict],
+) -> dict:
+    """
+    Cross-reference configured models against capabilities data.
+
+    Args:
+        configured_models: list from llm_client.list_models() — each has 'name', 'model', 'provider'
+        capabilities: list from load_models_capabilities() — each has 'model_name', 'specifications', etc.
+
+    Returns:
+        {
+            "available": [{"model": ..., "name": ..., "capabilities": <cap_entry or None>}, ...],
+            "with_capabilities": [...],  # subset with capabilities data
+            "missing_capabilities": [...],  # subset without capabilities data
+        }
+    """
+    cap_names = {cap["model_name"]: cap for cap in capabilities}
+    available = []
+    with_caps = []
+    missing_caps = []
+
+    for m in configured_models:
+        model_id = m.get("model", "")
+        # Match: exact match, prefix match, or substring match
+        matched_cap = None
+        for cap_name, cap in cap_names.items():
+            if (model_id == cap_name
+                    or cap_name.startswith(model_id)
+                    or model_id in cap_name):
+                matched_cap = cap
+                break
+
+        entry = {
+            "model": model_id,
+            "name": m.get("name", ""),
+            "provider": m.get("provider", ""),
+            "vision": m.get("vision", False),
+            "capabilities": matched_cap,
+        }
+        available.append(entry)
+        if matched_cap:
+            with_caps.append(entry)
+        else:
+            missing_caps.append(entry)
+
+    return {
+        "available": available,
+        "with_capabilities": with_caps,
+        "missing_capabilities": missing_caps,
+    }
 
 
 def _extract_json(raw: str) -> dict:
