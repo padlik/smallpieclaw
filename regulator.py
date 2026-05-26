@@ -529,20 +529,23 @@ def validate_models_for_regulator(
         model_id = m.get("model", "")
         if not model_id:
             continue
-        # Match priority: exact > prefix > bidirectional substring (min 4 chars)
+        # Match priority: exact > prefix > bidirectional substring
+        # Require min 4 chars for any non-exact match to avoid false positives
         matched_cap = None
         best_score = 0
         for cap_name, cap in cap_names.items():
             if model_id == cap_name:
                 matched_cap = cap
                 break  # exact match — stop immediately
+            if len(model_id) < 4:
+                continue  # too short for reliable non-exact matching
             score = 0
             if cap_name.startswith(model_id):
                 score = 3  # config is prefix of capability
-            elif model_id.startswith(cap_name):
-                score = 2  # capability is prefix of config
-            elif len(model_id) >= 4 and (model_id in cap_name or cap_name in model_id):
-                score = 1  # substring match (require min 4 chars to avoid false positives)
+            elif model_id.startswith(cap_name) and len(cap_name) >= 4:
+                score = 2  # capability is prefix of config (also require cap ≥ 4 chars)
+            elif model_id in cap_name or cap_name in model_id:
+                score = 1  # substring match
             if score > best_score:
                 best_score = score
                 matched_cap = cap
