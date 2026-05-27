@@ -98,10 +98,18 @@ def _extract_mcp_result(response: dict) -> str:
     parts = []
     for item in content:
         if isinstance(item, dict):
-            if item.get("type") == "text":
+            item_type = item.get("type")
+            if item_type == "text":
                 parts.append(item.get("text", ""))
-            elif item.get("type") == "error":
+            elif item_type == "error":
                 parts.append(f"[error] {item.get('text', '')}")
+            elif item_type == "image":
+                mime = item.get("mimeType", "image")
+                parts.append(f"[image: {mime}]")
+            elif item_type == "resource":
+                uri = (item.get("resource") or {}).get("uri", "")
+                parts.append(f"[resource: {uri}]" if uri else "[resource]")
+            # unknown types are silently skipped
         elif isinstance(item, str):
             parts.append(item)
     text = "\n".join(parts) if parts else json.dumps(result)
@@ -344,22 +352,44 @@ class MCPStdioClient(MCPBaseClient):
         resp = self._recv(req_id)
         if "error" in resp:
             raise MCPConnectionError(f"MCP [{self.name}] initialize error: {resp['error']}")
+        # Log server's protocol version; warn if it differs from what we advertised
+        server_version = resp.get("result", {}).get("protocolVersion", "")
+        if server_version:
+            if server_version != _MCP_PROTOCOL_VERSION:
+                logger.warning(
+                    "MCP [%s] protocol version mismatch: advertised=%s server=%s",
+                    self.name, _MCP_PROTOCOL_VERSION, server_version,
+                )
+            else:
+                logger.info("MCP [%s] protocol version: %s", self.name, server_version)
         # MCP spec (2024-11-05 §3.1): after a successful initialize response,
         # client MUST send notifications/initialized (no params required)
         self._send_notification("notifications/initialized")
 
     def _list_tools(self) -> list[dict]:
-        req_id = self._next_id()
-        self._send({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "method": "tools/list",
-            "params": {},
-        })
-        resp = self._recv(req_id)
-        if "error" in resp:
-            raise MCPConnectionError(f"MCP [{self.name}] tools/list error: {resp['error']}")
-        return resp.get("result", {}).get("tools", [])
+        """Fetch all tools, following nextCursor pagination if present."""
+        tools: list[dict] = []
+        cursor: Optional[str] = None
+        while True:
+            req_id = self._next_id()
+            params: dict = {}
+            if cursor:
+                params["cursor"] = cursor
+            self._send({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/list",
+                "params": params,
+            })
+            resp = self._recv(req_id)
+            if "error" in resp:
+                raise MCPConnectionError(f"MCP [{self.name}] tools/list error: {resp['error']}")
+            result = resp.get("result", {})
+            tools.extend(result.get("tools", []))
+            cursor = result.get("nextCursor") or None
+            if not cursor:
+                break
+        return tools
 
 
 # ---------------------------------------------------------------------------
@@ -372,14 +402,20 @@ class MCPHttpClient(MCPBaseClient):
     def __init__(self, cfg: dict) -> None:
         super().__init__(cfg)
         self._url: str = cfg["url"]
-        self._headers: dict = {"Content-Type": "application/json"}
+        # MCP 2025-03-26 Streamable HTTP requires Accept: text/event-stream.
+        # Include application/json so servers that respond with plain JSON still work.
+        self._headers: dict = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
         self._headers.update(cfg.get("headers") or {})
-        # env vars applied to os.environ-like dict (not actually used for HTTP,
-        # but stored in case a future transport needs them)
         self._env_extra: dict = cfg.get("env") or {}
         self._session = requests.Session()
         self._req_id = 0
         self._lock = threading.Lock()
+        # MCP 2025-03-26: server may issue a session ID on initialize; must be
+        # included in all subsequent requests and used for DELETE on close.
+        self._session_id: Optional[str] = None
 
     def connect(self) -> list[Tool]:
         self._last_error = ""
@@ -428,6 +464,16 @@ class MCPHttpClient(MCPBaseClient):
 
     def close(self) -> None:
         self._connected = False
+        # MCP 2025-03-26: send DELETE to terminate the session cleanly
+        if self._session_id:
+            try:
+                self._session.request(
+                    "DELETE", self._url,
+                    headers={**self._headers, "Mcp-Session-Id": self._session_id},
+                    timeout=self.timeout,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("MCP [%s] session DELETE failed (non-fatal): %s", self.name, exc)
         self._session.close()
 
     # ------------------------------------------------------------------
@@ -439,13 +485,23 @@ class MCPHttpClient(MCPBaseClient):
         return self._req_id
 
     def _post(self, obj: dict) -> dict:
+        # Include Mcp-Session-Id if we have one (MCP 2025-03-26)
+        headers = self._headers
+        if self._session_id:
+            headers = {**self._headers, "Mcp-Session-Id": self._session_id}
         r = self._session.post(
             self._url,
             json=obj,
-            headers=self._headers,
+            headers=headers,
             timeout=self.timeout,
         )
         r.raise_for_status()
+        # Capture session ID from response if not yet set (MCP 2025-03-26)
+        if not self._session_id:
+            sid = r.headers.get("Mcp-Session-Id")
+            if sid:
+                self._session_id = sid
+                logger.debug("MCP [%s] session ID captured: %s", self.name, sid)
         # Handle both plain JSON and SSE-wrapped responses
         ct = r.headers.get("Content-Type", "")
         if "text/event-stream" in ct:
@@ -496,21 +552,43 @@ class MCPHttpClient(MCPBaseClient):
         })
         if "error" in resp:
             raise MCPConnectionError(f"MCP [{self.name}] initialize error: {resp['error']}")
-        # MCP spec (2024-11-05 §3.1): after a successful initialize response,
-        # client MUST send notifications/initialized (no params required)
+        # Log server's protocol version; warn if it differs from what we advertised
+        server_version = resp.get("result", {}).get("protocolVersion", "")
+        if server_version:
+            if server_version != _MCP_PROTOCOL_VERSION:
+                logger.warning(
+                    "MCP [%s] protocol version mismatch: advertised=%s server=%s",
+                    self.name, _MCP_PROTOCOL_VERSION, server_version,
+                )
+            else:
+                logger.info("MCP [%s] protocol version: %s", self.name, server_version)
+        # MCP spec: after a successful initialize response, client MUST send
+        # notifications/initialized (no params required)
         self._post_notification("notifications/initialized")
 
     def _list_tools(self) -> list[dict]:
-        req_id = self._next_id()
-        resp = self._post({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "method": "tools/list",
-            "params": {},
-        })
-        if "error" in resp:
-            raise MCPConnectionError(f"MCP [{self.name}] tools/list error: {resp['error']}")
-        return resp.get("result", {}).get("tools", [])
+        """Fetch all tools, following nextCursor pagination if present."""
+        tools: list[dict] = []
+        cursor: Optional[str] = None
+        while True:
+            req_id = self._next_id()
+            params: dict = {}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._post({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/list",
+                "params": params,
+            })
+            if "error" in resp:
+                raise MCPConnectionError(f"MCP [{self.name}] tools/list error: {resp['error']}")
+            result = resp.get("result", {})
+            tools.extend(result.get("tools", []))
+            cursor = result.get("nextCursor") or None
+            if not cursor:
+                break
+        return tools
 
 
 # ---------------------------------------------------------------------------
