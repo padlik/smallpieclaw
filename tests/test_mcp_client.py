@@ -357,6 +357,32 @@ class TestMCPHttpClientSessionId:
 
         client._session.request.assert_not_called()
 
+    def test_notification_includes_session_id(self):
+        client = _make_http_client()
+        client._session_id = "sess-notify"
+        resp = MagicMock()
+        resp.status_code = 204
+        resp.raise_for_status = MagicMock()
+        client._session.post = MagicMock(return_value=resp)
+
+        client._post_notification("notifications/initialized")
+
+        call_kwargs = client._session.post.call_args[1]
+        assert call_kwargs["headers"].get("Mcp-Session-Id") == "sess-notify"
+
+    def test_notification_no_session_id_no_header(self):
+        client = _make_http_client()
+        client._session_id = None
+        resp = MagicMock()
+        resp.status_code = 204
+        resp.raise_for_status = MagicMock()
+        client._session.post = MagicMock(return_value=resp)
+
+        client._post_notification("notifications/initialized")
+
+        call_kwargs = client._session.post.call_args[1]
+        assert "Mcp-Session-Id" not in call_kwargs["headers"]
+
 
 # ---------------------------------------------------------------------------
 # TestMCPHttpClientVersionCheck

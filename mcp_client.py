@@ -90,7 +90,7 @@ def _mcp_tools_to_registry(server_name: str, raw_tools: list[dict]) -> list[Tool
     return result
 
 
-def _extract_mcp_result(response: dict) -> str:
+def _extract_mcp_result(response: dict) -> tuple[str, bool]:
     """Extract text output from a tools/call MCP response."""
     result = response.get("result", {})
     is_error = result.get("isError", False)
@@ -513,11 +513,14 @@ class MCPHttpClient(MCPBaseClient):
         obj: dict = {"jsonrpc": "2.0", "method": method}
         if params:
             obj["params"] = params
+        headers = dict(self._headers)
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
         try:
             r = self._session.post(
                 self._url,
                 json=obj,
-                headers=self._headers,
+                headers=headers,
                 timeout=self.timeout,
             )
             # Servers may return 200 or 204; both are acceptable for notifications
