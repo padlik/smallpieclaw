@@ -645,7 +645,7 @@ class TelegramInterface:
             )
             return
 
-        status_msg = await update.effective_message.reply_text("🧠 Planning…")
+        status_msg = await update.effective_message.reply_text("🧠 <b>Regulator</b> — planning…", parse_mode=ParseMode.HTML)
         loop = asyncio.get_running_loop()
 
         # Get configured models for constrained selection
