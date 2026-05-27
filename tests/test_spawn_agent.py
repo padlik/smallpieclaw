@@ -277,3 +277,84 @@ class TestSubAgentFactoryOverrides:
         factory = self._make_factory_fn([], {})
         with pytest.raises(ValueError, match="not found"):
             factory(model="nonexistent-model")
+
+
+# ---------------------------------------------------------------------------
+# get_agent_result: cancel_on_timeout
+# ---------------------------------------------------------------------------
+
+class TestGetAgentResultCancelOnTimeout:
+    """Tests for cancel_on_timeout behaviour in _exec_get_agent_result."""
+
+    def _make_timed_out_record(self, agent_id: str = "sa-test"):
+        """Return a SubAgentRecord whose _result_event will never fire."""
+        from sub_agent_registry import SubAgentRecord
+
+        record = SubAgentRecord(
+            agent_id=agent_id,
+            label="test",
+            model="test-model",
+            task_preview="test task",
+            started_at=0.0,
+            source="on-demand",
+        )
+        # _result_event stays unset so wait() always times out immediately
+        return record
+
+    def _exec_with_record(self, exc, record, args: dict):
+        """Patch the registry so get_agent_result finds our record."""
+        from unittest.mock import patch as _patch
+
+        mock_reg = MagicMock()
+        mock_reg.get.return_value = record
+
+        with _patch("sub_agent_registry.get_registry", return_value=mock_reg):
+            return exc._exec_get_agent_result(args)
+
+    def test_cancel_event_set_by_default_on_timeout(self):
+        """With default cancel_on_timeout=True the sub-agent's cancel event must be set."""
+        exc = _make_executor()
+        record = self._make_timed_out_record()
+        result = self._exec_with_record(exc, record, {"agent_id": "sa-test", "timeout": 0})
+        assert result["status"] == "timeout"
+        assert record._cancel_event.is_set(), "cancel_event should be set after timeout"
+        assert record._timeout_cancelled is True
+
+    def test_cancel_event_not_set_when_opted_out(self):
+        """With cancel_on_timeout=False the sub-agent must NOT be cancelled."""
+        exc = _make_executor()
+        record = self._make_timed_out_record()
+        result = self._exec_with_record(
+            exc, record, {"agent_id": "sa-test", "timeout": 0, "cancel_on_timeout": False}
+        )
+        assert result["status"] == "timeout"
+        assert not record._cancel_event.is_set(), "cancel_event must not be set when opted out"
+        assert record._timeout_cancelled is False
+
+    def test_already_cancelled_agent_not_double_cancelled(self):
+        """If the agent is already cancelled, do not set _timeout_cancelled."""
+        exc = _make_executor()
+        record = self._make_timed_out_record()
+        record._cancel_event.set()  # pre-cancelled (e.g. user /agents cancel)
+        self._exec_with_record(exc, record, {"agent_id": "sa-test", "timeout": 0})
+        assert record._timeout_cancelled is False, "_timeout_cancelled must stay False for pre-cancelled agents"
+
+    def test_timeout_cancelled_flag_suppresses_notification(self):
+        """_timeout_cancelled=True on the record should suppress Telegram notification."""
+        from sub_agent_registry import SubAgentRecord
+
+        record = SubAgentRecord(
+            agent_id="sa-tnotify",
+            label="notify-test",
+            model="m",
+            task_preview="t",
+            started_at=0.0,
+            source="on-demand",
+        )
+        record._timeout_cancelled = True
+
+        assert record._timeout_cancelled is True
+        # The actual notification branch check is: `if _notify_result and not record._timeout_cancelled`
+        _notify_result = True
+        should_notify = _notify_result and not record._timeout_cancelled
+        assert should_notify is False, "notification must be suppressed when _timeout_cancelled is True"

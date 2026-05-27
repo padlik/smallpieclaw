@@ -179,7 +179,10 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Wait for a sub-agent to finish and retrieve its result. "
             "Blocks until the sub-agent completes or the timeout is reached. "
             "Args: agent_id (str, REQUIRED — the id returned by spawn_agent), "
-            "timeout (int, optional — seconds to wait, default: configured subagent_result_timeout). "
+            "timeout (int, optional — seconds to wait, default: configured subagent_result_timeout), "
+            "cancel_on_timeout (bool, optional — if true (default), the sub-agent is automatically cancelled "
+            "when the timeout expires so it does not waste tokens or send a stale notification; "
+            "set to false only if you intend to call get_agent_result again for the same agent). "
             "Returns: {status: 'done'|'failed'|'cancelled'|'timeout'|'not_found', "
             "result_type: 'text'|'json'|'file', result: <output>}. "
             "Example: {\"agent_id\": \"sa-abc123\"}"
@@ -930,7 +933,9 @@ class BuiltinExecutor:
                     record.result = "[Cancelled]"
                     record._result_event.set()
                     logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
-                    if _notify_result:
+                    # Suppress notification for agents cancelled due to get_agent_result timeout —
+                    # the caller already received a timeout response and moved on.
+                    if _notify_result and not record._timeout_cancelled:
                         try:
                             runner.notify_fn(
                                 f"🛑 Sub-agent {runner.agent_id} cancelled\n"
@@ -1032,6 +1037,17 @@ class BuiltinExecutor:
         # If already finished (event already set), return immediately
         finished = record._result_event.wait(timeout=timeout)
         if not finished:
+            # Auto-cancel the sub-agent unless caller explicitly opted out.
+            # This prevents orphaned sub-agents from wasting tokens and sending
+            # irrelevant Telegram notifications after the caller has moved on.
+            cancel_on_timeout = args.get("cancel_on_timeout", True)
+            if cancel_on_timeout and not record._cancel_event.is_set():
+                record._timeout_cancelled = True
+                record.cancel()
+                logger.info(
+                    "get_agent_result: timed out after %ds — auto-cancelled agent '%s'",
+                    timeout, agent_id,
+                )
             return {
                 "success": False,
                 "output": f"get_agent_result: timed out after {timeout}s waiting for agent '{agent_id}'.",

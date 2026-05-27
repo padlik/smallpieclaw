@@ -31,6 +31,7 @@ class SubAgentRecord:
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _result_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _llm_client: object = field(default=None, repr=False)  # LLMClient — for immediate HTTP interrupt
+    _timeout_cancelled: bool = field(default=False, repr=False)  # set by get_agent_result on timeout
 
     def cancel(self) -> None:
         self._cancel_event.set()
