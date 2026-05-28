@@ -348,8 +348,9 @@ class TestSavePlan:
             orch = RegulatorOrchestrator()
             path = orch.save_plan(PLAN, d)
             filename = os.path.basename(path)
-            assert filename.startswith("plan_")
+            # Filename is derived from task words, e.g. "do_research_and_summarise.md"
             assert filename.endswith(".md")
+            assert "do" in filename or "research" in filename
 
     def test_creates_dir_if_missing(self):
         with tempfile.TemporaryDirectory() as base:
@@ -397,13 +398,13 @@ class TestParseDecomposition:
     def test_valid_decomposition(self):
         raw = json.dumps({
             "subtasks": [
-                {"id": "t1", "name": "Step 1", "description": "Do thing", "depends_on": []},
+                {"id": "fetch_data", "name": "Fetch data", "description": "Do thing", "depends_on": []},
             ]
         })
         orch = RegulatorOrchestrator()
         result = orch._parse_decomposition(raw)
         assert len(result) == 1
-        assert result[0]["id"] == "t1"
+        assert result[0]["id"] == "fetch_data"
 
     def test_empty_subtasks_raises(self):
         raw = json.dumps({"subtasks": []})
@@ -423,7 +424,17 @@ class TestParseDecomposition:
         })
         orch = RegulatorOrchestrator()
         result = orch._parse_decomposition(raw)
-        assert result[0]["id"] == "t1"
+        # ID is slugified from name when missing
+        assert result[0]["id"] == "step"
+
+    def test_generic_id_replaced_with_slug(self):
+        """Generic IDs like t1, t2 are replaced with a slug of the name."""
+        raw = json.dumps({
+            "subtasks": [{"id": "t1", "name": "Fetch Invoice Data", "description": "desc", "depends_on": []}]
+        })
+        orch = RegulatorOrchestrator()
+        result = orch._parse_decomposition(raw)
+        assert result[0]["id"] == "fetch_invoice_data"
 
 
 # ---------------------------------------------------------------------------
