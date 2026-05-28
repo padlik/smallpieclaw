@@ -352,6 +352,17 @@ class TestSavePlan:
             assert filename.endswith(".md")
             assert "do" in filename or "research" in filename
 
+    def test_no_collision_on_repeated_saves(self):
+        """Three saves of the same task must produce three distinct files."""
+        with tempfile.TemporaryDirectory() as d:
+            orch = RegulatorOrchestrator()
+            p1 = orch.save_plan(PLAN, d)
+            p2 = orch.save_plan(PLAN, d)
+            p3 = orch.save_plan(PLAN, d)
+            assert len({p1, p2, p3}) == 3, "save_plan must produce unique filenames"
+            for p in (p1, p2, p3):
+                assert os.path.exists(p)
+
     def test_creates_dir_if_missing(self):
         with tempfile.TemporaryDirectory() as base:
             plans_dir = os.path.join(base, "subdir", "plans")
