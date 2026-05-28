@@ -314,15 +314,19 @@ class RegulatorOrchestrator:
                 f"Decomposition returned no sub-tasks. Raw: {raw[:300]}"
             )
         result = []
+        id_mapping: dict[str, str] = {}  # old_id -> new_id
         for i, st in enumerate(subtasks):
             if not isinstance(st, dict):
                 continue
             name = str(st.get("name", f"subtask_{i + 1}"))
             # Fallback: slugify the name if id is missing or looks generic (t1, task_2, etc.)
-            raw_id = str(st.get("id", ""))
+            original_id = str(st.get("id", ""))
+            raw_id = original_id
             if not raw_id or re.match(r"^t\d+$|^task[_\s]?\d+$", raw_id, re.IGNORECASE):
                 slug = re.sub(r"[^\w]+", "_", name.lower()).strip("_")[:40] or f"subtask_{i + 1}"
                 raw_id = slug
+                if original_id:
+                    id_mapping[original_id] = raw_id
             result.append({
                 "id": raw_id,
                 "name": name,
@@ -331,14 +335,22 @@ class RegulatorOrchestrator:
             })
         if not result:
             raise RegulatorError("Decomposition returned empty sub-task list.")
+
+        # Remap depends_on references when IDs were slugified
+        if id_mapping:
+            for st in result:
+                st["depends_on"] = [id_mapping.get(dep, dep) for dep in st["depends_on"]]
+
         return result
 
     def _parse_batch_model_selection(self, raw: str, subtasks: list[dict]) -> dict:
         """Parse a batched model selection response into a dict keyed by subtask_id."""
         data = _extract_json(raw)
         selections = data.get("selections")
-        if not isinstance(selections, list) or not selections:
+        if selections is None:
             # Fallback: LLM returned a flat object (single selection, no wrapper)
+            selections = [data]
+        elif not isinstance(selections, list):
             selections = [data]
 
         result: dict[str, dict] = {}

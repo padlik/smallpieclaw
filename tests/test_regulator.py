@@ -447,6 +447,20 @@ class TestParseDecomposition:
         result = orch._parse_decomposition(raw)
         assert result[0]["id"] == "fetch_invoice_data"
 
+    def test_depends_on_remapped_when_ids_slugified(self):
+        """When IDs are slugified, depends_on references must be updated."""
+        raw = json.dumps({
+            "subtasks": [
+                {"id": "t1", "name": "Fetch Data", "description": "d1", "depends_on": []},
+                {"id": "t2", "name": "Process Data", "description": "d2", "depends_on": ["t1"]},
+            ]
+        })
+        orch = RegulatorOrchestrator()
+        result = orch._parse_decomposition(raw)
+        assert result[0]["id"] == "fetch_data"
+        assert result[1]["id"] == "process_data"
+        assert result[1]["depends_on"] == ["fetch_data"]
+
 
 # ---------------------------------------------------------------------------
 # RegulatorOrchestrator._parse_batch_model_selection
