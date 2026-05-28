@@ -106,35 +106,25 @@ Task:
 {task}"""
 
 _MODEL_SELECT_SYSTEM = """\
-You are an expert AI model selector. Your goal is to match a task to the most capable \
-and cost-effective model from the CONFIGURED models list.
+You are an expert AI model selector. For each sub-task provided, select the most capable \
+and cost-effective model from the CONFIGURED models list and write an execution prompt.
 
 IMPORTANT: You MUST select from the "Configured Models" list below. These are the only \
 models available for execution. The "Capabilities Reference" section provides additional \
 context for models that have documented capabilities — use it to make better decisions, \
 but you cannot select a model that is not in the configured list.
 
-## Step 1 — Review available models
-Read the configured models list. For each, check if capabilities data is available.
+## Instructions
 
-## Step 2 — Analyze the task
-Identify the core requirements: reasoning depth, domain knowledge, instruction-following \
-precision, output format, required context length, latency, and cost sensitivity.
-
-## Step 3 — Select one model
-Choose exactly one model from the configured list. Use its "model" field as the model_name. \
-If capabilities data is available, ground your selection in specific evidence. \
-If no capabilities data exists, select based on model name, provider, and general knowledge.
-
-## Step 4 — Set parameters
-Specify `temperature`, `top_p`, and `max_tokens` appropriate for the task type \
-(e.g. lower temperature for deterministic extraction, higher for creative synthesis).
-
-## Step 5 — Write the execution prompt
-Draft a complete, self-contained prompt for the chosen model. It must:
-- Include all context the model needs to execute without follow-up.
-- Specify the exact expected output format.
-- Be tailored to the model's known strengths and limitations.
+For EACH sub-task in the request:
+1. Analyze its requirements: reasoning depth, domain knowledge, instruction-following \
+   precision, output format, required context length, latency, and cost sensitivity.
+2. Select exactly one model from the configured list. Use its "model" field as model_name. \
+   If capabilities data is available, ground your selection in specific evidence. \
+   If no capabilities data exists, select based on model name, provider, and general knowledge.
+3. Set `temperature`, `top_p`, and `max_tokens` appropriate for the task type.
+4. Write a complete, self-contained execution prompt that includes all context the model \
+   needs and specifies the exact expected output format.
 
 ---
 
@@ -150,21 +140,26 @@ Capabilities Reference (enrichment data for models that have documented capabili
 
 Respond with a JSON object only (no markdown fences). Schema:
 {{
-  "model_name": "exact 'model' field from the configured models list",
-  "temperature": <number>,
-  "top_p": <number>,
-  "max_tokens": <integer>,
-  "rationale": "2-4 sentences grounding the choice",
-  "prompt": "complete ready-to-use execution prompt"
+  "selections": [
+    {{
+      "subtask_id": "exact id of the sub-task",
+      "model_name": "exact 'model' field from the configured models list",
+      "temperature": <number>,
+      "top_p": <number>,
+      "max_tokens": <integer>,
+      "rationale": "2-4 sentences grounding the choice",
+      "prompt": "complete ready-to-use execution prompt"
+    }}
+  ]
 }}
+
+Return one entry per sub-task, in the same order as provided.
 """
 
 _MODEL_SELECT_USER_TMPL = """\
-Sub-task: {name}
+Select the best model and write the execution prompt for each sub-task below:
 
-Description: {description}
-{upstream_note}
-Select the best model and write the execution prompt for this sub-task."""
+{subtasks_block}"""
 
 
 # ---------------------------------------------------------------------------
@@ -252,34 +247,41 @@ class RegulatorOrchestrator:
         # Valid model IDs for post-selection validation
         valid_model_ids = {m.get("model") for m in configured_models if m.get("model")}
 
+        # Build batched user message with all sub-tasks
+        subtask_blocks = []
+        for st in subtasks:
+            block = f"### Sub-task: {st['id']}\n- Name: {st['name']}\n- Description: {st['description']}"
+            if st.get("depends_on"):
+                block += (
+                    f"\n- Note: depends on outputs of: {', '.join(st['depends_on'])}. "
+                    f"Upstream results will be injected at execution time."
+                )
+            subtask_blocks.append(block)
+
+        user_msg = _MODEL_SELECT_USER_TMPL.format(
+            subtasks_block="\n\n".join(subtask_blocks),
+        )
+
+        logger.info(
+            "Regulator: selecting models for %d sub-task(s) in a single call",
+            len(subtasks),
+        )
+        raw_sel = llm_client.chat(
+            [{"role": "user", "content": user_msg}],
+            system=model_system,
+            json_mode=True,
+        )
+        selections = self._parse_batch_model_selection(raw_sel, subtasks)
+
+        # Build enriched subtask list
         enriched = []
         for st in subtasks:
-            logger.info("Regulator: selecting model for sub-task '%s'", st["id"])
-            upstream_note = ""
-            if st.get("depends_on"):
-                upstream_note = (
-                    f"\nNote: this sub-task depends on the outputs of: "
-                    f"{', '.join(st['depends_on'])}. "
-                    f"Upstream results will be injected at execution time.\n"
-                )
-            user_msg = _MODEL_SELECT_USER_TMPL.format(
-                name=st["name"],
-                description=st["description"],
-                upstream_note=upstream_note,
-            )
-            raw_sel = llm_client.chat(
-                [{"role": "user", "content": user_msg}],
-                system=model_system,
-                json_mode=True,
-            )
-            sel = self._parse_model_selection(raw_sel)
-
-            # Validate selected model is in configured set
+            sel = selections.get(st["id"], {})
             selected_model = sel.get("model_name", "")
             if valid_model_ids and selected_model not in valid_model_ids:
                 logger.warning(
-                    "Regulator: LLM selected '%s' which is not configured. "
-                    "Falling back to first configured model.", selected_model,
+                    "Regulator: LLM selected '%s' for sub-task '%s' which is not configured. "
+                    "Falling back to first configured model.", selected_model, st["id"],
                 )
                 selected_model = configured_models[0].get("model", "") if configured_models else ""
 
@@ -331,16 +333,47 @@ class RegulatorOrchestrator:
             raise RegulatorError("Decomposition returned empty sub-task list.")
         return result
 
-    def _parse_model_selection(self, raw: str) -> dict:
+    def _parse_batch_model_selection(self, raw: str, subtasks: list[dict]) -> dict:
+        """Parse a batched model selection response into a dict keyed by subtask_id."""
         data = _extract_json(raw)
-        return {
-            "model_name": str(data.get("model_name", "")),
-            "temperature": _to_float(data.get("temperature")),
-            "top_p": _to_float(data.get("top_p")),
-            "max_tokens": _to_int(data.get("max_tokens")),
-            "rationale": str(data.get("rationale", "")),
-            "prompt": str(data.get("prompt", "")),
-        }
+        selections = data.get("selections")
+        if not isinstance(selections, list) or not selections:
+            # Fallback: LLM returned a flat object (single selection, no wrapper)
+            selections = [data]
+
+        result: dict[str, dict] = {}
+        for sel in selections:
+            if not isinstance(sel, dict):
+                continue
+            entry = {
+                "model_name": str(sel.get("model_name", "")),
+                "temperature": _to_float(sel.get("temperature")),
+                "top_p": _to_float(sel.get("top_p")),
+                "max_tokens": _to_int(sel.get("max_tokens")),
+                "rationale": str(sel.get("rationale", "")),
+                "prompt": str(sel.get("prompt", "")),
+            }
+            subtask_id = str(sel.get("subtask_id", ""))
+            if subtask_id:
+                result[subtask_id] = entry
+
+        # If some subtasks weren't matched by id, assign in order
+        unmatched = [st for st in subtasks if st["id"] not in result]
+        unassigned = [sel for sel in selections
+                      if isinstance(sel, dict) and str(sel.get("subtask_id", "")) not in
+                      {st["id"] for st in subtasks}]
+        for st, sel in zip(unmatched, unassigned):
+            if isinstance(sel, dict):
+                result[st["id"]] = {
+                    "model_name": str(sel.get("model_name", "")),
+                    "temperature": _to_float(sel.get("temperature")),
+                    "top_p": _to_float(sel.get("top_p")),
+                    "max_tokens": _to_int(sel.get("max_tokens")),
+                    "rationale": str(sel.get("rationale", "")),
+                    "prompt": str(sel.get("prompt", "")),
+                }
+
+        return result
 
     # ------------------------------------------------------------------
     # Formatting
