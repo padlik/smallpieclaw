@@ -327,6 +327,61 @@ class TelegramInterface:
 
         typing_task = asyncio.create_task(_typing_loop())
 
+        # --- Scrolling step-log panel state ---
+        _steps: list[tuple[float, str]] = []   # (elapsed_secs, one-line html text)
+        _task_start = time.monotonic()
+        _last_edit_ts: list[float] = [0.0]
+        _step_n: list[int] = [0]
+        _MIN_EDIT_INTERVAL = 1.5
+        _MAX_STEPS = 10
+
+        def _classify(msg: str) -> str:
+            """Return a single-line HTML snippet for a progress message."""
+            from react_loop import _tool_icon  # local import to avoid circular at module level
+            if "Thinking" in msg or msg.startswith("⚙️"):
+                _step_n[0] += 1
+                return "⚙️ <i>Thinking…</i>"
+            if "Running tool:" in msg:
+                # e.g. "🖥️ Running tool: `shell`\n..."
+                name = msg.split("`")[1] if "`" in msg else msg.split(":")[-1].strip()
+                icon = _tool_icon(name.strip())
+                return f"{icon} Running: <code>{html.escape(name.strip())}</code>"
+            if "✅" in msg and "**" in msg:
+                # result line e.g. "🖥️ **shell** ✅\n..."
+                first_line = msg.split("\n")[0]
+                return first_line.replace("**", "<b>", 1).replace("**", "</b>", 1)
+            if "❌" in msg and "**" in msg:
+                first_line = msg.split("\n")[0]
+                return first_line.replace("**", "<b>", 1).replace("**", "</b>", 1)
+            # Fallback: plain first line, truncated
+            first_line = msg.split("\n")[0][:80]
+            return html.escape(first_line)
+
+        def _build_panel() -> str:
+            elapsed = time.monotonic() - _task_start
+            mins, secs = divmod(int(elapsed), 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            header = (
+                f"⚡ <b>Agent working</b>  •  Step {_step_n[0]}  •  {time_str}\n\n"
+            )
+            visible = _steps[-_MAX_STEPS:]
+            lines = []
+            for step_elapsed, rendered in visible:
+                sm, ss = divmod(int(step_elapsed), 60)
+                ts = f"{sm}:{ss:02d}" if sm else f"0:{ss:02d}"
+                lines.append(f"<code>[{ts}]</code> {rendered}")
+            return header + "\n".join(lines)
+
+        def _flush_panel(force: bool = False) -> None:
+            now = time.monotonic()
+            if not force and now - _last_edit_ts[0] < _MIN_EDIT_INTERVAL:
+                return
+            _last_edit_ts[0] = now
+            asyncio.run_coroutine_threadsafe(
+                self._safe_edit_html(status_msg, _build_panel()),
+                loop,
+            )
+
         def progress(msg: str):
             if msg.startswith("__CONFIRM__:"):
                 # Format: __CONFIRM__:{token}:{tool_name}:{description}
@@ -373,22 +428,24 @@ class TelegramInterface:
                     self._send_verbose_event(ctx.bot, chat_id, msg),
                     loop,
                 )
-            else:
-                asyncio.run_coroutine_threadsafe(
-                    self._safe_edit(status_msg, msg),
-                    loop,
-                )
+                return
+            # Normal progress: append to step log and (maybe) flush the panel
+            elapsed = time.monotonic() - _task_start
+            _steps.append((elapsed, _classify(msg)))
+            _flush_panel()
 
         try:
             result = await loop.run_in_executor(
                 None,
                 lambda: self.agent_handler(user.id, task_text, progress, images=images),
             )
+            _flush_panel(force=True)
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
                 await self._send_safe(update.effective_message, chunk)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
+            _flush_panel(force=True)
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
@@ -511,6 +568,16 @@ class TelegramInterface:
         except Exception:
             try:
                 await message.edit_text(text[:4096])
+            except Exception:
+                pass
+
+    async def _safe_edit_html(self, message, html_text: str) -> None:
+        """Edit a message with pre-built HTML, bypassing _md_to_html conversion."""
+        try:
+            await message.edit_text(html_text[:4096], parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await message.edit_text(html_text[:4096])
             except Exception:
                 pass
 
