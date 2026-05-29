@@ -79,16 +79,13 @@ prepared by step N-1 earlier — without re-entering the same session or tool co
   avoid spawning sub-tasks for trivial operations.
 - Mark dependencies: if sub-task B requires output from sub-task A, set depends_on=["A_id"].
 - Independent sub-tasks have depends_on=[].
-- Sub-task IDs MUST be short verb-noun phrases in snake_case that reflect the action and \
-  subject (e.g. "fetch_invoice_data", "enrich_contacts", "send_summary_email"). \
-  Never use generic labels like "t1", "t2", "task_3", or numbered placeholders.
 
 Respond with a JSON object only (no markdown fences). Schema:
 {
   "subtasks": [
     {
-      "id": "fetch_invoice_data",
-      "name": "Fetch invoice data",
+      "id": "t1",
+      "name": "Short descriptive name",
       "description": "What exactly this sub-task produces",
       "depends_on": []
     }
@@ -315,15 +312,9 @@ class RegulatorOrchestrator:
         for i, st in enumerate(subtasks):
             if not isinstance(st, dict):
                 continue
-            name = str(st.get("name", f"subtask_{i + 1}"))
-            # Fallback: slugify the name if id is missing or looks generic (t1, task_2, etc.)
-            raw_id = str(st.get("id", ""))
-            if not raw_id or re.match(r"^t\d+$|^task[_\s]?\d+$", raw_id, re.IGNORECASE):
-                slug = re.sub(r"[^\w]+", "_", name.lower()).strip("_")[:40] or f"subtask_{i + 1}"
-                raw_id = slug
             result.append({
-                "id": raw_id,
-                "name": name,
+                "id": str(st.get("id", f"t{i + 1}")),
+                "name": str(st.get("name", f"Sub-task {i + 1}")),
                 "description": str(st.get("description", "")),
                 "depends_on": [str(d) for d in st.get("depends_on", [])],
             })
@@ -396,32 +387,23 @@ class RegulatorOrchestrator:
 
     def save_plan(self, plan: dict, plans_dir: str) -> str:
         """
-        Save plan as Markdown to plans_dir/<task_slug>.md.
-        The filename is derived from the task text (first ~5 words, slugified).
+        Save plan as Markdown to plans_dir/plan_<timestamp>.md.
         Returns the absolute file path.
         """
         os.makedirs(plans_dir, exist_ok=True)
-
-        # Build a concise filename from the first few words of the task
-        task_text = plan.get("task", "plan")
-        created_at = plan.get("created_at", datetime.now(timezone.utc).isoformat())
-        words = re.findall(r"[a-zA-Z0-9]+", task_text)[:5]
-        slug = "_".join(w.lower() for w in words) if words else "plan"
-        # Avoid overwriting: append timestamp suffix if file already exists
-        base = os.path.join(plans_dir, f"{slug}.md")
-        if os.path.exists(base):
-            ts_suffix = re.sub(r"[^\d]", "", created_at[:19])
-            base = os.path.join(plans_dir, f"{slug}_{ts_suffix}.md")
-        path = base
+        ts = plan.get("created_at", datetime.now(timezone.utc).isoformat())
+        ts_file = re.sub(r"[^\d]", "", ts[:19])
+        filename = f"plan_{ts_file}.md"
+        path = os.path.join(plans_dir, filename)
 
         lines = [
             f"# Plan: {plan['task'][:80]}",
             "",
             "## Task Description",
-            task_text,
+            plan["task"],
             "",
             "## Created",
-            created_at,
+            ts,
             "",
             "## Sub-tasks",
             "",

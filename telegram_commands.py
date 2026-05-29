@@ -997,7 +997,7 @@ async def cb_mode_switch(iface: "TelegramInterface", update: Update, ctx: Contex
 
 
 async def cb_regulator_plan(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Regulator plan approval / rejection / show buttons."""
+    """Handle Regulator plan approval / save / discard button presses."""
     import asyncio
     import os
 
@@ -1028,39 +1028,29 @@ async def cb_regulator_plan(iface: "TelegramInterface", update: Update, ctx: Con
         asyncio.create_task(iface._run_regulator_execute(update, ctx, plan))
         return
 
-    if action == "reject":
-        iface._pending_plan = None
+    if action == "save":
+        plans_dir = os.path.join(os.getcwd(), "plans")
         try:
-            await query.edit_message_text("❌ Plan rejected.", parse_mode=ParseMode.HTML)
+            from regulator import RegulatorOrchestrator
+            orch = RegulatorOrchestrator()
+            path = orch.save_plan(iface._pending_plan, plans_dir)
+            iface._pending_plan = None
+            filename = os.path.basename(path)
+            text = f"💾 Plan saved to <code>{html.escape(filename)}</code>."
+        except Exception as exc:
+            text = f"❌ Failed to save plan: {html.escape(str(exc))}"
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML)
         except Exception:
             pass
         return
 
-    if action == "show":
-        saved_path = iface._pending_plan.get("_saved_path", "")
-        if saved_path and os.path.exists(saved_path):
-            try:
-                with open(saved_path, "rb") as fh:
-                    await query.message.reply_document(
-                        document=fh,
-                        filename=os.path.basename(saved_path),
-                        caption="📋 Full plan",
-                    )
-            except Exception as exc:
-                try:
-                    await query.message.reply_text(
-                        f"❌ Could not send plan file: {html.escape(str(exc))}",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-        else:
-            try:
-                await query.message.reply_text(
-                    "❌ Plan file not found.", parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
+    if action == "discard":
+        iface._pending_plan = None
+        try:
+            await query.edit_message_text("❌ Plan discarded.", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
         return
 
 

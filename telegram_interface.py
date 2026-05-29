@@ -664,26 +664,20 @@ class TelegramInterface:
 
         try:
             plan = await loop.run_in_executor(None, _run_planning)
-
-            # Auto-save plan immediately after creation
-            plans_dir = os.path.join(os.getcwd(), "plans")
-            from regulator import RegulatorOrchestrator
-            orch = RegulatorOrchestrator()
-            saved_path = await loop.run_in_executor(None, orch.save_plan, plan, plans_dir)
-            plan["_saved_path"] = saved_path
-
             self._pending_plan = plan
 
-            plan_html = orch.format_plan_html(plan)
-            saved_name = os.path.basename(saved_path)
+            from regulator import RegulatorOrchestrator
+            plan_html = RegulatorOrchestrator().format_plan_html(plan)
 
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data="reg_approve"),
-                InlineKeyboardButton("❌ Reject", callback_data="reg_reject"),
-                InlineKeyboardButton("📋 Show full plan", callback_data="reg_show"),
-            ]])
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Approve", callback_data="reg_approve")],
+                [
+                    InlineKeyboardButton("💾 Save Plan", callback_data="reg_save"),
+                    InlineKeyboardButton("❌ Discard", callback_data="reg_discard"),
+                ],
+            ])
             await status_msg.edit_text(
-                plan_html + f"\n\n<i>Plan saved as <code>{html.escape(saved_name)}</code></i>",
+                plan_html,
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
             )
