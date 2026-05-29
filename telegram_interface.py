@@ -688,4 +688,4 @@ class TelegramInterface:
 
 # Progress message prefixes that represent agent "actions" (tool calls, results,
 # errors, model switches) — shown as new messages in verbose mode.
-_VERBOSE_EVENT_PREFIXES = ("🔧", "✅ C", "❌", "🛠️", "⚡", "⚠️ ")
+_VERBOSE_EVENT_PREFIXES = ("🔧", "🖥️", "📄", "✏️", "🤖", "🧠", "🌐", "👁️", "✅ C", "❌", "🛠️", "⚡", "⚠️ ")
