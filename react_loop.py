@@ -165,20 +165,20 @@ def fmt_tool_call(tool_name: str, args: dict) -> str:
     """Format a tool call as a compact, readable string for progress display."""
     if tool_name == "shell":
         cmd = args.get("command", "")
-        return f"<blockquote>$ {cmd}</blockquote>"
+        return f"```\n$ {cmd}\n```"
     if tool_name == "file_read":
-        return f"<blockquote>read: {args.get('path', '?')}</blockquote>"
+        return f"```\nread: {args.get('path', '?')}\n```"
     if tool_name == "file_write":
         path = args.get("path", "?")
         size = len(args.get("content", ""))
-        return f"<blockquote>write: {path} ({size} bytes)</blockquote>"
+        return f"```\nwrite: {path} ({size} bytes)\n```"
     try:
         arg_str = json.dumps(args, ensure_ascii=False)
     except Exception:
         arg_str = str(args)
     if len(arg_str) > 200:
         arg_str = arg_str[:197] + "…"
-    return f"<blockquote>{arg_str}</blockquote>" if arg_str and arg_str != "{}" else ""
+    return f"```\n{arg_str}\n```" if arg_str and arg_str != "{}" else ""
 
 
 def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
@@ -191,13 +191,13 @@ def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
             preview = "\n".join(lines[:8])
             if len(lines) > 8 or len(preview) > 400:
                 preview = preview[:400] + "\n…"
-            return f"🔧 <b>{tool_name}</b> ✅\n{call}\n<blockquote>{preview}</blockquote>"
-        return f"🔧 <b>{tool_name}</b> ✅\n{call}\n<i>(no output)</i>"
+            return f"🔧 **{tool_name}** ✅\n{call}\n```\n{preview}\n```"
+        return f"🔧 **{tool_name}** ✅\n{call}\n_(no output)_"
     else:
         err = (outcome.get("error") or outcome.get("output") or "failed").strip()
         if len(err) > 300:
             err = err[:297] + "…"
-        return f"🔧 <b>{tool_name}</b> ❌\n{call}\n<blockquote>{err}</blockquote>"
+        return f"🔧 **{tool_name}** ❌\n{call}\n```\n{err}\n```"
 
 
 def format_tool_result(tool_name: str, outcome: dict) -> str:
@@ -536,7 +536,7 @@ def _dispatch_tool(
     if isinstance(args, list):
         args = {str(i): v for i, v in enumerate(args)}
 
-    _progress(f"🔧 Running tool: <code>{tool_name}</code>\n{fmt_tool_call(tool_name, args)}")
+    _progress(f"🔧 Running tool: `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
 
     # vision_query handled directly (needs LLM access)
     if tool_name == "vision_query":
@@ -556,7 +556,7 @@ def _dispatch_tool(
                     pfx, tool_name, tool_name,
                 )
                 outcome = ctx.builtin_executor.confirm(token)
-                _progress(f"✅ Auto-approved <code>{tool_name}</code> (approve-all active)")
+                _progress(f"✅ Auto-approved `{tool_name}` (approve-all active)")
             else:
                 result_confirmed = ctx.confirmation.request_confirmation(
                     token, tool_name, description, _progress,
@@ -564,7 +564,7 @@ def _dispatch_tool(
 
                 if result_confirmed:
                     outcome = ctx.builtin_executor.confirm(token)
-                    _progress(f"✅ Confirmed — executing <code>{tool_name}</code>\n{fmt_tool_call(tool_name, args)}")
+                    _progress(f"✅ Confirmed — executing `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
                 else:
                     ctx.builtin_executor.cancel(token)
                     outcome = {
@@ -611,15 +611,15 @@ def _dispatch_create_tool(
                 f"Tool '{result['name']}' was created successfully at {result['path']}. "
                 "You can now use it with the 'tool' action."
             )
-            _progress(f"🛠️ Tool Created: <code>{result['name']}</code>\n✅ {description}")
+            _progress(f"🛠️ Tool Created: `{result['name']}`\n✅ {description}")
         else:
             feedback = f"Tool creation failed: {result['error']}"
-            _progress(f"🛠️ Tool Creation Failed: <code>{tool_name}</code>\n❌ {result['error']}")
+            _progress(f"🛠️ Tool Creation Failed: `{tool_name}`\n❌ {result['error']}")
         logger.info("Tool creation '%s': %s", tool_name, result)
         return feedback, False
 
     elif tc_action == "run":
-        _progress(f"⚡ Running <code>{tool_name}</code> as one-off script…")
+        _progress(f"⚡ Running `{tool_name}` as one-off script…")
         try:
             if language == "python":
                 proc = subprocess.run(
@@ -634,7 +634,7 @@ def _dispatch_create_tool(
             output = (proc.stdout or "") + (proc.stderr or "")
             output = output[:2000]
             feedback = f"Script executed (exit {proc.returncode}):\n{output}" if output else f"Script executed (exit {proc.returncode}), no output."
-            _progress(f"⚡ Script result (exit {proc.returncode}):\n<blockquote>{output[:400]}</blockquote>" if output else "⚡ Script ran, no output.")
+            _progress(f"⚡ Script result (exit {proc.returncode}):\n```\n{output[:400]}\n```" if output else "⚡ Script ran, no output.")
         except Exception as exc:
             feedback = f"Script execution failed: {exc}"
             _progress(f"❌ Script failed: {exc}")
