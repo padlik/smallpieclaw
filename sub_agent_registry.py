@@ -24,16 +24,24 @@ class SubAgentRecord:
     # mutable fields updated by the runner
     iteration: int = 0
     max_iterations: int = 8
+    # result fields — populated when the sub-agent finishes
+    status: str = "running"          # "running" | "done" | "failed" | "cancelled"
+    result: Optional[str] = None     # final output text (or file path for response_format="file")
+    result_type: str = "text"        # "text" | "json" | "file"
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _result_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _llm_client: object = field(default=None, repr=False)  # LLMClient — for immediate HTTP interrupt
+    _timeout_cancelled: bool = field(default=False, repr=False)  # set by get_agent_result on timeout
 
     def cancel(self) -> None:
         self._cancel_event.set()
-        # Close the HTTP client to immediately interrupt any in-progress LLM request.
+        # Close the HTTP transport to immediately interrupt any in-progress LLM request.
+        # For openai/google/anthropic: closes self._http (httpx.Client).
+        # For ollama: also closes the ollama Client's internal httpx transport.
         # The resulting transport exception is caught as LLMCancelledError in _with_retry.
         if self._llm_client is not None:
             try:
-                self._llm_client._http.close()
+                self._llm_client.close_http()
             except Exception:
                 pass
 
@@ -114,6 +122,19 @@ class SubAgentRegistry:
     def count(self) -> int:
         with self._lock:
             return len(self._agents)
+
+    def count_managed(self) -> int:
+        """Return count of on-demand (managed) sub-agents only."""
+        with self._lock:
+            return sum(1 for r in self._agents.values() if r.source == "on-demand")
+
+    def cancel_all_managed(self) -> int:
+        """Cancel all on-demand sub-agents atomically. Returns count cancelled."""
+        with self._lock:
+            targets = [r for r in self._agents.values() if r.source == "on-demand"]
+        for rec in targets:
+            rec.cancel()
+        return len(targets)
 
 
 # Module-level singleton

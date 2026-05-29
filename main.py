@@ -176,6 +176,7 @@ except ImportError:
 from agent_controller import AgentController, SubAgentRunner  # noqa: E402
 from builtin_executor import BuiltinExecutor, _load_context  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
+from mcp_client import MCPManager  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
@@ -194,6 +195,16 @@ def load_config(path="config.toml"):
     with open(path, "rb") as f:
         cfg = tomli.load(f)
     logger.info("Configuration loaded from %s", path)
+
+    # Validate config structure early — fail fast with clear error messages
+    from config_schema import parse_config
+    from exceptions import ConfigError
+    try:
+        parse_config(cfg)
+    except ConfigError as exc:
+        logger.error("Configuration error: %s", exc)
+        sys.exit(1)
+
     return cfg
 
 
@@ -264,16 +275,52 @@ def _run(
     max_output = agent_cfg.get("max_output_size", 4000)
     top_tools  = agent_cfg.get("top_tools", 3)
     ctx_max_tokens = agent_cfg.get("ctx_max_tokens", 90_000)
+    max_subagents = agent_cfg.get("max_subagents", 6)
+    subagent_result_timeout = agent_cfg.get("subagent_result_timeout", 300)
+    # Separate step cap for scheduled/background agents (chat sessions use max_iter)
+    _raw_sched_max = agent_cfg.get("scheduled_max_iterations", 100)
+    scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
 
     logger.info("Initialising components...")
 
-    llm      = LLMClient(cfg, usage_registry=get_token_registry())
+    llm      = LLMClient(cfg, usage_registry=get_token_registry(), caller_tag="main")
     memory   = MemoryStore(memory_path)
+    # Purge any model/LLM facts the agent may have written in past sessions.
+    # These are always stale — authoritative model info lives in config.toml and is
+    # injected fresh into every system prompt via _format_models().
+    _purged = memory.purge_matching("model", "llm")
+    if _purged:
+        logger.info("Startup: purged %d stale model/provider key(s) from memory store", _purged)
     registry = ToolRegistry(tools_dirs=[tools_dir, gen_tools_dir])
-    builtin  = BuiltinExecutor(default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory)
+    builtin  = BuiltinExecutor(
+        default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,
+        max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
+    )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
     creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)
+
+    # Initialise MCP servers (optional — skip if none configured)
+    mcp_manager: MCPManager | None = None
+    mcp_server_cfgs = cfg.get("mcp_servers", [])
+    if mcp_server_cfgs:
+        logger.info("Initialising %d MCP server(s)...", len(mcp_server_cfgs))
+        mcp_manager = MCPManager(mcp_server_cfgs)
+        try:
+            mcp_manager.connect_all()
+            mcp_tools = mcp_manager.get_tools()
+            if mcp_tools:
+                # Group by server and register
+                servers_seen: set[str] = set()
+                for t in mcp_tools:
+                    servers_seen.add(t.server_name)
+                for srv in servers_seen:
+                    srv_tools = [t for t in mcp_tools if t.server_name == srv]
+                    registry.register_mcp_tools(srv, srv_tools)
+                logger.info("MCP: registered %d tool(s) from %d server(s)",
+                            len(mcp_tools), len(servers_seen))
+        except Exception as exc:
+            logger.warning("MCP connect_all failed (agent will start without MCP): %s", exc)
 
     short_term  = ShortTermMemory(max_turns=20)
     working     = WorkingMemory()
@@ -298,6 +345,7 @@ def _run(
         results=results_mem,
         builtin_executor=builtin,
         skill_registry=skills,
+        mcp_manager=mcp_manager,
         tmp_dir=tmp_dir,
         downloads_dir=downloads_dir,
         log_file=log_file,
@@ -310,19 +358,20 @@ def _run(
     except Exception as exc:
         logger.warning("Tool index build failed (check embeddings API config): %s", exc)
 
-    def agent_handler(user_id, text, progress_cb):
-        return agent.run(text, progress_callback=progress_cb)
-
-    def run_agent(goal):
-        return agent.run(goal)
+    def agent_handler(user_id, text, progress_cb, images=None):
+        return agent.run(text, progress_callback=progress_cb, images=images or None)
 
     # Build TelegramInterface first so notify() can reference it
-    # (scheduler and tg are wired together via forward references in closures)
-    _tg_holder: list = [None]
+    # (tg is created after scheduler/sub_agent_factory wiring, so we use nonlocal)
+    tg: TelegramInterface | None = None
 
     def notify(msg):
-        if _tg_holder[0] is not None:
-            _tg_holder[0].send_message_to_users(msg)
+        if tg is not None:
+            tg.send_message_to_users(msg)
+
+    def notify_html(html_msg):
+        if tg is not None:
+            tg.send_html_to_users(html_msg)
 
     # Resolve background_model for sub-agents
     background_model_id = agent_cfg.get("background_model") or agent_cfg.get("default_model", "")
@@ -338,7 +387,9 @@ def _run(
             background_model_cfg.get("model", "none"),
         )
 
-    def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None):
+    def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
+                          fallback_models=None, max_iterations=None,
+                          max_tokens=None, temperature=None, top_p=None):
         """Create an isolated SubAgentRunner with the requested model override."""
         # Resolve model config
         if model:
@@ -350,6 +401,19 @@ def _run(
                 )
         else:
             model_cfg = background_model_cfg
+
+        # Apply per-call LLM parameter overrides — always shallow-copy to protect shared config
+        llm_overrides = {}
+        if max_tokens is not None:
+            llm_overrides["max_tokens"] = max_tokens
+        if temperature is not None:
+            llm_overrides["temperature"] = temperature
+        if top_p is not None:
+            llm_overrides["top_p"] = top_p
+        model_cfg = {**model_cfg, **llm_overrides}
+
+        # max_iterations: explicit override > scheduled default (never use chat max_iter here)
+        effective_max_iter = max_iterations if max_iterations is not None else scheduled_max_iter
 
         ctx_max_turns = 50
         pre_loaded_ctx = None
@@ -365,24 +429,27 @@ def _run(
             base_memory=memory,
             builtin_executor=builtin,
             skill_registry=skills,
+            mcp_manager=mcp_manager,
             long_term=long_term,
             results=results_mem,
             short_term=pre_loaded_ctx,
             notify_fn=notify_fn or notify,
             context_key=context_key,
             label=label,
-            max_iterations=max_iter,
+            max_iterations=effective_max_iter,
             top_tools=top_tools,
             ctx_max_tokens=ctx_max_tokens,
             tmp_dir=tmp_dir,
             downloads_dir=downloads_dir,
             usage_registry=get_token_registry(),
             depth=1,
+            fallback_models=fallback_models,
         )
         return runner
 
     # Wire sub_agent_factory into builtin executor
     builtin._sub_agent_factory = sub_agent_factory
+    builtin._notify_html_fn = notify_html
 
     scheduler = Scheduler(
         cfg, notify_fn=notify,
@@ -397,15 +464,17 @@ def _run(
     tg = TelegramInterface(
         cfg, agent_handler,
         agent_reset_fn=agent.reset_task,
+        agent_compress_fn=agent.compress_context,
         scheduler=scheduler,
         tool_registry=registry,
         llm_client=llm,
         tool_index=index,
         skill_registry=skills,
         usage_registry=get_token_registry(),
+        downloads_dir=downloads_dir,
+        mcp_manager=mcp_manager,
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
-    _tg_holder[0] = tg
 
     scheduler.start()
     try:
@@ -414,7 +483,11 @@ def _run(
         logger.info("Shutdown requested.")
     finally:
         scheduler.stop()
+        builtin.shutdown()
         llm.close()
+        if mcp_manager:
+            mcp_manager.close_all()
+            logger.info("MCP servers closed.")
         logger.info("Agent stopped.")
 
 

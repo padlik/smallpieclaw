@@ -54,7 +54,7 @@ def _legacy_to_cron(stype: str, time_str: str = None, hours=None, minutes=None, 
         try:
             h, m = t.split(":")
             return f"{int(m)} {int(h)} * * *"
-        except Exception:
+        except (ValueError, TypeError):
             return "0 2 * * *"
     if stype == "interval":
         if hours:
@@ -95,6 +95,7 @@ class Scheduler:
         builtin_executor=None,
     ):
         sched_cfg = config.get("scheduler", {})
+        agent_cfg = config.get("agent", {})
         self.enabled: bool = sched_cfg.get("enabled", True)
         self.notify = notify_fn
         self.agent = agent_fn
@@ -106,6 +107,10 @@ class Scheduler:
         self._state_file = os.path.join(data_dir, "scheduler_state.json")
         self._dynamic_jobs_file = os.path.join(data_dir, "scheduled_jobs.json")
 
+        # Long-running agent watcher
+        self._warn_minutes: int = int(agent_cfg.get("long_run_warn_minutes", 30))
+        self._warned_agent_ids: set = set()
+
         self._jobs_meta: dict = {}
         self._run_history: dict = {}  # tag → {last_run, last_error} — persisted forever
         self._thread: Optional[threading.Thread] = None
@@ -114,6 +119,9 @@ class Scheduler:
         # Overlap detection: tracks tags of currently executing jobs
         self._running_jobs: set = set()
         self._running_lock = threading.Lock()
+        # Serializes all writes to scheduler.toml and scheduler_state.json,
+        # preventing race conditions when two jobs finish simultaneously.
+        self._save_lock = threading.Lock()
 
         os.makedirs(data_dir, exist_ok=True)
         self._load_config_jobs(scheduler_config_path, sched_cfg)
@@ -183,9 +191,11 @@ class Scheduler:
         cron: str = None,
         source: str = "dynamic",
         model: str = None,
+        fallback_models: list = None,
         preserve_context: bool = False,
         context_max_messages: int = 50,
         overlap_policy: str = "skip",
+        max_iterations: int = None,
     ) -> dict:
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
         tag = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
@@ -242,11 +252,18 @@ class Scheduler:
         }
         if model:
             meta["model"] = model
+        if fallback_models is not None:
+            meta["fallback_models"] = fallback_models
         if preserve_context:
             meta["preserve_context"] = preserve_context
             meta["context_max_messages"] = context_max_messages
         if overlap_policy != "skip":
             meta["overlap_policy"] = overlap_policy
+        if max_iterations is not None:
+            try:
+                meta["max_iterations"] = int(max_iterations)
+            except (ValueError, TypeError):
+                pass
 
         self._jobs_meta[tag] = meta
         self._save_state()
@@ -322,6 +339,7 @@ class Scheduler:
                 "notify": meta.get("notify", True),
                 "source": meta.get("source", "config"),
                 "model": meta.get("model"),
+                "fallback_models": meta.get("fallback_models"),
                 "preserve_context": meta.get("preserve_context", False),
                 "is_running": tag in running,
             }
@@ -395,7 +413,7 @@ class Scheduler:
                 "Registered cron job: %s (%s) → next run %s (jitter %s%ds)",
                 tag, expr, next_run.strftime("%Y-%m-%d %H:%M:%S"), sign, jitter_secs,
             )
-        except Exception as exc:
+        except (CroniterBadCronError, ValueError, TypeError) as exc:
             logger.warning("Could not compute next_run for job '%s' (%s): %s", tag, expr, exc)
 
     def _mark_job_finished(self, tag: str) -> None:
@@ -408,26 +426,33 @@ class Scheduler:
         if not meta or not meta.get("enabled", True):
             return
 
+        _spfx = f"[sched/{tag}] "
+
         # Overlap detection
         overlap_policy = meta.get("overlap_policy", "skip")
         with self._running_lock:
             if tag in self._running_jobs:
                 if overlap_policy == "skip":
                     logger.warning(
-                        "Job '%s' skipped — previous run still in progress (policy: skip)", tag
+                        "%sJob skipped — previous run still in progress (policy: skip)", _spfx
                     )
                     return
                 # else: parallel — allow multiple instances
             self._running_jobs.add(tag)
 
         task = meta.get("task", "").strip()
-        logger.info("Running scheduled job: %s", tag)
+        job_model = meta.get("model") or None
+        job_fallbacks = meta.get("fallback_models")
+        _log_extra = f" | model={job_model}" if job_model else ""
+        if job_fallbacks is not None:
+            _log_extra += f" | fallback_models={job_fallbacks}"
+        logger.info("%sRunning scheduled job%s", _spfx, _log_extra)
         now = datetime.utcnow().isoformat()
         is_once = meta.get("schedule_type") == "once"
 
         # --- Empty task guard ---
         if not task:
-            logger.warning("Job '%s' has no task — sending direct notification", tag)
+            logger.warning("%sNo task — sending direct notification", _spfx)
             friendly = tag.replace("_", " ")
             meta["last_run"] = now
             self._run_history[tag] = {"last_run": now, "last_error": None}
@@ -445,10 +470,6 @@ class Scheduler:
 
         # Prefer spawn_agent via builtin_executor if available
         if self.builtin_executor is not None and hasattr(self.builtin_executor, '_exec_spawn_agent'):
-            # Register finish callback so _running_jobs is cleaned up
-            self.builtin_executor._scheduler_finish_cb = self._mark_job_finished
-
-            job_model = meta.get("model") or None
             preserve_ctx = meta.get("preserve_context", False)
             context_key = tag if preserve_ctx else None
 
@@ -457,6 +478,21 @@ class Scheduler:
                 spawn_args["model"] = job_model
             if context_key:
                 spawn_args["context_key"] = context_key
+            # fallback_models: if key present in meta (even as []), pass it through;
+            # if absent, omit so sub-agent inherits from parent config
+            if "fallback_models" in meta:
+                spawn_args["fallback_models"] = meta["fallback_models"]
+            # max_iterations: per-job override; None = factory uses scheduled_max_iterations
+            if "max_iterations" in meta:
+                spawn_args["max_iterations"] = meta["max_iterations"]
+            # Pass finish callback directly in spawn_args to avoid race when
+            # multiple jobs fire concurrently and overwrite the shared attribute.
+            spawn_args["_finish_cb"] = self._mark_job_finished
+            # Scheduled job results should be shown as plain text, not in a
+            # collapsed expandable blockquote (which hides the result by default).
+            spawn_args["expandable"] = False
+            # Honour the job's notify setting — False suppresses Telegram output.
+            spawn_args["_notify"] = meta.get("notify", True)
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now
@@ -465,7 +501,7 @@ class Scheduler:
 
             result = self.builtin_executor._exec_spawn_agent(spawn_args)
             if not result.get("success"):
-                logger.error("Job '%s' spawn failed: %s", tag, result.get("error"))
+                logger.error("%sSpawn failed: %s", _spfx, result.get("error"))
                 meta["last_error"] = result.get("error", "spawn failed")
                 self._run_history[tag]["last_error"] = meta["last_error"]
                 self._save_state()
@@ -495,8 +531,8 @@ class Scheduler:
                 result = "Agent not available for task."
             if result.startswith("❌"):
                 error_occurred = True
-        except Exception as exc:
-            logger.error("Job '%s' failed: %s", tag, exc)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.error("%sFailed: %s", _spfx, exc)
             result = f"Job failed: {exc}"
             error_occurred = True
         finally:
@@ -523,13 +559,13 @@ class Scheduler:
         if tag == "longterm_memory_update" and self.long_term_memory:
             try:
                 self.long_term_memory.add(result, source="scheduled")
-                logger.info("Long-term memory updated from job '%s'", tag)
+                logger.info("%sLong-term memory updated", _spfx)
             except Exception as exc:
-                logger.warning("Failed to update long-term memory from job '%s': %s", tag, exc)
+                logger.warning("%sFailed to update long-term memory: %s", _spfx, exc)
 
         # Auto-remove once/reminder jobs after successful execution
         if is_once:
-            logger.info("Once job '%s' completed — removing", tag)
+            logger.info("%sOnce job completed — removing", _spfx)
             schedule.clear(tag)
             self._jobs_meta.pop(tag, None)
             self._save_state()
@@ -545,7 +581,7 @@ class Scheduler:
             with open(self._commands_file) as f:
                 commands = json.load(f)
             os.remove(self._commands_file)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Could not read scheduler commands: %s", exc)
             return
 
@@ -580,10 +616,14 @@ class Scheduler:
                     self.resume_job(tag)
                 else:
                     logger.warning("Unknown scheduler command action: %s", action)
-            except Exception as exc:
+            except (KeyError, TypeError, ValueError) as exc:
                 logger.error("Error processing scheduler command %s: %s", cmd, exc)
 
     def _save_state(self) -> None:
+        with self._save_lock:
+            self._save_state_locked()
+
+    def _save_state_locked(self) -> None:
         # Merge current job states into run_history so history is never lost
         for tag, meta in self._jobs_meta.items():
             if meta.get("last_run") or meta.get("last_error"):
@@ -606,7 +646,7 @@ class Scheduler:
             with open(tmp, "w") as f:
                 json.dump(state, f, indent=2)
             os.replace(tmp, self._state_file)
-        except Exception as exc:
+        except OSError as exc:
             logger.warning("Could not save scheduler state: %s", exc)
 
     def _load_state(self) -> None:
@@ -616,7 +656,7 @@ class Scheduler:
         try:
             with open(self._state_file) as f:
                 state = json.load(f)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Could not load scheduler state: %s", exc)
             return
 
@@ -663,7 +703,7 @@ class Scheduler:
                 self._save_scheduler_toml()
             os.remove(self._dynamic_jobs_file)
             logger.info("Removed legacy %s after migration", self._dynamic_jobs_file)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Could not migrate dynamic jobs: %s", exc)
 
     _MAX_BACKUPS = 5
@@ -679,7 +719,7 @@ class Scheduler:
             )
             for old in baks[: max(0, len(baks) - self._MAX_BACKUPS)]:
                 os.remove(os.path.join(dir_, old))
-        except Exception as exc:
+        except OSError as exc:
             logger.debug("Could not prune scheduler backups: %s", exc)
 
     def reload(self) -> dict:
@@ -707,7 +747,7 @@ class Scheduler:
                 try:
                     self._register_job(tag, meta)
                     reloaded += 1
-                except Exception as exc:
+                except (CroniterBadCronError, TypeError, ValueError) as exc:
                     logger.warning("Failed to register job '%s' on reload: %s", tag, exc)
                     failed += 1
         logger.info("Scheduler reloaded: %d active, %d failed", reloaded, failed)
@@ -715,6 +755,11 @@ class Scheduler:
 
     def _save_scheduler_toml(self) -> None:
         """Persist all current jobs to scheduler.toml (auto-managed file)."""
+        with self._save_lock:
+            self._save_scheduler_toml_locked()
+
+    def _save_scheduler_toml_locked(self) -> None:
+        """Inner (lock-free) implementation — always called under _save_lock."""
         def _toml_str(v: str) -> str:
             return '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
@@ -741,7 +786,12 @@ class Scheduler:
             lines.append(f"task = {_toml_str(meta.get('task', ''))}\n")
             lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
             if meta.get("model"):
-                lines.append(f'model = "{meta["model"]}"\n')
+                lines.append(f"model = {_toml_str(meta['model'])}\n")
+            if meta.get("fallback_models") is not None:
+                fb = meta["fallback_models"]
+                # Serialize as TOML inline array using the same escaping as _toml_str
+                items = ", ".join(_toml_str(m) for m in fb)
+                lines.append(f"fallback_models = [{items}]\n")
             if meta.get("preserve_context"):
                 lines.append('preserve_context = true\n')
                 ctx_max = meta.get("context_max_messages", 50)
@@ -749,6 +799,8 @@ class Scheduler:
                     lines.append(f'context_max_messages = {ctx_max}\n')
             if meta.get("overlap_policy", "skip") != "skip":
                 lines.append(f'overlap_policy = "{meta["overlap_policy"]}"\n')
+            if meta.get("max_iterations") is not None:
+                lines.append(f'max_iterations = {int(meta["max_iterations"])}\n')
             source = meta.get("source", "config")
             if source != "config":
                 lines.append(f'source = "{source}"\n')
@@ -768,7 +820,7 @@ class Scheduler:
                 self._prune_backups()
             os.replace(tmp, self._scheduler_config_path)
             logger.debug("Saved %d jobs to %s", len(self._jobs_meta), self._scheduler_config_path)
-        except Exception as exc:
+        except OSError as exc:
             logger.warning("Could not save scheduler.toml: %s", exc)
 
     def _load_config_jobs(self, config_path: str, sched_cfg: dict = None) -> None:
@@ -783,7 +835,7 @@ class Scheduler:
         try:
             with open(config_path, "rb") as f:
                 toml_data = tomli.load(f)
-        except Exception as exc:
+        except (OSError, tomli.TOMLDecodeError) as exc:
             logger.warning("Could not load %s: %s — starting with no jobs", config_path, exc)
             return
 
@@ -821,10 +873,17 @@ class Scheduler:
                 "last_run": None,
                 "created_at": job_cfg.get("created_at", datetime.utcnow().isoformat()),
                 "model": job_cfg.get("model") or None,
+                "fallback_models": job_cfg.get("fallback_models"),
                 "preserve_context": bool(job_cfg.get("preserve_context", False)),
                 "context_max_messages": int(job_cfg.get("context_max_messages", 50)),
                 "overlap_policy": job_cfg.get("overlap_policy", "skip"),
             }
+            # Optional per-job step cap
+            if job_cfg.get("max_iterations") is not None:
+                try:
+                    self._jobs_meta[tag]["max_iterations"] = int(job_cfg["max_iterations"])
+                except (ValueError, TypeError):
+                    pass
 
         logger.info(
             "Loaded %d jobs from %s%s",
@@ -851,7 +910,7 @@ class Scheduler:
                     continue
                 try:
                     next_run = datetime.fromisoformat(next_run_str)
-                except Exception:
+                except ValueError:
                     continue
                 if now_local >= next_run:
                     # Fire in background thread
@@ -868,8 +927,49 @@ class Scheduler:
                             next_dt = cron_iter.get_next(datetime)
                             meta["_natural_next_run"] = next_dt.isoformat()
                             meta["_next_run"] = next_dt.isoformat()
-                    except Exception as exc:
+                    except (CroniterBadCronError, TypeError, ValueError) as exc:
                         logger.warning("Could not compute next_run for '%s': %s", tag, exc)
             # Once-jobs handled by schedule library
             schedule.run_pending()
+            if self._warn_minutes > 0:
+                self._check_long_running_agents()
             self._stop_event.wait(timeout=30)
+
+    def _check_long_running_agents(self) -> None:
+        """Warn once in chat when a sub-agent has been running longer than _warn_minutes."""
+        try:
+            from sub_agent_registry import get_registry as _get_reg
+        except ImportError:
+            return
+
+        registry = _get_reg()
+        threshold = self._warn_minutes * 60
+        active_ids: set = set()
+
+        for record in registry.list_active():
+            active_ids.add(record.agent_id)
+            if record.elapsed_seconds < threshold:
+                continue
+            if record.agent_id in self._warned_agent_ids:
+                continue
+            self._warned_agent_ids.add(record.agent_id)
+            elapsed = record.elapsed_str()
+            msg = (
+                f"⏱ <b>Sub-agent running for {elapsed}</b>\n"
+                f"Job: <code>{_html.escape(record.label)}</code> | "
+                f"Model: <code>{_html.escape(record.model)}</code>\n"
+                f"Task: {_html.escape(record.task_preview)}…\n"
+                f"Agent ID: <code>{record.agent_id}</code> — use /agents to monitor or cancel"
+            )
+            logger.warning(
+                "Long-running sub-agent detected: id=%s label=%s elapsed=%s",
+                record.agent_id, record.label, elapsed,
+            )
+            try:
+                self.notify(msg)
+            except Exception as exc:
+                logger.warning("_check_long_running_agents: notify failed: %s", exc)
+
+        # Clean up ids for agents that have since finished
+        self._warned_agent_ids &= active_ids
+

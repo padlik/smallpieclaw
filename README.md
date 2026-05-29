@@ -18,14 +18,20 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Self-health diagnosis** — `/health` command and automatic 4-hour periodic job: reads log file, analyzes errors, suggests fixes, rotates logs
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
 - **Typing indicator** — Telegram shows "typing…" while the agent is reasoning
-- **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps or cancel
-- **Multi-model LLM** — define multiple models with hint keywords; agent auto-selects; switch via `/models`
-- **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude; reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
-- **Context compaction** — auto-summarises older messages when the token budget is near the configured limit
+- **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps, extend **unlimited**, or cancel; dangerous built-in actions offer an **Approve All** button to skip future confirmation prompts for the same action type
+- **MCP server support** — connect external tools via [Model Context Protocol](https://modelcontextprotocol.io) servers; supports `stdio` (subprocess) and `http` transports with per-server headers and env variables; manage via `/mcp`
+- **JSON mode enforcement** — the agent instructs the LLM to respond in JSON at the API level (provider-native where supported); non-JSON responses are coerced after 3 consecutive failures
+- **Multi-model LLM** — define multiple models; switch via `/models`
+- **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama (cloud & local); reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
+- **Multimodal vision** — send a photo with a caption and the agent forwards both the image and text to vision-capable models (GPT-4o, Claude, Gemini, LLaVA, etc.)
+- **File uploads** — send any file (document, photo, audio, video, voice) via Telegram to save it to the agent's `downloads/` folder; photos with a caption are automatically routed to the agent
+- **Context compaction** — auto-summarises older messages when the token budget is near the configured limit; `/compress` lets the operator trigger manual compaction at any time
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
 - **Agent Skills** — autonomous skill system (per [agentskills.io](https://agentskills.io/specification)) with progressive disclosure; skills listed via `/skills`
 - **File storage guidance** — agent directed to use `/tmp/<agent>` for temporary files and `downloads/` for files the user wants to keep
+- **`/stop` command** — immediately cancels the currently running agent task
 - **Log rotation safe** — uses `WatchedFileHandler`; re-opens log file automatically after `logrotate` without restart
+- **Structured log source tags** — every log line carries a `[source]` or `[source/model]` prefix so concurrent agents, sub-agents, and scheduled jobs are unambiguous in a single log file
 
 ---
 
@@ -46,6 +52,7 @@ scheduler.py             # Background task scheduler
 memory_store.py          # Short-term, working, long-term, and results memory
 builtin_executor.py      # Always-available built-in tools (shell, file_read, file_write)
 skill_registry.py        # Agent Skills discovery and registry
+mcp_client.py            # MCP server client (stdio + http transports)
 tools/                   # Built-in tools (.sh and .py)
 tools_generated/         # Tools created by the LLM at runtime
 skills/                  # Agent Skills (each skill is a subdirectory with SKILL.md)
@@ -113,16 +120,17 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 | Field | Description |
 |-------|-------------|
 | `name` | Display name shown in `/models` |
-| `provider` | `openai` \| `openrouter` \| `google` \| `anthropic` |
-| `api_key` | Provider API key |
+| `provider` | `openai` \| `openrouter` \| `google` \| `anthropic` \| `ollama` |
+| `api_key` | Provider API key (empty string for local Ollama) |
 | `model` | Exact model identifier (e.g. `gpt-4o-mini`) |
-| `base_url` | API base URL (leave empty for Anthropic/Google) |
+| `base_url` | API base URL (leave empty for Anthropic/Google; Ollama: `https://ollama.com` or `http://localhost:11434`) |
 | `max_tokens` | Max tokens in the LLM response |
 | `temperature` | Sampling temperature |
-| `hint` | Space-separated keywords; model is **not** auto-selected — only used for display purposes. Switch models manually with `/models` |
+| `top_p` | Nucleus sampling probability (optional; omit to use provider default; ignored by OpenAI reasoning models) |
 | `request_timeout` | Per-request timeout in seconds (default: 120) |
-| `max_retries` | Retry attempts on timeout/connection errors (default: 3) |
+| `max_retries` | Retry attempts on timeout/connection errors (default: 5) |
 | `retry_delay` | Base retry delay in seconds, doubles each attempt (default: 2) |
+| `vision` | Set to `true` for vision-capable models; shown with 👁 badge in `/models` (optional) |
 
 ```toml
 [[models]]
@@ -133,9 +141,8 @@ model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
 temperature     = 0.2
-hint            = "general quick default"
 request_timeout = 120
-max_retries     = 3
+max_retries     = 5
 retry_delay     = 2
 
 [[models]]
@@ -146,8 +153,21 @@ model           = "claude-3-5-sonnet-20241022"
 base_url        = ""
 max_tokens      = 8192
 temperature     = 0.2
-hint            = "complex analyze reason large file code review"
 request_timeout = 180
+max_retries     = 5
+retry_delay     = 2
+
+# Ollama Cloud — requires: pip install ollama>=0.4.0
+# API key from https://ollama.com/settings/keys
+[[models]]
+name            = "ollama-cloud"
+provider        = "ollama"
+api_key         = "YOUR_OLLAMA_API_KEY"
+model           = "gpt-oss:120b-cloud"
+base_url        = "https://ollama.com"
+max_tokens      = 4096
+temperature     = 0.2
+request_timeout = 300
 max_retries     = 3
 retry_delay     = 2
 
@@ -194,7 +214,13 @@ notify = false
 
 For one-time reminders, use `schedule = "once"` with `run_at = "HH:MM"` — auto-removed after execution.
 
-You can also add, pause, or remove jobs from the Telegram chat at runtime (the agent uses the `schedule` built-in tool), or use `/jobs` to see all active jobs and next scheduled run times.
+You can also add, pause, or remove jobs from the Telegram chat at runtime — either by asking the agent (it uses the `schedule` built-in tool) or directly via `/jobs` sub-commands:
+
+- `/jobs` — list all jobs with status and next run time
+- `/jobs reload` — hot-reload `scheduler.toml` from disk
+- `/jobs remove <tag>` — permanently remove a job (shows refreshed list)
+- `/jobs pause <tag>` — disable a job without removing it
+- `/jobs resume <tag>` — re-enable a paused job
 
 Scheduler features:
 - **`scheduler.toml` is the single source of truth** — all jobs (including user-added reminders) live in this file; no hardcoded defaults exist in code
@@ -324,6 +350,70 @@ Memory is shared across all sessions and persisted immediately to disk after eve
 
 ---
 
+## File Uploads
+
+Send any file directly in the Telegram chat to save it to the agent's `downloads/` folder:
+
+| File type | Behaviour |
+|-----------|-----------|
+| **Photo with caption** | File is saved **and** caption + image are forwarded to the agent |
+| **Photo without caption** | File is saved; bot confirms path and size |
+| **Document, audio, video, voice** | File is saved; bot confirms path and size |
+
+Photos with a caption are the primary way to trigger multimodal tasks:
+
+> **Send:** 📷 *(screenshot of an error message)* + caption: *"What does this error mean?"*
+> **Agent:** Reads the screenshot and explains the error.
+
+Files saved this way are accessible by the agent at their full path for subsequent tasks.
+
+---
+
+## Multimodal Vision
+
+For models that support image input (GPT-4o, Claude 3+, Gemini, LLaVA, etc.), the agent can analyse photos you send directly from Telegram.
+
+### How to use
+
+1. **Send a photo with a caption** — the image is saved and the caption becomes the agent's task:
+   - *📷 + "What's in this image?"*
+   - *📷 + "Read the text in this screenshot"*
+   - *📷 + "Is there anything wrong with this network diagram?"*
+
+2. **Reference a saved file** — after uploading any file, you can ask the agent to process it:
+   - *"Analyse the file at /home/pi/downloads/photo_abc123.jpg"*
+
+### Configuration
+
+Mark models as vision-capable in `config.toml` to display the 👁 badge in `/models`:
+
+```toml
+[[models]]
+name    = "vision"
+model   = "gpt-4o"
+vision  = true      # informational — enables 👁 badge in /models
+provider = "openai"
+api_key  = "sk-..."
+base_url = "https://api.openai.com/v1"
+max_tokens = 2048
+temperature = 0.2
+```
+
+The `vision` flag is **informational only** — image encoding is always attempted when images are present. Models without vision support will return an API error which is shown to the user.
+
+### Supported providers
+
+| Provider | Vision support |
+|----------|---------------|
+| OpenAI (`gpt-4o`, `gpt-4o-mini`) | ✅ inline `data:` URL |
+| Anthropic (`claude-3+`) | ✅ base64 source block |
+| Google Gemini | ✅ `inline_data` part |
+| Ollama (LLaVA, llama3.2-vision, etc.) | ✅ `images` field |
+
+Files > 20 MB are skipped with a warning (Telegram photos are typically ≤ 1 MB so this limit is rarely reached).
+
+---
+
 ## File Storage
 
 The agent is instructed to use specific directories for different file types:
@@ -390,7 +480,9 @@ Restart the agent (or wait for the next query) to pick up new tools.
 
 | Parameter | Default | Config key |
 |-----------|---------|------------|
-| Max agent steps | 8 | `agent.max_iterations` |
+| Max agent steps (interactive) | 8 | `agent.max_iterations` |
+| Max agent steps (scheduled/sub-agents) | 100 | `agent.scheduled_max_iterations` |
+| Long-run watcher threshold | 30 min | `agent.long_run_warn_minutes` |
 | Tool timeout | 10 s | `agent.tool_timeout` |
 | Max tool output | 4000 chars | `agent.max_output_size` |
 | Semantic top-K tools | 3 | `agent.top_tools` |
@@ -399,8 +491,19 @@ Restart the agent (or wait for the next query) to pick up new tools.
 | Empty-response diagnostics | off | `agent.diagnose_empty_responses` |
 
 When the agent reaches `max_iterations`, inline buttons appear in the chat:
-**⏩ Extend 10 more steps** or **❌ Cancel** (2-minute timeout). This prevents
-silent failures while still giving the operator control over runaway tasks.
+**⏩ Extend 10 more steps**, **♾ Unlimited**, or **❌ Cancel** (2-minute timeout).
+Choosing **Unlimited** lets the agent run until the task is complete (internal safety
+ceiling still applies). This prevents silent failures while still giving the operator
+control over runaway tasks.
+
+For dangerous built-in actions that require confirmation (e.g. `shell` with destructive
+commands), an **✅ Approve All** button is offered alongside the per-action **Yes/No**
+buttons. Choosing **Approve All** suppresses further confirmation prompts for the same
+action type for the rest of the current task.
+
+Scheduled jobs and sub-agents use `scheduled_max_iterations` (default 100) instead of the
+interactive limit. Set to `0` for no limit (internal safety ceiling: 500). Individual jobs
+can override this with a `max_iterations` field in `scheduler.toml`.
 
 Context compaction fires automatically at 85% of `ctx_max_tokens`. Older messages are summarised by the LLM and replaced with a compact bullet-point summary before the next request.
 
@@ -414,8 +517,44 @@ Context compaction fires automatically at 85% of `ctx_max_tokens`. Older message
 | OpenRouter | `openrouter` | Set `base_url = "https://openrouter.ai/api/v1"` |
 | Google | `google` | Gemini models |
 | Anthropic | `anthropic` | Claude models |
+| Ollama Cloud | `ollama` | `base_url = "https://ollama.com"` — hosted cloud models (gpt-oss, deepseek, kimi-k2, etc.) |
+| Ollama Local | `ollama` | `base_url = "http://localhost:11434"` — local instance, no API key needed |
 
 Embeddings can use a different provider/key than the main LLM. If `embeddings.api_key` is empty, the agent falls back to the active model's `api_key` automatically.
+
+### Ollama Setup
+
+Requires the official `ollama` Python package:
+
+```bash
+pip install "ollama>=0.4.0"
+```
+
+**Cloud API** — access hosted large models directly:
+
+1. Create an API key at [ollama.com/settings/keys](https://ollama.com/settings/keys)
+2. Browse available cloud models at [ollama.com/search?c=cloud](https://ollama.com/search?c=cloud)
+3. Configure in `config.toml`:
+
+```toml
+[[models]]
+name     = "ollama-cloud"
+provider = "ollama"
+api_key  = "YOUR_OLLAMA_API_KEY"
+model    = "gpt-oss:120b-cloud"
+base_url = "https://ollama.com"
+```
+
+**Local instance** — run models on your own hardware:
+
+```toml
+[[models]]
+name     = "ollama-local"
+provider = "ollama"
+api_key  = ""
+model    = "gemma3:27b"
+base_url = "http://localhost:11434"
+```
 
 ### LLM Resilience
 
@@ -452,15 +591,19 @@ Disable after diagnosing to keep logs clean.
 |---------|-------------|
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
-| `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, and per-model token usage today |
+| `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, scheduler state, system time, and per-model token usage today |
 | `/health` | Run self-health diagnosis, analyze logs, rotate log file |
-| `/tools` | List all built-in and generated tools |
+| `/tools` | List all built-in, generated, and MCP tools |
 | `/skills` | List all available agent skills |
-| `/models` | List available LLM models and switch the active one |
-| `/jobs` | List all scheduled jobs with running status; `/jobs reload` to reload scheduler.toml from disk |
+| `/models` | List available LLM models and switch the active one (👁 badge marks vision-capable models) |
+| `/jobs` | List all scheduled jobs with running status; sub-commands: `reload`, `remove <tag>`, `pause <tag>`, `resume <tag>` |
 | `/agents` | List all active background sub-agents; `/agents cancel <id>` to stop one |
+| `/mcp` | Manage MCP servers: `list`, `on <name>`, `off <name>`, `info <name>` |
+| `/stop` | Cancel the currently running agent task |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
+| `/compress` | Summarise the current conversation history in place to reduce context size |
+| `/verbose` | Toggle live tool-call progress messages; `/verbose on` or `/verbose off` to set explicitly |
 | `/reindex` | Force re-embed all tools in the semantic index |
 | `/pair` | Generate or submit pairing token |
 | `/unpair <id>` | Remove a user from the allowlist |
@@ -483,6 +626,11 @@ Or just send a natural language message:
 - *"show me the CPU temperature"*
 - *"create a tool that lists all open ports"*
 - *"remind me every day at 9am to check the backup logs"*
+
+Or send a **photo with a caption**:
+- 📷 *"What does this error message say?"*
+- 📷 *"Is this network diagram correct?"*
+- 📷 *"Read the text from this screenshot"*
 
 ---
 
@@ -587,7 +735,31 @@ model = "gpt-4o-mini"           # optional: override model for this job
 preserve_context = true          # optional: persist context between runs (default: false)
 context_max_messages = 50        # optional: cap on saved messages (default: 50)
 overlap_policy = "skip"          # optional: skip|parallel when previous run is still active
+max_iterations = 50              # optional: per-job step cap (overrides scheduled_max_iterations)
 ```
+
+**`notify` flag** — set `notify = false` to suppress Telegram output for a job entirely.
+The job runs silently; results are only written to the log file. Useful for high-frequency
+monitoring jobs that should only alert on anomalies (the agent's task prompt can
+still send explicit messages via the `notify_user` tool when thresholds are exceeded).
+
+**Step limits** — scheduled jobs use `scheduled_max_iterations` (default 100) to allow
+complex multi-step automation that would be too long for an interactive session. Override
+per-job with `max_iterations` in the TOML or when creating a job from chat.
+
+### Long-running agent watcher
+
+When a sub-agent or scheduled job runs longer than `long_run_warn_minutes` (default 30),
+the operator receives a Telegram notification:
+
+```
+⏱ Sub-agent running for 35m
+Job: disk_check | Model: gpt-4o-mini
+Task: Check disk usage and alert if above 85%...
+Agent ID: sa-abc123 — use /agents to monitor or cancel
+```
+
+Each agent is warned only once. Set `long_run_warn_minutes = 0` to disable the watcher.
 
 When `preserve_context = true`, the sub-agent's conversation history is saved to
 `data/job_contexts/<job_tag>.json` after each run and reloaded on the next. This lets
@@ -701,6 +873,24 @@ SKILL.md files may describe sub-commands, binary flags, or helper operations usi
 
 The agent handles log rotation internally — no `logrotate` or external tooling required.
 
+### Source tags
+
+Every log line carries a consistent source prefix so concurrent agents, sub-agents, and scheduler jobs are unambiguous in a shared log file.
+
+| Source | Tag format | Example |
+|--------|-----------|---------|
+| Main agent | `[main]` | `[main] step 2/25 \| model: gemma4:27b` |
+| Sub-agent | `[sa-<id>]` | `[sa-fcf85d] step 4/10 \| model: kimi-k2.5:cloud` |
+| Built-in tool (shell, file_read, …) | `[<caller>]` | `[sa-fcf85d] Built-in shell executing: yt-dlp …` |
+| LLM retries / errors | `[<caller>/<model>]` | `[sa-fcf85d/kimi-k2.5:cloud] Empty LLM response (attempt 1/3)` |
+| Scheduled job | `[sched/<tag>]` | `[sched/morning-report] Running scheduled job` |
+
+This makes it straightforward to `grep` a single sub-agent's full activity:
+
+```bash
+grep '\[sa-fcf85d\]' agent.log
+```
+
 ### How it works
 
 - **Active log**: always `agent.log` (or the path set in config) — the agent writes here continuously
@@ -727,13 +917,68 @@ The `log_file` default is always anchored to the directory containing `main.py`,
 
 ---
 
+## MCP Servers
+
+The agent supports external tool servers via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). MCP servers expose additional tools that appear alongside built-in and generated tools in the agent's ReAct loop.
+
+### Transports
+
+| Transport | When to use |
+|-----------|-------------|
+| `stdio` | Subprocess — MCP server is a local command (e.g. `npx …`, Python script) |
+| `http` | HTTP/HTTPS — MCP server is a remote or local HTTP service |
+
+### Configuration (`config.toml`)
+
+```toml
+# Filesystem MCP server via stdio
+[[mcp_servers]]
+name      = "filesystem"
+transport = "stdio"
+command   = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+enabled   = true
+timeout   = 30        # seconds (default: 30)
+
+[mcp_servers.env]     # optional environment variables for the subprocess
+MY_ENV_VAR = "value"
+
+# Remote API MCP server via HTTP
+[[mcp_servers]]
+name      = "my-api"
+transport = "http"
+url       = "https://api.example.com/mcp"
+enabled   = true
+timeout   = 30
+
+[mcp_servers.headers]   # optional HTTP headers (e.g. auth)
+Authorization = "Bearer your-token-here"
+```
+
+`enabled = false` loads the server definition but does not connect at startup. You can activate it later with `/mcp on <name>`.
+
+### Telegram commands
+
+| Command | Description |
+|---------|-------------|
+| `/mcp list` | Show all configured servers with transport type and status |
+| `/mcp on <name>` | Connect a server and register its tools |
+| `/mcp off <name>` | Disconnect a server and remove its tools |
+| `/mcp info <name>` | Show server details, tool list, and last error |
+
+MCP errors and tool calls are written to `agent.log` with the prefix `MCP [<name>]`.
+
+---
+
 ## Requirements
 
 ```
-python-telegram-bot==20.7
-httpx~=0.25.2
+python-telegram-bot>=21.0
+httpx~=0.27
+requests>=2.31
 tomli==2.0.1
 schedule==1.2.1
+croniter>=1.4
+ollama>=0.4.0
 ```
 
 Python 3.9+ required. Python 3.11+ uses the built-in `tomllib` (no `tomli` needed).

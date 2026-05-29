@@ -16,13 +16,14 @@ user responds.
 
 from __future__ import annotations
 
+import html as _html_mod
 import logging
 import os
 import re
 import secrets
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from html import escape as _he
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,9 @@ _DANGEROUS_SHELL_PATTERNS: list[tuple[str, str]] = [
     (r":\(\)\{.*:\|:&\}", "fork bomb"),
     (r"/dev/tcp/", "TCP reverse shell"),
     (r"\bnc\s+-e\b", "netcat reverse shell"),
+    # Writing to or executing from tools_generated/ is equivalent to creating/running a tool
+    # and must go through the same operator confirmation gate as create_tool.
+    (r"tools_generated/", "write/execute in tools_generated/ (same as tool creation — requires operator approval)"),
 ]
 
 _SENSITIVE_PATH_PATTERNS: list[str] = [
@@ -130,20 +134,58 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "notify (bool, default true). "
             "model (str, optional — model identifier to use for this job's sub-agent, e.g. 'gpt-4o'). "
             "preserve_context (bool, default false — if true, conversation history is kept between runs). "
+            "max_iterations (int, optional — override the step limit for this job; "
+            "default: scheduled_max_iterations from config, 0 = unlimited). "
             "Always provide a non-empty task when adding any job."
         ),
     ),
     "spawn_agent": BuiltinTool(
         name="spawn_agent",
         description=(
-            "Spawn an isolated sub-agent in the background for a long-running task "
-            "or a task requiring a different model. Returns immediately — result is delivered "
-            "via Telegram when done. "
-            "Args: task (str, required — goal for the sub-agent), "
-            "model (str, optional — model identifier from AVAILABLE MODELS, default: background_model), "
-            "context_key (str, optional — key for persisting conversation history between calls). "
-            "Example: spawn a Docker log analysis on a smarter model: "
-            "{\"task\": \"Analyze Docker logs\", \"model\": \"claude-3-5-sonnet-20241022\"}."
+            "Spawn an isolated sub-agent in the background for a long-running or model-specific task. "
+            "Returns immediately with agent_id — use get_agent_result(agent_id) to retrieve the result.\n"
+            "\n"
+            "WRITING A GOOD TASK — sub-agents run in complete isolation (no shared context, memory, or files):\n"
+            "  • State the OBJECTIVE clearly in the first sentence.\n"
+            "  • Include ALL context the sub-agent needs: file paths already on disk, data already extracted,\n"
+            "    language requirements, relevant facts, constraints.\n"
+            "  • Specify which TOOLS to use (shell, file_read, etc.) and the order if sequence matters.\n"
+            "  • Specify the exact OUTPUT required: format, language, structure, length.\n"
+            "  • Do NOT rely on sub-agent improvisation — be explicit and complete.\n"
+            "  • Sub-agents cannot spawn further sub-agents.\n"
+            "\n"
+            "Args:\n"
+            "  task            (str, REQUIRED) — self-contained instructions for the sub-agent.\n"
+            "                  Must be named 'task', NOT 'prompt', 'goal', or 'description'.\n"
+            "  model           (str, optional) — model id from AVAILABLE MODELS (default: background_model).\n"
+            "  response_format (str, optional) — 'text' (default) | 'json' | 'file'.\n"
+            "                  json → sub-agent must return a single valid JSON object.\n"
+            "                  file → sub-agent writes output to a file and returns the absolute path.\n"
+            "  context_key     (str, optional) — key for persisting conversation history between calls.\n"
+            "  max_tokens      (int, optional) — override maximum tokens in the sub-agent's response.\n"
+            "  temperature     (float, optional) — override sampling temperature (0.0–2.0).\n"
+            "  top_p           (float, optional) — override nucleus sampling probability (0.0–1.0).\n"
+            "\n"
+            "Example (good task — self-contained):\n"
+            "{\"task\": \"Summarise the podcast transcript already saved at /tmp/piclaw/clean_transcript.txt "
+            "in Russian. Use file_read to load the file. Return a structured report with three sections: "
+            "Key Topics, Main Arguments, Conclusions. Plain text, maximum 800 words.\", "
+            "\"model\": \"kimi-k2.5:cloud\", \"response_format\": \"text\"}"
+        ),
+    ),
+    "get_agent_result": BuiltinTool(
+        name="get_agent_result",
+        description=(
+            "Wait for a sub-agent to finish and retrieve its result. "
+            "Blocks until the sub-agent completes or the timeout is reached. "
+            "Args: agent_id (str, REQUIRED — the id returned by spawn_agent), "
+            "timeout (int, optional — seconds to wait, default: configured subagent_result_timeout), "
+            "cancel_on_timeout (bool, optional — if true (default), the sub-agent is automatically cancelled "
+            "when the timeout expires so it does not waste tokens or send a stale notification; "
+            "set to false only if you intend to call get_agent_result again for the same agent). "
+            "Returns: {status: 'done'|'failed'|'cancelled'|'timeout'|'not_found', "
+            "result_type: 'text'|'json'|'file', result: <output>}. "
+            "Example: {\"agent_id\": \"sa-abc123\"}"
         ),
     ),
     "memory_write": BuiltinTool(
@@ -160,6 +202,36 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "{\"action\":\"append\",\"key\":\"notes\",\"value\":\"Disk replaced 2025-04-01\"}, "
             "{\"action\":\"set\",\"key\":\"last_backup\",\"value\":\"2025-04-05\"}, "
             "{\"action\":\"delete\",\"key\":\"old_key\"}."
+        ),
+    ),
+    "vision_query": BuiltinTool(
+        name="vision_query",
+        description=(
+            "Ask the active LLM to analyse a local image file. "
+            "Use this whenever the user asks about the contents of an image or photo. "
+            "Args: path (str, required — absolute path to the image file on disk), "
+            "question (str, required — what to ask about the image, e.g. 'Who is in this photo?'). "
+            "Returns the LLM's text description/answer. "
+            "Only works with vision-capable models (GPT-4o, Claude 3+, Gemini, LLaVA, etc.). "
+            "Example: {\"path\": \"/home/pi/downloads/photo.jpg\", \"question\": \"What is in this image?\"}"
+        ),
+    ),
+    "file_patch": BuiltinTool(
+        name="file_patch",
+        description=(
+            "Make a surgical search-and-replace edit to a file. "
+            "Prefer this over file_read + file_write when making small targeted changes. "
+            "Args: "
+            "  path       (str, required) — absolute path to the file. "
+            "  old_str    (str, required) — exact text to find in the file; include enough surrounding "
+            "                              context (e.g. the whole line) to be unambiguous. "
+            "  new_str    (str, required) — replacement text (may be empty string to delete old_str). "
+            "  occurrence (int, optional, default 1) — which occurrence to replace (1 = first); "
+            "                                          0 = replace all occurrences. "
+            "Returns an error (no changes made) if old_str is not found or matches more than one "
+            "occurrence when occurrence=1. "
+            "Always requires operator confirmation — confirmation shows a diff-style preview. "
+            "Example: {\"path\": \"/etc/app/config.toml\", \"old_str\": \"port = 8080\", \"new_str\": \"port = 9090\"}"
         ),
     ),
 }
@@ -182,15 +254,21 @@ class BuiltinExecutor:
     """
 
     def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
-                 sub_agent_factory=None, data_dir: str = "data", agent_depth: int = 0,
-                 memory=None):
+                 sub_agent_factory=None, data_dir: str = "data",
+                 memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300,
+                 notify_html_fn=None):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
         self._sub_agent_factory = sub_agent_factory  # Callable[[model, context_key, label, notify_fn], SubAgentRunner]
         self._data_dir = data_dir
-        self._agent_depth = agent_depth  # 0 = main agent, 1 = sub-agent (no nested spawning)
         self._memory = memory  # Optional[MemoryStore] — for memory_write built-in
+        self._max_subagents = max_subagents
+        self._subagent_result_timeout = subagent_result_timeout
+        self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
+        self._sub_agent_pool = ThreadPoolExecutor(
+            max_workers=max_subagents, thread_name_prefix="sub-agent"
+        )
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
 
@@ -198,32 +276,63 @@ class BuiltinExecutor:
     # Public API
     # ------------------------------------------------------------------
 
+    def shutdown(self, graceful_timeout: float = 10.0) -> None:
+        """Shut down the sub-agent thread pool.
+
+        Signals all active sub-agents to cancel, waits up to graceful_timeout
+        seconds for them to finish, then forces shutdown of any stragglers.
+        """
+        from sub_agent_registry import get_registry as _get_registry
+        registry = _get_registry()
+        active = registry.list_active()
+        if active:
+            logger.info("Shutdown: cancelling %d active sub-agent(s)…", len(active))
+            for record in active:
+                record.cancel()
+            # Wait briefly for cancelled agents to wind down before forcing pool shutdown
+            import time as _time
+            deadline = _time.monotonic() + graceful_timeout
+            while _time.monotonic() < deadline:
+                if not any(r.status == "running" for r in registry.list_active()):
+                    break
+                _time.sleep(0.25)
+        self._sub_agent_pool.shutdown(wait=False, cancel_futures=True)
+        logger.debug("Sub-agent pool shut down.")
+
     def is_builtin(self, name: str) -> bool:
         return name in BUILTIN_TOOLS
 
     def all_tools(self) -> list[BuiltinTool]:
         return list(BUILTIN_TOOLS.values())
 
-    def execute(self, tool_name: str, args: Optional[dict] = None) -> dict:
+    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "") -> dict:
         """
         Execute a built-in tool. Returns standard result dict, or a
         requires_confirmation dict if the operation needs user approval.
+
+        caller_depth is the depth of the AgentController invoking this tool
+        (0 = main agent, 1 = sub-agent). Used to enforce the no-nested-spawn rule.
+        caller_tag is a human-readable label for logging (e.g. "[main]", "[sa-fcf85d]").
         """
         args = args or {}
         if tool_name == "shell":
-            return self._exec_shell(args)
+            return self._exec_shell(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "file_read":
-            return self._exec_file_read(args)
+            return self._exec_file_read(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "file_write":
-            return self._exec_file_write(args)
+            return self._exec_file_write(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "file_send":
-            return self._exec_file_send(args)
+            return self._exec_file_send(args, caller_tag=caller_tag)
         elif tool_name == "schedule":
             return self._exec_schedule(args)
         elif tool_name == "spawn_agent":
-            return self._exec_spawn_agent(args)
+            return self._exec_spawn_agent(args, caller_depth=caller_depth, caller_tag=caller_tag)
+        elif tool_name == "get_agent_result":
+            return self._exec_get_agent_result(args, caller_tag=caller_tag)
         elif tool_name == "memory_write":
-            return self._exec_memory_write(args)
+            return self._exec_memory_write(args, caller_tag=caller_tag)
+        elif tool_name == "file_patch":
+            return self._exec_file_patch(args, caller_depth=caller_depth, caller_tag=caller_tag)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -244,16 +353,18 @@ class BuiltinExecutor:
     # Internals
     # ------------------------------------------------------------------
 
-    def _requires_confirmation(self, tool_name: str, args: dict, description: str) -> dict:
+    def _requires_confirmation(self, tool_name: str, args: dict, description: str,
+                               caller_depth: int = 0, caller_tag: str = "") -> dict:
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
         # In headless mode (sub-agents), there is no user to confirm — auto-handle:
         #   shell/dangerous → deny (too risky to run destructive commands unattended)
         #   file_read/sensitive, file_write → approve (non-destructive or expected by task)
-        if self._agent_depth >= 1:
+        if caller_depth >= 1:
             if tool_name == "shell":
                 command = args.get("command", "")
                 logger.warning(
-                    "Headless sub-agent: dangerous shell command blocked (requires confirmation): %s",
-                    command[:120],
+                    "%sHeadless sub-agent: dangerous shell command blocked (requires confirmation): %s",
+                    _pfx, command[:120],
                 )
                 return {
                     "success": False,
@@ -267,32 +378,34 @@ class BuiltinExecutor:
             else:
                 # file_read sensitive or file_write — auto-approve
                 logger.info(
-                    "Headless sub-agent: auto-approving %s (no user confirmation available)", tool_name
+                    "%sHeadless sub-agent: auto-approving %s (no user confirmation available)", _pfx, tool_name
                 )
-                return self._run(tool_name, args)
+                return self._run(tool_name, args, caller_tag=caller_tag)
 
         token = secrets.token_hex(12)
         self._pending[token] = (tool_name, args)
-        logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
+        logger.info("%sBuilt-in '%s' requires confirmation, token=%s", _pfx, tool_name, token[:8])
         return {
             "requires_confirmation": True,
             "token": token,
             "description": description,
         }
 
-    def _run(self, tool_name: str, args: dict) -> dict:
+    def _run(self, tool_name: str, args: dict, caller_tag: str = "") -> dict:
         """Actually execute without any confirmation check."""
         if tool_name == "shell":
-            return self._run_shell(args)
+            return self._run_shell(args, caller_tag=caller_tag)
         elif tool_name == "file_read":
-            return self._run_file_read(args)
+            return self._run_file_read(args, caller_tag=caller_tag)
         elif tool_name == "file_write":
-            return self._run_file_write(args)
+            return self._run_file_write(args, caller_tag=caller_tag)
+        elif tool_name == "file_patch":
+            return self._run_file_patch(args, caller_tag=caller_tag)
         return {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1}
 
     # ---- shell ----
 
-    def _exec_shell(self, args: dict) -> dict:
+    def _exec_shell(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         if not command:
             return {"success": False, "output": "", "error": "No command provided.", "exit_code": -1}
@@ -300,14 +413,15 @@ class BuiltinExecutor:
         dangerous, reason = _is_dangerous_shell(command)
         if dangerous:
             desc = f"Run shell command: <code>{command}</code>\n⚠️ Reason for confirmation: {reason}"
-            return self._requires_confirmation("shell", args, desc)
+            return self._requires_confirmation("shell", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
-        return self._run_shell(args)
+        return self._run_shell(args, caller_tag=caller_tag)
 
-    def _run_shell(self, args: dict) -> dict:
+    def _run_shell(self, args: dict, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self.default_timeout))
-        logger.info("Built-in shell executing: %s", command[:120])
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in shell executing: %s", _pfx, command[:120])
         try:
             proc = subprocess.run(
                 command,
@@ -330,12 +444,12 @@ class BuiltinExecutor:
             }
         except subprocess.TimeoutExpired:
             return {"success": False, "output": "", "error": f"Command timed out after {timeout}s.", "exit_code": -1}
-        except Exception as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
 
     # ---- file_read ----
 
-    def _exec_file_read(self, args: dict) -> dict:
+    def _exec_file_read(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         path = str(args.get("path", "")).strip()
         if not path:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
@@ -343,15 +457,16 @@ class BuiltinExecutor:
         sensitive, reason = _is_sensitive_path(path)
         if sensitive:
             desc = f"Read file: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
-            return self._requires_confirmation("file_read", args, desc)
+            return self._requires_confirmation("file_read", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
-        return self._run_file_read(args)
+        return self._run_file_read(args, caller_tag=caller_tag)
 
-    def _run_file_read(self, args: dict) -> dict:
+    def _run_file_read(self, args: dict, caller_tag: str = "") -> dict:
         path = str(args.get("path", "")).strip()
         max_bytes = int(args.get("max_bytes", 50_000))
         offset = int(args.get("offset", 0))
-        logger.info("Built-in file_read: %s (offset=%d, max=%d)", path, offset, max_bytes)
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_read: %s (offset=%d, max=%d)", _pfx, path, offset, max_bytes)
         try:
             if not os.path.exists(path):
                 return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
@@ -368,12 +483,12 @@ class BuiltinExecutor:
             return {"success": True, "output": content + note, "error": "", "exit_code": 0}
         except PermissionError as exc:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
-        except Exception as exc:
+        except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
 
     # ---- file_write ----
 
-    def _exec_file_write(self, args: dict) -> dict:
+    def _exec_file_write(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         path = str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
         mode = str(args.get("mode", "w"))
@@ -384,15 +499,16 @@ class BuiltinExecutor:
 
         action = "append to" if mode == "a" else "overwrite"
         desc = f"{action.capitalize()} file: <code>{path}</code> ({len(content)} chars)"
-        return self._requires_confirmation("file_write", args, desc)
+        return self._requires_confirmation("file_write", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
-    def _run_file_write(self, args: dict) -> dict:
+    def _run_file_write(self, args: dict, caller_tag: str = "") -> dict:
         path = str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
         mode = str(args.get("mode", "w"))
         if mode not in ("w", "a"):
             mode = "w"
-        logger.info("Built-in file_write: %s (mode=%s, len=%d)", path, mode, len(content))
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_write: %s (mode=%s, len=%d)", _pfx, path, mode, len(content))
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, mode) as f:
@@ -400,7 +516,131 @@ class BuiltinExecutor:
             return {"success": True, "output": f"Written {len(content)} chars to {path}.", "error": "", "exit_code": 0}
         except PermissionError as exc:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
-        except Exception as exc:
+        except OSError as exc:
+            return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+    # ---- file_patch ----
+
+    def _exec_file_patch(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+        path = str(args.get("path", "")).strip()
+        old_str = str(args.get("old_str", ""))
+        new_str = str(args.get("new_str", ""))
+        try:
+            occurrence = int(args.get("occurrence", 1))
+        except (ValueError, TypeError):
+            return {"success": False, "output": "", "error": "file_patch: 'occurrence' must be an integer.", "exit_code": -1}
+        if occurrence < 0:
+            return {"success": False, "output": "", "error": "file_patch: 'occurrence' must be >= 0 (0 = replace all).", "exit_code": -1}
+
+        if not path:
+            return {"success": False, "output": "", "error": "file_patch: 'path' is required.", "exit_code": -1}
+        if not old_str:
+            return {"success": False, "output": "", "error": "file_patch: 'old_str' is required.", "exit_code": -1}
+        if not os.path.exists(path):
+            return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
+
+        # Validate the match before staging for confirmation
+        try:
+            with open(path, "r", errors="replace") as fh:
+                content = fh.read()
+        except PermissionError as exc:
+            return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
+        except OSError as exc:
+            return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+        count = content.count(old_str)
+        if count == 0:
+            return {
+                "success": False, "output": "",
+                "error": (
+                    f"file_patch: 'old_str' not found in {path}. "
+                    "Make sure the text matches exactly (including whitespace and indentation). "
+                    "Use file_read to inspect the file if needed."
+                ),
+                "exit_code": 1,
+            }
+        if occurrence == 1 and count > 1:
+            return {
+                "success": False, "output": "",
+                "error": (
+                    f"file_patch: 'old_str' matches {count} occurrences in {path} but occurrence=1 (ambiguous). "
+                    "Include more surrounding context in 'old_str' to make it unique, "
+                    "or set occurrence=0 to replace all."
+                ),
+                "exit_code": 1,
+            }
+
+        # Build a human-readable diff summary for the confirmation prompt
+        old_lines = old_str.splitlines()
+        new_lines = new_str.splitlines()
+        removed = "\n".join(f"  - {ln}" for ln in old_lines[:8])
+        added = "\n".join(f"  + {ln}" for ln in new_lines[:8])
+        if len(old_lines) > 8:
+            removed += f"\n  - … ({len(old_lines) - 8} more lines)"
+        if len(new_lines) > 8:
+            added += f"\n  + … ({len(new_lines) - 8} more lines)"
+        replace_note = f" (replacing all {count} occurrences)" if occurrence == 0 else ""
+        desc = (
+            f"Patch file: <code>{path}</code>{replace_note}\n"
+            f"{removed}\n{added}"
+        )
+
+        sensitive, _ = _is_sensitive_path(path)
+        if sensitive:
+            desc += "\n⚠️ Sensitive file"
+
+        return self._requires_confirmation("file_patch", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
+
+    def _run_file_patch(self, args: dict, caller_tag: str = "") -> dict:
+        path = str(args.get("path", "")).strip()
+        old_str = str(args.get("old_str", ""))
+        new_str = str(args.get("new_str", ""))
+        try:
+            occurrence = int(args.get("occurrence", 1))
+        except (ValueError, TypeError):
+            occurrence = 1
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_patch: %s (occurrence=%d)", _pfx, path, occurrence)
+        try:
+            with open(path, "r", errors="replace") as fh:
+                content = fh.read()
+            if occurrence == 0:
+                count = content.count(old_str)
+                if count == 0:
+                    return {
+                        "success": False, "output": "",
+                        "error": f"file_patch: 'old_str' not found in {path} at execution time.",
+                        "exit_code": 1,
+                    }
+                patched = content.replace(old_str, new_str)
+                n_replaced = count
+            else:
+                # Find the Nth occurrence (occurrence >= 1)
+                pos = 0
+                for _ in range(occurrence):
+                    idx = content.find(old_str, pos)
+                    if idx == -1:
+                        return {
+                            "success": False, "output": "",
+                            "error": (
+                                f"file_patch: occurrence {occurrence} of 'old_str' not found in {path} "
+                                "at execution time (file may have changed after validation)."
+                            ),
+                            "exit_code": 1,
+                        }
+                    pos = idx + 1
+                patched = content[:idx] + new_str + content[idx + len(old_str):]
+                n_replaced = 1
+            with open(path, "w") as fh:
+                fh.write(patched)
+            return {
+                "success": True,
+                "output": f"Patched {path}: replaced {n_replaced} occurrence(s).",
+                "error": "", "exit_code": 0,
+            }
+        except PermissionError as exc:
+            return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
+        except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
 
     # ---- file_send ----
@@ -408,7 +648,7 @@ class BuiltinExecutor:
     _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
     _MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (Telegram bot API limit)
 
-    def _exec_file_send(self, args: dict) -> dict:
+    def _exec_file_send(self, args: dict, caller_tag: str = "") -> dict:
         path = os.path.expanduser(str(args.get("path", "")).strip())
         caption = str(args.get("caption", "")).strip()
         if not path:
@@ -423,7 +663,8 @@ class BuiltinExecutor:
                 "success": False, "output": "",
                 "error": f"File too large ({size // 1024 // 1024} MB). Max 50 MB.", "exit_code": 1,
             }
-        logger.info("Built-in file_send: %s (%d bytes)", path, size)
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_send: %s (%d bytes)", _pfx, path, size)
         return {
             "success": True,
             "output": f"Sending {os.path.basename(path)} to chat…",
@@ -472,7 +713,9 @@ class BuiltinExecutor:
                 run_at=str(args.get("run_at", "")) or None,
                 cron=str(args.get("cron", "")) or None,
                 model=str(args["model"]) if args.get("model") else None,
+                fallback_models=args.get("fallback_models"),
                 preserve_context=bool(args.get("preserve_context", False)),
+                max_iterations=int(args["max_iterations"]) if args.get("max_iterations") is not None else None,
             )
             if result["success"]:
                 return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}
@@ -508,45 +751,118 @@ class BuiltinExecutor:
     # spawn_agent
     # ------------------------------------------------------------------
 
-    def _exec_spawn_agent(self, args: dict) -> dict:
+    def _exec_spawn_agent(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         """
         Spawn an isolated sub-agent in a background thread.
 
         The sub-agent runs to completion then delivers its result via
         notify_fn (Telegram) and writes to long-term memory.
         Returns immediately with {status: "spawned", agent_id: "sa-..."}.
-        """
-        import threading
 
+        caller_depth is the depth of the AgentController that invoked this tool.
+        Sub-agents (depth ≥ 1) are not allowed to spawn further sub-agents.
+        """
         from sub_agent_registry import get_registry as get_agent_registry
 
         task = args.get("task", "").strip()
+        # Accept common LLM aliases for the 'task' parameter
+        if not task:
+            for _alias in ("prompt", "goal", "description"):
+                _v = args.get(_alias, "").strip()
+                if _v:
+                    logger.warning(
+                        "spawn_agent: received '%s' instead of 'task' — treating as task (fix your prompt)", _alias
+                    )
+                    task = _v
+                    break
         if not task:
             return {"success": False, "output": "", "error": "spawn_agent: 'task' is required.", "exit_code": -1}
 
-        # Depth guard — prevent recursive sub-agent spawning
-        if self._agent_depth >= 1:
+        # Depth guard — prevent recursive sub-agent spawning (hard error, not a silent no-op)
+        if caller_depth >= 1:
             return {
                 "success": False, "output": "",
-                "error": "spawn_agent cannot be called from within a sub-agent (max depth: 1).",
+                "error": "spawn_agent cannot be called from within a sub-agent (max nesting depth: 1).",
                 "exit_code": -1,
             }
 
         if self._sub_agent_factory is None:
             return {"success": False, "output": "", "error": "spawn_agent: sub_agent_factory not configured.", "exit_code": -1}
 
+        # Concurrency cap — only count on-demand (managed) agents, not scheduler jobs
+        current_managed = get_agent_registry().count_managed()
+        if current_managed >= self._max_subagents:
+            return {
+                "success": False, "output": "",
+                "error": (
+                    f"spawn_agent: max_subagents cap reached ({current_managed}/{self._max_subagents}). "
+                    "Wait for a managed sub-agent to finish or cancel one with /agents cancel managed."
+                ),
+                "exit_code": -1,
+            }
+
+        # response_format — how the sub-agent should return its result
+        response_format = args.get("response_format", "text").lower()
+        if response_format not in ("text", "json", "file"):
+            response_format = "text"
+        if response_format == "json":
+            task = task + "\n\nReturn your entire answer as a single valid JSON object. Do not include any prose or markdown fences."
+        elif response_format == "file":
+            task = task + "\n\nWrite your output to a file and return only the absolute file path as your answer."
+
         model = args.get("model") or None
         context_key = args.get("context_key") or None
+        fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
         job_tag = args.get("_job_tag") or None       # set by scheduler; used for finish callback
         label = job_tag or context_key or "on-demand"
+        # Finish callback passed directly from scheduler to avoid shared-attribute race
+        # when multiple jobs fire concurrently.
+        _finish_cb = args.get("_finish_cb") or getattr(self, '_scheduler_finish_cb', None)
+        _finish_tag = job_tag or label
+        # Scheduled jobs set expandable=False so results are shown as plain text,
+        # not collapsed inside an expandable blockquote.
+        _expandable = args.get("expandable", True)
+        # _notify=False suppresses Telegram output for silent scheduled jobs.
+        _notify_result = args.get("_notify", True)
 
         # Build the sub-agent via factory
+        max_iterations = args.get("max_iterations")  # None = use factory default (scheduled_max_iter)
+        if max_iterations is not None:
+            try:
+                max_iterations = int(max_iterations)
+                if max_iterations <= 0:
+                    max_iterations = None  # treat 0/negative as "use default"
+            except (ValueError, TypeError):
+                max_iterations = None
+
+        # Optional per-call LLM parameter overrides
+        _raw_max_tokens = args.get("max_tokens")
+        _raw_temperature = args.get("temperature")
+        _raw_top_p = args.get("top_p")
+        try:
+            max_tokens_override = int(_raw_max_tokens) if _raw_max_tokens is not None else None
+        except (ValueError, TypeError):
+            max_tokens_override = None
+        try:
+            temperature_override = float(_raw_temperature) if _raw_temperature is not None else None
+        except (ValueError, TypeError):
+            temperature_override = None
+        try:
+            top_p_override = float(_raw_top_p) if _raw_top_p is not None else None
+        except (ValueError, TypeError):
+            top_p_override = None
+
         try:
             runner = self._sub_agent_factory(
                 model=model,
                 context_key=context_key,
                 label=label,
                 notify_fn=None,   # factory sets this from main notify_fn
+                fallback_models=fallback_models,
+                max_iterations=max_iterations,
+                max_tokens=max_tokens_override,
+                temperature=temperature_override,
+                top_p=top_p_override,
             )
         except ValueError as exc:
             return {"success": False, "output": "", "error": f"spawn_agent: {exc}", "exit_code": -1}
@@ -562,21 +878,43 @@ class BuiltinExecutor:
             started_at=time.time(),
             source="on-demand",
             max_iterations=runner._agent.max_iterations,
+            result_type=response_format,
         )
         # Share cancel_event and LLM client with the registry record so that
         # /agents cancel can immediately interrupt any in-progress HTTP request.
         record._cancel_event = runner._cancel_event
         record._llm_client = runner._llm
 
+        # Wire iteration tracking: update registry on each step
+        _agent_id = runner.agent_id
+        runner._agent._on_step = lambda s: get_agent_registry().update_iteration(_agent_id, s)
+
         get_agent_registry().register(record)
 
-        # Capture scheduler finish callback now (at spawn time) to avoid race
-        # conditions when multiple jobs are spawned concurrently — each thread
-        # gets its own snapshot of the callback bound to the correct job tag.
-        _finish_cb = getattr(self, '_scheduler_finish_cb', None)
-        _finish_tag = job_tag or label
+        # Log spawn params for observability
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        _fb_log = str(fallback_models) if fallback_models is not None else "inherited"
+        logger.info(
+            "%sspawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
+            _pfx, runner.agent_id, label, runner._model_id, _fb_log, task[:100],
+        )
 
         def _run_and_notify():
+            # Convenience: use HTML notify if available (results in expandable quote blocks)
+            _notify_html = self._notify_html_fn
+
+            def _send_result_html(header_html: str, body: str) -> None:
+                """Send header + body, optionally wrapped in an expandable blockquote."""
+                escaped = _html_mod.escape(body)
+                if _expandable:
+                    msg = f"{header_html}\n<blockquote expandable>{escaped}</blockquote>"
+                else:
+                    msg = f"{header_html}\n\n{escaped}"
+                if _notify_html:
+                    _notify_html(msg)
+                else:
+                    runner.notify_fn(msg)
+
             try:
                 result = runner.run(task)
                 # Persist context if requested
@@ -591,46 +929,147 @@ class BuiltinExecutor:
                     except Exception:
                         pass
                 if result == "[Cancelled]":
-                    runner.notify_fn(
-                        f"🛑 Sub-agent {runner.agent_id} cancelled\n"
-                        f"Job: <b>{_he(label)}</b>\n"
-                        f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
-                    )
+                    record.status = "cancelled"
+                    record.result = "[Cancelled]"
+                    record._result_event.set()
+                    logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
+                    # Suppress notification for agents cancelled due to get_agent_result timeout —
+                    # the caller already received a timeout response and moved on.
+                    if _notify_result and not record._timeout_cancelled:
+                        try:
+                            runner.notify_fn(
+                                f"🛑 Sub-agent {runner.agent_id} cancelled\n"
+                                f"Job: **{label}**\n"
+                                f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
+                            )
+                        except Exception as notify_exc:
+                            logger.warning("spawn_agent: [%s] notify failed (cancelled): %s", label, notify_exc)
                 else:
+                    record.status = "done"
+                    record.result = result
+                    record._result_event.set()
                     elapsed = int(time.time() - record.started_at)
-                    header = (
-                        f"✅ Sub-agent {runner.agent_id} finished ({elapsed}s)\n"
-                        f"Job: <b>{_he(label)}</b> | Model: {_he(runner._model_id)}\n"
-                        f"Task: {_he(task[:120])}"
+                    logger.info(
+                        "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
+                        label, runner.agent_id, runner._model_id, elapsed,
                     )
-                    # Send header + full result; send_message_to_users paginates automatically
-                    runner.notify_fn(header + "\n\n" + result)
+                    if _notify_result:
+                        header_html = (
+                            f"✅ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
+                            f" finished ({elapsed}s)\n"
+                            f"<b>Job:</b> {_html_mod.escape(label)}"
+                            f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
+                            f"<b>Task:</b> {_html_mod.escape(task[:120])}"
+                        )
+                        try:
+                            _send_result_html(header_html, result)
+                        except Exception as notify_exc:
+                            logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
             except Exception as exc:
+                record.status = "failed"
+                record.result = str(exc)
+                record._result_event.set()
                 elapsed = int(time.time() - record.started_at)
-                runner.notify_fn(
-                    f"❌ Sub-agent {runner.agent_id} failed ({elapsed}s)\n"
-                    f"Job: <b>{_he(label)}</b> | Model: {_he(runner._model_id)}\n"
-                    f"Task: {_he(task[:120])}\n"
-                    f"Error: {_he(str(exc))}"
+                logger.error(
+                    "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
+                    label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
                 )
+                if _notify_result:
+                    header_html = (
+                        f"❌ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
+                        f" failed ({elapsed}s)\n"
+                        f"<b>Job:</b> {_html_mod.escape(label)}"
+                        f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
+                        f"<b>Task:</b> {_html_mod.escape(task[:120])}"
+                    )
+                    try:
+                        _send_result_html(header_html, f"Error: {exc}")
+                    except Exception as notify_exc:
+                        logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
             finally:
                 get_agent_registry().unregister(runner.agent_id)
                 if _finish_cb:
                     _finish_cb(_finish_tag)
 
-        t = threading.Thread(target=_run_and_notify, daemon=True, name=f"sub-agent-{label}")
-        t.start()
+        self._sub_agent_pool.submit(_run_and_notify)
 
         return {
             "success": True,
-            "output": f"Sub-agent spawned (id: {runner.agent_id}, model: {runner._model_id}). Result will be delivered when done.",
+            "output": (
+                f"Sub-agent spawned (id: {runner.agent_id}, model: {runner._model_id}, "
+                f"response_format: {response_format}). "
+                f"Call get_agent_result(\"{runner.agent_id}\") to retrieve the result when needed."
+            ),
             "error": "",
             "exit_code": 0,
             "agent_id": runner.agent_id,
+            "response_format": response_format,
         }
 
 
-    def _exec_memory_write(self, args: dict) -> dict:
+    def _exec_get_agent_result(self, args: dict, caller_tag: str = "") -> dict:
+        """
+        Wait for a sub-agent to finish and return its result.
+
+        Blocks until the agent's _result_event is set or timeout expires.
+        """
+        from sub_agent_registry import get_registry as get_agent_registry
+
+        agent_id = args.get("agent_id", "").strip()
+        if not agent_id:
+            return {"success": False, "output": "", "error": "get_agent_result: 'agent_id' is required.", "exit_code": -1}
+
+        timeout = args.get("timeout", self._subagent_result_timeout)
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            timeout = self._subagent_result_timeout
+
+        record = get_agent_registry().get(agent_id)
+        if record is None:
+            return {
+                "success": False, "output": "",
+                "error": f"get_agent_result: no active sub-agent with id '{agent_id}'.",
+                "exit_code": -1,
+                "status": "not_found",
+            }
+
+        # If already finished (event already set), return immediately
+        finished = record._result_event.wait(timeout=timeout)
+        if not finished:
+            # Auto-cancel the sub-agent unless caller explicitly opted out.
+            # This prevents orphaned sub-agents from wasting tokens and sending
+            # irrelevant Telegram notifications after the caller has moved on.
+            cancel_on_timeout = args.get("cancel_on_timeout", True)
+            if cancel_on_timeout and not record._cancel_event.is_set():
+                record._timeout_cancelled = True
+                record.cancel()
+                logger.info(
+                    "get_agent_result: timed out after %ds — auto-cancelled agent '%s'",
+                    timeout, agent_id,
+                )
+            return {
+                "success": False,
+                "output": f"get_agent_result: timed out after {timeout}s waiting for agent '{agent_id}'.",
+                "error": "",
+                "exit_code": 0,
+                "status": "timeout",
+                "agent_id": agent_id,
+            }
+
+        return {
+            "success": record.status == "done",
+            "output": record.result or "",
+            "error": record.result if record.status == "failed" else "",
+            "exit_code": 0 if record.status == "done" else -1,
+            "status": record.status,
+            "result_type": record.result_type,
+            "result": record.result,
+            "agent_id": agent_id,
+        }
+
+
+    def _exec_memory_write(self, args: dict, caller_tag: str = "") -> dict:
         """Read or update persistent MemoryStore (data/memory.json)."""
         if self._memory is None:
             return {
@@ -667,7 +1106,7 @@ class BuiltinExecutor:
                             key, type(parsed).__name__,
                         )
                         value = parsed
-                except Exception:
+                except _json.JSONDecodeError:
                     pass  # Keep original string value
             self._memory.set(key, value)
             logger.info("memory_write set: key=%s type=%s", key, type(value).__name__)
@@ -708,7 +1147,7 @@ def _save_context(context_key: str, short_term, data_dir: str) -> None:
         data = short_term.to_dict()
         with open(path, "w", encoding="utf-8") as f:
             _json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
+    except OSError:
         logger.warning("Failed to save context for %s", context_key, exc_info=True)
 
 
@@ -725,6 +1164,6 @@ def _load_context(context_key: str, data_dir: str, max_turns: int = 50):
         with open(path, "r", encoding="utf-8") as f:
             data = _json.load(f)
         return ShortTermMemory.from_dict(data, max_turns=max_turns)
-    except Exception:
+    except (OSError, _json.JSONDecodeError):
         logger.warning("Context file corrupted for %s — starting fresh", context_key, exc_info=True)
         return ShortTermMemory(max_turns=max_turns)

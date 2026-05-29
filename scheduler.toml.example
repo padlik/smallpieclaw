@@ -22,20 +22,8 @@
 #   preserve_context     = true/false    (keep ShortTermMemory between runs; default: false)
 #   context_max_messages = N             (sliding window size when preserve_context=true; default: 50)
 #   overlap_policy       = "skip"|"parallel"  (what to do if previous run is still active; default: skip)
-
-[jobs.nightly_health]
-enabled = true
-schedule = "cron"
-cron = "0 2 * * *"
-task = "Run a full system health check and summarize the status."
-notify = true
-
-[jobs.disk_check]
-enabled = true
-schedule = "cron"
-cron = "0 */6 * * *"
-task = "Check disk usage on all mount points. Alert if any mount point is above 80% full."
-notify = true
+#   fallback_models      = ["<model>"]   (optional: fallback models for this job; [] disables fallback;
+#                                         omit to inherit agent.fallback_models)
 
 [jobs.longterm_memory_update]
 enabled = true

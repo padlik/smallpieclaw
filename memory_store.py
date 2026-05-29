@@ -27,6 +27,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_JSON_FILE_ERRORS = (OSError, json.JSONDecodeError)
+
 
 # ---------------------------------------------------------------------------
 # Shared helper
@@ -84,6 +86,35 @@ class MemoryStore:
             self._data.update(updates)
             self._save_with_retry()
 
+    def purge_matching(self, *substrings: str) -> int:
+        """Delete keys whose names contain any substring as a whole segment
+        (delimited by underscores, hyphens, or string boundaries; plural 's' allowed).
+
+        Examples: ``purge_matching("model")`` matches ``available_models``,
+        ``active_model``, ``llm_model_config`` but NOT ``remodel_schedule``
+        (the 're' prefix is not a delimiter).
+
+        Internal keys starting with '_' are never purged.
+        Returns the number of keys deleted.
+        """
+        import re
+        pattern = re.compile(
+            r"(?:(?<![a-zA-Z])|^)("
+            + "|".join(re.escape(s) for s in substrings)
+            + r")s?(?:[^a-zA-Z]|$)",
+            re.IGNORECASE,
+        )
+        with self._lock:
+            to_delete = [
+                k for k in self._data
+                if not k.startswith("_") and pattern.search(k)
+            ]
+            for k in to_delete:
+                del self._data[k]
+            if to_delete:
+                self._save_with_retry()
+        return len(to_delete)
+
     def as_prompt_text(self) -> str:
         """Format memory as a short text block suitable for LLM context."""
         with self._lock:
@@ -114,14 +145,13 @@ class MemoryStore:
                     with open(self.path, "r") as f:
                         self._data = json.load(f)
                     logger.debug("Memory loaded from %s (%d keys)", self.path, len(self._data))
-                except Exception as exc:
+                except _JSON_FILE_ERRORS as exc:
                     logger.warning("Could not load memory from %s: %s — starting fresh", self.path, exc)
                     self._data = {}
             else:
                 # Seed with useful defaults
                 self._data = {
                     "known_services": [],
-                    "last_health_check": None,
                     "notes": [],
                 }
                 self._save_with_retry()
@@ -137,7 +167,7 @@ class MemoryStore:
                     json.dump(self._data, f, indent=2)
                 os.replace(tmp, self.path)
                 return
-            except Exception as exc:
+            except OSError as exc:
                 if attempt < attempts:
                     logger.warning("MemoryStore save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
                     time.sleep(delay)
@@ -325,7 +355,7 @@ class LongTermMemory:
                 try:
                     with open(self.path) as f:
                         self._data = json.load(f)
-                except Exception as exc:
+                except _JSON_FILE_ERRORS as exc:
                     logger.warning("LongTermMemory load failed: %s", exc)
                     self._data = {}
 
@@ -340,7 +370,7 @@ class LongTermMemory:
                     json.dump(self._data, f, indent=2)
                 os.replace(tmp, self.path)
                 return
-            except Exception as exc:
+            except OSError as exc:
                 if attempt < attempts:
                     logger.warning("LongTermMemory save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
                     time.sleep(delay)
@@ -431,7 +461,7 @@ class ResultsMemory:
                 try:
                     with open(self.path) as f:
                         self._data = json.load(f)
-                except Exception as exc:
+                except _JSON_FILE_ERRORS as exc:
                     logger.warning("ResultsMemory load failed: %s", exc)
                     self._data = {}
 
@@ -446,7 +476,7 @@ class ResultsMemory:
                     json.dump(self._data, f, indent=2)
                 os.replace(tmp, self.path)
                 return
-            except Exception as exc:
+            except OSError as exc:
                 if attempt < attempts:
                     logger.warning("ResultsMemory save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
                     time.sleep(delay)

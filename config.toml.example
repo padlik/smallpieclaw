@@ -13,8 +13,7 @@ pairing_timeout = 300
 # LLM Models
 # Define one or more [[models]] entries. The active model is chosen by
 # matching agent.default_model against the 'model' field of each entry.
-# The agent can also auto-switch based on 'hint' keywords, and users can
-# switch manually with /models.
+# Users can switch manually with /models.
 #
 # Fields per model:
 #   name             — display name shown in /models
@@ -24,10 +23,11 @@ pairing_timeout = 300
 #   base_url         — API base URL (leave empty for Anthropic/Google defaults)
 #   max_tokens       — max tokens in LLM response
 #   temperature      — sampling temperature
-#   hint             — space-separated keywords for auto-selection
+#   top_p            — nucleus sampling (optional; omit to use provider default)
 #   request_timeout  — per-request timeout in seconds (default: 120)
 #   max_retries      — retry attempts on timeout/connection errors (default: 5)
 #   retry_delay      — base retry delay in seconds, doubles each attempt (default: 2)
+#   vision           — true if the model accepts image input (informational; shown in /models)
 # ---------------------------------------------------------------------------
 [[models]]
 name            = "default"
@@ -37,7 +37,9 @@ model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
 temperature     = 0.2
-hint            = "general quick default"
+vision          = true   # gpt-4o-mini supports image input
+# top_p         = 0.9  # optional: nucleus sampling (omit to use provider default)
+# aliases       = ["gpt-4o-mini"]  # optional: names to match against models_capabilities.json
 request_timeout = 120
 max_retries     = 5
 retry_delay     = 2
@@ -51,9 +53,41 @@ retry_delay     = 2
 # base_url        = ""
 # max_tokens      = 8192
 # temperature     = 0.2
-# hint            = "complex analyze reason large file code review"
 # request_timeout = 180
 # max_retries     = 5
+# retry_delay     = 2
+
+# Ollama Cloud API (https://ollama.com) — hosted cloud models.
+# Requires the 'ollama' Python package (pip install ollama>=0.4.0).
+# Create an API key at https://ollama.com/settings/keys.
+# Available cloud models: https://ollama.com/search?c=cloud
+# Examples: gpt-oss:120b-cloud, deepseek-v3.1:671b-cloud, kimi-k2:1t-cloud
+# [[models]]
+# name            = "ollama-cloud"
+# provider        = "ollama"
+# api_key         = "YOUR_OLLAMA_API_KEY"
+# model           = "kimi-k2:1t-cloud"
+# base_url        = "https://ollama.com"
+# max_tokens      = 4096
+# temperature     = 0.2
+# aliases         = ["kimi-k2.6", "kimi-k2"]  # map to models_capabilities.json entries
+# request_timeout = 300
+# max_retries     = 3
+# retry_delay     = 2
+
+# Ollama local instance (no API key required).
+# Make sure Ollama is running: https://ollama.com/download
+# Pull a model first: ollama pull gemma3:27b
+# [[models]]
+# name            = "ollama-local"
+# provider        = "ollama"
+# api_key         = ""
+# model           = "gemma3:27b"
+# base_url        = "http://localhost:11434"
+# max_tokens      = 4096
+# temperature     = 0.2
+# request_timeout = 120
+# max_retries     = 3
 # retry_delay     = 2
 
 [embeddings]
@@ -74,18 +108,30 @@ default_model  = "gpt-4o-mini"
 # Model used by sub-agents (scheduled jobs and spawn_agent tool).
 # Must match the 'model' field of a [[models]] entry. Defaults to default_model if not set.
 # background_model = "gpt-4o-mini"
+# Fallback models tried in order when the primary model fails with a transient error.
+# Each entry must match the 'model' field of a [[models]] entry.
+# LLMPermanentError (content filter, invalid key) skips fallback — these indicate a request issue.
+# Omit or leave empty to disable fallback.
+# fallback_models = ["claude-3-haiku-20240307", "gemini-1.5-flash"]
 # Maximum estimated context tokens per LLM request (4 chars ≈ 1 token).
 # When 85% is reached the agent auto-summarises older messages before the next call.
 ctx_max_tokens = 90000
 # Enable verbose diagnostics when the LLM returns empty content (default: false).
 # Logs full HTTP response, checks stream/non-stream mismatch, finish_reason, and runs a curl probe.
 diagnose_empty_responses = false
+# Hard cap on concurrent managed (on-demand) sub-agents. Scheduler jobs do not count toward this cap.
+# Attempting to spawn beyond this limit returns a hard error. Default: 6.
+max_subagents = 6
+# Timeout in seconds for get_agent_result tool when waiting for a sub-agent to finish. Default: 300.
+subagent_result_timeout = 300
+# Max steps for scheduled/background sub-agents (independent of max_iterations for chat sessions).
+# Set to 0 for no limit (capped internally at 500). Default: 100.
+scheduled_max_iterations = 100
+# Warn in chat when a sub-agent has been running longer than this many minutes. 0 = disabled.
+long_run_warn_minutes = 30
 
 [scheduler]
 enabled = true
-# Cron-style: "HH:MM" for daily tasks
-nightly_health_check = "02:00"
-disk_check_interval_hours = 6
 
 [paths]
 tools_dir          = "tools"
@@ -100,3 +146,29 @@ log_backup_count   = 30         # number of daily rotated files to keep
 pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate instances
 # tmp_dir defaults to /tmp/<working_dir_name> if not set
 # tmp_dir = "/tmp/agent"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP Servers (Model Context Protocol)
+# Use [[mcp_servers]] to configure one or more MCP servers.
+# Two transports are supported: "stdio" (subprocess) and "http" (HTTP/HTTPS).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Example: stdio MCP server (subprocess with JSON-RPC over stdin/stdout)
+# [[mcp_servers]]
+# name      = "filesystem"
+# transport = "stdio"
+# command   = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# enabled   = true
+# timeout   = 30
+# [mcp_servers.env]
+# MY_ENV_VAR = "value"
+
+# Example: HTTP MCP server (JSON-RPC POST to HTTP/HTTPS endpoint)
+# [[mcp_servers]]
+# name      = "my-api"
+# transport = "http"
+# url       = "https://api.example.com/mcp"
+# enabled   = true
+# timeout   = 30
+# [mcp_servers.headers]
+# Authorization = "Bearer your-token-here"
