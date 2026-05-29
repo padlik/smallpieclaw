@@ -39,6 +39,7 @@ from telegram_commands import (
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid, cmd_health,
     cmd_show_ctx, cmd_show_env, cmd_models,
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
+    cmd_mad_plan, cmd_agent, cb_mad_plan_review,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,12 @@ class TelegramInterface:
 
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
+
+        # MadPlan mode state
+        self._agent_mode: str = "agent"
+        self._pending_plan: dict | None = None
+        self._pending_plan_name_override: str = ""
+        self.sub_agent_factory: Optional[Callable] = None
 
         # Verbose mode: send each agent action as a new message instead of editing
         self._verbose: bool = False
@@ -149,6 +156,8 @@ class TelegramInterface:
             BotCommand("show_ctx", "Show current system prompt snapshot"),
             BotCommand("show_env", "Show runtime environment info"),
             BotCommand("stop", "Cancel the currently running task"),
+            BotCommand("mad_plan", "Model Adaptive Planner (plan / list / execute)"),
+            BotCommand("agent", "Return to standard agent mode"),
         ]
         try:
             await app.bot.set_my_commands(commands)
@@ -183,11 +192,15 @@ class TelegramInterface:
         # Hidden diagnostic commands (not registered with BotFather)
         app.add_handler(CommandHandler("show_ctx", partial(cmd_show_ctx, self)))
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
+        # MadPlan commands
+        app.add_handler(CommandHandler("mad_plan", partial(cmd_mad_plan, self)))
+        app.add_handler(CommandHandler("agent", partial(cmd_agent, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
+        app.add_handler(CallbackQueryHandler(partial(cb_mad_plan_review, self), pattern=r"^madplan_"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
         app.add_handler(MessageHandler(filters.PHOTO, self._on_file))
@@ -295,6 +308,9 @@ class TelegramInterface:
         images: Optional[list[str]] = None,
     ) -> None:
         """Run the agent with a given task, showing streaming progress."""
+        if self._agent_mode == "madplan":
+            await self._run_mad_plan_task(update, ctx, task_text, images)
+            return
         user = update.effective_user
         status_msg = await update.effective_message.reply_text("🔄 Processing…")
         loop = asyncio.get_running_loop()
@@ -603,6 +619,134 @@ class TelegramInterface:
                 asyncio.run(_send())
             except Exception as exc:
                 logger.error("send_html_to_users fallback failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # MadPlan execution
+    # ------------------------------------------------------------------
+
+    async def _run_mad_plan_task(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        task_text: str,
+        images: Optional[list[str]] = None,
+    ) -> None:
+        """Plan a task in MadPlan mode and show the enriched plan for review."""
+        from mad_plan import MadPlanOrchestrator, MadPlanError, build_agent_capabilities_summary
+        plans_dir = os.path.join(os.getcwd(), "plans")
+
+        status_msg = await update.effective_message.reply_text("🧠 Planning…")
+
+        try:
+            orchestrator = MadPlanOrchestrator()
+
+            capabilities = build_agent_capabilities_summary(
+                tool_registry=self.tool_registry,
+                skill_registry=self.skill_registry,
+                mcp_manager=self.mcp_manager,
+            )
+
+            configured_models = []
+            if self.llm_client and hasattr(self.llm_client, "list_models"):
+                configured_models = self.llm_client.list_models()
+
+            from mad_plan import load_models_capabilities
+            caps_data = load_models_capabilities(os.path.join(os.getcwd(), "data"))
+
+            plan = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: orchestrator.plan_task(
+                    task_text,
+                    self.llm_client,
+                    caps_data,
+                    configured_models=configured_models,
+                    agent_capabilities=capabilities,
+                ),
+            )
+
+            # Auto-save the plan
+            name_override = getattr(self, "_pending_plan_name_override", "")
+            if name_override:
+                plan["task"] = f"{name_override} - {plan.get('task', '')}"
+            plan_name, saved_path = orchestrator.save_plan(plan, plans_dir)
+            plan["_plan_name"] = plan_name
+            plan["_saved_path"] = saved_path
+            self._pending_plan = plan
+
+            plan_html = orchestrator.format_plan_html(plan)
+
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data="madplan_approve"),
+                InlineKeyboardButton("❌ Reject",  callback_data="madplan_reject"),
+                InlineKeyboardButton("📋 Full plan", callback_data="madplan_show"),
+            ]])
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            for chunk in self._split_message(plan_html):
+                await update.effective_message.reply_text(
+                    chunk,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+                keyboard = None  # only attach buttons to first chunk
+
+        except MadPlanError as exc:
+            await self._safe_edit(status_msg, f"❌ MadPlan error: {html.escape(str(exc))}")
+        except Exception as exc:
+            logger.exception("MadPlan planning failed")
+            await self._safe_edit(status_msg, f"❌ Planning failed: {html.escape(str(exc))}")
+
+    async def _run_mad_plan_execute(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        plan: dict,
+    ) -> None:
+        """Execute an approved MadPlan plan via sub-agents."""
+        from mad_plan import MadPlanOrchestrator
+
+        # Snapshot and clear pending state to prevent double-execute
+        self._pending_plan = None
+
+        status_msg = await update.effective_message.reply_text("⚙️ <b>Executing plan…</b>", parse_mode=ParseMode.HTML)
+
+        async def _notify(text: str) -> None:
+            try:
+                await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+
+        try:
+            orchestrator = MadPlanOrchestrator()
+            output, failure = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: orchestrator.execute_plan(
+                    plan,
+                    sub_agent_factory=self.sub_agent_factory,
+                    notify_fn=lambda msg: asyncio.run_coroutine_threadsafe(
+                        _notify(msg), asyncio.get_event_loop()
+                    ),
+                ),
+            )
+            total = len(output)
+            if failure:
+                failed_id = html.escape(str(failure.get("subtask_id", "?")))
+                remaining = len(failure.get("remaining", []))
+                await self._safe_edit(
+                    status_msg,
+                    f"⚠️ <b>Plan partially complete</b> — {total} sub-task(s) done, "
+                    f"failed at <code>{failed_id}</code>, {remaining} skipped",
+                )
+            else:
+                summary = f"✅ <b>Plan complete</b> — {total}/{total} sub-tasks completed"
+                await self._safe_edit(status_msg, summary)
+        except Exception as exc:
+            logger.exception("MadPlan execute failed")
+            await self._safe_edit(status_msg, f"❌ Execution error: {html.escape(str(exc))}")
 
 # ---------------------------------------------------------------------------
 # Module constants

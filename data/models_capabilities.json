@@ -1,0 +1,387 @@
+{
+  "models": [
+    {
+      "model_name": "grok-4-1-fast-reasoning",
+      "specifications": {
+        "context_window": 2000000,
+        "relative_speed_rating": 7,
+        "reasoning": true,
+        "provider": "xAI",
+        "release_date": "2025-11-19",
+        "license": "Proprietary"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16000,
+        "temperature": {
+          "min": 0,
+          "max": 0.7,
+          "recommended": 0.7,
+          "rationale": "xAI's default and recommended temperature for the reasoning variant is 0.7 per vals.ai benchmark configuration. Lower to 0.2–0.3 for strict structured outputs or deterministic tool-calling loops. Reasoning depth is controlled by the reasoning_enabled flag and effort budget, not by temperature alone."
+        },
+        "top_p": 0.95
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "Same 2M-token context window and native Agent Tools API (web search, X post search, code execution, document retrieval) as the non-reasoning variant, but with chain-of-thought enabled — making it the best single option in the xAI portfolio when tasks require both deep reasoning and live information retrieval in the same request.",
+          "Agentic tool-calling with reasoning traces: trained via long-horizon RL across multi-turn agentic scenarios, it maintains coherent intent across hundreds of sequential tool calls, reducing strategy drift that is common in pure non-reasoning agentic loops.",
+          "LM Arena Thinking-mode leader at Elo 1483 (codename quasarflux) as of November 2025 — the highest human-preference score on the leaderboard at launch, placing it above all non-xAI models on overall conversational quality with reasoning enabled.",
+          "Hallucination rate approximately 3× lower than Grok 4 Fast on information-seeking queries, and meaningfully lower than Grok 4.1 Fast non-reasoning on factually contested or multi-hop retrieval tasks where the model cannot call tools.",
+          "Dual-mode deployment: reasoning can be enabled or disabled per request via a single API flag, allowing the same model endpoint to handle both latency-sensitive and reasoning-depth-sensitive tasks without maintaining two separate deployments or paying for two rate-limit pools."
+        ],
+        "weaknesses": [
+          "Substantially higher time-to-first-token (TTFT ~10.66s measured by Artificial Analysis) compared to the non-reasoning variant (~1–2s) — structurally incompatible with sub-1s latency budgets regardless of prompt complexity.",
+          "Output verbosity is elevated: the reasoning variant generated 53M tokens during the Artificial Analysis Intelligence Index evaluation versus 26M for the median comparable model, increasing per-request cost and downstream latency for streaming interfaces.",
+          "Artificial Analysis Intelligence Index score of 39 places it notably below frontier reasoning models (Gemini 3 Flash at 49, Claude Opus 4.6 at ~55) on general intelligence benchmarks, suggesting it is better suited to agentic tool-use tasks than pure reasoning challenges.",
+          "Pricing at $0.20/$0.50 per million input/output tokens is competitive but reasoning token generation at high verbosity can make effective per-task cost higher than headline rates suggest for long-chain reasoning workloads.",
+          "No published multimodal reasoning benchmarks: image input is confirmed but there are no independent VQA or visual-reasoning scores, making it unsuitable as a primary choice for workflows requiring validated vision-reasoning quality."
+        ]
+      },
+      "management_summary": "Deploy grok-4-1-fast-reasoning when your workload requires both live information access and a visible chain-of-thought reasoning trace in the same request — the combination that neither pure reasoning models (no native search) nor the non-reasoning variant (no thinking tokens) can provide alone. Its 2M-token context, native Agent Tools API, and 3× hallucination reduction over Grok 4 Fast make it the strongest option in the xAI portfolio for agentic deep-research pipelines, multi-step customer support with tool access, and agentic finance and compliance workflows that require an audit trail. Accept the ~10s TTFT as a structural cost of the reasoning mode; route latency-sensitive requests to the non-reasoning variant via the same API endpoint. Prefer Gemini 3 Flash or Claude Opus 4.6 when pure reasoning depth on GPQA/AIME-class tasks is the primary selection criterion, as those models score 10–15 points higher on the Artificial Analysis Intelligence Index."
+    },
+    {
+      "model_name": "grok-4-1-fast-non-reasoning",
+      "specifications": {
+        "context_window": 2000000,
+        "relative_speed_rating": 9,
+        "reasoning": false,
+        "provider": "xAI",
+        "release_date": "2025-11-20",
+        "license": "Proprietary"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16000,
+        "temperature": {
+          "min": 0,
+          "max": 0.3,
+          "recommended": 0.1,
+          "rationale": "Low temperature improves determinism for tool-calling and structured extraction tasks"
+        },
+        "top_p": 0.9
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "High-throughput agentic tool-calling loops where each step is a direct, unambiguous action and reasoning overhead would add latency without measurable quality benefit, such as orchestration of API calls in multi-step automation workflows",
+          "Real-time customer-facing chat interfaces with strict sub-500ms latency budgets that reasoning models structurally cannot meet due to chain-of-thought token generation",
+          "Structured data extraction from large documents up to 2M tokens, such as parsing legal contracts, financial reports, or log files where the answer is retrievable rather than computed",
+          "Web search and multi-hop retrieval pipelines backed by live internet access, where xAI-native search integration gives it a speed-accuracy advantage over competing models at the same price point",
+          "Cost-sensitive production pipelines processing thousands of requests per hour at $0.50 per million output tokens, where reasoning models would increase per-unit cost by 2-4x without improving output quality on direct-response tasks"
+        ],
+        "weaknesses": [
+          "Multi-step mathematical derivations or graduate-level reasoning problems where chain-of-thought consistently outperforms direct response by 10-20% accuracy on benchmarks including GPQA and AIME",
+          "Complex code debugging requiring hypothesis generation and iterative analysis, where the reasoning variant or full Grok 4 produces materially fewer regressions per debugging session",
+          "Long-horizon agentic planning involving more than 5 dependent decision points, where absence of internal reasoning traces leads to compounding errors across steps",
+          "Compliance-sensitive workflows requiring an audit trail of reasoning steps, since non-reasoning output provides no intermediate logic for human or automated review",
+          "Highly ambiguous or underspecified prompts where deliberating over multiple interpretations before answering significantly reduces downstream correction cost"
+        ]
+      },
+      "management_summary": "Deploy grok-4-1-fast-non-reasoning when your binding constraints are latency and per-request cost rather than reasoning depth. It is the strongest option in the xAI portfolio for agentic automation, live customer interactions, and large-document parsing workloads that do not require multi-step deliberation. Its 2M-token context window and native search integration make it highly competitive in retrieval-augmented pipelines at a fraction of full Grok 4 cost. Select the reasoning variant when tasks involve mathematical problem-solving, multi-step code debugging, or any workflow where a visible reasoning trace is required for compliance or quality assurance."
+    },
+    {
+      "model_name": "kimi-k2.6",
+      "specifications": {
+        "context_window": 262144,
+        "relative_speed_rating": 5,
+        "reasoning": true,
+        "provider": "Moonshot AI",
+        "release_date": "2026-04-20",
+        "license": "Modified MIT"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16384,
+        "temperature": {
+          "min": 0,
+          "max": 1,
+          "recommended": 1,
+          "rationale": "Moonshot AI's official recommendation is temperature=1.0 for Thinking mode and 0.6 for Instant (non-thinking) mode. Keep at 1.0 for agentic coding, long-horizon reasoning, and swarm orchestration tasks. Drop to 0.6 for structured extraction, JSON output, or direct-response classification."
+        },
+        "top_p": 1
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "Agent Swarm architecture scales to 300 domain-specialized sub-agents executing up to 4,000 coordinated steps per run — tripling the swarm capacity of K2.5 — making it the strongest open-weight model for fully autonomous multi-agent orchestration pipelines that produce finished deliverables (documents, websites, spreadsheets) without human intervention.",
+          "Long-horizon coding across Rust, Go, and Python with 12% higher code generation accuracy and 18% improved long-context stability over K2.5, and a 96.6% tool invocation success rate in internal CodeBuddy evaluations — the highest published for any open-weight model at the time of release.",
+          "Native multimodal input (text, image, video) via a 400M-parameter MoonViT encoder enables unified UI/UX code generation from visual mockups, video timeline queries, and image-to-production-interface workflows without a separate vision model.",
+          "Open weights under Modified MIT license with self-hosting support on vLLM and SGLang — giving teams that cannot use proprietary APIs (data residency, audit, cost control) a deployment path to SOTA-class agentic coding at zero per-token cost beyond compute.",
+          "Coding and agentic benchmarks rank #6 globally on BenchLM (89.1 coding average, 88.1 agentic tool use), with Claw Eval tool invocation accuracy improvements measurable across all five benchmark domains versus K2.5, and >50% improvement on the Next.js-specific benchmark."
+        ],
+        "weaknesses": [
+          "262K context ceiling is the binding constraint for workloads that require 500K–1M tokens — proprietary alternatives like Gemini 3 Flash (1M) and Grok 4.1 Fast (2M) have a structural advantage on very-long-document ingestion and large-codebase single-pass analysis.",
+          "Output verbosity is extreme: Artificial Analysis measured 170M output tokens during the Intelligence Index evaluation, versus a 40M median — roughly 4× more verbose than peers, which inflates per-task cost and downstream streaming latency at Kimi's API pricing ($0.95/$4.00 per million input/output).",
+          "Pure mathematical reasoning trails closed-source frontier models: GPT-5.4 leads on AIME 2026 (99.2 vs 96.4) and GPQA Diamond (92.8 vs 90.5), making K2.6 a second choice for high-stakes single-turn math derivation tasks.",
+          "Thinking mode raises TTFT to ~2.92s (Kimi API) and output throughput drops to ~48 t/s — below the 59 t/s median for comparable open-weight models. For agents requiring sub-1s interactive response, this is a structural bottleneck.",
+          "Self-hosting the full 1T parameter checkpoint requires significant GPU cluster capacity (TP=8+ on H100/B200 class GPUs for production latency); consumer-grade or mid-tier cloud inference setups require native INT4 quantization which may reduce accuracy on long-horizon tasks."
+        ]
+      },
+      "management_summary": "Deploy kimi-k2.6 when your primary constraint is agentic coding quality under an open license with no per-token API cost at self-hosted scale. Its 300-agent swarm architecture, 96.6% tool invocation success rate, and native multimodal input place it at the top of the open-weight agentic coding tier as of April 2026. It is the default recommendation over K2.5 for all new projects — K2.6 delivers +12% code accuracy, +18% long-context stability, and triple the swarm capacity at a moderate API cost premium. Accept the 262K context ceiling and high verbosity as structural trade-offs; route very-long-document or cost-per-token-sensitive workloads to DeepSeek V4 Flash or Gemini 3 Flash. Prefer K2.5 only when K2.6 API pricing is cost-prohibitive and K2.5's lower per-token rate ($0.40/$1.90) is a binding constraint."
+    },
+    {
+      "model_name": "kimi-k2.5",
+      "specifications": {
+        "context_window": 262144,
+        "relative_speed_rating": 5,
+        "reasoning": true,
+        "provider": "Moonshot AI",
+        "release_date": "2026-01-27",
+        "license": "MIT"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16384,
+        "temperature": {
+          "min": 0,
+          "max": 1,
+          "recommended": 1,
+          "rationale": "Official benchmark settings use temperature=1.0, top_p=0.95, 256K context for all evaluations. Lower to 0.6 for non-thinking (Instant) mode to balance fluency and determinism. Keep at 1.0 for Thinking mode and agentic workflows."
+        },
+        "top_p": 0.95
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "Agent Swarm technology coordinates up to 100 specialized parallel sub-agents simultaneously, reducing execution time by 4.5× on parallelizable tasks versus sequential execution — the first open-weight model to ship this capability at scale, scoring 79.0% on Wide Search in swarm mode versus 72.7% in standard mode.",
+          "Native multimodal architecture trained from scratch on ~15 trillion mixed visual and text tokens, delivering strong visual coding performance (sketches and mockups to production UI), multi-image dialogue, and video timeline queries without a separate vision encoder component.",
+          "SWE-Bench Verified at 76.8%, SWE-Bench Multilingual at 73.0%, and LiveCodeBench at 85.0% — making it the strongest open-weight model for software engineering at the time of release and the direct predecessor to K2.6 on the same MoE architecture.",
+          "Stable multi-step agentic execution across 200–300 sequential tool calls without drift — a measured capability gap over models that lose coherence in long-running agent loops, demonstrated on BrowseComp at 74.9% against a 29.2% human baseline.",
+          "Cost-efficient API at $0.40/$1.90 per million input/output tokens — substantially cheaper than K2.6 ($0.95/$4.00) — making it the cost-optimal choice when K2.6's incremental agentic improvements do not justify the price premium for a given workload."
+        ],
+        "weaknesses": [
+          "Superseded by Kimi K2.6 across all primary benchmarks: K2.6 is +12% on code generation accuracy, +18% on long-context stability, +50% on Next.js-specific coding, and has 3× the agent swarm capacity (300 vs 100 sub-agents). For new projects, K2.5 should only be selected on cost grounds.",
+          "Agent Swarm capped at 100 parallel sub-agents and 1,500 steps per run — sufficient for most current workflows but a documented bottleneck relative to K2.6 for tasks requiring thousands of coordinated steps.",
+          "Knowledge cutoff of April 2024 means K2.5 lacks training signal for the most recent 18+ months of library releases, API changes, and security advisories — a meaningful gap for projects building on actively evolving frameworks.",
+          "Pure reasoning ceiling: AIME 2026 score (94.5 vs K2.6's 96.4, K2.5 benchmark) and GPQA Diamond (87.6) trail leading closed-source frontier models by 5–10 points on the hardest mathematical and scientific reasoning tasks.",
+          "Self-hosting the full 1T parameter BF16 checkpoint is inaccessible without a large GPU cluster; INT4 quantization is required for most teams and introduces accuracy degradation on long-horizon reasoning chains."
+        ]
+      },
+      "management_summary": "Deploy kimi-k2.5 as a cost-optimized fallback for agentic coding and multimodal workflows where K2.6's incremental capability gains do not justify the 2–2.5× API price increase. At $0.40/$1.90 per million tokens, it offers strong SWE-Bench Verified performance (76.8%), native multimodal input, and 100-agent swarm orchestration at a fraction of K2.6 cost — making it the right choice for high-volume pipelines where per-request economics are the binding constraint. For all greenfield projects where quality is the primary selection criterion, start with K2.6 and evaluate whether the cost premium is justified by measured quality improvement on your specific workload. Expect K2.5 to be deprecated from most production stacks as K2.6 API pricing matures through the second half of 2026."
+    },
+    {
+      "model_name": "deepseek-v4-pro",
+      "specifications": {
+        "context_window": 1000000,
+        "relative_speed_rating": 5,
+        "reasoning": true,
+        "provider": "DeepSeek",
+        "release_date": "2026-04-24",
+        "license": "MIT"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16000,
+        "temperature": {
+          "min": 0,
+          "max": 1,
+          "recommended": 1,
+          "rationale": "DeepSeek's official deployment recommendation for both V4 variants is temperature=1.0, top_p=1.0 for local inference. For Think Max reasoning mode, context window must be set to at least 384K tokens. Three effort tiers (non-thinking, thinking, think-max) are the primary quality-cost lever; temperature tuning has secondary impact."
+        },
+        "top_p": 1
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "Highest competitive programming score of any model at release: Codeforces ELO 3206 — surpassing GPT-5.4 (3168) and all other models at the time — with LiveCodeBench Pass@1 at 93.5 (the highest published score on that benchmark) making it the default recommendation for competitive programming agents and algorithm-intensive workloads.",
+          "Near-parity with Claude Opus 4.6 on SWE-Bench Verified (80.6% vs 80.8%, a 0.2-point gap) at approximately 1/7th the cost per output token, delivering the most cost-efficient path to frontier-class autonomous software engineering in April 2026.",
+          "Novel CSA+HCA hybrid attention architecture reduces single-token inference FLOPs to 27% and KV cache usage to 10% of V3.2 at the 1M-token context setting — making the full 1M context window economically practical for production RAG and large-codebase workflows, not just a marketing figure.",
+          "Three reasoning effort tiers (non-thinking, thinking, think-max) in a single model, selectable per-request, enable the same API endpoint to serve both direct-response and deep-reasoning use cases — providing K2.6/Grok-style dual-mode flexibility without maintaining separate deployments.",
+          "MIT-licensed open weights on HuggingFace with FP8 and FP4+FP8 mixed precision variants, trained on 33T tokens — the largest open-weight model by total parameter count (1.6T) with full commercial reuse rights, enabling fine-tuning and private deployment for regulated environments."
+        ],
+        "weaknesses": [
+          "Self-hosting at production latency requires significant GPU cluster capacity: the full BF16 checkpoint exceeds 800GB; even the FP8 variant demands multi-node H100/B200 setup for reasonable throughput, making V4-Flash the practical self-hosting target for most teams.",
+          "Reasoning benchmarks trail Gemini 3.1 Pro on MMLU-Pro (87.5% vs 91.0%) and GPQA Diamond (90.1% vs 94.3%), and trail Claude Opus 4.6 on HLE (37.7% vs 40.0%) — indicating that while Pro is highly competitive on coding, closed-source frontier models retain meaningful leads on broad scientific and knowledge reasoning.",
+          "No multimodal input at launch: both V4 variants are text-only at GA, with multimodal support indicated as forthcoming by DeepSeek. Teams requiring visual validation of UI components, document parsing with images, or video analysis cannot use V4-Pro as a unified multimodal endpoint.",
+          "Non-standard chat template: the model does not include a Jinja-format chat template at release; prompt construction requires DeepSeek's Python encoding scripts (encoding_dsv4.py), which breaks compatibility with all standard OpenAI-SDK and popular client libraries out of the box.",
+          "Preview release status at launch: chat instances were reported identifying as V3 at release, with confusion about endpoint routing — indicating incomplete production hardening for large-scale enterprise deployments at the initial GA date."
+        ]
+      },
+      "management_summary": "Deploy deepseek-v4-pro as the primary open-weight model for competitive programming, advanced agentic coding, and knowledge-intensive RAG workloads where near-frontier performance is required but closed-source licensing or API cost is a constraint. Its Codeforces ELO 3206 and LiveCodeBench 93.5 are the highest published scores on those benchmarks, and its SWE-Bench Verified parity with Claude Opus 4.6 at 1/7th the cost represents the most efficient price-performance trade-off in the April 2026 landscape. Plan for the non-standard chat template as a day-one integration cost. For most teams, V4-Flash is the practical self-hosting target (284B, 13B active) while V4-Pro is consumed via the DeepSeek API; the 1.6–2 point benchmark gap between them on coding tasks rarely justifies self-hosting at the cluster capacity required. Prefer Gemini 3.1 Pro or Claude Opus 4.6 when GPQA Diamond reasoning depth or multimodal input is the primary selection criterion."
+    },
+    {
+      "model_name": "deepseek-v4-flash",
+      "specifications": {
+        "context_window": 1000000,
+        "relative_speed_rating": 8,
+        "reasoning": true,
+        "provider": "DeepSeek",
+        "release_date": "2026-04-24",
+        "license": "MIT"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16000,
+        "temperature": {
+          "min": 0,
+          "max": 1,
+          "recommended": 1,
+          "rationale": "Same recommendation as V4-Pro: temperature=1.0, top_p=1.0 per DeepSeek's official guidance for local deployment. Three reasoning effort tiers (non-thinking, thinking, think-max) are the primary quality-cost lever. Drop temperature to 0.0–0.2 for strict JSON extraction or deterministic classification."
+        },
+        "top_p": 1
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "Most cost-efficient high-throughput model in the open-weight tier at $0.14/$0.28 per million input/output tokens — roughly 12.4× cheaper per output token than V4-Pro — while scoring within 1.9 points of Pro on LiveCodeBench (91.6 vs 93.5) and 1.6 points on SWE-Bench Verified (79.0 vs 80.6), making it the default production choice for the vast majority of agentic coding workloads.",
+          "Practical self-hosting target for the V4 family: 284B total parameters (13B active) fits within a TP=2 to TP=4 multi-GPU setup accessible to mid-size engineering teams, whereas V4-Pro at 1.6T requires significantly more cluster capacity.",
+          "GPQA Diamond at 88.1 and LiveCodeBench at 91.6 — both above the median for comparable models — with Flash@max reasoning effort roughly matching V4-Pro@high on most production reasoning tasks, eliminating the performance gap for the majority of workloads.",
+          "1M-token native context via the same CSA+HCA hybrid attention architecture as V4-Pro, with TTFT of 1.18s and 92.7 t/s output throughput at the DeepSeek API — competitive latency for an open-weight model and significantly faster than the Pro variant.",
+          "MIT-licensed with FP8 and FP4+FP8 mixed precision variants on HuggingFace, three reasoning effort tiers, and OpenAI-compatible API structure (modulo the custom chat template) — making it the most accessible open-weight frontier-class model for production deployment in 2026."
+        ],
+        "weaknesses": [
+          "Falls 7–10 points behind V4-Pro on the most demanding agentic coding benchmarks (SWE-Pro, Terminal-Bench 2.0), meaning Flash is not a drop-in substitute for Pro in the top quartile of task difficulty — long-horizon debugging chains, multi-repository refactors, and complex DevOps automation workflows will measurably benefit from Pro.",
+          "No multimodal input: same text-only limitation as V4-Pro at GA. Cannot be used for vision-dependent workflows until DeepSeek ships the indicated multimodal update.",
+          "Non-standard chat template shared with V4-Pro: requires the custom Python encoding script (encoding_dsv4.py) for prompt construction, breaking standard OpenAI SDK and popular client library integrations out of the box.",
+          "Reasoning tokens are billed at the same rate as output tokens, so think-max mode — while pricing is very low per token — can produce long reasoning traces that increase effective per-task cost beyond the headline $0.28/M output rate for complex problems.",
+          "Knowledge cutoff and training data recency are not disclosed precisely in the V4 technical report; teams should assume a lag of several months to a year behind the April 2026 release date and implement retrieval augmentation for any workload requiring current information."
+        ]
+      },
+      "management_summary": "Deploy deepseek-v4-flash as the default production model for the overwhelming majority of agentic coding, RAG, and tool-calling workloads in the DeepSeek V4 family. At $0.14/$0.28 per million tokens with 92.7 t/s throughput, 1M context, and benchmark scores within 2 points of V4-Pro on standard coding tasks, it delivers frontier-class performance at a price point that makes large-scale deployment economically viable. Reserve V4-Pro specifically for top-quartile difficulty tasks where the 7–10 point benchmark gap on SWE-Pro and Terminal-Bench 2.0 translates to measurable production quality improvement. For self-hosting, Flash is the practical target; Pro requires cluster capacity that most teams cannot justify outside hyperscaler environments. Plan for the non-standard chat template as an integration day-one cost for both variants."
+    },
+    {
+      "model_name": "qwen3-vl:235b",
+      "specifications": {
+        "context_window": 262144,
+        "relative_speed_rating": 5,
+        "reasoning": true,
+        "provider": "Alibaba Cloud (Qwen Team)",
+        "release_date": "2025-09-23",
+        "license": "Apache-2.0"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16384,
+        "temperature": {
+          "min": 0,
+          "max": 1,
+          "recommended": 0.7,
+          "rationale": "Use 0.7 for Instruct (non-thinking) mode for general vision-language tasks such as VQA, OCR, and document parsing. For the Thinking variant, use temperature=1.0 to allow full reasoning chain exploration. Drop to 0.0–0.3 for structured JSON extraction from visual inputs or deterministic table parsing workflows."
+        },
+        "top_p": 0.9
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "Unified vision-language architecture with early joint training across text, images, and video — the Instruct variant rivals Gemini 2.5 Pro on perception benchmarks and the Thinking variant leads on multimodal reasoning and STEM tasks, delivering both capabilities in a single open-weight checkpoint under Apache 2.0.",
+          "Spatial understanding with 2D/3D object grounding, precise bounding-box localization, and GUI element detection — enabling visual agent workflows such as automated UI testing, accessibility auditing, and screen-based autonomous operation that require spatial precision most VLMs lack.",
+          "Precise video temporal grounding: the model can align text queries to specific timestamps in long video sequences, enabling use cases such as meeting transcript alignment, surveillance clip analysis, and video content indexing that require temporal-spatial reasoning.",
+          "Visual coding capability: converts sketches, wireframes, and mockups directly into production-ready code with deliberate aesthetic precision, making it the strongest open-weight model for design-to-code automation pipelines and visual UI debugging.",
+          "Multilingual OCR with fine-grained scene text interpretation across 201 languages — the same language breadth as the Qwen3 text family — making it a practical choice for global document-processing pipelines that handle non-Latin scripts, mixed-language receipts, contracts, and forms."
+        ],
+        "weaknesses": [
+          "Context window of 262K tokens via the Instruct variant (131K on third-party providers via the API) is a ceiling for workflows that need to ingest very long multi-image or video sequences in a single pass — Gemini 3 Flash at 1M tokens has a structural advantage for long-form video and multi-document visual workflows.",
+          "Maximum output of 16,384 tokens limits single-pass generation of long structured documents from visual input — multi-image report generation or large-table extraction requiring very long outputs must be chunked.",
+          "Self-hosting the full 235B model requires TP=8 on A100/H100 class hardware for production throughput; the 22B active parameter MoE design keeps per-token inference cost manageable but cluster setup complexity remains high for teams without dedicated infrastructure.",
+          "Benchmark positioning has shifted since September 2025 release: Kimi K2.5 (January 2026) and Kimi K2.6 (April 2026) both ship stronger visual coding and swarm agentic capabilities, and GLM-5.1 leads on cybersecurity and SWE-Bench Pro — making Qwen3-VL:235B the strongest choice specifically when spatial/temporal visual reasoning is the primary requirement, not general agentic coding.",
+          "No proprietary API pricing stability guarantee given Apache 2.0 open-weight status: third-party provider pricing varies from $0.20–$0.26 input and $0.88–$0.90 output per million tokens and may change as the model ages."
+        ]
+      },
+      "management_summary": "Deploy qwen3-vl:235b when vision-language reasoning is the primary selection criterion and open weights are required: specifically for design-to-code generation, spatial GUI automation, multilingual OCR pipelines, and video temporal grounding workflows that need a single permissively licensed model. Its Instruct variant rivals Gemini 2.5 Pro on perception and its Thinking variant leads on multimodal STEM reasoning as of release. The Apache 2.0 license with 235B parameters (22B active) makes it uniquely positioned for teams that need on-premises visual AI without proprietary API dependency. Prefer Gemini 3 Flash when a longer context window (1M tokens) is required for very-long video or multi-document visual ingestion, or when overall intelligence index score matters more than visual-spatial capability. Prefer Kimi K2.6 or GLM-5.1 when agentic coding rather than visual reasoning is the primary workload."
+    },
+    {
+      "model_name": "glm-5.1",
+      "specifications": {
+        "context_window": 200000,
+        "relative_speed_rating": 5,
+        "reasoning": true,
+        "provider": "Z.ai (Zhipu AI)",
+        "release_date": "2026-04-07",
+        "license": "MIT"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16000,
+        "temperature": {
+          "min": 0,
+          "max": 1,
+          "recommended": 0.6,
+          "rationale": "Z.ai benchmarks use temperature=0.6 for standard agentic coding evaluations. Lower to 0.0–0.2 for deterministic structured output or JSON extraction. For maximum reasoning depth on SWE-Bench Pro-class tasks, allow temperature up to 1.0 to enable broader hypothesis exploration. The model supports up to 128K output tokens — use max_tokens judiciously to avoid excessive verbosity costs."
+        },
+        "top_p": 0.9
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "#1 open-source model globally on SWE-Bench Pro at 58.4% as of April 2026 — surpassing GPT-5.4 (57.7), Claude Opus 4.6 (57.3), and Kimi K2.6 (in the Pro variant) — making it the definitive choice when real-world GitHub issue resolution quality is the primary benchmark.",
+          "8-hour sustained autonomous execution capability: purpose-built for long-horizon agentic tasks, capable of 655 autonomous iterations in a single run (demonstrated by building a functional Linux desktop from scratch) and a 6.9× vector database throughput optimization — a capability class no prior open-source model had demonstrated.",
+          "CyberGym score of 68.7% (first place among all models tested, ahead of Claude Opus 4.6 at 66.6%) makes it the only open-weight model competitive with closed-source frontier models on cybersecurity reasoning, threat detection, and vulnerability analysis workflows.",
+          "Unique GlmMoeDSA architecture combining Gated DeltaNet linear attention with standard attention layers and sparse MoE feed-forward networks — delivering stable long-horizon signal propagation and efficient inference across 78 layers with 40B active of 754B total parameters.",
+          "MIT license with FP8 quantized weights available on HuggingFace, #1 open-source model on LM Arena Text Leaderboard as of May 2026 with 11,000+ votes, and production API access via Z.ai and BigModel.cn at $0.98/$3.08 per million tokens (OpenRouter) — combining benchmark leadership with permissive licensing."
+        ],
+        "weaknesses": [
+          "SWE-Bench Pro and Terminal-Bench 2.0 leads are narrow: Claude Opus 4.6 leads on Terminal-Bench 2.0 composite (65.4 vs 63.5 at Terminus-2 standard), and the NL2Repo gap is substantial (Claude 49.8 vs GLM-5.1's 42.7), indicating GLM-5.1 is not a universal winner on the full agentic coding composite.",
+          "Pure reasoning ceiling: GPQA Diamond at 86.2% and HLE at 31.0% trail Gemini 3.1 Pro (94.3% GPQA), Claude Opus 4.6 (36.7% HLE), and GPT-5.4 (39.8% HLE) — making it a second choice for high-stakes scientific reasoning and broad knowledge tasks.",
+          "Text-only at GA: no multimodal input support in the current release. Teams building visual coding, document Q&A with images, or GUI automation pipelines cannot use GLM-5.1 as a unified model.",
+          "API pricing at $1.40/$4.40 per million tokens (median across providers per Artificial Analysis) is above the open-weight median ($0.59/$2.20), reflecting the model's strong performance positioning. Cost-sensitive pipelines should evaluate whether Kimi K2.5 or DeepSeek V4 Flash provide sufficient quality at lower cost.",
+          "Output throughput of ~52 t/s (median, Artificial Analysis) is below the 58 t/s open-weight median for comparable models, and the 128K maximum output capability — while powerful for long-horizon tasks — requires careful max_tokens budgeting to avoid unexpectedly large responses and costs."
+        ]
+      },
+      "management_summary": "Deploy glm-5.1 when SWE-Bench Pro performance, long-horizon autonomous execution, or cybersecurity reasoning quality is the primary selection criterion and open weights are required. Its #1 position on SWE-Bench Pro (58.4%), 8-hour autonomous task execution capability, and CyberGym leadership (68.7%) are benchmark results that no other open-weight model matches as of April 2026. The MIT license and FP8 weights make it deployable in regulated or air-gapped environments where proprietary API access is not permitted. Accept the text-only limitation and above-median API pricing as structural trade-offs. Prefer Kimi K2.6 for swarm-scale multi-agent orchestration (300 sub-agents vs GLM-5.1's single-agent architecture), DeepSeek V4 Flash for cost-optimized production coding, and Gemini 3.1 Pro or Claude Opus 4.6 when broad scientific reasoning depth or multimodal input is the primary requirement."
+    },
+    {
+      "model_name": "qwen3-coder-next",
+      "specifications": {
+        "context_window": 262144,
+        "relative_speed_rating": 9,
+        "reasoning": false,
+        "provider": "Alibaba Cloud (Qwen Team)",
+        "release_date": "2026-02-04",
+        "license": "Apache-2.0"
+      },
+      "optimal_configuration": {
+        "max_tokens": 8192,
+        "temperature": {
+          "min": 0,
+          "max": 0.6,
+          "recommended": 0.6,
+          "rationale": "Non-thinking mode only — no <think></think> chain-of-thought. Use 0.6 for agentic coding loops and multi-step tool use. Drop to 0.0–0.2 for fill-in-the-middle (FIM) code completion, diff-style patch generation, and strict JSON structured output. Avoid temperatures above 0.7 which increase hallucination rate on code tasks without quality benefit."
+        },
+        "top_p": 0.9
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "Highest efficiency-to-performance ratio of any agentic coding model: 3B active parameters from an 80B total MoE checkpoint achieves over 70% on SWE-Bench Verified — performance comparable to Claude Sonnet 4.5 — while running on a single RTX 5090 at Q4_K_M quantization, making frontier-class coding agents accessible to individual developers for the first time.",
+          "Trained on 800K executable tasks with environment interaction and reinforcement learning feedback — not static code-text pairs — giving it structural advantages over instruction-tuned models on recovery from execution failures, complex tool call sequences, and long-horizon multi-turn debugging.",
+          "Pareto-optimal on the efficiency-vs-performance frontier: Qwen3-Coder-Next (3B active) achieves SWE-Bench Pro performance comparable to models with 10–20× more active parameters, per the official technical report — making it the most compute-efficient entry point for agentic coding quality in the open-weight tier.",
+          "Native fill-in-the-middle (FIM) code completion in both chat-FIM and search-and-replace FIM formats, with a proxy server converting search-and-replace outputs to standard autocomplete-compatible format — enabling seamless integration with VSCode, Cursor, Zed, and other IDEs that expect standard completion API responses.",
+          "Out-of-the-box compatibility with Claude Code, Qwen Code, Cline, Kilo, Trae, and OpenCode scaffolds via standard tool-call parsing (qwen3_coder parser) — lower integration friction than models requiring custom prompt engineering for agent frameworks."
+        ],
+        "weaknesses": [
+          "Non-thinking mode only: the model has no chain-of-thought capability, making it structurally unsuitable for tasks requiring visible reasoning traces, multi-step mathematical derivation, graduate-level STEM reasoning, or compliance workflows that mandate an audit log of intermediate steps.",
+          "70% SWE-Bench Verified ceiling means it trails K2.6 (100% SWE-Bench relative gap), GLM-5.1, and V4-Pro on the hardest real-world software engineering tasks — for top-quartile agentic coding quality, larger active-parameter models are measurably better.",
+          "256K context window is the Pareto frontier for the model's scale, but teams with codebases or document corpora exceeding that limit must implement chunking or retrieval augmentation — unlike 1M-token models that can ingest an entire large monorepo in a single pass.",
+          "No multimodal input: text-only model. Design-to-code workflows requiring mockup-to-production-UI conversion, visual debugging, or image-based specification ingestion require a separate vision model in the pipeline.",
+          "Consumer hardware performance is real but bounded: Q4_K_M on a single RTX 5090 delivers 38–48 t/s, which may create latency bottlenecks in high-throughput production agent loops that need >100 t/s. Cloud inference via the Qwen API ($0.11–$0.12 input / $0.75–$0.80 output per million tokens) provides higher throughput but removes the zero-compute-cost local deployment advantage."
+        ]
+      },
+      "management_summary": "Deploy qwen3-coder-next when compute efficiency and local deployment feasibility are the primary constraints for agentic coding workloads. Its 3B active parameter MoE architecture achieves >70% SWE-Bench Verified on a single consumer GPU — a capability class that was cloud-only six months prior — making it the correct choice for individual developers, resource-constrained teams, and air-gapped environments where cloud API access is not possible or desirable. The 800K-task RL training on executable environments gives it structural robustness in multi-turn tool-use and failure recovery that instruction-tuned models at the same active parameter scale cannot match. Accept the non-thinking-only limitation as a fundamental constraint: this model is designed exclusively for fast, direct-response agentic coding and is not a substitute for reasoning models on STEM, math, or compliance workflows. For production at scale, evaluate the Qwen API as an alternative to local inference when throughput requirements exceed single-GPU capacity."
+    },
+    {
+      "model_name": "gemini-3-flash",
+      "specifications": {
+        "context_window": 1048576,
+        "relative_speed_rating": 8,
+        "reasoning": true,
+        "provider": "Google (DeepMind)",
+        "release_date": "2025-12-17",
+        "license": "Proprietary"
+      },
+      "optimal_configuration": {
+        "max_tokens": 16384,
+        "temperature": {
+          "min": 0,
+          "max": 1,
+          "recommended": 1,
+          "rationale": "Google's default temperature of 1.0 is well-calibrated for Gemini 3 Flash's internal sampling. Lower to 0.0–0.3 for strict JSON extraction or deterministic tool-calling loops. Keep at 1.0 for conversational, reasoning, and multimodal tasks where the model's own calibration outperforms manual tuning. Note: thinking_level (minimal/low/medium/high) is a more impactful lever than temperature for controlling cost and latency on this model."
+        },
+        "top_p": 0.95
+      },
+      "usage_guidelines": {
+        "strengths": [
+          "Frontier PhD-level reasoning at Flash latency: 90.4% GPQA Diamond and 35% on Humanity's Last Exam place it in the top tier of all models tested, while running 3× faster than Gemini 2.5 Pro — making it the strongest option when reasoning depth and response speed must coexist in the same deployment.",
+          "Granular thinking control via four levels (minimal, low, medium, high) lets agents and pipelines dial cost-latency-quality tradeoffs at the per-request level without switching models, and still uses 30% fewer tokens on average than Gemini 2.5 Pro across typical production traffic.",
+          "Full 1M-token context window (1,048,576 tokens) with automatic context caching, enabling ingestion of entire codebases, legal document corpora, or multi-hour transcripts in a single pass and reducing repeated-prompt cost significantly on agentic loops.",
+          "State-of-the-art agentic coding at 78% SWE-bench Verified — outperforming both Gemini 2.5 series models and Gemini 3 Pro on this benchmark — making it the primary choice for autonomous software engineering pipelines within the Gemini ecosystem.",
+          "Native five-modality input support (text, image, audio, video, PDF) via a unified architecture, reaching 81.2% on MMMU Pro, enabling mixed-media enterprise workflows — document Q&A, video analysis, audio transcription — without multi-model orchestration overhead.",
+          "Highest knowledge accuracy of any model in Artificial Analysis's AA-Omniscience benchmark, making it the strongest choice for knowledge-intensive retrieval-augmented generation pipelines where factual correctness on answered questions is the primary quality metric.",
+          "Competitive price point at $0.50/$3.00 per million input/output tokens — less than a quarter the cost of Gemini 3 Pro — with structured output, tool use, and thought signatures supported natively, making it the default recommendation for most Google-stack production deployments."
+        ],
+        "weaknesses": [
+          "Elevated hallucination rate: Artificial Analysis independently measured a 91% hallucination rate on AA-Omniscience (the model answers confidently rather than refusing when it should not know), which is 3 percentage points higher than both Gemini 2.5 Flash and Gemini 3 Pro. Any pipeline where refusal on uncertainty is safety-critical should add an explicit abstention layer or route uncertain queries to Gemini 3 Pro.",
+          "Severe long-context latency degradation: prompts exceeding 500,000 tokens extend time-to-first-token from 1–2 seconds to 8–12 seconds, eliminating the speed advantage that defines the Flash tier. Tasks genuinely requiring 500K+ token prompts should budget for this or chunk via retrieval.",
+          "Maximum output capped at 65,536 tokens, which rules out single-shot generation of book-length documents, large multi-file code scaffolding, or any structured output requiring very long completions.",
+          "Proprietary with no open weights: unsuitable for air-gapped deployments, regulated environments with data residency constraints outside Google Cloud regions, or organizations that require on-premises inference or model inspection.",
+          "Knowledge cutoff of January 2025 means it has no training signal for any event, library release, or API change from the past year and a half. Live search via Google-native grounding is the only mitigation for production use cases where recency is critical.",
+          "Still in Preview status at time of GA release tracking; the model ID (gemini-3-flash-preview) carries pre-GA terms of service on Vertex AI, introducing contractual and SLA considerations for compliance-sensitive enterprise production workloads."
+        ]
+      },
+      "management_summary": "Deploy gemini-3-flash as the default workhorse model for Google-stack production workloads that require frontier reasoning quality at interactive latency and moderate cost. Its 90.4% GPQA Diamond score and 78% SWE-bench Verified rate match or exceed models that cost 4–10× more, while its 3× speed advantage over Gemini 2.5 Pro and four-level thinking control make it uniquely flexible across both latency-sensitive and reasoning-heavy segments of the same agentic pipeline. The 1M-token context window with automatic caching gives it a structural edge in retrieval-augmented and long-document pipelines. Prefer Gemini 3 Pro when maximum reasoning depth or minimal hallucination rate is non-negotiable, particularly in compliance-sensitive or high-stakes domains — Flash's 91% hallucination rate on uncertain queries is materially higher than Pro's and requires compensating pipeline design. Prefer a smaller, cheaper model such as Gemini 3.1 Flash-Lite when tasks are classification, short extraction, or instruction-following at scale and reasoning depth is not required. Avoid gemini-3-flash for air-gapped or strict on-premises deployments given its proprietary closed-weights status, and plan for latency degradation when context payloads regularly exceed 500K tokens."
+    }
+  ]
+}

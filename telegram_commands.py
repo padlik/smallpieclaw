@@ -54,6 +54,8 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
         "  /jobs    — list scheduled jobs\n"
         "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
+        "  /mad_plan — Model Adaptive Planner (plan / list / execute)\n"
+        "  /agent   — return to standard agent mode\n"
         "  /pair    — pairing token management\n"
         "  /myid    — show your Telegram user ID\n",
         parse_mode=ParseMode.HTML,
@@ -126,6 +128,10 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         sched_state = "enabled" if iface.scheduler.enabled else "disabled"
         scheduler_line = f"\n📅 Scheduler: <code>{sched_state}</code> | {enabled}/{total} jobs active"
 
+    # Current agent mode
+    current_mode = getattr(iface, "_agent_mode", "agent")
+    mode_line = "\n🧠 Mode: <b>MadPlan</b>" if current_mode == "madplan" else ""
+
     # Current server time
     from datetime import datetime as _dt
     now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -141,6 +147,7 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
         f"{agents_line}"
         f"{scheduler_line}"
+        f"{mode_line}"
         f"{token_line}",
         parse_mode=ParseMode.HTML,
     )
@@ -744,19 +751,39 @@ async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         return
 
     models = iface.llm_client.list_models()
+
+    # Load capabilities for presence indicator (best-effort)
+    cap_model_names: set[str] = set()
+    try:
+        import os
+        from mad_plan import load_models_capabilities, validate_models_for_mad_plan
+        caps = load_models_capabilities(os.path.join(os.getcwd(), "data"))
+        if caps:
+            validation = validate_models_for_mad_plan(models, caps)
+            cap_model_names = {
+                e["model"] for e in validation["with_capabilities"]
+            }
+    except Exception:
+        pass
+
     lines = [f"🤖 <b>LLM Models</b> ({len(models)} configured)\n"]
     buttons = []
     for m in models:
-        icon = "✅" if m["active"] else "⬜"
+        active_icon = "✅" if m["active"] else "⬜"
         vision_tag = " 👁" if m.get("vision") else ""
+        cap_tag = " 📊" if m.get("model") in cap_model_names else ""
         lines.append(
-            f"{icon} <b>{html.escape(m['name'])}</b>: <code>{html.escape(m['model'])}</code>{vision_tag}"
+            f"{active_icon} <b>{html.escape(m['name'])}</b>: "
+            f"<code>{html.escape(m['model'])}</code>{vision_tag}{cap_tag}"
         )
         if not m["active"]:
             buttons.append([InlineKeyboardButton(
                 f"Switch to {m['name']}",
                 callback_data=f"model:{m['name']}",
             )])
+
+    if cap_model_names:
+        lines.append("\n<i>📊 = capabilities data available for MadPlan model selection</i>")
 
     keyboard = InlineKeyboardMarkup(buttons) if buttons else None
     await update.effective_message.reply_text(
@@ -921,3 +948,167 @@ async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: Conte
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)
     except Exception:
         pass
+
+
+async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /mad_plan [plan|list|execute] [plan_name] command."""
+    if not iface._is_authorized(update.effective_user.id):
+        await iface._send_unauthorized(update)
+        return
+
+    text = update.effective_message.text or ""
+    # Strip the command itself and parse args
+    parts = text.split(maxsplit=2)
+    subcommand = parts[1].lower() if len(parts) > 1 else ""
+    plan_name_arg = parts[2].strip() if len(parts) > 2 else ""
+
+    plans_dir = os.path.join(os.getcwd(), "plans")
+
+    if subcommand == "list":
+        from mad_plan import list_plans as _list_plans
+        names = _list_plans(plans_dir)
+        if not names:
+            await update.effective_message.reply_text(
+                "📋 <b>MadPlan — Saved Plans</b>\n\n<i>No plans found.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            lines = ["📋 <b>MadPlan — Saved Plans</b>\n"]
+            for name in names:
+                lines.append(f"  • <code>{html.escape(name)}</code>")
+            await update.effective_message.reply_text(
+                "\n".join(lines), parse_mode=ParseMode.HTML
+            )
+        return
+
+    if subcommand == "execute":
+        if not plan_name_arg:
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/mad_plan execute &lt;plan_name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        iface._agent_mode = "madplan"
+        from mad_plan import MadPlanOrchestrator, MadPlanError
+        try:
+            plan = MadPlanOrchestrator().load_plan(plan_name_arg, plans_dir)
+        except MadPlanError as exc:
+            await update.effective_message.reply_text(
+                f"❌ Could not load plan: {html.escape(str(exc))}", parse_mode=ParseMode.HTML
+            )
+            return
+        plan["_plan_name"] = plan_name_arg
+        iface._pending_plan = plan
+        await iface._run_mad_plan_execute(update, ctx, plan)
+        return
+
+    if subcommand in ("plan", ""):
+        # Switch to madplan mode; optional plan_name stored for the next message
+        iface._agent_mode = "madplan"
+        if plan_name_arg:
+            iface._pending_plan_name_override = plan_name_arg
+        else:
+            iface._pending_plan_name_override = ""
+
+        # Validate configured models against capabilities
+        validation_text = ""
+        try:
+            import os as _os
+            from mad_plan import load_models_capabilities, validate_models_for_mad_plan
+            caps = load_models_capabilities(_os.path.join(_os.getcwd(), "data"))
+            if caps and iface.llm_client and hasattr(iface.llm_client, "list_models"):
+                configured = iface.llm_client.list_models()
+                v = validate_models_for_mad_plan(configured, caps)
+                model_lines = ["\n\n📋 <b>Model readiness:</b>"]
+                for entry in v["available"]:
+                    icon = "✅" if entry["capabilities"] else "⚠️"
+                    model_lines.append(
+                        f"  {icon} <code>{html.escape(entry['model'])}</code> ({html.escape(entry['name'])})"
+                    )
+                if v["missing_capabilities"]:
+                    model_lines.append("<i>⚠️ = no capabilities data (model still usable)</i>")
+                validation_text = "\n".join(model_lines)
+        except Exception:
+            pass
+
+        await update.effective_message.reply_text(
+            "🧠 <b>MadPlan mode active</b>\n\n"
+            "Send your task description and I'll decompose it, select the best model "
+            "for each sub-task, and present a plan for your review."
+            + validation_text,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "❌ Unknown subcommand. Usage:\n"
+        "  <code>/mad_plan plan</code> — start planning\n"
+        "  <code>/mad_plan list</code> — list saved plans\n"
+        "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_agent(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Return to standard agent mode."""
+    if not iface._is_authorized(update.effective_user.id):
+        await iface._send_unauthorized(update)
+        return
+    iface._agent_mode = "agent"
+    iface._pending_plan = None
+    await update.effective_message.reply_text(
+        "🤖 <b>Agent mode active</b>\n<i>Standard execution restored.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle MadPlan plan review buttons: madplan_approve / madplan_reject / madplan_show."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception as exc:
+        logger.warning("cb_mad_plan_review query.answer() failed: %s", exc)
+
+    data = query.data
+
+    if data == "madplan_approve":
+        plan = iface._pending_plan
+        if not plan:
+            try:
+                await query.edit_message_text("❌ No active plan.", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            return
+        try:
+            await query.edit_message_text("⚙️ <b>Executing plan…</b>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await iface._run_mad_plan_execute(update, ctx, plan)
+
+    elif data == "madplan_reject":
+        iface._pending_plan = None
+        try:
+            await query.edit_message_text("❌ <b>Plan rejected.</b>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+    elif data == "madplan_show":
+        plan = iface._pending_plan
+        saved_path = plan.get("_saved_path") if plan else None
+        if saved_path and os.path.exists(saved_path):
+            try:
+                with open(saved_path, "rb") as fh:
+                    await query.message.reply_document(
+                        document=fh,
+                        filename=os.path.basename(saved_path),
+                    )
+            except Exception as exc:
+                await query.message.reply_text(
+                    f"❌ Could not send plan file: {html.escape(str(exc))}",
+                    parse_mode=ParseMode.HTML,
+                )
+        else:
+            await query.message.reply_text(
+                "❌ Plan file not found.", parse_mode=ParseMode.HTML
+            )

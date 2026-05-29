@@ -44,6 +44,7 @@ class ModelConfig:
     retry_delay: int = 2
     vision: bool = False
     reasoning: bool = False
+    aliases: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,7 @@ def _parse_model(entry: dict, index: int) -> ModelConfig:
         retry_delay=int(entry.get("retry_delay", 2)),
         vision=bool(entry.get("vision", False)),
         reasoning=bool(entry.get("reasoning", False)),
+        aliases=list(entry.get("aliases") or []),
     )
 
 
