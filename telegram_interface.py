@@ -689,14 +689,17 @@ class TelegramInterface:
         self,
         update: Update,
         ctx: ContextTypes.DEFAULT_TYPE,
-        plan: Optional[dict] = None,
     ) -> None:
-        """Execute a Regulator plan after user approval."""
-        if not plan:
+        """Execute the pending Regulator plan after user approval."""
+        if not self._pending_plan:
             await update.effective_message.reply_text(
-                "❌ No plan to execute.", parse_mode=ParseMode.HTML
+                "❌ No pending plan.", parse_mode=ParseMode.HTML
             )
             return
+
+        # Snapshot and clear immediately to prevent double-execution
+        plan = self._pending_plan
+        self._pending_plan = None
 
         status_msg = await update.effective_message.reply_text("⚙️ Executing plan…")
         loop = asyncio.get_running_loop()
