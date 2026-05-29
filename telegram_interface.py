@@ -21,7 +21,6 @@ from typing import Callable, Optional
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
-    AIORateLimiter,
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -111,7 +110,6 @@ class TelegramInterface:
         self._app = (
             Application.builder()
             .token(self.token)
-            .rate_limiter(AIORateLimiter())
             .concurrent_updates(True)  # allow callback queries while agent is running
             .post_init(self._post_init)
             .build()
