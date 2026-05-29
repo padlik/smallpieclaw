@@ -475,7 +475,6 @@ def _run(
         mcp_manager=mcp_manager,
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
-    tg.sub_agent_factory = sub_agent_factory  # wire for Regulator mode
 
     scheduler.start()
     try:
