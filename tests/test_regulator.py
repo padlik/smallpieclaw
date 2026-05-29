@@ -449,92 +449,43 @@ class TestParseDecomposition:
 
 
 # ---------------------------------------------------------------------------
-# RegulatorOrchestrator._parse_batch_model_selection
+# RegulatorOrchestrator._parse_model_selection
 # ---------------------------------------------------------------------------
 
-class TestParseBatchModelSelection:
+class TestParseModelSelection:
     def test_valid_selection(self):
-        raw = json.dumps({"selections": [{
-            "subtask_id": "t1",
+        raw = json.dumps({
             "model_name": "gpt-4o",
             "temperature": 0.3,
             "top_p": 0.9,
             "max_tokens": 1024,
             "rationale": "Best for this task.",
             "prompt": "Do the thing.",
-        }]})
+        })
         orch = RegulatorOrchestrator()
-        subtasks = [{"id": "t1", "name": "Task 1"}]
-        result = orch._parse_batch_model_selection(raw, subtasks)
-        assert result["t1"]["model_name"] == "gpt-4o"
-        assert result["t1"]["temperature"] == 0.3
-        assert result["t1"]["max_tokens"] == 1024
+        result = orch._parse_model_selection(raw)
+        assert result["model_name"] == "gpt-4o"
+        assert result["temperature"] == 0.3
+        assert result["max_tokens"] == 1024
 
     def test_string_numbers_coerced(self):
-        raw = json.dumps({"selections": [{
-            "subtask_id": "t1",
+        raw = json.dumps({
             "model_name": "m1",
             "temperature": "0.5",
             "top_p": "0.9",
             "max_tokens": "512",
             "rationale": "ok",
             "prompt": "p",
-        }]})
-        orch = RegulatorOrchestrator()
-        subtasks = [{"id": "t1", "name": "Task 1"}]
-        result = orch._parse_batch_model_selection(raw, subtasks)
-        assert result["t1"]["temperature"] == 0.5
-        assert result["t1"]["max_tokens"] == 512
-
-    def test_missing_optional_fields_return_none(self):
-        raw = json.dumps({"selections": [{
-            "subtask_id": "t1", "model_name": "m1", "rationale": "r", "prompt": "p"
-        }]})
-        orch = RegulatorOrchestrator()
-        subtasks = [{"id": "t1", "name": "Task 1"}]
-        result = orch._parse_batch_model_selection(raw, subtasks)
-        assert result["t1"]["temperature"] is None
-        assert result["t1"]["top_p"] is None
-        assert result["t1"]["max_tokens"] is None
-
-    def test_multiple_selections_parsed(self):
-        raw = json.dumps({"selections": [
-            {"subtask_id": "fetch_data", "model_name": "gpt-4o", "temperature": 0.2,
-             "top_p": 0.9, "max_tokens": 2048, "rationale": "r1", "prompt": "p1"},
-            {"subtask_id": "analyze_data", "model_name": "claude-3", "temperature": 0.7,
-             "top_p": 0.95, "max_tokens": 4096, "rationale": "r2", "prompt": "p2"},
-        ]})
-        orch = RegulatorOrchestrator()
-        subtasks = [{"id": "fetch_data", "name": "Fetch"}, {"id": "analyze_data", "name": "Analyze"}]
-        result = orch._parse_batch_model_selection(raw, subtasks)
-        assert len(result) == 2
-        assert result["fetch_data"]["model_name"] == "gpt-4o"
-        assert result["analyze_data"]["model_name"] == "claude-3"
-
-    def test_missing_subtask_id_fallback(self):
-        """Selections without matching subtask_id are assigned to unmatched subtasks in order."""
-        raw = json.dumps({"selections": [
-            {"subtask_id": "wrong_id", "model_name": "gpt-4o", "temperature": 0.3,
-             "top_p": 0.9, "max_tokens": 1024, "rationale": "r", "prompt": "p"},
-        ]})
-        orch = RegulatorOrchestrator()
-        subtasks = [{"id": "real_task", "name": "Real task"}]
-        result = orch._parse_batch_model_selection(raw, subtasks)
-        # Unmatched subtask gets the unassigned selection
-        assert result["real_task"]["model_name"] == "gpt-4o"
-
-    def test_single_object_fallback(self):
-        """If LLM returns a single object without 'selections' wrapper, still works."""
-        raw = json.dumps({
-            "subtask_id": "t1",
-            "model_name": "gpt-4o",
-            "temperature": 0.5,
-            "top_p": 0.9,
-            "max_tokens": 2000,
-            "rationale": "r",
-            "prompt": "p",
         })
         orch = RegulatorOrchestrator()
-        subtasks = [{"id": "t1", "name": "T"}]
-        result = orch._parse_batch_model_selection(raw, subtasks)
-        assert result["t1"]["model_name"] == "gpt-4o"
+        result = orch._parse_model_selection(raw)
+        assert result["temperature"] == 0.5
+        assert result["max_tokens"] == 512
+
+    def test_missing_optional_fields_return_none(self):
+        raw = json.dumps({"model_name": "m1", "rationale": "r", "prompt": "p"})
+        orch = RegulatorOrchestrator()
+        result = orch._parse_model_selection(raw)
+        assert result["temperature"] is None
+        assert result["top_p"] is None
+        assert result["max_tokens"] is None
