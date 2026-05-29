@@ -407,17 +407,12 @@ class RegulatorOrchestrator:
         created_at = plan.get("created_at", datetime.now(timezone.utc).isoformat())
         words = re.findall(r"[a-zA-Z0-9]+", task_text)[:5]
         slug = "_".join(w.lower() for w in words) if words else "plan"
-
-        # Guarantee a unique path: base slug → slug_timestamp → slug_timestamp_2 → …
-        candidate = os.path.join(plans_dir, f"{slug}.md")
-        if os.path.exists(candidate):
+        # Avoid overwriting: append timestamp suffix if file already exists
+        base = os.path.join(plans_dir, f"{slug}.md")
+        if os.path.exists(base):
             ts_suffix = re.sub(r"[^\d]", "", created_at[:19])
-            candidate = os.path.join(plans_dir, f"{slug}_{ts_suffix}.md")
-            counter = 2
-            while os.path.exists(candidate):
-                candidate = os.path.join(plans_dir, f"{slug}_{ts_suffix}_{counter}.md")
-                counter += 1
-        path = candidate
+            base = os.path.join(plans_dir, f"{slug}_{ts_suffix}.md")
+        path = base
 
         lines = [
             f"# Plan: {plan['task'][:80]}",
