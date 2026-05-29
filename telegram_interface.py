@@ -13,6 +13,7 @@ import base64
 import html
 import logging
 import os
+import re
 import time
 from functools import partial
 from typing import Callable, Optional
@@ -335,10 +336,20 @@ class TelegramInterface:
             if "✅" in msg and "**" in msg:
                 # result line e.g. "🖥️ **shell** ✅\n..."
                 first_line = msg.split("\n")[0]
-                return first_line.replace("**", "<b>", 1).replace("**", "</b>", 1)
+                m = re.search(r"\*\*(.+?)\*\*", first_line)
+                if m:
+                    icon_part = first_line[:first_line.index("**")]
+                    suffix = first_line[first_line.rindex("**") + 2:]
+                    return f"{icon_part}<b>{html.escape(m.group(1))}</b>{html.escape(suffix)}"
+                return html.escape(first_line)
             if "❌" in msg and "**" in msg:
                 first_line = msg.split("\n")[0]
-                return first_line.replace("**", "<b>", 1).replace("**", "</b>", 1)
+                m = re.search(r"\*\*(.+?)\*\*", first_line)
+                if m:
+                    icon_part = first_line[:first_line.index("**")]
+                    suffix = first_line[first_line.rindex("**") + 2:]
+                    return f"{icon_part}<b>{html.escape(m.group(1))}</b>{html.escape(suffix)}"
+                return html.escape(first_line)
             # Fallback: plain first line, truncated
             first_line = msg.split("\n")[0][:80]
             return html.escape(first_line)
@@ -425,13 +436,13 @@ class TelegramInterface:
                 None,
                 lambda: self.agent_handler(user.id, task_text, progress, images=images),
             )
-            _flush_panel(force=True)
+            await self._safe_edit_html(status_msg, _build_panel())
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
                 await self._send_safe(update.effective_message, chunk)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
-            _flush_panel(force=True)
+            await self._safe_edit_html(status_msg, _build_panel())
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
