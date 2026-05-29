@@ -46,37 +46,14 @@ class RegulatorExecutionError(RegulatorError):
 # ---------------------------------------------------------------------------
 
 _DECOMPOSE_SYSTEM = """\
-You are an expert task decomposition specialist.
+You are an expert task decomposition specialist. Break a complex user request into a \
+minimal set of atomic, non-overlapping sub-tasks that together fully satisfy the request.
 
-## Default behavior
-Execute the task as a SINGLE continuous flow unless decomposition is clearly justified. \
-Do not decompose unless the task contains multiple steps with FULLY INDEPENDENT contexts.
-
-## When to decompose
-Decompose a task ONLY when it contains multiple steps where each step can be executed \
-in isolation, producing a transferable artifact (file, dataset, message, report) that \
-the next step consumes as input — independent of any live session state.
-
-✅ Decompose when each step operates on portable, storable artifacts:
-  Download data → Analyze / Enrich → Summarize → Send email
-  Each step takes the previous step's OUTPUT (a file or dataset) as input, not its live state.
-
-❌ Do NOT decompose when steps share live session context:
-  Open website → Find items → Open form → Change value → Save
-  These steps share browser state, DOM navigation, and form context. Splitting them \
-  forces redundant re-entry into the same session and breaks the flow.
-
-## Decision rule
-Before splitting a step, ask: "Can step N independently process a batch of outputs \
-prepared by step N-1 earlier — without re-entering the same session or tool context?"
-  YES → candidate for decomposition
-  NO  → keep as a single atomic task; execute the whole flow sequentially
-
-## Rules for decomposed sub-tasks
+Rules:
 - Sub-tasks must be ATOMIC: each has a single, well-defined output.
 - Sub-tasks must be NON-OVERLAPPING: no two sub-tasks produce the same artifact.
-- Decomposition must be MINIMAL: batch small steps within a single sub-task; \
-  avoid spawning sub-tasks for trivial operations.
+- Decomposition must be MINIMAL: avoid spawning a sub-task for trivial operations; \
+  prefer batching small steps within a single task.
 - Mark dependencies: if sub-task B requires output from sub-task A, set depends_on=["A_id"].
 - Independent sub-tasks have depends_on=[].
 
@@ -93,14 +70,7 @@ Respond with a JSON object only (no markdown fences). Schema:
 }
 """
 
-_DECOMPOSE_USER_TMPL = """\
-Analyze the following task. First decide whether decomposition is warranted: \
-if the task is a sequential or session-bound workflow that cannot be meaningfully split \
-into independent steps with transferable outputs, return a single sub-task that covers \
-the full task. Otherwise decompose into minimal atomic sub-tasks.
-
-Task:
-{task}"""
+_DECOMPOSE_USER_TMPL = "Decompose the following task into atomic sub-tasks:\n\n{task}"
 
 _MODEL_SELECT_SYSTEM = """\
 You are an expert AI model selector. Your goal is to match a task to the most capable \
