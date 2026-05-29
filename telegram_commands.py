@@ -131,12 +131,6 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     from datetime import datetime as _dt
     now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    current_mode = getattr(iface, "_agent_mode", "agent")
-    mode_line = (
-        "\n🧠 Mode: <b>Regulator</b>" if current_mode == "regulator"
-        else "\n🤖 Mode: <b>Agent</b>"
-    )
-
     await update.effective_message.reply_text(
         f"✅ <b>Agent Status</b>\n\n"
         f"🕐 Time: <code>{now_str}</code>\n"
@@ -148,7 +142,6 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
         f"{agents_line}"
         f"{scheduler_line}"
-        f"{mode_line}"
         f"{token_line}",
         parse_mode=ParseMode.HTML,
     )
