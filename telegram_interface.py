@@ -648,19 +648,12 @@ class TelegramInterface:
         status_msg = await update.effective_message.reply_text("🧠 Planning…")
         loop = asyncio.get_running_loop()
 
-        # Get configured models for constrained selection
-        configured_models = []
-        if hasattr(self.llm_client, "list_models"):
-            configured_models = self.llm_client.list_models()
-
         def _run_planning():
             from regulator import RegulatorOrchestrator, load_models_capabilities
             caps = load_models_capabilities(os.path.join(os.getcwd(), "data"))
-            return RegulatorOrchestrator().plan_task(
-                task_text, self.llm_client, caps,
-                configured_models=configured_models,
-                images=images,
-            )
+            if not caps:
+                raise ValueError("data/models_capabilities.json is missing or empty")
+            return RegulatorOrchestrator().plan_task(task_text, self.llm_client, caps)
 
         try:
             plan = await loop.run_in_executor(None, _run_planning)
@@ -697,12 +690,9 @@ class TelegramInterface:
             )
             return
 
-        # Snapshot and clear immediately to prevent double-execution
-        plan = self._pending_plan
-        self._pending_plan = None
-
         status_msg = await update.effective_message.reply_text("⚙️ Executing plan…")
         loop = asyncio.get_running_loop()
+        plan = self._pending_plan
 
         def _run_execution():
             from regulator import RegulatorOrchestrator
@@ -711,47 +701,31 @@ class TelegramInterface:
             )
 
         try:
-            results, failure = await loop.run_in_executor(None, _run_execution)
+            results = await loop.run_in_executor(None, _run_execution)
+            self._pending_plan = None
 
-            if failure is None:
-                # All sub-tasks completed successfully
-                lines = ["✅ <b>Plan completed</b>\n"]
-                for res in results:
-                    result_text = res.get("result", "")
-                    preview = html.escape(result_text[:300])
-                    ellipsis = "…" if len(result_text) > 300 else ""
-                    lines.append(
-                        f"<b>{html.escape(res['id'])}. {html.escape(res['name'])}</b>\n"
-                        f"  {preview}{ellipsis}\n"
-                    )
-                await status_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
-            else:
-                # Partial failure — show completed + failure info
-                lines = ["⚠️ <b>Plan partially completed</b>\n"]
-                for res in results:
-                    result_text = res.get("result", "")
-                    preview = html.escape(result_text[:200])
-                    ellipsis = "…" if len(result_text) > 200 else ""
-                    lines.append(
-                        f"✅ <b>{html.escape(res['id'])}. {html.escape(res['name'])}</b>\n"
-                        f"  {preview}{ellipsis}\n"
-                    )
+            lines = ["✅ <b>Plan completed</b>\n"]
+            for res in results:
+                result_text = res.get("result", "")
+                preview = html.escape(result_text[:300])
+                ellipsis = "…" if len(result_text) > 300 else ""
                 lines.append(
-                    f"\n❌ <b>Failed: {html.escape(failure['subtask_id'])}</b>\n"
-                    f"Model: <code>{html.escape(failure['model_name'])}</code>\n"
-                    f"Error: {html.escape(failure['error'][:300])}"
+                    f"<b>{html.escape(res['id'])}. {html.escape(res['name'])}</b>\n"
+                    f"  {preview}{ellipsis}\n"
                 )
-                if failure["remaining"]:
-                    lines.append(
-                        f"\n⏸ Remaining: {', '.join(html.escape(r) for r in failure['remaining'])}"
-                    )
-                await status_msg.edit_text(
-                    "\n".join(lines), parse_mode=ParseMode.HTML
-                )
+            await status_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
         except Exception as exc:
             logger.exception("Regulator execution error")
-            msg = f"❌ Execution failed: {html.escape(str(exc))}"
+            from regulator import RegulatorExecutionError
+            if isinstance(exc, RegulatorExecutionError):
+                msg = (
+                    f"❌ <b>Sub-task '{html.escape(exc.subtask_id)}' failed</b>\n"
+                    f"Model: <code>{html.escape(exc.model_name)}</code>\n"
+                    f"Error: {html.escape(str(exc.cause))}"
+                )
+            else:
+                msg = f"❌ Execution failed: {html.escape(str(exc))}"
             await status_msg.edit_text(msg, parse_mode=ParseMode.HTML)
 
 

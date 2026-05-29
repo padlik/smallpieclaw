@@ -745,32 +745,19 @@ async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         return
 
     models = iface.llm_client.list_models()
-
-    # Check capabilities presence
-    import os
-    from regulator import load_models_capabilities, validate_models_for_regulator
-    caps = load_models_capabilities(os.path.join(os.getcwd(), "data"))
-    validation = validate_models_for_regulator(models, caps)
-    caps_set = {e["model"] for e in validation["with_capabilities"]}
-
     lines = [f"🤖 <b>LLM Models</b> ({len(models)} configured)\n"]
     buttons = []
     for m in models:
         icon = "✅" if m["active"] else "⬜"
         vision_tag = " 👁" if m.get("vision") else ""
-        caps_tag = " 📊" if m.get("model", "") in caps_set else ""
         lines.append(
-            f"{icon} <b>{html.escape(m['name'])}</b>: "
-            f"<code>{html.escape(m['model'])}</code>{vision_tag}{caps_tag}"
+            f"{icon} <b>{html.escape(m['name'])}</b>: <code>{html.escape(m['model'])}</code>{vision_tag}"
         )
         if not m["active"]:
             buttons.append([InlineKeyboardButton(
                 f"Switch to {m['name']}",
                 callback_data=f"model:{m['name']}",
             )])
-
-    if caps_set:
-        lines.append("\n<i>📊 = capabilities data available</i>")
 
     keyboard = InlineKeyboardMarkup(buttons) if buttons else None
     await update.effective_message.reply_text(
@@ -967,22 +954,6 @@ async def cb_mode_switch(iface: "TelegramInterface", update: Update, ctx: Contex
         f"{icon} Switched to <b>{name} mode</b>.\n"
         f"<i>Takes effect from your next message.</i>"
     )
-
-    # When entering Regulator mode, validate configured models against capabilities
-    if new_mode == "regulator" and iface.llm_client and hasattr(iface.llm_client, "list_models"):
-        import os
-        from regulator import load_models_capabilities, validate_models_for_regulator
-        caps = load_models_capabilities(os.path.join(os.getcwd(), "data"))
-        configured = iface.llm_client.list_models()
-        validation = validate_models_for_regulator(configured, caps)
-        lines = ["\n\n📋 <b>Model readiness:</b>"]
-        for entry in validation["available"]:
-            has_caps = "✅" if entry["capabilities"] else "⚠️"
-            lines.append(f"  {has_caps} <code>{html.escape(entry['model'])}</code> ({entry['name']})")
-        if validation["missing_capabilities"]:
-            lines.append("<i>⚠️ = no capabilities data (model still usable)</i>")
-        text += "\n".join(lines)
-
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)
     except Exception:
@@ -1025,7 +996,6 @@ async def cb_regulator_plan(iface: "TelegramInterface", update: Update, ctx: Con
             from regulator import RegulatorOrchestrator
             orch = RegulatorOrchestrator()
             path = orch.save_plan(iface._pending_plan, plans_dir)
-            iface._pending_plan = None
             filename = os.path.basename(path)
             text = f"💾 Plan saved to <code>{html.escape(filename)}</code>."
         except Exception as exc:
