@@ -28,6 +28,25 @@ from prompt_builder import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
 
+_TOOL_ICONS: dict[str, str] = {
+    "shell":            "🖥️",
+    "file_read":        "📄",
+    "file_write":       "✏️",
+    "file_append":      "✏️",
+    "spawn_agent":      "🤖",
+    "get_agent_result": "🤖",
+    "memory_write":     "🧠",
+    "memory_read":      "🧠",
+    "web_fetch":        "🌐",
+    "http_request":     "🌐",
+    "vision_query":     "👁️",
+}
+_DEFAULT_TOOL_ICON = "🔧"
+
+
+def _tool_icon(name: str) -> str:
+    return _TOOL_ICONS.get(name, _DEFAULT_TOOL_ICON)
+
 
 # ---------------------------------------------------------------------------
 # Context object — bundles all dependencies for the loop
@@ -191,13 +210,13 @@ def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
             preview = "\n".join(lines[:8])
             if len(lines) > 8 or len(preview) > 400:
                 preview = preview[:400] + "\n…"
-            return f"🔧 **{tool_name}** ✅\n{call}\n```\n{preview}\n```"
-        return f"🔧 **{tool_name}** ✅\n{call}\n_(no output)_"
+            return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n```\n{preview}\n```"
+        return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n_(no output)_"
     else:
         err = (outcome.get("error") or outcome.get("output") or "failed").strip()
         if len(err) > 300:
             err = err[:297] + "…"
-        return f"🔧 **{tool_name}** ❌\n{call}\n```\n{err}\n```"
+        return f"{_tool_icon(tool_name)} **{tool_name}** ❌\n{call}\n```\n{err}\n```"
 
 
 def format_tool_result(tool_name: str, outcome: dict) -> str:
@@ -536,7 +555,7 @@ def _dispatch_tool(
     if isinstance(args, list):
         args = {str(i): v for i, v in enumerate(args)}
 
-    _progress(f"🔧 Running tool: `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
+    _progress(f"{_tool_icon(tool_name)} Running tool: `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
 
     # vision_query handled directly (needs LLM access)
     if tool_name == "vision_query":
