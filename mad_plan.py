@@ -56,7 +56,7 @@ MINIMUM number of sub-tasks needed — never more.
 ## Default behavior
 Execute the task as a SINGLE continuous flow unless decomposition is clearly justified.
 A single sub-task is correct when all steps share session state, or when the agent's \
-available capabilities can handle the full task in one run.
+available capabilities can handle the full task in one run WITH HIGH CONFIDENCE.
 
 ## Agent capabilities
 The agent executing each sub-task has the following capabilities available natively. \
@@ -74,9 +74,16 @@ Decompose ONLY when the task contains multiple steps where each step:
   Download data → Enrich → Summarize → Send email
   Each step takes the previous step's OUTPUT (a file or dataset), not its live state.
 
+✅ Also decompose when the task involves UNCERTAINTY that requires research first:
+  - The correct approach, command, or method is unknown or may fail
+  - The task has constraints (e.g. "without root", "read-only", "on a specific OS")
+    that require checking alternatives before executing
+  - Multiple approaches exist and the best one depends on the environment
+  Pattern: "research/explore available options" → "execute the best option found"
+
 ❌ Do NOT decompose when:
 - Steps share live session context (browser, terminal session, API auth, open file handle).
-- The entire task fits within a single sub-agent run using the listed capabilities above.
+- The task is clear and the approach is known to work without requiring research.
 - Splitting only adds overhead without isolating genuinely independent work.
 
 ## Decision rule
@@ -84,6 +91,10 @@ Before splitting a step, ask: "Can step N independently process outputs prepared
 step N-1 earlier — without re-entering the same session or tool context?"
   YES → candidate for decomposition
   NO  → keep as a single atomic task
+
+For uncertain tasks, also ask: "Does the executing agent need to discover what approach \
+will work before it can execute?" If YES, split into a research sub-task followed by \
+an execution sub-task that receives the research findings.
 
 ## Rules for sub-tasks
 - ATOMIC: each has a single, well-defined output.
@@ -109,10 +120,12 @@ Respond with a JSON object only (no markdown fences). Schema:
 """
 
 _DECOMPOSE_USER_TMPL = """\
-Analyze the following task. First decide whether decomposition is warranted: \
-if the task is a sequential or session-bound workflow, or can be completed by the \
-agent in a single run using its available capabilities, return a SINGLE sub-task \
-that covers the full task. Otherwise decompose into minimal atomic sub-tasks.
+Analyze the following task. Consider:
+1. Is the approach clear and known to succeed? → single sub-task covering the full task.
+2. Does the task involve uncertainty (unknown system state, commands that may fail, \
+   constraints like "without root", platform differences)? → decompose into \
+   "research/explore options" first, then "execute with findings".
+3. Are there genuinely independent phases producing separate artifacts? → decompose minimally.
 
 Task:
 {task}"""
@@ -135,8 +148,16 @@ For EACH sub-task in the request:
    If capabilities data is available, ground your selection in specific evidence. \
    If no capabilities data exists, select based on model name, provider, and general knowledge.
 3. Set `temperature`, `top_p`, and `max_tokens` appropriate for the task type.
-4. Write a complete, self-contained execution prompt that includes all context the model \
-   needs and specifies the exact expected output format.
+4. Write a complete, self-contained execution prompt that includes:
+   - All context the model needs (no follow-up questions)
+   - The exact expected output format
+   - For tasks involving system commands or uncertain operations: list multiple approaches \
+     in priority order and instruct the agent to try them sequentially, reporting which \
+     succeeded and why others were skipped (permissions, not found, etc.)
+   - For research/exploration sub-tasks: instruct the agent to enumerate ALL viable \
+     approaches, test each one, and produce a structured report of findings (what worked, \
+     what didn't, and why) for use by downstream sub-tasks
+   - Tailoring to the model's known strengths and limitations
 
 ---
 
