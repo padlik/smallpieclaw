@@ -427,6 +427,12 @@ class MadPlanOrchestrator:
         except MadPlanError:
             logger.warning("MadPlan: could not parse strategy JSON, using empty strategy")
             data = {}
+        if not isinstance(data, dict):
+            logger.warning(
+                "MadPlan: strategy JSON was not an object (got %s), using empty strategy",
+                type(data).__name__,
+            )
+            data = {}
         required_keys = {
             "task_summary", "constraints", "primary_approach",
             "fallback_approaches", "discovery_needed", "execution_phases", "notes",
@@ -672,6 +678,12 @@ class MadPlanOrchestrator:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
 
+        strategy = plan.get("strategy")
+        if strategy:
+            strategy_path = os.path.join(plan_dir, "strategy.json")
+            with open(strategy_path, "w", encoding="utf-8") as fh:
+                json.dump(strategy, fh, indent=2, ensure_ascii=False)
+
         logger.info("MadPlan: plan saved to %s", path)
         return slug, path
 
@@ -745,8 +757,22 @@ class MadPlanOrchestrator:
         return {
             "task": task,
             "created_at": created_at,
+            "strategy": self._load_strategy(plan_name, plans_dir),
             "subtasks": subtasks,
         }
+
+    def _load_strategy(self, plan_name: str, plans_dir: str) -> dict:
+        """Load strategy.json for a plan; return empty-but-valid dict if absent."""
+        path = os.path.join(plans_dir, plan_name, "strategy.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("MadPlan: could not load strategy.json for '%s': %s", plan_name, exc)
+            return {}
 
     # ------------------------------------------------------------------
     # Execution

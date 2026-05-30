@@ -465,3 +465,142 @@ class TestExecutePlan:
         factory = self._make_factory({})
         MadPlanOrchestrator().execute_plan(self.PLAN, factory, notify_fn=notifications.append)
         assert any("step_one" in n for n in notifications)
+
+
+# ---------------------------------------------------------------------------
+# _parse_strategy
+# ---------------------------------------------------------------------------
+
+class TestParseStrategy:
+    def _orc(self):
+        return MadPlanOrchestrator()
+
+    def _valid_strategy(self):
+        return {
+            "task_summary": "Check firewall status without root",
+            "constraints": ["no sudo", "read-only access"],
+            "primary_approach": "Use systemctl status ufw",
+            "fallback_approaches": ["check /proc/net/ip_tables_names"],
+            "discovery_needed": ["which commands work without root"],
+            "execution_phases": [
+                {"phase": "explore", "goal": "Find working method", "depends_on_discovery": False, "can_run_independently": True},
+                {"phase": "report", "goal": "Output result", "depends_on_discovery": True, "can_run_independently": False},
+            ],
+            "notes": "iptables requires root",
+        }
+
+    def test_valid_strategy_parsed(self):
+        raw = json.dumps(self._valid_strategy())
+        result = self._orc()._parse_strategy(raw)
+        assert result["task_summary"] == "Check firewall status without root"
+        assert result["constraints"] == ["no sudo", "read-only access"]
+        assert len(result["execution_phases"]) == 2
+
+    def test_missing_keys_filled_with_defaults(self):
+        raw = json.dumps({"task_summary": "Do something"})
+        result = self._orc()._parse_strategy(raw)
+        assert result["task_summary"] == "Do something"
+        assert result["constraints"] == []
+        assert result["fallback_approaches"] == []
+        assert result["discovery_needed"] == []
+        assert result["execution_phases"] == []
+        assert result["primary_approach"] == ""
+        assert result["notes"] == ""
+
+    def test_non_dict_json_array_falls_back(self):
+        """LLM returns a JSON array instead of object — must not raise TypeError."""
+        raw = json.dumps([{"task_summary": "should be dict not list"}])
+        result = self._orc()._parse_strategy(raw)
+        assert isinstance(result, dict)
+        assert result["constraints"] == []
+
+    def test_null_json_falls_back(self):
+        """LLM returns JSON null — must not raise."""
+        result = self._orc()._parse_strategy("null")
+        assert isinstance(result, dict)
+        assert result["primary_approach"] == ""
+
+    def test_invalid_json_falls_back(self):
+        """Completely broken JSON — must return empty-but-valid dict."""
+        result = self._orc()._parse_strategy("not json at all {{{")
+        assert isinstance(result, dict)
+        assert result["notes"] == ""
+
+    def test_fenced_json_parsed(self):
+        raw = "```json\n" + json.dumps(self._valid_strategy()) + "\n```"
+        result = self._orc()._parse_strategy(raw)
+        assert result["task_summary"] == "Check firewall status without root"
+
+
+# ---------------------------------------------------------------------------
+# save_plan / load_plan — strategy round-trip
+# ---------------------------------------------------------------------------
+
+class TestSaveLoadPlanWithStrategy:
+    SAMPLE_PLAN_WITH_STRATEGY = {
+        "task": "Check ufw status without root",
+        "created_at": "2025-06-01T10:00:00+00:00",
+        "strategy": {
+            "task_summary": "Determine firewall state using non-root methods",
+            "constraints": ["no sudo", "Linux environment"],
+            "primary_approach": "Try systemctl status ufw first",
+            "fallback_approaches": ["check /proc/net/ip_tables_names", "use ss -tuln"],
+            "discovery_needed": ["which method is accessible without root"],
+            "execution_phases": [
+                {"phase": "explore", "goal": "Find accessible method", "depends_on_discovery": False, "can_run_independently": True},
+                {"phase": "report", "goal": "Output firewall state", "depends_on_discovery": True, "can_run_independently": False},
+            ],
+            "notes": "iptables -L always requires root",
+        },
+        "subtasks": [
+            {
+                "id": "explore_ufw_access",
+                "name": "Explore accessible methods",
+                "description": "Try all methods without root",
+                "model_name": "gpt-4",
+                "params": {"temperature": 0.1, "top_p": 0.9, "max_tokens": 2000},
+                "prompt": "Try these methods in order: ...",
+                "rationale": "Needs tool use.",
+                "depends_on": [],
+            },
+        ],
+    }
+
+    def test_strategy_survives_round_trip(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            slug, _ = orc.save_plan(self.SAMPLE_PLAN_WITH_STRATEGY, d)
+            loaded = orc.load_plan(slug, d)
+            assert loaded["strategy"]["task_summary"] == "Determine firewall state using non-root methods"
+            assert loaded["strategy"]["constraints"] == ["no sudo", "Linux environment"]
+            assert len(loaded["strategy"]["fallback_approaches"]) == 2
+            assert len(loaded["strategy"]["execution_phases"]) == 2
+
+    def test_strategy_json_file_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            slug, _ = orc.save_plan(self.SAMPLE_PLAN_WITH_STRATEGY, d)
+            strategy_path = os.path.join(d, slug, "strategy.json")
+            assert os.path.exists(strategy_path)
+            with open(strategy_path) as fh:
+                data = json.load(fh)
+            assert data["task_summary"] == "Determine firewall state using non-root methods"
+
+    def test_load_without_strategy_json_returns_empty_strategy(self):
+        """Plans saved before strategy feature have no strategy.json — load gracefully."""
+        plan_no_strategy = {
+            "task": "Old plan without strategy",
+            "created_at": "2025-01-01T00:00:00+00:00",
+            "subtasks": [],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            slug, _ = orc.save_plan(plan_no_strategy, d)
+            loaded = orc.load_plan(slug, d)
+            assert loaded["strategy"] == {}
+
+    def test_format_plan_html_shows_strategy(self):
+        orc = MadPlanOrchestrator()
+        html_out = orc.format_plan_html(self.SAMPLE_PLAN_WITH_STRATEGY)
+        assert "Try systemctl status ufw first" in html_out
+        assert "no sudo" in html_out
