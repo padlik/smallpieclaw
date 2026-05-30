@@ -249,6 +249,13 @@ You are an expert task planner. A MadPlan has already been prepared for a task. 
 The user has reviewed the plan and provided feedback. Your job is to incorporate \
 the feedback and produce a complete, revised plan.
 
+## Agent capabilities
+The agent executing each sub-task has the following capabilities available. \
+Use this to decide whether tasks require decomposition and to write accurate \
+execution prompts:
+
+{agent_capabilities}
+
 ## What you receive
 - The original task
 - The current execution strategy
@@ -557,9 +564,11 @@ class MadPlanOrchestrator:
         )
 
         logger.info("MadPlan: revising plan with user feedback (%d chars)", len(feedback))
+        caps_section = agent_capabilities or "No capability information available."
+        revise_system = _REVISE_SYSTEM.format(agent_capabilities=caps_section)
         raw = llm_client.chat(
             [{"role": "user", "content": user_msg}],
-            system=_REVISE_SYSTEM,
+            system=revise_system,
             json_mode=True,
         )
         revised = self._parse_revision(raw, plan, valid_model_ids, configured_models)
@@ -814,31 +823,42 @@ class MadPlanOrchestrator:
     # Save / Load / List
     # ------------------------------------------------------------------
 
-    def save_plan(self, plan: dict, plans_dir: str, overwrite: bool = False) -> tuple[str, str]:
+    def save_plan(
+        self,
+        plan: dict,
+        plans_dir: str,
+        overwrite: bool = False,
+        target_slug: str = "",
+    ) -> tuple[str, str]:
         """
         Save plan as Markdown to plans_dir/<plan_name>/plan.md.
 
-        The plan_name is derived from the task text (first ~5 words, slugified, max 50 chars).
+        The plan_name is derived from the task text (first ~5 words, slugified, max 50 chars),
+        unless target_slug is provided, in which case that directory is used directly.
         If overwrite=True and the directory already exists, the files are overwritten in place.
         Returns (plan_name, absolute_file_path).
         """
         task_text = plan.get("task", "plan")
         created_at = plan.get("created_at", datetime.now(timezone.utc).isoformat())
-        words = re.findall(r"[a-zA-Z0-9]+", task_text)[:5]
-        slug = "_".join(w.lower() for w in words)[:50] if words else "plan"
 
-        plan_dir = os.path.join(plans_dir, slug)
-        if os.path.exists(plan_dir) and not overwrite:
-            # Guarantee a unique directory name
-            ts_suffix = re.sub(r"[^\d]", "", created_at[:19])
-            slug = f"{slug}_{ts_suffix}"
+        if target_slug:
+            slug = target_slug
             plan_dir = os.path.join(plans_dir, slug)
-            counter = 2
-            while os.path.exists(plan_dir):
-                new_slug = f"{slug}_{counter}"
-                plan_dir = os.path.join(plans_dir, new_slug)
-                counter += 1
-            slug = os.path.basename(plan_dir)
+        else:
+            words = re.findall(r"[a-zA-Z0-9]+", task_text)[:5]
+            slug = "_".join(w.lower() for w in words)[:50] if words else "plan"
+            plan_dir = os.path.join(plans_dir, slug)
+            if os.path.exists(plan_dir) and not overwrite:
+                # Guarantee a unique directory name
+                ts_suffix = re.sub(r"[^\d]", "", created_at[:19])
+                slug = f"{slug}_{ts_suffix}"
+                plan_dir = os.path.join(plans_dir, slug)
+                counter = 2
+                while os.path.exists(plan_dir):
+                    new_slug = f"{slug}_{counter}"
+                    plan_dir = os.path.join(plans_dir, new_slug)
+                    counter += 1
+                slug = os.path.basename(plan_dir)
 
         os.makedirs(plan_dir, exist_ok=True)
         path = os.path.join(plan_dir, "plan.md")

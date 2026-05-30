@@ -725,9 +725,31 @@ class TestRevisePlan:
         for st in result["subtasks"]:
             assert st["model_name"] == "gpt-4"  # first configured model
 
+    def test_agent_capabilities_injected_into_system_prompt(self):
+        """agent_capabilities text must appear in the system prompt sent to the LLM."""
+        llm = self._make_llm(self._valid_revision())
+        orc = MadPlanOrchestrator()
+        caps = "TOOL: bash_execute — run shell commands\nSKILL: web_search — search the internet"
+        orc.revise_plan(
+            self.ORIGINAL_PLAN, "some feedback", llm, [], self.CONFIGURED_MODELS,
+            agent_capabilities=caps,
+        )
+        # The system prompt is passed as the `system` kwarg to llm.chat
+        call_kwargs = llm.chat.call_args
+        system_prompt = call_kwargs.kwargs.get("system") or call_kwargs[1].get("system", "")
+        assert "bash_execute" in system_prompt
+        assert "web_search" in system_prompt
+
+    def test_no_double_braces_in_revise_system_prompt(self):
+        """The _REVISE_SYSTEM prompt must not contain literal {{ after .format() call."""
+        from mad_plan import _REVISE_SYSTEM
+        formatted = _REVISE_SYSTEM.format(agent_capabilities="test-caps")
+        assert "{{" not in formatted
+        assert "}}" not in formatted
+
 
 class TestSavePlanOverwrite:
-    """Test save_plan overwrite=True behaviour."""
+    """Test save_plan overwrite=True and target_slug behaviours."""
 
     PLAN = {
         "task": "Check UFW status",
@@ -752,3 +774,30 @@ class TestSavePlanOverwrite:
             slug1, _ = orc.save_plan(self.PLAN, d)
             slug2, _ = orc.save_plan(self.PLAN, d)  # overwrite=False by default
             assert slug1 != slug2
+
+    def test_target_slug_writes_to_correct_directory(self):
+        """target_slug overrides task-derived slug — even if task text would produce a different name."""
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            # First save produces a timestamped slug because the base slug dir already exists
+            slug1, _ = orc.save_plan(self.PLAN, d)
+            # Simulate a revision using the original slug as target_slug
+            updated = dict(self.PLAN)
+            updated["task"] = "Check UFW status"
+            slug2, path2 = orc.save_plan(updated, d, target_slug=slug1)
+            assert slug2 == slug1
+            assert os.path.join(d, slug1, "plan.md") == path2
+
+    def test_target_slug_overrides_timestamped_slug(self):
+        """When original slug was timestamped, target_slug writes to that exact dir."""
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            # Force a timestamped slug by saving twice
+            slug1, _ = orc.save_plan(self.PLAN, d)
+            slug_ts, _ = orc.save_plan(self.PLAN, d)  # slug_ts will be timestamped
+            assert slug_ts != slug1
+            # Revise using slug_ts as target — must not accidentally use slug1
+            updated = dict(self.PLAN)
+            slug_rev, path_rev = orc.save_plan(updated, d, target_slug=slug_ts)
+            assert slug_rev == slug_ts
+            assert os.path.dirname(path_rev) == os.path.join(d, slug_ts)

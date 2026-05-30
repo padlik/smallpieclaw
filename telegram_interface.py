@@ -789,7 +789,7 @@ class TelegramInterface:
         images: Optional[list[str]] = None,
     ) -> None:
         """Revise the pending MadPlan plan using user feedback."""
-        from mad_plan import MadPlanOrchestrator, MadPlanError
+        from mad_plan import MadPlanOrchestrator, MadPlanError, build_agent_capabilities_summary
 
         original_plan = self._pending_plan
         if not original_plan:
@@ -802,6 +802,12 @@ class TelegramInterface:
 
         try:
             orchestrator = MadPlanOrchestrator()
+
+            capabilities = build_agent_capabilities_summary(
+                tool_registry=self.tool_registry,
+                skill_registry=self.skill_registry,
+                mcp_manager=self.mcp_manager,
+            )
 
             configured_models = []
             if self.llm_client and hasattr(self.llm_client, "list_models"):
@@ -824,14 +830,18 @@ class TelegramInterface:
                     self.llm_client,
                     caps_data,
                     configured_models=configured_models,
+                    agent_capabilities=capabilities,
                 ),
             )
 
-            # Overwrite the saved plan file (same plan_name) if one exists
+            # Save the revised plan, using the original plan_name as target_slug
+            # so the correct directory is always overwritten regardless of task text.
             plans_dir = os.path.join(os.getcwd(), "plans")
             plan_name = revised_plan.get("_plan_name", "")
             if plan_name:
-                _, saved_path = orchestrator.save_plan(revised_plan, plans_dir, overwrite=True)
+                _, saved_path = orchestrator.save_plan(
+                    revised_plan, plans_dir, target_slug=plan_name
+                )
                 revised_plan["_saved_path"] = saved_path
             else:
                 plan_name, saved_path = orchestrator.save_plan(revised_plan, plans_dir)
