@@ -310,7 +310,33 @@ class TelegramInterface:
     ) -> None:
         """Run the agent with a given task, showing streaming progress."""
         if self._agent_mode == "madplan":
-            if self._pending_plan is not None:
+            intent = await self._classify_madplan_intent(
+                task_text, has_pending_plan=self._pending_plan is not None
+            )
+            logger.info("MadPlan intent classified as: %s (pending=%s)", intent, self._pending_plan is not None)
+            if intent == "CONVERSATIONAL":
+                await update.effective_message.reply_text(
+                    "💬 Got it.\n\n💡 <i>Send me a task description to start planning, "
+                    "or use /mad_plan list to see saved plans.</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            if intent == "QUESTION":
+                # Route through standard agent (full react loop with tools),
+                # with a context prefix so the agent doesn't start planning.
+                prefixed = (
+                    "[CONTEXT: You are answering a question while in MadPlan mode. "
+                    "Answer concisely using available tools if needed. "
+                    "Do NOT start planning a task.]\n" + task_text
+                )
+                # Temporarily leave madplan mode so the standard path runs
+                self._agent_mode = "agent"
+                try:
+                    await self._run_agent_task(update, ctx, prefixed, images)
+                finally:
+                    self._agent_mode = "madplan"
+                return
+            if intent == "PLAN_FEEDBACK" and self._pending_plan is not None:
                 await self._run_mad_plan_revise(update, ctx, task_text, images)
             else:
                 await self._run_mad_plan_task(update, ctx, task_text, images)
@@ -700,6 +726,63 @@ class TelegramInterface:
                 asyncio.run(_send())
             except Exception as exc:
                 logger.error("send_html_to_users fallback failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # MadPlan intent classification
+    # ------------------------------------------------------------------
+
+    _MADPLAN_CLASSIFIER_SYSTEM = """\
+You are a routing classifier for a task-planning assistant. The user is in \
+MadPlan planning mode.
+
+Classify the intent of the user's message as exactly one of:
+- PLAN_TASK: the user is describing a new task they want planned (complex or \
+  simple, as long as it is an actionable request to do something)
+- PLAN_FEEDBACK: the user is giving feedback, corrections, or additional \
+  information about a plan that was already shown to them (only applicable \
+  when a plan is pending)
+- QUESTION: the user is asking a question about the bot, its capabilities, \
+  the current mode, available plans, or anything informational — not asking \
+  for a task to be planned
+- CONVERSATIONAL: the message is a short conversational response, \
+  acknowledgment, typo, or noise (e.g. "ok", "thanks", "wait", "never mind", \
+  single words, accidental messages)
+
+Rules:
+- If no plan is pending, PLAN_FEEDBACK is impossible — use PLAN_TASK instead.
+- Prefer QUESTION over PLAN_TASK when the message ends with "?" or starts \
+  with question words (what, how, why, is, are, can, do, does, will).
+- Prefer CONVERSATIONAL for messages under 4 words that are not clear tasks.
+- Return ONLY the label — no explanation, no punctuation."""
+
+    async def _classify_madplan_intent(self, text: str, has_pending_plan: bool) -> str:
+        """
+        Classify the user's intent in MadPlan mode via a single fast LLM call.
+
+        Returns one of: PLAN_TASK, PLAN_FEEDBACK, QUESTION, CONVERSATIONAL.
+        Falls back to PLAN_TASK (or PLAN_FEEDBACK if plan pending) on any error.
+        """
+        if not self.llm_client:
+            return "PLAN_FEEDBACK" if has_pending_plan else "PLAN_TASK"
+        context_flag = "yes" if has_pending_plan else "no"
+        user_msg = f"Pending plan: {context_flag}\nMessage: {text}"
+        try:
+            loop = asyncio.get_running_loop()
+            raw = await loop.run_in_executor(
+                None,
+                lambda: self.llm_client.chat(
+                    [{"role": "user", "content": user_msg}],
+                    system=self._MADPLAN_CLASSIFIER_SYSTEM,
+                ),
+            )
+            label = raw.strip().upper().split()[0] if raw.strip() else ""
+            if label in ("PLAN_TASK", "PLAN_FEEDBACK", "QUESTION", "CONVERSATIONAL"):
+                if label == "PLAN_FEEDBACK" and not has_pending_plan:
+                    return "PLAN_TASK"
+                return label
+        except Exception as exc:
+            logger.warning("MadPlan intent classification failed: %s", exc)
+        return "PLAN_FEEDBACK" if has_pending_plan else "PLAN_TASK"
 
     # ------------------------------------------------------------------
     # MadPlan execution
