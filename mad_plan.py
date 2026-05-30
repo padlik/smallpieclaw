@@ -244,6 +244,82 @@ Select the best model and write the execution prompt for each sub-task below:
 
 {subtasks_block}"""
 
+_REVISE_SYSTEM = """\
+You are an expert task planner. A MadPlan has already been prepared for a task. \
+The user has reviewed the plan and provided feedback. Your job is to incorporate \
+the feedback and produce a complete, revised plan.
+
+## What you receive
+- The original task
+- The current execution strategy
+- The current sub-tasks with their model selections and execution prompts
+- The user's feedback / additional information
+
+## What you produce
+A fully revised plan in a single JSON response. Update only what the feedback \
+requires — preserve unchanged sections as-is. The response must always include \
+all three sections even if unchanged.
+
+Respond with a JSON object only (no markdown fences):
+{{
+  "strategy": {{
+    "task_summary": "...",
+    "constraints": [...],
+    "primary_approach": "...",
+    "fallback_approaches": [...],
+    "discovery_needed": [...],
+    "execution_phases": [
+      {{"phase": "...", "goal": "...", "depends_on_discovery": true/false, "can_run_independently": true/false}}
+    ],
+    "notes": "..."
+  }},
+  "subtasks": [
+    {{
+      "id": "snake_case_verb_noun",
+      "name": "Short name",
+      "description": "What this sub-task produces",
+      "depends_on": []
+    }}
+  ],
+  "selections": [
+    {{
+      "subtask_id": "exact id from subtasks",
+      "model_name": "exact model field from configured models",
+      "temperature": <number>,
+      "top_p": <number>,
+      "max_tokens": <integer>,
+      "rationale": "2-4 sentences",
+      "prompt": "complete ready-to-use execution prompt"
+    }}
+  ]
+}}
+
+Rules for sub-task IDs: short verb-noun phrases in snake_case \
+(e.g. "fetch_invoice_data", "run_docker_probe"). Never use "t1", "t2", etc.
+"""
+
+_REVISE_USER_TMPL = """\
+Original task:
+{task}
+
+Current strategy:
+{strategy}
+
+Current sub-tasks and model selections:
+{subtasks_block}
+
+---
+
+User feedback / new information:
+{feedback}
+
+---
+
+Configured models (select ONLY from this list for model_name fields):
+{configured_models_json}
+
+Produce the revised plan incorporating the feedback above."""
+
 
 # ---------------------------------------------------------------------------
 # MadPlanOrchestrator
@@ -420,6 +496,153 @@ class MadPlanOrchestrator:
             "subtasks": enriched,
         }
 
+    def revise_plan(
+        self,
+        plan: dict,
+        feedback: str,
+        llm_client,
+        models_capabilities: list[dict],
+        configured_models: Optional[list[dict]] = None,
+        agent_capabilities: str = "",
+    ) -> dict:
+        """
+        Revise an existing plan using user feedback in a single LLM call.
+
+        The LLM receives the full current plan (strategy + subtasks with prompts)
+        and the user's feedback, then returns a revised strategy, subtask list,
+        and model selections all at once.
+
+        Returns a new plan dict with the same schema as plan_task(), preserving
+        any internal metadata keys (_plan_name, _saved_path) from the original.
+        """
+        configured_models = configured_models or []
+        cfg_summary = []
+        for m in configured_models:
+            entry = {
+                "model": m.get("model", ""),
+                "name": m.get("name", ""),
+                "provider": m.get("provider", ""),
+                "vision": m.get("vision", False),
+            }
+            if m.get("aliases"):
+                entry["aliases"] = m["aliases"]
+            cfg_summary.append(entry)
+
+        valid_model_ids = {m.get("model") for m in configured_models if m.get("model")}
+
+        current_strategy = json.dumps(plan.get("strategy", {}), indent=2)
+
+        subtasks_block_parts = []
+        for st in plan.get("subtasks", []):
+            dep_str = f" ← {', '.join(st['depends_on'])}" if st.get("depends_on") else ""
+            params = st.get("params", {})
+            param_str = ", ".join(
+                f"{k}={v}" for k, v in params.items() if v is not None
+            )
+            block = (
+                f"### {st['id']}: {st['name']}{dep_str}\n"
+                f"Description: {st['description']}\n"
+                f"Model: {st.get('model_name', 'N/A')} ({param_str})\n"
+                f"Prompt: {st.get('prompt', '')[:300]}"
+                + ("…" if len(st.get("prompt", "")) > 300 else "")
+            )
+            subtasks_block_parts.append(block)
+
+        user_msg = _REVISE_USER_TMPL.format(
+            task=plan.get("task", ""),
+            strategy=current_strategy,
+            subtasks_block="\n\n".join(subtasks_block_parts),
+            feedback=feedback,
+            configured_models_json=json.dumps(cfg_summary, indent=2),
+        )
+
+        logger.info("MadPlan: revising plan with user feedback (%d chars)", len(feedback))
+        raw = llm_client.chat(
+            [{"role": "user", "content": user_msg}],
+            system=_REVISE_SYSTEM,
+            json_mode=True,
+        )
+        revised = self._parse_revision(raw, plan, valid_model_ids, configured_models)
+
+        # Preserve internal metadata from the original plan
+        for key in ("_plan_name", "_saved_path"):
+            if key in plan:
+                revised[key] = plan[key]
+
+        return revised
+
+    def _parse_revision(
+        self,
+        raw: str,
+        original_plan: dict,
+        valid_model_ids: set,
+        configured_models: list[dict],
+    ) -> dict:
+        """Parse the combined revision JSON; fall back gracefully on partial failures."""
+        try:
+            data = _extract_json(raw)
+        except MadPlanError:
+            logger.warning("MadPlan: could not parse revision JSON, returning original plan")
+            return dict(original_plan)
+        if not isinstance(data, dict):
+            logger.warning("MadPlan: revision JSON was not an object, returning original plan")
+            return dict(original_plan)
+
+        strategy = self._parse_strategy(json.dumps(data.get("strategy", {})))
+
+        subtasks_raw = data.get("subtasks", [])
+        if isinstance(subtasks_raw, list) and subtasks_raw:
+            try:
+                subtasks = self._parse_decomposition(
+                    json.dumps({"subtasks": subtasks_raw})
+                )
+            except MadPlanError:
+                logger.warning("MadPlan: revision subtask parse failed, keeping original subtasks")
+                subtasks = original_plan.get("subtasks", [])
+        else:
+            subtasks = original_plan.get("subtasks", [])
+
+        selections_raw = data.get("selections", [])
+        if isinstance(selections_raw, list) and selections_raw:
+            selections = self._parse_batch_model_selection(
+                json.dumps({"selections": selections_raw}), subtasks
+            )
+        else:
+            selections = {}
+
+        enriched = []
+        for st in subtasks:
+            sel = selections.get(st["id"], {})
+            selected_model = sel.get("model_name", "")
+            if valid_model_ids and selected_model not in valid_model_ids:
+                logger.warning(
+                    "MadPlan revision: LLM selected '%s' for '%s' which is not configured, "
+                    "falling back to first configured model.",
+                    selected_model, st["id"],
+                )
+                selected_model = configured_models[0].get("model", "") if configured_models else ""
+            enriched.append({
+                "id": st["id"],
+                "name": st["name"],
+                "description": st["description"],
+                "model_name": selected_model,
+                "params": {
+                    "temperature": sel.get("temperature"),
+                    "top_p": sel.get("top_p"),
+                    "max_tokens": sel.get("max_tokens"),
+                },
+                "prompt": sel.get("prompt", st.get("description", "")),
+                "rationale": sel.get("rationale", ""),
+                "depends_on": st.get("depends_on", []),
+            })
+
+        return {
+            "task": original_plan.get("task", ""),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "strategy": strategy,
+            "subtasks": enriched,
+        }
+
     def _parse_strategy(self, raw: str) -> dict:
         """Parse strategy JSON; return empty-but-valid dict on failure."""
         try:
@@ -591,11 +814,12 @@ class MadPlanOrchestrator:
     # Save / Load / List
     # ------------------------------------------------------------------
 
-    def save_plan(self, plan: dict, plans_dir: str) -> tuple[str, str]:
+    def save_plan(self, plan: dict, plans_dir: str, overwrite: bool = False) -> tuple[str, str]:
         """
         Save plan as Markdown to plans_dir/<plan_name>/plan.md.
 
         The plan_name is derived from the task text (first ~5 words, slugified, max 50 chars).
+        If overwrite=True and the directory already exists, the files are overwritten in place.
         Returns (plan_name, absolute_file_path).
         """
         task_text = plan.get("task", "plan")
@@ -603,9 +827,9 @@ class MadPlanOrchestrator:
         words = re.findall(r"[a-zA-Z0-9]+", task_text)[:5]
         slug = "_".join(w.lower() for w in words)[:50] if words else "plan"
 
-        # Guarantee a unique directory name
         plan_dir = os.path.join(plans_dir, slug)
-        if os.path.exists(plan_dir):
+        if os.path.exists(plan_dir) and not overwrite:
+            # Guarantee a unique directory name
             ts_suffix = re.sub(r"[^\d]", "", created_at[:19])
             slug = f"{slug}_{ts_suffix}"
             plan_dir = os.path.join(plans_dir, slug)

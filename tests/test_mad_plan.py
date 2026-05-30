@@ -604,3 +604,151 @@ class TestSaveLoadPlanWithStrategy:
         html_out = orc.format_plan_html(self.SAMPLE_PLAN_WITH_STRATEGY)
         assert "Try systemctl status ufw first" in html_out
         assert "no sudo" in html_out
+
+
+# ---------------------------------------------------------------------------
+# revise_plan / _parse_revision
+# ---------------------------------------------------------------------------
+
+class TestRevisePlan:
+    """Tests for MadPlanOrchestrator.revise_plan() and _parse_revision()."""
+
+    ORIGINAL_PLAN = {
+        "task": "Write a tool to check UFW status without root",
+        "created_at": "2025-06-01T10:00:00+00:00",
+        "strategy": {
+            "task_summary": "Read UFW config files directly",
+            "constraints": ["no sudo"],
+            "primary_approach": "Parse /etc/ufw/ufw.conf",
+            "fallback_approaches": [],
+            "discovery_needed": [],
+            "execution_phases": [],
+            "notes": "",
+        },
+        "subtasks": [
+            {
+                "id": "read_ufw_config",
+                "name": "Read UFW config",
+                "description": "Parse /etc/ufw/ufw.conf",
+                "model_name": "gpt-4",
+                "params": {"temperature": 0.2, "top_p": 0.9, "max_tokens": 2000},
+                "prompt": "Read /etc/ufw/ufw.conf and report status.",
+                "rationale": "File parsing task.",
+                "depends_on": [],
+            },
+        ],
+    }
+
+    CONFIGURED_MODELS = [
+        {"model": "gpt-4", "name": "GPT-4", "provider": "openai"},
+        {"model": "claude-3", "name": "Claude 3", "provider": "anthropic"},
+    ]
+
+    def _make_llm(self, response: dict):
+        m = MagicMock()
+        m.chat.return_value = json.dumps(response)
+        m.list_models.return_value = self.CONFIGURED_MODELS
+        return m
+
+    def _valid_revision(self):
+        return {
+            "strategy": {
+                "task_summary": "Use Docker privileged container to query iptables",
+                "constraints": ["no sudo on host", "Docker must be available"],
+                "primary_approach": "Run privileged Docker container to execute iptables -L",
+                "fallback_approaches": ["Parse /etc/ufw/ufw.conf if Docker unavailable"],
+                "discovery_needed": ["docker daemon accessibility"],
+                "execution_phases": [
+                    {"phase": "explore_docker", "goal": "Verify Docker access", "depends_on_discovery": False, "can_run_independently": True},
+                    {"phase": "query_iptables", "goal": "Run iptables inside container", "depends_on_discovery": True, "can_run_independently": False},
+                ],
+                "notes": "Requires Docker socket access",
+            },
+            "subtasks": [
+                {"id": "explore_docker_access", "name": "Explore Docker access", "description": "Verify Docker is available and privileged mode works", "depends_on": []},
+                {"id": "query_ufw_via_docker", "name": "Query UFW via Docker", "description": "Run iptables -L inside privileged container", "depends_on": ["explore_docker_access"]},
+            ],
+            "selections": [
+                {"subtask_id": "explore_docker_access", "model_name": "gpt-4", "temperature": 0.1, "top_p": 0.9, "max_tokens": 1500, "rationale": "Tool use needed", "prompt": "Verify docker run --privileged works..."},
+                {"subtask_id": "query_ufw_via_docker", "model_name": "gpt-4", "temperature": 0.1, "top_p": 0.9, "max_tokens": 2000, "rationale": "Execution task", "prompt": "Run: docker run --rm --privileged ..."},
+            ],
+        }
+
+    def test_revision_updates_strategy(self):
+        llm = self._make_llm(self._valid_revision())
+        orc = MadPlanOrchestrator()
+        result = orc.revise_plan(self.ORIGINAL_PLAN, "What if I can use Docker in privileged mode", llm, [], self.CONFIGURED_MODELS)
+        assert "Docker" in result["strategy"]["primary_approach"]
+        assert result["strategy"]["task_summary"] != self.ORIGINAL_PLAN["strategy"]["task_summary"]
+
+    def test_revision_produces_new_subtasks(self):
+        llm = self._make_llm(self._valid_revision())
+        orc = MadPlanOrchestrator()
+        result = orc.revise_plan(self.ORIGINAL_PLAN, "use Docker privileged", llm, [], self.CONFIGURED_MODELS)
+        assert len(result["subtasks"]) == 2
+        ids = [st["id"] for st in result["subtasks"]]
+        assert "explore_docker_access" in ids
+        assert "query_ufw_via_docker" in ids
+
+    def test_revision_respects_dependencies(self):
+        llm = self._make_llm(self._valid_revision())
+        orc = MadPlanOrchestrator()
+        result = orc.revise_plan(self.ORIGINAL_PLAN, "use Docker privileged", llm, [], self.CONFIGURED_MODELS)
+        second = next(st for st in result["subtasks"] if st["id"] == "query_ufw_via_docker")
+        assert "explore_docker_access" in second["depends_on"]
+
+    def test_revision_preserves_metadata_keys(self):
+        plan_with_meta = dict(self.ORIGINAL_PLAN)
+        plan_with_meta["_plan_name"] = "write_a_tool_to"
+        plan_with_meta["_saved_path"] = "/tmp/plans/write_a_tool_to/plan.md"
+        llm = self._make_llm(self._valid_revision())
+        orc = MadPlanOrchestrator()
+        result = orc.revise_plan(plan_with_meta, "use Docker", llm, [], self.CONFIGURED_MODELS)
+        assert result["_plan_name"] == "write_a_tool_to"
+        assert result["_saved_path"] == "/tmp/plans/write_a_tool_to/plan.md"
+
+    def test_revision_invalid_json_returns_original(self):
+        llm = MagicMock()
+        llm.chat.return_value = "not json at all"
+        orc = MadPlanOrchestrator()
+        result = orc.revise_plan(self.ORIGINAL_PLAN, "some feedback", llm, [], self.CONFIGURED_MODELS)
+        assert result["task"] == self.ORIGINAL_PLAN["task"]
+        assert len(result["subtasks"]) == len(self.ORIGINAL_PLAN["subtasks"])
+
+    def test_revision_model_not_in_configured_falls_back(self):
+        revision = self._valid_revision()
+        revision["selections"][0]["model_name"] = "hallucinated-model-xyz"
+        revision["selections"][1]["model_name"] = "also-not-real"
+        llm = self._make_llm(revision)
+        orc = MadPlanOrchestrator()
+        result = orc.revise_plan(self.ORIGINAL_PLAN, "use Docker", llm, [], self.CONFIGURED_MODELS)
+        for st in result["subtasks"]:
+            assert st["model_name"] == "gpt-4"  # first configured model
+
+
+class TestSavePlanOverwrite:
+    """Test save_plan overwrite=True behaviour."""
+
+    PLAN = {
+        "task": "Check UFW status",
+        "created_at": "2025-06-01T10:00:00+00:00",
+        "subtasks": [],
+    }
+
+    def test_overwrite_replaces_existing(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            slug1, path1 = orc.save_plan(self.PLAN, d)
+            # Overwrite with updated plan
+            updated = dict(self.PLAN)
+            updated["task"] = "Check UFW status"  # same task → same slug
+            slug2, path2 = orc.save_plan(updated, d, overwrite=True)
+            assert slug1 == slug2
+            assert path1 == path2
+
+    def test_no_overwrite_creates_new_slug(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            slug1, _ = orc.save_plan(self.PLAN, d)
+            slug2, _ = orc.save_plan(self.PLAN, d)  # overwrite=False by default
+            assert slug1 != slug2

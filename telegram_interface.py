@@ -310,7 +310,10 @@ class TelegramInterface:
     ) -> None:
         """Run the agent with a given task, showing streaming progress."""
         if self._agent_mode == "madplan":
-            await self._run_mad_plan_task(update, ctx, task_text, images)
+            if self._pending_plan is not None:
+                await self._run_mad_plan_revise(update, ctx, task_text, images)
+            else:
+                await self._run_mad_plan_task(update, ctx, task_text, images)
             return
         user = update.effective_user
         status_msg = await update.effective_message.reply_text("🔄 Processing…")
@@ -777,6 +780,91 @@ class TelegramInterface:
         except Exception as exc:
             logger.exception("MadPlan planning failed")
             await self._safe_edit(status_msg, f"❌ Planning failed: {html.escape(str(exc))}")
+
+    async def _run_mad_plan_revise(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        feedback: str,
+        images: Optional[list[str]] = None,
+    ) -> None:
+        """Revise the pending MadPlan plan using user feedback."""
+        from mad_plan import MadPlanOrchestrator, MadPlanError
+
+        original_plan = self._pending_plan
+        if not original_plan:
+            await update.effective_message.reply_text(
+                "❌ No active plan to revise.", parse_mode=ParseMode.HTML
+            )
+            return
+
+        status_msg = await update.effective_message.reply_text("🔄 Revising plan…")
+
+        try:
+            orchestrator = MadPlanOrchestrator()
+
+            configured_models = []
+            if self.llm_client and hasattr(self.llm_client, "list_models"):
+                configured_models = self.llm_client.list_models()
+
+            from mad_plan import load_models_capabilities
+            caps_data = load_models_capabilities(os.path.join(os.getcwd(), "data"))
+
+            full_feedback = feedback
+            if images:
+                full_feedback += (
+                    f"\n\n[Note: {len(images)} image attachment(s) accompany this feedback.]"
+                )
+
+            revised_plan = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: orchestrator.revise_plan(
+                    original_plan,
+                    full_feedback,
+                    self.llm_client,
+                    caps_data,
+                    configured_models=configured_models,
+                ),
+            )
+
+            # Overwrite the saved plan file (same plan_name) if one exists
+            plans_dir = os.path.join(os.getcwd(), "plans")
+            plan_name = revised_plan.get("_plan_name", "")
+            if plan_name:
+                _, saved_path = orchestrator.save_plan(revised_plan, plans_dir, overwrite=True)
+                revised_plan["_saved_path"] = saved_path
+            else:
+                plan_name, saved_path = orchestrator.save_plan(revised_plan, plans_dir)
+                revised_plan["_plan_name"] = plan_name
+                revised_plan["_saved_path"] = saved_path
+
+            self._pending_plan = revised_plan
+
+            plan_html = orchestrator.format_plan_html(revised_plan)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data="madplan_approve"),
+                InlineKeyboardButton("❌ Reject",  callback_data="madplan_reject"),
+                InlineKeyboardButton("📋 Full plan", callback_data="madplan_show"),
+            ]])
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            for chunk in self._split_message(plan_html):
+                await update.effective_message.reply_text(
+                    chunk,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+                keyboard = None
+
+        except MadPlanError as exc:
+            await self._safe_edit(status_msg, f"❌ MadPlan error: {html.escape(str(exc))}")
+        except Exception as exc:
+            logger.exception("MadPlan revision failed")
+            await self._safe_edit(status_msg, f"❌ Revision failed: {html.escape(str(exc))}")
 
     async def _run_mad_plan_execute(
         self,

@@ -1088,8 +1088,12 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
 
     elif data == "madplan_reject":
         iface._pending_plan = None
+        iface._agent_mode = "agent"
         try:
-            await query.edit_message_text("❌ <b>Plan rejected.</b>", parse_mode=ParseMode.HTML)
+            await query.edit_message_text(
+                "❌ <b>Plan rejected.</b> Switched to agent mode.",
+                parse_mode=ParseMode.HTML,
+            )
         except Exception:
             pass
 
