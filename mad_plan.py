@@ -49,14 +49,68 @@ class MadPlanExecutionError(MadPlanError):
 # Prompt templates
 # ---------------------------------------------------------------------------
 
+_STRATEGY_SYSTEM = """\
+You are an expert task analyst and execution strategist. Your job is to deeply \
+understand a task before any execution begins — to think through HOW it should \
+be done, not just DO it.
+
+## Your role
+Given a task and the available agent capabilities, produce a concrete execution \
+strategy that answers:
+1. What exactly does this task require? (clarify ambiguity, identify the real goal)
+2. What constraints or unknowns could affect execution? \
+   (permissions, OS, API availability, data access, rate limits, etc.)
+3. What is the best primary approach — and why?
+4. What are the fallback approaches if the primary fails?
+5. What information needs to be DISCOVERED at runtime before the main work can proceed?
+6. What are the natural phases of work, and which can run independently vs. sequentially?
+
+## Available agent capabilities
+The agent that will execute sub-tasks has these capabilities:
+
+{agent_capabilities}
+
+## Output format
+Respond with a JSON object only (no markdown fences):
+{{
+  "task_summary": "One sentence restating the task in concrete terms",
+  "constraints": ["each constraint or unknown as a short phrase"],
+  "primary_approach": "Detailed description of the recommended execution strategy",
+  "fallback_approaches": ["fallback 1 if primary fails", "fallback 2", ...],
+  "discovery_needed": ["things the agent must discover at runtime before acting"],
+  "execution_phases": [
+    {{
+      "phase": "short name",
+      "goal": "what this phase produces or achieves",
+      "depends_on_discovery": true/false,
+      "can_run_independently": true/false
+    }}
+  ],
+  "notes": "any other important observations about executing this task"
+}}
+"""
+
+_STRATEGY_USER_TMPL = """\
+Analyze the following task and produce a complete execution strategy.
+
+Task:
+{task}"""
+
 _DECOMPOSE_SYSTEM = """\
 You are an expert task decomposition specialist. Your goal is to produce the \
 MINIMUM number of sub-tasks needed — never more.
 
+## Input
+You receive:
+1. The original user task
+2. An execution strategy already prepared by a task analyst — use it as your \
+   primary guide for decomposition decisions
+
 ## Default behavior
-Execute the task as a SINGLE continuous flow unless decomposition is clearly justified.
-A single sub-task is correct when all steps share session state, or when the agent's \
-available capabilities can handle the full task in one run WITH HIGH CONFIDENCE.
+Return a SINGLE sub-task covering the full task unless decomposition is clearly \
+justified by the execution strategy. A single sub-task is correct when:
+- All work shares the same execution context (terminal session, browser, open connection)
+- OR the strategy identifies no distinct independent phases
 
 ## Agent capabilities
 The agent executing each sub-task has the following capabilities available natively. \
@@ -65,36 +119,25 @@ Consider these when deciding whether to decompose:
 {agent_capabilities}
 
 ## When to decompose
-Decompose ONLY when the task contains multiple steps where each step:
-1. Can be executed in isolation, producing a transferable artifact (file, dataset, \
-   message, report) consumed by the next step.
-2. Does NOT share live session state (browser context, DOM, form state, open connections).
+Decompose when the execution strategy identifies phases where:
+1. A phase produces a portable artifact (file, dataset, report, findings) consumed \
+   by the next phase.
+2. The phase does NOT require shared live session state from another phase.
 
-✅ Decompose when each step operates on portable, storable artifacts:
-  Download data → Enrich → Summarize → Send email
-  Each step takes the previous step's OUTPUT (a file or dataset), not its live state.
-
-✅ Also decompose when the task involves UNCERTAINTY that requires research first:
-  - The correct approach, command, or method is unknown or may fail
-  - The task has constraints (e.g. "without root", "read-only", "on a specific OS")
-    that require checking alternatives before executing
-  - Multiple approaches exist and the best one depends on the environment
-  Pattern: "research/explore available options" → "execute the best option found"
+✅ Decompose following the strategy's execution_phases when phases are independent:
+  "Discover accessible methods" → "Execute using discovered method" → "Report results"
 
 ❌ Do NOT decompose when:
-- Steps share live session context (browser, terminal session, API auth, open file handle).
-- The task is clear and the approach is known to work without requiring research.
-- Splitting only adds overhead without isolating genuinely independent work.
+- Phases share a live session (browser, terminal, API auth, open file handle).
+- The strategy marks all phases as NOT independently runnable.
+- Splitting adds overhead without isolating genuinely separate work.
 
 ## Decision rule
-Before splitting a step, ask: "Can step N independently process outputs prepared by \
-step N-1 earlier — without re-entering the same session or tool context?"
-  YES → candidate for decomposition
-  NO  → keep as a single atomic task
-
-For uncertain tasks, also ask: "Does the executing agent need to discover what approach \
-will work before it can execute?" If YES, split into a research sub-task followed by \
-an execution sub-task that receives the research findings.
+Before splitting a step, ask: "Does the execution strategy identify this as a \
+separate phase with a distinct output?" AND "Can this phase independently process \
+a portable artifact from the previous phase?"
+  YES to both → split it
+  NO to either → keep as one task
 
 ## Rules for sub-tasks
 - ATOMIC: each has a single, well-defined output.
@@ -120,15 +163,15 @@ Respond with a JSON object only (no markdown fences). Schema:
 """
 
 _DECOMPOSE_USER_TMPL = """\
-Analyze the following task. Consider:
-1. Is the approach clear and known to succeed? → single sub-task covering the full task.
-2. Does the task involve uncertainty (unknown system state, commands that may fail, \
-   constraints like "without root", platform differences)? → decompose into \
-   "research/explore options" first, then "execute with findings".
-3. Are there genuinely independent phases producing separate artifacts? → decompose minimally.
-
 Task:
-{task}"""
+{task}
+
+Execution Strategy (use this to guide decomposition):
+{strategy}
+
+Decide: can this task be handled in a single sub-task, or does the strategy \
+identify distinct independent phases that should be split? Return the minimum \
+number of sub-tasks."""
 
 _MODEL_SELECT_SYSTEM = """\
 You are an expert AI model selector. For each sub-task provided, select the most capable \
@@ -149,15 +192,17 @@ For EACH sub-task in the request:
    If no capabilities data exists, select based on model name, provider, and general knowledge.
 3. Set `temperature`, `top_p`, and `max_tokens` appropriate for the task type.
 4. Write a complete, self-contained execution prompt that includes:
-   - All context the model needs (no follow-up questions)
-   - The exact expected output format
-   - For tasks involving system commands or uncertain operations: list multiple approaches \
-     in priority order and instruct the agent to try them sequentially, reporting which \
-     succeeded and why others were skipped (permissions, not found, etc.)
-   - For research/exploration sub-tasks: instruct the agent to enumerate ALL viable \
-     approaches, test each one, and produce a structured report of findings (what worked, \
-     what didn't, and why) for use by downstream sub-tasks
-   - Tailoring to the model's known strengths and limitations
+   - Embeds ALL relevant context from the execution strategy (constraints, fallbacks, \
+     discovery needs) so the agent does not need to re-derive the approach
+   - Specifies the exact expected output format
+   - For discovery/research sub-tasks: lists ALL approaches to try in priority order, \
+     instructs the agent to test each and produce a structured report of findings \
+     (what worked, what failed, why) for use by downstream sub-tasks
+   - For execution sub-tasks that depend on upstream results: explicitly describes \
+     how to interpret the upstream findings and which approach to use based on them
+   - For sub-tasks involving system commands or uncertain operations: lists multiple \
+     approaches in priority order with fallback instructions
+   - Is tailored to the model's known strengths and limitations
 
 ---
 
@@ -190,6 +235,11 @@ Return one entry per sub-task, in the same order as provided.
 """
 
 _MODEL_SELECT_USER_TMPL = """\
+Execution Strategy (background context for writing prompts):
+{strategy}
+
+---
+
 Select the best model and write the execution prompt for each sub-task below:
 
 {subtasks_block}"""
@@ -216,7 +266,12 @@ class MadPlanOrchestrator:
         images: Optional[list[str]] = None,
     ) -> dict:
         """
-        Decompose a task and select models for each sub-task.
+        Research, decompose, and assign models for a task.
+
+        Pipeline:
+          1. Strategy  – analyse the task: constraints, approach, fallbacks, phases
+          2. Decompose – split the plan into minimal independent sub-tasks
+          3. Select    – choose best model + write execution prompt per sub-task
 
         Args:
             task: the task description text
@@ -230,6 +285,7 @@ class MadPlanOrchestrator:
         {
           "task": str,
           "created_at": ISO-8601 timestamp,
+          "strategy": dict,          # Phase 1 output
           "subtasks": [
             {
               "id": str, "name": str, "description": str,
@@ -240,26 +296,45 @@ class MadPlanOrchestrator:
           ]
         }
         """
-        # Step 1: Decompose
-        decompose_task = task
+        caps_section = agent_capabilities or "No capability information available."
+
+        full_task = task
         if images:
-            decompose_task += (
+            full_task += (
                 f"\n\n[Note: {len(images)} image attachment(s) are available "
                 f"for sub-tasks that require visual analysis.]"
             )
 
-        caps_section = agent_capabilities or "No capability information available."
-        decompose_system = _DECOMPOSE_SYSTEM.format(agent_capabilities=caps_section)
+        # Step 1: Research & strategy
+        strategy_system = _STRATEGY_SYSTEM.format(agent_capabilities=caps_section)
+        logger.info("MadPlan: building execution strategy for task (%d chars)", len(task))
+        raw_strategy = llm_client.chat(
+            [{"role": "user", "content": _STRATEGY_USER_TMPL.format(task=full_task)}],
+            system=strategy_system,
+            json_mode=True,
+        )
+        strategy = self._parse_strategy(raw_strategy)
+        strategy_text = json.dumps(strategy, indent=2)
+        logger.info(
+            "MadPlan: strategy ready — %d constraint(s), %d phase(s)",
+            len(strategy.get("constraints", [])),
+            len(strategy.get("execution_phases", [])),
+        )
 
-        logger.info("MadPlan: decomposing task (%d chars)", len(task))
+        # Step 2: Decompose (guided by strategy)
+        decompose_system = _DECOMPOSE_SYSTEM.format(agent_capabilities=caps_section)
+        logger.info("MadPlan: decomposing task")
         raw_decomp = llm_client.chat(
-            [{"role": "user", "content": _DECOMPOSE_USER_TMPL.format(task=decompose_task)}],
+            [{"role": "user", "content": _DECOMPOSE_USER_TMPL.format(
+                task=full_task,
+                strategy=strategy_text,
+            )}],
             system=decompose_system,
             json_mode=True,
         )
         subtasks = self._parse_decomposition(raw_decomp)
 
-        # Step 2: Batch model selection
+        # Step 3: Batch model selection (informed by strategy)
         configured_models = configured_models or []
         cfg_summary = []
         for m in configured_models:
@@ -297,6 +372,7 @@ class MadPlanOrchestrator:
             subtask_blocks.append(block)
 
         user_msg = _MODEL_SELECT_USER_TMPL.format(
+            strategy=strategy_text,
             subtasks_block="\n\n".join(subtask_blocks),
         )
 
@@ -340,8 +416,28 @@ class MadPlanOrchestrator:
         return {
             "task": task,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "strategy": strategy,
             "subtasks": enriched,
         }
+
+    def _parse_strategy(self, raw: str) -> dict:
+        """Parse strategy JSON; return empty-but-valid dict on failure."""
+        try:
+            data = _extract_json(raw)
+        except MadPlanError:
+            logger.warning("MadPlan: could not parse strategy JSON, using empty strategy")
+            data = {}
+        required_keys = {
+            "task_summary", "constraints", "primary_approach",
+            "fallback_approaches", "discovery_needed", "execution_phases", "notes",
+        }
+        for key in required_keys:
+            if key not in data:
+                data[key] = [] if key in (
+                    "constraints", "fallback_approaches",
+                    "discovery_needed", "execution_phases",
+                ) else ""
+        return data
 
     def _parse_decomposition(self, raw: str) -> list[dict]:
         data = _extract_json(raw)
@@ -430,11 +526,27 @@ class MadPlanOrchestrator:
         task_preview = html.escape(plan["task"][:200])
         created = plan.get("created_at", "")[:19].replace("T", " ")
         subtasks = plan.get("subtasks", [])
+        strategy = plan.get("strategy", {})
 
         lines = [
             "🧠 <b>MadPlan</b>",
             f"<i>{task_preview}</i>",
             f"<code>{created} UTC</code>",
+        ]
+
+        if strategy.get("primary_approach"):
+            lines += [
+                "",
+                "<b>Strategy:</b>",
+                f"<i>{html.escape(strategy['primary_approach'][:300])}</i>",
+            ]
+            if strategy.get("constraints"):
+                constraints_str = " · ".join(
+                    html.escape(c) for c in strategy["constraints"][:4]
+                )
+                lines.append(f"⚠️ <i>{constraints_str}</i>")
+
+        lines += [
             "",
             f"<b>{len(subtasks)} sub-task(s):</b>",
         ]
@@ -510,9 +622,34 @@ class MadPlanOrchestrator:
             "## Created",
             created_at,
             "",
-            "## Sub-tasks",
-            "",
         ]
+
+        strategy = plan.get("strategy", {})
+        if strategy:
+            lines += [
+                "## Strategy",
+                "",
+            ]
+            if strategy.get("task_summary"):
+                lines += [f"**Summary:** {strategy['task_summary']}", ""]
+            if strategy.get("primary_approach"):
+                lines += [f"**Primary approach:** {strategy['primary_approach']}", ""]
+            if strategy.get("constraints"):
+                lines += ["**Constraints:**"]
+                lines += [f"- {c}" for c in strategy["constraints"]]
+                lines.append("")
+            if strategy.get("fallback_approaches"):
+                lines += ["**Fallbacks:**"]
+                lines += [f"- {f}" for f in strategy["fallback_approaches"]]
+                lines.append("")
+            if strategy.get("discovery_needed"):
+                lines += ["**Discovery needed:**"]
+                lines += [f"- {d}" for d in strategy["discovery_needed"]]
+                lines.append("")
+            if strategy.get("notes"):
+                lines += [f"**Notes:** {strategy['notes']}", ""]
+
+        lines += ["## Sub-tasks", ""]
 
         for i, st in enumerate(plan.get("subtasks", []), 1):
             params = st.get("params", {})
