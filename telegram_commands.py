@@ -54,7 +54,10 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
         "  /jobs    — list scheduled jobs\n"
         "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
-        "  /mad_plan — Model Adaptive Planner (plan / list / execute)\n"
+        "  /mad_plan — Model Adaptive Planner\n"
+        "      <code>/mad_plan</code> or <code>/mad_plan plan</code> — start planning a task\n"
+        "      <code>/mad_plan list</code>            — list saved plans\n"
+        "      <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
         "  /agent   — return to standard agent mode\n"
         "  /pair    — pairing token management\n"
         "  /myid    — show your Telegram user ID\n",
@@ -1033,8 +1036,14 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
 
         await update.effective_message.reply_text(
             "🧠 <b>MadPlan mode active</b>\n\n"
-            "Send your task description and I'll decompose it, select the best model "
-            "for each sub-task, and present a plan for your review."
+            "Send me a task description and I'll analyse it, decompose it into "
+            "sub-tasks, select the best model for each one, and present a plan "
+            "for your review before any execution begins.\n\n"
+            "<b>Available subcommands:</b>\n"
+            "  <code>/mad_plan list</code>            — list saved plans\n"
+            "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
+            "  <code>/agent</code>                    — return to standard agent mode\n\n"
+            "💡 <i>Just send your task to start planning.</i>"
             + validation_text,
             parse_mode=ParseMode.HTML,
         )

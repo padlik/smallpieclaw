@@ -74,6 +74,7 @@ The agent that will execute sub-tasks has these capabilities:
 Respond with a JSON object only (no markdown fences):
 {{
   "task_summary": "One sentence restating the task in concrete terms",
+  "short_name": "3-5 word snake_case slug for the plan directory, e.g. check_ufw_without_root or docker_iptables_probe (no generic words like task/write/check at the start — use the domain noun)",
   "constraints": ["each constraint or unknown as a short phrase"],
   "primary_approach": "Detailed description of the recommended execution strategy",
   "fallback_approaches": ["fallback 1 if primary fails", "fallback 2", ...],
@@ -271,6 +272,7 @@ Respond with a JSON object only (no markdown fences):
 {{
   "strategy": {{
     "task_summary": "...",
+    "short_name": "3-5 word snake_case slug, e.g. ufw_check_without_root (update if the approach changed significantly)",
     "constraints": [...],
     "primary_approach": "...",
     "fallback_approaches": [...],
@@ -666,7 +668,7 @@ class MadPlanOrchestrator:
             )
             data = {}
         required_keys = {
-            "task_summary", "constraints", "primary_approach",
+            "task_summary", "short_name", "constraints", "primary_approach",
             "fallback_approaches", "discovery_needed", "execution_phases", "notes",
         }
         for key in required_keys:
@@ -675,6 +677,9 @@ class MadPlanOrchestrator:
                     "constraints", "fallback_approaches",
                     "discovery_needed", "execution_phases",
                 ) else ""
+        # Normalise short_name: slugify whatever the LLM returned
+        if data.get("short_name"):
+            data["short_name"] = re.sub(r"[^\w]+", "_", str(data["short_name"]).lower()).strip("_")[:50]
         return data
 
     def _parse_decomposition(self, raw: str) -> list[dict]:
@@ -845,17 +850,23 @@ class MadPlanOrchestrator:
             slug = target_slug
             plan_dir = os.path.join(plans_dir, slug)
         else:
-            words = re.findall(r"[a-zA-Z0-9]+", task_text)[:5]
-            slug = "_".join(w.lower() for w in words)[:50] if words else "plan"
+            # Prefer the LLM-generated short_name from the strategy when available
+            short_name = plan.get("strategy", {}).get("short_name", "")
+            if short_name:
+                base_slug = re.sub(r"[^\w]+", "_", str(short_name).lower()).strip("_")[:50] or "plan"
+            else:
+                words = re.findall(r"[a-zA-Z0-9]+", task_text)[:5]
+                base_slug = "_".join(w.lower() for w in words)[:50] if words else "plan"
+            slug = base_slug
             plan_dir = os.path.join(plans_dir, slug)
             if os.path.exists(plan_dir) and not overwrite:
                 # Guarantee a unique directory name
                 ts_suffix = re.sub(r"[^\d]", "", created_at[:19])
-                slug = f"{slug}_{ts_suffix}"
+                slug = f"{base_slug}_{ts_suffix}"
                 plan_dir = os.path.join(plans_dir, slug)
                 counter = 2
                 while os.path.exists(plan_dir):
-                    new_slug = f"{slug}_{counter}"
+                    new_slug = f"{base_slug}_{ts_suffix}_{counter}"
                     plan_dir = os.path.join(plans_dir, new_slug)
                     counter += 1
                 slug = os.path.basename(plan_dir)

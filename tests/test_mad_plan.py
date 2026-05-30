@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from unittest.mock import MagicMock
 
@@ -801,3 +802,98 @@ class TestSavePlanOverwrite:
             slug_rev, path_rev = orc.save_plan(updated, d, target_slug=slug_ts)
             assert slug_rev == slug_ts
             assert os.path.dirname(path_rev) == os.path.join(d, slug_ts)
+
+
+class TestShortNamePlanNaming:
+    """Test that save_plan uses strategy.short_name when available."""
+
+    def test_short_name_used_as_slug(self):
+        plan = {
+            "task": "Write a tool that can check UFW status without root permissions",
+            "created_at": "2025-06-01T10:00:00+00:00",
+            "strategy": {"short_name": "ufw_check_without_root"},
+            "subtasks": [],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            slug, path = MadPlanOrchestrator().save_plan(plan, d)
+            assert slug == "ufw_check_without_root"
+            assert os.path.dirname(path) == os.path.join(d, "ufw_check_without_root")
+
+    def test_short_name_preferred_over_task_words(self):
+        """short_name beats 5-word task derivation."""
+        plan = {
+            "task": "task check ufw status in current environment",
+            "created_at": "2025-06-01T10:00:00+00:00",
+            "strategy": {"short_name": "ufw_status_probe"},
+            "subtasks": [],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            slug, _ = MadPlanOrchestrator().save_plan(plan, d)
+            assert slug == "ufw_status_probe"
+            assert "task_check_ufw" not in slug
+
+    def test_fallback_to_task_words_when_short_name_absent(self):
+        """No strategy → falls back to first-5-words derivation."""
+        plan = {
+            "task": "Check UFW status",
+            "created_at": "2025-06-01T10:00:00+00:00",
+            "subtasks": [],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            slug, _ = MadPlanOrchestrator().save_plan(plan, d)
+            assert slug == "check_ufw_status"
+
+    def test_fallback_to_task_words_when_short_name_empty(self):
+        """Empty short_name → falls back to first-5-words derivation."""
+        plan = {
+            "task": "Check UFW status",
+            "created_at": "2025-06-01T10:00:00+00:00",
+            "strategy": {"short_name": ""},
+            "subtasks": [],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            slug, _ = MadPlanOrchestrator().save_plan(plan, d)
+            assert slug == "check_ufw_status"
+
+    def test_short_name_slugified(self):
+        """short_name with spaces or special chars is slugified."""
+        plan = {
+            "task": "some task",
+            "created_at": "2025-06-01T10:00:00+00:00",
+            "strategy": {"short_name": "UFW Check — Without Root!"},
+            "subtasks": [],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            slug, _ = MadPlanOrchestrator().save_plan(plan, d)
+            assert re.match(r"^[a-z0-9_]+$", slug)
+            assert "ufw" in slug
+
+    def test_parse_strategy_adds_short_name_default(self):
+        """_parse_strategy must always return short_name key."""
+        raw = json.dumps({
+            "task_summary": "Check UFW",
+            "primary_approach": "Read config",
+            "constraints": [],
+            "fallback_approaches": [],
+            "discovery_needed": [],
+            "execution_phases": [],
+            "notes": "",
+        })
+        result = MadPlanOrchestrator()._parse_strategy(raw)
+        assert "short_name" in result
+        assert result["short_name"] == ""
+
+    def test_parse_strategy_preserves_short_name(self):
+        """short_name from LLM is preserved and slugified."""
+        raw = json.dumps({
+            "task_summary": "Check UFW",
+            "short_name": "UFW Status Probe",
+            "primary_approach": "Read config",
+            "constraints": [],
+            "fallback_approaches": [],
+            "discovery_needed": [],
+            "execution_phases": [],
+            "notes": "",
+        })
+        result = MadPlanOrchestrator()._parse_strategy(raw)
+        assert result["short_name"] == "ufw_status_probe"
