@@ -726,6 +726,34 @@ class TestRevisePlan:
         for st in result["subtasks"]:
             assert st["model_name"] == "gpt-4"  # first configured model
 
+    def test_partial_revision_preserves_original_model_and_prompt(self):
+        """When LLM returns subtasks but omits selections, original model/prompt must be kept."""
+        partial = self._valid_revision()
+        del partial["selections"]  # LLM omits selections
+        llm = self._make_llm(partial)
+        orc = MadPlanOrchestrator()
+        result = orc.revise_plan(self.ORIGINAL_PLAN, "some feedback", llm, [], self.CONFIGURED_MODELS)
+        # The original plan has one subtask "read_ufw_config" with gpt-4 and a known prompt
+        original_st = next((s for s in result["subtasks"] if s["id"] == "read_ufw_config"), None)
+        if original_st:
+            assert original_st["model_name"] == "gpt-4"
+            assert original_st["prompt"] == "Read /etc/ufw/ufw.conf and report status."
+
+    def test_partial_revision_no_none_params_for_preserved_subtasks(self):
+        """Preserved subtasks must keep original params, not get None for all fields."""
+        partial = self._valid_revision()
+        partial["subtasks"] = [
+            {"id": "read_ufw_config", "name": "Read UFW config",
+             "description": "Parse /etc/ufw/ufw.conf", "depends_on": []}
+        ]
+        del partial["selections"]
+        llm = self._make_llm(partial)
+        orc = MadPlanOrchestrator()
+        result = orc.revise_plan(self.ORIGINAL_PLAN, "keep existing", llm, [], self.CONFIGURED_MODELS)
+        st = result["subtasks"][0]
+        assert st["params"]["temperature"] == 0.2  # from ORIGINAL_PLAN
+        assert st["params"]["max_tokens"] == 2000
+
     def test_agent_capabilities_injected_into_system_prompt(self):
         """agent_capabilities text must appear in the system prompt sent to the LLM."""
         llm = self._make_llm(self._valid_revision())

@@ -749,6 +749,7 @@ class TelegramInterface:
             name_override = getattr(self, "_pending_plan_name_override", "")
             if name_override:
                 plan["task"] = f"{name_override} - {plan.get('task', '')}"
+                self._pending_plan_name_override = ""
             plan_name, saved_path = orchestrator.save_plan(plan, plans_dir)
             plan["_plan_name"] = plan_name
             plan["_saved_path"] = saved_path
@@ -898,13 +899,14 @@ class TelegramInterface:
 
         try:
             orchestrator = MadPlanOrchestrator()
-            output, failure = await asyncio.get_event_loop().run_in_executor(
+            loop = asyncio.get_running_loop()
+            output, failure = await loop.run_in_executor(
                 None,
                 lambda: orchestrator.execute_plan(
                     plan,
                     sub_agent_factory=self.sub_agent_factory,
                     notify_fn=lambda msg: asyncio.run_coroutine_threadsafe(
-                        _notify(msg), asyncio.get_event_loop()
+                        _notify(msg), loop
                     ),
                 ),
             )
@@ -923,6 +925,8 @@ class TelegramInterface:
         except Exception as exc:
             logger.exception("MadPlan execute failed")
             await self._safe_edit(status_msg, f"❌ Execution error: {html.escape(str(exc))}")
+        finally:
+            self._agent_mode = "agent"
 
 # ---------------------------------------------------------------------------
 # Module constants

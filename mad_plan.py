@@ -619,7 +619,18 @@ class MadPlanOrchestrator:
                 json.dumps({"selections": selections_raw}), subtasks
             )
         else:
-            selections = {}
+            # Partial response: preserve original model/prompt/params keyed by subtask id
+            selections = {
+                st["id"]: {
+                    "model_name": st.get("model_name", ""),
+                    "temperature": st.get("params", {}).get("temperature"),
+                    "top_p": st.get("params", {}).get("top_p"),
+                    "max_tokens": st.get("params", {}).get("max_tokens"),
+                    "prompt": st.get("prompt", ""),
+                    "rationale": st.get("rationale", ""),
+                }
+                for st in original_plan.get("subtasks", [])
+            }
 
         enriched = []
         for st in subtasks:
