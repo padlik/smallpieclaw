@@ -17,6 +17,7 @@ from mad_plan import (
     MadPlanError,
     MadPlanOrchestrator,
     build_agent_capabilities_summary,
+    delete_plan,
     list_plans,
     load_models_capabilities,
     validate_models_for_mad_plan,
@@ -925,3 +926,61 @@ class TestShortNamePlanNaming:
         })
         result = MadPlanOrchestrator()._parse_strategy(raw)
         assert result["short_name"] == "ufw_status_probe"
+
+
+class TestDeletePlan:
+    """Tests for delete_plan()."""
+
+    PLAN = {
+        "task": "Test plan for deletion",
+        "created_at": "2025-06-01T10:00:00+00:00",
+        "subtasks": [],
+    }
+
+    def _save_plan(self, d):
+        orc = MadPlanOrchestrator()
+        slug, _ = orc.save_plan(self.PLAN, d)
+        return slug
+
+    def test_delete_removes_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            slug = self._save_plan(d)
+            assert os.path.isdir(os.path.join(d, slug))
+            delete_plan(slug, d)
+            assert not os.path.exists(os.path.join(d, slug))
+
+    def test_delete_removes_from_list(self):
+        with tempfile.TemporaryDirectory() as d:
+            slug = self._save_plan(d)
+            assert slug in list_plans(d)
+            delete_plan(slug, d)
+            assert slug not in list_plans(d)
+
+    def test_delete_not_found_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(MadPlanError, match="not found"):
+                delete_plan("nonexistent_plan", d)
+
+    def test_delete_empty_name_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(MadPlanError, match="must not be empty"):
+                delete_plan("", d)
+
+    def test_delete_path_traversal_slash_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(MadPlanError, match="path-traversal"):
+                delete_plan("../some_plan", d)
+
+    def test_delete_path_traversal_dotdot_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(MadPlanError, match="path-traversal"):
+                delete_plan("valid..evil", d)
+
+    def test_delete_does_not_remove_dir_without_plan_md(self):
+        """Should not delete a directory that exists but has no plan.md."""
+        with tempfile.TemporaryDirectory() as d:
+            fake_dir = os.path.join(d, "not_a_plan")
+            os.makedirs(fake_dir)
+            with pytest.raises(MadPlanError, match="not found"):
+                delete_plan("not_a_plan", d)
+            assert os.path.isdir(fake_dir)

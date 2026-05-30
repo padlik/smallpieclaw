@@ -58,6 +58,7 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "      <code>/mad_plan</code> or <code>/mad_plan plan</code> — start planning a task\n"
         "      <code>/mad_plan list</code>            — list saved plans\n"
         "      <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
+        "      <code>/mad_plan delete &lt;name&gt;</code>  — delete a saved plan\n"
         "  /agent   — return to standard agent mode\n"
         "  /pair    — pairing token management\n"
         "  /myid    — show your Telegram user ID\n",
@@ -1005,6 +1006,36 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
         await iface._run_mad_plan_execute(update, ctx, plan)
         return
 
+    if subcommand == "delete":
+        if not plan_name_arg:
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/mad_plan delete &lt;plan_name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        from mad_plan import MadPlanError, list_plans as _list_plans
+        names = _list_plans(plans_dir)
+        if plan_name_arg not in names:
+            await update.effective_message.reply_text(
+                f"❌ Plan <code>{html.escape(plan_name_arg)}</code> not found.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🗑️ Yes, delete",
+                callback_data=f"madplan_delete_confirm:{plan_name_arg}",
+            ),
+            InlineKeyboardButton("↩️ Cancel", callback_data="madplan_delete_cancel"),
+        ]])
+        await update.effective_message.reply_text(
+            f"⚠️ Delete plan <code>{html.escape(plan_name_arg)}</code>? "
+            "This cannot be undone.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+
     if subcommand in ("plan", ""):
         # Switch to madplan mode; optional plan_name stored for the next message
         iface._agent_mode = "madplan"
@@ -1042,6 +1073,7 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
             "<b>Available subcommands:</b>\n"
             "  <code>/mad_plan list</code>            — list saved plans\n"
             "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
+            "  <code>/mad_plan delete &lt;name&gt;</code>  — delete a saved plan\n"
             "  <code>/agent</code>                    — return to standard agent mode\n\n"
             "💡 <i>Just send your task to start planning.</i>"
             + validation_text,
@@ -1053,7 +1085,8 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
         "❌ Unknown subcommand. Usage:\n"
         "  <code>/mad_plan plan</code> — start planning\n"
         "  <code>/mad_plan list</code> — list saved plans\n"
-        "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan",
+        "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
+        "  <code>/mad_plan delete &lt;name&gt;</code> — delete a saved plan",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1125,3 +1158,30 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
             await query.message.reply_text(
                 "❌ Plan file not found.", parse_mode=ParseMode.HTML
             )
+
+    elif data.startswith("madplan_delete_confirm:"):
+        plan_name = data.split(":", 1)[1]
+        plans_dir = os.path.join(os.getcwd(), "plans")
+        from mad_plan import delete_plan, MadPlanError
+        try:
+            delete_plan(plan_name, plans_dir)
+            try:
+                await query.edit_message_text(
+                    f"✅ Plan <code>{html.escape(plan_name)}</code> deleted.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+        except MadPlanError as exc:
+            try:
+                await query.edit_message_text(
+                    f"❌ {html.escape(str(exc))}", parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+
+    elif data == "madplan_delete_cancel":
+        try:
+            await query.edit_message_text("↩️ Deletion cancelled.", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass

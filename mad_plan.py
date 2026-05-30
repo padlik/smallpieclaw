@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -1140,6 +1141,24 @@ def list_plans(plans_dir: str) -> list[str]:
             names.append(entry)
     return names
 
+
+def delete_plan(plan_name: str, plans_dir: str) -> None:
+    """
+    Delete a saved plan directory.
+
+    Raises MadPlanError if the plan is not found or if plan_name contains
+    path-traversal characters (/, \\, ..).
+    """
+    if not plan_name:
+        raise MadPlanError("Plan name must not be empty.")
+    if any(c in plan_name for c in ("/", "\\", "..")):
+        raise MadPlanError(f"Invalid plan name: '{plan_name}' contains path-traversal characters.")
+    plan_dir = os.path.join(plans_dir, plan_name)
+    plan_file = os.path.join(plan_dir, "plan.md")
+    if not os.path.isdir(plan_dir) or not os.path.exists(plan_file):
+        raise MadPlanError(f"Plan '{plan_name}' not found.")
+    shutil.rmtree(plan_dir)
+    logger.info("MadPlan: deleted plan directory '%s'", plan_dir)
 
 def validate_models_for_mad_plan(
     configured_models: list[dict],
