@@ -992,7 +992,8 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
                 parse_mode=ParseMode.HTML,
             )
             return
-        iface._agent_mode = "madplan"
+        user_state = iface._get_user_state(update.effective_user.id)
+        user_state.agent_mode = "madplan"
         from mad_plan import MadPlanOrchestrator, MadPlanError
         try:
             plan = MadPlanOrchestrator().load_plan(plan_name_arg, plans_dir)
@@ -1002,7 +1003,7 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
             )
             return
         plan["_plan_name"] = plan_name_arg
-        iface._pending_plan = plan
+        user_state.pending_plan = plan
         await iface._run_mad_plan_execute(update, ctx, plan)
         return
 
@@ -1038,11 +1039,9 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
 
     if subcommand in ("plan", ""):
         # Switch to madplan mode; optional plan_name stored for the next message
-        iface._agent_mode = "madplan"
-        if plan_name_arg:
-            iface._pending_plan_name_override = plan_name_arg
-        else:
-            iface._pending_plan_name_override = ""
+        user_state = iface._get_user_state(update.effective_user.id)
+        user_state.agent_mode = "madplan"
+        user_state.pending_plan_name_override = plan_name_arg
 
         # Validate configured models against capabilities
         validation_text = ""
@@ -1096,8 +1095,9 @@ async def cmd_agent(iface: "TelegramInterface", update: Update, ctx: ContextType
     if not iface._is_authorized(update.effective_user.id):
         await iface._send_unauthorized(update)
         return
-    iface._agent_mode = "agent"
-    iface._pending_plan = None
+    user_state = iface._get_user_state(update.effective_user.id)
+    user_state.agent_mode = "agent"
+    user_state.pending_plan = None
     await update.effective_message.reply_text(
         "🤖 <b>Agent mode active</b>\n<i>Standard execution restored.</i>",
         parse_mode=ParseMode.HTML,
@@ -1113,24 +1113,39 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
         logger.warning("cb_mad_plan_review query.answer() failed: %s", exc)
 
     data = query.data
+    user_id = query.from_user.id
+    user_state = iface._get_user_state(user_id)
 
-    if data == "madplan_approve":
-        plan = iface._pending_plan
+    if data.startswith("madplan_approve"):
+        plan = user_state.pending_plan
         if not plan:
             try:
                 await query.edit_message_text("❌ No active plan.", parse_mode=ParseMode.HTML)
             except Exception:
                 pass
             return
+        # Verify plan identity to prevent approving a stale/replaced plan
+        parts = data.split(":", 1)
+        if len(parts) > 1:
+            expected_id = parts[1]
+            if expected_id != user_state.plan_id:
+                try:
+                    await query.edit_message_text(
+                        "⚠️ This plan is outdated. Please review the current plan.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+                return
         try:
             await query.edit_message_text("⚙️ <b>Executing plan…</b>", parse_mode=ParseMode.HTML)
         except Exception:
             pass
         await iface._run_mad_plan_execute(update, ctx, plan)
 
-    elif data == "madplan_reject":
-        iface._pending_plan = None
-        iface._agent_mode = "agent"
+    elif data.startswith("madplan_reject"):
+        user_state.pending_plan = None
+        user_state.agent_mode = "agent"
         try:
             await query.edit_message_text(
                 "❌ <b>Plan rejected.</b> Switched to agent mode.",
@@ -1140,7 +1155,7 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
             pass
 
     elif data == "madplan_show":
-        plan = iface._pending_plan
+        plan = user_state.pending_plan
         saved_path = plan.get("_saved_path") if plan else None
         if saved_path and os.path.exists(saved_path):
             try:

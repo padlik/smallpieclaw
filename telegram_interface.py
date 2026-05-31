@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import html
 import logging
 import os
 import re
 import time
+import uuid
 from functools import partial
 from typing import Callable, Optional
 
@@ -44,6 +46,16 @@ from telegram_commands import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class _UserMadPlanState:
+    """Per-user MadPlan mode state, isolated to avoid races with concurrent_updates=True."""
+
+    agent_mode: str = "agent"
+    pending_plan: dict | None = None
+    pending_plan_name_override: str = ""
+    plan_id: str = ""  # ID of the current pending plan (verified on approve)
 
 
 class TelegramInterface:
@@ -89,10 +101,8 @@ class TelegramInterface:
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
 
-        # MadPlan mode state
-        self._agent_mode: str = "agent"
-        self._pending_plan: dict | None = None
-        self._pending_plan_name_override: str = ""
+        # Per-user MadPlan mode state (isolated to avoid races with concurrent_updates=True)
+        self._user_state: dict[int, _UserMadPlanState] = {}
         self.sub_agent_factory: Optional[Callable] = None
 
         # Verbose mode: send each agent action as a new message instead of editing
@@ -105,6 +115,12 @@ class TelegramInterface:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def _get_user_state(self, user_id: int) -> _UserMadPlanState:
+        """Return (or lazily create) per-user MadPlan state."""
+        if user_id not in self._user_state:
+            self._user_state[user_id] = _UserMadPlanState()
+        return self._user_state[user_id]
 
     def build(self) -> Application:
         self._app = (
@@ -307,13 +323,18 @@ class TelegramInterface:
     async def _run_agent_task(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str,
         images: Optional[list[str]] = None,
+        *,
+        _bypass_madplan: bool = False,
     ) -> None:
         """Run the agent with a given task, showing streaming progress."""
-        if self._agent_mode == "madplan":
+        user = update.effective_user
+        user_id = user.id if user else 0
+        user_state = self._get_user_state(user_id)
+        if user_state.agent_mode == "madplan" and not _bypass_madplan:
             intent = await self._classify_madplan_intent(
-                task_text, has_pending_plan=self._pending_plan is not None
+                task_text, has_pending_plan=user_state.pending_plan is not None
             )
-            logger.info("MadPlan intent classified as: %s (pending=%s)", intent, self._pending_plan is not None)
+            logger.info("MadPlan intent classified as: %s (pending=%s)", intent, user_state.pending_plan is not None)
             if intent == "CONVERSATIONAL":
                 await update.effective_message.reply_text(
                     "💬 Got it.\n\n💡 <i>Send me a task description to start planning, "
@@ -322,21 +343,16 @@ class TelegramInterface:
                 )
                 return
             if intent == "QUESTION":
-                # Route through standard agent (full react loop with tools),
-                # with a context prefix so the agent doesn't start planning.
+                # Route through standard agent without mutating shared mode state.
+                # _bypass_madplan=True skips the madplan gate on the recursive call.
                 prefixed = (
                     "[CONTEXT: You are answering a question while in MadPlan mode. "
                     "Answer concisely using available tools if needed. "
                     "Do NOT start planning a task.]\n" + task_text
                 )
-                # Temporarily leave madplan mode so the standard path runs
-                self._agent_mode = "agent"
-                try:
-                    await self._run_agent_task(update, ctx, prefixed, images)
-                finally:
-                    self._agent_mode = "madplan"
+                await self._run_agent_task(update, ctx, prefixed, images, _bypass_madplan=True)
                 return
-            if intent == "PLAN_FEEDBACK" and self._pending_plan is not None:
+            if intent == "PLAN_FEEDBACK" and user_state.pending_plan is not None:
                 await self._run_mad_plan_revise(update, ctx, task_text, images)
             else:
                 await self._run_mad_plan_task(update, ctx, task_text, images)
@@ -829,20 +845,25 @@ Rules:
             )
 
             # Auto-save the plan
-            name_override = getattr(self, "_pending_plan_name_override", "")
+            uid = update.effective_user.id if update.effective_user else 0
+            user_state = self._get_user_state(uid)
+            name_override = user_state.pending_plan_name_override
             if name_override:
                 plan["task"] = f"{name_override} - {plan.get('task', '')}"
-                self._pending_plan_name_override = ""
+                user_state.pending_plan_name_override = ""
             plan_name, saved_path = orchestrator.save_plan(plan, plans_dir)
             plan["_plan_name"] = plan_name
             plan["_saved_path"] = saved_path
-            self._pending_plan = plan
+            plan_id = uuid.uuid4().hex[:8]
+            plan["_plan_id"] = plan_id
+            user_state.pending_plan = plan
+            user_state.plan_id = plan_id
 
             plan_html = orchestrator.format_plan_html(plan)
 
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data="madplan_approve"),
-                InlineKeyboardButton("❌ Reject",  callback_data="madplan_reject"),
+                InlineKeyboardButton("✅ Approve", callback_data=f"madplan_approve:{plan_id}"),
+                InlineKeyboardButton("❌ Reject",  callback_data=f"madplan_reject:{plan_id}"),
                 InlineKeyboardButton("📋 Full plan", callback_data="madplan_show"),
             ]])
 
@@ -875,7 +896,9 @@ Rules:
         """Revise the pending MadPlan plan using user feedback."""
         from mad_plan import MadPlanOrchestrator, MadPlanError, build_agent_capabilities_summary
 
-        original_plan = self._pending_plan
+        uid = update.effective_user.id if update.effective_user else 0
+        user_state = self._get_user_state(uid)
+        original_plan = user_state.pending_plan
         if not original_plan:
             await update.effective_message.reply_text(
                 "❌ No active plan to revise.", parse_mode=ParseMode.HTML
@@ -932,12 +955,15 @@ Rules:
                 revised_plan["_plan_name"] = plan_name
                 revised_plan["_saved_path"] = saved_path
 
-            self._pending_plan = revised_plan
+            plan_id = uuid.uuid4().hex[:8]
+            revised_plan["_plan_id"] = plan_id
+            user_state.pending_plan = revised_plan
+            user_state.plan_id = plan_id
 
             plan_html = orchestrator.format_plan_html(revised_plan)
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data="madplan_approve"),
-                InlineKeyboardButton("❌ Reject",  callback_data="madplan_reject"),
+                InlineKeyboardButton("✅ Approve", callback_data=f"madplan_approve:{plan_id}"),
+                InlineKeyboardButton("❌ Reject",  callback_data=f"madplan_reject:{plan_id}"),
                 InlineKeyboardButton("📋 Full plan", callback_data="madplan_show"),
             ]])
 
@@ -970,7 +996,10 @@ Rules:
         from mad_plan import MadPlanOrchestrator
 
         # Snapshot and clear pending state to prevent double-execute
-        self._pending_plan = None
+        uid = update.effective_user.id if update.effective_user else 0
+        user_state = self._get_user_state(uid)
+        user_state.pending_plan = None
+        user_state.plan_id = ""
 
         status_msg = await update.effective_message.reply_text("⚙️ <b>Executing plan…</b>", parse_mode=ParseMode.HTML)
 
@@ -1009,7 +1038,7 @@ Rules:
             logger.exception("MadPlan execute failed")
             await self._safe_edit(status_msg, f"❌ Execution error: {html.escape(str(exc))}")
         finally:
-            self._agent_mode = "agent"
+            user_state.agent_mode = "agent"
 
 # ---------------------------------------------------------------------------
 # Module constants
