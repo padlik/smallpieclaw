@@ -702,6 +702,7 @@ class MadPlanOrchestrator:
 
         result = []
         id_mapping: dict[str, str] = {}
+        seen_ids: set[str] = set()
         for i, st in enumerate(subtasks):
             if not isinstance(st, dict):
                 continue
@@ -713,6 +714,15 @@ class MadPlanOrchestrator:
                 raw_id = slug
                 if original_id:
                     id_mapping[original_id] = raw_id
+            # Deduplicate: append _2, _3, … to break collisions
+            base_id = raw_id
+            counter = 2
+            while raw_id in seen_ids:
+                raw_id = f"{base_id}_{counter}"
+                counter += 1
+            seen_ids.add(raw_id)
+            if original_id and original_id in id_mapping and id_mapping[original_id] != raw_id:
+                id_mapping[original_id] = raw_id
             result.append({
                 "id": raw_id,
                 "name": name,
@@ -1308,12 +1318,33 @@ def _extract_json(raw: str) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
+        # Find the first balanced {…} using brace-counting to avoid the greedy
+        # regex pitfall where trailing text with '}' chars produces invalid JSON.
+        start = raw.find("{")
+        if start != -1:
+            depth = 0
+            in_string = False
+            escape_next = False
+            for i, ch in enumerate(raw[start:], start):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\" and in_string:
+                    escape_next = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                if not in_string:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidate = raw[start : i + 1]
+                            try:
+                                return json.loads(candidate)
+                            except json.JSONDecodeError:
+                                break
         raise MadPlanError(f"Could not parse JSON from LLM response: {raw[:300]}")
 
 

@@ -941,6 +941,10 @@ Rules:
                 ),
             )
 
+            # Propagate metadata fields from the original plan that the LLM won't return
+            if original_plan.get("_plan_name"):
+                revised_plan["_plan_name"] = original_plan["_plan_name"]
+
             # Save the revised plan, using the original plan_name as target_slug
             # so the correct directory is always overwritten regardless of task text.
             plans_dir = os.path.join(os.getcwd(), "plans")
@@ -998,6 +1002,7 @@ Rules:
         # Snapshot and clear pending state to prevent double-execute
         uid = update.effective_user.id if update.effective_user else 0
         user_state = self._get_user_state(uid)
+        mode_before_execution = user_state.agent_mode
         user_state.pending_plan = None
         user_state.plan_id = ""
 
@@ -1038,7 +1043,10 @@ Rules:
             logger.exception("MadPlan execute failed")
             await self._safe_edit(status_msg, f"❌ Execution error: {html.escape(str(exc))}")
         finally:
-            user_state.agent_mode = "agent"
+            # Only reset to agent mode if the user hasn't re-entered madplan
+            # mode during the (potentially long) execution.
+            if user_state.agent_mode == mode_before_execution:
+                user_state.agent_mode = "agent"
 
 # ---------------------------------------------------------------------------
 # Module constants

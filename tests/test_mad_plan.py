@@ -1018,3 +1018,84 @@ class TestLoadPlanSecurity:
             orc = MadPlanOrchestrator()
             with pytest.raises(MadPlanError, match="not found"):
                 orc.load_plan("nonexistent_plan", d)
+
+
+# ---------------------------------------------------------------------------
+# _extract_json (brace-counting)
+# ---------------------------------------------------------------------------
+
+class TestExtractJson:
+    """Tests for _extract_json() — specifically the brace-counting fallback."""
+
+    def _call(self, raw: str) -> dict:
+        from mad_plan import _extract_json
+        return _extract_json(raw)
+
+    def test_clean_json(self):
+        assert self._call('{"a": 1}') == {"a": 1}
+
+    def test_fenced_json(self):
+        assert self._call('```json\n{"a": 1}\n```') == {"a": 1}
+
+    def test_trailing_text_after_json(self):
+        """Greedy regex would have matched too much; brace-counting finds the right end."""
+        assert self._call('{"a": 1} some trailing text {"b": 2}') == {"a": 1}
+
+    def test_embedded_in_prose(self):
+        raw = 'Here is the result:\n{"x": "hello"}\nDone.'
+        assert self._call(raw) == {"x": "hello"}
+
+    def test_nested_objects(self):
+        raw = 'prefix {"outer": {"inner": 42}} suffix}'
+        assert self._call(raw) == {"outer": {"inner": 42}}
+
+    def test_invalid_json_raises(self):
+        from mad_plan import MadPlanError
+        with pytest.raises(MadPlanError):
+            self._call("this is not json at all")
+
+    def test_string_with_braces_inside_value(self):
+        """Braces inside string literals must not confuse the counter."""
+        assert self._call('{"key": "value with } brace"}') == {"key": "value with } brace"}
+
+
+# ---------------------------------------------------------------------------
+# _parse_decomposition — ID deduplication
+# ---------------------------------------------------------------------------
+
+class TestSubtaskIdDeduplication:
+    """Tests for ID collision handling in _parse_decomposition."""
+
+    def _orc(self):
+        return MadPlanOrchestrator()
+
+    def test_duplicate_slugs_get_suffix(self):
+        """Two subtasks whose names slugify identically should get unique IDs."""
+        raw = json.dumps({"subtasks": [
+            {"id": "t1", "name": "Fetch user data", "description": "a", "depends_on": []},
+            {"id": "t2", "name": "Fetch user-data", "description": "b", "depends_on": []},
+        ]})
+        result = self._orc()._parse_decomposition(raw)
+        ids = [st["id"] for st in result]
+        assert len(ids) == len(set(ids)), f"Duplicate IDs: {ids}"
+        assert ids[0] == "fetch_user_data"
+        assert ids[1] == "fetch_user_data_2"
+
+    def test_three_duplicates_get_sequential_suffixes(self):
+        raw = json.dumps({"subtasks": [
+            {"id": "t1", "name": "Do thing", "description": "", "depends_on": []},
+            {"id": "t2", "name": "Do thing", "description": "", "depends_on": []},
+            {"id": "t3", "name": "Do thing", "description": "", "depends_on": []},
+        ]})
+        result = self._orc()._parse_decomposition(raw)
+        ids = [st["id"] for st in result]
+        assert ids == ["do_thing", "do_thing_2", "do_thing_3"]
+
+    def test_no_collision_unchanged(self):
+        raw = json.dumps({"subtasks": [
+            {"id": "t1", "name": "Alpha task", "description": "", "depends_on": []},
+            {"id": "t2", "name": "Beta task", "description": "", "depends_on": []},
+        ]})
+        result = self._orc()._parse_decomposition(raw)
+        assert result[0]["id"] == "alpha_task"
+        assert result[1]["id"] == "beta_task"
