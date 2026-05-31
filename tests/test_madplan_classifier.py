@@ -1,13 +1,16 @@
 """
 tests/test_madplan_classifier.py
-Tests for TelegramInterface._classify_madplan_intent() routing logic
-and per-user _UserMadPlanState isolation (fixes #2 and #9).
+Tests for TelegramInterface._classify_madplan_intent() routing logic,
+per-user _UserMadPlanState isolation (fixes #2 and #9),
+and /mad_plan show command.
 """
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+import os
+import tempfile
+from unittest.mock import AsyncMock, MagicMock
 
 
 def _make_iface(llm_response: str):
@@ -151,3 +154,107 @@ class TestPerUserMadPlanState:
         from telegram_interface import _UserMadPlanState
         s = _UserMadPlanState()
         assert s.pending_plan_name_override == ""
+
+
+def _make_cmd_update(text: str, user_id: int = 1):
+    """Build a minimal Update mock for command handler tests."""
+    update = MagicMock()
+    update.effective_user.id = user_id
+    update.effective_message.text = text
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_message.reply_document = AsyncMock()
+    return update
+
+
+def _make_cmd_iface(authorized: bool = True):
+    """Build a minimal TelegramInterface stub for command handler tests."""
+    from telegram_interface import TelegramInterface
+    iface = TelegramInterface.__new__(TelegramInterface)
+    iface._user_state = {}
+    iface._is_authorized = MagicMock(return_value=authorized)
+    iface._send_unauthorized = AsyncMock()
+    return iface
+
+
+class TestMadPlanShowCommand:
+    """Tests for /mad_plan show <plan_name>."""
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_show_no_name_returns_usage(self):
+        from telegram_commands import cmd_mad_plan
+        iface = _make_cmd_iface()
+        update = _make_cmd_update("/mad_plan show")
+        ctx = MagicMock()
+        self._run(cmd_mad_plan(iface, update, ctx))
+        update.effective_message.reply_text.assert_called_once()
+        assert "Usage" in update.effective_message.reply_text.call_args[0][0]
+
+    def test_show_path_traversal_rejected(self):
+        from telegram_commands import cmd_mad_plan
+        iface = _make_cmd_iface()
+        for bad_name in ("../etc", "foo/bar", "back\\slash"):
+            update = _make_cmd_update(f"/mad_plan show {bad_name}")
+            ctx = MagicMock()
+            self._run(cmd_mad_plan(iface, update, ctx))
+            reply = update.effective_message.reply_text.call_args[0][0]
+            assert "Invalid" in reply
+
+    def test_show_nonexistent_plan(self):
+        from telegram_commands import cmd_mad_plan
+        iface = _make_cmd_iface()
+        update = _make_cmd_update("/mad_plan show no_such_plan_xyz")
+        ctx = MagicMock()
+        self._run(cmd_mad_plan(iface, update, ctx))
+        reply = update.effective_message.reply_text.call_args[0][0]
+        assert "not found" in reply
+
+    def test_show_existing_plan_sends_document(self):
+        from telegram_commands import cmd_mad_plan
+        iface = _make_cmd_iface()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan_dir = os.path.join(tmpdir, "plans", "my_plan")
+            os.makedirs(plan_dir)
+            plan_md_content = "# My Plan\n\nSome content here."
+            with open(os.path.join(plan_dir, "plan.md"), "w", encoding="utf-8") as f:
+                f.write(plan_md_content)
+
+            original_getcwd = os.getcwd
+            os.getcwd = lambda: tmpdir  # patch cwd to use tmpdir plans_dir
+            try:
+                update = _make_cmd_update("/mad_plan show my_plan")
+                ctx = MagicMock()
+                self._run(cmd_mad_plan(iface, update, ctx))
+            finally:
+                os.getcwd = original_getcwd
+
+        update.effective_message.reply_document.assert_called_once()
+        call_kwargs = update.effective_message.reply_document.call_args[1]
+        assert call_kwargs.get("filename") == "my_plan.md"
+        assert "my_plan" in call_kwargs.get("caption", "")
+
+    def test_show_document_content_matches_plan(self):
+        from telegram_commands import cmd_mad_plan
+        import io as _io
+        iface = _make_cmd_iface()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan_dir = os.path.join(tmpdir, "plans", "test_plan")
+            os.makedirs(plan_dir)
+            plan_md_content = "# Test Plan\n\nHello world."
+            with open(os.path.join(plan_dir, "plan.md"), "w", encoding="utf-8") as f:
+                f.write(plan_md_content)
+
+            original_getcwd = os.getcwd
+            os.getcwd = lambda: tmpdir
+            try:
+                update = _make_cmd_update("/mad_plan show test_plan")
+                ctx = MagicMock()
+                self._run(cmd_mad_plan(iface, update, ctx))
+            finally:
+                os.getcwd = original_getcwd
+
+        doc_arg = update.effective_message.reply_document.call_args[1]["document"]
+        assert isinstance(doc_arg, _io.BytesIO)
+        assert doc_arg.read().decode("utf-8") == plan_md_content
+

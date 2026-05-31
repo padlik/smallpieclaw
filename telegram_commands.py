@@ -985,6 +985,44 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
             )
         return
 
+    if subcommand == "show":
+        if not plan_name_arg:
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/mad_plan show &lt;plan_name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if any(c in plan_name_arg for c in ("/", "\\", "..")):
+            await update.effective_message.reply_text(
+                "❌ Invalid plan name.", parse_mode=ParseMode.HTML
+            )
+            return
+        plan_md_path = os.path.join(plans_dir, plan_name_arg, "plan.md")
+        if not os.path.exists(plan_md_path):
+            await update.effective_message.reply_text(
+                f"❌ Plan <code>{html.escape(plan_name_arg)}</code> not found.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            with open(plan_md_path, encoding="utf-8") as fh:
+                content = fh.read()
+        except OSError as exc:
+            await update.effective_message.reply_text(
+                f"❌ Could not read plan: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        doc = io.BytesIO(content.encode("utf-8"))
+        doc.name = f"{plan_name_arg}.md"
+        await update.effective_message.reply_document(
+            document=doc,
+            filename=f"{plan_name_arg}.md",
+            caption=f"📋 Plan: <code>{html.escape(plan_name_arg)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if subcommand == "execute":
         if not plan_name_arg:
             await update.effective_message.reply_text(
@@ -1080,6 +1118,7 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
             "for your review before any execution begins.\n\n"
             "<b>Available subcommands:</b>\n"
             "  <code>/mad_plan list</code>            — list saved plans\n"
+            "  <code>/mad_plan show &lt;name&gt;</code>   — view a saved plan\n"
             "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
             "  <code>/mad_plan delete &lt;name&gt;</code>  — delete a saved plan\n"
             "  <code>/agent</code>                    — return to standard agent mode\n\n"
@@ -1093,6 +1132,7 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
         "❌ Unknown subcommand. Usage:\n"
         "  <code>/mad_plan plan</code> — start planning\n"
         "  <code>/mad_plan list</code> — list saved plans\n"
+        "  <code>/mad_plan show &lt;name&gt;</code> — view a saved plan\n"
         "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
         "  <code>/mad_plan delete &lt;name&gt;</code> — delete a saved plan",
         parse_mode=ParseMode.HTML,
