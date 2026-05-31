@@ -984,3 +984,37 @@ class TestDeletePlan:
             with pytest.raises(MadPlanError, match="not found"):
                 delete_plan("not_a_plan", d)
             assert os.path.isdir(fake_dir)
+
+
+class TestLoadPlanSecurity:
+    """Path-traversal guard tests for load_plan()."""
+
+    def test_load_plan_empty_name_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            with pytest.raises(MadPlanError, match="must not be empty"):
+                orc.load_plan("", d)
+
+    def test_load_plan_slash_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            with pytest.raises(MadPlanError, match="path-traversal"):
+                orc.load_plan("../etc/passwd", d)
+
+    def test_load_plan_backslash_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            with pytest.raises(MadPlanError, match="path-traversal"):
+                orc.load_plan("evil\\plan", d)
+
+    def test_load_plan_dotdot_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            with pytest.raises(MadPlanError, match="path-traversal"):
+                orc.load_plan("valid..evil", d)
+
+    def test_load_plan_valid_name_not_found_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            orc = MadPlanOrchestrator()
+            with pytest.raises(MadPlanError, match="not found"):
+                orc.load_plan("nonexistent_plan", d)

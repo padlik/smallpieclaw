@@ -817,7 +817,7 @@ Rules:
             from mad_plan import load_models_capabilities
             caps_data = load_models_capabilities(os.path.join(os.getcwd(), "data"))
 
-            plan = await asyncio.get_event_loop().run_in_executor(
+            plan = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: orchestrator.plan_task(
                     task_text,
@@ -906,7 +906,7 @@ Rules:
                     f"\n\n[Note: {len(images)} image attachment(s) accompany this feedback.]"
                 )
 
-            revised_plan = await asyncio.get_event_loop().run_in_executor(
+            revised_plan = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: orchestrator.revise_plan(
                     original_plan,

@@ -960,6 +960,10 @@ class MadPlanOrchestrator:
         Returns a minimal plan dict with task, created_at, and subtasks (prompts only).
         Raises MadPlanError if not found or unreadable.
         """
+        if not plan_name:
+            raise MadPlanError("Plan name must not be empty.")
+        if any(c in plan_name for c in ("/", "\\", "..")):
+            raise MadPlanError(f"Invalid plan name: '{plan_name}' contains path-traversal characters.")
         path = os.path.join(plans_dir, plan_name, "plan.md")
         if not os.path.exists(path):
             raise MadPlanError(f"Plan '{plan_name}' not found at {path}")
