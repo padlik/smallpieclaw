@@ -814,8 +814,20 @@ Rules:
         """Plan a task in MadPlan mode and show the enriched plan for review."""
         from mad_plan import MadPlanOrchestrator, MadPlanError, build_agent_capabilities_summary
         plans_dir = os.path.join(os.getcwd(), "plans")
+        chat_id = update.effective_chat.id
 
         status_msg = await update.effective_message.reply_text("🧠 Planning…")
+
+        # Keep typing indicator alive during the long planning LLM calls
+        async def _typing_loop():
+            while True:
+                try:
+                    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(_typing_loop())
 
         try:
             orchestrator = MadPlanOrchestrator()
@@ -860,9 +872,12 @@ Rules:
             user_state.plan_id = plan_id
 
             plan_html = orchestrator.format_plan_html(plan)
+            mode_footer = (
+                "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
+            )
 
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data=f"madplan_approve:{plan_id}"),
+                InlineKeyboardButton("💾 Confirm & Save", callback_data=f"madplan_approve:{plan_id}"),
                 InlineKeyboardButton("❌ Reject",  callback_data=f"madplan_reject:{plan_id}"),
                 InlineKeyboardButton("📋 Full plan", callback_data="madplan_show"),
             ]])
@@ -872,9 +887,12 @@ Rules:
             except Exception:
                 pass
 
-            for chunk in self._split_message(plan_html):
+            chunks = self._split_message(plan_html)
+            for i, chunk in enumerate(chunks):
+                # Append mode footer to last chunk
+                text = chunk + mode_footer if i == len(chunks) - 1 else chunk
                 await update.effective_message.reply_text(
-                    chunk,
+                    text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=keyboard,
                 )
@@ -885,6 +903,8 @@ Rules:
         except Exception as exc:
             logger.exception("MadPlan planning failed")
             await self._safe_edit(status_msg, f"❌ Planning failed: {html.escape(str(exc))}")
+        finally:
+            typing_task.cancel()
 
     async def _run_mad_plan_revise(
         self,
@@ -905,7 +925,19 @@ Rules:
             )
             return
 
+        chat_id = update.effective_chat.id
         status_msg = await update.effective_message.reply_text("🔄 Revising plan…")
+
+        # Keep typing indicator alive during the long revision LLM calls
+        async def _typing_loop():
+            while True:
+                try:
+                    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(_typing_loop())
 
         try:
             orchestrator = MadPlanOrchestrator()
@@ -965,8 +997,11 @@ Rules:
             user_state.plan_id = plan_id
 
             plan_html = orchestrator.format_plan_html(revised_plan)
+            mode_footer = (
+                "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
+            )
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data=f"madplan_approve:{plan_id}"),
+                InlineKeyboardButton("💾 Confirm & Save", callback_data=f"madplan_approve:{plan_id}"),
                 InlineKeyboardButton("❌ Reject",  callback_data=f"madplan_reject:{plan_id}"),
                 InlineKeyboardButton("📋 Full plan", callback_data="madplan_show"),
             ]])
@@ -976,9 +1011,11 @@ Rules:
             except Exception:
                 pass
 
-            for chunk in self._split_message(plan_html):
+            chunks = self._split_message(plan_html)
+            for i, chunk in enumerate(chunks):
+                text = chunk + mode_footer if i == len(chunks) - 1 else chunk
                 await update.effective_message.reply_text(
-                    chunk,
+                    text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=keyboard,
                 )
@@ -989,6 +1026,8 @@ Rules:
         except Exception as exc:
             logger.exception("MadPlan revision failed")
             await self._safe_edit(status_msg, f"❌ Revision failed: {html.escape(str(exc))}")
+        finally:
+            typing_task.cancel()
 
     async def _run_mad_plan_execute(
         self,

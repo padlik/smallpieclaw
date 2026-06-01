@@ -1024,25 +1024,12 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
         return
 
     if subcommand == "execute":
-        if not plan_name_arg:
-            await update.effective_message.reply_text(
-                "❌ Usage: <code>/mad_plan execute &lt;plan_name&gt;</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        user_state = iface._get_user_state(update.effective_user.id)
-        user_state.agent_mode = "madplan"
-        from mad_plan import MadPlanOrchestrator, MadPlanError
-        try:
-            plan = MadPlanOrchestrator().load_plan(plan_name_arg, plans_dir)
-        except MadPlanError as exc:
-            await update.effective_message.reply_text(
-                f"❌ Could not load plan: {html.escape(str(exc))}", parse_mode=ParseMode.HTML
-            )
-            return
-        plan["_plan_name"] = plan_name_arg
-        user_state.pending_plan = plan
-        await iface._run_mad_plan_execute(update, ctx, plan)
+        await update.effective_message.reply_text(
+            "⚠️ <b>Plan execution is not yet available.</b>\n\n"
+            "Use <code>/mad_plan show &lt;name&gt;</code> to review a saved plan, "
+            "or <code>/mad_plan list</code> to see all plans.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if subcommand == "delete":
@@ -1052,7 +1039,7 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
                 parse_mode=ParseMode.HTML,
             )
             return
-        from mad_plan import MadPlanError, list_plans as _list_plans
+        from mad_plan import list_plans as _list_plans
         names = _list_plans(plans_dir)
         if plan_name_arg not in names:
             await update.effective_message.reply_text(
@@ -1115,13 +1102,12 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
             "🧠 <b>MadPlan mode active</b>\n\n"
             "Send me a task description and I'll analyse it, decompose it into "
             "sub-tasks, select the best model for each one, and present a plan "
-            "for your review before any execution begins.\n\n"
+            "for your review.\n\n"
             "<b>Available subcommands:</b>\n"
-            "  <code>/mad_plan list</code>            — list saved plans\n"
-            "  <code>/mad_plan show &lt;name&gt;</code>   — view a saved plan\n"
-            "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
-            "  <code>/mad_plan delete &lt;name&gt;</code>  — delete a saved plan\n"
-            "  <code>/agent</code>                    — return to standard agent mode\n\n"
+            "  <code>/mad_plan list</code>           — list saved plans\n"
+            "  <code>/mad_plan show &lt;name&gt;</code>  — view a saved plan\n"
+            "  <code>/mad_plan delete &lt;name&gt;</code> — delete a saved plan\n"
+            "  <code>/agent</code>                   — return to standard agent mode\n\n"
             "💡 <i>Just send your task to start planning.</i>"
             + validation_text,
             parse_mode=ParseMode.HTML,
@@ -1133,7 +1119,6 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
         "  <code>/mad_plan plan</code> — start planning\n"
         "  <code>/mad_plan list</code> — list saved plans\n"
         "  <code>/mad_plan show &lt;name&gt;</code> — view a saved plan\n"
-        "  <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
         "  <code>/mad_plan delete &lt;name&gt;</code> — delete a saved plan",
         parse_mode=ParseMode.HTML,
     )
@@ -1186,11 +1171,19 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
                 except Exception:
                     pass
                 return
+        # Plan is already auto-saved — just confirm and clear pending state
+        plan_name = plan.get("_plan_name", "")
+        user_state.pending_plan = None
+        user_state.plan_id = ""
+        name_display = f" <code>{html.escape(plan_name)}</code>" if plan_name else ""
         try:
-            await query.edit_message_text("⚙️ <b>Executing plan…</b>", parse_mode=ParseMode.HTML)
+            await query.edit_message_text(
+                f"✅ <b>Plan{name_display} saved.</b>\n\n"
+                "Send a new task to plan, or use /agent to return to standard mode.",
+                parse_mode=ParseMode.HTML,
+            )
         except Exception:
             pass
-        await iface._run_mad_plan_execute(update, ctx, plan)
 
     elif data.startswith("madplan_reject"):
         user_state.pending_plan = None
