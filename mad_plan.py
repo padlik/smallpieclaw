@@ -47,6 +47,39 @@ class MadPlanExecutionError(MadPlanError):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_model_id(selected: str, configured_models: list[dict]) -> str:
+    """Resolve a model name returned by the LLM to the canonical model ID.
+
+    The LLM may return the model's ``name`` or an alias instead of the full
+    ``model`` identifier (e.g. ``kimi-k2.5`` vs ``kimi-k2.5:cloud``).  This
+    function tries, in order:
+
+    1. Exact match on the ``model`` field (already correct).
+    2. Case-insensitive match on the ``name`` field.
+    3. Case-insensitive match on any entry in the ``aliases`` list.
+
+    Returns the canonical ``model`` ID on success, or ``""`` on failure.
+    """
+    if not selected:
+        return ""
+    selected_lower = selected.lower()
+    for m in configured_models:
+        if m.get("model", "") == selected:
+            return selected
+    for m in configured_models:
+        if m.get("name", "").lower() == selected_lower:
+            return m.get("model", "")
+    for m in configured_models:
+        for alias in m.get("aliases", []):
+            if alias.lower() == selected_lower:
+                return m.get("model", "")
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
 
@@ -477,12 +510,16 @@ class MadPlanOrchestrator:
             sel = selections.get(st["id"], {})
             selected_model = sel.get("model_name", "")
             if valid_model_ids and selected_model not in valid_model_ids:
-                logger.warning(
-                    "MadPlan: LLM selected '%s' for sub-task '%s' which is not configured. "
-                    "Falling back to first configured model.",
-                    selected_model, st["id"],
-                )
-                selected_model = configured_models[0].get("model", "") if configured_models else ""
+                resolved = _resolve_model_id(selected_model, configured_models)
+                if resolved:
+                    selected_model = resolved
+                else:
+                    logger.warning(
+                        "MadPlan: LLM selected '%s' for sub-task '%s' which is not configured. "
+                        "Falling back to first configured model.",
+                        selected_model, st["id"],
+                    )
+                    selected_model = configured_models[0].get("model", "") if configured_models else ""
 
             enriched.append({
                 "id": st["id"],
@@ -638,12 +675,16 @@ class MadPlanOrchestrator:
             sel = selections.get(st["id"], {})
             selected_model = sel.get("model_name", "")
             if valid_model_ids and selected_model not in valid_model_ids:
-                logger.warning(
-                    "MadPlan revision: LLM selected '%s' for '%s' which is not configured, "
-                    "falling back to first configured model.",
-                    selected_model, st["id"],
-                )
-                selected_model = configured_models[0].get("model", "") if configured_models else ""
+                resolved = _resolve_model_id(selected_model, configured_models)
+                if resolved:
+                    selected_model = resolved
+                else:
+                    logger.warning(
+                        "MadPlan revision: LLM selected '%s' for '%s' which is not configured, "
+                        "falling back to first configured model.",
+                        selected_model, st["id"],
+                    )
+                    selected_model = configured_models[0].get("model", "") if configured_models else ""
             enriched.append({
                 "id": st["id"],
                 "name": st["name"],

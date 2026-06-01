@@ -16,6 +16,7 @@ import pytest
 from mad_plan import (
     MadPlanError,
     MadPlanOrchestrator,
+    _resolve_model_id,
     build_agent_capabilities_summary,
     delete_plan,
     list_plans,
@@ -1099,3 +1100,44 @@ class TestSubtaskIdDeduplication:
         result = self._orc()._parse_decomposition(raw)
         assert result[0]["id"] == "alpha_task"
         assert result[1]["id"] == "beta_task"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_model_id
+# ---------------------------------------------------------------------------
+
+class TestResolveModelId:
+    """Unit tests for the _resolve_model_id helper."""
+
+    MODELS = [
+        {"model": "kimi-k2.5:cloud", "name": "kimi-k2.5", "aliases": ["kimi-k25"]},
+        {"model": "deepseek-v4-pro:cloud", "name": "deepseek-v4-pro", "aliases": []},
+        {"model": "gemini-3-flash:cloud", "name": "gemini-3-flash", "aliases": ["gemini-flash"]},
+    ]
+
+    def test_exact_model_id_unchanged(self):
+        assert _resolve_model_id("kimi-k2.5:cloud", self.MODELS) == "kimi-k2.5:cloud"
+
+    def test_resolves_name_to_model_id(self):
+        assert _resolve_model_id("kimi-k2.5", self.MODELS) == "kimi-k2.5:cloud"
+
+    def test_resolves_name_case_insensitive(self):
+        assert _resolve_model_id("KIMI-K2.5", self.MODELS) == "kimi-k2.5:cloud"
+
+    def test_resolves_alias(self):
+        assert _resolve_model_id("kimi-k25", self.MODELS) == "kimi-k2.5:cloud"
+
+    def test_resolves_alias_case_insensitive(self):
+        assert _resolve_model_id("Gemini-Flash", self.MODELS) == "gemini-3-flash:cloud"
+
+    def test_resolves_second_model_by_name(self):
+        assert _resolve_model_id("deepseek-v4-pro", self.MODELS) == "deepseek-v4-pro:cloud"
+
+    def test_unknown_returns_empty_string(self):
+        assert _resolve_model_id("nonexistent-model", self.MODELS) == ""
+
+    def test_empty_selection_returns_empty_string(self):
+        assert _resolve_model_id("", self.MODELS) == ""
+
+    def test_empty_model_list(self):
+        assert _resolve_model_id("kimi-k2.5", []) == ""
