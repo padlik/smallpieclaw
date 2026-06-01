@@ -1048,8 +1048,8 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
             )
             return
         # Telegram callback_data is limited to 64 bytes.
-        # Prefix "madplan_delete_confirm:" is 22 bytes → max 42 bytes for name.
-        if len(plan_name_arg.encode()) > 42:
+        # Prefix "madplan_delete_confirm:" is 23 bytes → max 41 bytes for name.
+        if len(plan_name_arg.encode()) > 41:
             await update.effective_message.reply_text(
                 "❌ Plan name is too long to use in a button. "
                 "Delete it manually by removing the directory.",
