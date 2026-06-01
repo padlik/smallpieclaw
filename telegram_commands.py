@@ -132,9 +132,11 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         sched_state = "enabled" if iface.scheduler.enabled else "disabled"
         scheduler_line = f"\n📅 Scheduler: <code>{sched_state}</code> | {enabled}/{total} jobs active"
 
-    # Current agent mode
+    # Current agent mode — always shown
     current_mode = iface._get_user_state(update.effective_user.id).agent_mode
-    mode_line = "\n🧠 Mode: <b>MadPlan</b>" if current_mode == "madplan" else ""
+    _MODE_LABELS = {"madplan": "🧠 <b>MadPlan</b>", "agent": "🤖 <b>Agent</b>"}
+    mode_label = _MODE_LABELS.get(current_mode, f"<b>{html.escape(current_mode)}</b>")
+    mode_line = f"\n💡 Mode: {mode_label}"
 
     # Current server time
     from datetime import datetime as _dt
