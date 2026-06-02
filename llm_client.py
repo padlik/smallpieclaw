@@ -1099,9 +1099,11 @@ class LLMClient:
         skip the API round-trip entirely.
         """
         if text in self._embed_cache:
+            logger.debug("embed: cache hit (text_len=%d)", len(text))
             return self._embed_cache[text]
 
         provider = self.emb_cfg.get("provider", "openai")
+        logger.debug("embed: calling %s provider (text_len=%d)", provider, len(text))
         try:
             if provider in ("openai", "openrouter"):
                 vector = self._openai_embed(text)
@@ -1126,7 +1128,15 @@ class LLMClient:
             if len(self._embed_cache) >= self._embed_cache_max:
                 oldest = next(iter(self._embed_cache))
                 del self._embed_cache[oldest]
+                logger.debug("embed: cache evicted oldest entry")
             self._embed_cache[text] = vector
+            cache_size = len(self._embed_cache)
+        logger.debug(
+            "embed: cached vector (dim=%d, cache=%d/%d)",
+            len(vector),
+            cache_size,
+            self._embed_cache_max,
+        )
         return vector
 
     def _openai_embed(self, text: str) -> list[float]:
