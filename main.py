@@ -175,6 +175,7 @@ except ImportError:
 
 from agent_controller import AgentController, SubAgentRunner  # noqa: E402
 from builtin_executor import BuiltinExecutor, _load_context  # noqa: E402
+from config_schema import resolve_model_id  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory  # noqa: E402
@@ -376,11 +377,12 @@ def _run(
     # Resolve background_model for sub-agents
     background_model_id = agent_cfg.get("background_model") or agent_cfg.get("default_model", "")
     all_models = cfg.get("models", [])
+    _bg_resolved = resolve_model_id(background_model_id, all_models)
     background_model_cfg = next(
-        (m for m in all_models if m.get("model") == background_model_id),
+        (m for m in all_models if m.get("model") == _bg_resolved),
         all_models[0] if all_models else {},
     )
-    if background_model_id and background_model_cfg.get("model") != background_model_id:
+    if background_model_id and background_model_cfg.get("model") != _bg_resolved:
         logger.warning(
             "background_model '%s' not found in [[models]]. Falling back to '%s'.",
             background_model_id,
@@ -391,9 +393,10 @@ def _run(
                           fallback_models=None, max_iterations=None,
                           max_tokens=None, temperature=None, top_p=None):
         """Create an isolated SubAgentRunner with the requested model override."""
-        # Resolve model config
+        # Resolve model config — accept full model ID, model name, or alias
         if model:
-            model_cfg = next((m for m in all_models if m.get("model") == model), None)
+            resolved = resolve_model_id(model, all_models)
+            model_cfg = next((m for m in all_models if m.get("model") == resolved), None)
             if model_cfg is None:
                 raise ValueError(
                     f"Model '{model}' not found in [[models]]. "

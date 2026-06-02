@@ -251,6 +251,49 @@ def _parse_mcp_server(entry: dict, index: int) -> MCPServerConfig:
     )
 
 
+def resolve_model_id(selected: str, configured_models: list[dict]) -> str:
+    """Resolve a model name/alias to the canonical ``model`` ID.
+
+    The LLM (or a user) may supply the model's ``name`` or a configured
+    ``alias`` instead of the full ``model`` identifier
+    (e.g. ``kimi-k2.5`` vs ``kimi-k2.5:cloud``).  Resolution order:
+
+    1. Exact match on the ``model`` field — already correct, return as-is.
+    2. Case-insensitive match on the ``name`` field.
+    3. Case-insensitive match on any entry in the ``aliases`` list.
+
+    Works with both raw ``dict`` entries from the TOML config and with
+    :class:`ModelConfig` dataclass instances (accessed via attribute or key).
+
+    Returns the canonical ``model`` ID on success, or ``""`` on failure.
+    """
+    if not selected:
+        return ""
+
+    def _get(m, key: str, default: str = "") -> str:
+        if isinstance(m, dict):
+            return m.get(key, default) or default
+        return getattr(m, key, default) or default
+
+    def _aliases(m) -> list:
+        if isinstance(m, dict):
+            return m.get("aliases") or []
+        return getattr(m, "aliases", None) or []
+
+    selected_lower = selected.lower()
+    for m in configured_models:
+        if _get(m, "model") == selected:
+            return selected
+    for m in configured_models:
+        if _get(m, "name").lower() == selected_lower:
+            return _get(m, "model")
+    for m in configured_models:
+        for alias in _aliases(m):
+            if alias.lower() == selected_lower:
+                return _get(m, "model")
+    return ""
+
+
 def parse_config(raw: dict) -> AppConfig:
     """
     Parse and validate a raw TOML config dict into a typed AppConfig.

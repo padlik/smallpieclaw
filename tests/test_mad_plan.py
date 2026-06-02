@@ -13,11 +13,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from config_schema import resolve_model_id as _resolve_model_id
 from mad_plan import (
     MadPlanError,
     MadPlanOrchestrator,
     _escape_prompt,
-    _resolve_model_id,
     _topo_sort_subtasks,
     _unescape_prompt,
     build_agent_capabilities_summary,

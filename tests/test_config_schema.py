@@ -8,6 +8,7 @@ from config_schema import (
     AppConfig,
     ConfigError,
     parse_config,
+    resolve_model_id,
 )
 
 
@@ -151,3 +152,39 @@ class TestModelConfig:
         minimal_config["models"][0]["top_p"] = 0.9
         cfg = parse_config(minimal_config)
         assert cfg.models[0].top_p == 0.9
+
+
+# ---------------------------------------------------------------------------
+# resolve_model_id
+# ---------------------------------------------------------------------------
+
+class TestResolveModelId:
+    MODELS = [
+        {"name": "kimi-k2.5", "model": "kimi-k2.5:cloud", "aliases": ["kimi"]},
+        {"name": "deepseek-v4-pro", "model": "deepseek-v4-pro:cloud", "aliases": []},
+        {"name": "grok", "model": "grok-4-1-fast", "aliases": ["grok-fast"]},
+    ]
+
+    def test_exact_model_id_match(self):
+        assert resolve_model_id("kimi-k2.5:cloud", self.MODELS) == "kimi-k2.5:cloud"
+
+    def test_name_match(self):
+        assert resolve_model_id("kimi-k2.5", self.MODELS) == "kimi-k2.5:cloud"
+
+    def test_case_insensitive_name(self):
+        assert resolve_model_id("KIMI-K2.5", self.MODELS) == "kimi-k2.5:cloud"
+
+    def test_alias_match(self):
+        assert resolve_model_id("kimi", self.MODELS) == "kimi-k2.5:cloud"
+
+    def test_alias_case_insensitive(self):
+        assert resolve_model_id("Grok-Fast", self.MODELS) == "grok-4-1-fast"
+
+    def test_no_match_returns_empty(self):
+        assert resolve_model_id("nonexistent-model", self.MODELS) == ""
+
+    def test_empty_string_returns_empty(self):
+        assert resolve_model_id("", self.MODELS) == ""
+
+    def test_empty_models_list(self):
+        assert resolve_model_id("kimi-k2.5", []) == ""

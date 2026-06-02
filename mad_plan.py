@@ -24,6 +24,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from config_schema import resolve_model_id as _resolve_model_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,34 +52,6 @@ class MadPlanExecutionError(MadPlanError):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _resolve_model_id(selected: str, configured_models: list[dict]) -> str:
-    """Resolve a model name returned by the LLM to the canonical model ID.
-
-    The LLM may return the model's ``name`` or an alias instead of the full
-    ``model`` identifier (e.g. ``kimi-k2.5`` vs ``kimi-k2.5:cloud``).  This
-    function tries, in order:
-
-    1. Exact match on the ``model`` field (already correct).
-    2. Case-insensitive match on the ``name`` field.
-    3. Case-insensitive match on any entry in the ``aliases`` list.
-
-    Returns the canonical ``model`` ID on success, or ``""`` on failure.
-    """
-    if not selected:
-        return ""
-    selected_lower = selected.lower()
-    for m in configured_models:
-        if m.get("model", "") == selected:
-            return selected
-    for m in configured_models:
-        if m.get("name", "").lower() == selected_lower:
-            return m.get("model", "")
-    for m in configured_models:
-        for alias in m.get("aliases", []):
-            if alias.lower() == selected_lower:
-                return m.get("model", "")
-    return ""
 
 
 def _escape_prompt(text: str) -> str:
