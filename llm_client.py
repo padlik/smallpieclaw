@@ -27,6 +27,7 @@ import math
 import mimetypes
 import re
 import subprocess
+import threading
 import time
 from datetime import date
 from typing import Any, Optional
@@ -355,6 +356,7 @@ class LLMClient:
         # (e.g. tool-index queries repeated across user turns).
         self._embed_cache: dict[str, list[float]] = {}
         self._embed_cache_max: int = 512
+        self._embed_cache_lock = threading.Lock()
 
         # Retry / timeout from active model config
         _ref = self._models[self._active_idx]
@@ -1106,17 +1108,25 @@ class LLMClient:
             elif provider == "google":
                 vector = self._google_embed(text)
             else:
-                # Fallback: OpenAI-compatible
+                logger.warning(
+                    "Embedding provider '%s' has no native support; "
+                    "attempting OpenAI-compatible endpoint. "
+                    "Configure [embeddings] provider as 'openai', 'openrouter', or 'google'.",
+                    provider,
+                )
                 vector = self._openai_embed(text)
         except _LLM_CALL_ERRORS as exc:
             logger.error("Embedding error: %s", exc)
             raise
 
-        # Evict oldest entry when full (FIFO via dict insertion order, Python 3.7+)
-        if len(self._embed_cache) >= self._embed_cache_max:
-            oldest = next(iter(self._embed_cache))
-            del self._embed_cache[oldest]
-        self._embed_cache[text] = vector
+        # Evict oldest entry when full (FIFO via dict insertion order, Python 3.7+).
+        # Lock is required: concurrent sub-agents share this LLMClient and can race
+        # on the check-evict-insert sequence causing a KeyError on del.
+        with self._embed_cache_lock:
+            if len(self._embed_cache) >= self._embed_cache_max:
+                oldest = next(iter(self._embed_cache))
+                del self._embed_cache[oldest]
+            self._embed_cache[text] = vector
         return vector
 
     def _openai_embed(self, text: str) -> list[float]:

@@ -66,7 +66,7 @@ def mock_llm_response():
         mock = MagicMock()
         mock.chat.return_value = response_json
         mock.chat_with_fallback.return_value = response_json
-        mock.embed.return_value = [[0.1] * 128]
+        mock.embed.return_value = [0.1] * 128
         return mock
     return _factory
 

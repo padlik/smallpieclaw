@@ -31,9 +31,8 @@ class LLMProvider(Protocol):
     def chat(
         self,
         messages: list[dict],
-        model_cfg: dict,
-        *,
-        system: str = "",
+        system: str | None = None,
+        progress_cb=None,
         json_mode: bool = False,
     ) -> str:
         """Send a chat request and return the response text."""
@@ -42,17 +41,15 @@ class LLMProvider(Protocol):
     def chat_with_fallback(
         self,
         messages: list[dict],
-        model_cfg: dict,
-        fallback_models: list[dict],
-        *,
-        system: str = "",
+        system: str | None = None,
+        progress_cb=None,
         json_mode: bool = False,
     ) -> str:
         """Chat with automatic fallback to alternative models on failure."""
         ...
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """Generate embedding vectors for a list of texts."""
+    def embed(self, text: str) -> list[float]:
+        """Generate an embedding vector for a single text string."""
         ...
 
 
