@@ -16,7 +16,10 @@ import pytest
 from mad_plan import (
     MadPlanError,
     MadPlanOrchestrator,
+    _escape_prompt,
     _resolve_model_id,
+    _topo_sort_subtasks,
+    _unescape_prompt,
     build_agent_capabilities_summary,
     delete_plan,
     list_plans,
@@ -1141,3 +1144,157 @@ class TestResolveModelId:
 
     def test_empty_model_list(self):
         assert _resolve_model_id("kimi-k2.5", []) == ""
+
+
+# ---------------------------------------------------------------------------
+# _topo_sort_subtasks
+# ---------------------------------------------------------------------------
+
+class TestTopoSortSubtasks:
+    def _st(self, id_, depends_on=None):
+        return {"id": id_, "name": id_, "depends_on": depends_on or []}
+
+    def test_empty_list(self):
+        assert _topo_sort_subtasks([]) == []
+
+    def test_single_subtask_no_deps(self):
+        st = self._st("a")
+        assert _topo_sort_subtasks([st]) == [st]
+
+    def test_already_ordered(self):
+        a, b = self._st("a"), self._st("b", ["a"])
+        result = _topo_sort_subtasks([a, b])
+        assert [s["id"] for s in result] == ["a", "b"]
+
+    def test_reverse_order_reordered(self):
+        # b depends on a, but b is listed first — must be reordered
+        a, b = self._st("a"), self._st("b", ["a"])
+        result = _topo_sort_subtasks([b, a])
+        assert [s["id"] for s in result] == ["a", "b"]
+
+    def test_chain_three(self):
+        a = self._st("a")
+        b = self._st("b", ["a"])
+        c = self._st("c", ["b"])
+        result = _topo_sort_subtasks([c, b, a])
+        ids = [s["id"] for s in result]
+        assert ids.index("a") < ids.index("b") < ids.index("c")
+
+    def test_diamond_dependency(self):
+        a = self._st("a")
+        b = self._st("b", ["a"])
+        c = self._st("c", ["a"])
+        d = self._st("d", ["b", "c"])
+        result = _topo_sort_subtasks([d, c, b, a])
+        ids = [s["id"] for s in result]
+        assert ids.index("a") < ids.index("b")
+        assert ids.index("a") < ids.index("c")
+        assert ids.index("b") < ids.index("d")
+        assert ids.index("c") < ids.index("d")
+
+    def test_independent_subtasks_all_present(self):
+        a, b, c = self._st("a"), self._st("b"), self._st("c")
+        result = _topo_sort_subtasks([a, b, c])
+        assert {s["id"] for s in result} == {"a", "b", "c"}
+
+    def test_cycle_raises(self):
+        a = self._st("a", ["b"])
+        b = self._st("b", ["a"])
+        with pytest.raises(MadPlanError, match="cycle"):
+            _topo_sort_subtasks([a, b])
+
+    def test_external_dep_ignored_for_ordering(self):
+        # depends_on references an ID not in the subtask list — no crash, no order change
+        a = self._st("a", ["external_task"])
+        b = self._st("b", ["a"])
+        result = _topo_sort_subtasks([b, a])
+        assert [s["id"] for s in result] == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# save_plan / load_plan multi-line prompt round-trip
+# ---------------------------------------------------------------------------
+
+class TestSavePlanLoadPlanPromptRoundTrip:
+    def _orc(self):
+        return MadPlanOrchestrator()
+
+    def _make_plan(self, prompt: str) -> dict:
+        return {
+            "task": "Test task",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "strategy": {},
+            "subtasks": [
+                {
+                    "id": "subtask_1",
+                    "name": "Do something",
+                    "description": "desc",
+                    "model_name": "test-model",
+                    "params": {"temperature": 0.7, "top_p": 0.9, "max_tokens": 512},
+                    "prompt": prompt,
+                    "depends_on": [],
+                }
+            ],
+        }
+
+    def test_single_line_prompt_roundtrip(self, tmp_path):
+        orc = self._orc()
+        prompt = "Do the thing with argument X and return Y."
+        plan = self._make_plan(prompt)
+        name, _ = orc.save_plan(plan, str(tmp_path))
+        loaded = orc.load_plan(name, str(tmp_path))
+        assert loaded["subtasks"][0]["prompt"] == prompt
+
+    def test_multiline_prompt_roundtrip(self, tmp_path):
+        orc = self._orc()
+        prompt = "Step 1: fetch the data.\nStep 2: transform it.\nStep 3: upload results."
+        plan = self._make_plan(prompt)
+        name, _ = orc.save_plan(plan, str(tmp_path))
+        loaded = orc.load_plan(name, str(tmp_path))
+        assert loaded["subtasks"][0]["prompt"] == prompt
+
+    def test_empty_prompt_roundtrip(self, tmp_path):
+        orc = self._orc()
+        plan = self._make_plan("")
+        name, _ = orc.save_plan(plan, str(tmp_path))
+        loaded = orc.load_plan(name, str(tmp_path))
+        assert loaded["subtasks"][0]["prompt"] == ""
+
+    def test_prompt_with_backslash_n_literal(self, tmp_path):
+        # A prompt that already contains the literal text \n (not a real newline)
+        orc = self._orc()
+        prompt = r"Use \n as a separator between items."
+        plan = self._make_plan(prompt)
+        name, _ = orc.save_plan(plan, str(tmp_path))
+        loaded = orc.load_plan(name, str(tmp_path))
+        assert loaded["subtasks"][0]["prompt"] == prompt
+
+
+# ---------------------------------------------------------------------------
+# _escape_prompt / _unescape_prompt
+# ---------------------------------------------------------------------------
+
+class TestEscapeUnescapePrompt:
+    def test_roundtrip_plain(self):
+        s = "Hello world"
+        assert _unescape_prompt(_escape_prompt(s)) == s
+
+    def test_roundtrip_newline(self):
+        s = "Step 1\nStep 2\nStep 3"
+        assert _unescape_prompt(_escape_prompt(s)) == s
+
+    def test_roundtrip_backslash(self):
+        s = "Use \\ as escape"
+        assert _unescape_prompt(_escape_prompt(s)) == s
+
+    def test_roundtrip_literal_backslash_n(self):
+        s = r"Use \n as separator"
+        assert _unescape_prompt(_escape_prompt(s)) == s
+
+    def test_roundtrip_mixed(self):
+        s = "Line 1\nLine 2 with \\n literal and \\ backslash"
+        assert _unescape_prompt(_escape_prompt(s)) == s
+
+    def test_escape_is_single_line(self):
+        s = "a\nb\nc"
+        assert "\n" not in _escape_prompt(s)

@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import shutil
+from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -77,6 +78,72 @@ def _resolve_model_id(selected: str, configured_models: list[dict]) -> str:
             if alias.lower() == selected_lower:
                 return m.get("model", "")
     return ""
+
+
+def _escape_prompt(text: str) -> str:
+    """Escape a prompt for single-line Markdown storage.
+
+    Two characters are escaped: backslash (→ ``\\\\``) then newline (→ ``\\n``).
+    This order ensures that a literal ``\\n`` in the original round-trips correctly.
+    """
+    return text.replace("\\", "\\\\").replace("\n", "\\n")
+
+
+def _unescape_prompt(text: str) -> str:
+    """Reverse ``_escape_prompt``: decode ``\\n`` → newline and ``\\\\`` → ``\\``."""
+    result: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt == "n":
+                result.append("\n")
+                i += 2
+            elif nxt == "\\":
+                result.append("\\")
+                i += 2
+            else:
+                result.append(text[i])
+                i += 1
+        else:
+            result.append(text[i])
+            i += 1
+    return "".join(result)
+
+
+def _topo_sort_subtasks(subtasks: list[dict]) -> list[dict]:
+    """Return subtasks sorted so every dependency appears before its dependent.
+
+    Uses Kahn's BFS algorithm.  Dependency IDs that reference subtasks not
+    present in this plan (external dependencies) are ignored for ordering.
+    Raises MadPlanError if a dependency cycle is detected.
+    """
+    known_ids = {st["id"] for st in subtasks}
+    in_degree: dict[str, int] = {st["id"]: 0 for st in subtasks}
+    dependents: dict[str, list[str]] = {st["id"]: [] for st in subtasks}
+
+    for st in subtasks:
+        for dep_id in st.get("depends_on", []):
+            if dep_id in known_ids:
+                in_degree[st["id"]] += 1
+                dependents[dep_id].append(st["id"])
+
+    queue: deque[str] = deque(sid for sid, deg in in_degree.items() if deg == 0)
+    order: list[str] = []
+    while queue:
+        sid = queue.popleft()
+        order.append(sid)
+        for dep_sid in dependents[sid]:
+            in_degree[dep_sid] -= 1
+            if in_degree[dep_sid] == 0:
+                queue.append(dep_sid)
+
+    if len(order) != len(subtasks):
+        cycle_ids = [sid for sid, deg in in_degree.items() if deg > 0]
+        raise MadPlanError(f"Dependency cycle detected in subtasks: {cycle_ids}")
+
+    id_to_st = {st["id"]: st for st in subtasks}
+    return [id_to_st[sid] for sid in order]
 
 
 # ---------------------------------------------------------------------------
@@ -978,6 +1045,9 @@ class MadPlanOrchestrator:
         for i, st in enumerate(plan.get("subtasks", []), 1):
             params = st.get("params", {})
             dep_str = ", ".join(st.get("depends_on", [])) or "none"
+            # Escape real newlines so the prompt serialises as a single line;
+            # load_plan reverses this with _unescape_prompt().
+            escaped_prompt = _escape_prompt(st.get("prompt", ""))
             lines += [
                 f"### {i}. {st['name']}",
                 f"- **ID:** {st['id']}",
@@ -989,7 +1059,7 @@ class MadPlanOrchestrator:
                 f"- **Depends on:** {dep_str}",
                 "- **Parallel with:** none",
                 "- **Prompt:**",
-                f"  {st.get('prompt', '')}",
+                f"  {escaped_prompt}",
                 "",
             ]
 
@@ -1069,7 +1139,7 @@ class MadPlanOrchestrator:
                         st["_in_prompt"] = False
                     i += 1
                 st.pop("_in_prompt", None)
-                st["prompt"] = st["prompt"].strip()
+                st["prompt"] = _unescape_prompt(st["prompt"].strip())
                 if not st["id"]:
                     st["id"] = re.sub(r"[^\w]+", "_", st["name"].lower()).strip("_")[:40] or f"subtask_{len(subtasks)+1}"
                 subtasks.append(st)
@@ -1114,7 +1184,7 @@ class MadPlanOrchestrator:
         """
         results: dict[str, str] = {}
         output: list[dict] = []
-        subtasks = plan.get("subtasks", [])
+        subtasks = _topo_sort_subtasks(plan.get("subtasks", []))
 
         for i, st in enumerate(subtasks):
             st_id = st["id"]
