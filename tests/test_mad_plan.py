@@ -1381,3 +1381,169 @@ class TestMadPlanSession:
         s = load_session(str(tmp_path), "nonexistent")
         assert s.state == MadPlanState.PLANNING
         assert s.plan_name == "nonexistent"
+
+    def test_executing_to_planning_transition(self):
+        from mad_plan import MadPlanSession, MadPlanState
+        s = MadPlanSession(state=MadPlanState.EXECUTING)
+        s.transition(MadPlanState.PLANNING)
+        assert s.state == MadPlanState.PLANNING
+
+    def test_in_review_to_planning_transition(self):
+        from mad_plan import MadPlanSession, MadPlanState
+        s = MadPlanSession(state=MadPlanState.IN_REVIEW)
+        s.transition(MadPlanState.PLANNING)
+        assert s.state == MadPlanState.PLANNING
+
+    def test_in_review_to_off_transition(self):
+        from mad_plan import MadPlanSession, MadPlanState
+        s = MadPlanSession(state=MadPlanState.IN_REVIEW)
+        s.transition(MadPlanState.OFF)
+        assert s.state == MadPlanState.OFF
+
+    def test_loaded_session_has_cancel_event(self, tmp_path):
+        """Freshly-loaded session should have a usable cancel_event."""
+        import threading
+        from mad_plan import MadPlanSession, MadPlanState, load_session
+        s = MadPlanSession(state=MadPlanState.PLANNING, plan_name="ce_test")
+        s.persist(str(tmp_path))
+        loaded = load_session(str(tmp_path), "ce_test")
+        assert isinstance(loaded.cancel_event, threading.Event)
+        assert not loaded.cancel_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# execute_plan: cancellation and resume
+# ---------------------------------------------------------------------------
+
+class TestExecutePlanCancelResume:
+    """Tests for cancel_event and skip_completed/resume_from_dir."""
+
+    PLAN = {
+        "task": "cancel-resume test",
+        "subtasks": [
+            {"id": "a", "name": "Task A", "prompt": "do A", "model_name": "m1",
+             "params": {}, "depends_on": []},
+            {"id": "b", "name": "Task B", "prompt": "do B", "model_name": "m1",
+             "params": {}, "depends_on": ["a"]},
+            {"id": "c", "name": "Task C", "prompt": "do C", "model_name": "m1",
+             "params": {}, "depends_on": ["b"]},
+        ],
+    }
+
+    def _make_factory(self, results=None):
+        results = results or {}
+
+        def factory(model=None, label=None, **kw):
+            runner = MagicMock()
+            runner.run.return_value = results.get(label, "ok")
+            return runner
+        return factory
+
+    def test_cancel_before_first_subtask(self):
+        """Cancel event set before execution starts → no subtasks run."""
+        import threading
+        cancel = threading.Event()
+        cancel.set()
+
+        factory = self._make_factory()
+        output, failure = MadPlanOrchestrator().execute_plan(
+            self.PLAN, factory, cancel_event=cancel,
+        )
+        assert failure is not None
+        assert failure["error"] == "Cancelled by user"
+        assert "a" in failure["remaining"]
+        assert len(output) == 0
+
+    def test_cancel_after_first_subtask(self):
+        """Cancel event set after first subtask → only first subtask result returned."""
+        import threading
+        cancel = threading.Event()
+        call_count = [0]
+
+        def factory(model=None, label=None, **kw):
+            runner = MagicMock()
+            def _run(prompt):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    cancel.set()  # cancel after first task runs
+                return f"result-{call_count[0]}"
+            runner.run = _run
+            return runner
+
+        output, failure = MadPlanOrchestrator().execute_plan(
+            self.PLAN, factory, cancel_event=cancel,
+        )
+        assert len(output) == 1
+        assert output[0]["id"] == "a"
+        assert failure is not None
+        assert failure["error"] == "Cancelled by user"
+        assert "b" in failure["remaining"]
+
+    def test_skip_completed_skips_subtasks(self):
+        """skip_completed prevents matching subtasks from running."""
+        call_labels = []
+
+        def factory(model=None, label=None, **kw):
+            call_labels.append(label)
+            runner = MagicMock()
+            runner.run.return_value = "ok"
+            return runner
+
+        output, failure = MadPlanOrchestrator().execute_plan(
+            self.PLAN, factory, skip_completed={"a", "b"},
+        )
+        assert failure is None
+        # Only "c" should have been executed
+        assert len(call_labels) == 1
+        assert call_labels[0] == "madplan-c"
+
+    def test_resume_from_dir_loads_results(self, tmp_path):
+        """resume_from_dir loads previous results for dependency injection."""
+        # Write a previous results.json
+        prev_results = [
+            {"id": "a", "name": "Task A", "result": "previous-A-result", "traces": []},
+            {"id": "b", "name": "Task B", "result": "previous-B-result", "traces": []},
+        ]
+        results_path = tmp_path / "results.json"
+        results_path.write_text(json.dumps(prev_results))
+
+        # Track what prompt subtask C receives
+        received_prompts = []
+
+        def factory(model=None, label=None, **kw):
+            runner = MagicMock()
+            def _run(prompt):
+                received_prompts.append(prompt)
+                return "result-c"
+            runner.run = _run
+            return runner
+
+        output, failure = MadPlanOrchestrator().execute_plan(
+            self.PLAN, factory,
+            skip_completed={"a", "b"},
+            resume_from_dir=str(tmp_path),
+        )
+        assert failure is None
+        assert len(output) == 3  # 2 loaded + 1 new
+        # Verify subtask C got the upstream result injected
+        assert len(received_prompts) == 1
+        assert "previous-B-result" in received_prompts[0]
+
+    def test_resume_with_run_dir_writes_incrementally(self, tmp_path):
+        """New results are written to run_dir incrementally."""
+        factory = self._make_factory({"madplan-a": "r1", "madplan-b": "r2", "madplan-c": "r3"})
+        run_dir = str(tmp_path / "run")
+        os.makedirs(run_dir)
+
+        output, failure = MadPlanOrchestrator().execute_plan(
+            self.PLAN, factory, run_dir=run_dir,
+        )
+        assert failure is None
+        # results.json should exist with all 3 results
+        results_file = os.path.join(run_dir, "results.json")
+        assert os.path.exists(results_file)
+        with open(results_file) as f:
+            saved = json.load(f)
+        assert len(saved) == 3
+        assert saved[0]["id"] == "a"
+        assert saved[2]["id"] == "c"
