@@ -432,7 +432,7 @@ class TestExecutePlan:
     }
 
     def _make_factory(self, results: dict):
-        def factory(model=None, label=None, temperature=None, top_p=None, max_tokens=None):
+        def factory(model=None, label=None, temperature=None, top_p=None, max_tokens=None, on_tool_trace=None):
             runner = MagicMock()
             runner.run.return_value = results.get(label, "ok")
             return runner
@@ -1298,3 +1298,86 @@ class TestEscapeUnescapePrompt:
     def test_escape_is_single_line(self):
         s = "a\nb\nc"
         assert "\n" not in _escape_prompt(s)
+
+
+class TestMadPlanSession:
+    """Tests for MadPlanSession state machine."""
+
+    def test_initial_state_is_off(self):
+        from mad_plan import MadPlanSession, MadPlanState
+        s = MadPlanSession()
+        assert s.state == MadPlanState.OFF
+        assert not s.is_on
+        assert not s.is_executing
+
+    def test_transition_off_to_planning(self):
+        from mad_plan import MadPlanSession, MadPlanState
+        s = MadPlanSession()
+        s.transition(MadPlanState.PLANNING)
+        assert s.state == MadPlanState.PLANNING
+        assert s.is_on
+
+    def test_transition_planning_to_executing(self):
+        from mad_plan import MadPlanSession, MadPlanState
+        s = MadPlanSession(state=MadPlanState.PLANNING)
+        s.transition(MadPlanState.EXECUTING)
+        assert s.is_executing
+
+    def test_illegal_transition_raises(self):
+        from mad_plan import MadPlanSession, MadPlanState, MadPlanError
+        s = MadPlanSession()  # Off
+        with pytest.raises(MadPlanError, match="Cannot transition"):
+            s.transition(MadPlanState.EXECUTING)
+
+    def test_can_transition(self):
+        from mad_plan import MadPlanSession, MadPlanState
+        s = MadPlanSession(state=MadPlanState.PLANNING)
+        assert s.can_transition(MadPlanState.EXECUTING)
+        assert s.can_transition(MadPlanState.OFF)
+        assert not s.can_transition(MadPlanState.PLANNING)
+
+    def test_to_json_roundtrip(self):
+        from mad_plan import MadPlanSession, MadPlanState
+        s = MadPlanSession(
+            state=MadPlanState.PLANNING,
+            plan_name="test_plan",
+            dirty=True,
+            last_run="2026-01-01T00:00:00Z",
+            last_run_success=True,
+            plan_id="abc123",
+        )
+        data = s.to_json()
+        s2 = MadPlanSession.from_json(data)
+        assert s2.state == MadPlanState.PLANNING
+        assert s2.plan_name == "test_plan"
+        assert s2.dirty is True
+        assert s2.last_run == "2026-01-01T00:00:00Z"
+        assert s2.plan_id == "abc123"
+
+    def test_persist_and_load(self, tmp_path):
+        from mad_plan import MadPlanSession, MadPlanState, load_session
+        s = MadPlanSession(
+            state=MadPlanState.PLANNING,
+            plan_name="my_plan",
+            dirty=True,
+            plan_id="xyz",
+        )
+        s.persist(str(tmp_path))
+        loaded = load_session(str(tmp_path), "my_plan")
+        assert loaded.state == MadPlanState.PLANNING
+        assert loaded.plan_name == "my_plan"
+        assert loaded.dirty is True
+        assert loaded.plan_id == "xyz"
+
+    def test_persist_noop_without_plan_name(self, tmp_path):
+        from mad_plan import MadPlanSession
+        s = MadPlanSession()  # no plan_name
+        s.persist(str(tmp_path))
+        # No file created
+        assert not (tmp_path / "session.json").exists()
+
+    def test_load_session_missing_returns_default(self, tmp_path):
+        from mad_plan import MadPlanState, load_session
+        s = load_session(str(tmp_path), "nonexistent")
+        assert s.state == MadPlanState.PLANNING
+        assert s.plan_name == "nonexistent"

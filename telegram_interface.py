@@ -20,6 +20,8 @@ import uuid
 from functools import partial
 from typing import Callable, Optional
 
+import httpx
+
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -44,18 +46,55 @@ from telegram_commands import (
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
     cmd_mad_plan, cmd_agent, cb_mad_plan_review,
 )
+from mad_plan import MadPlanSession, MadPlanState
 
 logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class _UserMadPlanState:
-    """Per-user MadPlan mode state, isolated to avoid races with concurrent_updates=True."""
+class _UserState:
+    """Per-user state: MadPlan session + asyncio lock for concurrency safety."""
 
-    agent_mode: str = "agent"
-    pending_plan: dict | None = None
-    pending_plan_name_override: str = ""
-    plan_id: str = ""  # ID of the current pending plan (verified on approve)
+    session: MadPlanSession = dataclasses.field(default_factory=MadPlanSession)
+    lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
+
+    # Legacy convenience properties (bridge to old code during migration)
+    @property
+    def agent_mode(self) -> str:
+        return "madplan" if self.session.is_on else "agent"
+
+    @agent_mode.setter
+    def agent_mode(self, value: str) -> None:
+        if value == "madplan" and not self.session.is_on:
+            self.session.transition(MadPlanState.PLANNING)
+        elif value == "agent" and self.session.is_on:
+            self.session.transition(MadPlanState.OFF)
+
+    @property
+    def pending_plan(self) -> dict | None:
+        return self.session.plan
+
+    @pending_plan.setter
+    def pending_plan(self, value: dict | None) -> None:
+        self.session.plan = value
+        if value is not None:
+            self.session.dirty = True
+
+    @property
+    def pending_plan_name_override(self) -> str:
+        return self.session.plan_name
+
+    @pending_plan_name_override.setter
+    def pending_plan_name_override(self, value: str) -> None:
+        self.session.plan_name = value
+
+    @property
+    def plan_id(self) -> str:
+        return self.session.plan_id
+
+    @plan_id.setter
+    def plan_id(self, value: str) -> None:
+        self.session.plan_id = value
 
 
 class TelegramInterface:
@@ -102,7 +141,7 @@ class TelegramInterface:
         self._pending_pairs: dict[str, int] = {}
 
         # Per-user MadPlan mode state (isolated to avoid races with concurrent_updates=True)
-        self._user_state: dict[int, _UserMadPlanState] = {}
+        self._user_state: dict[int, _UserState] = {}
         self.sub_agent_factory: Optional[Callable] = None
 
         # Verbose mode: send each agent action as a new message instead of editing
@@ -116,10 +155,10 @@ class TelegramInterface:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def _get_user_state(self, user_id: int) -> _UserMadPlanState:
+    def _get_user_state(self, user_id: int) -> _UserState:
         """Return (or lazily create) per-user MadPlan state."""
         if user_id not in self._user_state:
-            self._user_state[user_id] = _UserMadPlanState()
+            self._user_state[user_id] = _UserState()
         return self._user_state[user_id]
 
     def build(self) -> Application:
@@ -173,7 +212,7 @@ class TelegramInterface:
             BotCommand("show_ctx", "Show current system prompt snapshot"),
             BotCommand("show_env", "Show runtime environment info"),
             BotCommand("stop", "Cancel the currently running task"),
-            BotCommand("mad_plan", "Model Adaptive Planner (plan / list / execute)"),
+            BotCommand("mp", "Model Adaptive Planner (plan / exec / review)"),
             BotCommand("agent", "Return to standard agent mode"),
         ]
         try:
@@ -209,7 +248,8 @@ class TelegramInterface:
         # Hidden diagnostic commands (not registered with BotFather)
         app.add_handler(CommandHandler("show_ctx", partial(cmd_show_ctx, self)))
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
-        # MadPlan commands
+        # MadPlan commands (register both /mp and legacy /mad_plan)
+        app.add_handler(CommandHandler("mp", partial(cmd_mad_plan, self)))
         app.add_handler(CommandHandler("mad_plan", partial(cmd_mad_plan, self)))
         app.add_handler(CommandHandler("agent", partial(cmd_agent, self)))
         # Inline button callbacks
@@ -338,7 +378,7 @@ class TelegramInterface:
             if intent == "CONVERSATIONAL":
                 await update.effective_message.reply_text(
                     "💬 Got it.\n\n💡 <i>Send me a task description to start planning, "
-                    "or use /mad_plan list to see saved plans.</i>",
+                    "or use /mp list to see saved plans.</i>",
                     parse_mode=ParseMode.HTML,
                 )
                 return
@@ -358,7 +398,10 @@ class TelegramInterface:
                 await self._run_mad_plan_task(update, ctx, task_text, images)
             return
         user = update.effective_user
-        status_msg = await update.effective_message.reply_text("🔄 Processing…")
+        try:
+            status_msg = await update.effective_message.reply_text("🔄 Processing…")
+        except Exception:
+            return
         loop = asyncio.get_running_loop()
         chat_id = update.effective_chat.id
 
@@ -604,6 +647,14 @@ class TelegramInterface:
 
     async def _error_handler(self, update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Global PTB error handler — logs with full context and notifies users."""
+        _network_errs = (
+            httpx.ConnectTimeout,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+        )
+        if isinstance(ctx.error, _network_errs):
+            logger.warning("Network timeout in update handler (transient): %s", ctx.error)
+            return
         logger.error("Unhandled exception in update handler", exc_info=ctx.error)
         # Try to notify the user who triggered the error
         try:
@@ -643,7 +694,22 @@ class TelegramInterface:
         try:
             await message.reply_text(_md_to_html(text), parse_mode=ParseMode.HTML)
         except Exception:
-            await message.reply_text(text)
+            try:
+                await message.reply_text(text)
+            except Exception:
+                pass
+
+    async def _safe_reply(self, message, text: str, **kwargs) -> bool:
+        """Send a new message; swallow all Telegram/network errors. Returns True on success."""
+        try:
+            await message.reply_text(text, **kwargs)
+            return True
+        except Exception:
+            try:
+                await message.reply_text(text[:4096])
+                return True
+            except Exception:
+                return False
 
     def _is_authorized(self, user_id: int) -> bool:
         if self.security_mode == "allowlist":
@@ -816,7 +882,10 @@ Rules:
         plans_dir = os.path.join(os.getcwd(), "plans")
         chat_id = update.effective_chat.id
 
-        status_msg = await update.effective_message.reply_text("🧠 Planning…")
+        try:
+            status_msg = await update.effective_message.reply_text("🧠 Planning…")
+        except Exception:
+            return
 
         # Keep typing indicator alive during the long planning LLM calls
         async def _typing_loop():
@@ -920,13 +989,18 @@ Rules:
         user_state = self._get_user_state(uid)
         original_plan = user_state.pending_plan
         if not original_plan:
-            await update.effective_message.reply_text(
-                "❌ No active plan to revise.", parse_mode=ParseMode.HTML
+            await self._safe_reply(
+                update.effective_message,
+                "❌ No active plan to revise.",
+                parse_mode=ParseMode.HTML,
             )
             return
 
         chat_id = update.effective_chat.id
-        status_msg = await update.effective_message.reply_text("🔄 Revising plan…")
+        try:
+            status_msg = await update.effective_message.reply_text("🔄 Revising plan…")
+        except Exception:
+            return
 
         # Keep typing indicator alive during the long revision LLM calls
         async def _typing_loop():
@@ -1034,18 +1108,39 @@ Rules:
         update: Update,
         ctx: ContextTypes.DEFAULT_TYPE,
         plan: dict,
+        traced: bool = False,
+        skip_completed: Optional[set] = None,
     ) -> None:
         """Execute an approved MadPlan plan via sub-agents."""
         from mad_plan import MadPlanOrchestrator
 
-        # Snapshot and clear pending state to prevent double-execute
         uid = update.effective_user.id if update.effective_user else 0
         user_state = self._get_user_state(uid)
-        mode_before_execution = user_state.agent_mode
+        session = user_state.session
+
+        # Create run directory
+        plans_dir = self.cfg.get("paths", {}).get("plans_dir", "plans")
+        run_ts = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = ""
+        if session.plan_name:
+            run_dir = os.path.join(plans_dir, session.plan_name, "runs", run_ts)
+            os.makedirs(run_dir, exist_ok=True)
+
+        # Transition to Executing
+        session.transition(MadPlanState.EXECUTING)
+        session.run_dir = run_dir
+
+        try:
+            status_msg = await update.effective_message.reply_text(
+                "⚙️ <b>Executing plan…</b>", parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            session.transition(MadPlanState.PLANNING)
+            return
+
+        # Clear pending state now that execution has started
         user_state.pending_plan = None
         user_state.plan_id = ""
-
-        status_msg = await update.effective_message.reply_text("⚙️ <b>Executing plan…</b>", parse_mode=ParseMode.HTML)
 
         async def _notify(text: str) -> None:
             try:
@@ -1064,9 +1159,40 @@ Rules:
                     notify_fn=lambda msg: asyncio.run_coroutine_threadsafe(
                         _notify(msg), loop
                     ),
+                    run_dir=run_dir,
+                    skip_completed=skip_completed,
                 ),
             )
             total = len(output)
+            session.last_run = run_ts
+            session.last_run_success = failure is None
+
+            # Write trace.json when tracing is enabled
+            if traced and run_dir:
+                import json as _json
+                trace_data = {
+                    "plan_name": session.plan_name,
+                    "run_ts": run_ts,
+                    "traced": True,
+                    "success": failure is None,
+                    "subtasks": [
+                        {
+                            "id": entry["id"],
+                            "name": entry["name"],
+                            "traces": entry.get("traces", []),
+                        }
+                        for entry in output
+                    ],
+                }
+                if failure:
+                    trace_data["failure"] = failure
+                trace_path = os.path.join(run_dir, "trace.json")
+                try:
+                    with open(trace_path, "w") as f:
+                        _json.dump(trace_data, f, indent=2, ensure_ascii=False)
+                except OSError:
+                    pass
+
             if failure:
                 failed_id = html.escape(str(failure.get("subtask_id", "?")))
                 remaining = len(failure.get("remaining", []))
@@ -1082,10 +1208,9 @@ Rules:
             logger.exception("MadPlan execute failed")
             await self._safe_edit(status_msg, f"❌ Execution error: {html.escape(str(exc))}")
         finally:
-            # Only reset to agent mode if the user hasn't re-entered madplan
-            # mode during the (potentially long) execution.
-            if user_state.agent_mode == mode_before_execution:
-                user_state.agent_mode = "agent"
+            session.transition(MadPlanState.PLANNING)
+            if session.plan_name and plans_dir:
+                session.persist(os.path.join(plans_dir, session.plan_name))
 
 # ---------------------------------------------------------------------------
 # Module constants

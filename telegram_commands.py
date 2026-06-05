@@ -54,11 +54,7 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
         "  /jobs    — list scheduled jobs\n"
         "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
-        "  /mad_plan — Model Adaptive Planner\n"
-        "      <code>/mad_plan</code> or <code>/mad_plan plan</code> — start planning a task\n"
-        "      <code>/mad_plan list</code>            — list saved plans\n"
-        "      <code>/mad_plan execute &lt;name&gt;</code> — execute a saved plan\n"
-        "      <code>/mad_plan delete &lt;name&gt;</code>  — delete a saved plan\n"
+        "  /mp      — Model Adaptive Planner (<code>/mp help</code> for subcommands)\n"
         "  /agent   — return to standard agent mode\n"
         "  /pair    — pairing token management\n"
         "  /myid    — show your Telegram user ID\n",
@@ -957,7 +953,10 @@ async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: Conte
 
 
 async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /mad_plan [plan|list|execute] [plan_name] command."""
+    """Handle /mp [subcommand] [args] — MadPlan command router.
+
+    Also handles legacy /mad_plan for backward compatibility.
+    """
     if not iface._is_authorized(update.effective_user.id):
         await iface._send_unauthorized(update)
         return
@@ -968,116 +967,75 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
     subcommand = parts[1].lower() if len(parts) > 1 else ""
     plan_name_arg = parts[2].strip() if len(parts) > 2 else ""
 
+    # Handle "exec_trace" with underscore (legacy compat for typed commands)
+    if subcommand == "exec_trace":
+        subcommand = "exec_trace"
+
     plans_dir = os.path.join(os.getcwd(), "plans")
+    user_state = iface._get_user_state(update.effective_user.id)
 
-    if subcommand == "list":
-        from mad_plan import list_plans as _list_plans
-        names = _list_plans(plans_dir)
-        if not names:
-            await update.effective_message.reply_text(
-                "📋 <b>MadPlan — Saved Plans</b>\n\n<i>No plans found.</i>",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            lines = ["📋 <b>MadPlan — Saved Plans</b>\n"]
-            for name in names:
-                lines.append(f"  • <code>{html.escape(name)}</code>")
-            await update.effective_message.reply_text(
-                "\n".join(lines), parse_mode=ParseMode.HTML
-            )
-        return
+    # --- status (default) ---
+    if subcommand in ("", "status"):
+        from mad_plan import list_plans as _list_plans, MadPlanState
+        session = user_state.session
+        plan_count = len(_list_plans(plans_dir))
+        state_icon = "🟢" if session.is_on else "⚪"
+        mode_str = session.state.value.replace("_", " ").title()
+        plan_info = f"<code>{html.escape(session.plan_name)}</code>" if session.plan_name else "<i>none</i>"
+        subtask_count = ""
+        if session.plan and "subtasks" in session.plan:
+            subtask_count = f" ({len(session.plan['subtasks'])} subtasks)"
 
-    if subcommand == "show":
-        if not plan_name_arg:
-            await update.effective_message.reply_text(
-                "❌ Usage: <code>/mad_plan show &lt;plan_name&gt;</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        if any(c in plan_name_arg for c in ("/", "\\", "..")):
-            await update.effective_message.reply_text(
-                "❌ Invalid plan name.", parse_mode=ParseMode.HTML
-            )
-            return
-        plan_md_path = os.path.join(plans_dir, plan_name_arg, "plan.md")
-        if not os.path.exists(plan_md_path):
-            await update.effective_message.reply_text(
-                f"❌ Plan <code>{html.escape(plan_name_arg)}</code> not found.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        try:
-            with open(plan_md_path, encoding="utf-8") as fh:
-                content = fh.read()
-        except OSError as exc:
-            await update.effective_message.reply_text(
-                f"❌ Could not read plan: {html.escape(str(exc))}",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        doc = io.BytesIO(content.encode("utf-8"))
-        doc.name = f"{plan_name_arg}.md"
-        await update.effective_message.reply_document(
-            document=doc,
-            filename=f"{plan_name_arg}.md",
-            caption=f"📋 Plan: <code>{html.escape(plan_name_arg)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+        last_run_str = ""
+        if session.last_run:
+            icon = "✅" if session.last_run_success else "❌"
+            last_run_str = f"\nLast run: {icon} {session.last_run}"
 
-    if subcommand == "execute":
         await update.effective_message.reply_text(
-            "⚠️ <b>Plan execution is not yet available.</b>\n\n"
-            "Use <code>/mad_plan show &lt;name&gt;</code> to review a saved plan, "
-            "or <code>/mad_plan list</code> to see all plans.",
+            f"🧠 <b>MadPlan Status</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"State:   {state_icon} {'On' if session.is_on else 'Off'}\n"
+            f"Mode:    {mode_str}\n"
+            f"Plan:    {plan_info}{subtask_count}\n"
+            f"Plans:   {plan_count} saved"
+            f"{last_run_str}\n\n"
+            f"<code>on | off | new | load | save | exec | stop | resume | review | show | list</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if subcommand == "delete":
-        if not plan_name_arg:
-            await update.effective_message.reply_text(
-                "❌ Usage: <code>/mad_plan delete &lt;plan_name&gt;</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        from mad_plan import list_plans as _list_plans
-        names = _list_plans(plans_dir)
-        if plan_name_arg not in names:
-            await update.effective_message.reply_text(
-                f"❌ Plan <code>{html.escape(plan_name_arg)}</code> not found.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        # Telegram callback_data is limited to 64 bytes.
-        # Prefix "madplan_delete_confirm:" is 23 bytes → max 41 bytes for name.
-        if len(plan_name_arg.encode()) > 41:
-            await update.effective_message.reply_text(
-                "❌ Plan name is too long to use in a button. "
-                "Delete it manually by removing the directory.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "🗑️ Yes, delete",
-                callback_data=f"madplan_delete_confirm:{plan_name_arg}",
-            ),
-            InlineKeyboardButton("↩️ Cancel", callback_data="madplan_delete_cancel"),
-        ]])
+    # --- help ---
+    if subcommand == "help":
         await update.effective_message.reply_text(
-            f"⚠️ Delete plan <code>{html.escape(plan_name_arg)}</code>? "
-            "This cannot be undone.",
+            "🧠 <b>MadPlan Commands</b>\n\n"
+            "<code>/mp</code>                — status\n"
+            "<code>/mp on</code>             — enter MadPlan mode\n"
+            "<code>/mp off</code>            — exit to agent mode\n"
+            "<code>/mp new [name]</code>     — start new plan\n"
+            "<code>/mp load &lt;name&gt;</code>   — load saved plan\n"
+            "<code>/mp save [name]</code>    — save current plan\n"
+            "<code>/mp exec [name]</code>    — execute plan\n"
+            "<code>/mp exec_trace [name]</code> — execute with tracing\n"
+            "<code>/mp stop</code>           — stop execution\n"
+            "<code>/mp resume</code>         — resume from last failure\n"
+            "<code>/mp review</code>         — review traced execution\n"
+            "<code>/mp show</code>           — send plan as file\n"
+            "<code>/mp list</code>           — list saved plans\n"
+            "<code>/mp delete [name]</code>  — delete a plan\n"
+            "<code>/mp rename &lt;name&gt;</code>  — rename current plan\n",
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
         )
         return
 
-    if subcommand in ("plan", ""):
-        # Switch to madplan mode; optional plan_name stored for the next message
-        user_state = iface._get_user_state(update.effective_user.id)
+    # --- on ---
+    if subcommand == "on":
+        if user_state.agent_mode == "madplan":
+            await update.effective_message.reply_text(
+                "🧠 MadPlan is already active. Send a task to start planning.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         user_state.agent_mode = "madplan"
-        user_state.pending_plan_name_override = plan_name_arg
 
         # Validate configured models against capabilities
         validation_text = ""
@@ -1102,26 +1060,477 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
 
         await update.effective_message.reply_text(
             "🧠 <b>MadPlan mode active</b>\n\n"
-            "Send me a task description and I'll analyse it, decompose it into "
-            "sub-tasks, select the best model for each one, and present a plan "
-            "for your review.\n\n"
-            "<b>Available subcommands:</b>\n"
-            "  <code>/mad_plan list</code>           — list saved plans\n"
-            "  <code>/mad_plan show &lt;name&gt;</code>  — view a saved plan\n"
-            "  <code>/mad_plan delete &lt;name&gt;</code> — delete a saved plan\n"
-            "  <code>/agent</code>                   — return to standard agent mode\n\n"
-            "💡 <i>Just send your task to start planning.</i>"
+            "Send me a task description and I'll create a plan.\n\n"
+            "💡 <i>Use /mp help for all commands.</i>"
             + validation_text,
             parse_mode=ParseMode.HTML,
         )
         return
 
+    # --- off ---
+    if subcommand == "off":
+        from mad_plan import MadPlanState
+        session = user_state.session
+        if session.is_executing:
+            await update.effective_message.reply_text(
+                "⚠️ Plan is currently executing. Use <code>/mp stop</code> first.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if session.dirty and session.plan:
+            # Auto-save before switching off
+            try:
+                from mad_plan import MadPlanOrchestrator
+                orch = MadPlanOrchestrator()
+                name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
+                session.plan_name = name
+                session.dirty = False
+                session.persist(plans_dir)
+            except Exception as exc:
+                logger.warning("Auto-save on off failed: %s", exc)
+        user_state.agent_mode = "agent"
+        user_state.pending_plan = None
+        await update.effective_message.reply_text(
+            "🤖 <b>Agent mode active</b>\n<i>Standard execution restored.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- new ---
+    if subcommand == "new":
+        from mad_plan import MadPlanSession, MadPlanState
+        session = user_state.session
+        # Auto-save current plan if present
+        if session.plan and session.dirty:
+            try:
+                from mad_plan import MadPlanOrchestrator
+                orch = MadPlanOrchestrator()
+                name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
+                session.plan_name = name
+                session.persist(plans_dir)
+            except Exception as exc:
+                logger.warning("Auto-save on new failed: %s", exc)
+        # Reset session to fresh planning state
+        user_state.session = MadPlanSession(
+            state=MadPlanState.PLANNING,
+            plan_name=plan_name_arg,
+        )
+        await update.effective_message.reply_text(
+            "🧠 <b>New plan started</b>\n\n"
+            "Send me a task description to begin planning."
+            + (f"\n📋 Name: <code>{html.escape(plan_name_arg)}</code>" if plan_name_arg else ""),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- list ---
+    if subcommand == "list":
+        from mad_plan import list_plans as _list_plans
+        names = _list_plans(plans_dir)
+        if not names:
+            await update.effective_message.reply_text(
+                "📋 <b>MadPlan — Saved Plans</b>\n\n<i>No plans found.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            lines = ["📋 <b>MadPlan — Saved Plans</b>\n"]
+            for name in names:
+                lines.append(f"  • <code>{html.escape(name)}</code>")
+            await update.effective_message.reply_text(
+                "\n".join(lines), parse_mode=ParseMode.HTML
+            )
+        return
+
+    # --- show ---
+    if subcommand == "show":
+        target = plan_name_arg or user_state.session.plan_name
+        if not target:
+            # Show current pending plan if available
+            if user_state.pending_plan:
+                saved_path = user_state.pending_plan.get("_saved_path")
+                if saved_path and os.path.exists(saved_path):
+                    try:
+                        with open(saved_path, "rb") as fh:
+                            await update.effective_message.reply_document(
+                                document=fh, filename=os.path.basename(saved_path)
+                            )
+                    except Exception:
+                        pass
+                    return
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/mp show &lt;plan_name&gt;</code> or have an active plan.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if any(c in target for c in ("/", "\\", "..")):
+            await update.effective_message.reply_text(
+                "❌ Invalid plan name.", parse_mode=ParseMode.HTML
+            )
+            return
+        plan_md_path = os.path.join(plans_dir, target, "plan.md")
+        if not os.path.exists(plan_md_path):
+            await update.effective_message.reply_text(
+                f"❌ Plan <code>{html.escape(target)}</code> not found.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            with open(plan_md_path, encoding="utf-8") as fh:
+                content = fh.read()
+        except OSError as exc:
+            await update.effective_message.reply_text(
+                f"❌ Could not read plan: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        doc = io.BytesIO(content.encode("utf-8"))
+        doc.name = f"{target}.md"
+        await update.effective_message.reply_document(
+            document=doc,
+            filename=f"{target}.md",
+            caption=f"📋 Plan: <code>{html.escape(target)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- load ---
+    if subcommand == "load":
+        if not plan_name_arg:
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/mp load &lt;plan_name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        from mad_plan import list_plans as _list_plans, load_plan, load_session as _load_session, MadPlanState
+        names = _list_plans(plans_dir)
+        if plan_name_arg not in names:
+            await update.effective_message.reply_text(
+                f"❌ Plan <code>{html.escape(plan_name_arg)}</code> not found.\n"
+                f"Available: {', '.join(f'<code>{html.escape(n)}</code>' for n in names[:10])}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Auto-save current if dirty
+        session = user_state.session
+        if session.plan and session.dirty:
+            try:
+                from mad_plan import MadPlanOrchestrator
+                orch = MadPlanOrchestrator()
+                name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
+                session.plan_name = name
+                session.persist(plans_dir)
+            except Exception as exc:
+                logger.warning("Auto-save on load failed: %s", exc)
+        # Load target plan
+        plan = load_plan(plans_dir, plan_name_arg)
+        loaded_session = _load_session(plans_dir, plan_name_arg)
+        loaded_session.plan = plan
+        loaded_session.state = MadPlanState.PLANNING
+        user_state.session = loaded_session
+        subtask_count = len(plan.get("subtasks", []))
+        await update.effective_message.reply_text(
+            f"✅ Loaded plan <code>{html.escape(plan_name_arg)}</code> "
+            f"({subtask_count} subtasks)\n\n"
+            "💡 Use <code>/mp exec</code> to execute or send feedback to revise.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- save ---
+    if subcommand == "save":
+        session = user_state.session
+        if not session.is_on or not session.plan:
+            await update.effective_message.reply_text(
+                "❌ No active plan to save. Create one first with <code>/mp on</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        from mad_plan import MadPlanOrchestrator
+        orch = MadPlanOrchestrator()
+        target_slug = plan_name_arg or session.plan_name
+        try:
+            name, path = orch.save_plan(session.plan, plans_dir, target_slug=target_slug)
+            session.plan_name = name
+            session.dirty = False
+            session.persist(plans_dir)
+            await update.effective_message.reply_text(
+                f"💾 Plan saved as <code>{html.escape(name)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            await update.effective_message.reply_text(
+                f"❌ Save failed: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    # --- delete ---
+    if subcommand == "delete":
+        target = plan_name_arg or user_state.session.plan_name
+        if not target:
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/mp delete &lt;plan_name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        from mad_plan import list_plans as _list_plans
+        names = _list_plans(plans_dir)
+        if target not in names:
+            await update.effective_message.reply_text(
+                f"❌ Plan <code>{html.escape(target)}</code> not found.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if len(target.encode()) > 41:
+            await update.effective_message.reply_text(
+                "❌ Plan name too long for confirmation button. Delete manually.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🗑️ Yes, delete",
+                callback_data=f"madplan_delete_confirm:{target}",
+            ),
+            InlineKeyboardButton("↩️ Cancel", callback_data="madplan_delete_cancel"),
+        ]])
+        await update.effective_message.reply_text(
+            f"⚠️ Delete plan <code>{html.escape(target)}</code>? This cannot be undone.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+
+    # --- rename ---
+    if subcommand == "rename":
+        if not plan_name_arg:
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/mp rename &lt;new_name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        session = user_state.session
+        if not session.is_on or not session.plan:
+            await update.effective_message.reply_text(
+                "❌ No active plan to rename.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        session.plan_name = plan_name_arg
+        session.dirty = True
+        await update.effective_message.reply_text(
+            f"✅ Plan renamed to <code>{html.escape(plan_name_arg)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- exec / exec_trace ---
+    if subcommand in ("exec", "exec_trace"):
+        session = user_state.session
+        if session.is_executing:
+            await update.effective_message.reply_text(
+                "⚠️ Execution already in progress. Use <code>/mp stop</code> to cancel.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # If plan_name_arg provided, load that plan
+        if plan_name_arg:
+            from mad_plan import list_plans as _list_plans, load_plan, load_session as _load_session, MadPlanState
+            names = _list_plans(plans_dir)
+            if plan_name_arg not in names:
+                await update.effective_message.reply_text(
+                    f"❌ Plan <code>{html.escape(plan_name_arg)}</code> not found.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            plan = load_plan(plans_dir, plan_name_arg)
+            loaded_session = _load_session(plans_dir, plan_name_arg)
+            loaded_session.plan = plan
+            loaded_session.state = MadPlanState.PLANNING
+            user_state.session = loaded_session
+            session = user_state.session
+        if not session.plan:
+            await update.effective_message.reply_text(
+                "❌ No plan to execute. Create or load one first.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not session.plan.get("subtasks"):
+            await update.effective_message.reply_text(
+                "❌ Plan has no subtasks. Cannot execute an empty plan.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Delegate to the existing execution handler
+        traced = subcommand == "exec_trace"
+        await iface._run_mad_plan_execute(update, ctx, session.plan, traced=traced)
+        return
+
+    # --- stop ---
+    if subcommand == "stop":
+        session = user_state.session
+        if not session.is_executing:
+            await update.effective_message.reply_text(
+                "ℹ️ No execution in progress.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Cancellation is handled via the existing cancel mechanism
+        await update.effective_message.reply_text(
+            "🛑 Stopping execution… partial results will be saved.",
+            parse_mode=ParseMode.HTML,
+        )
+        # The actual cancel signal is sent via /stop which sets cancel_event
+        return
+
+    # --- resume ---
+    if subcommand == "resume":
+        session = user_state.session
+        if not session.is_on:
+            await update.effective_message.reply_text(
+                "⚠️ MadPlan is not active. Use <code>/mp on</code> first.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not session.plan:
+            await update.effective_message.reply_text(
+                "⚠️ No plan loaded to resume.", parse_mode=ParseMode.HTML,
+            )
+            return
+        if not session.run_dir or not os.path.exists(
+            os.path.join(session.run_dir, "results.json")
+        ):
+            await update.effective_message.reply_text(
+                "⚠️ No previous run results found. Use <code>/mp exec</code> to start.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Read completed subtask IDs from results.json
+        import json as _json
+        try:
+            with open(os.path.join(session.run_dir, "results.json")) as f:
+                prev_results = _json.load(f)
+            completed_ids = {r["id"] for r in prev_results}
+        except (OSError, _json.JSONDecodeError, KeyError):
+            await update.effective_message.reply_text(
+                "⚠️ Could not read previous results. Use <code>/mp exec</code> instead.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        total_subtasks = len(session.plan.get("subtasks", []))
+        remaining = total_subtasks - len(completed_ids)
+        if remaining <= 0:
+            await update.effective_message.reply_text(
+                "✅ All subtasks already completed. Nothing to resume.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await update.effective_message.reply_text(
+            f"▶️ <b>Resuming execution</b> — skipping {len(completed_ids)} completed, "
+            f"{remaining} remaining.",
+            parse_mode=ParseMode.HTML,
+        )
+        await iface._run_mad_plan_execute(
+            update, ctx, session.plan, traced=False, skip_completed=completed_ids,
+        )
+        return
+
+    # --- review ---
+    if subcommand == "review":
+        session = user_state.session
+        if not session.is_on:
+            await update.effective_message.reply_text(
+                "⚠️ MadPlan is not active.", parse_mode=ParseMode.HTML,
+            )
+            return
+        # Find trace file: use run_dir from session, or last run in plan dir
+        trace_path = ""
+        if session.run_dir:
+            candidate = os.path.join(session.run_dir, "trace.json")
+            if os.path.exists(candidate):
+                trace_path = candidate
+        if not trace_path and session.plan_name:
+            runs_dir = os.path.join(plans_dir, session.plan_name, "runs")
+            if os.path.isdir(runs_dir):
+                runs = sorted(os.listdir(runs_dir), reverse=True)
+                for run_name in runs:
+                    candidate = os.path.join(runs_dir, run_name, "trace.json")
+                    if os.path.exists(candidate):
+                        trace_path = candidate
+                        break
+        if not trace_path:
+            await update.effective_message.reply_text(
+                "⚠️ No trace file found. Run <code>/mp exec_trace</code> first.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        import json as _json
+        try:
+            with open(trace_path) as f:
+                trace_data = _json.load(f)
+        except (OSError, _json.JSONDecodeError) as exc:
+            await update.effective_message.reply_text(
+                f"❌ Failed to read trace: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Transition to InReview
+        from mad_plan import MadPlanState
+        if session.can_transition(MadPlanState.IN_REVIEW):
+            session.transition(MadPlanState.IN_REVIEW)
+        # Build review prompt
+        review_prompt = _build_review_prompt(trace_data, session.plan)
+        await update.effective_message.reply_text(
+            "🔍 <b>Reviewing execution trace…</b>", parse_mode=ParseMode.HTML,
+        )
+        # Use sub-agent for review analysis
+        try:
+            loop = asyncio.get_running_loop()
+            runner = iface.sub_agent_factory(label="madplan-review")
+            review_result = await loop.run_in_executor(None, runner.run, review_prompt)
+        except Exception as exc:
+            logger.error("MadPlan review failed: %s", exc)
+            await update.effective_message.reply_text(
+                f"❌ Review failed: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
+            if session.can_transition(MadPlanState.PLANNING):
+                session.transition(MadPlanState.PLANNING)
+            return
+        # Send review result
+        if len(review_result) > 4000:
+            # Send as document for long reviews
+            doc = io.BytesIO(review_result.encode("utf-8"))
+            doc.name = "review.md"
+            try:
+                await update.effective_message.reply_document(document=doc)
+            except Exception:
+                await update.effective_message.reply_text(
+                    review_result[:4000] + "\n\n… (truncated)",
+                    parse_mode=None,
+                )
+        else:
+            await update.effective_message.reply_text(review_result, parse_mode=None)
+        # Transition back to planning
+        if session.can_transition(MadPlanState.PLANNING):
+            session.transition(MadPlanState.PLANNING)
+        return
+
+    # --- legacy: "plan" subcommand maps to "on" ---
+    if subcommand == "plan":
+        user_state.agent_mode = "madplan"
+        user_state.pending_plan_name_override = plan_name_arg
+        await update.effective_message.reply_text(
+            "🧠 <b>MadPlan mode active</b>\n\n"
+            "Send me a task description to begin planning.\n"
+            "💡 Use <code>/mp help</code> for all commands.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- unknown ---
     await update.effective_message.reply_text(
-        "❌ Unknown subcommand. Usage:\n"
-        "  <code>/mad_plan plan</code> — start planning\n"
-        "  <code>/mad_plan list</code> — list saved plans\n"
-        "  <code>/mad_plan show &lt;name&gt;</code> — view a saved plan\n"
-        "  <code>/mad_plan delete &lt;name&gt;</code> — delete a saved plan",
+        "❌ Unknown subcommand. Use <code>/mp help</code> for available commands.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1209,14 +1618,20 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
                         filename=os.path.basename(saved_path),
                     )
             except Exception as exc:
-                await query.message.reply_text(
-                    f"❌ Could not send plan file: {html.escape(str(exc))}",
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    await query.message.reply_text(
+                        f"❌ Could not send plan file: {html.escape(str(exc))}",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
         else:
-            await query.message.reply_text(
-                "❌ Plan file not found.", parse_mode=ParseMode.HTML
-            )
+            try:
+                await query.message.reply_text(
+                    "❌ Plan file not found.", parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
 
     elif data.startswith("madplan_delete_confirm:"):
         plan_name = data.split(":", 1)[1]
@@ -1244,3 +1659,35 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
             await query.edit_message_text("↩️ Deletion cancelled.", parse_mode=ParseMode.HTML)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Review helpers
+# ---------------------------------------------------------------------------
+
+def _build_review_prompt(trace_data: dict, plan: dict | None) -> str:
+    """Build a prompt for LLM-as-judge review of plan execution trace."""
+    import json as _json
+
+    parts = [
+        "You are reviewing a MadPlan execution trace. Analyze the execution and provide:",
+        "1. **Summary** — brief overview of what happened",
+        "2. **Issues found** — tool misusage, wrong paths, failed calls, inefficiencies",
+        "3. **Suggestions** — specific improvements to the plan",
+        "",
+        "Be concise and actionable. Focus on:",
+        "- Tools that failed or were called with wrong arguments",
+        "- Subtasks that took too long or had many retries",
+        "- Missing dependencies between subtasks",
+        "- Model selection issues",
+        "",
+        "## Plan",
+    ]
+    if plan:
+        parts.append(f"```json\n{_json.dumps(plan, indent=2, ensure_ascii=False)[:3000]}\n```")
+    else:
+        parts.append("(plan not available)")
+    parts.append("")
+    parts.append("## Execution Trace")
+    parts.append(f"```json\n{_json.dumps(trace_data, indent=2, ensure_ascii=False)[:8000]}\n```")
+    return "\n".join(parts)

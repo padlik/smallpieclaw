@@ -391,7 +391,8 @@ def _run(
 
     def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
                           fallback_models=None, max_iterations=None,
-                          max_tokens=None, temperature=None, top_p=None):
+                          max_tokens=None, temperature=None, top_p=None,
+                          on_tool_trace=None):
         """Create an isolated SubAgentRunner with the requested model override."""
         # Resolve model config — accept full model ID, model name, or alias
         if model:
@@ -447,6 +448,7 @@ def _run(
             usage_registry=get_token_registry(),
             depth=1,
             fallback_models=fallback_models,
+            on_tool_trace=on_tool_trace,
         )
         return runner
 

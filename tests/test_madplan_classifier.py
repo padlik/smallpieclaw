@@ -144,15 +144,15 @@ class TestPerUserMadPlanState:
         assert retrieved.plan_id == "abcd1234"
 
     def test_plan_id_field_exists_on_dataclass(self):
-        from telegram_interface import _UserMadPlanState
-        s = _UserMadPlanState()
+        from telegram_interface import _UserState
+        s = _UserState()
         assert s.plan_id == ""
         s.plan_id = "deadbeef"
         assert s.plan_id == "deadbeef"
 
     def test_pending_plan_name_override_defaults_empty(self):
-        from telegram_interface import _UserMadPlanState
-        s = _UserMadPlanState()
+        from telegram_interface import _UserState
+        s = _UserState()
         assert s.pending_plan_name_override == ""
 
 

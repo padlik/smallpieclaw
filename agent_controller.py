@@ -78,6 +78,7 @@ class AgentController:
         depth: int = 0,
         label: str = "main",   # identifies this agent in log lines
         on_step=None,          # Optional[Callable[[int], None]] — called after each step
+        on_tool_trace=None,    # Optional[Callable[[ToolTrace], None]] — called after each tool call
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -102,6 +103,7 @@ class AgentController:
         self.label = label
         self._log_prefix = f"[{label}] "
         self._on_step = on_step
+        self._on_tool_trace = on_tool_trace
         self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
 
         # ------------------------------------------------------------------
@@ -157,6 +159,7 @@ class AgentController:
             results=self.results,
             cancel_event=self._cancel_event,
             on_step=self._on_step,
+            on_tool_trace=self._on_tool_trace,
             confirmation=self._confirmation,
         )
         return react_loop(ctx, user_goal, progress_callback, images)
@@ -398,6 +401,7 @@ class SubAgentRunner:
         depth: int = 1,
         fallback_models: list[str] | None = None,  # None = inherit from parent config
         on_step=None,                 # Optional[Callable[[int], None]] — for iteration tracking
+        on_tool_trace=None,           # Optional[Callable[[ToolTrace], None]] — for trace collection
     ):
         import uuid
         from memory_store import ShortTermMemory, WorkingMemory
@@ -453,6 +457,7 @@ class SubAgentRunner:
             depth=depth,
             label=self.agent_id,
             on_step=on_step,
+            on_tool_trace=on_tool_trace,
         )
 
         self._model_id = model_cfg.get("model", "unknown")

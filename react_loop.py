@@ -54,6 +54,17 @@ def _tool_icon(name: str) -> str:
 
 
 @dataclass
+class ToolTrace:
+    """Record of a single tool call made during agent execution."""
+    tool_name: str
+    args_repr: str      # compact summary of args, never raw file contents
+    success: bool
+    duration_ms: float
+    error: str = ""     # only populated when success=False
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
 class ReactContext:
     """All state and dependencies the ReAct loop needs."""
 
@@ -88,6 +99,9 @@ class ReactContext:
 
     # Step callback
     on_step: Optional[Callable[[int], None]] = None
+
+    # Tool trace callback — called after each tool dispatch with a ToolTrace record
+    on_tool_trace: Optional[Callable] = None  # Optional[Callable[[ToolTrace], None]]
 
     # Confirmation coordination (shared with AgentController and Telegram)
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
@@ -465,11 +479,22 @@ def react_loop(
                 return result
 
             elif action == "tool":
+                _t0 = time.time()
                 outcome = _dispatch_tool(ctx, action_obj, _progress)
+                _duration_ms = (time.time() - _t0) * 1000
                 tool_name = action_obj.get("tool", "")
                 args = action_obj.get("args", {})
                 if isinstance(args, list):
                     args = {str(i): v for i, v in enumerate(args)}
+
+                if ctx.on_tool_trace is not None:
+                    ctx.on_tool_trace(ToolTrace(
+                        tool_name=tool_name,
+                        args_repr=_compact_args_repr(tool_name, args),
+                        success=outcome["success"],
+                        duration_ms=round(_duration_ms, 1),
+                        error=outcome.get("error", "") if not outcome["success"] else "",
+                    ))
 
                 if ctx.working:
                     ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
@@ -538,6 +563,20 @@ def react_loop(
 # ---------------------------------------------------------------------------
 # Tool dispatch helpers
 # ---------------------------------------------------------------------------
+
+
+def _compact_args_repr(tool_name: str, args: dict, max_len: int = 200) -> str:
+    """Build a compact, single-line summary of tool arguments (never raw file contents)."""
+    skip_keys = {"code", "content", "text", "body", "data"}
+    parts = []
+    for k, v in args.items():
+        if k in skip_keys:
+            parts.append(f"{k}=<{len(str(v))}chars>")
+        else:
+            s = str(v)
+            parts.append(f"{k}={s[:60]}{'…' if len(s) > 60 else ''}")
+    summary = ", ".join(parts)
+    return summary[:max_len] + ("…" if len(summary) > max_len else "")
 
 
 def _dispatch_tool(

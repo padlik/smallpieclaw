@@ -14,17 +14,21 @@ avoids over-decomposing tasks the agent can execute in a single run.
 
 from __future__ import annotations
 
+import enum
 import html
 import json
 import logging
 import os
 import re
 import shutil
+import tempfile
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from config_schema import resolve_model_id as _resolve_model_id
+from react_loop import ToolTrace
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +54,148 @@ class MadPlanExecutionError(MadPlanError):
 
 
 # ---------------------------------------------------------------------------
+# State Machine
+# ---------------------------------------------------------------------------
+
+# Valid state transitions: {from_state: {to_state, ...}}
+_VALID_TRANSITIONS: dict[str, set[str]] = {
+    "off":       {"planning"},
+    "planning":  {"off", "executing", "in_review"},
+    "executing": {"planning", "off"},
+    "in_review": {"planning", "off"},
+}
+
+
+class MadPlanState(str, enum.Enum):
+    """MadPlan session states."""
+    OFF = "off"
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    IN_REVIEW = "in_review"
+
+
+@dataclass
+class MadPlanSession:
+    """Per-user MadPlan session with state machine and persistence."""
+
+    state: MadPlanState = MadPlanState.OFF
+    plan_name: str = ""
+    plan: dict | None = None
+    dirty: bool = False
+    last_run: str = ""            # ISO timestamp of last execution
+    last_run_success: bool = False
+    run_dir: str = ""             # path to current/last run directory
+    plan_id: str = ""             # unique ID for pending plan (for callback verification)
+
+    def transition(self, target: MadPlanState) -> None:
+        """Transition to target state. Raises MadPlanError if transition is illegal."""
+        allowed = _VALID_TRANSITIONS.get(self.state.value, set())
+        if target.value not in allowed:
+            raise MadPlanError(
+                f"Cannot transition from '{self.state.value}' to '{target.value}'. "
+                f"Allowed: {sorted(allowed) or 'none'}"
+            )
+        self.state = target
+
+    def can_transition(self, target: MadPlanState) -> bool:
+        """Check if transition is legal without raising."""
+        return target.value in _VALID_TRANSITIONS.get(self.state.value, set())
+
+    @property
+    def is_on(self) -> bool:
+        return self.state != MadPlanState.OFF
+
+    @property
+    def is_executing(self) -> bool:
+        return self.state == MadPlanState.EXECUTING
+
+    def to_json(self) -> dict:
+        """Serialize session state to a JSON-safe dict (excludes plan content)."""
+        return {
+            "state": self.state.value,
+            "plan_name": self.plan_name,
+            "dirty": self.dirty,
+            "last_run": self.last_run,
+            "last_run_success": self.last_run_success,
+            "run_dir": self.run_dir,
+            "plan_id": self.plan_id,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> "MadPlanSession":
+        """Deserialize session state from a dict."""
+        return cls(
+            state=MadPlanState(data.get("state", "off")),
+            plan_name=data.get("plan_name", ""),
+            plan=None,  # plan content loaded separately from plan.md
+            dirty=data.get("dirty", False),
+            last_run=data.get("last_run", ""),
+            last_run_success=data.get("last_run_success", False),
+            run_dir=data.get("run_dir", ""),
+            plan_id=data.get("plan_id", ""),
+        )
+
+    def persist(self, plans_dir: str) -> None:
+        """Write session.json atomically to the plan folder. No-op if no plan_name."""
+        if not self.plan_name:
+            return
+        plan_dir = os.path.join(plans_dir, self.plan_name)
+        os.makedirs(plan_dir, exist_ok=True)
+        target = os.path.join(plan_dir, "session.json")
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=plan_dir, prefix=".session_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(self.to_json(), f, indent=2)
+            os.replace(tmp_path, target)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+
+def load_session(plans_dir: str, plan_name: str) -> MadPlanSession:
+    """Load session.json for a given plan. Returns default session if not found."""
+    session_path = os.path.join(plans_dir, plan_name, "session.json")
+    if not os.path.exists(session_path):
+        return MadPlanSession(
+            state=MadPlanState.PLANNING,
+            plan_name=plan_name,
+        )
+    try:
+        with open(session_path) as f:
+            data = json.load(f)
+        session = MadPlanSession.from_json(data)
+        session.plan_name = plan_name
+        return session
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to load session.json for '%s': %s", plan_name, exc)
+        return MadPlanSession(
+            state=MadPlanState.PLANNING,
+            plan_name=plan_name,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _sanitize_plan_name(name: str) -> str:
+    """Sanitize a plan name to a valid filesystem-safe slug.
+
+    - Lowercase
+    - Replace [^a-z0-9_-] with _
+    - Collapse consecutive underscores
+    - Trim trailing underscores
+    - Max 50 chars
+    """
+    slug = re.sub(r"[^a-z0-9_-]", "_", name.lower())
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug[:50] or "plan"
 
 
 def _escape_prompt(text: str) -> str:
@@ -951,29 +1095,24 @@ class MadPlanOrchestrator:
         created_at = plan.get("created_at", datetime.now(timezone.utc).isoformat())
 
         if target_slug:
-            slug = target_slug
+            slug = _sanitize_plan_name(target_slug)
             plan_dir = os.path.join(plans_dir, slug)
         else:
             # Prefer the LLM-generated short_name from the strategy when available
             short_name = plan.get("strategy", {}).get("short_name", "")
             if short_name:
-                base_slug = re.sub(r"[^\w]+", "_", str(short_name).lower()).strip("_")[:50] or "plan"
+                base_slug = _sanitize_plan_name(short_name)
             else:
                 words = re.findall(r"[a-zA-Z0-9]+", task_text)[:5]
-                base_slug = "_".join(w.lower() for w in words)[:50] if words else "plan"
+                base_slug = _sanitize_plan_name("_".join(words)) if words else "plan"
             slug = base_slug
             plan_dir = os.path.join(plans_dir, slug)
             if os.path.exists(plan_dir) and not overwrite:
-                # Guarantee a unique directory name
-                ts_suffix = re.sub(r"[^\d]", "", created_at[:19])
-                slug = f"{base_slug}_{ts_suffix}"
-                plan_dir = os.path.join(plans_dir, slug)
                 counter = 2
-                while os.path.exists(plan_dir):
-                    new_slug = f"{base_slug}_{ts_suffix}_{counter}"
-                    plan_dir = os.path.join(plans_dir, new_slug)
+                while os.path.exists(os.path.join(plans_dir, f"{base_slug}_{counter}")):
                     counter += 1
-                slug = os.path.basename(plan_dir)
+                slug = f"{base_slug}_{counter}"
+                plan_dir = os.path.join(plans_dir, slug)
 
         os.makedirs(plan_dir, exist_ok=True)
         path = os.path.join(plan_dir, "plan.md")
@@ -1149,9 +1288,18 @@ class MadPlanOrchestrator:
         plan: dict,
         sub_agent_factory: Callable,
         notify_fn: Optional[Callable] = None,
+        run_dir: str = "",
+        skip_completed: Optional[set] = None,
     ) -> tuple[list[dict], Optional[dict]]:
         """
         Execute sub-tasks sequentially.
+
+        Args:
+            plan: Plan dict with subtasks.
+            sub_agent_factory: Factory to create SubAgentRunner instances.
+            notify_fn: Optional callback for progress notifications.
+            run_dir: If set, write results.json incrementally to this directory.
+            skip_completed: Set of subtask IDs to skip (for resume functionality).
 
         Returns (completed_results, failure_info).
         failure_info is None on full success, or {subtask_id, model_name, error, remaining}.
@@ -1159,9 +1307,27 @@ class MadPlanOrchestrator:
         results: dict[str, str] = {}
         output: list[dict] = []
         subtasks = _topo_sort_subtasks(plan.get("subtasks", []))
+        skip = skip_completed or set()
+
+        # Load existing results if resuming
+        if run_dir and skip:
+            results_path = os.path.join(run_dir, "results.json")
+            if os.path.exists(results_path):
+                try:
+                    with open(results_path) as f:
+                        existing = json.load(f)
+                    for entry in existing:
+                        results[entry["id"]] = entry.get("result", "")
+                        output.append(entry)
+                except (json.JSONDecodeError, OSError):
+                    pass
 
         for i, st in enumerate(subtasks):
             st_id = st["id"]
+            if st_id in skip:
+                logger.info("MadPlan: skipping completed sub-task '%s'", st_id)
+                continue
+
             model_name = st.get("model_name", "")
             params = st.get("params", {})
             prompt = st.get("prompt", st.get("description", ""))
@@ -1188,12 +1354,18 @@ class MadPlanOrchestrator:
             logger.info("MadPlan: executing sub-task '%s' with model '%s'", st_id, model_name)
 
             try:
+                subtask_traces: list[ToolTrace] = []
+
+                def _collect_trace(trace: ToolTrace) -> None:
+                    subtask_traces.append(trace)
+
                 runner = sub_agent_factory(
                     model=model_name or None,
                     label=f"madplan-{st_id}",
                     temperature=params.get("temperature"),
                     top_p=params.get("top_p"),
                     max_tokens=params.get("max_tokens"),
+                    on_tool_trace=_collect_trace,
                 )
                 result = runner.run(prompt)
             except Exception as exc:
@@ -1207,10 +1379,49 @@ class MadPlanOrchestrator:
                 }
 
             results[st_id] = result
-            output.append({"id": st_id, "name": st["name"], "result": result})
-            logger.info("MadPlan: sub-task '%s' completed", st_id)
+            output.append({
+                "id": st_id,
+                "name": st["name"],
+                "result": result,
+                "traces": [
+                    {
+                        "tool": t.tool_name,
+                        "args": t.args_repr,
+                        "success": t.success,
+                        "duration_ms": t.duration_ms,
+                        "error": t.error,
+                        "ts": round(t.timestamp, 3),
+                    }
+                    for t in subtask_traces
+                ],
+            })
+            logger.info(
+                "MadPlan: sub-task '%s' completed (%d tool calls)",
+                st_id, len(subtask_traces),
+            )
+
+            # Incremental write to results.json (crash-safe)
+            if run_dir:
+                self._write_results(run_dir, output)
 
         return output, None
+
+    @staticmethod
+    def _write_results(run_dir: str, output: list[dict]) -> None:
+        """Write results.json atomically to the run directory."""
+        os.makedirs(run_dir, exist_ok=True)
+        target = os.path.join(run_dir, "results.json")
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=run_dir, prefix=".results_", suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(output, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, target)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1450,11 @@ def list_plans(plans_dir: str) -> list[str]:
         if os.path.isdir(os.path.join(plans_dir, entry)) and os.path.exists(plan_file):
             names.append(entry)
     return names
+
+
+def load_plan(plans_dir: str, plan_name: str) -> dict:
+    """Module-level wrapper for MadPlanOrchestrator.load_plan()."""
+    return MadPlanOrchestrator().load_plan(plan_name, plans_dir)
 
 
 def delete_plan(plan_name: str, plans_dir: str) -> None:
