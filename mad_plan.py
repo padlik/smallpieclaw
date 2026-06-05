@@ -1290,6 +1290,7 @@ class MadPlanOrchestrator:
         notify_fn: Optional[Callable] = None,
         run_dir: str = "",
         skip_completed: Optional[set] = None,
+        resume_from_dir: str = "",
     ) -> tuple[list[dict], Optional[dict]]:
         """
         Execute sub-tasks sequentially.
@@ -1300,6 +1301,8 @@ class MadPlanOrchestrator:
             notify_fn: Optional callback for progress notifications.
             run_dir: If set, write results.json incrementally to this directory.
             skip_completed: Set of subtask IDs to skip (for resume functionality).
+            resume_from_dir: Directory containing previous results.json to load
+                for dependency injection when resuming.
 
         Returns (completed_results, failure_info).
         failure_info is None on full success, or {subtask_id, model_name, error, remaining}.
@@ -1310,8 +1313,9 @@ class MadPlanOrchestrator:
         skip = skip_completed or set()
 
         # Load existing results if resuming
-        if run_dir and skip:
-            results_path = os.path.join(run_dir, "results.json")
+        load_dir = resume_from_dir or run_dir
+        if load_dir and skip:
+            results_path = os.path.join(load_dir, "results.json")
             if os.path.exists(results_path):
                 try:
                     with open(results_path) as f:

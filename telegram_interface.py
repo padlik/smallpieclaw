@@ -1121,6 +1121,7 @@ Rules:
         # Create run directory
         plans_dir = self.cfg.get("paths", {}).get("plans_dir", "plans")
         run_ts = time.strftime("%Y%m%d_%H%M%S")
+        prev_run_dir = session.run_dir  # save for resume
         run_dir = ""
         if session.plan_name:
             run_dir = os.path.join(plans_dir, session.plan_name, "runs", run_ts)
@@ -1161,6 +1162,7 @@ Rules:
                     ),
                     run_dir=run_dir,
                     skip_completed=skip_completed,
+                    resume_from_dir=prev_run_dir if skip_completed else "",
                 ),
             )
             total = len(output)
@@ -1208,9 +1210,10 @@ Rules:
             logger.exception("MadPlan execute failed")
             await self._safe_edit(status_msg, f"❌ Execution error: {html.escape(str(exc))}")
         finally:
-            session.transition(MadPlanState.PLANNING)
+            if session.can_transition(MadPlanState.PLANNING):
+                session.transition(MadPlanState.PLANNING)
             if session.plan_name and plans_dir:
-                session.persist(os.path.join(plans_dir, session.plan_name))
+                session.persist(plans_dir)
 
 # ---------------------------------------------------------------------------
 # Module constants

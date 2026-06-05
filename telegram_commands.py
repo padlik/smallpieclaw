@@ -1541,6 +1541,12 @@ async def cmd_agent(iface: "TelegramInterface", update: Update, ctx: ContextType
         await iface._send_unauthorized(update)
         return
     user_state = iface._get_user_state(update.effective_user.id)
+    if user_state.session.is_executing:
+        await update.effective_message.reply_text(
+            "⚠️ Plan is executing. Use <code>/mp stop</code> first.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     user_state.agent_mode = "agent"
     user_state.pending_plan = None
     await update.effective_message.reply_text(
