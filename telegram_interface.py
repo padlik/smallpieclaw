@@ -151,6 +151,12 @@ class TelegramInterface:
         # Saved when run() starts — used by send_message_to_users() from threads
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+    @property
+    def plans_dir(self) -> str:
+        """Centralized plans directory resolution."""
+        configured = self._config.get("paths", {}).get("plans_dir", "")
+        return configured or os.path.join(os.getcwd(), "plans")
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -1118,18 +1124,28 @@ Rules:
         user_state = self._get_user_state(uid)
         session = user_state.session
 
-        # Create run directory
-        plans_dir = self.cfg.get("paths", {}).get("plans_dir", "plans")
-        run_ts = time.strftime("%Y%m%d_%H%M%S")
-        prev_run_dir = session.run_dir  # save for resume
-        run_dir = ""
-        if session.plan_name:
-            run_dir = os.path.join(plans_dir, session.plan_name, "runs", run_ts)
-            os.makedirs(run_dir, exist_ok=True)
+        # Acquire lock for state transition (prevents double-exec race)
+        async with user_state.lock:
+            if session.is_executing:
+                await update.effective_message.reply_text(
+                    "⚠️ Execution already in progress.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
 
-        # Transition to Executing
-        session.transition(MadPlanState.EXECUTING)
-        session.run_dir = run_dir
+            # Create run directory
+            plans_dir = self.plans_dir
+            run_ts = time.strftime("%Y%m%d_%H%M%S")
+            prev_run_dir = session.run_dir  # save for resume
+            run_dir = ""
+            if session.plan_name:
+                run_dir = os.path.join(plans_dir, session.plan_name, "runs", run_ts)
+                os.makedirs(run_dir, exist_ok=True)
+
+            # Transition to Executing
+            session.transition(MadPlanState.EXECUTING)
+            session.run_dir = run_dir
+            session.cancel_event.clear()
 
         try:
             status_msg = await update.effective_message.reply_text(
@@ -1152,17 +1168,24 @@ Rules:
         try:
             orchestrator = MadPlanOrchestrator()
             loop = asyncio.get_running_loop()
+
+            def _safe_notify(msg: str) -> None:
+                try:
+                    if not loop.is_closed():
+                        asyncio.run_coroutine_threadsafe(_notify(msg), loop)
+                except RuntimeError:
+                    pass
+
             output, failure = await loop.run_in_executor(
                 None,
                 lambda: orchestrator.execute_plan(
                     plan,
                     sub_agent_factory=self.sub_agent_factory,
-                    notify_fn=lambda msg: asyncio.run_coroutine_threadsafe(
-                        _notify(msg), loop
-                    ),
+                    notify_fn=_safe_notify,
                     run_dir=run_dir,
                     skip_completed=skip_completed,
                     resume_from_dir=prev_run_dir if skip_completed else "",
+                    cancel_event=session.cancel_event,
                 ),
             )
             total = len(output)

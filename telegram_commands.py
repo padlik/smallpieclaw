@@ -971,7 +971,7 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
     if subcommand == "exec_trace":
         subcommand = "exec_trace"
 
-    plans_dir = os.path.join(os.getcwd(), "plans")
+    plans_dir = iface.plans_dir
     user_state = iface._get_user_state(update.effective_user.id)
 
     # --- status (default) ---
@@ -1375,12 +1375,11 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
                 parse_mode=ParseMode.HTML,
             )
             return
-        # Cancellation is handled via the existing cancel mechanism
+        session.cancel_event.set()
         await update.effective_message.reply_text(
-            "🛑 Stopping execution… partial results will be saved.",
+            "🛑 Stopping execution… will halt after current sub-task completes.",
             parse_mode=ParseMode.HTML,
         )
-        # The actual cancel signal is sent via /stop which sets cancel_event
         return
 
     # --- resume ---
@@ -1641,7 +1640,7 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
 
     elif data.startswith("madplan_delete_confirm:"):
         plan_name = data.split(":", 1)[1]
-        plans_dir = os.path.join(os.getcwd(), "plans")
+        plans_dir = iface.plans_dir
         from mad_plan import delete_plan, MadPlanError
         try:
             delete_plan(plan_name, plans_dir)

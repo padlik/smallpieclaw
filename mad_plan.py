@@ -22,8 +22,9 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -86,6 +87,7 @@ class MadPlanSession:
     last_run_success: bool = False
     run_dir: str = ""             # path to current/last run directory
     plan_id: str = ""             # unique ID for pending plan (for callback verification)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
     def transition(self, target: MadPlanState) -> None:
         """Transition to target state. Raises MadPlanError if transition is illegal."""
@@ -1291,6 +1293,7 @@ class MadPlanOrchestrator:
         run_dir: str = "",
         skip_completed: Optional[set] = None,
         resume_from_dir: str = "",
+        cancel_event: Optional[threading.Event] = None,
     ) -> tuple[list[dict], Optional[dict]]:
         """
         Execute sub-tasks sequentially.
@@ -1327,6 +1330,17 @@ class MadPlanOrchestrator:
                     pass
 
         for i, st in enumerate(subtasks):
+            # Check for cancellation before each subtask
+            if cancel_event and cancel_event.is_set():
+                remaining = [s["id"] for s in subtasks[i:] if s["id"] not in skip]
+                logger.info("MadPlan: execution cancelled, %d subtasks remaining", len(remaining))
+                return output, {
+                    "subtask_id": st["id"],
+                    "model_name": "",
+                    "error": "Cancelled by user",
+                    "remaining": remaining,
+                }
+
             st_id = st["id"]
             if st_id in skip:
                 logger.info("MadPlan: skipping completed sub-task '%s'", st_id)

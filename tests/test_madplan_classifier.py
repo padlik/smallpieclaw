@@ -171,6 +171,7 @@ def _make_cmd_iface(authorized: bool = True):
     from telegram_interface import TelegramInterface
     iface = TelegramInterface.__new__(TelegramInterface)
     iface._user_state = {}
+    iface._config = {}
     iface._is_authorized = MagicMock(return_value=authorized)
     iface._send_unauthorized = AsyncMock()
     return iface
