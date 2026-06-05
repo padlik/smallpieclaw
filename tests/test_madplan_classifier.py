@@ -259,3 +259,109 @@ class TestMadPlanShowCommand:
         assert isinstance(doc_arg, _io.BytesIO)
         assert doc_arg.read().decode("utf-8") == plan_md_content
 
+
+# ---------------------------------------------------------------------------
+# _build_review_prompt
+# ---------------------------------------------------------------------------
+
+class TestBuildReviewPrompt:
+    def test_with_plan_and_trace(self):
+        from telegram_commands import _build_review_prompt
+        plan = {"task": "test task", "subtasks": []}
+        trace = {"subtasks": [{"id": "s1", "traces": []}]}
+        prompt = _build_review_prompt(trace, plan)
+        assert "## Plan" in prompt
+        assert "test task" in prompt
+        assert "## Execution Trace" in prompt
+
+    def test_without_plan(self):
+        from telegram_commands import _build_review_prompt
+        trace = {"subtasks": []}
+        prompt = _build_review_prompt(trace, None)
+        assert "(plan not available)" in prompt
+        assert "## Execution Trace" in prompt
+
+    def test_large_plan_truncated(self):
+        from telegram_commands import _build_review_prompt
+        plan = {"task": "x" * 5000, "subtasks": []}
+        trace = {"small": True}
+        prompt = _build_review_prompt(trace, plan)
+        # Full 5000-char string shouldn't appear (3000 limit)
+        assert "x" * 4000 not in prompt
+
+    def test_large_trace_truncated(self):
+        from telegram_commands import _build_review_prompt
+        trace = {"data": "y" * 10000}
+        prompt = _build_review_prompt(trace, None)
+        # Full 10000-char string shouldn't appear (8000 limit)
+        assert "y" * 9000 not in prompt
+
+
+# ---------------------------------------------------------------------------
+# cmd_agent — is_executing guard
+# ---------------------------------------------------------------------------
+
+class TestCmdAgentExecutingGuard:
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_blocked_when_executing(self):
+        from telegram_commands import cmd_agent
+        from mad_plan import MadPlanState
+
+        iface = _make_cmd_iface()
+        user_state = iface._get_user_state(1)
+        user_state.session.state = MadPlanState.EXECUTING
+
+        update = _make_cmd_update("/agent", user_id=1)
+        ctx = MagicMock()
+        self._run(cmd_agent(iface, update, ctx))
+
+        reply = update.effective_message.reply_text.call_args[0][0]
+        assert "stop" in reply.lower() or "executing" in reply.lower()
+
+    def test_switches_when_not_executing(self):
+        from telegram_commands import cmd_agent
+        from mad_plan import MadPlanState
+
+        iface = _make_cmd_iface()
+        user_state = iface._get_user_state(1)
+        user_state.session.transition(MadPlanState.PLANNING)
+
+        update = _make_cmd_update("/agent", user_id=1)
+        ctx = MagicMock()
+        self._run(cmd_agent(iface, update, ctx))
+
+        reply = update.effective_message.reply_text.call_args[0][0]
+        assert "Agent mode" in reply
+        assert user_state.session.state == MadPlanState.OFF
+
+
+# ---------------------------------------------------------------------------
+# plans_dir property
+# ---------------------------------------------------------------------------
+
+class TestPlansDirProperty:
+    def test_from_config(self):
+        from telegram_interface import TelegramInterface
+        iface = TelegramInterface.__new__(TelegramInterface)
+        iface._config = {"paths": {"plans_dir": "/custom/plans"}}
+        iface._user_state = {}
+        assert iface.plans_dir == "/custom/plans"
+
+    def test_fallback_to_cwd(self, monkeypatch):
+        from telegram_interface import TelegramInterface
+        iface = TelegramInterface.__new__(TelegramInterface)
+        iface._config = {}
+        iface._user_state = {}
+        monkeypatch.setattr(os, "getcwd", lambda: "/fake/cwd")
+        assert iface.plans_dir == "/fake/cwd/plans"
+
+    def test_empty_config_uses_fallback(self, monkeypatch):
+        from telegram_interface import TelegramInterface
+        iface = TelegramInterface.__new__(TelegramInterface)
+        iface._config = {"paths": {"plans_dir": ""}}
+        iface._user_state = {}
+        monkeypatch.setattr(os, "getcwd", lambda: "/work")
+        assert iface.plans_dir == "/work/plans"
+

@@ -1547,3 +1547,147 @@ class TestExecutePlanCancelResume:
         assert len(saved) == 3
         assert saved[0]["id"] == "a"
         assert saved[2]["id"] == "c"
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_plan_name
+# ---------------------------------------------------------------------------
+
+class TestSanitizePlanName:
+    def test_basic_lowercasing(self):
+        from mad_plan import _sanitize_plan_name
+        assert _sanitize_plan_name("MyPlan") == "myplan"
+
+    def test_special_chars_replaced(self):
+        from mad_plan import _sanitize_plan_name
+        result = _sanitize_plan_name("hello world!")
+        assert " " not in result
+        assert "!" not in result
+
+    def test_consecutive_underscores_collapsed(self):
+        from mad_plan import _sanitize_plan_name
+        result = _sanitize_plan_name("foo   bar")
+        assert "__" not in result
+        assert "foo" in result and "bar" in result
+
+    def test_trailing_underscores_stripped(self):
+        from mad_plan import _sanitize_plan_name
+        result = _sanitize_plan_name("foo!!!")
+        assert not result.endswith("_")
+        assert result.startswith("foo")
+
+    def test_max_length_50(self):
+        from mad_plan import _sanitize_plan_name
+        result = _sanitize_plan_name("a" * 100)
+        assert len(result) <= 50
+
+    def test_empty_after_sanitize_returns_fallback(self):
+        from mad_plan import _sanitize_plan_name
+        result = _sanitize_plan_name("!!!")
+        assert len(result) > 0  # Should have some fallback
+
+    def test_hyphens_preserved(self):
+        from mad_plan import _sanitize_plan_name
+        assert _sanitize_plan_name("my-plan") == "my-plan"
+
+    def test_digits_preserved(self):
+        from mad_plan import _sanitize_plan_name
+        assert _sanitize_plan_name("plan123") == "plan123"
+
+    def test_empty_string(self):
+        from mad_plan import _sanitize_plan_name
+        result = _sanitize_plan_name("")
+        assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# load_plan module-level wrapper
+# ---------------------------------------------------------------------------
+
+class TestLoadPlanModuleWrapper:
+    def test_loads_saved_plan(self, tmp_path):
+        from mad_plan import load_plan as mod_load_plan
+        orc = MadPlanOrchestrator()
+        plan = {
+            "task": "wrapper test",
+            "subtasks": [
+                {"id": "s1", "name": "Step One", "description": "do it",
+                 "model_name": "m1", "params": {}, "prompt": "go",
+                 "rationale": "", "depends_on": []},
+            ],
+        }
+        slug, _ = orc.save_plan(plan, str(tmp_path))
+        loaded = mod_load_plan(str(tmp_path), slug)
+        assert loaded["task"] == "wrapper test"
+        assert len(loaded["subtasks"]) == 1
+
+    def test_raises_on_missing(self, tmp_path):
+        from mad_plan import load_plan as mod_load_plan
+        with pytest.raises(MadPlanError, match="not found"):
+            mod_load_plan(str(tmp_path), "nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# _write_results
+# ---------------------------------------------------------------------------
+
+class TestWriteResults:
+    def test_creates_dir_and_writes_json(self, tmp_path):
+        run_dir = str(tmp_path / "newdir")
+        output = [{"id": "a", "result": "ok"}]
+        MadPlanOrchestrator._write_results(run_dir, output)
+        with open(os.path.join(run_dir, "results.json")) as f:
+            assert json.load(f) == output
+
+    def test_atomic_overwrite(self, tmp_path):
+        run_dir = str(tmp_path)
+        MadPlanOrchestrator._write_results(run_dir, [{"id": "a"}])
+        MadPlanOrchestrator._write_results(run_dir, [{"id": "a"}, {"id": "b"}])
+        with open(os.path.join(run_dir, "results.json")) as f:
+            assert len(json.load(f)) == 2
+
+    def test_cleanup_on_failure(self, tmp_path, monkeypatch):
+        run_dir = str(tmp_path / "faildir")
+        os.makedirs(run_dir)
+        monkeypatch.setattr(json, "dump", lambda *a, **k: (_ for _ in ()).throw(IOError("full")))
+        with pytest.raises(IOError):
+            MadPlanOrchestrator._write_results(run_dir, [{"id": "x"}])
+        remaining = [f for f in os.listdir(run_dir) if f.startswith(".results_")]
+        assert remaining == []
+
+
+# ---------------------------------------------------------------------------
+# execute_plan: cancel + skip interaction
+# ---------------------------------------------------------------------------
+
+class TestExecutePlanCancelSkipInteraction:
+    PLAN = {
+        "task": "cancel-skip",
+        "subtasks": [
+            {"id": "a", "name": "A", "prompt": "A", "model_name": "m", "params": {}, "depends_on": []},
+            {"id": "b", "name": "B", "prompt": "B", "model_name": "m", "params": {}, "depends_on": ["a"]},
+            {"id": "c", "name": "C", "prompt": "C", "model_name": "m", "params": {}, "depends_on": ["b"]},
+        ],
+    }
+
+    def test_cancel_with_skip_reports_remaining_correctly(self):
+        import threading
+        cancel = threading.Event()
+        cancel.set()
+        factory = MagicMock()
+        output, failure = MadPlanOrchestrator().execute_plan(
+            self.PLAN, factory, cancel_event=cancel, skip_completed={"a"},
+        )
+        assert failure is not None
+        assert failure["error"] == "Cancelled by user"
+        # 'a' is in skip so excluded from remaining
+        assert "a" not in failure["remaining"]
+        factory.assert_not_called()
+
+    def test_skip_all_succeeds(self):
+        factory = MagicMock()
+        output, failure = MadPlanOrchestrator().execute_plan(
+            self.PLAN, factory, skip_completed={"a", "b", "c"},
+        )
+        assert failure is None
+        factory.assert_not_called()
