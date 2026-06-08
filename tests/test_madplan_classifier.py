@@ -365,3 +365,99 @@ class TestPlansDirProperty:
         monkeypatch.setattr(os, "getcwd", lambda: "/work")
         assert iface.plans_dir == "/work/plans"
 
+
+# ---------------------------------------------------------------------------
+# Post-planning UX: execute callbacks
+# ---------------------------------------------------------------------------
+
+class TestExecuteCallbacks:
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _make_callback_update(self, data: str, user_id: int = 1):
+        update = MagicMock()
+        query = MagicMock()
+        query.data = data
+        query.from_user.id = user_id
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.message.reply_text = AsyncMock()
+        query.message.reply_document = AsyncMock()
+        update.callback_query = query
+        update.effective_user = MagicMock()
+        update.effective_user.id = user_id
+        update.effective_message = query.message
+        return update
+
+    def test_approve_shows_execute_buttons(self):
+        """After approve, message is edited with execute keyboard."""
+        from telegram_commands import cb_mad_plan_review
+
+        iface = _make_cmd_iface()
+        user_state = iface._get_user_state(1)
+        plan = {"_plan_name": "test_plan", "_plan_id": "abc", "subtasks": []}
+        user_state.pending_plan = plan
+        user_state.plan_id = "abc"
+
+        update = self._make_callback_update("madplan_approve:abc")
+        ctx = MagicMock()
+        self._run(cb_mad_plan_review(iface, update, ctx))
+
+        query = update.callback_query
+        call_kwargs = query.edit_message_text.call_args[1]
+        assert "saved" in call_kwargs.get("text", query.edit_message_text.call_args[0][0]).lower() \
+            or "saved" in str(query.edit_message_text.call_args)
+        # Should have reply_markup with execute buttons
+        assert call_kwargs.get("reply_markup") is not None
+
+    def test_approve_keeps_plan_in_session(self):
+        """After approve, plan stays in session for /mp exec."""
+        from telegram_commands import cb_mad_plan_review
+
+        iface = _make_cmd_iface()
+        user_state = iface._get_user_state(1)
+        plan = {"_plan_name": "my_plan", "_plan_id": "xyz", "subtasks": [{"id": "s1"}]}
+        user_state.pending_plan = plan
+        user_state.plan_id = "xyz"
+
+        update = self._make_callback_update("madplan_approve:xyz")
+        ctx = MagicMock()
+        self._run(cb_mad_plan_review(iface, update, ctx))
+
+        # Plan stays in session (accessible via session.plan)
+        assert user_state.session.plan == plan
+        assert user_state.session.plan_name == "my_plan"
+        # plan_id cleared (no longer pending approval)
+        assert user_state.plan_id == ""
+
+    def test_execute_callback_no_plan(self):
+        """Execute callback with no plan shows error."""
+        from telegram_commands import cb_mad_plan_review
+
+        iface = _make_cmd_iface()
+        iface._get_user_state(1)  # ensure state exists
+
+        update = self._make_callback_update("madplan_execute:abc")
+        ctx = MagicMock()
+        self._run(cb_mad_plan_review(iface, update, ctx))
+
+        query = update.callback_query
+        text = query.edit_message_text.call_args[0][0]
+        assert "no plan" in text.lower() or "❌" in text
+
+    def test_done_callback_shows_final_message(self):
+        """Done callback edits message to simple confirmation."""
+        from telegram_commands import cb_mad_plan_review
+
+        iface = _make_cmd_iface()
+        user_state = iface._get_user_state(1)
+        user_state.session.plan_name = "final_plan"
+
+        update = self._make_callback_update("madplan_done")
+        ctx = MagicMock()
+        self._run(cb_mad_plan_review(iface, update, ctx))
+
+        query = update.callback_query
+        text = query.edit_message_text.call_args[0][0]
+        assert "final_plan" in text
+        assert "saved" in text.lower() or "✅" in text

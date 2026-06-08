@@ -951,11 +951,17 @@ Rules:
                 "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
             )
 
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("💾 Confirm & Save", callback_data=f"madplan_approve:{plan_id}"),
-                InlineKeyboardButton("❌ Reject",  callback_data=f"madplan_reject:{plan_id}"),
-                InlineKeyboardButton("📋 Full plan", callback_data="madplan_show"),
-            ]])
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("▶️ Execute", callback_data=f"madplan_execute:{plan_id}"),
+                    InlineKeyboardButton("▶️ Traced", callback_data=f"madplan_execute_traced:{plan_id}"),
+                ],
+                [
+                    InlineKeyboardButton("💾 Save only", callback_data=f"madplan_approve:{plan_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"madplan_reject:{plan_id}"),
+                    InlineKeyboardButton("📋 Show", callback_data="madplan_show"),
+                ],
+            ])
 
             try:
                 await status_msg.delete()
@@ -1080,11 +1086,18 @@ Rules:
             mode_footer = (
                 "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
             )
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("💾 Confirm & Save", callback_data=f"madplan_approve:{plan_id}"),
-                InlineKeyboardButton("❌ Reject",  callback_data=f"madplan_reject:{plan_id}"),
-                InlineKeyboardButton("📋 Full plan", callback_data="madplan_show"),
-            ]])
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("▶️ Execute", callback_data=f"madplan_execute:{plan_id}"),
+                    InlineKeyboardButton("▶️ Traced", callback_data=f"madplan_execute_traced:{plan_id}"),
+                ],
+                [
+                    InlineKeyboardButton("💾 Save only", callback_data=f"madplan_approve:{plan_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"madplan_reject:{plan_id}"),
+                    InlineKeyboardButton("📋 Show", callback_data="madplan_show"),
+                ],
+            ])
 
             try:
                 await status_msg.delete()

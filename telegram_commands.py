@@ -1587,16 +1587,26 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
                 except Exception:
                     pass
                 return
-        # Plan is already auto-saved — just confirm and clear pending state
+        # Keep plan in session for subsequent /mp exec
         plan_name = plan.get("_plan_name", "")
-        user_state.pending_plan = None
-        user_state.plan_id = ""
+        user_state.session.plan = plan
+        user_state.session.plan_name = plan_name
+        user_state.session.dirty = True
+        user_state.plan_id = ""  # clear pending approval (don't clear plan itself)
+
+        # Show confirmation with execute buttons
+        plan_id = plan.get("_plan_id", "")
         name_display = f" <code>{html.escape(plan_name)}</code>" if plan_name else ""
+        exec_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Execute", callback_data=f"madplan_execute:{plan_id}"),
+            InlineKeyboardButton("▶️ Traced", callback_data=f"madplan_execute_traced:{plan_id}"),
+            InlineKeyboardButton("✅ Done", callback_data="madplan_done"),
+        ]])
         try:
             await query.edit_message_text(
-                f"✅ <b>Plan{name_display} saved.</b>\n\n"
-                "Send a new task to plan, or use /agent to return to standard mode.",
+                f"✅ <b>Plan{name_display} saved.</b>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=exec_keyboard,
             )
         except Exception:
             pass
@@ -1637,6 +1647,58 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
                 )
             except Exception:
                 pass
+
+    elif data.startswith("madplan_execute_traced:") or data.startswith("madplan_execute:"):
+        traced = data.startswith("madplan_execute_traced:")
+        plan = user_state.pending_plan or user_state.session.plan
+        if not plan:
+            try:
+                await query.edit_message_text("❌ No plan available to execute.", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            return
+        # Verify plan identity
+        parts = data.split(":", 1)
+        if len(parts) > 1 and parts[1]:
+            expected_id = parts[1]
+            actual_id = user_state.plan_id or plan.get("_plan_id", "")
+            if expected_id != actual_id:
+                try:
+                    await query.edit_message_text(
+                        "⚠️ This plan is outdated. Please review the current plan.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+                return
+        # Transfer plan to session (if still pending)
+        plan_name = plan.get("_plan_name", "")
+        if user_state.session.plan != plan:
+            user_state.session.plan = plan
+            user_state.session.plan_name = plan_name
+            user_state.session.dirty = True
+        user_state.plan_id = ""
+        # Edit the button message
+        mode_label = "traced " if traced else ""
+        try:
+            await query.edit_message_text(
+                f"⚙️ Starting {mode_label}execution of <code>{html.escape(plan_name)}</code>…",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        # Delegate to execution handler
+        await iface._run_mad_plan_execute(update, ctx, plan, traced=traced)
+
+    elif data == "madplan_done":
+        try:
+            plan_name = user_state.session.plan_name or "plan"
+            await query.edit_message_text(
+                f"✅ Plan <code>{html.escape(plan_name)}</code> saved.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
     elif data.startswith("madplan_delete_confirm:"):
         plan_name = data.split(":", 1)[1]
