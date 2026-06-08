@@ -133,6 +133,8 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Legacy fields hours/minutes/time are still accepted and auto-converted to cron. "
             "notify (bool, default true). "
             "model (str, optional — model identifier to use for this job's sub-agent, e.g. 'gpt-4o'). "
+            "fallback_models (list[str], optional — ordered list of fallback model identifiers "
+            "to try if the primary model is unavailable, e.g. ['gemini-3-flash-preview:cloud', 'gpt-4o-mini']). "
             "preserve_context (bool, default false — if true, conversation history is kept between runs). "
             "max_iterations (int, optional — override the step limit for this job; "
             "default: scheduled_max_iterations from config, 0 = unlimited). "
