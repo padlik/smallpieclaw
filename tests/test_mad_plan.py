@@ -1400,15 +1400,11 @@ class TestMadPlanSession:
         s.transition(MadPlanState.OFF)
         assert s.state == MadPlanState.OFF
 
-    def test_loaded_session_has_cancel_event(self, tmp_path):
-        """Freshly-loaded session should have a usable cancel_event."""
-        import threading
-        from mad_plan import MadPlanSession, MadPlanState, load_session
+    def test_session_does_not_have_cancel_event(self, tmp_path):
+        """cancel_event lives on _UserState, not MadPlanSession (runtime-only)."""
+        from mad_plan import MadPlanSession, MadPlanState
         s = MadPlanSession(state=MadPlanState.PLANNING, plan_name="ce_test")
-        s.persist(str(tmp_path))
-        loaded = load_session(str(tmp_path), "ce_test")
-        assert isinstance(loaded.cancel_event, threading.Event)
-        assert not loaded.cancel_event.is_set()
+        assert not hasattr(s, "cancel_event")
 
 
 # ---------------------------------------------------------------------------

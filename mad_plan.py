@@ -24,7 +24,7 @@ import shutil
 import tempfile
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -87,7 +87,6 @@ class MadPlanSession:
     last_run_success: bool = False
     run_dir: str = ""             # path to current/last run directory
     plan_id: str = ""             # unique ID for pending plan (for callback verification)
-    cancel_event: threading.Event = field(default_factory=threading.Event)
 
     def transition(self, target: MadPlanState) -> None:
         """Transition to target state. Raises MadPlanError if transition is illegal."""

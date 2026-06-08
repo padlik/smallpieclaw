@@ -1070,26 +1070,27 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
     # --- off ---
     if subcommand == "off":
         from mad_plan import MadPlanState
-        session = user_state.session
-        if session.is_executing:
-            await update.effective_message.reply_text(
-                "⚠️ Plan is currently executing. Use <code>/mp stop</code> first.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        if session.dirty and session.plan:
-            # Auto-save before switching off
-            try:
-                from mad_plan import MadPlanOrchestrator
-                orch = MadPlanOrchestrator()
-                name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
-                session.plan_name = name
-                session.dirty = False
-                session.persist(plans_dir)
-            except Exception as exc:
-                logger.warning("Auto-save on off failed: %s", exc)
-        user_state.agent_mode = "agent"
-        user_state.pending_plan = None
+        async with user_state.lock:
+            session = user_state.session
+            if session.is_executing:
+                await update.effective_message.reply_text(
+                    "⚠️ Plan is currently executing. Use <code>/mp stop</code> first.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            if session.dirty and session.plan:
+                # Auto-save before switching off
+                try:
+                    from mad_plan import MadPlanOrchestrator
+                    orch = MadPlanOrchestrator()
+                    name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
+                    session.plan_name = name
+                    session.dirty = False
+                    session.persist(plans_dir)
+                except Exception as exc:
+                    logger.warning("Auto-save on off failed: %s", exc)
+            user_state.agent_mode = "agent"
+            user_state.pending_plan = None
         await update.effective_message.reply_text(
             "🤖 <b>Agent mode active</b>\n<i>Standard execution restored.</i>",
             parse_mode=ParseMode.HTML,
@@ -1099,22 +1100,23 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
     # --- new ---
     if subcommand == "new":
         from mad_plan import MadPlanSession, MadPlanState
-        session = user_state.session
-        # Auto-save current plan if present
-        if session.plan and session.dirty:
-            try:
-                from mad_plan import MadPlanOrchestrator
-                orch = MadPlanOrchestrator()
-                name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
-                session.plan_name = name
-                session.persist(plans_dir)
-            except Exception as exc:
-                logger.warning("Auto-save on new failed: %s", exc)
-        # Reset session to fresh planning state
-        user_state.session = MadPlanSession(
-            state=MadPlanState.PLANNING,
-            plan_name=plan_name_arg,
-        )
+        async with user_state.lock:
+            session = user_state.session
+            # Auto-save current plan if present
+            if session.plan and session.dirty:
+                try:
+                    from mad_plan import MadPlanOrchestrator
+                    orch = MadPlanOrchestrator()
+                    name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
+                    session.plan_name = name
+                    session.persist(plans_dir)
+                except Exception as exc:
+                    logger.warning("Auto-save on new failed: %s", exc)
+            # Reset session to fresh planning state
+            user_state.session = MadPlanSession(
+                state=MadPlanState.PLANNING,
+                plan_name=plan_name_arg,
+            )
         await update.effective_message.reply_text(
             "🧠 <b>New plan started</b>\n\n"
             "Send me a task description to begin planning."
@@ -1210,23 +1212,24 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
                 parse_mode=ParseMode.HTML,
             )
             return
-        # Auto-save current if dirty
-        session = user_state.session
-        if session.plan and session.dirty:
-            try:
-                from mad_plan import MadPlanOrchestrator
-                orch = MadPlanOrchestrator()
-                name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
-                session.plan_name = name
-                session.persist(plans_dir)
-            except Exception as exc:
-                logger.warning("Auto-save on load failed: %s", exc)
-        # Load target plan
-        plan = load_plan(plans_dir, plan_name_arg)
-        loaded_session = _load_session(plans_dir, plan_name_arg)
-        loaded_session.plan = plan
-        loaded_session.state = MadPlanState.PLANNING
-        user_state.session = loaded_session
+        async with user_state.lock:
+            # Auto-save current if dirty
+            session = user_state.session
+            if session.plan and session.dirty:
+                try:
+                    from mad_plan import MadPlanOrchestrator
+                    orch = MadPlanOrchestrator()
+                    name, _ = orch.save_plan(session.plan, plans_dir, target_slug=session.plan_name)
+                    session.plan_name = name
+                    session.persist(plans_dir)
+                except Exception as exc:
+                    logger.warning("Auto-save on load failed: %s", exc)
+            # Load target plan
+            plan = load_plan(plans_dir, plan_name_arg)
+            loaded_session = _load_session(plans_dir, plan_name_arg)
+            loaded_session.plan = plan
+            loaded_session.state = MadPlanState.PLANNING
+            user_state.session = loaded_session
         subtask_count = len(plan.get("subtasks", []))
         await update.effective_message.reply_text(
             f"✅ Loaded plan <code>{html.escape(plan_name_arg)}</code> "
@@ -1375,7 +1378,7 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
                 parse_mode=ParseMode.HTML,
             )
             return
-        session.cancel_event.set()
+        user_state.cancel_event.set()
         await update.effective_message.reply_text(
             "🛑 Stopping execution… will halt after current sub-task completes.",
             parse_mode=ParseMode.HTML,

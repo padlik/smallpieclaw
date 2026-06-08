@@ -15,6 +15,7 @@ import html
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from functools import partial
@@ -57,6 +58,7 @@ class _UserState:
 
     session: MadPlanSession = dataclasses.field(default_factory=MadPlanSession)
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
+    cancel_event: threading.Event = dataclasses.field(default_factory=threading.Event)
 
     # Legacy convenience properties (bridge to old code during migration)
     @property
@@ -885,7 +887,7 @@ Rules:
     ) -> None:
         """Plan a task in MadPlan mode and show the enriched plan for review."""
         from mad_plan import MadPlanOrchestrator, MadPlanError, build_agent_capabilities_summary
-        plans_dir = os.path.join(os.getcwd(), "plans")
+        plans_dir = self.plans_dir
         chat_id = update.effective_chat.id
 
         try:
@@ -1065,7 +1067,7 @@ Rules:
 
             # Save the revised plan, using the original plan_name as target_slug
             # so the correct directory is always overwritten regardless of task text.
-            plans_dir = os.path.join(os.getcwd(), "plans")
+            plans_dir = self.plans_dir
             plan_name = revised_plan.get("_plan_name", "")
             if plan_name:
                 _, saved_path = orchestrator.save_plan(
@@ -1158,7 +1160,7 @@ Rules:
             # Transition to Executing
             session.transition(MadPlanState.EXECUTING)
             session.run_dir = run_dir
-            session.cancel_event.clear()
+            user_state.cancel_event.clear()
 
         try:
             status_msg = await update.effective_message.reply_text(
@@ -1198,7 +1200,7 @@ Rules:
                     run_dir=run_dir,
                     skip_completed=skip_completed,
                     resume_from_dir=prev_run_dir if skip_completed else "",
-                    cancel_event=session.cancel_event,
+                    cancel_event=user_state.cancel_event,
                 ),
             )
             total = len(output)
