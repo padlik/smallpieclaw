@@ -17,7 +17,6 @@ import os
 import re
 import threading
 import time
-import uuid
 from functools import partial
 from typing import Callable, Optional
 
@@ -153,6 +152,21 @@ class TelegramInterface:
         """Centralized plans directory resolution."""
         configured = self._config.get("paths", {}).get("plans_dir", "")
         return configured or os.path.join(os.getcwd(), "plans")
+
+    @property
+    def _mad_plan_service(self):
+        """Lazy-initialized MadPlanService instance."""
+        if not hasattr(self, "_mad_plan_service_instance"):
+            from mad_plan_service import MadPlanService
+            self._mad_plan_service_instance = MadPlanService(
+                plans_dir=self.plans_dir,
+                llm_client=self.llm_client,
+                sub_agent_factory=self.sub_agent_factory,
+                tool_registry=self.tool_registry,
+                skill_registry=self.skill_registry,
+                mcp_manager=self.mcp_manager,
+            )
+        return self._mad_plan_service_instance
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -881,16 +895,14 @@ Rules:
         images: Optional[list[str]] = None,
     ) -> None:
         """Plan a task in MadPlan mode and show the enriched plan for review."""
-        from mad_plan import MadPlanOrchestrator, MadPlanError, build_agent_capabilities_summary
-        plans_dir = self.plans_dir
-        chat_id = update.effective_chat.id
+        from mad_plan import MadPlanError
 
+        chat_id = update.effective_chat.id
         try:
             status_msg = await update.effective_message.reply_text("🧠 Planning…")
         except Exception:
             return
 
-        # Keep typing indicator alive during the long planning LLM calls
         async def _typing_loop():
             while True:
                 try:
@@ -902,51 +914,24 @@ Rules:
         typing_task = asyncio.create_task(_typing_loop())
 
         try:
-            orchestrator = MadPlanOrchestrator()
-
-            capabilities = build_agent_capabilities_summary(
-                tool_registry=self.tool_registry,
-                skill_registry=self.skill_registry,
-                mcp_manager=self.mcp_manager,
-            )
-
-            configured_models = []
-            if self.llm_client and hasattr(self.llm_client, "list_models"):
-                configured_models = self.llm_client.list_models()
-
-            from mad_plan import load_models_capabilities
-            caps_data = load_models_capabilities(os.path.join(os.getcwd(), "data"))
-
-            plan = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: orchestrator.plan_task(
-                    task_text,
-                    self.llm_client,
-                    caps_data,
-                    configured_models=configured_models,
-                    agent_capabilities=capabilities,
-                ),
-            )
-
-            # Auto-save the plan
             uid = update.effective_user.id if update.effective_user else 0
             user_state = self._get_user_state(uid)
-            ctx = user_state.plan_context
-            if ctx.name_override:
-                plan["task"] = f"{ctx.name_override} - {plan.get('task', '')}"
-                ctx.name_override = ""
-            plan_name, saved_path = orchestrator.save_plan(plan, plans_dir)
-            plan_id = uuid.uuid4().hex[:8]
+            name_override = user_state.plan_context.name_override
+            if name_override:
+                user_state.plan_context.name_override = ""
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self._mad_plan_service.create_plan(task_text, name_override=name_override),
+            )
+
+            plan_id = result.plan_id
             user_state.plan_context = PlanContext(
-                plan_name=plan_name, saved_path=saved_path, plan_id=plan_id,
+                plan_name=result.plan_name, saved_path=result.saved_path, plan_id=plan_id,
             )
-            user_state.pending_plan = plan
+            user_state.pending_plan = result.plan
 
-            plan_html = orchestrator.format_plan_html(plan)
-            mode_footer = (
-                "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
-            )
-
+            mode_footer = "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("▶️ Execute", callback_data=f"madplan_execute:{plan_id}"),
@@ -964,16 +949,15 @@ Rules:
             except Exception:
                 pass
 
-            chunks = self._split_message(plan_html)
+            chunks = self._split_message(result.html)
             for i, chunk in enumerate(chunks):
-                # Append mode footer to last chunk
                 text = chunk + mode_footer if i == len(chunks) - 1 else chunk
                 await update.effective_message.reply_text(
                     text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=keyboard,
                 )
-                keyboard = None  # only attach buttons to first chunk
+                keyboard = None
 
         except MadPlanError as exc:
             await self._safe_edit(status_msg, f"❌ MadPlan error: {html.escape(str(exc))}")
@@ -991,7 +975,7 @@ Rules:
         images: Optional[list[str]] = None,
     ) -> None:
         """Revise the pending MadPlan plan using user feedback."""
-        from mad_plan import MadPlanOrchestrator, MadPlanError, build_agent_capabilities_summary
+        from mad_plan import MadPlanError
 
         uid = update.effective_user.id if update.effective_user else 0
         user_state = self._get_user_state(uid)
@@ -1010,7 +994,6 @@ Rules:
         except Exception:
             return
 
-        # Keep typing indicator alive during the long revision LLM calls
         async def _typing_loop():
             while True:
                 try:
@@ -1022,62 +1005,25 @@ Rules:
         typing_task = asyncio.create_task(_typing_loop())
 
         try:
-            orchestrator = MadPlanOrchestrator()
-
-            capabilities = build_agent_capabilities_summary(
-                tool_registry=self.tool_registry,
-                skill_registry=self.skill_registry,
-                mcp_manager=self.mcp_manager,
-            )
-
-            configured_models = []
-            if self.llm_client and hasattr(self.llm_client, "list_models"):
-                configured_models = self.llm_client.list_models()
-
-            from mad_plan import load_models_capabilities
-            caps_data = load_models_capabilities(os.path.join(os.getcwd(), "data"))
-
             full_feedback = feedback
             if images:
-                full_feedback += (
-                    f"\n\n[Note: {len(images)} image attachment(s) accompany this feedback.]"
-                )
+                full_feedback += f"\n\n[Note: {len(images)} image attachment(s) accompany this feedback.]"
 
-            revised_plan = await asyncio.get_running_loop().run_in_executor(
+            prev_plan_name = user_state.plan_context.plan_name
+            result = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: orchestrator.revise_plan(
-                    original_plan,
-                    full_feedback,
-                    self.llm_client,
-                    caps_data,
-                    configured_models=configured_models,
-                    agent_capabilities=capabilities,
+                lambda: self._mad_plan_service.revise_plan(
+                    original_plan, full_feedback, plan_name=prev_plan_name,
                 ),
             )
 
-            # Save the revised plan, using the original plan_name as target_slug
-            # so the correct directory is always overwritten regardless of task text.
-            plans_dir = self.plans_dir
-            prev_ctx = user_state.plan_context
-            plan_name = prev_ctx.plan_name
-            if plan_name:
-                _, saved_path = orchestrator.save_plan(
-                    revised_plan, plans_dir, target_slug=plan_name
-                )
-            else:
-                plan_name, saved_path = orchestrator.save_plan(revised_plan, plans_dir)
-
-            plan_id = uuid.uuid4().hex[:8]
+            plan_id = result.plan_id
             user_state.plan_context = PlanContext(
-                plan_name=plan_name, saved_path=saved_path, plan_id=plan_id,
+                plan_name=result.plan_name, saved_path=result.saved_path, plan_id=plan_id,
             )
-            user_state.pending_plan = revised_plan
+            user_state.pending_plan = result.plan
 
-            plan_html = orchestrator.format_plan_html(revised_plan)
-            mode_footer = (
-                "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
-            )
-
+            mode_footer = "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("▶️ Execute", callback_data=f"madplan_execute:{plan_id}"),
@@ -1095,7 +1041,7 @@ Rules:
             except Exception:
                 pass
 
-            chunks = self._split_message(plan_html)
+            chunks = self._split_message(result.html)
             for i, chunk in enumerate(chunks):
                 text = chunk + mode_footer if i == len(chunks) - 1 else chunk
                 await update.effective_message.reply_text(
@@ -1122,8 +1068,6 @@ Rules:
         skip_completed: Optional[set] = None,
     ) -> None:
         """Execute an approved MadPlan plan via sub-agents."""
-        from mad_plan import MadPlanOrchestrator
-
         uid = update.effective_user.id if update.effective_user else 0
         user_state = self._get_user_state(uid)
         session = user_state.session
@@ -1137,18 +1081,9 @@ Rules:
                 )
                 return
 
-            # Create run directory
-            plans_dir = self.plans_dir
-            run_ts = time.strftime("%Y%m%d_%H%M%S")
-            prev_run_dir = session.run_dir  # save for resume
-            run_dir = ""
-            if session.plan_name:
-                run_dir = os.path.join(plans_dir, session.plan_name, "runs", run_ts)
-                os.makedirs(run_dir, exist_ok=True)
-
+            prev_run_dir = session.run_dir
             # Transition to Executing
             session.transition(MadPlanState.EXECUTING)
-            session.run_dir = run_dir
             user_state.cancel_event.clear()
 
         try:
@@ -1169,8 +1104,8 @@ Rules:
             except Exception:
                 pass
 
+        plans_dir = self.plans_dir
         try:
-            orchestrator = MadPlanOrchestrator()
             loop = asyncio.get_running_loop()
 
             def _safe_notify(msg: str) -> None:
@@ -1180,58 +1115,33 @@ Rules:
                 except RuntimeError:
                     pass
 
-            output, failure = await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None,
-                lambda: orchestrator.execute_plan(
+                lambda: self._mad_plan_service.execute_plan(
                     plan,
-                    sub_agent_factory=self.sub_agent_factory,
-                    notify_fn=_safe_notify,
-                    run_dir=run_dir,
+                    plan_name=session.plan_name,
+                    traced=traced,
                     skip_completed=skip_completed,
                     resume_from_dir=prev_run_dir if skip_completed else "",
                     cancel_event=user_state.cancel_event,
+                    notify_fn=_safe_notify,
                 ),
             )
-            total = len(output)
-            session.last_run = run_ts
-            session.last_run_success = failure is None
 
-            # Write trace.json when tracing is enabled
-            if traced and run_dir:
-                import json as _json
-                trace_data = {
-                    "plan_name": session.plan_name,
-                    "run_ts": run_ts,
-                    "traced": True,
-                    "success": failure is None,
-                    "subtasks": [
-                        {
-                            "id": entry["id"],
-                            "name": entry["name"],
-                            "traces": entry.get("traces", []),
-                        }
-                        for entry in output
-                    ],
-                }
-                if failure:
-                    trace_data["failure"] = failure
-                trace_path = os.path.join(run_dir, "trace.json")
-                try:
-                    with open(trace_path, "w") as f:
-                        _json.dump(trace_data, f, indent=2, ensure_ascii=False)
-                except OSError:
-                    pass
+            session.last_run = result.run_ts
+            session.last_run_success = result.success
+            session.run_dir = result.run_dir
 
-            if failure:
-                failed_id = html.escape(str(failure.get("subtask_id", "?")))
-                remaining = len(failure.get("remaining", []))
+            if result.failure:
+                failed_id = html.escape(str(result.failure.get("subtask_id", "?")))
+                remaining = len(result.failure.get("remaining", []))
                 await self._safe_edit(
                     status_msg,
-                    f"⚠️ <b>Plan partially complete</b> — {total} sub-task(s) done, "
+                    f"⚠️ <b>Plan partially complete</b> — {result.total} sub-task(s) done, "
                     f"failed at <code>{failed_id}</code>, {remaining} skipped",
                 )
             else:
-                summary = f"✅ <b>Plan complete</b> — {total}/{total} sub-tasks completed"
+                summary = f"✅ <b>Plan complete</b> — {result.total}/{result.total} sub-tasks completed"
                 await self._safe_edit(status_msg, summary)
         except Exception as exc:
             logger.exception("MadPlan execute failed")
