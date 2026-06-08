@@ -1344,7 +1344,6 @@ class TestMadPlanSession:
             dirty=True,
             last_run="2026-01-01T00:00:00Z",
             last_run_success=True,
-            plan_id="abc123",
         )
         data = s.to_json()
         s2 = MadPlanSession.from_json(data)
@@ -1352,7 +1351,6 @@ class TestMadPlanSession:
         assert s2.plan_name == "test_plan"
         assert s2.dirty is True
         assert s2.last_run == "2026-01-01T00:00:00Z"
-        assert s2.plan_id == "abc123"
 
     def test_persist_and_load(self, tmp_path):
         from mad_plan import MadPlanSession, MadPlanState, load_session
@@ -1360,14 +1358,12 @@ class TestMadPlanSession:
             state=MadPlanState.PLANNING,
             plan_name="my_plan",
             dirty=True,
-            plan_id="xyz",
         )
         s.persist(str(tmp_path))
         loaded = load_session(str(tmp_path), "my_plan")
         assert loaded.state == MadPlanState.PLANNING
         assert loaded.plan_name == "my_plan"
         assert loaded.dirty is True
-        assert loaded.plan_id == "xyz"
 
     def test_persist_noop_without_plan_name(self, tmp_path):
         from mad_plan import MadPlanSession

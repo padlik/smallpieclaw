@@ -86,7 +86,6 @@ class MadPlanSession:
     last_run: str = ""            # ISO timestamp of last execution
     last_run_success: bool = False
     run_dir: str = ""             # path to current/last run directory
-    plan_id: str = ""             # unique ID for pending plan (for callback verification)
 
     def transition(self, target: MadPlanState) -> None:
         """Transition to target state. Raises MadPlanError if transition is illegal."""
@@ -119,7 +118,6 @@ class MadPlanSession:
             "last_run": self.last_run,
             "last_run_success": self.last_run_success,
             "run_dir": self.run_dir,
-            "plan_id": self.plan_id,
         }
 
     @classmethod
@@ -133,7 +131,6 @@ class MadPlanSession:
             last_run=data.get("last_run", ""),
             last_run_success=data.get("last_run_success", False),
             run_dir=data.get("run_dir", ""),
-            plan_id=data.get("plan_id", ""),
         )
 
     def persist(self, plans_dir: str) -> None:

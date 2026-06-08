@@ -102,7 +102,7 @@ class TestClassifyMadplanIntent:
 
 
 class TestPerUserMadPlanState:
-    """Tests for per-user state isolation and plan_id verification (fixes #2 and #9)."""
+    """Tests for per-user state isolation and plan_context verification."""
 
     def _make_iface(self):
         from telegram_interface import TelegramInterface
@@ -115,7 +115,7 @@ class TestPerUserMadPlanState:
         state = iface._get_user_state(42)
         assert state.agent_mode == "agent"
         assert state.pending_plan is None
-        assert state.plan_id == ""
+        assert state.plan_context.plan_id == ""
 
     def test_get_user_state_returns_same_object(self):
         iface = self._make_iface()
@@ -128,32 +128,35 @@ class TestPerUserMadPlanState:
         s1 = iface._get_user_state(1)
         s2 = iface._get_user_state(2)
         s1.agent_mode = "madplan"
-        s1.plan_id = "aabbccdd"
+        s1.plan_context.plan_id = "aabbccdd"
         assert s2.agent_mode == "agent"
-        assert s2.plan_id == ""
+        assert s2.plan_context.plan_id == ""
 
     def test_user_state_mutations_are_persistent(self):
         iface = self._make_iface()
         state = iface._get_user_state(99)
         state.agent_mode = "madplan"
         state.pending_plan = {"task": "test"}
-        state.plan_id = "abcd1234"
+        state.plan_context.plan_id = "abcd1234"
         retrieved = iface._get_user_state(99)
         assert retrieved.agent_mode == "madplan"
         assert retrieved.pending_plan == {"task": "test"}
-        assert retrieved.plan_id == "abcd1234"
+        assert retrieved.plan_context.plan_id == "abcd1234"
 
-    def test_plan_id_field_exists_on_dataclass(self):
+    def test_plan_context_fields_exist(self):
+        from telegram_interface import _UserState, PlanContext
+        s = _UserState()
+        assert isinstance(s.plan_context, PlanContext)
+        assert s.plan_context.plan_id == ""
+        assert s.plan_context.plan_name == ""
+        assert s.plan_context.saved_path == ""
+        assert s.plan_context.name_override == ""
+
+    def test_plan_context_name_override(self):
         from telegram_interface import _UserState
         s = _UserState()
-        assert s.plan_id == ""
-        s.plan_id = "deadbeef"
-        assert s.plan_id == "deadbeef"
-
-    def test_pending_plan_name_override_defaults_empty(self):
-        from telegram_interface import _UserState
-        s = _UserState()
-        assert s.pending_plan_name_override == ""
+        s.plan_context.name_override = "custom_name"
+        assert s.plan_context.name_override == "custom_name"
 
 
 def _make_cmd_update(text: str, user_id: int = 1):
@@ -395,9 +398,10 @@ class TestExecuteCallbacks:
 
         iface = _make_cmd_iface()
         user_state = iface._get_user_state(1)
-        plan = {"_plan_name": "test_plan", "_plan_id": "abc", "subtasks": []}
+        plan = {"subtasks": []}
         user_state.pending_plan = plan
-        user_state.plan_id = "abc"
+        user_state.plan_context.plan_name = "test_plan"
+        user_state.plan_context.plan_id = "abc"
 
         update = self._make_callback_update("madplan_approve:abc")
         ctx = MagicMock()
@@ -416,9 +420,10 @@ class TestExecuteCallbacks:
 
         iface = _make_cmd_iface()
         user_state = iface._get_user_state(1)
-        plan = {"_plan_name": "my_plan", "_plan_id": "xyz", "subtasks": [{"id": "s1"}]}
+        plan = {"subtasks": [{"id": "s1"}]}
         user_state.pending_plan = plan
-        user_state.plan_id = "xyz"
+        user_state.plan_context.plan_name = "my_plan"
+        user_state.plan_context.plan_id = "xyz"
 
         update = self._make_callback_update("madplan_approve:xyz")
         ctx = MagicMock()
@@ -428,7 +433,7 @@ class TestExecuteCallbacks:
         assert user_state.session.plan == plan
         assert user_state.session.plan_name == "my_plan"
         # plan_id cleared (no longer pending approval)
-        assert user_state.plan_id == ""
+        assert user_state.plan_context.plan_id == ""
 
     def test_execute_callback_no_plan(self):
         """Execute callback with no plan shows error."""

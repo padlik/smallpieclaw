@@ -1148,17 +1148,16 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
         target = plan_name_arg or user_state.session.plan_name
         if not target:
             # Show current pending plan if available
-            if user_state.pending_plan:
-                saved_path = user_state.pending_plan.get("_saved_path")
-                if saved_path and os.path.exists(saved_path):
-                    try:
-                        with open(saved_path, "rb") as fh:
-                            await update.effective_message.reply_document(
-                                document=fh, filename=os.path.basename(saved_path)
-                            )
-                    except Exception:
-                        pass
-                    return
+            saved_path = user_state.plan_context.saved_path
+            if saved_path and os.path.exists(saved_path):
+                try:
+                    with open(saved_path, "rb") as fh:
+                        await update.effective_message.reply_document(
+                            document=fh, filename=os.path.basename(saved_path)
+                        )
+                except Exception:
+                    pass
+                return
             await update.effective_message.reply_text(
                 "❌ Usage: <code>/mp show &lt;plan_name&gt;</code> or have an active plan.",
                 parse_mode=ParseMode.HTML,
@@ -1521,7 +1520,7 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
     # --- legacy: "plan" subcommand maps to "on" ---
     if subcommand == "plan":
         user_state.agent_mode = "madplan"
-        user_state.pending_plan_name_override = plan_name_arg
+        user_state.plan_context.name_override = plan_name_arg
         await update.effective_message.reply_text(
             "🧠 <b>MadPlan mode active</b>\n\n"
             "Send me a task description to begin planning.\n"
@@ -1581,7 +1580,7 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
         parts = data.split(":", 1)
         if len(parts) > 1:
             expected_id = parts[1]
-            if expected_id != user_state.plan_id:
+            if expected_id != user_state.plan_context.plan_id:
                 try:
                     await query.edit_message_text(
                         "⚠️ This plan is outdated. Please review the current plan.",
@@ -1591,18 +1590,17 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
                     pass
                 return
         # Keep plan in session for subsequent /mp exec
-        plan_name = plan.get("_plan_name", "")
+        plan_ctx = user_state.plan_context
         user_state.session.plan = plan
-        user_state.session.plan_name = plan_name
+        user_state.session.plan_name = plan_ctx.plan_name
         user_state.session.dirty = True
-        user_state.plan_id = ""  # clear pending approval (don't clear plan itself)
+        plan_ctx.plan_id = ""  # clear pending approval (don't clear plan itself)
 
-        # Show confirmation with execute buttons
-        plan_id = plan.get("_plan_id", "")
-        name_display = f" <code>{html.escape(plan_name)}</code>" if plan_name else ""
+        # Show confirmation with execute buttons (no plan_id needed — plan is committed)
+        name_display = f" <code>{html.escape(plan_ctx.plan_name)}</code>" if plan_ctx.plan_name else ""
         exec_keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶️ Execute", callback_data=f"madplan_execute:{plan_id}"),
-            InlineKeyboardButton("▶️ Traced", callback_data=f"madplan_execute_traced:{plan_id}"),
+            InlineKeyboardButton("▶️ Execute", callback_data="madplan_execute:"),
+            InlineKeyboardButton("▶️ Traced", callback_data="madplan_execute_traced:"),
             InlineKeyboardButton("✅ Done", callback_data="madplan_done"),
         ]])
         try:
@@ -1626,8 +1624,7 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
             pass
 
     elif data == "madplan_show":
-        plan = user_state.pending_plan
-        saved_path = plan.get("_saved_path") if plan else None
+        saved_path = user_state.plan_context.saved_path
         if saved_path and os.path.exists(saved_path):
             try:
                 with open(saved_path, "rb") as fh:
@@ -1664,7 +1661,7 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
         parts = data.split(":", 1)
         if len(parts) > 1 and parts[1]:
             expected_id = parts[1]
-            actual_id = user_state.plan_id or plan.get("_plan_id", "")
+            actual_id = user_state.plan_context.plan_id
             if expected_id != actual_id:
                 try:
                     await query.edit_message_text(
@@ -1675,12 +1672,12 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
                     pass
                 return
         # Transfer plan to session (if still pending)
-        plan_name = plan.get("_plan_name", "")
+        plan_name = user_state.plan_context.plan_name
         if user_state.session.plan != plan:
             user_state.session.plan = plan
             user_state.session.plan_name = plan_name
             user_state.session.dirty = True
-        user_state.plan_id = ""
+        user_state.plan_context.plan_id = ""
         # Edit the button message
         mode_label = "traced " if traced else ""
         try:

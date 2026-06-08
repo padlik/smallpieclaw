@@ -53,12 +53,23 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
+class PlanContext:
+    """UI-layer metadata for the active plan (not persisted inside plan dict)."""
+
+    plan_name: str = ""
+    saved_path: str = ""
+    plan_id: str = ""       # unique ID for callback button verification
+    name_override: str = ""  # user-provided name hint before planning
+
+
+@dataclasses.dataclass
 class _UserState:
     """Per-user state: MadPlan session + asyncio lock for concurrency safety."""
 
     session: MadPlanSession = dataclasses.field(default_factory=MadPlanSession)
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
     cancel_event: threading.Event = dataclasses.field(default_factory=threading.Event)
+    plan_context: PlanContext = dataclasses.field(default_factory=PlanContext)
 
     # Legacy convenience properties (bridge to old code during migration)
     @property
@@ -81,22 +92,6 @@ class _UserState:
         self.session.plan = value
         if value is not None:
             self.session.dirty = True
-
-    @property
-    def pending_plan_name_override(self) -> str:
-        return self.session.plan_name
-
-    @pending_plan_name_override.setter
-    def pending_plan_name_override(self, value: str) -> None:
-        self.session.plan_name = value
-
-    @property
-    def plan_id(self) -> str:
-        return self.session.plan_id
-
-    @plan_id.setter
-    def plan_id(self, value: str) -> None:
-        self.session.plan_id = value
 
 
 class TelegramInterface:
@@ -936,17 +931,16 @@ Rules:
             # Auto-save the plan
             uid = update.effective_user.id if update.effective_user else 0
             user_state = self._get_user_state(uid)
-            name_override = user_state.pending_plan_name_override
-            if name_override:
-                plan["task"] = f"{name_override} - {plan.get('task', '')}"
-                user_state.pending_plan_name_override = ""
+            ctx = user_state.plan_context
+            if ctx.name_override:
+                plan["task"] = f"{ctx.name_override} - {plan.get('task', '')}"
+                ctx.name_override = ""
             plan_name, saved_path = orchestrator.save_plan(plan, plans_dir)
-            plan["_plan_name"] = plan_name
-            plan["_saved_path"] = saved_path
             plan_id = uuid.uuid4().hex[:8]
-            plan["_plan_id"] = plan_id
+            user_state.plan_context = PlanContext(
+                plan_name=plan_name, saved_path=saved_path, plan_id=plan_id,
+            )
             user_state.pending_plan = plan
-            user_state.plan_id = plan_id
 
             plan_html = orchestrator.format_plan_html(plan)
             mode_footer = (
@@ -1061,28 +1055,23 @@ Rules:
                 ),
             )
 
-            # Propagate metadata fields from the original plan that the LLM won't return
-            if original_plan.get("_plan_name"):
-                revised_plan["_plan_name"] = original_plan["_plan_name"]
-
             # Save the revised plan, using the original plan_name as target_slug
             # so the correct directory is always overwritten regardless of task text.
             plans_dir = self.plans_dir
-            plan_name = revised_plan.get("_plan_name", "")
+            prev_ctx = user_state.plan_context
+            plan_name = prev_ctx.plan_name
             if plan_name:
                 _, saved_path = orchestrator.save_plan(
                     revised_plan, plans_dir, target_slug=plan_name
                 )
-                revised_plan["_saved_path"] = saved_path
             else:
                 plan_name, saved_path = orchestrator.save_plan(revised_plan, plans_dir)
-                revised_plan["_plan_name"] = plan_name
-                revised_plan["_saved_path"] = saved_path
 
             plan_id = uuid.uuid4().hex[:8]
-            revised_plan["_plan_id"] = plan_id
+            user_state.plan_context = PlanContext(
+                plan_name=plan_name, saved_path=saved_path, plan_id=plan_id,
+            )
             user_state.pending_plan = revised_plan
-            user_state.plan_id = plan_id
 
             plan_html = orchestrator.format_plan_html(revised_plan)
             mode_footer = (
@@ -1172,7 +1161,7 @@ Rules:
 
         # Clear pending state now that execution has started
         user_state.pending_plan = None
-        user_state.plan_id = ""
+        user_state.plan_context.plan_id = ""
 
         async def _notify(text: str) -> None:
             try:
