@@ -71,6 +71,155 @@ def _legacy_to_cron(stype: str, time_str: str = None, hours=None, minutes=None, 
 
 
 # ---------------------------------------------------------------------------
+# JobExecutionLog
+# ---------------------------------------------------------------------------
+
+_RESULT_MAX_CHARS = 2000  # truncate result stored per entry
+
+
+class JobExecutionLog:
+    """Compact execution log for scheduled jobs, stored as JSONL.
+
+    Each entry:
+        {"ts": ISO8601, "tag": str, "task": str, "result": str,
+         "success": bool, "elapsed_s": int, "model": str}
+
+    Rotation (applied on every ``record()`` call):
+    - Drop entries older than ``max_age_hours``
+    - Keep at most ``max_per_job`` most recent entries per tag
+    """
+
+    def __init__(
+        self,
+        log_file: str,
+        max_age_hours: int = 48,
+        max_per_job: int = 10,
+    ) -> None:
+        self._log_file = log_file
+        self._max_age_hours = max_age_hours
+        self._max_per_job = max_per_job
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def record(
+        self,
+        tag: str,
+        task: str,
+        result: str,
+        success: bool,
+        elapsed_s: int = 0,
+        model: str = "",
+    ) -> None:
+        """Append a new entry and rotate old ones.  Thread-safe."""
+        entry = {
+            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "tag": tag,
+            "task": (task or "")[:200],
+            "result": (result or "")[:_RESULT_MAX_CHARS],
+            "success": bool(success),
+            "elapsed_s": int(elapsed_s),
+            "model": model or "",
+        }
+        with self._lock:
+            entries = self._load()
+            entries.append(entry)
+            entries = self._rotate(entries)
+            self._write(entries)
+        logger.debug("JobExecutionLog: recorded entry for tag=%s success=%s", tag, success)
+
+    def format_for_prompt(self, max_entries: int = 20) -> str:
+        """Return a compact human-readable summary for injection into the system prompt."""
+        with self._lock:
+            entries = self._load()
+        if not entries:
+            return ""
+        # Most recent first, capped
+        recent = entries[-max_entries:][::-1]
+        lines = ["SCHEDULED JOB EXECUTION HISTORY (most recent first):"]
+        for e in recent:
+            status = "✅" if e.get("success") else "❌"
+            ts = e.get("ts", "?")
+            tag = e.get("tag", "?")
+            elapsed = e.get("elapsed_s", 0)
+            model = e.get("model", "")
+            result_preview = (e.get("result") or "").strip()
+            if len(result_preview) > 300:
+                result_preview = result_preview[:300] + "…"
+            model_part = f" [{model}]" if model else ""
+            lines.append(f"  {status} {ts} | {tag}{model_part} ({elapsed}s)")
+            if result_preview:
+                lines.append(f"     → {result_preview}")
+        return "\n".join(lines)
+
+    def read_recent(self, n: int = 50) -> list[dict]:
+        """Return the most recent ``n`` entries (newest last)."""
+        with self._lock:
+            entries = self._load()
+        return entries[-n:]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load(self) -> list[dict]:
+        """Load all entries from the JSONL file.  Caller must hold self._lock."""
+        if not os.path.exists(self._log_file):
+            return []
+        entries = []
+        try:
+            with open(self._log_file, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        except OSError as exc:
+            logger.warning("JobExecutionLog: failed to read %s: %s", self._log_file, exc)
+        return entries
+
+    def _rotate(self, entries: list[dict]) -> list[dict]:
+        """Remove stale entries.  Returns a new (filtered) list."""
+        cutoff = datetime.utcnow() - timedelta(hours=self._max_age_hours)
+        cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Drop entries older than max_age_hours
+        entries = [e for e in entries if e.get("ts", "") >= cutoff_iso]
+
+        # Per-tag cap: keep only max_per_job most recent per tag
+        tag_counts: dict[str, int] = {}
+        kept = []
+        for e in reversed(entries):
+            tag = e.get("tag", "")
+            count = tag_counts.get(tag, 0)
+            if count < self._max_per_job:
+                tag_counts[tag] = count + 1
+                kept.append(e)
+        kept.reverse()
+        return kept
+
+    def _write(self, entries: list[dict]) -> None:
+        """Atomically write entries back to the JSONL file.  Caller must hold self._lock."""
+        tmp_file = self._log_file + ".tmp"
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as fh:
+                for e in entries:
+                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            os.replace(tmp_file, self._log_file)
+        except OSError as exc:
+            logger.warning("JobExecutionLog: failed to write %s: %s", self._log_file, exc)
+            try:
+                os.unlink(tmp_file)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 
@@ -106,6 +255,15 @@ class Scheduler:
         self._commands_file = os.path.join(data_dir, "scheduler_commands.json")
         self._state_file = os.path.join(data_dir, "scheduler_state.json")
         self._dynamic_jobs_file = os.path.join(data_dir, "scheduled_jobs.json")
+
+        # Execution history log
+        _log_max_age = int(sched_cfg.get("execution_log_max_age_hours", 48))
+        _log_max_per = int(sched_cfg.get("execution_log_max_per_job", 10))
+        self.execution_log = JobExecutionLog(
+            log_file=os.path.join(data_dir, "job_execution_log.jsonl"),
+            max_age_hours=_log_max_age,
+            max_per_job=_log_max_per,
+        )
 
         # Long-running agent watcher
         self._warn_minutes: int = int(agent_cfg.get("long_run_warn_minutes", 30))
@@ -493,6 +651,8 @@ class Scheduler:
             spawn_args["expandable"] = False
             # Honour the job's notify setting — False suppresses Telegram output.
             spawn_args["_notify"] = meta.get("notify", True)
+            # Pass execution log callback so spawn_agent records the result.
+            spawn_args["_result_log_cb"] = self.execution_log.record
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now
@@ -550,6 +710,16 @@ class Scheduler:
             "last_error": meta.get("last_error"),
         }
         self._save_state()
+
+        # Record in execution log
+        self.execution_log.record(
+            tag=tag,
+            task=task,
+            result=result,
+            success=not error_occurred,
+            elapsed_s=0,
+            model=job_model or "",
+        )
 
         if error_occurred:
             if meta.get("notify", True):

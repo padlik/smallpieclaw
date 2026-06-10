@@ -103,6 +103,9 @@ class ReactContext:
     # Tool trace callback — called after each tool dispatch with a ToolTrace record
     on_tool_trace: Optional[Callable] = None  # Optional[Callable[[ToolTrace], None]]
 
+    # Scheduled job history — called to get a formatted string for the system prompt
+    job_history_fn: Optional[Callable[[], str]] = None
+
     # Confirmation coordination (shared with AgentController and Telegram)
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
 
@@ -310,6 +313,12 @@ def react_loop(
         ctx.working.start_task(user_goal)
 
     # 1. Build system prompt
+    _job_history_section = ""
+    if ctx.job_history_fn:
+        try:
+            _job_history_section = ctx.job_history_fn() or ""
+        except Exception as _jh_exc:
+            logger.warning("%sFailed to get job history: %s", pfx, _jh_exc)
     system, _ = _build_system_prompt(
         tool_index=ctx.tool_index,
         memory=ctx.memory,
@@ -322,6 +331,7 @@ def react_loop(
         log_backup_count=ctx.log_backup_count,
         top_tools=ctx.top_tools,
         user_goal=user_goal,
+        job_history_section=_job_history_section,
     )
 
     first_msg: dict = {"role": "user", "content": user_goal}

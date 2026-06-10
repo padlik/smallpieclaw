@@ -224,6 +224,7 @@ def build_system_prompt(
     log_backup_count: int,
     top_tools: int,
     user_goal: str = "(context snapshot)",
+    job_history_section: str = "",
 ) -> tuple[str, int]:
     """Build the full system prompt for the ReAct agent.
 
@@ -255,4 +256,10 @@ def build_system_prompt(
         file_storage=file_storage,
         log_section=log_section,
     )
+    # Inject job history only when it has content (avoids wasting tokens on blank lines)
+    if job_history_section:
+        prompt = prompt.replace(
+            "RESPONSE FORMAT — CRITICAL:",
+            f"{job_history_section}\n\nRESPONSE FORMAT — CRITICAL:",
+        )
     return prompt, estimate_tokens(prompt)

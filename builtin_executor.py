@@ -821,6 +821,8 @@ class BuiltinExecutor:
         # when multiple jobs fire concurrently.
         _finish_cb = args.get("_finish_cb") or getattr(self, '_scheduler_finish_cb', None)
         _finish_tag = job_tag or label
+        # Execution log callback — only provided by scheduler for scheduled jobs.
+        _result_log_cb = args.get("_result_log_cb") if job_tag else None
         # Scheduled jobs set expandable=False so results are shown as plain text,
         # not collapsed inside an expandable blockquote.
         _expandable = args.get("expandable", True)
@@ -934,7 +936,21 @@ class BuiltinExecutor:
                     record.status = "cancelled"
                     record.result = "[Cancelled]"
                     record._result_event.set()
+                    elapsed = int(time.time() - record.started_at)
                     logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
+                    # Record cancellation in job history log for scheduled jobs
+                    if _result_log_cb:
+                        try:
+                            _result_log_cb(
+                                tag=job_tag,
+                                task=task,
+                                result="[Cancelled]",
+                                success=False,
+                                elapsed_s=elapsed,
+                                model=runner._model_id,
+                            )
+                        except Exception as log_exc:
+                            logger.warning("spawn_agent: [%s] result_log_cb failed (cancelled): %s", label, log_exc)
                     # Suppress notification for agents cancelled due to get_agent_result timeout —
                     # the caller already received a timeout response and moved on.
                     if _notify_result and not record._timeout_cancelled:
@@ -955,6 +971,19 @@ class BuiltinExecutor:
                         "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
                         label, runner.agent_id, runner._model_id, elapsed,
                     )
+                    # Record execution result in job history log for scheduled jobs
+                    if _result_log_cb:
+                        try:
+                            _result_log_cb(
+                                tag=job_tag,
+                                task=task,
+                                result=result,
+                                success=True,
+                                elapsed_s=elapsed,
+                                model=runner._model_id,
+                            )
+                        except Exception as log_exc:
+                            logger.warning("spawn_agent: [%s] result_log_cb failed: %s", label, log_exc)
                     if _notify_result:
                         header_html = (
                             f"✅ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
@@ -976,6 +1005,19 @@ class BuiltinExecutor:
                     "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
                     label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
                 )
+                # Record failure in job history log for scheduled jobs
+                if _result_log_cb:
+                    try:
+                        _result_log_cb(
+                            tag=job_tag,
+                            task=task,
+                            result=f"Error: {exc}",
+                            success=False,
+                            elapsed_s=elapsed,
+                            model=runner._model_id,
+                        )
+                    except Exception as log_exc:
+                        logger.warning("spawn_agent: [%s] result_log_cb failed (error): %s", label, log_exc)
                 if _notify_result:
                     header_html = (
                         f"❌ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
