@@ -166,3 +166,37 @@ main.py calls create_graph_memory()
 ### Graceful Degradation
 
 If `[graph_memory] enabled = false` (default), or if the `ladybug` package is not installed, the feature is silently skipped — `graph_memory` remains `None` on `ReactContext`, no graph context is injected, and the `memory_graph_*` tools return informative error messages.
+
+### One-Time Backfill: LongTermMemory → Graph
+
+Existing `LongTermMemory` entries (`data/longterm_memory.json`) are **not** automatically migrated into the graph. To seed the graph from those entries, run the one-time backfill CLI:
+
+```bash
+# Dry-run (no graph writes, no state update)
+python backfill_graph_memory.py --config config.toml --dry-run
+
+# Import everything (incremental — already-imported entries are skipped)
+python backfill_graph_memory.py --config config.toml
+
+# Re-import all entries regardless of prior state
+python backfill_graph_memory.py --config config.toml --force
+
+# Import only the first 20 entries
+python backfill_graph_memory.py --config config.toml --limit 20
+```
+
+**Prerequisites:** `[graph_memory] enabled = true` in config.toml and `pip install ladybug`.
+The main agent **must not** be running against the same `db_path` at the same time (single-process DB).
+
+**How it works:**
+
+1. Loads all `LongTermMemory` entries sorted oldest-first via `LongTermMemory.entries()`.
+2. Filters out IDs already recorded in `data/graph_memory_backfill_state.json` (matching checksum).
+3. For each remaining entry, runs the same LLM triplet-extraction pipeline used by `GraphMemoryWriter`.
+4. Writes entities, facts, and an episode with `source="longterm_memory_backfill"`.
+5. Saves the entry ID, SHA-256 checksum, episode ID, and timestamp to the state file atomically after each entry.
+
+**Idempotency:** The state file (`data/graph_memory_backfill_state.json`) tracks imported entry IDs and content checksums. Rerunning is safe — unchanged entries are skipped. Use `--force` to reprocess all entries. The state file is written atomically (tmp file + `os.replace`) after each entry, so a partial run leaves no corrupt state.
+
+**Fidelity note:** The graph stores *distilled* knowledge (extracted entities and facts), not verbatim transcripts. `Episode.content` is stored up to 2000 characters per entry; original LongTermMemory timestamps are preserved in the state file and episode text, but not in the graph schema's timestamp fields.
+

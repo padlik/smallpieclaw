@@ -59,3 +59,17 @@ EmbeddingsConfig
 SchedulerConfig
 PathsConfig
 MCPServerConfig
+
+# graph_memory.py — backfill public API
+from graph_memory import (  # noqa: E402
+    BackfillEntryResult,
+    BackfillResult,
+    backfill_longterm_to_graph,
+)
+BackfillEntryResult
+BackfillResult
+backfill_longterm_to_graph
+
+# LongTermMemory.entries — safe snapshot API used by backfill CLI
+from memory_store import LongTermMemory  # noqa: E402
+LongTermMemory.entries

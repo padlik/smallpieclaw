@@ -345,6 +345,19 @@ class LongTermMemory:
             lines.append(f"  [{ts}] {entry['content']}")
         return "\n".join(lines)
 
+    def entries(self) -> list[tuple[str, dict]]:
+        """Return a snapshot of all entries as (entry_id, entry_dict) pairs.
+
+        The returned dicts are shallow copies — safe to read without holding
+        the lock, but callers must not mutate them.  Pairs are sorted oldest-
+        first by timestamp so backfill / iteration order is deterministic.
+        """
+        with self._lock:
+            return sorted(
+                ((eid, dict(entry)) for eid, entry in self._data.items()),
+                key=lambda pair: pair[1].get("timestamp", ""),
+            )
+
     def _latest(self, top_k: int) -> list:
         with self._lock:
             return sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)[:top_k]
