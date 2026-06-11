@@ -1,0 +1,601 @@
+"""
+graph_memory.py
+---------------
+Graph-based memory for the agent backed by LadybugDB (embedded graph DB,
+community fork of KuzuDB — same MIT licence and API).
+
+Install the optional dependency:  pip install ladybug
+
+The feature is entirely opt-in — if the package is not installed, or if
+`[graph_memory] enabled = false` (the default), nothing in this module is
+called and zero overhead is incurred.
+
+Architecture
+============
+- GraphMemoryStore : thread-safe LadybugDB wrapper with HNSW vector index
+- GraphMemoryWriter : background daemon thread; extracts triplets via LLM and
+  writes them to the store without blocking the agent turn
+- parse_extraction()  : JSON triplet parser (no Pydantic required)
+- format_for_prompt() : assemble graph context string for system prompt injection
+
+Three-layer schema
+------------------
+  Entity   — semantic layer (concepts, people, tools)
+  Episode  — episodic layer (timestamped user interactions)
+  RELATES_TO  rel — directed fact edge between entities
+  MENTIONED_IN rel — entity appeared in episode
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from queue import Empty, Queue
+from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Optional import — graceful degradation when ladybug is not installed
+# ---------------------------------------------------------------------------
+
+try:
+    import ladybug  # type: ignore[import-untyped]
+    _LADYBUG_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    ladybug = None  # type: ignore[assignment]
+    _LADYBUG_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Simple data transfer objects for extracted triplets (no Pydantic needed)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ExtractedEntity:
+    name: str
+    entity_type: str
+
+
+@dataclass
+class ExtractedFact:
+    source: str
+    target: str
+    relation_type: str
+    fact: str
+
+
+@dataclass
+class ExtractionResult:
+    entities: list[ExtractedEntity]
+    facts: list[ExtractedFact]
+
+
+# ---------------------------------------------------------------------------
+# Triplet extraction
+# ---------------------------------------------------------------------------
+
+EXTRACTION_PROMPT = """You are an expert knowledge graph extraction specialist.
+Extract both entity nodes and relationship facts from the conversation text below.
+
+ENTITY RULES:
+1. Extract speakers and named entities explicitly mentioned.
+2. Entity names must be at most 5 words. Use the most specific form available.
+3. Do NOT extract: pronouns, bare quantities, clock times, vague abstractions.
+
+FACT RULES:
+1. source and target must match extracted entity names exactly.
+2. Facts must be SELF-CONTAINED — understandable without the original context.
+3. relation_type must be SCREAMING_SNAKE_CASE (e.g. WORKS_AT, LIVES_IN, PREFERS).
+4. Extract preferences, opinions, plans, and states — these are valuable.
+
+Return ONLY a JSON object matching this exact schema (no markdown, no prose):
+{
+  "entities": [{"name": "...", "entity_type": "person|tool|concept|preference|other"}],
+  "facts": [{"source": "...", "target": "...", "relation_type": "...", "fact": "..."}]
+}
+
+Text to extract from:
+"""
+
+
+def parse_extraction(response_text: str) -> Optional[ExtractionResult]:
+    """Parse LLM extraction response into an ExtractionResult.
+
+    Handles code-fenced JSON, leading prose, and partial results robustly.
+    Returns None on complete parse failure.
+    """
+    text = response_text.strip()
+    # Strip ```json ... ``` fences
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+
+    # Find outermost JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+    entities: list[ExtractedEntity] = []
+    for e in data.get("entities") or []:
+        name = (e.get("name") or "").strip()
+        etype = (e.get("entity_type") or "other").strip()
+        if name:
+            entities.append(ExtractedEntity(name=name, entity_type=etype))
+
+    facts: list[ExtractedFact] = []
+    for f in data.get("facts") or []:
+        src = (f.get("source") or "").strip()
+        tgt = (f.get("target") or "").strip()
+        rel = (f.get("relation_type") or "RELATES_TO").strip().upper().replace(" ", "_")
+        fact_text = (f.get("fact") or "").strip()
+        if src and tgt and fact_text:
+            facts.append(ExtractedFact(source=src, target=tgt, relation_type=rel, fact=fact_text))
+
+    if not entities and not facts:
+        return None
+    return ExtractionResult(entities=entities, facts=facts)
+
+
+# ---------------------------------------------------------------------------
+# GraphMemoryStore
+# ---------------------------------------------------------------------------
+
+
+class GraphMemoryStore:
+    """Thread-safe LadybugDB graph memory with HNSW vector search.
+
+    Raises RuntimeError at construction if ladybug is not installed.
+    """
+
+    def __init__(
+        self,
+        db_path: str,
+        embedder_fn: Callable[[str], list[float]],
+        embedding_dim: int = 1536,
+        buffer_pool_mb: int = 256,
+    ) -> None:
+        if not _LADYBUG_AVAILABLE:
+            raise RuntimeError(
+                "ladybug package is required for graph memory. "
+                "Install it with: pip install ladybug"
+            )
+        os.makedirs(db_path, exist_ok=True)
+        self._db = ladybug.Database(
+            db_path,
+            buffer_pool_size=buffer_pool_mb * 1024 * 1024,
+            max_num_threads=2,
+        )
+        self._conn = ladybug.Connection(self._db, num_threads=2)
+        self._write_lock = threading.Lock()
+        self._embed = embedder_fn
+        self._embedding_dim = embedding_dim
+        self._init_schema()
+        logger.info("GraphMemoryStore initialised at %s (dim=%d)", db_path, embedding_dim)
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
+
+    def _init_schema(self) -> None:
+        dim = self._embedding_dim
+        ddl = [
+            (
+                f"CREATE NODE TABLE IF NOT EXISTS Entity("
+                f"id STRING PRIMARY KEY, name STRING, entity_type STRING, "
+                f"normalized_name STRING, summary STRING, "
+                f"first_seen TIMESTAMP, last_seen TIMESTAMP, "
+                f"mention_count INT32 DEFAULT 1, "
+                f"embedding FLOAT[{dim}])"
+            ),
+            (
+                f"CREATE NODE TABLE IF NOT EXISTS Episode("
+                f"id STRING PRIMARY KEY, name STRING, content STRING, "
+                f"source STRING, user_id STRING, "
+                f"created_at TIMESTAMP, embedding FLOAT[{dim}])"
+            ),
+            (
+                "CREATE REL TABLE IF NOT EXISTS RELATES_TO("
+                "FROM Entity TO Entity, "
+                "relation_type STRING, fact STRING, "
+                "valid_at TIMESTAMP, invalid_at TIMESTAMP, "
+                "confidence FLOAT DEFAULT 1.0)"
+            ),
+            (
+                "CREATE REL TABLE IF NOT EXISTS MENTIONED_IN("
+                "FROM Entity TO Episode, "
+                "confidence FLOAT DEFAULT 1.0)"
+            ),
+        ]
+        for stmt in ddl:
+            self._execute(stmt)
+        # HNSW vector indexes — ignore "already exists"
+        for table, idx in [("Entity", "entity_vec_idx"), ("Episode", "episode_vec_idx")]:
+            try:
+                self._execute(
+                    f'CALL CREATE_VECTOR_INDEX("{table}", "{idx}", "embedding")'
+                )
+            except Exception as exc:  # noqa: BLE001
+                if "already exists" not in str(exc).lower():
+                    logger.warning("Vector index creation warning (%s/%s): %s", table, idx, exc)
+
+    # ------------------------------------------------------------------
+    # Internal execute helper
+    # ------------------------------------------------------------------
+
+    def _execute(self, query: str, params: Optional[dict] = None):
+        first = query.strip().split()[0].lower()
+        if first in ("create", "merge", "set", "delete", "detach", "drop", "call"):
+            with self._write_lock:
+                return self._conn.execute(query, params or {})
+        return self._conn.execute(query, params or {})
+
+    # ------------------------------------------------------------------
+    # Write operations
+    # ------------------------------------------------------------------
+
+    def upsert_entity(self, name: str, entity_type: str, ts: str) -> str:
+        """Create or update an entity node; returns its stable ID."""
+        normalized = name.lower().replace(" ", "_")
+        entity_id = f"ent:{normalized}:{entity_type}"
+        self._execute(
+            """
+            MERGE (e:Entity {id: $id})
+            ON CREATE SET
+                e.name=$name, e.entity_type=$etype, e.normalized_name=$norm,
+                e.first_seen=TIMESTAMP($ts), e.last_seen=TIMESTAMP($ts),
+                e.mention_count=1
+            ON MATCH SET
+                e.mention_count=e.mention_count+1, e.last_seen=TIMESTAMP($ts)
+            """,
+            {"id": entity_id, "name": name, "etype": entity_type, "norm": normalized, "ts": ts},
+        )
+        try:
+            emb = self._embed(name)
+            self._execute(
+                "MATCH (e:Entity {id:$id}) SET e.embedding=$emb",
+                {"id": entity_id, "emb": emb},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Embedding entity '%s' failed: %s", name, exc)
+        return entity_id
+
+    def add_relation(self, src_id: str, tgt_id: str, relation_type: str, fact: str, ts: str) -> None:
+        """Merge a directed relationship edge between two entity nodes."""
+        self._execute(
+            """
+            MATCH (s:Entity {id:$src}) MATCH (t:Entity {id:$tgt})
+            MERGE (s)-[r:RELATES_TO {relation_type:$rel}]->(t)
+            ON CREATE SET r.fact=$fact, r.valid_at=TIMESTAMP($ts), r.confidence=1.0
+            ON MATCH SET r.fact=$fact, r.valid_at=TIMESTAMP($ts)
+            """,
+            {"src": src_id, "tgt": tgt_id, "rel": relation_type, "fact": fact, "ts": ts},
+        )
+
+    def add_episode(self, content: str, user_id: str, source: str = "chat") -> str:
+        """Store a conversation episode; returns its ID."""
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ep_id = f"ep:{int(time.time() * 1000)}"
+        emb: Optional[list[float]] = None
+        try:
+            emb = self._embed(content[:500])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Embedding episode failed: %s", exc)
+        self._execute(
+            """
+            CREATE (e:Episode {id:$id, name:$name, content:$content, source:$src,
+                               user_id:$uid, created_at:TIMESTAMP($ts), embedding:$emb})
+            """,
+            {
+                "id": ep_id,
+                "name": f"ep_{ts}",
+                "content": content[:2000],
+                "src": source,
+                "uid": user_id,
+                "ts": ts,
+                "emb": emb or [],
+            },
+        )
+        return ep_id
+
+    # ------------------------------------------------------------------
+    # Read operations
+    # ------------------------------------------------------------------
+
+    def search(self, query: str, k: int = 10) -> dict:
+        """Hybrid retrieval: vector ANN → seed entities → 1-hop graph expansion.
+
+        Returns dict with keys:
+          "seeds"  — list of {id, name, type, sim}
+          "facts"  — list of {source, relation, fact, target}
+        """
+        try:
+            query_vec = self._embed(query)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Graph memory search embed failed: %s", exc)
+            return {"seeds": [], "facts": []}
+
+        # Phase 1: HNSW vector search
+        seeds: list[dict] = []
+        try:
+            result = self._conn.execute(
+                'CALL QUERY_VECTOR_INDEX("Entity", "entity_vec_idx", $emb, $k) '
+                "RETURN node, distance",
+                {"emb": query_vec, "k": k * 2},
+            )
+            while result.has_next():
+                node, dist = result.get_next()
+                seeds.append(
+                    {
+                        "id": node["id"],
+                        "name": node["name"],
+                        "type": node.get("entity_type", ""),
+                        "sim": round(max(0.0, 1.0 - dist), 3),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Vector index search failed: %s", exc)
+
+        # Phase 2: 1-hop graph expansion from seed nodes
+        facts: list[dict] = []
+        seed_ids = [s["id"] for s in seeds[:5]]
+        if seed_ids:
+            try:
+                graph_result = self._conn.execute(
+                    """
+                    MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
+                    WHERE s.id IN $ids AND r.invalid_at IS NULL
+                    RETURN s.name, r.relation_type, r.fact, t.name
+                    LIMIT $lim
+                    """,
+                    {"ids": seed_ids, "lim": k * 2},
+                )
+                while graph_result.has_next():
+                    row = graph_result.get_next()
+                    facts.append(
+                        {
+                            "source": row[0],
+                            "relation": row[1],
+                            "fact": row[2],
+                            "target": row[3],
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Graph expansion failed: %s", exc)
+
+        return {"seeds": seeds[:k], "facts": facts[:k]}
+
+    def format_for_prompt(self, query: str, max_entries: int = 10) -> str:
+        """Retrieve and format graph context for injection into the system prompt.
+
+        Returns empty string when no relevant context is found.
+        """
+        result = self.search(query, k=max_entries)
+        if not result["seeds"] and not result["facts"]:
+            return ""
+        lines = ["KNOWLEDGE GRAPH CONTEXT (relevant facts from memory):"]
+        for s in result["seeds"][:5]:
+            lines.append(f"  • {s['name']} ({s['type']}) [relevance: {s['sim']}]")
+        if result["facts"]:
+            lines.append("  Known relationships:")
+            for f in result["facts"][:max_entries]:
+                lines.append(
+                    f"    {f['source']} --[{f['relation']}]--> {f['target']}: {f['fact']}"
+                )
+        return "\n".join(lines)
+
+    def close(self) -> None:
+        """Release database resources."""
+        try:
+            self._conn.close()
+            self._db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("GraphMemoryStore close error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# GraphMemoryWriter — background extraction queue
+# ---------------------------------------------------------------------------
+
+
+class GraphMemoryWriter:
+    """Background daemon thread that extracts triplets from text and writes to
+    the graph store.
+
+    Callers enqueue text via enqueue() and return immediately — extraction
+    (LLM call) and write happen asynchronously without blocking the agent turn.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(
+        self,
+        store: GraphMemoryStore,
+        llm_call_fn: Callable[[str, str], str],
+        extract_every_n_turns: int = 3,
+        min_message_length: int = 100,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        store            : GraphMemoryStore instance
+        llm_call_fn      : callable(model_id, prompt) -> response_text
+                           should call the extraction model at low temperature
+        extract_every_n_turns : batch extraction — only extract every N enqueues
+        min_message_length    : skip messages shorter than this
+        """
+        self._store = store
+        self._llm_call = llm_call_fn
+        self._every_n = max(1, extract_every_n_turns)
+        self._min_len = min_message_length
+        self._queue: Queue = Queue()
+        self._pending: list[dict] = []
+        self._enqueue_count = 0
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="graph-memory-writer")
+        self._thread.start()
+        logger.info("GraphMemoryWriter started (every_n=%d, min_len=%d)", self._every_n, self._min_len)
+
+    def enqueue(self, text: str, user_id: str = "agent", source: str = "chat") -> None:
+        """Fire-and-forget: queue text for background extraction."""
+        if len(text) < self._min_len:
+            return
+        self._enqueue_count += 1
+        self._pending.append({"text": text, "user_id": user_id, "source": source})
+        if self._enqueue_count % self._every_n == 0:
+            batch = self._pending[:]
+            self._pending.clear()
+            self._queue.put(batch)
+
+    def flush(self) -> None:
+        """Force-process any buffered pending items immediately."""
+        if self._pending:
+            batch = self._pending[:]
+            self._pending.clear()
+            self._queue.put(batch)
+
+    def stop(self) -> None:
+        """Signal the worker to stop after finishing pending work."""
+        self.flush()
+        self._queue.put(self._SENTINEL)
+
+    def _worker(self) -> None:
+        while True:
+            try:
+                item = self._queue.get(timeout=5)
+            except Empty:
+                continue
+            if item is self._SENTINEL:
+                break
+            try:
+                self._process_batch(item)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("GraphMemoryWriter batch failed: %s", exc)
+            finally:
+                self._queue.task_done()
+
+    def _process_batch(self, batch: list[dict]) -> None:
+        if not batch:
+            return
+        combined_text = "\n---\n".join(item["text"] for item in batch)
+        user_id = batch[-1].get("user_id", "agent")
+        source = batch[-1].get("source", "chat")
+
+        prompt = EXTRACTION_PROMPT + combined_text
+        try:
+            response = self._llm_call(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Extraction LLM call failed: %s", exc)
+            return
+
+        result = parse_extraction(response)
+        if not result:
+            logger.debug("No entities/facts extracted from batch of %d messages", len(batch))
+            return
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Upsert entities and build id map
+        entity_ids: dict[str, str] = {}
+        for entity in result.entities:
+            try:
+                eid = self._store.upsert_entity(entity.name, entity.entity_type, ts)
+                entity_ids[entity.name.lower()] = eid
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("upsert_entity failed for '%s': %s", entity.name, exc)
+
+        # Upsert relationships
+        for fact in result.facts:
+            src_key = fact.source.lower()
+            tgt_key = fact.target.lower()
+            # Look up IDs; skip if we don't know either endpoint
+            src_id = entity_ids.get(src_key)
+            tgt_id = entity_ids.get(tgt_key)
+            # Fallback: try to derive IDs for entities we may have seen before
+            if src_id is None:
+                src_id = f"ent:{fact.source.lower().replace(' ', '_')}:other"
+            if tgt_id is None:
+                tgt_id = f"ent:{fact.target.lower().replace(' ', '_')}:other"
+            try:
+                self._store.add_relation(src_id, tgt_id, fact.relation_type, fact.fact, ts)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("add_relation failed: %s", exc)
+
+        # Optionally record episode
+        try:
+            self._store.add_episode(combined_text[:1000], user_id, source)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("add_episode failed: %s", exc)
+
+        logger.debug(
+            "GraphMemory: extracted %d entities, %d facts from %d messages",
+            len(result.entities),
+            len(result.facts),
+            len(batch),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Factory helper
+# ---------------------------------------------------------------------------
+
+
+def create_graph_memory(
+    cfg,  # AppConfig
+    embedder_fn: Callable[[str], list[float]],
+    llm_call_fn: Callable[[str], str],
+    embedding_dim: int = 1536,
+) -> tuple[Optional[GraphMemoryStore], Optional[GraphMemoryWriter]]:
+    """Create GraphMemoryStore + GraphMemoryWriter from AppConfig.
+
+    Returns (None, None) if:
+    - graph_memory.enabled is False
+    - ladybug package is not installed
+
+    Parameters
+    ----------
+    cfg           : AppConfig instance
+    embedder_fn   : callable(text) -> embedding vector (list of floats)
+    llm_call_fn   : callable(prompt) -> response text (extraction LLM)
+    embedding_dim : dimension of vectors returned by embedder_fn
+    """
+    gm_cfg = cfg.graph_memory
+    if not gm_cfg.enabled:
+        logger.debug("Graph memory disabled (enabled=false in config)")
+        return None, None
+
+    if not _LADYBUG_AVAILABLE:
+        logger.warning(
+            "Graph memory is enabled in config but 'ladybug' package is not installed. "
+            "Install it with: pip install ladybug"
+        )
+        return None, None
+
+    try:
+        store = GraphMemoryStore(
+            db_path=gm_cfg.db_path,
+            embedder_fn=embedder_fn,
+            embedding_dim=embedding_dim,
+            buffer_pool_mb=gm_cfg.buffer_pool_mb,
+        )
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=llm_call_fn,
+            extract_every_n_turns=gm_cfg.extract_every_n_turns,
+            min_message_length=gm_cfg.min_message_length,
+        )
+        return store, writer
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to initialise graph memory: %s", exc)
+        return None, None

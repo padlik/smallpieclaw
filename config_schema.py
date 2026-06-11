@@ -73,6 +73,17 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class GraphMemoryConfig:
+    enabled: bool = False
+    db_path: str = "data/graph_memory"
+    buffer_pool_mb: int = 256
+    extraction_model: str = ""
+    extract_every_n_turns: int = 3
+    min_message_length: int = 100
+    max_context_entries: int = 10
+
+
+@dataclass(frozen=True)
 class SchedulerConfig:
     enabled: bool = True
 
@@ -116,6 +127,7 @@ class AppConfig:
     embeddings: EmbeddingsConfig
     scheduler: SchedulerConfig
     paths: PathsConfig
+    graph_memory: GraphMemoryConfig = field(default_factory=GraphMemoryConfig)
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
 
     # Keep reference to raw dict for incremental migration — consumers that
@@ -226,6 +238,19 @@ def _parse_paths(raw: dict) -> PathsConfig:
     )
 
 
+def _parse_graph_memory(raw: dict) -> GraphMemoryConfig:
+    section = raw.get("graph_memory") or {}
+    return GraphMemoryConfig(
+        enabled=bool(section.get("enabled", False)),
+        db_path=section.get("db_path", "data/graph_memory"),
+        buffer_pool_mb=int(section.get("buffer_pool_mb", 256)),
+        extraction_model=section.get("extraction_model", ""),
+        extract_every_n_turns=int(section.get("extract_every_n_turns", 3)),
+        min_message_length=int(section.get("min_message_length", 100)),
+        max_context_entries=int(section.get("max_context_entries", 10)),
+    )
+
+
 def _parse_mcp_server(entry: dict, index: int) -> MCPServerConfig:
     name = entry.get("name", "")
     if not name:
@@ -317,6 +342,7 @@ def parse_config(raw: dict) -> AppConfig:
         embeddings=_parse_embeddings(raw),
         scheduler=_parse_scheduler(raw),
         paths=_parse_paths(raw),
+        graph_memory=_parse_graph_memory(raw),
         mcp_servers=mcp_servers,
         _raw=raw,
     )

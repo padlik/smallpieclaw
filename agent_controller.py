@@ -107,6 +107,10 @@ class AgentController:
         self._on_tool_trace = on_tool_trace
         self._job_history_fn = job_history_fn
         self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
+        # Graph memory (optional — set by main.py after init when enabled)
+        self._graph_memory = None          # Optional[GraphMemoryStore]
+        self._graph_memory_writer = None   # Optional[GraphMemoryWriter]
+        self._graph_memory_max_entries = 10
 
         # ------------------------------------------------------------------
         # Cross-thread synchronisation for operator confirmation prompts.
@@ -163,6 +167,9 @@ class AgentController:
             on_step=self._on_step,
             on_tool_trace=self._on_tool_trace,
             job_history_fn=self._job_history_fn,
+            graph_memory=self._graph_memory,
+            graph_memory_writer=self._graph_memory_writer,
+            graph_memory_max_entries=self._graph_memory_max_entries,
             confirmation=self._confirmation,
         )
         return react_loop(ctx, user_goal, progress_callback, images)

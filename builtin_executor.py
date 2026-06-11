@@ -236,6 +236,32 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Example: {\"path\": \"/etc/app/config.toml\", \"old_str\": \"port = 8080\", \"new_str\": \"port = 9090\"}"
         ),
     ),
+    "memory_graph_search": BuiltinTool(
+        name="memory_graph_search",
+        description=(
+            "Search the knowledge graph for facts, entities, people, preferences, or past events. "
+            "Returns relevant entities and relationships from the graph memory. "
+            "Args: query (str, required) — what to search for. "
+            "Only available when graph memory is enabled ([graph_memory] enabled = true in config). "
+            "ALWAYS call this before saying 'I don't have information about...' regarding past events "
+            "or user preferences. "
+            "Example: {\"query\": \"user preferred languages\"}"
+        ),
+    ),
+    "memory_graph_store": BuiltinTool(
+        name="memory_graph_store",
+        description=(
+            "Store an important fact, preference, or relationship in the knowledge graph. "
+            "Use this when the user shares important facts or preferences that should be remembered. "
+            "Args: "
+            "  content     (str, required) — the fact or information to remember. "
+            "  entity_type (str, optional) — type hint: person, tool, concept, preference, other. "
+            "  user_id     (str, optional) — user identifier (default: 'agent'). "
+            "Only available when graph memory is enabled ([graph_memory] enabled = true in config). "
+            "Example: {\"content\": \"User prefers Python over JavaScript for automation scripts\", "
+            "\"entity_type\": \"preference\"}"
+        ),
+    ),
 }
 
 
@@ -268,6 +294,8 @@ class BuiltinExecutor:
         self._max_subagents = max_subagents
         self._subagent_result_timeout = subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
+        self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
+        self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init
         self._sub_agent_pool = ThreadPoolExecutor(
             max_workers=max_subagents, thread_name_prefix="sub-agent"
         )
@@ -335,6 +363,10 @@ class BuiltinExecutor:
             return self._exec_memory_write(args, caller_tag=caller_tag)
         elif tool_name == "file_patch":
             return self._exec_file_patch(args, caller_depth=caller_depth, caller_tag=caller_tag)
+        elif tool_name == "memory_graph_search":
+            return self._exec_memory_graph_search(args, caller_tag=caller_tag)
+        elif tool_name == "memory_graph_store":
+            return self._exec_memory_graph_store(args, caller_tag=caller_tag)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -1177,6 +1209,62 @@ class BuiltinExecutor:
                 "error": f"memory_write: unknown action '{action}'. Valid: set, append, delete, get.",
                 "exit_code": -1,
             }
+
+    # ---- memory_graph_search ----
+
+    def _exec_memory_graph_search(self, args: dict, caller_tag: str = "") -> dict:
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        if self._graph_memory is None:
+            return {
+                "success": False, "output": "",
+                "error": "memory_graph_search: graph memory is not enabled or not available. "
+                         "Set [graph_memory] enabled = true in config.toml and install ladybug.",
+                "exit_code": -1,
+            }
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return {"success": False, "output": "", "error": "memory_graph_search: 'query' is required.", "exit_code": -1}
+        try:
+            context = self._graph_memory.format_for_prompt(query)
+            if not context:
+                return {"success": True, "output": "No relevant entities or facts found in graph memory.", "error": "", "exit_code": 0}
+            logger.info("%smemory_graph_search: query=%s", _pfx, query[:60])
+            return {"success": True, "output": context, "error": "", "exit_code": 0}
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "output": "", "error": f"memory_graph_search failed: {exc}", "exit_code": -1}
+
+    # ---- memory_graph_store ----
+
+    def _exec_memory_graph_store(self, args: dict, caller_tag: str = "") -> dict:
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        if self._graph_memory is None:
+            return {
+                "success": False, "output": "",
+                "error": "memory_graph_store: graph memory is not enabled or not available. "
+                         "Set [graph_memory] enabled = true in config.toml and install ladybug.",
+                "exit_code": -1,
+            }
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return {"success": False, "output": "", "error": "memory_graph_store: 'content' is required.", "exit_code": -1}
+        entity_type = str(args.get("entity_type", "other")).strip() or "other"
+        user_id = str(args.get("user_id", "agent")).strip() or "agent"
+        try:
+            # Store as an episode (full content) and also trigger extraction
+            ep_id = self._graph_memory.add_episode(content, user_id=user_id, source="manual")
+            # Directly upsert a single entity for the content as a note
+            if self._graph_memory_writer is not None:
+                self._graph_memory_writer.enqueue(content, user_id=user_id, source="manual")
+                self._graph_memory_writer.flush()
+            logger.info("%smemory_graph_store: stored episode %s type=%s", _pfx, ep_id, entity_type)
+            return {
+                "success": True,
+                "output": f"Stored in graph memory (episode {ep_id}). Extraction scheduled in background.",
+                "error": "",
+                "exit_code": 0,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "output": "", "error": f"memory_graph_store failed: {exc}", "exit_code": -1}
 
 
 def _save_context(context_key: str, short_term, data_dir: str) -> None:

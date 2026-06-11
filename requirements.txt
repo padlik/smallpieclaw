@@ -5,3 +5,5 @@ tomli==2.0.1
 schedule==1.2.1
 croniter>=1.4
 ollama>=0.4.0
+# Optional: graph-based memory (install to enable [graph_memory] enabled = true)
+# ladybug>=0.7.0

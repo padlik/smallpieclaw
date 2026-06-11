@@ -176,6 +176,7 @@ except ImportError:
 from agent_controller import AgentController, SubAgentRunner  # noqa: E402
 from builtin_executor import BuiltinExecutor, _load_context  # noqa: E402
 from config_schema import resolve_model_id  # noqa: E402
+from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory  # noqa: E402
@@ -467,6 +468,61 @@ def _run(
     # Give the main agent access to scheduled job execution history
     agent._job_history_fn = scheduler.execution_log.format_for_prompt
 
+    # Initialise graph memory (opt-in — only when enabled in config and ladybug installed)
+    graph_memory_store = None
+    graph_memory_writer = None
+    try:
+        from config_schema import parse_config as _parse_config
+        _app_cfg = _parse_config(cfg)
+        if _app_cfg.graph_memory.enabled:
+            _gm_cfg = _app_cfg.graph_memory
+
+            def _embedder_fn(text: str) -> list[float]:
+                return llm.embed(text)
+
+            # Determine extraction model — fall back to default_model
+            _extraction_model_id = _gm_cfg.extraction_model or _app_cfg.agent.default_model
+            _extraction_model_cfg = next(
+                (m for m in all_models if m.get("model") == _extraction_model_id),
+                all_models[0] if all_models else {},
+            )
+
+            def _llm_call_fn(prompt: str) -> str:
+                """One-shot LLM call for extraction (low temperature, no history)."""
+                extraction_llm = LLMClient(
+                    {**cfg, "_override_llm": _extraction_model_cfg},
+                    usage_registry=get_token_registry(),
+                    caller_tag="graph-extract",
+                )
+                try:
+                    messages = [{"role": "user", "content": prompt}]
+                    resp = extraction_llm.chat(messages, temperature=0.1, max_tokens=1024)
+                    return resp.get("content", "")
+                finally:
+                    extraction_llm.close()
+
+            graph_memory_store, graph_memory_writer = create_graph_memory(
+                cfg=_app_cfg,
+                embedder_fn=_embedder_fn,
+                llm_call_fn=_llm_call_fn,
+                embedding_dim=len(llm.embed("test")),
+            )
+            if graph_memory_store is not None:
+                # Wire into agent (main react_loop context)
+                agent._graph_memory = graph_memory_store
+                agent._graph_memory_writer = graph_memory_writer
+                agent._graph_memory_max_entries = _gm_cfg.max_context_entries
+                # Wire into builtin executor for memory_graph_search/store tools
+                builtin._graph_memory = graph_memory_store
+                builtin._graph_memory_writer = graph_memory_writer
+                logger.info(
+                    "Graph memory enabled (db=%s, extraction_model=%s)",
+                    _gm_cfg.db_path,
+                    _extraction_model_id,
+                )
+    except Exception as _gm_init_exc:
+        logger.warning("Graph memory initialisation failed (continuing without it): %s", _gm_init_exc)
+
     logger.info("Starting Telegram bot...")
     tg = TelegramInterface(
         cfg, agent_handler,
@@ -492,6 +548,16 @@ def _run(
     finally:
         scheduler.stop()
         builtin.shutdown()
+        if graph_memory_writer is not None:
+            try:
+                graph_memory_writer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if graph_memory_store is not None:
+            try:
+                graph_memory_store.close()
+            except Exception:  # noqa: BLE001
+                pass
         llm.close()
         if mcp_manager:
             mcp_manager.close_all()

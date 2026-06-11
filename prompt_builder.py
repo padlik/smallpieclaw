@@ -129,7 +129,7 @@ information is always injected fresh above and any memory entry about it will be
 RELEVANT PAST RESULTS:
 {past_results}
 
-BUILT-IN TOOLS (always available — prefer these before creating new tools):
+{graph_context_section}BUILT-IN TOOLS (always available — prefer these before creating new tools):
   shell             — execute any shell command on the host system
   file_read         — read a file from the filesystem
   file_write        — write content to a file on the filesystem
@@ -139,6 +139,8 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string; do NOT store model or provider configuration here
   vision_query      — ask the LLM to analyse an image file on disk. Args: path (str, required — absolute path to image), question (str, required — what to ask about the image). Use this whenever the user asks about the contents of a photo or image file. Do NOT use shell to base64-encode or manually analyse images.
   file_patch        — make a surgical search-and-replace edit to a file. Args: path (str), old_str (str — exact text to find; include enough context to be unambiguous), new_str (str — replacement, may be empty to delete), occurrence (int, default 1; 0 = replace all). Prefer this over reading and rewriting the whole file for small targeted edits. Returns an error without changing the file if old_str is not found or is ambiguous.
+  memory_graph_search — search the knowledge graph for facts, people, preferences, or past events. Args: query (str). Only available when graph memory is enabled.
+  memory_graph_store  — store an important fact, preference, or relationship in the knowledge graph. Args: content (str), entity_type (str, optional). Only available when graph memory is enabled.
 
 SUB-AGENT USAGE:
 Sub-agents run in complete isolation — they have NO access to your memory, conversation
@@ -204,6 +206,14 @@ Rules:
 - Never include dangerous commands (rm -rf /, sudo, eval, reverse shells, etc.).
 - If a tool fails, try a different approach or explain the issue.
 - Always end with a "finish" action.
+
+GRAPH MEMORY RULES (applies only when memory_graph_search / memory_graph_store are listed above):
+- ALWAYS call memory_graph_search BEFORE answering any question that might involve information
+  from a prior conversation: people, their preferences, tools they use, past events, rules.
+- Do NOT say "I don't have that information" without first calling memory_graph_search.
+- Use memory_graph_store when the user shares important facts, preferences, or rules that should
+  be remembered across sessions.
+- Graph memory persists across conversations — facts survive restarts.
 """.strip()
 
 
@@ -225,6 +235,7 @@ def build_system_prompt(
     top_tools: int,
     user_goal: str = "(context snapshot)",
     job_history_section: str = "",
+    graph_context_section: str = "",
 ) -> tuple[str, int]:
     """Build the full system prompt for the ReAct agent.
 
@@ -247,6 +258,9 @@ def build_system_prompt(
     )
     log_section = format_log_section(log_file, log_backup_count)
 
+    # Format graph context: inject as a block followed by a newline, or empty
+    graph_ctx_block = f"{graph_context_section}\n\n" if graph_context_section else ""
+
     prompt = SYSTEM_PROMPT_TEMPLATE.format(
         memory=memory_text,
         past_results=past_results_text,
@@ -255,6 +269,7 @@ def build_system_prompt(
         models_section=models_section,
         file_storage=file_storage,
         log_section=log_section,
+        graph_context_section=graph_ctx_block,
     )
     # Inject job history only when it has content (avoids wasting tokens on blank lines)
     if job_history_section:

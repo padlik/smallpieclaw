@@ -106,6 +106,15 @@ class ReactContext:
     # Scheduled job history — called to get a formatted string for the system prompt
     job_history_fn: Optional[Callable[[], str]] = None
 
+    # Graph memory — Optional[GraphMemoryStore]; None when feature is disabled
+    graph_memory: Optional[object] = None
+
+    # Graph memory writer — Optional[GraphMemoryWriter]; for enqueuing new messages
+    graph_memory_writer: Optional[object] = None
+
+    # Max graph context entries to inject per turn
+    graph_memory_max_entries: int = 10
+
     # Confirmation coordination (shared with AgentController and Telegram)
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
 
@@ -319,6 +328,18 @@ def react_loop(
             _job_history_section = ctx.job_history_fn() or ""
         except Exception as _jh_exc:
             logger.warning("%sFailed to get job history: %s", pfx, _jh_exc)
+
+    _graph_context_section = ""
+    if ctx.graph_memory is not None:
+        try:
+            _graph_context_section = (
+                ctx.graph_memory.format_for_prompt(
+                    user_goal, max_entries=ctx.graph_memory_max_entries
+                ) or ""
+            )
+        except Exception as _gm_exc:
+            logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
+
     system, _ = _build_system_prompt(
         tool_index=ctx.tool_index,
         memory=ctx.memory,
@@ -332,6 +353,7 @@ def react_loop(
         top_tools=ctx.top_tools,
         user_goal=user_goal,
         job_history_section=_job_history_section,
+        graph_context_section=_graph_context_section,
     )
 
     first_msg: dict = {"role": "user", "content": user_goal}
@@ -345,6 +367,13 @@ def react_loop(
     messages.append(first_msg)
 
     ctx.memory.record_event(f"User request: {user_goal[:100]}")
+
+    # Enqueue user message for background graph extraction (fire-and-forget)
+    if ctx.graph_memory_writer is not None:
+        try:
+            ctx.graph_memory_writer.enqueue(user_goal, source="chat")
+        except Exception as _gw_exc:  # noqa: BLE001
+            logger.debug("%sGraph memory enqueue failed: %s", pfx, _gw_exc)
 
     # 2. ReAct loop
     max_steps = ctx.max_iterations

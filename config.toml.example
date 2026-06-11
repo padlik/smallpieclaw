@@ -133,6 +133,22 @@ long_run_warn_minutes = 30
 [scheduler]
 enabled = true
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph-Based Memory (opt-in — disabled by default)
+# Requires: pip install ladybug  (LadybugDB — community fork of KuzuDB)
+# Also requires [embeddings] to be configured (reuses the same embedding model).
+# ─────────────────────────────────────────────────────────────────────────────
+# [graph_memory]
+# enabled               = false        # set to true to enable
+# db_path               = "data/graph_memory"   # LadybugDB directory
+# buffer_pool_mb        = 256          # RAM for DB buffer pool (lower on Pi 3/4)
+# # extraction_model: model to use for triplet extraction (LLM call per batch).
+# # Must match the 'model' field of a [[models]] entry. Falls back to default_model.
+# # extraction_model    = "gpt-4o-mini"
+# extract_every_n_turns = 3            # batch: extract every N user turns (cost control)
+# min_message_length    = 100          # skip short messages / chatter
+# max_context_entries   = 10           # max entities/facts injected into prompt
+
 [paths]
 tools_dir          = "tools"
 generated_tools_dir = "tools_generated"

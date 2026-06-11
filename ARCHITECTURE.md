@@ -113,3 +113,56 @@ main.py (composition root)
 4. **Process isolation for tools** — All tool execution (shell, scripts) runs in subprocesses with timeouts. The agent process itself never `exec()`s untrusted code.
 
 5. **Resilience over correctness** — Broad `except Exception` blocks prevent daemon crashes at the cost of sometimes hiding bugs. The exception hierarchy in `exceptions.py` enables gradual narrowing.
+
+## Graph-Based Memory (Optional Feature)
+
+Graph memory is an **opt-in** feature that stores entities, relationships, and episodic memory in a LadybugDB graph database (embedded, community fork of KuzuDB). It is **disabled by default** — no overhead is incurred unless explicitly enabled.
+
+### Activation
+
+```toml
+# config.toml
+[graph_memory]
+enabled = true
+db_path = "data/graph_memory"
+buffer_pool_mb = 256
+extraction_model = "gpt-4o-mini"   # falls back to agent.default_model
+```
+
+Install the optional dependency: `pip install ladybug`
+
+### Architecture
+
+```
+[graph_memory] enabled = true
+         │
+         ▼
+main.py calls create_graph_memory()
+         │
+         ├─ GraphMemoryStore (graph_memory.py)
+         │    ├── LadybugDB (embedded graph DB)
+         │    ├── Entity table   — semantic layer (people, tools, concepts)
+         │    ├── Episode table  — episodic layer (timestamped interactions)
+         │    ├── RELATES_TO rel — directed fact edges
+         │    ├── HNSW vector index (embeddings from [embeddings] config)
+         │    └── search() — hybrid: vector ANN + 1-hop graph expansion
+         │
+         └─ GraphMemoryWriter (background daemon thread)
+              ├── Queue (fire-and-forget from caller)
+              ├── LLM triplet extraction (configurable model, temperature=0.1)
+              └── Writes to GraphMemoryStore on every N user turns
+```
+
+### Integration Points
+
+| File | What changes |
+|------|-------------|
+| `react_loop.py` | `ReactContext.graph_memory` / `graph_memory_writer` fields; pre-injection of context before LLM call; user message enqueued after turn |
+| `prompt_builder.py` | `graph_context_section` parameter; `{graph_context_section}` placeholder in template; graph memory rules added to agent instructions |
+| `builtin_executor.py` | `memory_graph_search` and `memory_graph_store` built-in tools |
+| `agent_controller.py` | `_graph_memory` / `_graph_memory_writer` fields; passed to `ReactContext` |
+| `main.py` | Conditional init via `create_graph_memory()`; graceful fallback if `ladybug` not installed |
+
+### Graceful Degradation
+
+If `[graph_memory] enabled = false` (default), or if the `ladybug` package is not installed, the feature is silently skipped — `graph_memory` remains `None` on `ReactContext`, no graph context is injected, and the `memory_graph_*` tools return informative error messages.
