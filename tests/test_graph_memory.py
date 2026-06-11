@@ -352,9 +352,53 @@ class TestGraphMemoryWriter:
         assert store.add_relation.called
         writer.stop()
 
+    def test_fact_with_unlisted_entity_creates_node(self, store):
+        """A fact referencing an entity not in the entities list must still
+        create the node so the relation is not silently dropped."""
+        upserts: list[tuple] = []
 
-# Sentinel for approximate timestamp check
-ANY_TS = object()
+        def _upsert(name, etype, ts):
+            upserts.append((name, etype))
+            return f"ent:{name.lower()}:{etype}"
+
+        store.upsert_entity = MagicMock(side_effect=_upsert)
+        store.add_relation = MagicMock()
+        store.add_episode = MagicMock(return_value="ep:1")
+
+        def _llm(prompt: str) -> str:
+            # Fact references "Bob" and "Docker" but only "Bob" is in entities
+            return (
+                '{"entities":[{"name":"Bob","entity_type":"person"}],'
+                '"facts":[{"source":"Bob","target":"Docker","relation_type":"USES",'
+                '"fact":"Bob uses Docker."}]}'
+            )
+
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=_llm,
+            extract_every_n_turns=1,
+            min_message_length=10,
+        )
+        writer.enqueue("A long enough message to process here", user_id="u1")
+        time.sleep(0.3)
+        # Docker (unlisted) must have been upserted as type "other"
+        assert ("Docker", "other") in upserts
+        # And the relation must have been added
+        assert store.add_relation.called
+        writer.stop()
+
+    def test_stop_joins_worker_thread(self, store):
+        store.add_episode = MagicMock(return_value="ep:1")
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=lambda p: '{"entities":[],"facts":[]}',
+            extract_every_n_turns=1,
+            min_message_length=10,
+        )
+        assert writer._thread.is_alive()
+        writer.stop()
+        # After stop(), the worker thread must have terminated (joined)
+        assert not writer._thread.is_alive()
 
 
 # ---------------------------------------------------------------------------

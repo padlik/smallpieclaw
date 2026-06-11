@@ -179,7 +179,11 @@ class GraphMemoryStore:
             max_num_threads=2,
         )
         self._conn = ladybug.Connection(self._db, num_threads=2)
-        self._write_lock = threading.Lock()
+        # Single reentrant lock serialising ALL connection access. The ladybug/
+        # Kuzu Connection is not safe for unsynchronised concurrent use, and the
+        # background writer thread and the main agent read thread share one
+        # Connection — so reads and writes must both hold this lock.
+        self._conn_lock = threading.RLock()
         self._embed = embedder_fn
         self._embedding_dim = embedding_dim
         self._init_schema()
@@ -236,11 +240,9 @@ class GraphMemoryStore:
     # ------------------------------------------------------------------
 
     def _execute(self, query: str, params: Optional[dict] = None):
-        first = query.strip().split()[0].lower()
-        if first in ("create", "merge", "set", "delete", "detach", "drop", "call"):
-            with self._write_lock:
-                return self._conn.execute(query, params or {})
-        return self._conn.execute(query, params or {})
+        """Execute a query holding the connection lock (reads and writes alike)."""
+        with self._conn_lock:
+            return self._conn.execute(query, params or {})
 
     # ------------------------------------------------------------------
     # Write operations
@@ -330,21 +332,22 @@ class GraphMemoryStore:
         # Phase 1: HNSW vector search
         seeds: list[dict] = []
         try:
-            result = self._conn.execute(
-                'CALL QUERY_VECTOR_INDEX("Entity", "entity_vec_idx", $emb, $k) '
-                "RETURN node, distance",
-                {"emb": query_vec, "k": k * 2},
-            )
-            while result.has_next():
-                node, dist = result.get_next()
-                seeds.append(
-                    {
-                        "id": node["id"],
-                        "name": node["name"],
-                        "type": node.get("entity_type", ""),
-                        "sim": round(max(0.0, 1.0 - dist), 3),
-                    }
+            with self._conn_lock:
+                result = self._conn.execute(
+                    'CALL QUERY_VECTOR_INDEX("Entity", "entity_vec_idx", $emb, $k) '
+                    "RETURN node, distance",
+                    {"emb": query_vec, "k": k * 2},
                 )
+                while result.has_next():
+                    node, dist = result.get_next()
+                    seeds.append(
+                        {
+                            "id": node["id"],
+                            "name": node["name"],
+                            "type": node.get("entity_type", ""),
+                            "sim": round(max(0.0, 1.0 - dist), 3),
+                        }
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Vector index search failed: %s", exc)
 
@@ -353,25 +356,26 @@ class GraphMemoryStore:
         seed_ids = [s["id"] for s in seeds[:5]]
         if seed_ids:
             try:
-                graph_result = self._conn.execute(
-                    """
-                    MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
-                    WHERE s.id IN $ids AND r.invalid_at IS NULL
-                    RETURN s.name, r.relation_type, r.fact, t.name
-                    LIMIT $lim
-                    """,
-                    {"ids": seed_ids, "lim": k * 2},
-                )
-                while graph_result.has_next():
-                    row = graph_result.get_next()
-                    facts.append(
-                        {
-                            "source": row[0],
-                            "relation": row[1],
-                            "fact": row[2],
-                            "target": row[3],
-                        }
+                with self._conn_lock:
+                    graph_result = self._conn.execute(
+                        """
+                        MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
+                        WHERE s.id IN $ids AND r.invalid_at IS NULL
+                        RETURN s.name, r.relation_type, r.fact, t.name
+                        LIMIT $lim
+                        """,
+                        {"ids": seed_ids, "lim": k * 2},
                     )
+                    while graph_result.has_next():
+                        row = graph_result.get_next()
+                        facts.append(
+                            {
+                                "source": row[0],
+                                "relation": row[1],
+                                "fact": row[2],
+                                "target": row[3],
+                            }
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Graph expansion failed: %s", exc)
 
@@ -443,6 +447,7 @@ class GraphMemoryWriter:
         self._queue: Queue = Queue()
         self._pending: list[dict] = []
         self._enqueue_count = 0
+        self._pending_lock = threading.Lock()
         self._thread = threading.Thread(target=self._worker, daemon=True, name="graph-memory-writer")
         self._thread.start()
         logger.info("GraphMemoryWriter started (every_n=%d, min_len=%d)", self._every_n, self._min_len)
@@ -451,24 +456,37 @@ class GraphMemoryWriter:
         """Fire-and-forget: queue text for background extraction."""
         if len(text) < self._min_len:
             return
-        self._enqueue_count += 1
-        self._pending.append({"text": text, "user_id": user_id, "source": source})
-        if self._enqueue_count % self._every_n == 0:
-            batch = self._pending[:]
-            self._pending.clear()
+        with self._pending_lock:
+            self._enqueue_count += 1
+            self._pending.append({"text": text, "user_id": user_id, "source": source})
+            ready = self._enqueue_count % self._every_n == 0
+            batch = None
+            if ready:
+                batch = self._pending[:]
+                self._pending.clear()
+        if batch is not None:
             self._queue.put(batch)
 
     def flush(self) -> None:
         """Force-process any buffered pending items immediately."""
-        if self._pending:
+        with self._pending_lock:
+            if not self._pending:
+                return
             batch = self._pending[:]
             self._pending.clear()
-            self._queue.put(batch)
+        self._queue.put(batch)
 
-    def stop(self) -> None:
-        """Signal the worker to stop after finishing pending work."""
+    def stop(self, join_timeout: float = 10.0) -> None:
+        """Signal the worker to stop after finishing pending work, then join.
+
+        Joining before the caller closes the GraphMemoryStore prevents the
+        worker from issuing queries against a closed connection.
+        """
         self.flush()
         self._queue.put(self._SENTINEL)
+        self._thread.join(timeout=join_timeout)
+        if self._thread.is_alive():
+            logger.warning("GraphMemoryWriter worker did not stop within %.1fs", join_timeout)
 
     def _worker(self) -> None:
         while True:
@@ -515,19 +533,22 @@ class GraphMemoryWriter:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("upsert_entity failed for '%s': %s", entity.name, exc)
 
-        # Upsert relationships
+        # Upsert relationships. Endpoints must already exist as nodes for
+        # add_relation's MATCH...MERGE to create the edge. If the extractor
+        # referenced an entity it did not list under "entities", create it now
+        # (typed "other") so the relation is not silently dropped.
         for fact in result.facts:
             src_key = fact.source.lower()
             tgt_key = fact.target.lower()
-            # Look up IDs; skip if we don't know either endpoint
             src_id = entity_ids.get(src_key)
             tgt_id = entity_ids.get(tgt_key)
-            # Fallback: try to derive IDs for entities we may have seen before
-            if src_id is None:
-                src_id = f"ent:{fact.source.lower().replace(' ', '_')}:other"
-            if tgt_id is None:
-                tgt_id = f"ent:{fact.target.lower().replace(' ', '_')}:other"
             try:
+                if src_id is None:
+                    src_id = self._store.upsert_entity(fact.source, "other", ts)
+                    entity_ids[src_key] = src_id
+                if tgt_id is None:
+                    tgt_id = self._store.upsert_entity(fact.target, "other", ts)
+                    entity_ids[tgt_key] = tgt_id
                 self._store.add_relation(src_id, tgt_id, fact.relation_type, fact.fact, ts)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("add_relation failed: %s", exc)
