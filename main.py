@@ -393,7 +393,7 @@ def _run(
     def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
                           fallback_models=None, max_iterations=None,
                           max_tokens=None, temperature=None, top_p=None,
-                          on_tool_trace=None):
+                          on_tool_trace=None, cancel_event=None):
         """Create an isolated SubAgentRunner with the requested model override."""
         # Resolve model config — accept full model ID, model name, or alias
         if model:
@@ -450,6 +450,7 @@ def _run(
             depth=1,
             fallback_models=fallback_models,
             on_tool_trace=on_tool_trace,
+            cancel_event=cancel_event,
         )
         return runner
 
@@ -480,8 +481,17 @@ def _run(
             def _embedder_fn(text: str) -> list[float]:
                 return llm.embed(text)
 
-            # Determine extraction model — fall back to default_model
-            _extraction_model_id = _gm_cfg.extraction_model or _app_cfg.agent.default_model
+            # Determine extraction model — resolve name/alias/model-id, fall back to default_model
+            _extraction_selector = _gm_cfg.extraction_model or _app_cfg.agent.default_model
+            _extraction_model_id = resolve_model_id(_extraction_selector, all_models)
+            if not _extraction_model_id:
+                logger.warning(
+                    "Graph memory: extraction_model '%s' did not resolve to a configured "
+                    "model; falling back to default_model '%s'.",
+                    _extraction_selector,
+                    _app_cfg.agent.default_model,
+                )
+                _extraction_model_id = resolve_model_id(_app_cfg.agent.default_model, all_models)
             _extraction_model_cfg = next(
                 (m for m in all_models if m.get("model") == _extraction_model_id),
                 all_models[0] if all_models else {},

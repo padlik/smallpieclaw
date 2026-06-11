@@ -181,6 +181,11 @@ class TestGraphMemoryStore:
         assert ep_id.startswith("ep:")
         assert conn.execute.called
 
+    def test_add_episode_ids_unique_same_millisecond(self, store, mock_ladybug):
+        # IDs must not collide even when generated within the same millisecond
+        ids = {store.add_episode(f"content {i}", user_id="user1") for i in range(50)}
+        assert len(ids) == 50
+
     def test_search_empty_result(self, store, mock_ladybug):
         empty = MagicMock()
         empty.has_next.return_value = False
@@ -218,6 +223,10 @@ class TestGraphMemoryStore:
         output = store.format_for_prompt("Alice")
         assert "KNOWLEDGE GRAPH CONTEXT" in output
         assert "Alice" in output
+        # Trust boundary: recalled facts are delimited and flagged as untrusted data
+        assert "untrusted" in output.lower()
+        assert "--- begin recalled facts ---" in output
+        assert "--- end recalled facts ---" in output
 
     def test_close_called(self, store, mock_ladybug):
         store.close()

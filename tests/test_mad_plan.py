@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -432,7 +433,7 @@ class TestExecutePlan:
     }
 
     def _make_factory(self, results: dict):
-        def factory(model=None, label=None, temperature=None, top_p=None, max_tokens=None, on_tool_trace=None):
+        def factory(model=None, label=None, temperature=None, top_p=None, max_tokens=None, on_tool_trace=None, **kw):
             runner = MagicMock()
             runner.run.return_value = results.get(label, "ok")
             return runner
@@ -471,6 +472,36 @@ class TestExecutePlan:
         factory = self._make_factory({})
         MadPlanOrchestrator().execute_plan(self.PLAN, factory, notify_fn=notifications.append)
         assert any("step_one" in n for n in notifications)
+
+    def test_runner_closed_and_cancel_event_forwarded(self):
+        created_runners = []
+        forwarded_events = []
+        sentinel = threading.Event()
+
+        def factory(model=None, label=None, cancel_event=None, **kw):
+            forwarded_events.append(cancel_event)
+            runner = MagicMock()
+            runner.run.return_value = "ok"
+            created_runners.append(runner)
+            return runner
+
+        MadPlanOrchestrator().execute_plan(self.PLAN, factory, cancel_event=sentinel)
+        assert len(created_runners) == 2
+        for runner in created_runners:
+            runner.close.assert_called_once()
+        assert forwarded_events == [sentinel, sentinel]
+
+    def test_runner_closed_on_failure(self):
+        closed = []
+
+        def factory(model=None, label=None, **kw):
+            runner = MagicMock()
+            runner.run.side_effect = RuntimeError("boom")
+            runner.close.side_effect = lambda: closed.append(label)
+            return runner
+
+        MadPlanOrchestrator().execute_plan(self.PLAN, factory)
+        assert closed == ["madplan-step_one"]
 
 
 # ---------------------------------------------------------------------------

@@ -1380,8 +1380,12 @@ class MadPlanOrchestrator:
                     top_p=params.get("top_p"),
                     max_tokens=params.get("max_tokens"),
                     on_tool_trace=_collect_trace,
+                    cancel_event=cancel_event,
                 )
-                result = runner.run(prompt)
+                try:
+                    result = runner.run(prompt)
+                finally:
+                    runner.close()
             except Exception as exc:
                 logger.error("MadPlan: sub-task '%s' failed: %s", st_id, exc)
                 remaining = [s["id"] for s in subtasks[i + 1:]]

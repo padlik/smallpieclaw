@@ -412,6 +412,7 @@ class SubAgentRunner:
         fallback_models: list[str] | None = None,  # None = inherit from parent config
         on_step=None,                 # Optional[Callable[[int], None]] — for iteration tracking
         on_tool_trace=None,           # Optional[Callable[[ToolTrace], None]] — for trace collection
+        cancel_event=None,            # Optional[threading.Event] — shared cancel signal (e.g. MadPlan /mp stop)
     ):
         import uuid
         from memory_store import ShortTermMemory, WorkingMemory
@@ -431,7 +432,7 @@ class SubAgentRunner:
         agent_section["default_model"] = model_cfg.get("model", "")
         sub_config["agent"] = agent_section
 
-        self._cancel_event = threading.Event()
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
 
         # Own LLM instance with model override + shared token registry + cancellation
         # fallback_models=None means inherit from sub_config (which inherited from parent config)
@@ -477,6 +478,13 @@ class SubAgentRunner:
     def cancel(self) -> None:
         """Signal cooperative cancellation. Takes effect between iterations."""
         self._cancel_event.set()
+
+    def close(self) -> None:
+        """Release the sub-agent's LLM HTTP resources. Idempotent; safe to call once after run()."""
+        try:
+            self._llm.close()
+        except Exception:
+            pass
 
     @property
     def is_cancelled(self) -> bool:

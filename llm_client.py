@@ -1176,4 +1176,14 @@ class LLMClient:
         return _cosine_similarity(a, b)
 
     def close(self):
-        self._http.close()
+        """Close all HTTP transports owned by this client. Idempotent."""
+        try:
+            self._http.close()
+        except Exception:
+            pass
+        for oc in self._ollama_clients:
+            if oc is not None:
+                try:
+                    oc._client.close()
+                except Exception:
+                    pass

@@ -1064,6 +1064,7 @@ class BuiltinExecutor:
                         logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
             finally:
                 get_agent_registry().unregister(runner.agent_id)
+                runner.close()
                 if _finish_cb:
                     _finish_cb(_finish_tag)
 
