@@ -145,7 +145,7 @@ def good_llm():
 @pytest.fixture
 def empty_llm():
     """LLM callable that returns empty extraction."""
-    return lambda p: '{"entities":[],"facts":[]}'
+    return lambda _: '{"entities":[],"facts":[]}'
 
 
 @pytest.fixture
@@ -460,6 +460,39 @@ class TestBackfillFailures:
         assert result.imported == 0
         # Graph writes did happen (entities were upserted before the state-save attempt)
         assert mock_store.upsert_entity.called
+
+    def test_state_save_failure_restores_prior_state(self, mock_store, good_llm, tmp_path):
+        """If state-save fails when reprocessing (--force) an already-imported entry,
+        the prior import record must be restored in-memory — not erased — so that
+        a subsequent successful save of another entry does not lose this entry's history."""
+        from unittest.mock import patch
+
+        state_path = str(tmp_path / "state.json")
+        entry_id, entry = _make_entries()[0]
+        checksum = _entry_checksum(entry)
+        prior_record = {
+            "checksum": checksum,
+            "episode_id": "ep-prior",
+            "imported_at": "2024-01-01T00:00:00+00:00",
+        }
+        # Pre-seed state file with a prior successful import for this entry
+        _save_backfill_state(state_path, {"version": 1, "imported": {entry_id: prior_record}})
+
+        with patch("graph_memory._save_backfill_state", side_effect=[OSError("disk full")]):
+            result = backfill_longterm_to_graph(
+                long_term_entries=[(entry_id, entry)],
+                store=mock_store,
+                llm_call_fn=good_llm,
+                state_path=state_path,
+                force=True,  # reprocess even though already imported
+            )
+
+        assert result.failed == 1
+        assert result.imported == 0
+        # The state file on disk still has the prior record (save was patched to fail,
+        # but the in-memory map should have been restored rather than popped)
+        loaded = _load_backfill_state(state_path)
+        assert loaded["imported"].get(entry_id) == prior_record
 
     def test_limit_stops_early(self, mock_store, good_llm, tmp_path):
         entries = [

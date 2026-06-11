@@ -824,6 +824,7 @@ def backfill_longterm_to_graph(
                 entry_id=entry_id, status="no_extraction", episode_id=ep_id
             )
             result.entries.append(entry_result)
+            prev_state_ne = imported_map.get(entry_id)
             imported_map[entry_id] = {
                 "checksum": checksum,
                 "episode_id": ep_id,
@@ -833,7 +834,10 @@ def backfill_longterm_to_graph(
                 _save_backfill_state(state_path, {"version": 1, "imported": imported_map})
             except OSError as exc:
                 logger.error("Backfill state save failed for %s — skipping state update: %s", entry_id, exc)
-                imported_map.pop(entry_id, None)
+                if prev_state_ne is not None:
+                    imported_map[entry_id] = prev_state_ne
+                else:
+                    imported_map.pop(entry_id, None)
                 result.no_extraction -= 1
                 result.entries[-1] = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
                 result.failed += 1
@@ -898,6 +902,7 @@ def backfill_longterm_to_graph(
             ep_id,
         )
 
+        prev_state_main = imported_map.get(entry_id)
         imported_map[entry_id] = {
             "checksum": checksum,
             "episode_id": ep_id,
@@ -907,7 +912,10 @@ def backfill_longterm_to_graph(
             _save_backfill_state(state_path, {"version": 1, "imported": imported_map})
         except OSError as exc:
             logger.error("Backfill state save failed for %s — skipping state update: %s", entry_id, exc)
-            imported_map.pop(entry_id, None)
+            if prev_state_main is not None:
+                imported_map[entry_id] = prev_state_main
+            else:
+                imported_map.pop(entry_id, None)
             result.imported -= 1
             result.total_entities -= entities_written
             result.total_facts -= facts_written
