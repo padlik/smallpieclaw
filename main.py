@@ -497,10 +497,23 @@ def _run(
                 all_models[0] if all_models else {},
             )
 
+            # Build a real sub-config that selects the extraction model as default.
+            # LLMClient chooses its active model from config["agent"]["default_model"],
+            # so reorder models (extraction first) and point default_model at it.
+            _extraction_model_name = _extraction_model_cfg.get("model", "")
+            _other_models = [
+                m for m in all_models if m.get("model") != _extraction_model_name
+            ]
+            _extraction_cfg = dict(cfg)
+            _extraction_cfg["models"] = [_extraction_model_cfg] + _other_models
+            _extraction_agent = dict(cfg.get("agent", {}))
+            _extraction_agent["default_model"] = _extraction_model_name
+            _extraction_cfg["agent"] = _extraction_agent
+
             def _llm_call_fn(prompt: str) -> str:
                 """One-shot LLM call for extraction (low temperature, no history)."""
                 extraction_llm = LLMClient(
-                    {**cfg, "_override_llm": _extraction_model_cfg},
+                    _extraction_cfg,
                     usage_registry=get_token_registry(),
                     caller_tag="graph-extract",
                 )

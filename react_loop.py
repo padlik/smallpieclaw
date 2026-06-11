@@ -97,6 +97,12 @@ class ReactContext:
     # Cancellation
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
+    # Whether this loop owns its cancel_event. When False (event is shared,
+    # e.g. a MadPlan /mp stop signal forwarded into sub-agents), react_loop
+    # must NOT clear it at startup — doing so would erase a stop request that
+    # arrived just before/while the sub-agent began running.
+    owns_cancel_event: bool = True
+
     # Step callback
     on_step: Optional[Callable[[int], None]] = None
 
@@ -313,7 +319,8 @@ def react_loop(
             progress_callback(msg)
         logger.debug("%sAgent progress: %s", pfx, msg)
 
-    ctx.cancel_event.clear()
+    if ctx.owns_cancel_event:
+        ctx.cancel_event.clear()
 
     active_model = ctx.llm.llm_cfg.get("model", "?")
     logger.info("%sstart | model: %s | goal: %s", pfx, active_model, user_goal[:80])

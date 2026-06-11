@@ -101,6 +101,7 @@ class AgentController:
         self.log_file = log_file
         self.log_backup_count = log_backup_count
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        self._owns_cancel_event = cancel_event is None
         self.label = label
         self._log_prefix = f"[{label}] "
         self._on_step = on_step
@@ -164,6 +165,7 @@ class AgentController:
             working=self.working,
             results=self.results,
             cancel_event=self._cancel_event,
+            owns_cancel_event=self._owns_cancel_event,
             on_step=self._on_step,
             on_tool_trace=self._on_tool_trace,
             job_history_fn=self._job_history_fn,

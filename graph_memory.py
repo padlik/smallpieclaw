@@ -42,6 +42,28 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Max characters per recalled field rendered into the system prompt.
+_PROMPT_FIELD_MAX = 200
+
+
+def _sanitize_prompt_field(value: object) -> str:
+    """Neutralise an untrusted recalled value before injecting it into the
+    system prompt.
+
+    Recalled facts originate from past (possibly adversarial) conversations.
+    To prevent prompt-injection breakout we (1) collapse all whitespace —
+    including newlines — to single spaces so a value cannot introduce new
+    instruction-like lines, (2) defang long dash runs that could reproduce the
+    "--- begin/end recalled facts ---" delimiters, and (3) truncate.
+    """
+    text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Collapse 3+ consecutive dashes (delimiter fences) to two dashes
+    text = re.sub(r"-{3,}", "--", text)
+    if len(text) > _PROMPT_FIELD_MAX:
+        text = text[:_PROMPT_FIELD_MAX].rstrip() + "…"
+    return text
+
 # ---------------------------------------------------------------------------
 # Optional import — graceful degradation when ladybug is not installed
 # ---------------------------------------------------------------------------
@@ -398,12 +420,18 @@ class GraphMemoryStore:
             "  --- begin recalled facts ---",
         ]
         for s in result["seeds"][:5]:
-            lines.append(f"  • {s['name']} ({s['type']}) [relevance: {s['sim']}]")
+            _name = _sanitize_prompt_field(s["name"])
+            _type = _sanitize_prompt_field(s["type"])
+            lines.append(f"  • {_name} ({_type}) [relevance: {s['sim']}]")
         if result["facts"]:
             lines.append("  Known relationships:")
             for f in result["facts"][:max_entries]:
+                _src = _sanitize_prompt_field(f["source"])
+                _rel = _sanitize_prompt_field(f["relation"])
+                _tgt = _sanitize_prompt_field(f["target"])
+                _fact = _sanitize_prompt_field(f["fact"])
                 lines.append(
-                    f"    {f['source']} --[{f['relation']}]--> {f['target']}: {f['fact']}"
+                    f"    {_src} --[{_rel}]--> {_tgt}: {_fact}"
                 )
         lines.append("  --- end recalled facts ---")
         return "\n".join(lines)

@@ -274,3 +274,89 @@ class TestOnToolTraceCallback:
             ctx.on_tool_trace(ToolTrace("shell", "", True, 1.0))
         # Just assert we reached here without error
         assert True
+
+
+class TestCancelEventOwnership:
+    """Verify react_loop only clears cancel events it owns (fix: a shared
+    MadPlan /mp stop signal must not be erased when a sub-agent starts)."""
+
+    def _make_controller(self, cancel_event=None):
+        from unittest.mock import MagicMock
+        from agent_controller import AgentController
+
+        return AgentController(
+            llm=MagicMock(),
+            tool_index=MagicMock(),
+            executor=MagicMock(),
+            creator=MagicMock(),
+            memory=MagicMock(),
+            cancel_event=cancel_event,
+        )
+
+    def test_react_context_owns_by_default(self):
+        from react_loop import ReactContext
+        from unittest.mock import MagicMock
+
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=MagicMock(), executor=MagicMock(),
+            creator=MagicMock(), memory=MagicMock(), builtin_executor=None,
+            mcp_manager=None, skill_registry=None,
+        )
+        assert ctx.owns_cancel_event is True
+
+    def test_controller_owns_when_no_external_event(self):
+        ctrl = self._make_controller(cancel_event=None)
+        assert ctrl._owns_cancel_event is True
+
+    def test_controller_does_not_own_external_event(self):
+        import threading
+        ev = threading.Event()
+        ctrl = self._make_controller(cancel_event=ev)
+        assert ctrl._owns_cancel_event is False
+        assert ctrl._cancel_event is ev
+
+    def test_run_does_not_clear_shared_event(self):
+        """A pre-set external cancel event survives into the loop (not cleared)."""
+        import threading
+        from unittest.mock import patch
+
+        ev = threading.Event()
+        ev.set()
+        ctrl = self._make_controller(cancel_event=ev)
+
+        captured = {}
+
+        def _fake_loop(ctx, *args, **kwargs):
+            captured["was_set"] = ctx.cancel_event.is_set()
+            captured["owns"] = ctx.owns_cancel_event
+            return "done"
+
+        with patch("agent_controller.react_loop", side_effect=_fake_loop):
+            ctrl.run("hello")
+
+        # react_loop received an event still set + flagged as not-owned
+        assert captured["owns"] is False
+        assert captured["was_set"] is True
+
+    def test_owned_event_is_cleared_at_loop_start(self):
+        """The main agent (owns its event) clears stale state per turn."""
+        import threading
+        from react_loop import ReactContext, react_loop
+        from unittest.mock import MagicMock, patch
+
+        ev = threading.Event()
+        ev.set()
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=MagicMock(), executor=MagicMock(),
+            creator=MagicMock(), memory=MagicMock(), builtin_executor=None,
+            mcp_manager=None, skill_registry=None,
+            cancel_event=ev, owns_cancel_event=True,
+        )
+        # Stop the loop right after the clear by raising inside the first
+        # heavy call; we only care that the owned event was cleared.
+        with patch("react_loop._build_system_prompt", side_effect=RuntimeError("stop")):
+            try:
+                react_loop(ctx, "hello")
+            except Exception:
+                pass
+        assert ev.is_set() is False
