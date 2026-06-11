@@ -199,14 +199,14 @@ def main() -> None:
     from token_usage import get_registry as get_token_registry
 
     logger.info("Loading LongTermMemory from %s", longterm_path)
-    llm = LLMClient(raw_cfg, usage_registry=get_token_registry(), caller_tag="backfill-embed")
-    long_term = LongTermMemory(path=longterm_path, llm=llm)
+    # For dry-run we only need the file reader, not the embed LLM.
+    # Avoid spinning up LLMClient (and incurring API calls) until needed.
+    long_term = LongTermMemory(path=longterm_path, llm=None)
     entries = long_term.entries()
 
     logger.info("Found %d LongTermMemory entries", len(entries))
     if not entries:
         logger.info("Nothing to import.")
-        llm.close()
         sys.exit(0)
 
     # Compute limit display
@@ -218,8 +218,42 @@ def main() -> None:
         state_file,
     )
 
+    # ------------------------------------------------------------------
+    # DRY-RUN fast path — count/preview without opening the graph DB,
+    # calling embeddings, or making LLM calls.
+    # ------------------------------------------------------------------
     if args.dry_run:
-        logger.info("DRY-RUN — no graph writes will occur.")
+        from graph_memory import (
+            BackfillResult,
+            BackfillEntryResult,
+            _load_backfill_state,
+            _entry_checksum,
+        )
+        logger.info("DRY-RUN — counting entries only; no DB, embeddings, or LLM calls.")
+        state = _load_backfill_state(state_file)
+        imported_map = state.get("imported", {})
+        result = BackfillResult(total=len(entries))
+        processed = 0
+        for entry_id, entry in entries:
+            if args.limit is not None and processed >= args.limit:
+                break
+            checksum = _entry_checksum(entry)
+            if not args.force and entry_id in imported_map:
+                if imported_map[entry_id].get("checksum") == checksum:
+                    result.skipped += 1
+                    result.entries.append(BackfillEntryResult(entry_id=entry_id, status="skipped"))
+                    continue
+            processed += 1
+            result.imported += 1
+            result.entries.append(BackfillEntryResult(entry_id=entry_id, status="imported (dry-run)"))
+
+        _print_summary(result, dry_run=True, verbose=args.verbose)
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # LIVE path — open LLM client, embedding, and graph store.
+    # ------------------------------------------------------------------
+    llm = LLMClient(raw_cfg, usage_registry=get_token_registry(), caller_tag="backfill-embed")
 
     # ------------------------------------------------------------------
     # Build graph store
@@ -265,7 +299,7 @@ def main() -> None:
             store=store,
             llm_call_fn=llm_call_fn,
             state_path=state_file,
-            dry_run=args.dry_run,
+            dry_run=False,
             limit=args.limit,
             force=args.force,
         )
@@ -273,12 +307,16 @@ def main() -> None:
         store.close()
         llm.close()
 
-    # ------------------------------------------------------------------
-    # Print summary
-    # ------------------------------------------------------------------
+    _print_summary(result, dry_run=False, verbose=args.verbose)
+
+    if result.failed > 0:
+        sys.exit(1)
+
+
+def _print_summary(result, *, dry_run: bool, verbose: bool) -> None:
     print()
     print("=" * 60)
-    print("Backfill complete")
+    print("Backfill complete" + (" (DRY-RUN)" if dry_run else ""))
     print("=" * 60)
     print(f"  Total entries:      {result.total}")
     print(f"  Imported:           {result.imported}")
@@ -287,24 +325,21 @@ def main() -> None:
     print(f"  Failed:             {result.failed}")
     print(f"  Total entities:     {result.total_entities}")
     print(f"  Total facts:        {result.total_facts}")
-    if args.dry_run:
+    if dry_run:
         print()
-        print("  [DRY-RUN] No graph writes were made.")
+        print("  [DRY-RUN] No graph writes, embeddings, or LLM calls were made.")
     print("=" * 60)
 
-    if args.verbose or result.failed > 0:
+    if verbose or result.failed > 0:
         print()
         for er in result.entries:
-            if args.verbose or er.status == "failed":
+            if verbose or er.status == "failed":
                 line = f"  {er.entry_id[:12]}..  {er.status}"
                 if er.entities or er.facts:
                     line += f"  ({er.entities} entities, {er.facts} facts)"
                 if er.error:
                     line += f"  ERROR: {er.error}"
                 print(line)
-
-    if result.failed > 0:
-        sys.exit(1)
 
 
 if __name__ == "__main__":

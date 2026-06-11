@@ -712,19 +712,24 @@ def _load_backfill_state(state_path: str) -> dict:
 
 
 def _save_backfill_state(state_path: str, state: dict) -> None:
-    """Atomic write of the migration state JSON."""
+    """Atomic write of the migration state JSON.
+
+    Raises OSError on failure so callers know idempotency state was not
+    persisted and can treat the entry as failed rather than silently
+    risking duplicate imports on the next run.
+    """
     os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
     tmp = f"{state_path}.tmp.{os.getpid()}"
     try:
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, state_path)
-    except OSError as exc:
-        logger.error("Failed to save backfill state: %s", exc)
+    except OSError:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        raise
 
 
 def backfill_longterm_to_graph(
@@ -805,12 +810,15 @@ def backfill_longterm_to_graph(
         extraction = parse_extraction(response)
         if not extraction:
             # No entities/facts found — still write episode for raw-text retrieval
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             try:
                 ep_id = store.add_episode(content[:2000], user_id="backfill", source="longterm_memory_backfill")
             except Exception as exc:  # noqa: BLE001
+                result.failed += 1
+                result.entries.append(
+                    BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+                )
                 logger.warning("Backfill add_episode failed for %s: %s", entry_id, exc)
-                ep_id = ""
+                continue
             result.no_extraction += 1
             entry_result = BackfillEntryResult(
                 entry_id=entry_id, status="no_extraction", episode_id=ep_id
@@ -821,7 +829,14 @@ def backfill_longterm_to_graph(
                 "episode_id": ep_id,
                 "imported_at": datetime.now(timezone.utc).isoformat(),
             }
-            _save_backfill_state(state_path, {"version": 1, "imported": imported_map})
+            try:
+                _save_backfill_state(state_path, {"version": 1, "imported": imported_map})
+            except OSError as exc:
+                logger.error("Backfill state save failed for %s — skipping state update: %s", entry_id, exc)
+                imported_map.pop(entry_id, None)
+                result.no_extraction -= 1
+                result.entries[-1] = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+                result.failed += 1
             continue
 
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -857,8 +872,12 @@ def backfill_longterm_to_graph(
         try:
             ep_id = store.add_episode(content[:2000], user_id="backfill", source="longterm_memory_backfill")
         except Exception as exc:  # noqa: BLE001
+            result.failed += 1
+            result.entries.append(
+                BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            )
             logger.warning("Backfill add_episode failed for %s: %s", entry_id, exc)
-            ep_id = ""
+            continue
 
         result.imported += 1
         result.total_entities += entities_written
@@ -884,6 +903,15 @@ def backfill_longterm_to_graph(
             "episode_id": ep_id,
             "imported_at": datetime.now(timezone.utc).isoformat(),
         }
-        _save_backfill_state(state_path, {"version": 1, "imported": imported_map})
+        try:
+            _save_backfill_state(state_path, {"version": 1, "imported": imported_map})
+        except OSError as exc:
+            logger.error("Backfill state save failed for %s — skipping state update: %s", entry_id, exc)
+            imported_map.pop(entry_id, None)
+            result.imported -= 1
+            result.total_entities -= entities_written
+            result.total_facts -= facts_written
+            result.entries[-1] = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.failed += 1
 
     return result

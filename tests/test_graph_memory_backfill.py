@@ -404,6 +404,63 @@ class TestBackfillFailures:
         assert result.failed == 0
         assert result.skipped == 0
 
+    def test_add_episode_failure_is_hard_failure_in_main_path(self, mock_store, good_llm, tmp_path):
+        """If add_episode raises after entity/fact writes, the entry must be marked failed,
+        not imported, so the next run re-attempts it."""
+        mock_store.add_episode.side_effect = RuntimeError("DB write error")
+        state_path = str(tmp_path / "state.json")
+
+        result = backfill_longterm_to_graph(
+            long_term_entries=_make_entries(),
+            store=mock_store,
+            llm_call_fn=good_llm,
+            state_path=state_path,
+        )
+
+        assert result.failed == 1
+        assert result.imported == 0
+        # State file must NOT record this entry
+        from graph_memory import _load_backfill_state
+        state = _load_backfill_state(state_path)
+        assert "entry-001" not in state.get("imported", {})
+
+    def test_add_episode_failure_no_extraction_path(self, mock_store, empty_llm, tmp_path):
+        """In the no-extraction path, add_episode failure must also be a hard failure."""
+        mock_store.add_episode.side_effect = RuntimeError("episode write error")
+        state_path = str(tmp_path / "state.json")
+
+        result = backfill_longterm_to_graph(
+            long_term_entries=_make_entries(),
+            store=mock_store,
+            llm_call_fn=empty_llm,
+            state_path=state_path,
+        )
+
+        assert result.failed == 1
+        assert result.no_extraction == 0
+        from graph_memory import _load_backfill_state
+        state = _load_backfill_state(state_path)
+        assert "entry-001" not in state.get("imported", {})
+
+    def test_state_save_failure_marks_entry_failed(self, mock_store, good_llm, tmp_path):
+        """If the state file cannot be written after graph writes succeed,
+        the entry must be marked failed (not imported) so the next run re-imports it."""
+        from unittest.mock import patch
+        state_path = str(tmp_path / "state.json")
+
+        with patch("graph_memory._save_backfill_state", side_effect=OSError("disk full")):
+            result = backfill_longterm_to_graph(
+                long_term_entries=_make_entries(),
+                store=mock_store,
+                llm_call_fn=good_llm,
+                state_path=state_path,
+            )
+
+        assert result.failed == 1
+        assert result.imported == 0
+        # Graph writes did happen (entities were upserted before the state-save attempt)
+        assert mock_store.upsert_entity.called
+
     def test_limit_stops_early(self, mock_store, good_llm, tmp_path):
         entries = [
             ("e1", {"content": "one", "source": "manual", "timestamp": "2024-01-01"}),
