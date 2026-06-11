@@ -999,7 +999,9 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
             f"Plan:    {plan_info}{subtask_count}\n"
             f"Plans:   {plan_count} saved"
             f"{last_run_str}\n\n"
-            f"<code>on | off | new | load | save | exec | stop | resume | review | show | list</code>",
+            f"<i>Tip: /mp on · /mp off · /mp new [name] · /mp load &lt;name&gt; · /mp save [name]"
+            f" · /mp exec [name] · /mp exec_trace [name] · /mp stop · /mp resume"
+            f" · /mp review · /mp show · /mp list · /mp delete [name] · /mp rename &lt;name&gt;</i>",
             parse_mode=ParseMode.HTML,
         )
         return
