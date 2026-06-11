@@ -462,37 +462,101 @@ class TestBackfillFailures:
         assert mock_store.upsert_entity.called
 
     def test_state_save_failure_restores_prior_state(self, mock_store, good_llm, tmp_path):
-        """If state-save fails when reprocessing (--force) an already-imported entry,
-        the prior import record must be restored in-memory — not erased — so that
-        a subsequent successful save of another entry does not lose this entry's history."""
+        """Regression: when save fails for entry-1 and later succeeds for entry-2,
+        entry-1's prior import record must still be present in the persisted state.
+
+        The original bug: rollback did imported_map.pop(entry_id) which erased the
+        prior record. Entry-2's subsequent successful save would then persist the map
+        without entry-1, causing duplicate imports on the next run.
+        """
         from unittest.mock import patch
 
         state_path = str(tmp_path / "state.json")
-        entry_id, entry = _make_entries()[0]
-        checksum = _entry_checksum(entry)
+        entry1_id = "entry-001"
+        entry1 = {"content": "Alice uses Python in her projects.", "source": "manual", "timestamp": "2024-01-01"}
+        entry2_id = "entry-002"
+        entry2 = {"content": "Bob uses Go for services.", "source": "manual", "timestamp": "2024-01-02"}
+
         prior_record = {
-            "checksum": checksum,
+            "checksum": _entry_checksum(entry1),
             "episode_id": "ep-prior",
             "imported_at": "2024-01-01T00:00:00+00:00",
         }
-        # Pre-seed state file with a prior successful import for this entry
-        _save_backfill_state(state_path, {"version": 1, "imported": {entry_id: prior_record}})
+        # Pre-seed a prior successful import for entry-1
+        _save_backfill_state(state_path, {"version": 1, "imported": {entry1_id: prior_record}})
 
-        with patch("graph_memory._save_backfill_state", side_effect=[OSError("disk full")]):
+        # Save fails for entry-1, succeeds for entry-2 (None = no side effect = normal write)
+        real_save = _save_backfill_state
+        save_calls = []
+        def patched_save(path, state):
+            save_calls.append(len(state.get("imported", {})))
+            if len(save_calls) == 1:
+                raise OSError("disk full")
+            real_save(path, state)
+
+        with patch("graph_memory._save_backfill_state", side_effect=patched_save):
             result = backfill_longterm_to_graph(
-                long_term_entries=[(entry_id, entry)],
+                long_term_entries=[(entry1_id, entry1), (entry2_id, entry2)],
                 store=mock_store,
                 llm_call_fn=good_llm,
                 state_path=state_path,
-                force=True,  # reprocess even though already imported
+                force=True,
+            )
+
+        assert result.failed == 1   # entry-1 state save failed
+        assert result.imported == 1  # entry-2 succeeded
+        assert len(save_calls) == 2  # both entries attempted a save
+
+        # After entry-2's successful save, state file must contain entry-1's PRIOR record
+        loaded = _load_backfill_state(state_path)
+        assert loaded["imported"].get(entry1_id) == prior_record, (
+            "entry-1 prior record was erased by the failed-save rollback"
+        )
+        assert entry2_id in loaded["imported"], "entry-2 must be in state after successful save"
+
+    def test_state_save_failure_restores_prior_state_no_extraction_path(
+        self, mock_store, empty_llm, tmp_path
+    ):
+        """Same regression as above but via the no_extraction path (empty LLM response)."""
+        from unittest.mock import patch
+
+        state_path = str(tmp_path / "state.json")
+        entry1_id = "entry-001"
+        entry1 = {"content": "Alice uses Python in her projects.", "source": "manual", "timestamp": "2024-01-01"}
+        entry2_id = "entry-002"
+        entry2 = {"content": "Bob uses Go for services.", "source": "manual", "timestamp": "2024-01-02"}
+
+        prior_record = {
+            "checksum": _entry_checksum(entry1),
+            "episode_id": "ep-prior-ne",
+            "imported_at": "2024-01-01T00:00:00+00:00",
+        }
+        _save_backfill_state(state_path, {"version": 1, "imported": {entry1_id: prior_record}})
+
+        real_save = _save_backfill_state
+        save_calls = []
+        def patched_save(path, state):
+            save_calls.append(True)
+            if len(save_calls) == 1:
+                raise OSError("disk full")
+            real_save(path, state)
+
+        with patch("graph_memory._save_backfill_state", side_effect=patched_save):
+            result = backfill_longterm_to_graph(
+                long_term_entries=[(entry1_id, entry1), (entry2_id, entry2)],
+                store=mock_store,
+                llm_call_fn=empty_llm,
+                state_path=state_path,
+                force=True,
             )
 
         assert result.failed == 1
-        assert result.imported == 0
-        # The state file on disk still has the prior record (save was patched to fail,
-        # but the in-memory map should have been restored rather than popped)
+        assert result.no_extraction == 1
         loaded = _load_backfill_state(state_path)
-        assert loaded["imported"].get(entry_id) == prior_record
+        assert loaded["imported"].get(entry1_id) == prior_record, (
+            "no_extraction path erased entry-1 prior record on failed save"
+        )
+        assert entry2_id in loaded["imported"]
 
     def test_limit_stops_early(self, mock_store, good_llm, tmp_path):
         entries = [
