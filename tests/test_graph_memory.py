@@ -197,6 +197,62 @@ class TestGraphMemoryStorePathHandling:
         assert passed.startswith(str(tmp_path))
 
 
+class TestVectorExtensionLoader:
+    """_load_vector_extension() should try LOAD first and INSTALL+LOAD on first use."""
+
+    def _make_store(self, mock_ladybug, embedder, tmp_path):
+        """Return a store with a no-op _load_vector_extension (avoids side effects)."""
+        store = GraphMemoryStore.__new__(GraphMemoryStore)
+        import threading
+        store._conn = mock_ladybug["conn"]
+        store._conn_lock = threading.RLock()
+        store._embed = embedder
+        store._embedding_dim = 4
+        return store
+
+    def test_load_only_when_already_installed(self, mock_ladybug, embedder, tmp_path):
+        """Happy path: LOAD EXTENSION VECTOR succeeds on first try."""
+        store = self._make_store(mock_ladybug, embedder, tmp_path)
+        calls = []
+
+        def _exec(query, *_):
+            calls.append(query.strip())
+
+        store._execute = _exec
+        store._load_vector_extension()
+
+        assert calls == ["LOAD EXTENSION VECTOR"]
+
+    def test_install_then_load_when_not_installed(self, mock_ladybug, embedder, tmp_path):
+        """If LOAD raises 'not been installed', INSTALL then LOAD are called."""
+        store = self._make_store(mock_ladybug, embedder, tmp_path)
+        calls = []
+
+        def _exec(query, *_):
+            q = query.strip()
+            calls.append(q)
+            if q == "LOAD EXTENSION VECTOR" and len(calls) == 1:
+                raise RuntimeError(
+                    "Extension: vector is an official extension and has not been installed."
+                )
+
+        store._execute = _exec
+        store._load_vector_extension()
+
+        assert calls == ["LOAD EXTENSION VECTOR", "INSTALL VECTOR", "LOAD EXTENSION VECTOR"]
+
+    def test_other_exception_is_reraised(self, mock_ladybug, embedder, tmp_path):
+        """Unexpected exceptions (e.g. permission error) should propagate."""
+        store = self._make_store(mock_ladybug, embedder, tmp_path)
+
+        def _exec(query, *_):
+            raise OSError("permission denied")
+
+        store._execute = _exec
+        with pytest.raises(OSError, match="permission denied"):
+            store._load_vector_extension()
+
+
 class TestGraphMemoryStore:
     def test_upsert_entity_calls_execute(self, store, mock_ladybug):
         conn = mock_ladybug["conn"]

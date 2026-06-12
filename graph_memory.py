@@ -237,7 +237,26 @@ class GraphMemoryStore:
     # Schema
     # ------------------------------------------------------------------
 
+    def _load_vector_extension(self) -> None:
+        """Install (once) and load the VECTOR extension required for HNSW indexes.
+
+        INSTALL downloads the extension binary to disk on first use only; subsequent
+        calls to LOAD EXTENSION are fast and require no network access.
+        """
+        try:
+            self._execute("LOAD EXTENSION VECTOR")
+        except Exception as exc:  # noqa: BLE001
+            exc_str = str(exc).lower()
+            if "not been installed" in exc_str or "has not been installed" in exc_str:
+                logger.info("graph_memory: VECTOR extension not installed — installing now")
+                self._execute("INSTALL VECTOR")
+                self._execute("LOAD EXTENSION VECTOR")
+            else:
+                logger.warning("graph_memory: Failed to load VECTOR extension: %s", exc)
+                raise
+
     def _init_schema(self) -> None:
+        self._load_vector_extension()
         dim = self._embedding_dim
         ddl = [
             (
