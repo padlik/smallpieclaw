@@ -64,47 +64,13 @@ def _load_toml(path: str) -> dict:
 
 
 def _build_llm_call(cfg: dict, app_cfg, all_models: list) -> "Callable[[str], str]":
-    """Build a one-shot LLM callable that uses the extraction model."""
-    from config_schema import resolve_model_id
-    from llm_client import LLMClient
-    from token_usage import get_registry as get_token_registry
+    """Build a one-shot LLM callable that uses the extraction model.
 
-    gm_cfg = app_cfg.graph_memory
-    extraction_selector = gm_cfg.extraction_model or app_cfg.agent.default_model
-    extraction_model_id = resolve_model_id(extraction_selector, all_models)
-    if not extraction_model_id:
-        extraction_model_id = resolve_model_id(app_cfg.agent.default_model, all_models) or ""
-
-    extraction_model_cfg = next(
-        (m for m in all_models if m.get("model") == extraction_model_id),
-        all_models[0] if all_models else {},
-    )
-    # Force low-temperature, bounded extraction. chat() reads temperature/max_tokens
-    # from the active model config (not call kwargs), so inject them onto a COPY of
-    # the model dict — never mutate the shared all_models entry. Reasoning models
-    # strip temperature automatically inside LLMClient, so this is provider-safe.
-    extraction_model_cfg = dict(extraction_model_cfg)
-    extraction_model_cfg["temperature"] = 0.1
-    extraction_model_cfg["max_tokens"] = 1024
-    extraction_model_name = extraction_model_cfg.get("model", "")
-    other_models = [m for m in all_models if m.get("model") != extraction_model_name]
-    extraction_cfg = dict(cfg)
-    extraction_cfg["models"] = [extraction_model_cfg] + other_models
-    extraction_agent = dict(cfg.get("agent", {}))
-    extraction_agent["default_model"] = extraction_model_name
-    extraction_cfg["agent"] = extraction_agent
-
-    logger.info("Extraction model: %s", extraction_model_id or "(default)")
-
-    def _llm_call(prompt: str) -> str:
-        llm = LLMClient(extraction_cfg, usage_registry=get_token_registry(), caller_tag="backfill")
-        try:
-            messages = [{"role": "user", "content": prompt}]
-            return llm.chat(messages)
-        finally:
-            llm.close()
-
-    return _llm_call
+    Delegates to the shared ``build_extraction_llm_call`` helper in graph_memory.py
+    so that both the backfill CLI and the live main-process path use identical logic.
+    """
+    from graph_memory import build_extraction_llm_call
+    return build_extraction_llm_call(cfg, app_cfg, all_models, caller_tag="backfill")
 
 
 def main() -> None:

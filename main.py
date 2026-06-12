@@ -476,59 +476,12 @@ def _run(
         from config_schema import parse_config as _parse_config
         _app_cfg = _parse_config(cfg)
         if _app_cfg.graph_memory.enabled:
-            _gm_cfg = _app_cfg.graph_memory
+            from graph_memory import build_extraction_llm_call as _build_extraction_llm_call
 
             def _embedder_fn(text: str) -> list[float]:
                 return llm.embed(text)
 
-            # Determine extraction model — resolve name/alias/model-id, fall back to default_model
-            _extraction_selector = _gm_cfg.extraction_model or _app_cfg.agent.default_model
-            _extraction_model_id = resolve_model_id(_extraction_selector, all_models)
-            if not _extraction_model_id:
-                logger.warning(
-                    "Graph memory: extraction_model '%s' did not resolve to a configured "
-                    "model; falling back to default_model '%s'.",
-                    _extraction_selector,
-                    _app_cfg.agent.default_model,
-                )
-                _extraction_model_id = resolve_model_id(_app_cfg.agent.default_model, all_models)
-            _extraction_model_cfg = next(
-                (m for m in all_models if m.get("model") == _extraction_model_id),
-                all_models[0] if all_models else {},
-            )
-
-            # Build a real sub-config that selects the extraction model as default.
-            # LLMClient chooses its active model from config["agent"]["default_model"],
-            # so reorder models (extraction first) and point default_model at it.
-            # Force low-temperature, bounded extraction. chat() reads temperature/
-            # max_tokens from the active model config (not call kwargs), so inject them
-            # onto a COPY of the model dict — never mutate the shared all_models entry.
-            # Reasoning models strip temperature automatically inside LLMClient.
-            _extraction_model_cfg = dict(_extraction_model_cfg)
-            _extraction_model_cfg["temperature"] = 0.1
-            _extraction_model_cfg["max_tokens"] = 1024
-            _extraction_model_name = _extraction_model_cfg.get("model", "")
-            _other_models = [
-                m for m in all_models if m.get("model") != _extraction_model_name
-            ]
-            _extraction_cfg = dict(cfg)
-            _extraction_cfg["models"] = [_extraction_model_cfg] + _other_models
-            _extraction_agent = dict(cfg.get("agent", {}))
-            _extraction_agent["default_model"] = _extraction_model_name
-            _extraction_cfg["agent"] = _extraction_agent
-
-            def _llm_call_fn(prompt: str) -> str:
-                """One-shot LLM call for extraction (low temperature, no history)."""
-                extraction_llm = LLMClient(
-                    _extraction_cfg,
-                    usage_registry=get_token_registry(),
-                    caller_tag="graph-extract",
-                )
-                try:
-                    messages = [{"role": "user", "content": prompt}]
-                    return extraction_llm.chat(messages)
-                finally:
-                    extraction_llm.close()
+            _llm_call_fn = _build_extraction_llm_call(cfg, _app_cfg, all_models)
 
             graph_memory_store, graph_memory_writer = create_graph_memory(
                 cfg=_app_cfg,
@@ -540,14 +493,14 @@ def _run(
                 # Wire into agent (main react_loop context)
                 agent._graph_memory = graph_memory_store
                 agent._graph_memory_writer = graph_memory_writer
-                agent._graph_memory_max_entries = _gm_cfg.max_context_entries
+                agent._graph_memory_max_entries = _app_cfg.graph_memory.max_context_entries
                 # Wire into builtin executor for memory_graph_search/store tools
                 builtin._graph_memory = graph_memory_store
                 builtin._graph_memory_writer = graph_memory_writer
                 logger.info(
                     "Graph memory enabled (db=%s, extraction_model=%s)",
-                    _gm_cfg.db_path,
-                    _extraction_model_id,
+                    _app_cfg.graph_memory.db_path,
+                    _app_cfg.graph_memory.extraction_model or _app_cfg.agent.default_model,
                 )
     except Exception as _gm_init_exc:
         logger.warning("Graph memory initialisation failed (continuing without it): %s", _gm_init_exc)

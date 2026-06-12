@@ -65,9 +65,12 @@ from graph_memory import (  # noqa: E402
     BackfillEntryResult,
     BackfillResult,
     backfill_longterm_to_graph,
+    build_extraction_llm_call,
 )
 BackfillEntryResult
 BackfillResult
+backfill_longterm_to_graph
+build_extraction_llm_call
 backfill_longterm_to_graph
 
 # LongTermMemory.entries — safe snapshot API used by backfill CLI

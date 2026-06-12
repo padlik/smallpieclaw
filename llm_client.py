@@ -831,6 +831,9 @@ class LLMClient:
             }
             if system:
                 payload["system"] = system
+            temperature = self.llm_cfg.get("temperature")
+            if temperature is not None:
+                payload["temperature"] = temperature
             top_p = self.llm_cfg.get("top_p")
             if top_p is not None:
                 payload["top_p"] = top_p

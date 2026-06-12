@@ -29,15 +29,18 @@ from memory_store import LongTermMemory
 
 
 # ---------------------------------------------------------------------------
-# _build_llm_call — extraction LLM callable (regression for chat() kwargs bug)
+# build_extraction_llm_call — shared extraction LLM builder
 # ---------------------------------------------------------------------------
 
-class TestBuildLLMCall:
-    """Regression tests for backfill_graph_memory._build_llm_call.
+class TestBuildExtractionLLMCall:
+    """Regression tests for graph_memory.build_extraction_llm_call.
 
     Guards against the bug where the closure called
     ``llm.chat(messages, temperature=0.1, max_tokens=1024)`` (chat() takes no
     such kwargs) and then ``resp.get("content")`` (chat() returns a str).
+
+    Both backfill_graph_memory._build_llm_call and main.py delegate to this
+    shared helper, so coverage here covers all extraction paths.
     """
 
     def _app_cfg(self, minimal_config):
@@ -46,7 +49,7 @@ class TestBuildLLMCall:
         return parse_config(minimal_config)
 
     def test_chat_called_without_unsupported_kwargs(self, minimal_config, monkeypatch):
-        from backfill_graph_memory import _build_llm_call
+        from graph_memory import build_extraction_llm_call
 
         app_cfg = self._app_cfg(minimal_config)
         all_models = minimal_config["models"]
@@ -57,12 +60,12 @@ class TestBuildLLMCall:
         monkeypatch.setattr("llm_client.LLMClient", llm_cls)
         monkeypatch.setattr("token_usage.get_registry", lambda: MagicMock())
 
-        fn = _build_llm_call(minimal_config, app_cfg, all_models)
+        fn = build_extraction_llm_call(minimal_config, app_cfg, all_models)
         result = fn("some prompt")
 
         # chat() returns a str — it must be passed straight through
         assert result == '{"entities":[],"facts":[]}'
-        # chat() must be called with the messages list only — no temperature/max_tokens
+        # chat() must be called with the messages list only — no temperature/max_tokens kwargs
         assert instance.chat.call_count == 1
         args, kwargs = instance.chat.call_args
         assert "temperature" not in kwargs
@@ -71,7 +74,7 @@ class TestBuildLLMCall:
         instance.close.assert_called_once()
 
     def test_temperature_and_max_tokens_injected_into_config(self, minimal_config, monkeypatch):
-        from backfill_graph_memory import _build_llm_call
+        from graph_memory import build_extraction_llm_call
 
         app_cfg = self._app_cfg(minimal_config)
         all_models = minimal_config["models"]
@@ -83,7 +86,7 @@ class TestBuildLLMCall:
         monkeypatch.setattr("llm_client.LLMClient", llm_cls)
         monkeypatch.setattr("token_usage.get_registry", lambda: MagicMock())
 
-        fn = _build_llm_call(minimal_config, app_cfg, all_models)
+        fn = build_extraction_llm_call(minimal_config, app_cfg, all_models)
         fn("prompt")
 
         # The config handed to LLMClient must carry the low-temperature extraction settings
@@ -94,6 +97,30 @@ class TestBuildLLMCall:
         # The shared all_models entry must NOT have been mutated
         assert all_models[0] == original_model
         assert "temperature" not in all_models[0]
+
+    def test_backfill_delegate_calls_shared_helper(self, minimal_config, monkeypatch):
+        """backfill_graph_memory._build_llm_call must delegate to build_extraction_llm_call."""
+        from backfill_graph_memory import _build_llm_call
+        from graph_memory import build_extraction_llm_call
+
+        app_cfg = self._app_cfg(minimal_config)
+        all_models = minimal_config["models"]
+
+        captured = {}
+        original = build_extraction_llm_call
+        def spy_helper(raw_cfg, a_cfg, models, caller_tag="graph-extract"):
+            captured["called"] = True
+            captured["caller_tag"] = caller_tag
+            return original(raw_cfg, a_cfg, models, caller_tag=caller_tag)
+
+        monkeypatch.setattr("graph_memory.build_extraction_llm_call", spy_helper)
+        monkeypatch.setattr("llm_client.LLMClient", MagicMock(return_value=MagicMock(
+            chat=MagicMock(return_value="{}"))))
+        monkeypatch.setattr("token_usage.get_registry", lambda: MagicMock())
+
+        _build_llm_call(minimal_config, app_cfg, all_models)
+        assert captured.get("called"), "backfill _build_llm_call did not call build_extraction_llm_call"
+        assert captured.get("caller_tag") == "backfill"
 
 
 # ---------------------------------------------------------------------------

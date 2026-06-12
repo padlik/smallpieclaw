@@ -679,6 +679,67 @@ def create_graph_memory(
         return None, None
 
 
+def build_extraction_llm_call(
+    raw_cfg: dict,
+    app_cfg,
+    all_models: list,
+    caller_tag: str = "graph-extract",
+) -> "Callable[[str], str]":
+    """Build a one-shot LLM callable for graph-memory triplet extraction.
+
+    Injects ``temperature=0.1`` and ``max_tokens=1024`` onto a *copy* of the
+    extraction model config so that ``LLMClient.chat()`` picks them up from
+    ``self.llm_cfg``.  The shared ``all_models`` list is never mutated.
+
+    Parameters
+    ----------
+    raw_cfg     : full raw config dict (as loaded from config.toml / TOML parse)
+    app_cfg     : parsed AppConfig instance (for graph_memory.extraction_model,
+                  agent.default_model)
+    all_models  : list of model config dicts from raw_cfg["models"]
+    caller_tag  : caller tag passed to LLMClient for log identification
+    """
+    from config_schema import resolve_model_id  # local to avoid circular import
+    from llm_client import LLMClient
+    from token_usage import get_registry as get_token_registry  # local import
+
+    gm_cfg = app_cfg.graph_memory
+    extraction_selector = gm_cfg.extraction_model or app_cfg.agent.default_model
+    extraction_model_id = resolve_model_id(extraction_selector, all_models)
+    if not extraction_model_id:
+        extraction_model_id = resolve_model_id(app_cfg.agent.default_model, all_models) or ""
+
+    extraction_model_cfg = next(
+        (m for m in all_models if m.get("model") == extraction_model_id),
+        all_models[0] if all_models else {},
+    )
+    # Inject low-temperature extraction settings onto a COPY of the model dict —
+    # never mutate the shared all_models entry. Reasoning models strip temperature
+    # automatically inside LLMClient, so this is provider-safe.
+    extraction_model_cfg = dict(extraction_model_cfg)
+    extraction_model_cfg["temperature"] = 0.1
+    extraction_model_cfg["max_tokens"] = 1024
+
+    extraction_model_name = extraction_model_cfg.get("model", "")
+    other_models = [m for m in all_models if m.get("model") != extraction_model_name]
+    extraction_cfg = dict(raw_cfg)
+    extraction_cfg["models"] = [extraction_model_cfg] + other_models
+    extraction_agent = dict(raw_cfg.get("agent", {}))
+    extraction_agent["default_model"] = extraction_model_name
+    extraction_cfg["agent"] = extraction_agent
+
+    logger.info("Graph extraction model: %s (tag=%s)", extraction_model_id or "(default)", caller_tag)
+
+    def _llm_call(prompt: str) -> str:
+        llm = LLMClient(extraction_cfg, usage_registry=get_token_registry(), caller_tag=caller_tag)
+        try:
+            return llm.chat([{"role": "user", "content": prompt}])
+        finally:
+            llm.close()
+
+    return _llm_call
+
+
 # ---------------------------------------------------------------------------
 # LongTermMemory → Graph backfill service
 # ---------------------------------------------------------------------------
