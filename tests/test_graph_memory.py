@@ -7,6 +7,7 @@ if it is not installed.
 
 from __future__ import annotations
 
+import os
 import time
 from unittest.mock import MagicMock
 
@@ -155,6 +156,45 @@ class TestGraphMemoryStoreUnavailable:
                 db_path="/tmp/test",
                 embedder_fn=lambda t: [0.0],
             )
+
+
+class TestGraphMemoryStorePathHandling:
+    """db_path must be passed to LadybugDB as a FILE, never a directory.
+
+    LadybugDB raises 'Database path cannot be a directory' otherwise.
+    """
+
+    def test_db_path_passed_as_file_and_parent_created(self, mock_ladybug, embedder, tmp_path):
+        db_path = str(tmp_path / "sub" / "graph_memory")
+        GraphMemoryStore(db_path=db_path, embedder_fn=embedder, embedding_dim=4)
+        # Parent directory created, but the db_path itself is NOT a directory
+        assert os.path.isdir(os.path.dirname(db_path))
+        assert not os.path.isdir(db_path)
+        # The exact file path was handed to ladybug.Database
+        assert mock_ladybug["ladybug"].Database.call_args[0][0] == db_path
+
+    def test_empty_leftover_directory_is_removed(self, mock_ladybug, embedder, tmp_path):
+        db_path = str(tmp_path / "graph_memory")
+        os.makedirs(db_path)  # simulate the old buggy makedirs(db_path)
+        GraphMemoryStore(db_path=db_path, embedder_fn=embedder, embedding_dim=4)
+        assert not os.path.isdir(db_path)
+
+    def test_non_empty_directory_raises(self, mock_ladybug, embedder, tmp_path):
+        db_path = str(tmp_path / "graph_memory")
+        os.makedirs(db_path)
+        with open(os.path.join(db_path, "stale"), "w") as f:
+            f.write("x")
+        with pytest.raises(RuntimeError, match="non-empty directory"):
+            GraphMemoryStore(db_path=db_path, embedder_fn=embedder, embedding_dim=4)
+
+    def test_home_directory_is_expanded(self, mock_ladybug, embedder, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        GraphMemoryStore(
+            db_path="~/piclaw/data/graph_memory", embedder_fn=embedder, embedding_dim=4
+        )
+        passed = mock_ladybug["ladybug"].Database.call_args[0][0]
+        assert "~" not in passed
+        assert passed.startswith(str(tmp_path))
 
 
 class TestGraphMemoryStore:

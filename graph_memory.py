@@ -196,7 +196,27 @@ class GraphMemoryStore:
                 "ladybug package is required for graph memory. "
                 "Install it with: pip install ladybug"
             )
-        os.makedirs(db_path, exist_ok=True)
+        # LadybugDB stores the entire database in a single file at ``db_path``
+        # and raises "Database path cannot be a directory" if the path is an
+        # existing directory. Create the *parent* directory (not the path
+        # itself) and expand ``~`` so our filesystem operations match the path
+        # ladybug opens internally.
+        db_path = os.path.expanduser(db_path)
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # Migration: older versions mistakenly created ``db_path`` itself as a
+        # directory via os.makedirs(). Remove that empty leftover so the
+        # embedded database file can be created in its place.
+        if os.path.isdir(db_path):
+            try:
+                os.rmdir(db_path)  # only succeeds if the directory is empty
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Graph memory db_path '{db_path}' is a non-empty directory, "
+                    "but LadybugDB requires a file path. Remove or relocate it, "
+                    "or set [graph_memory] db_path to a file path."
+                ) from exc
         self._db = ladybug.Database(
             db_path,
             buffer_pool_size=buffer_pool_mb * 1024 * 1024,

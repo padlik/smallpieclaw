@@ -140,7 +140,7 @@ enabled = true
 # ─────────────────────────────────────────────────────────────────────────────
 # [graph_memory]
 # enabled               = false        # set to true to enable
-# db_path               = "data/graph_memory"   # LadybugDB directory
+# db_path               = "data/graph_memory"   # LadybugDB database file (NOT a directory)
 # buffer_pool_mb        = 256          # RAM for DB buffer pool (lower on Pi 3/4)
 # # extraction_model: model to use for triplet extraction (LLM call per batch).
 # # Must match the 'model' field of a [[models]] entry. Falls back to default_model.
