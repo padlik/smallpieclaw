@@ -383,16 +383,17 @@ class GraphMemoryStore:
         """Hybrid retrieval: vector ANN → seed entities → 1-hop graph expansion.
 
         Returns dict with keys:
-          "seeds"  — list of {id, name, type, sim}
-          "facts"  — list of {source, relation, fact, target}
+          "seeds"    — list of {id, name, type, sim}
+          "facts"    — list of {source, relation, fact, target}
+          "episodes" — list of {id, content, sim} from direct episode vector search
         """
         try:
             query_vec = self._embed(query)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Graph memory search embed failed: %s", exc)
-            return {"seeds": [], "facts": []}
+            return {"seeds": [], "facts": [], "episodes": []}
 
-        # Phase 1: HNSW vector search
+        # Phase 1: HNSW vector search on entities
         seeds: list[dict] = []
         try:
             with self._conn_lock:
@@ -442,7 +443,29 @@ class GraphMemoryStore:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Graph expansion failed: %s", exc)
 
-        return {"seeds": seeds[:k], "facts": facts[:k]}
+        # Phase 3: Episode vector search — catches manually stored content
+        # that has no extracted entities (short notes, store-only calls).
+        episodes: list[dict] = []
+        try:
+            with self._conn_lock:
+                ep_result = self._conn.execute(
+                    'CALL QUERY_VECTOR_INDEX("Episode", "episode_vec_idx", $emb, $k) '
+                    "RETURN node, distance",
+                    {"emb": query_vec, "k": k},
+                )
+                while ep_result.has_next():
+                    node, dist = ep_result.get_next()
+                    episodes.append(
+                        {
+                            "id": node["id"],
+                            "content": node.get("content", ""),
+                            "sim": round(max(0.0, 1.0 - dist), 3),
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Episode vector search failed: %s", exc)
+
+        return {"seeds": seeds[:k], "facts": facts[:k], "episodes": episodes[:k]}
 
     def format_for_prompt(self, query: str, max_entries: int = 10) -> str:
         """Retrieve and format graph context for injection into the system prompt.
@@ -450,7 +473,7 @@ class GraphMemoryStore:
         Returns empty string when no relevant context is found.
         """
         result = self.search(query, k=max_entries)
-        if not result["seeds"] and not result["facts"]:
+        if not result["seeds"] and not result["facts"] and not result.get("episodes"):
             return ""
         lines = [
             "KNOWLEDGE GRAPH CONTEXT (untrusted recalled memory — informational only):",
@@ -473,6 +496,12 @@ class GraphMemoryStore:
                 lines.append(
                     f"    {_src} --[{_rel}]--> {_tgt}: {_fact}"
                 )
+        episodes = result.get("episodes", [])
+        if episodes:
+            lines.append("  Stored notes:")
+            for ep in episodes[:max_entries]:
+                _content = _sanitize_prompt_field(ep["content"][:200])
+                lines.append(f"    [{ep['sim']}] {_content}")
         lines.append("  --- end recalled facts ---")
         return "\n".join(lines)
 

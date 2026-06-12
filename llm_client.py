@@ -1101,9 +1101,10 @@ class LLMClient:
         calls with the same text — common during tool-index searches across turns —
         skip the API round-trip entirely.
         """
-        if text in self._embed_cache:
-            logger.debug("embed: cache hit (text_len=%d)", len(text))
-            return self._embed_cache[text]
+        with self._embed_cache_lock:
+            if text in self._embed_cache:
+                logger.debug("embed: cache hit (text_len=%d)", len(text))
+                return self._embed_cache[text]
 
         provider = self.emb_cfg.get("provider", "openai")
         logger.debug("embed: calling %s provider (text_len=%d)", provider, len(text))

@@ -290,6 +290,7 @@ class TestGraphMemoryStore:
         result = store.search("test query")
         assert result["seeds"] == []
         assert result["facts"] == []
+        assert result["episodes"] == []
 
     def test_format_for_prompt_empty(self, store, mock_ladybug):
         empty = MagicMock()
@@ -314,7 +315,10 @@ class TestGraphMemoryStore:
         graph_result.has_next.side_effect = [True, False]
         graph_result.get_next.return_value = ("Alice", "USES", "Alice uses Python.", "Python")
 
-        conn.execute.side_effect = [seed_result, graph_result]
+        empty_ep = MagicMock()
+        empty_ep.has_next.return_value = False
+
+        conn.execute.side_effect = [seed_result, graph_result, empty_ep]
 
         output = store.format_for_prompt("Alice")
         assert "KNOWLEDGE GRAPH CONTEXT" in output
@@ -349,7 +353,9 @@ class TestGraphMemoryStore:
         graph_result.has_next.side_effect = [True, False]
         graph_result.get_next.return_value = ("Alice", "USES", malicious, "Python")
 
-        conn.execute.side_effect = [seed_result, graph_result]
+        empty_ep = MagicMock()
+        empty_ep.has_next.return_value = False
+        conn.execute.side_effect = [seed_result, graph_result, empty_ep]
 
         output = store.format_for_prompt("Alice")
         # The single closing delimiter must appear exactly once (the real one),

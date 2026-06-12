@@ -1094,8 +1094,8 @@ Rules:
             session.transition(MadPlanState.PLANNING)
             return
 
-        # Clear pending state now that execution has started
-        user_state.pending_plan = None
+        # Keep session.plan set — /mp resume needs it after a partial failure.
+        # Only clear the pending tracking ID now that execution has started.
         user_state.plan_context.plan_id = ""
 
         async def _notify(text: str) -> None:
