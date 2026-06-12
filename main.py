@@ -500,6 +500,13 @@ def _run(
             # Build a real sub-config that selects the extraction model as default.
             # LLMClient chooses its active model from config["agent"]["default_model"],
             # so reorder models (extraction first) and point default_model at it.
+            # Force low-temperature, bounded extraction. chat() reads temperature/
+            # max_tokens from the active model config (not call kwargs), so inject them
+            # onto a COPY of the model dict — never mutate the shared all_models entry.
+            # Reasoning models strip temperature automatically inside LLMClient.
+            _extraction_model_cfg = dict(_extraction_model_cfg)
+            _extraction_model_cfg["temperature"] = 0.1
+            _extraction_model_cfg["max_tokens"] = 1024
             _extraction_model_name = _extraction_model_cfg.get("model", "")
             _other_models = [
                 m for m in all_models if m.get("model") != _extraction_model_name
@@ -519,8 +526,7 @@ def _run(
                 )
                 try:
                     messages = [{"role": "user", "content": prompt}]
-                    resp = extraction_llm.chat(messages, temperature=0.1, max_tokens=1024)
-                    return resp.get("content", "")
+                    return extraction_llm.chat(messages)
                 finally:
                     extraction_llm.close()
 

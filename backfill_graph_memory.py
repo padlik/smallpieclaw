@@ -79,6 +79,13 @@ def _build_llm_call(cfg: dict, app_cfg, all_models: list) -> "Callable[[str], st
         (m for m in all_models if m.get("model") == extraction_model_id),
         all_models[0] if all_models else {},
     )
+    # Force low-temperature, bounded extraction. chat() reads temperature/max_tokens
+    # from the active model config (not call kwargs), so inject them onto a COPY of
+    # the model dict — never mutate the shared all_models entry. Reasoning models
+    # strip temperature automatically inside LLMClient, so this is provider-safe.
+    extraction_model_cfg = dict(extraction_model_cfg)
+    extraction_model_cfg["temperature"] = 0.1
+    extraction_model_cfg["max_tokens"] = 1024
     extraction_model_name = extraction_model_cfg.get("model", "")
     other_models = [m for m in all_models if m.get("model") != extraction_model_name]
     extraction_cfg = dict(cfg)
@@ -93,8 +100,7 @@ def _build_llm_call(cfg: dict, app_cfg, all_models: list) -> "Callable[[str], st
         llm = LLMClient(extraction_cfg, usage_registry=get_token_registry(), caller_tag="backfill")
         try:
             messages = [{"role": "user", "content": prompt}]
-            resp = llm.chat(messages, temperature=0.1, max_tokens=1024)
-            return resp.get("content", "")
+            return llm.chat(messages)
         finally:
             llm.close()
 

@@ -29,6 +29,74 @@ from memory_store import LongTermMemory
 
 
 # ---------------------------------------------------------------------------
+# _build_llm_call — extraction LLM callable (regression for chat() kwargs bug)
+# ---------------------------------------------------------------------------
+
+class TestBuildLLMCall:
+    """Regression tests for backfill_graph_memory._build_llm_call.
+
+    Guards against the bug where the closure called
+    ``llm.chat(messages, temperature=0.1, max_tokens=1024)`` (chat() takes no
+    such kwargs) and then ``resp.get("content")`` (chat() returns a str).
+    """
+
+    def _app_cfg(self, minimal_config):
+        from config_schema import parse_config
+        minimal_config["graph_memory"] = {"enabled": True}
+        return parse_config(minimal_config)
+
+    def test_chat_called_without_unsupported_kwargs(self, minimal_config, monkeypatch):
+        from backfill_graph_memory import _build_llm_call
+
+        app_cfg = self._app_cfg(minimal_config)
+        all_models = minimal_config["models"]
+
+        instance = MagicMock()
+        instance.chat.return_value = '{"entities":[],"facts":[]}'
+        llm_cls = MagicMock(return_value=instance)
+        monkeypatch.setattr("llm_client.LLMClient", llm_cls)
+        monkeypatch.setattr("token_usage.get_registry", lambda: MagicMock())
+
+        fn = _build_llm_call(minimal_config, app_cfg, all_models)
+        result = fn("some prompt")
+
+        # chat() returns a str — it must be passed straight through
+        assert result == '{"entities":[],"facts":[]}'
+        # chat() must be called with the messages list only — no temperature/max_tokens
+        assert instance.chat.call_count == 1
+        args, kwargs = instance.chat.call_args
+        assert "temperature" not in kwargs
+        assert "max_tokens" not in kwargs
+        assert args[0] == [{"role": "user", "content": "some prompt"}]
+        instance.close.assert_called_once()
+
+    def test_temperature_and_max_tokens_injected_into_config(self, minimal_config, monkeypatch):
+        from backfill_graph_memory import _build_llm_call
+
+        app_cfg = self._app_cfg(minimal_config)
+        all_models = minimal_config["models"]
+        original_model = dict(all_models[0])  # snapshot to detect mutation
+
+        instance = MagicMock()
+        instance.chat.return_value = "{}"
+        llm_cls = MagicMock(return_value=instance)
+        monkeypatch.setattr("llm_client.LLMClient", llm_cls)
+        monkeypatch.setattr("token_usage.get_registry", lambda: MagicMock())
+
+        fn = _build_llm_call(minimal_config, app_cfg, all_models)
+        fn("prompt")
+
+        # The config handed to LLMClient must carry the low-temperature extraction settings
+        passed_cfg = llm_cls.call_args[0][0]
+        extraction_model = passed_cfg["models"][0]
+        assert extraction_model["temperature"] == 0.1
+        assert extraction_model["max_tokens"] == 1024
+        # The shared all_models entry must NOT have been mutated
+        assert all_models[0] == original_model
+        assert "temperature" not in all_models[0]
+
+
+# ---------------------------------------------------------------------------
 # LongTermMemory.entries() snapshot
 # ---------------------------------------------------------------------------
 
