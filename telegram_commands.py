@@ -1365,6 +1365,11 @@ async def cmd_mad_plan(iface: "TelegramInterface", update: Update, ctx: ContextT
                 parse_mode=ParseMode.HTML,
             )
             return
+        # Ensure plan_name is populated from plan_context when the session
+        # has a freshly created plan that hasn't been explicitly named yet.
+        if not session.plan_name and user_state.plan_context.plan_name:
+            session.plan_name = user_state.plan_context.plan_name
+            session.dirty = True
         # Delegate to the existing execution handler
         traced = subcommand == "exec_trace"
         await iface._run_mad_plan_execute(update, ctx, session.plan, traced=traced)
@@ -1673,10 +1678,15 @@ async def cb_mad_plan_review(iface: "TelegramInterface", update: Update, ctx: Co
                 except Exception:
                     pass
                 return
-        # Transfer plan to session (if still pending)
+        # Transfer plan to session (if still pending).
+        # NOTE: pending_plan is an alias for session.plan, so the identity
+        # check is always False on the normal flow. Always sync plan_name
+        # from plan_context to ensure run artifacts are named correctly.
         plan_name = user_state.plan_context.plan_name
         if user_state.session.plan != plan:
             user_state.session.plan = plan
+            user_state.session.dirty = True
+        if plan_name and user_state.session.plan_name != plan_name:
             user_state.session.plan_name = plan_name
             user_state.session.dirty = True
         user_state.plan_context.plan_id = ""
