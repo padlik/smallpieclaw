@@ -217,10 +217,8 @@ class GraphMemoryStore:
                     "but LadybugDB requires a file path. Remove or relocate it, "
                     "or set [graph_memory] db_path to a file path."
                 ) from exc
-        self._db = ladybug.Database(
-            db_path,
-            buffer_pool_size=buffer_pool_mb * 1024 * 1024,
-            max_num_threads=2,
+        self._db = self._open_db(
+            db_path, buffer_pool_mb * 1024 * 1024
         )
         self._conn = ladybug.Connection(self._db, num_threads=2)
         # Single reentrant lock serialising ALL connection access. The ladybug/
@@ -232,6 +230,60 @@ class GraphMemoryStore:
         self._embedding_dim = embedding_dim
         self._init_schema()
         logger.info("GraphMemoryStore initialised at %s (dim=%d)", db_path, embedding_dim)
+
+    # ------------------------------------------------------------------
+    # DB open helper — WAL recovery
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _open_db(db_path: str, buffer_pool_size: int):
+        """Open (or create) the LadybugDB database at *db_path*.
+
+        If opening fails with a corrupted WAL error the WAL files are removed
+        and the open is retried.  Deleting the WAL discards any transactions
+        that were committed but not yet checkpointed to the main DB file;
+        all checkpointed data is preserved.  This is acceptable because the
+        alternative is a permanently unreadable database.
+
+        WAL file paths (LadybugDB convention):
+            {db_path}.wal               — primary WAL
+            {db_path}.wal.checkpoint    — checkpoint WAL
+        """
+        try:
+            return ladybug.Database(
+                db_path,
+                buffer_pool_size=buffer_pool_size,
+                max_num_threads=2,
+            )
+        except Exception as exc:  # noqa: BLE001
+            exc_lower = str(exc).lower()
+            if "corrupted wal" not in exc_lower and "invalid wal record" not in exc_lower:
+                raise
+            # Attempt WAL recovery: remove corrupt WAL files and retry.
+            wal_path = db_path + ".wal"
+            ckpt_path = db_path + ".wal.checkpoint"
+            removed = []
+            for p in (wal_path, ckpt_path):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                        removed.append(p)
+                    except OSError as rm_exc:
+                        raise RuntimeError(
+                            f"Corrupted WAL detected but could not remove '{p}': {rm_exc}"
+                        ) from exc
+            if not removed:
+                raise  # WAL files not found — original error was something else
+            logger.warning(
+                "graph_memory: Corrupted WAL detected — removed %s and retrying open. "
+                "Any data written since the last checkpoint has been lost.",
+                removed,
+            )
+            return ladybug.Database(
+                db_path,
+                buffer_pool_size=buffer_pool_size,
+                max_num_threads=2,
+            )
 
     # ------------------------------------------------------------------
     # Schema

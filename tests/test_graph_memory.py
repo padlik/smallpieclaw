@@ -197,6 +197,70 @@ class TestGraphMemoryStorePathHandling:
         assert passed.startswith(str(tmp_path))
 
 
+class TestGraphMemoryWALRecovery:
+    """_open_db() removes corrupt WAL files and retries on corrupted-WAL errors."""
+
+    def _make_ladybug_mock(self, monkeypatch, db_side_effect):
+        """Patch graph_memory.ladybug with a minimal mock whose Database calls db_side_effect."""
+        from unittest.mock import MagicMock as _MM
+        lbug_mock = _MM()
+        lbug_mock.Database.side_effect = db_side_effect
+        monkeypatch.setattr("graph_memory.ladybug", lbug_mock)
+        return lbug_mock
+
+    def test_corrupted_wal_removes_wal_and_retries(self, tmp_path, monkeypatch):
+        db_path = str(tmp_path / "graph")
+        wal_path = db_path + ".wal"
+        ckpt_path = db_path + ".wal.checkpoint"
+
+        # Create fake WAL sidecar files so the removal is exercised.
+        open(wal_path, "w").close()
+        open(ckpt_path, "w").close()
+
+        call_count = 0
+
+        def _db_side_effect(*_args, **_kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("Corrupted wal file. Read out invalid WAL record type.")
+            return MagicMock()
+
+        self._make_ladybug_mock(monkeypatch, _db_side_effect)
+
+        from graph_memory import GraphMemoryStore as GMS
+        db = GMS._open_db(db_path, 64 * 1024 * 1024)
+        assert db is not None
+        assert call_count == 2, "Database should have been opened twice (fail then retry)"
+        assert not os.path.exists(wal_path), "WAL file should have been removed"
+        assert not os.path.exists(ckpt_path), "Checkpoint WAL file should have been removed"
+
+    def test_non_wal_error_is_reraised(self, tmp_path, monkeypatch):
+        db_path = str(tmp_path / "graph2")
+
+        def _fail(*_args, **_kw):
+            raise RuntimeError("Disk is full")
+
+        self._make_ladybug_mock(monkeypatch, _fail)
+
+        from graph_memory import GraphMemoryStore as GMS
+        with pytest.raises(RuntimeError, match="Disk is full"):
+            GMS._open_db(db_path, 64 * 1024 * 1024)
+
+    def test_corrupted_wal_without_files_reraises(self, tmp_path, monkeypatch):
+        """If no WAL files are present the original exception is re-raised."""
+        db_path = str(tmp_path / "graph3")
+
+        def _fail(*_args, **_kw):
+            raise RuntimeError("Corrupted wal file. Read out invalid WAL record type.")
+
+        self._make_ladybug_mock(monkeypatch, _fail)
+
+        from graph_memory import GraphMemoryStore as GMS
+        with pytest.raises(RuntimeError, match="Corrupted wal"):
+            GMS._open_db(db_path, 64 * 1024 * 1024)
+
+
 class TestVectorExtensionLoader:
     """_load_vector_extension() should try LOAD first and INSTALL+LOAD on first use."""
 
