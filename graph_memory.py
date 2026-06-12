@@ -921,6 +921,7 @@ def backfill_longterm_to_graph(
     dry_run: bool = False,
     limit: Optional[int] = None,
     force: bool = False,
+    notify_fn: Optional[Callable[[int, int, "BackfillResult", "BackfillEntryResult"], None]] = None,
 ) -> BackfillResult:
     """Seed the graph store from a snapshot of LongTermMemory entries.
 
@@ -933,6 +934,9 @@ def backfill_longterm_to_graph(
     dry_run           : if True, count/preview only — no graph writes, no state update
     limit             : stop after N entries (useful for incremental processing)
     force             : ignore state file and reprocess all entries
+    notify_fn         : optional progress callback called after each entry is processed.
+                        Signature: notify_fn(current, total, result, entry_result)
+                        where current = number of entries processed so far (1-based).
 
     Returns a BackfillResult with per-entry outcomes and aggregate counts.
     """
@@ -941,6 +945,10 @@ def backfill_longterm_to_graph(
 
     result = BackfillResult(total=len(long_term_entries))
     processed = 0
+
+    def _notify(er: BackfillEntryResult) -> None:
+        if notify_fn is not None:
+            notify_fn(len(result.entries), result.total, result, er)
 
     for entry_id, entry in long_term_entries:
         if limit is not None and processed >= limit:
@@ -953,7 +961,9 @@ def backfill_longterm_to_graph(
             existing = imported_map[entry_id]
             if existing.get("checksum") == checksum:
                 result.skipped += 1
-                result.entries.append(BackfillEntryResult(entry_id=entry_id, status="skipped"))
+                er = BackfillEntryResult(entry_id=entry_id, status="skipped")
+                result.entries.append(er)
+                _notify(er)
                 continue
 
         content = entry.get("content", "").strip()
@@ -964,9 +974,9 @@ def backfill_longterm_to_graph(
         if dry_run:
             # In dry-run mode just count; don't call LLM or touch graph
             result.imported += 1
-            result.entries.append(
-                BackfillEntryResult(entry_id=entry_id, status="imported (dry-run)")
-            )
+            er = BackfillEntryResult(entry_id=entry_id, status="imported (dry-run)")
+            result.entries.append(er)
+            _notify(er)
             continue
 
         # Format a stable migration text block that the extraction prompt can parse
@@ -982,10 +992,10 @@ def backfill_longterm_to_graph(
             response = llm_call_fn(prompt)
         except Exception as exc:  # noqa: BLE001
             result.failed += 1
-            result.entries.append(
-                BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
-            )
+            er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.entries.append(er)
             logger.warning("Backfill LLM extraction failed for %s: %s", entry_id, exc)
+            _notify(er)
             continue
 
         extraction = parse_extraction(response)
@@ -995,10 +1005,10 @@ def backfill_longterm_to_graph(
                 ep_id = store.add_episode(content[:2000], user_id="backfill", source="longterm_memory_backfill")
             except Exception as exc:  # noqa: BLE001
                 result.failed += 1
-                result.entries.append(
-                    BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
-                )
+                er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+                result.entries.append(er)
                 logger.warning("Backfill add_episode failed for %s: %s", entry_id, exc)
+                _notify(er)
                 continue
             result.no_extraction += 1
             entry_result = BackfillEntryResult(
@@ -1022,6 +1032,7 @@ def backfill_longterm_to_graph(
                 result.no_extraction -= 1
                 result.entries[-1] = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
                 result.failed += 1
+            _notify(result.entries[-1])
             continue
 
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1058,10 +1069,10 @@ def backfill_longterm_to_graph(
             ep_id = store.add_episode(content[:2000], user_id="backfill", source="longterm_memory_backfill")
         except Exception as exc:  # noqa: BLE001
             result.failed += 1
-            result.entries.append(
-                BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
-            )
+            er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.entries.append(er)
             logger.warning("Backfill add_episode failed for %s: %s", entry_id, exc)
+            _notify(er)
             continue
 
         result.imported += 1
@@ -1102,5 +1113,6 @@ def backfill_longterm_to_graph(
             result.total_facts -= facts_written
             result.entries[-1] = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
             result.failed += 1
+        _notify(result.entries[-1])
 
     return result

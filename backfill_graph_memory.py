@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sys
 from typing import Callable
 
@@ -52,6 +53,80 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("backfill")
+
+
+class _ProgressPrinter:
+    """Per-entry progress display for the backfill CLI.
+
+    Compatible with the ``notify_fn`` parameter of ``backfill_longterm_to_graph``.
+
+    - **TTY**: overwrites a single line using ``\\r`` with an ASCII progress bar.
+    - **verbose** (``--verbose``): prints one permanent line per entry.
+    - **Non-TTY / pipe**: emits ``logger.info`` every 10 entries and on failure.
+    """
+
+    def __init__(self, total: int, verbose: bool) -> None:
+        self._total = total
+        self._verbose = verbose
+        self._is_tty = sys.stdout.isatty()
+        self._did_print = False
+
+    def __call__(
+        self,
+        current: int,
+        total: int,
+        result: object,
+        entry_result: object,
+    ) -> None:
+        self._did_print = True
+        eid: str = getattr(entry_result, "entry_id", "")
+        status: str = getattr(entry_result, "status", "")
+        entities: int = getattr(entry_result, "entities", 0)
+        facts: int = getattr(entry_result, "facts", 0)
+        error: str = getattr(entry_result, "error", "")
+        imported: int = getattr(result, "imported", 0)
+        skipped: int = getattr(result, "skipped", 0)
+        failed: int = getattr(result, "failed", 0)
+
+        if self._verbose:
+            w = len(str(total))
+            line = f"  {current:{w}}/{total}  {eid[:16]}  {status}"
+            if entities or facts:
+                line += f"  ({entities} ent, {facts} fact)"
+            if error:
+                line += f"  ERROR: {error}"
+            print(line)
+            return
+
+        if self._is_tty:
+            term_width = shutil.get_terminal_size(fallback=(80, 24)).columns
+            pct = current * 100 // total if total else 100
+            bar_width = min(20, max(10, term_width // 5))
+            filled = bar_width * current // total if total else bar_width
+            bar = "█" * filled + "░" * (bar_width - filled)
+            w = len(str(total))
+            short_status = (
+                status
+                .replace("imported (dry-run)", "dry-run")
+                .replace("no_extraction", "no-extr")
+            )
+            counters = f"imp:{imported} skip:{skipped} fail:{failed}"
+            line = f"\r  [{current:{w}}/{total}] {bar} {pct:>3}%  {counters}  {eid[:8]}.. {short_status}"
+            if len(line) > term_width:
+                line = line[:term_width]
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        else:
+            if status == "failed" or current % 10 == 0:
+                logger.info(
+                    "Backfill progress: %d/%d | imp:%d skip:%d fail:%d | %s %s",
+                    current, total, imported, skipped, failed, eid[:16], status,
+                )
+
+    def finalize(self) -> None:
+        """Print a trailing newline to end the ``\\r`` progress line (TTY only)."""
+        if self._did_print and self._is_tty and not self._verbose:
+            print()
 
 
 def _load_toml(path: str) -> dict:
@@ -206,6 +281,7 @@ def main() -> None:
         imported_map = state.get("imported", {})
         result = BackfillResult(total=len(entries))
         processed = 0
+        progress = _ProgressPrinter(len(entries), args.verbose)
         for entry_id, entry in entries:
             if args.limit is not None and processed >= args.limit:
                 break
@@ -213,12 +289,17 @@ def main() -> None:
             if not args.force and entry_id in imported_map:
                 if imported_map[entry_id].get("checksum") == checksum:
                     result.skipped += 1
-                    result.entries.append(BackfillEntryResult(entry_id=entry_id, status="skipped"))
+                    er = BackfillEntryResult(entry_id=entry_id, status="skipped")
+                    result.entries.append(er)
+                    progress(len(result.entries), len(entries), result, er)
                     continue
             processed += 1
             result.imported += 1
-            result.entries.append(BackfillEntryResult(entry_id=entry_id, status="imported (dry-run)"))
+            er = BackfillEntryResult(entry_id=entry_id, status="imported (dry-run)")
+            result.entries.append(er)
+            progress(len(result.entries), len(entries), result, er)
 
+        progress.finalize()
         _print_summary(result, dry_run=True, verbose=args.verbose)
         sys.exit(0)
 
@@ -265,6 +346,7 @@ def main() -> None:
     # Run backfill
     # ------------------------------------------------------------------
     logger.info("Starting backfill...")
+    progress = _ProgressPrinter(len(entries), args.verbose)
     try:
         result = backfill_longterm_to_graph(
             long_term_entries=entries,
@@ -274,11 +356,13 @@ def main() -> None:
             dry_run=False,
             limit=args.limit,
             force=args.force,
+            notify_fn=progress,
         )
     finally:
         store.close()
         llm.close()
 
+    progress.finalize()
     _print_summary(result, dry_run=False, verbose=args.verbose)
 
     if result.failed > 0:

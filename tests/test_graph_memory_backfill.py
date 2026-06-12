@@ -667,3 +667,126 @@ class TestBackfillFailures:
             limit=2,
         )
         assert result.imported + result.failed + result.no_extraction == 2
+
+
+# ---------------------------------------------------------------------------
+# notify_fn / progress callback
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillProgress:
+    """Verify the notify_fn callback contract for backfill_longterm_to_graph."""
+
+    def test_notify_called_once_per_entry_all_imported(self, mock_store, good_llm, tmp_path):
+        entries = [
+            ("e1", {"content": "fact one", "source": "manual", "timestamp": "2024-01-01"}),
+            ("e2", {"content": "fact two", "source": "manual", "timestamp": "2024-01-02"}),
+            ("e3", {"content": "fact three", "source": "manual", "timestamp": "2024-01-03"}),
+        ]
+        calls: list[tuple] = []
+        def _notify(current, total, result, entry_result):
+            calls.append((current, total, entry_result.entry_id, entry_result.status))
+
+        backfill_longterm_to_graph(
+            long_term_entries=entries,
+            store=mock_store,
+            llm_call_fn=good_llm,
+            state_path=str(tmp_path / "state.json"),
+            notify_fn=_notify,
+        )
+
+        assert len(calls) == 3
+        # current is 1-based and matches len(result.entries) at call time
+        assert calls[0][0] == 1
+        assert calls[1][0] == 2
+        assert calls[2][0] == 3
+        # total is always the full count of input entries
+        assert all(total == 3 for _, total, _, _ in calls)
+        # all entries imported successfully
+        assert all(status == "imported" for _, _, _, status in calls)
+        assert [eid for _, _, eid, _ in calls] == ["e1", "e2", "e3"]
+
+    def test_notify_called_for_skipped_entries(self, mock_store, good_llm, tmp_path):
+        state_path = str(tmp_path / "state.json")
+        entries = [
+            ("e1", {"content": "fact one", "source": "manual", "timestamp": "2024-01-01"}),
+        ]
+        # First run to populate state
+        backfill_longterm_to_graph(
+            long_term_entries=entries,
+            store=mock_store,
+            llm_call_fn=good_llm,
+            state_path=state_path,
+        )
+
+        calls: list[str] = []
+        backfill_longterm_to_graph(
+            long_term_entries=entries,
+            store=mock_store,
+            llm_call_fn=good_llm,
+            state_path=state_path,
+            notify_fn=lambda current, total, result, er: calls.append(er.status),
+        )
+
+        assert calls == ["skipped"]
+
+    def test_notify_called_for_failed_entry(self, mock_store, error_llm, tmp_path):
+        entries = [
+            ("e1", {"content": "fact one", "source": "manual", "timestamp": "2024-01-01"}),
+        ]
+        calls: list[str] = []
+        backfill_longterm_to_graph(
+            long_term_entries=entries,
+            store=mock_store,
+            llm_call_fn=error_llm,
+            state_path=str(tmp_path / "state.json"),
+            notify_fn=lambda current, total, result, er: calls.append(er.status),
+        )
+
+        assert calls == ["failed"]
+
+    def test_notify_called_for_dry_run(self, mock_store, good_llm, tmp_path):
+        entries = [
+            ("e1", {"content": "fact one", "source": "manual", "timestamp": "2024-01-01"}),
+            ("e2", {"content": "fact two", "source": "manual", "timestamp": "2024-01-02"}),
+        ]
+        calls: list[str] = []
+        backfill_longterm_to_graph(
+            long_term_entries=entries,
+            store=mock_store,
+            llm_call_fn=good_llm,
+            state_path=str(tmp_path / "state.json"),
+            dry_run=True,
+            notify_fn=lambda current, total, result, er: calls.append(er.status),
+        )
+
+        assert calls == ["imported (dry-run)", "imported (dry-run)"]
+
+    def test_notify_receives_live_result_counters(self, mock_store, good_llm, tmp_path):
+        """Each notify_fn call receives the result snapshot at that point in time."""
+        entries = [
+            ("e1", {"content": "fact one", "source": "manual", "timestamp": "2024-01-01"}),
+            ("e2", {"content": "fact two", "source": "manual", "timestamp": "2024-01-02"}),
+        ]
+        imported_counts: list[int] = []
+        backfill_longterm_to_graph(
+            long_term_entries=entries,
+            store=mock_store,
+            llm_call_fn=good_llm,
+            state_path=str(tmp_path / "state.json"),
+            notify_fn=lambda current, total, result, er: imported_counts.append(result.imported),
+        )
+
+        # After first import imported=1, after second imported=2
+        assert imported_counts == [1, 2]
+
+    def test_notify_none_does_not_raise(self, mock_store, good_llm, tmp_path):
+        """Passing notify_fn=None (default) works without errors."""
+        result = backfill_longterm_to_graph(
+            long_term_entries=_make_entries(),
+            store=mock_store,
+            llm_call_fn=good_llm,
+            state_path=str(tmp_path / "state.json"),
+            notify_fn=None,
+        )
+        assert result.imported == 1
