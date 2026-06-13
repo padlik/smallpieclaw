@@ -605,9 +605,10 @@ class GraphMemoryStore:
 
         def _count(query: str, key: str) -> None:
             try:
-                r = self._execute(query)
-                if r.has_next():
-                    stats[key] = r.get_next()[0]
+                with self._conn_lock:
+                    r = self._conn.execute(query, {})
+                    if r.has_next():
+                        stats[key] = r.get_next()[0]
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{key}: {exc}")
 
@@ -616,11 +617,12 @@ class GraphMemoryStore:
         _count("MATCH ()-[r:RELATES_TO]->() RETURN COUNT(r)", "relation_count")
 
         try:
-            r = self._execute("MATCH (e:Episode) RETURN MAX(e.created_at)")
-            if r.has_next():
-                val = r.get_next()[0]
-                if val is not None:
-                    stats["latest_episode_ts"] = str(val)
+            with self._conn_lock:
+                r = self._conn.execute("MATCH (e:Episode) RETURN MAX(e.created_at)", {})
+                if r.has_next():
+                    val = r.get_next()[0]
+                    if val is not None:
+                        stats["latest_episode_ts"] = str(val)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"latest_episode_ts: {exc}")
 
@@ -631,8 +633,8 @@ class GraphMemoryStore:
                     'CALL QUERY_VECTOR_INDEX("Entity", "entity_vec_idx", $emb, 1) RETURN node, distance',
                     {"emb": zero_vec},
                 )
-            # A successful execute (even with no rows) means the index is reachable.
-            _ = probe.has_next()
+                # A successful execute (even with no rows) means the index is reachable.
+                _ = probe.has_next()
             stats["vector_index_ok"] = True
         except Exception as exc:  # noqa: BLE001
             errors.append(f"vector_index: {exc}")
