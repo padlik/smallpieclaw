@@ -128,6 +128,54 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         sched_state = "enabled" if iface.scheduler.enabled else "disabled"
         scheduler_line = f"\n📅 Scheduler: <code>{sched_state}</code> | {enabled}/{total} jobs active"
 
+    # Graph memory state
+    graph_memory_line = ""
+    _gm_store = getattr(iface, "_graph_memory_store", None)
+    _gm_writer = getattr(iface, "_graph_memory_writer", None)
+    _gm_cfg = iface._config.get("graph_memory", {})
+    if _gm_cfg.get("enabled", False):
+        if _gm_store is None:
+            graph_memory_line = "\n🧠 Graph Memory: 🔴 failed (check logs)"
+        else:
+            loop = asyncio.get_event_loop()
+            _ss = await loop.run_in_executor(None, _gm_store.get_stats)
+            _ws = _gm_writer.get_stats() if _gm_writer is not None else {}
+            _ents = _ss.get("entity_count", -1)
+            _rels = _ss.get("relation_count", -1)
+            _eps = _ss.get("episode_count", -1)
+            _hits = _ss.get("retrieval_hits", 0)
+            _misses = _ss.get("retrieval_misses", 0)
+            _worker_ok = _ws.get("worker_alive", True)
+            _q = _ws.get("queue_depth", 0)
+            _wfails = _ws.get("write_failures", 0)
+            _vidx = _ss.get("vector_index_ok", False)
+            # Determine health state
+            if _ents == 0 and _eps == 0:
+                _health = "active-empty"
+                _dot = "🟡"
+            elif _hits > 0:
+                _health = "active-used"
+                _dot = "🟢"
+            elif _ws.get("batches_processed", 0) > 0 or _ws.get("episodes_stored", 0) > 0:
+                _health = "active-learning"
+                _dot = "🟢"
+            else:
+                _health = "active"
+                _dot = "🟢"
+            if not _worker_ok or _wfails > 0 or not _vidx:
+                _health += "-degraded"
+                _dot = "🟠"
+            _counts = (
+                f"{_ents:,} entities · {_rels:,} facts · {_eps:,} episodes"
+                if _ents >= 0 else "counts unavailable"
+            )
+            _writer_info = f"writer {'ok' if _worker_ok else 'stopped'}, queue {_q}"
+            graph_memory_line = (
+                f"\n🧠 Graph Memory: {_dot} <code>{html.escape(_health)}</code> | "
+                f"{_counts} | "
+                f"hits {_hits} / misses {_misses} | {_writer_info}"
+            )
+
     # Current agent mode — always shown
     current_mode = iface._get_user_state(update.effective_user.id).agent_mode
     _MODE_LABELS = {"madplan": "🧠 <b>MadPlan</b>", "agent": "🤖 <b>Agent</b>"}
@@ -149,6 +197,7 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
         f"{agents_line}"
         f"{scheduler_line}"
+        f"{graph_memory_line}"
         f"{mode_line}"
         f"{token_line}",
         parse_mode=ParseMode.HTML,
@@ -738,6 +787,86 @@ async def cmd_show_env(iface: "TelegramInterface", update: Update, ctx: ContextT
 
     text = "\n".join(lines)
     # Telegram max message length is 4096; split if needed
+    chunk_size = 4096
+    for i in range(0, len(text), chunk_size):
+        await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
+
+
+async def cmd_memory(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hidden command: show graph memory diagnostics (counts, writer health, retrieval stats)."""
+    if not iface._is_authorized(update.effective_user.id):
+        await iface._send_unauthorized(update)
+        return
+
+    _gm_cfg = iface._config.get("graph_memory", {})
+    if not _gm_cfg.get("enabled", False):
+        await update.effective_message.reply_text(
+            "🧠 <b>Graph Memory</b>\n\nDisabled in config (<code>[graph_memory] enabled = false</code>).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    _gm_store = getattr(iface, "_graph_memory_store", None)
+    _gm_writer = getattr(iface, "_graph_memory_writer", None)
+
+    if _gm_store is None:
+        await update.effective_message.reply_text(
+            "🧠 <b>Graph Memory</b>\n\n🔴 Initialisation failed — check logs for details.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    loop = asyncio.get_event_loop()
+    ss = await loop.run_in_executor(None, _gm_store.get_stats)
+    ws = _gm_writer.get_stats() if _gm_writer is not None else {}
+
+    def _v(val: object, suffix: str = "") -> str:
+        if isinstance(val, int) and val < 0:
+            return "N/A"
+        return f"{val:,}{suffix}" if isinstance(val, int) else html.escape(str(val) if val is not None else "N/A")
+
+    store_section = (
+        "<b>📦 Store</b>\n"
+        f"  Entities:  <code>{_v(ss.get('entity_count', -1))}</code>\n"
+        f"  Facts:     <code>{_v(ss.get('relation_count', -1))}</code>\n"
+        f"  Episodes:  <code>{_v(ss.get('episode_count', -1))}</code>\n"
+        f"  Latest:    <code>{html.escape(str(ss.get('latest_episode_ts') or 'none'))}</code>\n"
+        f"  Vec index: <code>{'ok' if ss.get('vector_index_ok') else 'error'}</code>"
+    )
+    if ss.get("stats_error"):
+        store_section += f"\n  ⚠️ <i>{html.escape(ss['stats_error'])}</i>"
+
+    worker_alive = ws.get("worker_alive", "N/A")
+    writer_section = (
+        "<b>✍️ Writer</b>\n"
+        f"  Worker:           <code>{'alive' if worker_alive is True else ('stopped' if worker_alive is False else 'N/A')}</code>\n"
+        f"  Queue depth:      <code>{_v(ws.get('queue_depth', 'N/A'))}</code>\n"
+        f"  Pending depth:    <code>{_v(ws.get('pending_depth', 'N/A'))}</code>\n"
+        f"  Enqueued:         <code>{_v(ws.get('enqueued', 0))}</code>\n"
+        f"  Skipped short:    <code>{_v(ws.get('skipped_short', 0))}</code>\n"
+        f"  Batches queued:   <code>{_v(ws.get('batches_queued', 0))}</code>\n"
+        f"  Batches done:     <code>{_v(ws.get('batches_processed', 0))}</code>\n"
+        f"  Entities stored:  <code>{_v(ws.get('entities_extracted', 0))}</code>\n"
+        f"  Facts stored:     <code>{_v(ws.get('facts_extracted', 0))}</code>\n"
+        f"  Episodes stored:  <code>{_v(ws.get('episodes_stored', 0))}</code>\n"
+        f"  LLM failures:     <code>{_v(ws.get('llm_failures', 0))}</code>\n"
+        f"  Parse failures:   <code>{_v(ws.get('parse_failures', 0))}</code>\n"
+        f"  Write failures:   <code>{_v(ws.get('write_failures', 0))}</code>"
+    )
+
+    retrieval_section = (
+        "<b>🔍 Retrieval</b>\n"
+        f"  Hits:             <code>{_v(ss.get('retrieval_hits', 0))}</code>\n"
+        f"  Misses:           <code>{_v(ss.get('retrieval_misses', 0))}</code>\n"
+        f"  Injections:       <code>{_v(ss.get('context_injections', 0))}</code>"
+    )
+
+    text = (
+        f"🧠 <b>Graph Memory Diagnostics</b>\n\n"
+        f"{store_section}\n\n"
+        f"{writer_section}\n\n"
+        f"{retrieval_section}"
+    )
     chunk_size = 4096
     for i in range(0, len(text), chunk_size):
         await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)

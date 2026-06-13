@@ -42,7 +42,7 @@ from telegram_commands import (
     cmd_start, cmd_help, cmd_status, cmd_stop, cmd_reset, cmd_compress,
     cmd_verbose, cmd_jobs, cmd_agents, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid, cmd_health,
-    cmd_show_ctx, cmd_show_env, cmd_models,
+    cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models,
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
     cmd_mad_plan, cmd_agent, cb_mad_plan_review,
 )
@@ -265,6 +265,7 @@ class TelegramInterface:
         # Hidden diagnostic commands (not registered with BotFather)
         app.add_handler(CommandHandler("show_ctx", partial(cmd_show_ctx, self)))
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
+        app.add_handler(CommandHandler("memory", partial(cmd_memory, self)))
         # MadPlan commands (register both /mp and legacy /mad_plan)
         app.add_handler(CommandHandler("mp", partial(cmd_mad_plan, self)))
         app.add_handler(CommandHandler("mad_plan", partial(cmd_mad_plan, self)))

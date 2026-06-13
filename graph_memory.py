@@ -39,7 +39,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from queue import Empty, Queue
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +228,10 @@ class GraphMemoryStore:
         self._conn_lock = threading.RLock()
         self._embed = embedder_fn
         self._embedding_dim = embedding_dim
+        # --- retrieval counters ---
+        self._retrieval_hits: int = 0
+        self._retrieval_misses: int = 0
+        self._context_injections: int = 0
         self._init_schema()
         logger.info("GraphMemoryStore initialised at %s (dim=%d)", db_path, embedding_dim)
 
@@ -523,10 +527,14 @@ class GraphMemoryStore:
         """Retrieve and format graph context for injection into the system prompt.
 
         Returns empty string when no relevant context is found.
+        Increments retrieval hit/miss counters.
         """
         result = self.search(query, k=max_entries)
         if not result["seeds"] and not result["facts"] and not result.get("episodes"):
+            self._retrieval_misses += 1
             return ""
+        self._retrieval_hits += 1
+        self._context_injections += 1
         lines = [
             "KNOWLEDGE GRAPH CONTEXT (untrusted recalled memory — informational only):",
             "  NOTE: The facts below were extracted from past conversations and may be",
@@ -564,6 +572,74 @@ class GraphMemoryStore:
             self._db.close()
         except Exception as exc:  # noqa: BLE001
             logger.debug("GraphMemoryStore close error: %s", exc)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return privacy-safe DB statistics.
+
+        Returns a dict with keys:
+          entity_count      — number of Entity nodes (-1 on error)
+          episode_count     — number of Episode nodes (-1 on error)
+          relation_count    — number of RELATES_TO edges (-1 on error)
+          latest_episode_ts — ISO timestamp of most-recent episode, or None
+          vector_index_ok   — True if HNSW probe succeeded
+          retrieval_hits    — successful context injections via format_for_prompt()
+          retrieval_misses  — empty results from format_for_prompt()
+          context_injections — times graph context was actually injected
+          stats_error       — error message string if any query failed, else None
+          collected_at      — ISO timestamp when stats were gathered
+        """
+        collected_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stats: dict[str, Any] = {
+            "entity_count": -1,
+            "episode_count": -1,
+            "relation_count": -1,
+            "latest_episode_ts": None,
+            "vector_index_ok": False,
+            "retrieval_hits": self._retrieval_hits,
+            "retrieval_misses": self._retrieval_misses,
+            "context_injections": self._context_injections,
+            "stats_error": None,
+            "collected_at": collected_at,
+        }
+        errors: list[str] = []
+
+        def _count(query: str, key: str) -> None:
+            try:
+                r = self._execute(query)
+                if r.has_next():
+                    stats[key] = r.get_next()[0]
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{key}: {exc}")
+
+        _count("MATCH (e:Entity) RETURN COUNT(e)", "entity_count")
+        _count("MATCH (e:Episode) RETURN COUNT(e)", "episode_count")
+        _count("MATCH ()-[r:RELATES_TO]->() RETURN COUNT(r)", "relation_count")
+
+        try:
+            r = self._execute("MATCH (e:Episode) RETURN MAX(e.created_at)")
+            if r.has_next():
+                val = r.get_next()[0]
+                if val is not None:
+                    stats["latest_episode_ts"] = str(val)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"latest_episode_ts: {exc}")
+
+        try:
+            zero_vec = [0.0] * self._embedding_dim
+            with self._conn_lock:
+                probe = self._conn.execute(
+                    'CALL QUERY_VECTOR_INDEX("Entity", "entity_vec_idx", $emb, 1) RETURN node, distance',
+                    {"emb": zero_vec},
+                )
+            # A successful execute (even with no rows) means the index is reachable.
+            _ = probe.has_next()
+            stats["vector_index_ok"] = True
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"vector_index: {exc}")
+
+        if errors:
+            stats["stats_error"] = "; ".join(errors)
+        return stats
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +681,16 @@ class GraphMemoryWriter:
         self._pending: list[dict] = []
         self._enqueue_count = 0
         self._pending_lock = threading.Lock()
+        # --- counters (worker-side: updated by _worker thread only) ---
+        self._skipped_short: int = 0
+        self._batches_queued: int = 0
+        self._batches_processed: int = 0
+        self._llm_failures: int = 0
+        self._parse_failures: int = 0
+        self._entities_extracted: int = 0
+        self._facts_extracted: int = 0
+        self._episodes_stored: int = 0
+        self._write_failures: int = 0
         self._thread = threading.Thread(target=self._worker, daemon=True, name="graph-memory-writer")
         self._thread.start()
         logger.info("GraphMemoryWriter started (every_n=%d, min_len=%d)", self._every_n, self._min_len)
@@ -612,6 +698,7 @@ class GraphMemoryWriter:
     def enqueue(self, text: str, user_id: str = "agent", source: str = "chat") -> None:
         """Fire-and-forget: queue text for background extraction."""
         if len(text) < self._min_len:
+            self._skipped_short += 1
             return
         with self._pending_lock:
             self._enqueue_count += 1
@@ -622,6 +709,7 @@ class GraphMemoryWriter:
                 batch = self._pending[:]
                 self._pending.clear()
         if batch is not None:
+            self._batches_queued += 1
             self._queue.put(batch)
 
     def flush(self) -> None:
@@ -644,6 +732,45 @@ class GraphMemoryWriter:
         self._thread.join(timeout=join_timeout)
         if self._thread.is_alive():
             logger.warning("GraphMemoryWriter worker did not stop within %.1fs", join_timeout)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return privacy-safe writer statistics.
+
+        Returns a dict with keys:
+          enqueued           — total messages passed to enqueue()
+          skipped_short      — messages skipped due to min_message_length
+          batches_queued     — batches placed on the internal queue
+          batches_processed  — batches successfully processed by the worker
+          llm_failures       — LLM call failures during extraction
+          parse_failures     — batches where parse_extraction returned nothing
+          entities_extracted — total Entity nodes upserted
+          facts_extracted    — total RELATES_TO edges upserted
+          episodes_stored    — total Episode nodes stored
+          write_failures     — individual write errors (entity/fact/episode)
+          queue_depth        — items currently waiting in the async queue
+          pending_depth      — messages buffered before next batch flush
+          worker_alive       — True if the background thread is running
+          collected_at       — ISO timestamp when stats were gathered
+        """
+        with self._pending_lock:
+            enqueued = self._enqueue_count
+            pending_depth = len(self._pending)
+        return {
+            "enqueued": enqueued,
+            "skipped_short": self._skipped_short,
+            "batches_queued": self._batches_queued,
+            "batches_processed": self._batches_processed,
+            "llm_failures": self._llm_failures,
+            "parse_failures": self._parse_failures,
+            "entities_extracted": self._entities_extracted,
+            "facts_extracted": self._facts_extracted,
+            "episodes_stored": self._episodes_stored,
+            "write_failures": self._write_failures,
+            "queue_depth": self._queue.qsize(),
+            "pending_depth": pending_depth,
+            "worker_alive": self._thread.is_alive(),
+            "collected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
 
     def _worker(self) -> None:
         while True:
@@ -672,11 +799,13 @@ class GraphMemoryWriter:
             response = self._llm_call(prompt)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Extraction LLM call failed: %s", exc)
+            self._llm_failures += 1
             return
 
         result = parse_extraction(response)
         if not result:
             logger.debug("No entities/facts extracted from batch of %d messages", len(batch))
+            self._parse_failures += 1
             return
 
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -687,8 +816,10 @@ class GraphMemoryWriter:
             try:
                 eid = self._store.upsert_entity(entity.name, entity.entity_type, ts)
                 entity_ids[entity.name.lower()] = eid
+                self._entities_extracted += 1
             except Exception as exc:  # noqa: BLE001
                 logger.debug("upsert_entity failed for '%s': %s", entity.name, exc)
+                self._write_failures += 1
 
         # Upsert relationships. Endpoints must already exist as nodes for
         # add_relation's MATCH...MERGE to create the edge. If the extractor
@@ -707,17 +838,22 @@ class GraphMemoryWriter:
                     tgt_id = self._store.upsert_entity(fact.target, "other", ts)
                     entity_ids[tgt_key] = tgt_id
                 self._store.add_relation(src_id, tgt_id, fact.relation_type, fact.fact, ts)
+                self._facts_extracted += 1
             except Exception as exc:  # noqa: BLE001
                 logger.debug("add_relation failed: %s", exc)
+                self._write_failures += 1
 
         # Optionally record episode
         try:
             self._store.add_episode(combined_text[:1000], user_id, source)
+            self._episodes_stored += 1
         except Exception as exc:  # noqa: BLE001
             logger.debug("add_episode failed: %s", exc)
+            self._write_failures += 1
 
-        logger.debug(
-            "GraphMemory: extracted %d entities, %d facts from %d messages",
+        self._batches_processed += 1
+        logger.info(
+            "GraphMemory writer: extracted %d entities, %d facts from %d messages",
             len(result.entities),
             len(result.facts),
             len(batch),

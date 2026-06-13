@@ -521,6 +521,8 @@ def _run(
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
     tg.sub_agent_factory = sub_agent_factory  # wire factory for MadPlan execution
+    tg._graph_memory_store = graph_memory_store
+    tg._graph_memory_writer = graph_memory_writer
 
     scheduler.start()
     try:

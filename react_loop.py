@@ -344,6 +344,10 @@ def react_loop(
                     user_goal, max_entries=ctx.graph_memory_max_entries
                 ) or ""
             )
+            if _graph_context_section:
+                logger.info("%sGraph memory context injected", pfx)
+            else:
+                logger.debug("%sGraph memory context: no relevant data found", pfx)
         except Exception as _gm_exc:
             logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
 
