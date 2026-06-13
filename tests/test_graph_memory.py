@@ -660,3 +660,265 @@ class TestCreateGraphMemory:
         assert store is not None
         assert writer is not None
         writer.stop()
+
+
+# ---------------------------------------------------------------------------
+# GraphMemoryStore.get_stats() tests
+# ---------------------------------------------------------------------------
+
+class TestGraphMemoryStoreStats:
+    def _make_count_result(self, value: int):
+        r = MagicMock()
+        r.has_next.side_effect = [True, False]
+        r.get_next.return_value = (value,)
+        return r
+
+    def _make_ts_result(self, value):
+        r = MagicMock()
+        r.has_next.side_effect = [True, False]
+        r.get_next.return_value = (value,)
+        return r
+
+    def _make_probe_result(self):
+        r = MagicMock()
+        r.has_next.return_value = False
+        return r
+
+    def test_empty_db_returns_zeros(self, store, mock_ladybug):
+        conn = mock_ladybug["conn"]
+        conn.execute.side_effect = [
+            self._make_count_result(0),   # entity_count
+            self._make_count_result(0),   # episode_count
+            self._make_count_result(0),   # relation_count
+            self._make_ts_result(None),   # latest_episode_ts
+            self._make_probe_result(),    # vector_index probe
+        ]
+        stats = store.get_stats()
+        assert stats["entity_count"] == 0
+        assert stats["episode_count"] == 0
+        assert stats["relation_count"] == 0
+        assert stats["latest_episode_ts"] is None
+        assert stats["vector_index_ok"] is True
+        assert stats["stats_error"] is None
+        assert "collected_at" in stats
+
+    def test_populated_db_returns_counts(self, store, mock_ladybug):
+        conn = mock_ladybug["conn"]
+        conn.execute.side_effect = [
+            self._make_count_result(5),
+            self._make_count_result(3),
+            self._make_count_result(8),
+            self._make_ts_result("2024-01-01T00:00:00Z"),
+            self._make_probe_result(),
+        ]
+        stats = store.get_stats()
+        assert stats["entity_count"] == 5
+        assert stats["episode_count"] == 3
+        assert stats["relation_count"] == 8
+        assert "2024-01-01" in str(stats["latest_episode_ts"])
+
+    def test_partial_failure_returns_minus_one_and_error(self, store, mock_ladybug):
+        conn = mock_ladybug["conn"]
+        # entity_count fails, others succeed
+        conn.execute.side_effect = [
+            Exception("DB error"),        # entity_count fails
+            self._make_count_result(2),   # episode_count
+            self._make_count_result(4),   # relation_count
+            self._make_ts_result(None),   # latest_episode_ts
+            self._make_probe_result(),    # vector_index probe
+        ]
+        stats = store.get_stats()
+        assert stats["entity_count"] == -1
+        assert stats["episode_count"] == 2
+        assert stats["stats_error"] is not None
+        assert "entity_count" in stats["stats_error"]
+
+    def test_vector_index_probe_failure_sets_false(self, store, mock_ladybug):
+        conn = mock_ladybug["conn"]
+        conn.execute.side_effect = [
+            self._make_count_result(1),
+            self._make_count_result(1),
+            self._make_count_result(1),
+            self._make_ts_result(None),
+            Exception("vector index error"),
+        ]
+        stats = store.get_stats()
+        assert stats["vector_index_ok"] is False
+        assert stats["stats_error"] is not None
+
+    def test_retrieval_counters_initial_zero(self, store):
+        assert store._retrieval_hits == 0
+        assert store._retrieval_misses == 0
+        assert store._context_injections == 0
+
+    def test_retrieval_hit_increments_counters(self, store, mock_ladybug):
+        conn = mock_ladybug["conn"]
+        seed_result = MagicMock()
+        seed_result.has_next.side_effect = [True, False]
+        seed_result.get_next.return_value = (
+            {"id": "ent:alice:person", "name": "Alice", "entity_type": "person"}, 0.1
+        )
+        graph_result = MagicMock()
+        graph_result.has_next.side_effect = [True, False]
+        graph_result.get_next.return_value = ("Alice", "USES", "fact", "Python")
+        empty_ep = MagicMock()
+        empty_ep.has_next.return_value = False
+        conn.execute.side_effect = [seed_result, graph_result, empty_ep]
+        result = store.format_for_prompt("Alice")
+        assert result != ""
+        assert store._retrieval_hits == 1
+        assert store._context_injections == 1
+        assert store._retrieval_misses == 0
+
+    def test_retrieval_miss_increments_miss_counter(self, store, mock_ladybug):
+        conn = mock_ladybug["conn"]
+        empty = MagicMock()
+        empty.has_next.return_value = False
+        conn.execute.return_value = empty
+        result = store.format_for_prompt("nobody")
+        assert result == ""
+        assert store._retrieval_misses == 1
+        assert store._retrieval_hits == 0
+
+    def test_get_stats_includes_retrieval_counters(self, store, mock_ladybug):
+        store._retrieval_hits = 7
+        store._retrieval_misses = 3
+        store._context_injections = 7
+        conn = mock_ladybug["conn"]
+        conn.execute.side_effect = [
+            self._make_count_result(0),
+            self._make_count_result(0),
+            self._make_count_result(0),
+            self._make_ts_result(None),
+            self._make_probe_result(),
+        ]
+        stats = store.get_stats()
+        assert stats["retrieval_hits"] == 7
+        assert stats["retrieval_misses"] == 3
+        assert stats["context_injections"] == 7
+
+
+# ---------------------------------------------------------------------------
+# GraphMemoryWriter.get_stats() tests
+# ---------------------------------------------------------------------------
+
+class TestGraphMemoryWriterStats:
+    def test_initial_stats_all_zero(self, store):
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=lambda p: '{"entities":[],"facts":[]}',
+            extract_every_n_turns=10,
+            min_message_length=10,
+        )
+        stats = writer.get_stats()
+        assert stats["enqueued"] == 0
+        assert stats["skipped_short"] == 0
+        assert stats["batches_queued"] == 0
+        assert stats["batches_processed"] == 0
+        assert stats["llm_failures"] == 0
+        assert stats["parse_failures"] == 0
+        assert stats["entities_extracted"] == 0
+        assert stats["facts_extracted"] == 0
+        assert stats["episodes_stored"] == 0
+        assert stats["write_failures"] == 0
+        assert stats["worker_alive"] is True
+        writer.stop()
+        assert writer.get_stats()["worker_alive"] is False
+
+    def test_skipped_short_counted(self, store):
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=lambda p: '{"entities":[],"facts":[]}',
+            extract_every_n_turns=1,
+            min_message_length=100,
+        )
+        writer.enqueue("short", user_id="u1")
+        writer.enqueue("also short", user_id="u1")
+        assert writer._skipped_short == 2
+        writer.stop()
+
+    def test_batches_queued_and_processed(self, store):
+        store.upsert_entity = MagicMock(side_effect=lambda n, t, ts: f"ent:{n}:{t}")
+        store.add_relation = MagicMock()
+        store.add_episode = MagicMock(return_value="ep:1")
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=lambda p: '{"entities":[{"name":"Alice","entity_type":"person"}],"facts":[]}',
+            extract_every_n_turns=1,
+            min_message_length=10,
+        )
+        writer.enqueue("a long enough message to enqueue", user_id="u1")
+        import time
+        time.sleep(0.3)
+        assert writer._batches_queued >= 1
+        assert writer._batches_processed >= 1
+        writer.stop()
+
+    def test_llm_failure_counted(self, store):
+        def _bad_llm(prompt: str) -> str:
+            raise RuntimeError("LLM down")
+
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=_bad_llm,
+            extract_every_n_turns=1,
+            min_message_length=10,
+        )
+        writer.enqueue("a long enough message for test", user_id="u1")
+        import time
+        time.sleep(0.3)
+        assert writer._llm_failures >= 1
+        writer.stop()
+
+    def test_parse_failure_counted(self, store):
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=lambda p: "not valid json at all",
+            extract_every_n_turns=1,
+            min_message_length=10,
+        )
+        writer.enqueue("a long enough message to test parse", user_id="u1")
+        import time
+        time.sleep(0.3)
+        assert writer._parse_failures >= 1
+        writer.stop()
+
+    def test_entities_and_facts_counted(self, store):
+        store.upsert_entity = MagicMock(side_effect=lambda n, t, ts: f"ent:{n}:{t}")
+        store.add_relation = MagicMock()
+        store.add_episode = MagicMock(return_value="ep:1")
+
+        def _llm(p):
+            return (
+                '{"entities":['
+                '{"name":"Alice","entity_type":"person"},'
+                '{"name":"Python","entity_type":"tool"}],'
+                '"facts":[{"source":"Alice","target":"Python",'
+                '"relation_type":"USES","fact":"Alice uses Python."}]}'
+            )
+
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=_llm,
+            extract_every_n_turns=1,
+            min_message_length=10,
+        )
+        writer.enqueue("A long enough message to process here", user_id="u1")
+        import time
+        time.sleep(0.3)
+        assert writer._entities_extracted == 2
+        assert writer._facts_extracted == 1
+        assert writer._episodes_stored == 1
+        writer.stop()
+
+    def test_get_stats_returns_collected_at(self, store):
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=lambda p: '{"entities":[],"facts":[]}',
+            extract_every_n_turns=10,
+            min_message_length=10,
+        )
+        stats = writer.get_stats()
+        assert "collected_at" in stats
+        assert stats["collected_at"].endswith("Z")
+        writer.stop()
