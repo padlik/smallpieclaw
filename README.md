@@ -14,6 +14,7 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Built-in tools** — `shell`, `file_read`, `file_write`, `file_send`, `schedule` always available; dangerous ops require inline-button confirmation
 - **Secure Telegram bot** — allowlist or pairing-token access control
 - **4-tier memory architecture** — short-term conversation history, working task context, long-term vector knowledge index, and results history
+- **Graph memory** (optional) — semantic entity/relationship/episode store backed by [LadybugDB](https://github.com/kuzudb/ladybug) (embedded graph DB); extracts entities and facts from conversations automatically in the background and injects relevant context per-turn; visible via `/status` and `/memory`; zero overhead when disabled
 - **Configurable scheduler** — jobs defined in `scheduler.toml` (auto-updated at runtime); manage jobs from chat or via `/jobs`; supports cron-style schedules and one-time reminders; jobs staggered with ±5 min jitter to avoid thundering herd
 - **Self-health diagnosis** — `/health` command and automatic 4-hour periodic job: reads log file, analyzes errors, suggests fixes, rotates logs
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
@@ -49,6 +50,8 @@ tool_executor.py         # Runs tools in subprocess
 tool_index.py            # Semantic search over tool descriptions
 tool_creator.py          # LLM-generated tools with safety validation
 scheduler.py             # Background task scheduler
+graph_memory.py          # Optional LadybugDB graph store, background writer, and retrieval
+backfill_graph_memory.py # One-time CLI to seed graph store from data/longterm_memory.json
 memory_store.py          # Short-term, working, long-term, and results memory
 builtin_executor.py      # Always-available built-in tools (shell, file_read, file_write)
 skill_registry.py        # Agent Skills discovery and registry
@@ -64,6 +67,8 @@ data/
     longterm_memory.json     # Long-term vector knowledge index
     results_memory.json      # Past task summaries and results
     scheduler_state.json     # Scheduler run history (last_run + last_error for all jobs ever executed)
+    graph_memory             # LadybugDB graph store (created when graph memory is enabled)
+    graph_memory_backfill_state.json  # Progress checkpoint for backfill_graph_memory.py
 ```
 
 ---
@@ -241,7 +246,66 @@ Scheduler features:
 - **Manual reload**: `/jobs reload` re-reads `scheduler.toml` from disk at any time
 - **Error tracking**: job failures are reported in the Telegram chat and shown in `/jobs`
 
-### 7. Run
+### 7. (Optional) Enable graph memory
+
+Graph memory is opt-in. Skip this step if you don't need long-term semantic recall.
+
+#### Prerequisites
+
+Install the optional dependency:
+
+```bash
+pip install "ladybug>=0.7.0"
+```
+
+#### Configuration
+
+Add to `config.toml`:
+
+```toml
+[graph_memory]
+enabled              = true
+db_path              = "data/graph_memory"   # path to the embedded DB file
+buffer_pool_mb       = 256                   # LadybugDB buffer pool size
+extraction_model     = ""                    # empty = use agent.default_model
+extract_every_n_turns = 3                    # batch every N enqueued messages
+min_message_length   = 100                   # ignore messages shorter than this
+max_context_entries  = 10                    # max entities/facts injected per turn
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable/disable graph memory entirely |
+| `db_path` | `data/graph_memory` | Path to the embedded LadybugDB file (created on first run) |
+| `buffer_pool_mb` | `256` | In-process memory budget for the graph DB in MB |
+| `extraction_model` | `""` | Model used for entity/fact extraction; falls back to `agent.default_model` if empty |
+| `extract_every_n_turns` | `3` | How many chat messages to accumulate before triggering one extraction batch |
+| `min_message_length` | `100` | Messages shorter than this (characters) are skipped |
+| `max_context_entries` | `10` | Maximum entities, facts, and episodes injected into each turn's system prompt |
+
+> **Resource note:** LadybugDB is embedded — it runs in the same process and uses no additional server. On a Raspberry Pi 2 GB, `buffer_pool_mb = 64` is a safe starting point.
+
+#### Seeding from existing long-term memory
+
+If you have entries in `data/longterm_memory.json` from previous sessions, import them once with the backfill script **while the main agent is not running**:
+
+```bash
+# Dry-run: count entries without touching the DB
+python backfill_graph_memory.py --config config.toml --dry-run
+
+# Import everything (incremental — skips already-imported entries)
+python backfill_graph_memory.py --config config.toml
+
+# Import in batches and watch progress
+python backfill_graph_memory.py --config config.toml --limit 50 --verbose
+
+# Re-import everything regardless of prior state
+python backfill_graph_memory.py --config config.toml --force
+```
+
+After the initial seeding, the agent continues to grow the graph automatically from each chat session — no further backfill is needed.
+
+### 8. Run
 
 ```bash
 python main.py
@@ -292,7 +356,7 @@ allowed_user_ids = [123456789]
 
 ## Built-in Tools
 
-Six tools are always available to the agent regardless of the `tools/` directory:
+The following built-in tools are always available to the agent regardless of the `tools/` directory. The two graph-memory tools (`memory_graph_search`, `memory_graph_store`) require `[graph_memory] enabled = true` and the `ladybug` package — they return a clear error message when unavailable:
 
 | Tool | Description | Dangerous? |
 |------|-------------|-----------|
@@ -302,7 +366,9 @@ Six tools are always available to the agent regardless of the `tools/` directory
 | `file_send` | Send a local file or photo to the Telegram chat | No |
 | `schedule` | Manage scheduled jobs and reminders | No |
 | `spawn_agent` | Spawn an isolated background sub-agent | No |
-| `memory_write` | Read/write the agent's persistent memory (`data/memory.json`) | No |
+| `memory_write` | Read/write the agent's persistent key-value memory (`data/memory.json`) | No |
+| `memory_graph_search` | Search the graph memory store for entities, facts, and episodes relevant to a query | No — requires graph memory enabled |
+| `memory_graph_store` | Store a note, episode, or fact directly in graph memory and trigger background extraction | No — requires graph memory enabled |
 
 When a dangerous operation is requested, the bot sends an inline confirmation prompt:
 
@@ -347,6 +413,32 @@ Examples:
 ```
 
 Memory is shared across all sessions and persisted immediately to disk after every write.
+
+### `memory_graph_search` tool
+
+Searches the graph memory store for entities, relationships, and episodes relevant to a natural-language query. Returns a formatted context block injected into the response — or "No relevant entities or facts found" when the graph is empty or the query has no match.
+
+Requires `[graph_memory] enabled = true` and `ladybug` installed. Returns a clear error message when graph memory is unavailable so the agent can fall back gracefully.
+
+```json
+{"action": "memory_graph_search", "query": "What databases are used in this project?"}
+```
+
+### `memory_graph_store` tool
+
+Stores a note, observation, or fact directly in the graph memory and triggers immediate background extraction. Useful for the agent to explicitly record information it wants to recall across sessions.
+
+| Arg | Required | Description |
+|-----|----------|-------------|
+| `content` | ✓ | Text to store (also stored as an Episode) |
+| `entity_type` | — | Optional hint for the extraction model (default: `other`) |
+| `user_id` | — | Attribution tag (default: `agent`) |
+
+```json
+{"action": "memory_graph_store", "content": "The main database is PostgreSQL 16 on /dev/sda2.", "entity_type": "database"}
+```
+
+Both tools are no-ops when graph memory is disabled and return a clear error message.
 
 ---
 
@@ -591,7 +683,7 @@ Disable after diagnosing to keep logs clean.
 |---------|-------------|
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
-| `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, scheduler state, system time, and per-model token usage today |
+| `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, scheduler state, graph memory health (when enabled), system time, and per-model token usage today |
 | `/health` | Run self-health diagnosis, analyze logs, rotate log file |
 | `/tools` | List all built-in, generated, and MCP tools |
 | `/skills` | List all available agent skills |
@@ -619,6 +711,23 @@ These commands are not shown in the Telegram menu but are available to authorize
 |---------|-------------|
 | `/show_ctx` | Download the current LLM system prompt as `context.md` (with estimated token count) |
 | `/show_env` | Show the shell environment the agent runs commands in — all env vars (secrets redacted), PATH entries per line, and configured agent paths |
+| `/memory` | Graph memory diagnostics — **Store** (entity/fact/episode counts, latest episode timestamp, vector index status), **Writer** (worker alive, queue depth, extraction counters, failure counts), and **Retrieval** (hit/miss/injection counts). Only shown when graph memory is enabled. |
+
+#### Graph memory health states (`/status` line)
+
+When graph memory is enabled, `/status` shows a compact health line:
+
+```
+🧠 Graph Memory: 🟢 active-used | 47 entities · 91 facts · 28 episodes | hits 14 / misses 3 | writer ok, queue 0
+```
+
+| State | Meaning |
+|-------|---------|
+| `active-empty` 🟡 | Store initialised; no entities or episodes yet |
+| `active-learning` 🟢 | Writer has processed at least one batch but no retrieval hit yet |
+| `active-used` 🟢 | Graph context has been injected into at least one turn |
+| `*-degraded` 🟠 | Any of: writer thread stopped, write failures, vector index probe failed |
+| 🔴 failed | Enabled in config but store did not initialise — check logs |
 
 Or just send a natural language message:
 - *"check disk usage"*
@@ -636,7 +745,7 @@ Or send a **photo with a caption**:
 
 ## Memory Architecture
 
-The agent uses a four-tier memory system:
+The agent uses a four-tier memory system with an optional semantic graph layer:
 
 | Tier | Storage | Purpose |
 |------|---------|---------|
@@ -644,8 +753,19 @@ The agent uses a four-tier memory system:
 | **Working** | In-memory (current task) | Tracks the current goal, tool calls, and results; cleared on `/reset` |
 | **Long-term** | `data/longterm_memory.json` (vector index) | Nightly summaries and manually added facts; semantically searchable |
 | **Results** | `data/results_memory.json` (vector index) | Past task summaries saved on `/reset` or task completion |
+| **Graph memory** (optional) | `data/graph_memory` (LadybugDB) | Entities, typed relationships, and conversation episodes extracted from chat; semantically retrieved per-turn and injected into the system prompt |
 
 When you send `/reset`, the working memory is summarised by the LLM and persisted to results memory before being cleared. Use `/reset discard` to skip saving.
+
+### Graph memory in detail
+
+Graph memory is an **opt-in semantic layer** that runs alongside the other tiers when `[graph_memory] enabled = true`. It differs from the existing tiers:
+
+- **Structure**: stores a graph of typed entities (`person`, `tool`, `service`, `concept`, …) connected by labelled relationships (`USES`, `DEPENDS_ON`, `RUNS_ON`, …) and timestamped episode nodes.
+- **Automatic extraction**: every `extract_every_n_turns` messages, a background thread calls the extraction model, parses entity/fact JSON, and upserts the results into LadybugDB without blocking the agent turn.
+- **Per-turn retrieval**: at the start of each ReAct loop, the agent's goal is embedded and used to probe the HNSW vector index on entities and episodes; relevant results are injected into the system prompt as an untrusted-memory block (clearly labelled, never overriding explicit instructions).
+- **Privacy-safe logging**: logs expose only counts (`extracted 3 entities, 2 facts from 4 messages`), health states, and queue depths — never entity names, fact text, or episode content.
+- **Relationship to long-term memory**: `data/longterm_memory.json` is a flat vector index of text summaries; graph memory is a structured relational store. Use `backfill_graph_memory.py` to import existing long-term entries into the graph at initial setup time.
 
 ---
 
@@ -979,6 +1099,12 @@ tomli==2.0.1
 schedule==1.2.1
 croniter>=1.4
 ollama>=0.4.0
+```
+
+**Optional** — required only when `[graph_memory] enabled = true`:
+
+```
+ladybug>=0.7.0
 ```
 
 Python 3.9+ required. Python 3.11+ uses the built-in `tomllib` (no `tomli` needed).
