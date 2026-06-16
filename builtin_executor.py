@@ -16,6 +16,7 @@ user responds.
 
 from __future__ import annotations
 
+import difflib
 import html as _html_mod
 import logging
 import os
@@ -111,6 +112,18 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
     "file_write": BuiltinTool(
         name="file_write",
         description="Write content to a file on the filesystem. Args: path (str), content (str), mode (str: 'w' or 'a', default 'w').",
+    ),
+    "file_diff": BuiltinTool(
+        name="file_diff",
+        description=(
+            "Compare two files and return a traditional unified diff. "
+            "Read-only and non-destructive. "
+            "Args: path_a (str, required — first/old file), "
+            "path_b (str, required — second/new file), "
+            "context_lines (int, default 3 — lines of context around changes), "
+            "max_bytes (int, default 200000 — per-file read cap). "
+            "Returns the unified diff text, or 'Files are identical.' when there are no differences."
+        ),
     ),
     "file_send": BuiltinTool(
         name="file_send",
@@ -363,6 +376,8 @@ class BuiltinExecutor:
             return self._exec_memory_write(args, caller_tag=caller_tag)
         elif tool_name == "file_patch":
             return self._exec_file_patch(args, caller_depth=caller_depth, caller_tag=caller_tag)
+        elif tool_name == "file_diff":
+            return self._exec_file_diff(args, caller_tag=caller_tag)
         elif tool_name == "memory_graph_search":
             return self._exec_memory_graph_search(args, caller_tag=caller_tag)
         elif tool_name == "memory_graph_store":
@@ -519,6 +534,55 @@ class BuiltinExecutor:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
         except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+    # ---- file_diff ----
+
+    def _exec_file_diff(self, args: dict, caller_tag: str = "") -> dict:
+        path_a = str(args.get("path_a", "")).strip()
+        path_b = str(args.get("path_b", "")).strip()
+        if not path_a or not path_b:
+            return {
+                "success": False, "output": "",
+                "error": "file_diff: both 'path_a' and 'path_b' are required.",
+                "exit_code": -1,
+            }
+        try:
+            context_lines = int(args.get("context_lines", 3))
+        except (TypeError, ValueError):
+            return {"success": False, "output": "", "error": "file_diff: 'context_lines' must be an integer.", "exit_code": -1}
+        if context_lines < 0:
+            context_lines = 0
+        try:
+            max_bytes = int(args.get("max_bytes", 200_000))
+        except (TypeError, ValueError):
+            return {"success": False, "output": "", "error": "file_diff: 'max_bytes' must be an integer.", "exit_code": -1}
+
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_diff: %s <-> %s (context=%d)", _pfx, path_a, path_b, context_lines)
+
+        try:
+            for p in (path_a, path_b):
+                if not os.path.exists(p):
+                    return {"success": False, "output": "", "error": f"File not found: {p}", "exit_code": 1}
+            with open(path_a, "r", errors="replace") as f:
+                a_text = f.read(max_bytes)
+            with open(path_b, "r", errors="replace") as f:
+                b_text = f.read(max_bytes)
+        except PermissionError as exc:
+            return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
+        except OSError as exc:
+            return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+        a_lines = a_text.splitlines(keepends=True)
+        b_lines = b_text.splitlines(keepends=True)
+        diff = list(difflib.unified_diff(
+            a_lines, b_lines,
+            fromfile=path_a, tofile=path_b,
+            n=context_lines,
+        ))
+        if not diff:
+            return {"success": True, "output": "Files are identical.", "error": "", "exit_code": 0}
+        return {"success": True, "output": "".join(diff), "error": "", "exit_code": 0}
 
     # ---- file_write ----
 

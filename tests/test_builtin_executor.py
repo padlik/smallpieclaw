@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from builtin_executor import _is_dangerous_shell, _is_sensitive_path
+from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _is_sensitive_path
 
 
 class TestIsDangerousShell:
@@ -214,3 +214,54 @@ class TestIsSensitivePath:
         # id_rsa matches the pattern since it contains "id_rsa"
         # This is a known conservative false positive — acceptable for security
         assert flagged  # conservative match: "id_rsa" substring matches
+
+
+class TestFileDiff:
+    def _exec(self, **args):
+        return BuiltinExecutor().execute("file_diff", args)
+
+    def test_identical_files(self, tmp_path):
+        a = tmp_path / "a.txt"
+        b = tmp_path / "b.txt"
+        a.write_text("line1\nline2\n")
+        b.write_text("line1\nline2\n")
+        result = self._exec(path_a=str(a), path_b=str(b))
+        assert result["success"] is True
+        assert result["output"] == "Files are identical."
+
+    def test_differing_files(self, tmp_path):
+        a = tmp_path / "a.txt"
+        b = tmp_path / "b.txt"
+        a.write_text("line1\nline2\nline3\n")
+        b.write_text("line1\nCHANGED\nline3\n")
+        result = self._exec(path_a=str(a), path_b=str(b))
+        assert result["success"] is True
+        out = result["output"]
+        assert "---" in out and "+++" in out and "@@" in out
+        assert "-line2" in out
+        assert "+CHANGED" in out
+
+    def test_missing_file(self, tmp_path):
+        a = tmp_path / "a.txt"
+        a.write_text("x\n")
+        result = self._exec(path_a=str(a), path_b=str(tmp_path / "nope.txt"))
+        assert result["success"] is False
+        assert result["exit_code"] == 1
+        assert "File not found" in result["error"]
+
+    def test_missing_arg(self, tmp_path):
+        a = tmp_path / "a.txt"
+        a.write_text("x\n")
+        result = self._exec(path_a=str(a))
+        assert result["success"] is False
+        assert result["exit_code"] == -1
+        assert "required" in result["error"]
+
+    def test_context_lines(self, tmp_path):
+        a = tmp_path / "a.txt"
+        b = tmp_path / "b.txt"
+        a.write_text("\n".join(f"l{i}" for i in range(20)) + "\n")
+        b.write_text("\n".join(f"l{i}" for i in range(20)).replace("l10", "CHANGED") + "\n")
+        result = self._exec(path_a=str(a), path_b=str(b), context_lines=1)
+        assert result["success"] is True
+        assert "CHANGED" in result["output"]
