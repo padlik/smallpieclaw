@@ -60,7 +60,7 @@ class AgentConfig:
     max_iterations: int = 8
     scheduled_max_iterations: int = 100
     tool_timeout: int = 10
-    max_output_size: int = 4000
+    max_output_size: int = 4000  # chars: stdout/stderr per-stream limit for shell/tools
     top_tools: int = 3
     ctx_max_tokens: int = 90_000
     max_subagents: int = 6
@@ -70,6 +70,12 @@ class AgentConfig:
     default_model: str = ""
     background_model: str = ""
     fallback_models: list[str] = field(default_factory=list)
+    # Shell execution backend — "subprocess" (default, cross-platform) or "pty"
+    # (POSIX-only; gives commands a real TTY, enabling line buffering, color
+    # output, and progress indicators from tools like pytest, git, npm, etc.)
+    shell_backend: str = "subprocess"
+    shell_pty_cols: int = 220  # terminal width reported to the child (wide → fewer wraps)
+    shell_pty_rows: int = 50
 
 
 @dataclass(frozen=True)
@@ -208,6 +214,9 @@ def _parse_agent(raw: dict) -> AgentConfig:
         default_model=section.get("default_model", ""),
         background_model=section.get("background_model", ""),
         fallback_models=list(section.get("fallback_models") or []),
+        shell_backend=str(section.get("shell_backend", "subprocess")),
+        shell_pty_cols=int(section.get("shell_pty_cols", 220)),
+        shell_pty_rows=int(section.get("shell_pty_rows", 50)),
     )
 
 

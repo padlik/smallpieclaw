@@ -568,18 +568,26 @@ class TelegramInterface:
             typing_task.cancel()
 
     async def _send_verbose_event(self, bot, chat_id: int, text: str) -> None:
-        """Send a verbose progress event as a new top-level message (not a reply)."""
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=_md_to_html(text)[:4096],
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
+        """Send a verbose progress event as a new top-level message (not a reply).
+
+        Long events are chunked via split_message() so no content is silently
+        dropped.  Each chunk is a separate Telegram message.
+        """
+        from telegram_formatter import split_message as _split
+        chunks = _split(text)
+        for chunk in chunks:
             try:
-                await bot.send_message(chat_id=chat_id, text=text[:4096])
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode=ParseMode.HTML,
+                )
             except Exception:
-                pass
+                try:
+                    import html as _html
+                    await bot.send_message(chat_id=chat_id, text=_html.unescape(chunk)[:4096])
+                except Exception:
+                    pass
 
     async def _send_file_to_chat(self, message, file_path: str, caption: str) -> None:
         """Send a local file or photo to the chat (called from the progress callback)."""
@@ -697,12 +705,22 @@ class TelegramInterface:
                 pass
 
     async def _safe_edit_html(self, message, html_text: str) -> None:
-        """Edit a message with pre-built HTML, bypassing _md_to_html conversion."""
+        """Edit a message with pre-built HTML, bypassing _md_to_html conversion.
+
+        Edit-in-place messages have a hard 4096-char Telegram limit and cannot
+        be chunked into multiple messages.  When the content exceeds the limit,
+        the tail is shown (the most recent log lines are most useful).
+        """
+        _LIMIT = 4096
+        if len(html_text) > _LIMIT:
+            # Tail semantics: keep the end; prepend a truncation notice
+            tail = html_text[-(_LIMIT - 60):]
+            html_text = f"<i>[…log truncated, showing tail]</i>\n{tail}"
         try:
-            await message.edit_text(html_text[:4096], parse_mode=ParseMode.HTML)
+            await message.edit_text(html_text[:_LIMIT], parse_mode=ParseMode.HTML)
         except Exception:
             try:
-                await message.edit_text(html_text[:4096])
+                await message.edit_text(html_text[:_LIMIT])
             except Exception:
                 pass
 

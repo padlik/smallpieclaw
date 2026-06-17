@@ -239,15 +239,20 @@ def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
         out = (outcome.get("output") or "").strip()
         if out:
             lines = out.splitlines()
-            preview = "\n".join(lines[:8])
-            if len(lines) > 8 or len(preview) > 400:
-                preview = preview[:400] + "\n…"
+            # Tail semantics: show the last 8 lines (errors/results appear at the end)
+            if len(lines) > 8:
+                preview = "…\n" + "\n".join(lines[-8:])
+            else:
+                preview = "\n".join(lines)
+            if len(preview) > 400:
+                preview = "…" + preview[-399:]
             return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n```\n{preview}\n```"
         return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n_(no output)_"
     else:
         err = (outcome.get("error") or outcome.get("output") or "failed").strip()
         if len(err) > 300:
-            err = err[:297] + "…"
+            # Tail semantics for errors too
+            err = "…" + err[-297:]
         return f"{_tool_icon(tool_name)} **{tool_name}** ❌\n{call}\n```\n{err}\n```"
 
 

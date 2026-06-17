@@ -29,6 +29,22 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _truncate_output(text: str, limit: int) -> str:
+    """Truncate *text* to at most *limit* chars, keeping the tail.
+
+    Tail semantics are intentional: for build, test, and script output the
+    useful information (errors, results, summaries) almost always appears near
+    the end.  When truncation occurs a clear marker is prepended so the LLM
+    knows data was omitted.
+    """
+    if len(text) <= limit:
+        return text
+    kept = text[-limit:]
+    omitted = len(text) - limit
+    return f"[...{omitted} chars omitted, showing last {limit} chars...]\n{kept}"
+
+
 # ---------------------------------------------------------------------------
 # Dangerous / sensitive pattern detection
 # ---------------------------------------------------------------------------
@@ -297,7 +313,8 @@ class BuiltinExecutor:
     def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
                  sub_agent_factory=None, data_dir: str = "data",
                  memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300,
-                 notify_html_fn=None):
+                 notify_html_fn=None, shell_backend: str = "subprocess",
+                 shell_pty_cols: int = 220, shell_pty_rows: int = 50):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -309,6 +326,9 @@ class BuiltinExecutor:
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
         self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
         self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init
+        self._shell_backend = shell_backend   # "subprocess" or "pty"
+        self._shell_pty_cols = shell_pty_cols
+        self._shell_pty_rows = shell_pty_rows
         self._sub_agent_pool = ThreadPoolExecutor(
             max_workers=max_subagents, thread_name_prefix="sub-agent"
         )
@@ -467,10 +487,17 @@ class BuiltinExecutor:
         return self._run_shell(args, caller_tag=caller_tag)
 
     def _run_shell(self, args: dict, caller_tag: str = "") -> dict:
+        """Dispatch to the configured shell backend (subprocess or pty)."""
+        import sys
+        if self._shell_backend == "pty" and sys.platform != "win32":
+            return self._run_shell_pty(args, caller_tag=caller_tag)
+        return self._run_shell_subprocess(args, caller_tag=caller_tag)
+
+    def _run_shell_subprocess(self, args: dict, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self.default_timeout))
         _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in shell executing: %s", _pfx, command[:120])
+        logger.info("%sBuilt-in shell (subprocess) executing: %s", _pfx, command[:120])
         try:
             proc = subprocess.run(
                 command,
@@ -479,12 +506,24 @@ class BuiltinExecutor:
                 text=True,
                 timeout=timeout,
             )
-            output = (proc.stdout or "")[:self.max_output]
-            error = (proc.stderr or "")[:500]
-            if proc.returncode != 0 and not output and error:
-                # Some commands write only to stderr on success (e.g. systemctl status)
+            stdout_raw = proc.stdout or ""
+            stderr_raw = proc.stderr or ""
+
+            # Truncate with explicit marker (tail semantics: keep the end where
+            # errors and results typically appear rather than the beginning).
+            output = _truncate_output(stdout_raw, self.max_output)
+            # stderr uses the same configurable limit; 500-char hardcap removed.
+            error = _truncate_output(stderr_raw, self.max_output)
+
+            if proc.returncode != 0 and not output.strip() and error:
+                # Some commands write only to stderr (e.g. systemctl status);
+                # promote stderr → output so the LLM sees the failure reason.
                 output = error
                 error = ""
+            logger.info(
+                "%sBuilt-in shell exit=%d stdout=%d stderr=%d chars",
+                _pfx, proc.returncode, len(stdout_raw), len(stderr_raw),
+            )
             return {
                 "success": proc.returncode == 0,
                 "output": output,
@@ -495,6 +534,106 @@ class BuiltinExecutor:
             return {"success": False, "output": "", "error": f"Command timed out after {timeout}s.", "exit_code": -1}
         except (OSError, subprocess.SubprocessError) as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
+
+    def _run_shell_pty(self, args: dict, caller_tag: str = "") -> dict:
+        """Run shell command inside a pseudo-terminal.
+
+        Gives the child process a real TTY so isatty()==True, enabling:
+        - line-buffered (real-time) output instead of 64 KB block buffering
+        - ANSI colour codes from tools like git, pytest, npm
+        - progress indicators that detect a terminal
+        stdout and stderr are merged by the PTY line discipline (chronological
+        order preserved).  Falls back to subprocess on import error.
+        """
+        command = str(args.get("command", "")).strip()
+        timeout = int(args.get("timeout", self.default_timeout))
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in shell (pty) executing: %s", _pfx, command[:120])
+
+        try:
+            from ptyprocess import PtyProcessUnicode  # type: ignore[import]
+        except ImportError:
+            logger.warning("%sptyprocess not available, falling back to subprocess", _pfx)
+            return self._run_shell_subprocess(args, caller_tag=caller_tag)
+
+        import select as _select
+        import re as _re
+        _ANSI_RE = _re.compile(r'\x1b\[[0-9;]*[mGKHF]|\x1b\].*?\x07')
+
+        try:
+            proc = PtyProcessUnicode.spawn(
+                ['/bin/sh', '-c', command],
+                dimensions=(self._shell_pty_rows, self._shell_pty_cols),
+                echo=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%sPTY spawn failed (%s), falling back to subprocess", _pfx, exc)
+            return self._run_shell_subprocess(args, caller_tag=caller_tag)
+
+        import time as _time
+        chunks: list[str] = []
+        total_chars = 0
+        timed_out = False
+        deadline = _time.monotonic() + timeout
+
+        try:
+            while proc.isalive():
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    ready, _, _ = _select.select([proc.fd], [], [], min(remaining, 0.25))
+                except (OSError, ValueError):
+                    break
+                if not ready:
+                    continue
+                try:
+                    chunk = proc.read(4096)
+                except EOFError:
+                    break
+                # Normalize TTY line endings and strip ANSI for clean LLM output
+                chunk = chunk.replace('\r\n', '\n').replace('\r', '\n')
+                chunk = _ANSI_RE.sub('', chunk)
+                total_chars += len(chunk)
+                chunks.append(chunk)
+
+            # Drain remaining output after loop
+            if not timed_out:
+                for _ in range(20):
+                    try:
+                        r, _, _ = _select.select([proc.fd], [], [], 0.05)
+                        if not r:
+                            break
+                        chunk = proc.read(4096).replace('\r\n', '\n').replace('\r', '\n')
+                        chunk = _ANSI_RE.sub('', chunk)
+                        total_chars += len(chunk)
+                        chunks.append(chunk)
+                    except (EOFError, OSError, ValueError):
+                        break
+        finally:
+            if timed_out:
+                proc.terminate(force=True)
+            proc.close(force=False)
+
+        raw_output = "".join(chunks)
+        output = _truncate_output(raw_output, self.max_output)
+        exit_code = proc.exitstatus if not timed_out else -1
+        # exitstatus is None if signalled; treat as failure
+        if exit_code is None:
+            exit_code = -1
+        logger.info(
+            "%sBuilt-in shell (pty) exit=%s combined=%d chars",
+            _pfx, exit_code, total_chars,
+        )
+        if timed_out:
+            return {"success": False, "output": output, "error": f"Command timed out after {timeout}s.", "exit_code": -1}
+        return {
+            "success": exit_code == 0,
+            "output": output,
+            "error": "",
+            "exit_code": exit_code,
+        }
 
     # ---- file_read ----
 

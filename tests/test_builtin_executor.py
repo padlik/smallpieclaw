@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _is_sensitive_path
+import sys
+
+from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _is_sensitive_path, _truncate_output
 
 
 class TestIsDangerousShell:
@@ -265,3 +267,173 @@ class TestFileDiff:
         result = self._exec(path_a=str(a), path_b=str(b), context_lines=1)
         assert result["success"] is True
         assert "CHANGED" in result["output"]
+
+
+class TestTruncateOutput:
+    """Unit tests for the _truncate_output helper."""
+
+    def test_no_truncation_when_within_limit(self):
+        text = "hello world"
+        assert _truncate_output(text, 100) == text
+
+    def test_exact_limit_not_truncated(self):
+        text = "a" * 50
+        assert _truncate_output(text, 50) == text
+
+    def test_truncation_appends_marker(self):
+        text = "a" * 10 + "b" * 10
+        result = _truncate_output(text, 10)
+        assert "omitted" in result
+        assert result.endswith("b" * 10)
+
+    def test_truncation_tail_semantics(self):
+        # Tail is preserved — end of output is visible
+        text = "BEGINNING_" + "x" * 100 + "_END"
+        result = _truncate_output(text, 20)
+        assert "_END" in result
+        assert "BEGINNING_" not in result
+
+    def test_truncation_marker_shows_omitted_count(self):
+        text = "a" * 1000
+        result = _truncate_output(text, 100)
+        assert "900 chars omitted" in result
+
+    def test_empty_string_not_truncated(self):
+        assert _truncate_output("", 10) == ""
+
+
+class TestShellTruncation:
+    """Integration tests for shell output truncation behavior."""
+
+    def _exec(self, command, max_output=500, timeout=10):
+        return BuiltinExecutor(max_output=max_output).execute(
+            "shell", {"command": command, "timeout": timeout}
+        )
+
+    def test_short_output_not_truncated(self):
+        result = self._exec("echo hello")
+        assert result["success"] is True
+        assert result["output"].strip() == "hello"
+
+    def test_long_stdout_truncated_with_marker(self):
+        # Generate more than 100 chars of output; use a small cap
+        result = self._exec("python3 -c \"print('x'*200)\"", max_output=50)
+        assert "omitted" in result["output"]
+
+    def test_long_stdout_tail_preserved(self):
+        # End of output must appear in result
+        result = self._exec(
+            "python3 -c \"for i in range(50): print(f'line{i}')\"",
+            max_output=100,
+        )
+        # Last lines should appear
+        assert "line49" in result["output"]
+
+    def test_stderr_uses_configurable_limit_not_500(self):
+        # Previously stderr was hardcoded to 500 chars.
+        # Now it uses max_output; with a generous limit all stderr should pass.
+        result = self._exec("python3 -c \"import sys; sys.stderr.write('e'*600)\"", max_output=5000)
+        # Should NOT be truncated to 500 — all 600 chars must be present in error
+        assert "e" * 600 in (result["output"] + result["error"])
+
+    def test_stderr_truncated_with_marker_when_exceeds_limit(self):
+        result = self._exec(
+            "python3 -c \"import sys; sys.stderr.write('e'*300)\"",
+            max_output=100,
+        )
+        combined = result["output"] + result["error"]
+        assert "omitted" in combined
+
+    def test_failed_command_promotes_stderr_to_output(self):
+        # When stdout empty and command fails, stderr is promoted
+        result = self._exec("ls /nonexistent_path_xyz_that_does_not_exist")
+        assert result["success"] is False
+        # Output should contain the error message (stderr promoted)
+        assert result["output"]
+
+    def test_timeout_returns_useful_error(self):
+        result = self._exec("sleep 10", timeout=1)
+        assert result["success"] is False
+        assert "timed out" in result["error"].lower()
+        assert result["exit_code"] == -1
+
+    def test_exit_code_preserved(self):
+        result = self._exec("exit 42")
+        assert result["exit_code"] == 42
+        assert result["success"] is False
+
+
+class TestShellPtyBackend:
+    """Tests for the PTY shell backend (POSIX-only)."""
+
+    @staticmethod
+    def _exec(command, max_output=4000, timeout=10):
+        return BuiltinExecutor(
+            max_output=max_output,
+            shell_backend="pty",
+            shell_pty_cols=80,
+            shell_pty_rows=24,
+        ).execute("shell", {"command": command, "timeout": timeout})
+
+    def test_pty_basic_output(self):
+        if sys.platform == "win32":
+            return  # PTY not available on Windows
+        result = self._exec("echo hello_pty")
+        assert result["success"] is True
+        assert "hello_pty" in result["output"]
+
+    def test_pty_exit_code_zero(self):
+        if sys.platform == "win32":
+            return
+        result = self._exec("true")
+        assert result["success"] is True
+        assert result["exit_code"] == 0
+
+    def test_pty_exit_code_nonzero(self):
+        if sys.platform == "win32":
+            return
+        result = self._exec("false")
+        assert result["success"] is False
+        assert result["exit_code"] != 0
+
+    def test_pty_multiline_output(self):
+        if sys.platform == "win32":
+            return
+        result = self._exec("printf 'line1\\nline2\\nline3\\n'")
+        assert result["success"] is True
+        assert "line1" in result["output"]
+        assert "line3" in result["output"]
+
+    def test_pty_timeout(self):
+        if sys.platform == "win32":
+            return
+        result = self._exec("sleep 10", timeout=1)
+        assert result["success"] is False
+        assert "timed out" in result["error"].lower()
+        assert result["exit_code"] == -1
+
+    def test_pty_truncation_marker(self):
+        if sys.platform == "win32":
+            return
+        result = self._exec("python3 -c \"print('x'*300)\"", max_output=100)
+        assert "omitted" in result["output"]
+
+    def test_pty_tail_preserved(self):
+        if sys.platform == "win32":
+            return
+        # Last line must be in output
+        result = self._exec(
+            "for i in $(seq 1 30); do echo \"line$i\"; done",
+            max_output=100,
+        )
+        assert "line30" in result["output"]
+
+    def test_pty_falls_back_on_windows(self, monkeypatch):
+        """On Windows platform, PTY backend falls back to subprocess silently."""
+        monkeypatch.setattr("sys.platform", "win32")
+        # Should not raise; falls back to subprocess
+        result = BuiltinExecutor(
+            max_output=4000, shell_backend="pty"
+        ).execute("shell", {"command": "echo hi"})
+        # On actual Linux/macOS with monkeypatched platform, subprocess used
+        assert result["success"] is True
