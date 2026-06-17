@@ -661,15 +661,20 @@ def _dispatch_tool(
         chunk_callback: Optional[Callable[[str], None]] = None
         if (tool_name == "shell"
                 and getattr(ctx.builtin_executor, "_shell_streaming", False)):
-            _chunk_buf: list[str] = []
+            # Keep only a bounded rolling tail (last few lines) rather than the
+            # full output history — avoids O(n²) re-joins and unbounded memory
+            # growth on high-output commands. We only ever display the tail.
+            _tail_buf: list[str] = [""]
 
             def _on_chunk(chunk: str) -> None:
-                _chunk_buf.append(chunk)
+                merged = _tail_buf[0] + chunk
+                # Retain only the last 8 line-segments, and cap total length to
+                # guard against a single very long line with no newlines.
+                lines = merged.rsplit("\n", 8)
+                tail = "\n".join(lines[-8:])[-2000:]
+                _tail_buf[0] = tail
                 # Emit a special-prefixed progress message so the UI handler can
                 # update the live tail without adding new panel steps.
-                accumulated = "".join(_chunk_buf)
-                tail_lines = accumulated.rsplit("\n", 8)[-8:]
-                tail = "\n".join(tail_lines)
                 _progress(f"__SHELL_CHUNK__:{tail}")
 
             chunk_callback = _on_chunk
