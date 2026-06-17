@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -43,6 +44,21 @@ def _truncate_output(text: str, limit: int) -> str:
         return text
     kept = text[-limit:]
     omitted = len(text) - limit
+    return f"[...{omitted} chars omitted, showing last {limit} chars...]\n{kept}"
+
+
+def _truncate_tail(tail: str, total_chars: int, limit: int) -> str:
+    """Build truncated output from a rolling tail when total stream size is known.
+
+    Use instead of _truncate_output when the caller only kept a rolling
+    *tail* in memory (not the full stream) but knows the *total_chars* written.
+    When total_chars <= limit the tail *is* the full output and is returned
+    as-is.  Otherwise a correct omission count is prepended.
+    """
+    if total_chars <= limit:
+        return tail
+    omitted = total_chars - limit
+    kept = tail[-limit:]
     return f"[...{omitted} chars omitted, showing last {limit} chars...]\n{kept}"
 
 
@@ -507,12 +523,12 @@ class BuiltinExecutor:
             return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
-    def _persist_shell_log(self, raw_text: str, caller_tag: str = "") -> Optional[str]:
-        """Write full shell output to a run-specific artifact file.
+    def _open_shell_log(self, caller_tag: str = "") -> tuple[Optional[object], Optional[str]]:
+        """Open a run-specific artifact log file for incremental writing.
 
-        Returns the absolute path to the written log, or None on failure. Only
-        called when output exceeds the context limit so the LLM can recover the
-        full log (e.g. via file_read) instead of losing it to truncation.
+        Returns (file_handle, absolute_path) or (None, None) on failure.
+        The caller must close the file handle and call _finalize_shell_log to
+        either keep or remove the file.
         """
         _pfx = f"[{caller_tag}] " if caller_tag else ""
         try:
@@ -521,14 +537,36 @@ class BuiltinExecutor:
             ts = time.strftime("%Y%m%d-%H%M%S")
             fname = f"shell-{ts}-{secrets.token_hex(4)}.log"
             path = os.path.abspath(os.path.join(log_dir, fname))
-            with open(path, "w", encoding="utf-8", errors="replace") as fh:
-                fh.write(raw_text)
-            logger.info("%sBuilt-in shell: full output (%d chars) saved to %s",
-                        _pfx, len(raw_text), path)
-            return path
+            fh = open(path, "w", encoding="utf-8", errors="replace")  # noqa: WPS515
+            return fh, path
         except OSError as exc:
-            logger.warning("%sBuilt-in shell: failed to persist full log: %s", _pfx, exc)
+            logger.warning("%sBuilt-in shell: cannot open artifact log: %s", _pfx, exc)
+            return None, None
+
+    def _finalize_shell_log(self, fh, path: Optional[str], total_chars: int,
+                            caller_tag: str = "") -> Optional[str]:
+        """Close the artifact file and decide whether to keep or delete it.
+
+        Keeps the file (and returns path) only when total_chars exceeds
+        max_output.  Otherwise removes the file and returns None.
+        """
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if path is None:
             return None
+        if total_chars > self.max_output:
+            logger.info("%sBuilt-in shell: full output (%d chars) saved to %s",
+                        _pfx, total_chars, path)
+            return path
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
 
     def _run_shell_subprocess(self, args: dict, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
@@ -536,60 +574,112 @@ class BuiltinExecutor:
         _pfx = f"[{caller_tag}] " if caller_tag else ""
         logger.info("%sBuilt-in shell (subprocess) executing: %s", _pfx, command[:120])
         _start = time.monotonic()
+
+        # Open artifact log for incremental writing; kept only if output is large.
+        _log_fh, _artifact_path = self._open_shell_log(caller_tag)
+        _log_lock = threading.Lock()
+        _tail_out: list[str] = [""]
+        _tail_err: list[str] = [""]
+        _total_out: list[int] = [0]
+        _total_err: list[int] = [0]
+
+        def _read_stream(pipe, tail_ref: list, total_ref: list, log_prefix: str = "") -> None:
+            """Drain a pipe, keeping a rolling max_output-char tail in memory."""
+            first = True
+            try:
+                while True:
+                    chunk = pipe.read(4096)
+                    if not chunk:
+                        break
+                    total_ref[0] += len(chunk)
+                    # Rolling tail: keep only the last max_output chars.
+                    tail_ref[0] = (tail_ref[0] + chunk)[-self.max_output:]
+                    if _log_fh is not None:
+                        with _log_lock:
+                            if first and log_prefix:
+                                _log_fh.write(log_prefix)
+                            _log_fh.write(chunk)
+                            first = False
+            except (OSError, ValueError):
+                pass
+
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
             )
-            elapsed_ms = (time.monotonic() - _start) * 1000.0
-            stdout_raw = proc.stdout or ""
-            stderr_raw = proc.stderr or ""
-
-            # Persist the full log to an artifact when either stream exceeds the
-            # context limit, so the truncated tail returned to the LLM still
-            # points at recoverable full output.
-            full_log_path: Optional[str] = None
-            if len(stdout_raw) > self.max_output or len(stderr_raw) > self.max_output:
-                combined = stdout_raw
-                if stderr_raw:
-                    combined = (combined + "\n--- stderr ---\n" + stderr_raw) if stdout_raw else stderr_raw
-                full_log_path = self._persist_shell_log(combined, caller_tag)
-
-            # Truncate with explicit marker (tail semantics: keep the end where
-            # errors and results typically appear rather than the beginning).
-            output = _truncate_output(stdout_raw, self.max_output)
-            # stderr uses the same configurable limit; 500-char hardcap removed.
-            error = _truncate_output(stderr_raw, self.max_output)
-
-            if proc.returncode != 0 and not output.strip() and error:
-                # Some commands write only to stderr (e.g. systemctl status);
-                # promote stderr → output so the LLM sees the failure reason.
-                output = error
-                error = ""
-
-            if full_log_path:
-                notice = f"\n[full output saved to: {full_log_path} — use file_read to view it]"
-                output = output + notice
-
-            logger.info(
-                "%sBuilt-in shell exit=%d stdout=%d stderr=%d chars in %.0fms",
-                _pfx, proc.returncode, len(stdout_raw), len(stderr_raw), elapsed_ms,
-            )
-            return {
-                "success": proc.returncode == 0,
-                "output": output,
-                "error": error,
-                "exit_code": proc.returncode,
-                "elapsed_ms": round(elapsed_ms),
-                "full_log_path": full_log_path,
-            }
-        except subprocess.TimeoutExpired:
-            return {"success": False, "output": "", "error": f"Command timed out after {timeout}s.", "exit_code": -1}
-        except (OSError, subprocess.SubprocessError) as exc:
+        except OSError as exc:
+            if _log_fh:
+                _log_fh.close()
+            if _artifact_path:
+                try:
+                    os.unlink(_artifact_path)
+                except OSError:
+                    pass
             return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
+
+        t_out = threading.Thread(
+            target=_read_stream,
+            args=(proc.stdout, _tail_out, _total_out, ""),
+            daemon=True,
+        )
+        t_err = threading.Thread(
+            target=_read_stream,
+            args=(proc.stderr, _tail_err, _total_err, "\n--- stderr ---\n"),
+            daemon=True,
+        )
+        t_out.start()
+        t_err.start()
+
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            timed_out = True
+
+        t_out.join(timeout=2.0)
+        t_err.join(timeout=2.0)
+
+        elapsed_ms = (time.monotonic() - _start) * 1000.0
+        total_combined = _total_out[0] + _total_err[0]
+        full_log_path = self._finalize_shell_log(_log_fh, _artifact_path, total_combined, caller_tag)
+
+        # Build truncated outputs from rolling tails using correct total counts.
+        output = _truncate_tail(_tail_out[0], _total_out[0], self.max_output)
+        error = _truncate_tail(_tail_err[0], _total_err[0], self.max_output)
+
+        returncode = proc.returncode if not timed_out else -1
+
+        if returncode != 0 and not output.strip() and error:
+            # Some commands write only to stderr (e.g. systemctl status);
+            # promote stderr → output so the LLM sees the failure reason.
+            output = error
+            error = ""
+
+        if full_log_path:
+            notice = f"\n[full output saved to: {full_log_path} — use file_read to view it]"
+            output = output + notice
+
+        logger.info(
+            "%sBuilt-in shell exit=%s stdout=%d stderr=%d chars in %.0fms",
+            _pfx, returncode, _total_out[0], _total_err[0], elapsed_ms,
+        )
+        if timed_out:
+            return {"success": False, "output": output, "error": f"Command timed out after {timeout}s.",
+                    "exit_code": -1, "elapsed_ms": round(elapsed_ms), "full_log_path": full_log_path}
+        return {
+            "success": returncode == 0,
+            "output": output,
+            "error": error,
+            "exit_code": returncode,
+            "elapsed_ms": round(elapsed_ms),
+            "full_log_path": full_log_path,
+        }
 
     def _run_shell_pty(self, args: dict, caller_tag: str = "",
                        chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
@@ -632,11 +722,16 @@ class BuiltinExecutor:
             return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
         import time as _time
-        chunks: list[str] = []
         total_chars = 0
         timed_out = False
         _start = _time.monotonic()
         deadline = _start + timeout
+
+        # Rolling tail: bounded memory regardless of how much the process emits.
+        _tail = ""
+
+        # Open artifact log for incremental writing.
+        _log_fh, _artifact_path = self._open_shell_log(caller_tag)
 
         try:
             while proc.isalive():
@@ -658,7 +753,9 @@ class BuiltinExecutor:
                 chunk = chunk.replace('\r\n', '\n').replace('\r', '\n')
                 chunk = _ANSI_RE.sub('', chunk)
                 total_chars += len(chunk)
-                chunks.append(chunk)
+                _tail = (_tail + chunk)[-self.max_output:]
+                if _log_fh is not None:
+                    _log_fh.write(chunk)
                 if streaming:
                     try:
                         chunk_callback(chunk)
@@ -675,7 +772,9 @@ class BuiltinExecutor:
                         chunk = proc.read(4096).replace('\r\n', '\n').replace('\r', '\n')
                         chunk = _ANSI_RE.sub('', chunk)
                         total_chars += len(chunk)
-                        chunks.append(chunk)
+                        _tail = (_tail + chunk)[-self.max_output:]
+                        if _log_fh is not None:
+                            _log_fh.write(chunk)
                         if streaming:
                             try:
                                 chunk_callback(chunk)
@@ -688,15 +787,10 @@ class BuiltinExecutor:
                 proc.terminate(force=True)
             proc.close(force=False)
 
-        raw_output = "".join(chunks)
         elapsed_ms = (_time.monotonic() - _start) * 1000.0
+        full_log_path = self._finalize_shell_log(_log_fh, _artifact_path, total_chars, caller_tag)
 
-        # Persist the full log to an artifact when it exceeds the context limit.
-        full_log_path: Optional[str] = None
-        if len(raw_output) > self.max_output:
-            full_log_path = self._persist_shell_log(raw_output, caller_tag)
-
-        output = _truncate_output(raw_output, self.max_output)
+        output = _truncate_tail(_tail, total_chars, self.max_output)
         if full_log_path:
             output = output + f"\n[full output saved to: {full_log_path} — use file_read to view it]"
 

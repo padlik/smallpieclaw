@@ -240,8 +240,11 @@ def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
         log_note = f"\n📄 full log: `{outcome['full_log_path']}`"
     if outcome["success"]:
         out = (outcome.get("output") or "").strip()
-        if out:
-            lines = out.splitlines()
+        # Include stderr even on success (warnings, compiler diagnostics, etc.)
+        err = (outcome.get("error") or "").strip()
+        combined = "\n".join(filter(None, [out, ("--- stderr ---\n" + err) if err else ""]))
+        if combined:
+            lines = combined.splitlines()
             # Tail semantics: show the last 8 lines (errors/results appear at the end)
             if len(lines) > 8:
                 preview = "…\n" + "\n".join(lines[-8:])
@@ -263,6 +266,10 @@ def format_tool_result(tool_name: str, outcome: dict) -> str:
     """Format a tool result as a message for the LLM."""
     if outcome["success"]:
         output = outcome["output"] or "(no output)"
+        # Include stderr even for successful commands; warnings/diagnostics matter.
+        stderr = (outcome.get("error") or "").strip()
+        if stderr:
+            return f"Tool '{tool_name}' succeeded:\n{output}\nstderr:\n{stderr}"
         return f"Tool '{tool_name}' succeeded:\n{output}"
     else:
         parts = [f"Tool '{tool_name}' failed (exit {outcome.get('exit_code', '?')})."]

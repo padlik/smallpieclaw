@@ -564,8 +564,10 @@ class TestShellLogArtifacts:
         result = ex.execute("shell", {"command": "echo small"})
         assert result["success"] is True
         assert result.get("full_log_path") is None
-        # No shell_logs dir should be created for small output
-        assert not (tmp_path / "shell_logs").exists()
+        # shell_logs dir may exist but must be empty (log file deleted after small run)
+        log_dir = tmp_path / "shell_logs"
+        if log_dir.exists():
+            assert list(log_dir.iterdir()) == []
 
     def test_artifact_written_when_truncated(self, tmp_path):
         ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path))
@@ -649,3 +651,75 @@ class TestShellStreamingThroughConfirm:
         token = staged["token"]
         result = ex.confirm(token)  # no callback — backward compatible
         assert "ok_confirm" in result["output"]
+
+
+class TestTruncateTail:
+    """Tests for _truncate_tail — rolling-tail truncation with correct omission count."""
+
+    def test_no_truncation_within_limit(self):
+        from builtin_executor import _truncate_tail
+        result = _truncate_tail("hello", 10, 100)
+        assert result == "hello"
+
+    def test_exact_limit_not_truncated(self):
+        from builtin_executor import _truncate_tail
+        result = _truncate_tail("hello", 5, 5)
+        assert result == "hello"
+
+    def test_truncation_shows_correct_total_omitted(self):
+        from builtin_executor import _truncate_tail
+        # 1000 total chars, only last 100 kept in tail, limit=100
+        tail = "x" * 100
+        result = _truncate_tail(tail, 1000, 100)
+        # omitted = 1000 - 100 = 900
+        assert "900" in result
+        assert result.endswith("x" * 100)
+
+    def test_tail_smaller_than_total_but_bigger_than_limit(self):
+        from builtin_executor import _truncate_tail
+        # tail=200, total=500, limit=100 → omitted should be 400 (based on total)
+        tail = "y" * 200
+        result = _truncate_tail(tail, 500, 100)
+        assert "400" in result
+        assert result.endswith("y" * 100)
+
+
+class TestSuccessfulStderrVisible:
+    """Successful shell commands with stderr output must surface it to LLM and UI."""
+
+    def test_format_tool_result_includes_stderr_on_success(self):
+        from react_loop import format_tool_result
+        outcome = {"success": True, "output": "hello", "error": "warning: deprecated"}
+        result = format_tool_result("shell", outcome)
+        assert "hello" in result
+        assert "warning: deprecated" in result
+
+    def test_format_tool_result_no_stderr_section_when_empty(self):
+        from react_loop import format_tool_result
+        outcome = {"success": True, "output": "hello", "error": ""}
+        result = format_tool_result("shell", outcome)
+        assert "stderr" not in result
+        assert "hello" in result
+
+    def test_fmt_tool_result_progress_includes_stderr_on_success(self):
+        from react_loop import fmt_tool_result_progress
+        outcome = {"success": True, "output": "built ok", "error": "1 warning"}
+        result = fmt_tool_result_progress("shell", {"command": "make"}, outcome)
+        assert "built ok" in result
+        assert "1 warning" in result
+
+    def test_fmt_tool_result_progress_no_stderr_section_when_empty(self):
+        from react_loop import fmt_tool_result_progress
+        outcome = {"success": True, "output": "clean output", "error": ""}
+        result = fmt_tool_result_progress("shell", {"command": "echo hi"}, outcome)
+        assert "stderr" not in result
+
+    def test_subprocess_success_stderr_in_result(self, tmp_path):
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        result = ex.execute(
+            "shell",
+            {"command": "python3 -c \"import sys; print('out'); sys.stderr.write('warn\\n')\""},
+        )
+        assert result["success"] is True
+        assert "out" in result["output"]
+        assert "warn" in result["error"]
