@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -411,14 +412,18 @@ class BuiltinExecutor:
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
-    def confirm(self, token: str) -> dict:
-        """Execute a previously staged dangerous operation after user confirmation."""
+    def confirm(self, token: str, chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
+        """Execute a previously staged dangerous operation after user confirmation.
+
+        chunk_callback is forwarded to the shell backend so live streaming keeps
+        working for commands that required confirmation before running.
+        """
         entry = self._pending.pop(token, None)
         if entry is None:
             return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
         tool_name, args = entry
         logger.info("Executing confirmed built-in '%s' (token %s)", tool_name, token[:8])
-        return self._run(tool_name, args)
+        return self._run(tool_name, args, chunk_callback=chunk_callback)
 
     def cancel(self, token: str) -> None:
         """Discard a pending confirmation."""
@@ -466,10 +471,11 @@ class BuiltinExecutor:
             "description": description,
         }
 
-    def _run(self, tool_name: str, args: dict, caller_tag: str = "") -> dict:
+    def _run(self, tool_name: str, args: dict, caller_tag: str = "",
+             chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         """Actually execute without any confirmation check."""
         if tool_name == "shell":
-            return self._run_shell(args, caller_tag=caller_tag)
+            return self._run_shell(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         elif tool_name == "file_read":
             return self._run_file_read(args, caller_tag=caller_tag)
         elif tool_name == "file_write":
@@ -501,11 +507,35 @@ class BuiltinExecutor:
             return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
+    def _persist_shell_log(self, raw_text: str, caller_tag: str = "") -> Optional[str]:
+        """Write full shell output to a run-specific artifact file.
+
+        Returns the absolute path to the written log, or None on failure. Only
+        called when output exceeds the context limit so the LLM can recover the
+        full log (e.g. via file_read) instead of losing it to truncation.
+        """
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        try:
+            log_dir = os.path.join(self._data_dir, "shell_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            fname = f"shell-{ts}-{secrets.token_hex(4)}.log"
+            path = os.path.abspath(os.path.join(log_dir, fname))
+            with open(path, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write(raw_text)
+            logger.info("%sBuilt-in shell: full output (%d chars) saved to %s",
+                        _pfx, len(raw_text), path)
+            return path
+        except OSError as exc:
+            logger.warning("%sBuilt-in shell: failed to persist full log: %s", _pfx, exc)
+            return None
+
     def _run_shell_subprocess(self, args: dict, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self.default_timeout))
         _pfx = f"[{caller_tag}] " if caller_tag else ""
         logger.info("%sBuilt-in shell (subprocess) executing: %s", _pfx, command[:120])
+        _start = time.monotonic()
         try:
             proc = subprocess.run(
                 command,
@@ -514,8 +544,19 @@ class BuiltinExecutor:
                 text=True,
                 timeout=timeout,
             )
+            elapsed_ms = (time.monotonic() - _start) * 1000.0
             stdout_raw = proc.stdout or ""
             stderr_raw = proc.stderr or ""
+
+            # Persist the full log to an artifact when either stream exceeds the
+            # context limit, so the truncated tail returned to the LLM still
+            # points at recoverable full output.
+            full_log_path: Optional[str] = None
+            if len(stdout_raw) > self.max_output or len(stderr_raw) > self.max_output:
+                combined = stdout_raw
+                if stderr_raw:
+                    combined = (combined + "\n--- stderr ---\n" + stderr_raw) if stdout_raw else stderr_raw
+                full_log_path = self._persist_shell_log(combined, caller_tag)
 
             # Truncate with explicit marker (tail semantics: keep the end where
             # errors and results typically appear rather than the beginning).
@@ -528,15 +569,22 @@ class BuiltinExecutor:
                 # promote stderr → output so the LLM sees the failure reason.
                 output = error
                 error = ""
+
+            if full_log_path:
+                notice = f"\n[full output saved to: {full_log_path} — use file_read to view it]"
+                output = output + notice
+
             logger.info(
-                "%sBuilt-in shell exit=%d stdout=%d stderr=%d chars",
-                _pfx, proc.returncode, len(stdout_raw), len(stderr_raw),
+                "%sBuilt-in shell exit=%d stdout=%d stderr=%d chars in %.0fms",
+                _pfx, proc.returncode, len(stdout_raw), len(stderr_raw), elapsed_ms,
             )
             return {
                 "success": proc.returncode == 0,
                 "output": output,
                 "error": error,
                 "exit_code": proc.returncode,
+                "elapsed_ms": round(elapsed_ms),
+                "full_log_path": full_log_path,
             }
         except subprocess.TimeoutExpired:
             return {"success": False, "output": "", "error": f"Command timed out after {timeout}s.", "exit_code": -1}
@@ -587,7 +635,8 @@ class BuiltinExecutor:
         chunks: list[str] = []
         total_chars = 0
         timed_out = False
-        deadline = _time.monotonic() + timeout
+        _start = _time.monotonic()
+        deadline = _start + timeout
 
         try:
             while proc.isalive():
@@ -640,22 +689,39 @@ class BuiltinExecutor:
             proc.close(force=False)
 
         raw_output = "".join(chunks)
+        elapsed_ms = (_time.monotonic() - _start) * 1000.0
+
+        # Persist the full log to an artifact when it exceeds the context limit.
+        full_log_path: Optional[str] = None
+        if len(raw_output) > self.max_output:
+            full_log_path = self._persist_shell_log(raw_output, caller_tag)
+
         output = _truncate_output(raw_output, self.max_output)
+        if full_log_path:
+            output = output + f"\n[full output saved to: {full_log_path} — use file_read to view it]"
+
         exit_code = proc.exitstatus if not timed_out else -1
         # exitstatus is None if signalled; treat as failure
         if exit_code is None:
             exit_code = -1
         logger.info(
-            "%sBuilt-in shell (pty) exit=%s combined=%d chars",
-            _pfx, exit_code, total_chars,
+            "%sBuilt-in shell (pty) exit=%s combined=%d chars in %.0fms",
+            _pfx, exit_code, total_chars, elapsed_ms,
         )
         if timed_out:
-            return {"success": False, "output": output, "error": f"Command timed out after {timeout}s.", "exit_code": -1}
+            return {
+                "success": False, "output": output,
+                "error": f"Command timed out after {timeout}s.",
+                "exit_code": -1, "elapsed_ms": round(elapsed_ms),
+                "full_log_path": full_log_path,
+            }
         return {
             "success": exit_code == 0,
             "output": output,
             "error": "",
             "exit_code": exit_code,
+            "elapsed_ms": round(elapsed_ms),
+            "full_log_path": full_log_path,
         }
 
     # ---- file_read ----

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _is_sensitive_path, _truncate_output
@@ -553,3 +554,98 @@ class TestShellStreaming:
         )
         assert result["success"] is True
         assert "no_callback" in result["output"]
+
+
+class TestShellLogArtifacts:
+    """Tests for full-log artifact persistence when output is truncated."""
+
+    def test_no_artifact_when_within_limit(self, tmp_path):
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        result = ex.execute("shell", {"command": "echo small"})
+        assert result["success"] is True
+        assert result.get("full_log_path") is None
+        # No shell_logs dir should be created for small output
+        assert not (tmp_path / "shell_logs").exists()
+
+    def test_artifact_written_when_truncated(self, tmp_path):
+        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path))
+        # Produce > 50 chars of output
+        result = ex.execute(
+            "shell",
+            {"command": "for i in $(seq 1 40); do echo \"line$i\"; done"},
+        )
+        assert result["success"] is True
+        path = result.get("full_log_path")
+        assert path is not None
+        assert os.path.exists(path)
+        # Notice referencing the path must be appended to output
+        assert path in result["output"]
+        assert "file_read" in result["output"]
+
+    def test_artifact_contains_full_output(self, tmp_path):
+        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path))
+        result = ex.execute(
+            "shell",
+            {"command": "for i in $(seq 1 40); do echo \"line$i\"; done"},
+        )
+        path = result["full_log_path"]
+        with open(path, encoding="utf-8") as fh:
+            full = fh.read()
+        # The full log must contain the first lines that were truncated away
+        assert "line1" in full
+        assert "line40" in full
+
+    def test_elapsed_ms_present(self, tmp_path):
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        result = ex.execute("shell", {"command": "echo timed"})
+        assert "elapsed_ms" in result
+        assert isinstance(result["elapsed_ms"], int)
+        assert result["elapsed_ms"] >= 0
+
+    def test_pty_artifact_written_when_truncated(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path), shell_backend="pty")
+        result = ex.execute(
+            "shell",
+            {"command": "for i in $(seq 1 40); do echo \"line$i\"; done", "timeout": 10},
+        )
+        assert result["success"] is True
+        path = result.get("full_log_path")
+        assert path is not None
+        assert os.path.exists(path)
+        with open(path, encoding="utf-8") as fh:
+            full = fh.read()
+        assert "line1" in full
+        assert "line40" in full
+
+
+class TestShellStreamingThroughConfirm:
+    """Streaming must survive the confirmation path (confirm → _run → shell)."""
+
+    def test_confirm_forwards_chunk_callback(self):
+        if sys.platform == "win32":
+            return
+        ex = BuiltinExecutor(
+            max_output=4000,
+            shell_backend="pty",
+            shell_streaming=True,
+        )
+        # A dangerous command requires confirmation
+        staged = ex.execute("shell", {"command": "rm -rf /tmp/does_not_exist_xyz && echo streamed_after_confirm"})
+        assert staged.get("requires_confirmation") is True
+        token = staged["token"]
+
+        received: list[str] = []
+        result = ex.confirm(token, chunk_callback=received.append)
+        combined = "".join(received)
+        assert "streamed_after_confirm" in combined
+        assert "streamed_after_confirm" in result["output"]
+
+    def test_confirm_without_callback_still_runs(self):
+        ex = BuiltinExecutor(max_output=4000, shell_backend="subprocess")
+        staged = ex.execute("shell", {"command": "rm -rf /tmp/does_not_exist_xyz && echo ok_confirm"})
+        assert staged.get("requires_confirmation") is True
+        token = staged["token"]
+        result = ex.confirm(token)  # no callback — backward compatible
+        assert "ok_confirm" in result["output"]

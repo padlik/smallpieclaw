@@ -235,6 +235,9 @@ def fmt_tool_call(tool_name: str, args: dict) -> str:
 def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
     """Format a tool result as a short progress update."""
     call = fmt_tool_call(tool_name, args)
+    log_note = ""
+    if outcome.get("full_log_path"):
+        log_note = f"\n📄 full log: `{outcome['full_log_path']}`"
     if outcome["success"]:
         out = (outcome.get("output") or "").strip()
         if out:
@@ -246,14 +249,14 @@ def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
                 preview = "\n".join(lines)
             if len(preview) > 400:
                 preview = "…" + preview[-399:]
-            return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n```\n{preview}\n```"
-        return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n_(no output)_"
+            return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n```\n{preview}\n```{log_note}"
+        return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n_(no output)_{log_note}"
     else:
         err = (outcome.get("error") or outcome.get("output") or "failed").strip()
         if len(err) > 300:
             # Tail semantics for errors too
             err = "…" + err[-297:]
-        return f"{_tool_icon(tool_name)} **{tool_name}** ❌\n{call}\n```\n{err}\n```"
+        return f"{_tool_icon(tool_name)} **{tool_name}** ❌\n{call}\n```\n{err}\n```{log_note}"
 
 
 def format_tool_result(tool_name: str, outcome: dict) -> str:
@@ -691,7 +694,7 @@ def _dispatch_tool(
                     "%sAuto-approving '%s' (operator approved all %s)",
                     pfx, tool_name, tool_name,
                 )
-                outcome = ctx.builtin_executor.confirm(token)
+                outcome = ctx.builtin_executor.confirm(token, chunk_callback=chunk_callback)
                 _progress(f"✅ Auto-approved `{tool_name}` (approve-all active)")
             else:
                 result_confirmed = ctx.confirmation.request_confirmation(
@@ -699,7 +702,7 @@ def _dispatch_tool(
                 )
 
                 if result_confirmed:
-                    outcome = ctx.builtin_executor.confirm(token)
+                    outcome = ctx.builtin_executor.confirm(token, chunk_callback=chunk_callback)
                     _progress(f"✅ Confirmed — executing `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
                 else:
                     ctx.builtin_executor.cancel(token)

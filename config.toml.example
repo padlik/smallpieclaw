@@ -104,8 +104,10 @@ tool_timeout   = 10
 # Maximum chars returned by the shell tool and registered tools per stream
 # (stdout and stderr each). When output exceeds this limit the tail is kept
 # and a truncation marker is prepended, so the LLM always sees the end of
-# the output (where errors and results typically appear). Increase for
-# sophisticated scripts that produce large logs.
+# the output (where errors and results typically appear). The full untruncated
+# output is also saved to a run-specific artifact under <data_dir>/shell_logs/
+# and the returned tail includes the path so it can be recovered via file_read.
+# Increase for sophisticated scripts that produce large logs.
 max_output_size = 4000
 top_tools      = 3
 # Must match the 'model' field of one [[models]] entry.
