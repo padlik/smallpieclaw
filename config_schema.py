@@ -76,6 +76,10 @@ class AgentConfig:
     shell_backend: str = "subprocess"
     shell_pty_cols: int = 220  # terminal width reported to the child (wide → fewer wraps)
     shell_pty_rows: int = 50
+    # Stream live shell output to the progress panel in real-time (PTY backend only).
+    # When enabled, each chunk of output is forwarded to the UI as it arrives;
+    # the panel shows a rolling tail. Requires shell_backend = "pty".
+    shell_streaming: bool = False
 
 
 @dataclass(frozen=True)
@@ -217,6 +221,7 @@ def _parse_agent(raw: dict) -> AgentConfig:
         shell_backend=str(section.get("shell_backend", "subprocess")),
         shell_pty_cols=int(section.get("shell_pty_cols", 220)),
         shell_pty_rows=int(section.get("shell_pty_rows", 50)),
+        shell_streaming=bool(section.get("shell_streaming", False)),
     )
 
 

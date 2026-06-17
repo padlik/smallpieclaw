@@ -657,7 +657,25 @@ def _dispatch_tool(
 
     # Built-in tools
     if ctx.builtin_executor and ctx.builtin_executor.is_builtin(tool_name):
-        outcome = ctx.builtin_executor.execute(tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.label)
+        # For shell tool with streaming enabled, create a live-chunk callback.
+        chunk_callback: Optional[Callable[[str], None]] = None
+        if (tool_name == "shell"
+                and getattr(ctx.builtin_executor, "_shell_streaming", False)):
+            _chunk_buf: list[str] = []
+
+            def _on_chunk(chunk: str) -> None:
+                _chunk_buf.append(chunk)
+                # Emit a special-prefixed progress message so the UI handler can
+                # update the live tail without adding new panel steps.
+                accumulated = "".join(_chunk_buf)
+                tail_lines = accumulated.rsplit("\n", 8)[-8:]
+                tail = "\n".join(tail_lines)
+                _progress(f"__SHELL_CHUNK__:{tail}")
+
+            chunk_callback = _on_chunk
+
+        outcome = ctx.builtin_executor.execute(tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.label,
+                                                chunk_callback=chunk_callback)
 
         if outcome.get("requires_confirmation"):
             token = outcome["token"]

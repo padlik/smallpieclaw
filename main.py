@@ -282,6 +282,7 @@ def _run(
     shell_backend = agent_cfg.get("shell_backend", "subprocess")
     shell_pty_cols = int(agent_cfg.get("shell_pty_cols", 220))
     shell_pty_rows = int(agent_cfg.get("shell_pty_rows", 50))
+    shell_streaming = bool(agent_cfg.get("shell_streaming", False))
     # Separate step cap for scheduled/background agents (chat sessions use max_iter)
     _raw_sched_max = agent_cfg.get("scheduled_max_iterations", 100)
     scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
@@ -301,6 +302,7 @@ def _run(
         default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,
         max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
         shell_backend=shell_backend, shell_pty_cols=shell_pty_cols, shell_pty_rows=shell_pty_rows,
+        shell_streaming=shell_streaming,
     )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)

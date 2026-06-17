@@ -546,6 +546,17 @@ class TelegramInterface:
                     loop,
                 )
                 return
+            if msg.startswith("__SHELL_CHUNK__:"):
+                # Live shell output chunk — update the last step entry in-place
+                # to show a scrolling tail rather than adding noise to the log.
+                tail_text = msg[len("__SHELL_CHUNK__:"):]
+                tail_lines = [ln for ln in tail_text.splitlines() if ln.strip()][-4:]
+                preview = " ↩ ".join(tail_lines)[:120]
+                if _steps:
+                    elapsed_s, _ = _steps[-1]
+                    _steps[-1] = (elapsed_s, f"🖥️ Running: <code>shell</code>  <i>{html.escape(preview)}</i>")
+                _flush_panel()
+                return
             # Normal progress: append to step log and (maybe) flush the panel
             elapsed = time.monotonic() - _task_start
             _steps.append((elapsed, _classify(msg)))

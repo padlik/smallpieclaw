@@ -25,7 +25,7 @@ import secrets
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +314,8 @@ class BuiltinExecutor:
                  sub_agent_factory=None, data_dir: str = "data",
                  memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300,
                  notify_html_fn=None, shell_backend: str = "subprocess",
-                 shell_pty_cols: int = 220, shell_pty_rows: int = 50):
+                 shell_pty_cols: int = 220, shell_pty_rows: int = 50,
+                 shell_streaming: bool = False):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -329,6 +330,7 @@ class BuiltinExecutor:
         self._shell_backend = shell_backend   # "subprocess" or "pty"
         self._shell_pty_cols = shell_pty_cols
         self._shell_pty_rows = shell_pty_rows
+        self._shell_streaming = shell_streaming  # forward chunks to on_chunk callback (PTY only)
         self._sub_agent_pool = ThreadPoolExecutor(
             max_workers=max_subagents, thread_name_prefix="sub-agent"
         )
@@ -368,7 +370,8 @@ class BuiltinExecutor:
     def all_tools(self) -> list[BuiltinTool]:
         return list(BUILTIN_TOOLS.values())
 
-    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "",
+                chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         """
         Execute a built-in tool. Returns standard result dict, or a
         requires_confirmation dict if the operation needs user approval.
@@ -376,10 +379,13 @@ class BuiltinExecutor:
         caller_depth is the depth of the AgentController invoking this tool
         (0 = main agent, 1 = sub-agent). Used to enforce the no-nested-spawn rule.
         caller_tag is a human-readable label for logging (e.g. "[main]", "[sa-fcf85d]").
+        chunk_callback is an optional callable invoked with each output chunk during PTY
+        shell execution (only when shell_streaming=True). Ignored for other tools.
         """
         args = args or {}
         if tool_name == "shell":
-            return self._exec_shell(args, caller_depth=caller_depth, caller_tag=caller_tag)
+            return self._exec_shell(args, caller_depth=caller_depth, caller_tag=caller_tag,
+                                    chunk_callback=chunk_callback)
         elif tool_name == "file_read":
             return self._exec_file_read(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "file_write":
@@ -474,7 +480,8 @@ class BuiltinExecutor:
 
     # ---- shell ----
 
-    def _exec_shell(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_shell(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                    chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         command = str(args.get("command", "")).strip()
         if not command:
             return {"success": False, "output": "", "error": "No command provided.", "exit_code": -1}
@@ -484,13 +491,14 @@ class BuiltinExecutor:
             desc = f"Run shell command: <code>{command}</code>\n⚠️ Reason for confirmation: {reason}"
             return self._requires_confirmation("shell", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
-        return self._run_shell(args, caller_tag=caller_tag)
+        return self._run_shell(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
 
-    def _run_shell(self, args: dict, caller_tag: str = "") -> dict:
+    def _run_shell(self, args: dict, caller_tag: str = "",
+                   chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         """Dispatch to the configured shell backend (subprocess or pty)."""
         import sys
         if self._shell_backend == "pty" and sys.platform != "win32":
-            return self._run_shell_pty(args, caller_tag=caller_tag)
+            return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
     def _run_shell_subprocess(self, args: dict, caller_tag: str = "") -> dict:
@@ -535,7 +543,8 @@ class BuiltinExecutor:
         except (OSError, subprocess.SubprocessError) as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
 
-    def _run_shell_pty(self, args: dict, caller_tag: str = "") -> dict:
+    def _run_shell_pty(self, args: dict, caller_tag: str = "",
+                       chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         """Run shell command inside a pseudo-terminal.
 
         Gives the child process a real TTY so isatty()==True, enabling:
@@ -544,11 +553,15 @@ class BuiltinExecutor:
         - progress indicators that detect a terminal
         stdout and stderr are merged by the PTY line discipline (chronological
         order preserved).  Falls back to subprocess on import error.
+
+        When chunk_callback is provided and self._shell_streaming is True, each
+        decoded text chunk is forwarded to the callback as it arrives.
         """
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self.default_timeout))
         _pfx = f"[{caller_tag}] " if caller_tag else ""
         logger.info("%sBuilt-in shell (pty) executing: %s", _pfx, command[:120])
+        streaming = self._shell_streaming and chunk_callback is not None
 
         try:
             from ptyprocess import PtyProcessUnicode  # type: ignore[import]
@@ -597,6 +610,11 @@ class BuiltinExecutor:
                 chunk = _ANSI_RE.sub('', chunk)
                 total_chars += len(chunk)
                 chunks.append(chunk)
+                if streaming:
+                    try:
+                        chunk_callback(chunk)
+                    except Exception:  # noqa: BLE001
+                        pass
 
             # Drain remaining output after loop
             if not timed_out:
@@ -609,6 +627,11 @@ class BuiltinExecutor:
                         chunk = _ANSI_RE.sub('', chunk)
                         total_chars += len(chunk)
                         chunks.append(chunk)
+                        if streaming:
+                            try:
+                                chunk_callback(chunk)
+                            except Exception:  # noqa: BLE001
+                                pass
                     except (EOFError, OSError, ValueError):
                         break
         finally:

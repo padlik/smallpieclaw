@@ -437,3 +437,119 @@ class TestShellPtyBackend:
         ).execute("shell", {"command": "echo hi"})
         # On actual Linux/macOS with monkeypatched platform, subprocess used
         assert result["success"] is True
+
+
+class TestShellStreaming:
+    """Tests for PTY streaming (chunk_callback) support in Phase 4."""
+
+    def test_streaming_callback_called(self):
+        """chunk_callback receives output chunks during PTY execution."""
+        if sys.platform == "win32":
+            return
+        received: list[str] = []
+        executor = BuiltinExecutor(
+            max_output=4000,
+            shell_backend="pty",
+            shell_streaming=True,
+        )
+        executor.execute(
+            "shell",
+            {"command": "echo streaming_test", "timeout": 10},
+            chunk_callback=received.append,
+        )
+        combined = "".join(received)
+        assert "streaming_test" in combined
+
+    def test_streaming_multiple_chunks_accumulated(self):
+        """Each line of output results in one or more callback invocations."""
+        if sys.platform == "win32":
+            return
+        received: list[str] = []
+        executor = BuiltinExecutor(
+            max_output=4000,
+            shell_backend="pty",
+            shell_streaming=True,
+        )
+        executor.execute(
+            "shell",
+            {"command": "for i in 1 2 3 4 5; do echo \"item$i\"; done", "timeout": 10},
+            chunk_callback=received.append,
+        )
+        combined = "".join(received)
+        for i in range(1, 6):
+            assert f"item{i}" in combined
+        assert len(received) >= 1
+
+    def test_streaming_disabled_callback_not_called(self):
+        """When shell_streaming=False, chunk_callback is NOT invoked even if provided."""
+        if sys.platform == "win32":
+            return
+        received: list[str] = []
+        executor = BuiltinExecutor(
+            max_output=4000,
+            shell_backend="pty",
+            shell_streaming=False,  # streaming disabled
+        )
+        executor.execute(
+            "shell",
+            {"command": "echo not_streamed", "timeout": 10},
+            chunk_callback=received.append,
+        )
+        # streaming disabled → callback must NOT be called
+        assert received == []
+
+    def test_streaming_subprocess_backend_no_callback(self):
+        """Subprocess backend ignores chunk_callback (no streaming support)."""
+        received: list[str] = []
+        executor = BuiltinExecutor(
+            max_output=4000,
+            shell_backend="subprocess",
+            shell_streaming=True,
+        )
+        result = executor.execute(
+            "shell",
+            {"command": "echo subprocess_test"},
+            chunk_callback=received.append,
+        )
+        # Command succeeds; callback not called by subprocess backend
+        assert result["success"] is True
+        assert "subprocess_test" in result["output"]
+        assert received == []
+
+    def test_streaming_callback_exception_does_not_crash(self):
+        """A raising chunk_callback must not kill PTY execution."""
+        if sys.platform == "win32":
+            return
+
+        def _bad_callback(_chunk: str) -> None:
+            raise RuntimeError("boom")
+
+        executor = BuiltinExecutor(
+            max_output=4000,
+            shell_backend="pty",
+            shell_streaming=True,
+        )
+        result = executor.execute(
+            "shell",
+            {"command": "echo safe", "timeout": 10},
+            chunk_callback=_bad_callback,
+        )
+        assert result["success"] is True
+        assert "safe" in result["output"]
+
+    def test_streaming_callback_none_when_streaming_enabled(self):
+        """When shell_streaming=True but no callback passed, execution is unaffected."""
+        if sys.platform == "win32":
+            return
+        executor = BuiltinExecutor(
+            max_output=4000,
+            shell_backend="pty",
+            shell_streaming=True,
+        )
+        result = executor.execute(
+            "shell",
+            {"command": "echo no_callback", "timeout": 10},
+            # no chunk_callback
+        )
+        assert result["success"] is True
+        assert "no_callback" in result["output"]

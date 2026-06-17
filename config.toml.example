@@ -148,6 +148,10 @@ long_run_warn_minutes = 30
 # Wider columns prevent spurious line-wrapping in captured text.
 # shell_pty_cols = 220
 # shell_pty_rows = 50
+# Stream live shell output to the progress panel chunk-by-chunk.
+# Requires shell_backend = "pty".  Updates are debounced at the panel's
+# 1.5 s edit interval so Telegram rate limits are not hit.
+# shell_streaming = false
 
 [scheduler]
 enabled = true
