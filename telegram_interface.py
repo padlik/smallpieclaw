@@ -570,11 +570,12 @@ class TelegramInterface:
     async def _send_verbose_event(self, bot, chat_id: int, text: str) -> None:
         """Send a verbose progress event as a new top-level message (not a reply).
 
-        Long events are chunked via split_message() so no content is silently
-        dropped.  Each chunk is a separate Telegram message.
+        The Markdown text is converted to HTML first (escaping <, >, & and
+        rendering code fences / bold), then chunked via split_message() so no
+        content is silently dropped.  Each chunk is a separate Telegram message.
         """
         from telegram_formatter import split_message as _split
-        chunks = _split(text)
+        chunks = _split(_md_to_html(text))
         for chunk in chunks:
             try:
                 await bot.send_message(
