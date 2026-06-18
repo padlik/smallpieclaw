@@ -641,6 +641,23 @@ class BuiltinExecutor:
             except (OSError, ValueError):
                 pass
 
+        def _disable_artifact_log() -> None:
+            """Silently close and unlink the artifact on write failure."""
+            nonlocal _log_fh, _artifact_path
+            fh, path = _log_fh, _artifact_path
+            _log_fh = None
+            _artifact_path = None
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
         def _append_stdout(text: str) -> None:
             nonlocal _tail_out, _total_out
             if not text:
@@ -648,7 +665,10 @@ class BuiltinExecutor:
             _total_out += len(text)
             _tail_out = (_tail_out + text)[-self.max_output:]
             if _log_fh is not None:
-                _log_fh.write(text)
+                try:
+                    _log_fh.write(text)
+                except OSError:
+                    _disable_artifact_log()
 
         def _append_stderr(text: str) -> None:
             nonlocal _tail_err, _total_err, _stderr_header_written
@@ -657,10 +677,13 @@ class BuiltinExecutor:
             _total_err += len(text)
             _tail_err = (_tail_err + text)[-self.max_output:]
             if _log_fh is not None:
-                if not _stderr_header_written:
-                    _log_fh.write("\n--- stderr ---\n")
-                    _stderr_header_written = True
-                _log_fh.write(text)
+                try:
+                    if not _stderr_header_written:
+                        _log_fh.write("\n--- stderr ---\n")
+                        _stderr_header_written = True
+                    _log_fh.write(text)
+                except OSError:
+                    _disable_artifact_log()
 
         import select as _select
 
@@ -683,13 +706,14 @@ class BuiltinExecutor:
         deadline = _start + timeout
         while streams:
             now = time.monotonic()
-            if proc.poll() is None and now >= deadline:
+            if not timed_out and proc.poll() is None and now >= deadline:
                 timed_out = True
                 _kill_tree()
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
+                break
 
             # If the shell has exited and no stream is immediately readable,
             # return without waiting for EOF: escaped descendants can keep pipe

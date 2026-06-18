@@ -892,3 +892,59 @@ class TestSubprocessMultibyteDecoding:
         combined = result["output"] + result["error"]
         assert "\ufffd" not in combined
         assert combined.count(char) == count
+
+
+class TestSubprocessArtifactWriteFailure:
+    """Artifact write failures must degrade gracefully, not crash the shell tool."""
+
+    def test_artifact_write_oserror_returns_result_not_exception(self, tmp_path, monkeypatch):
+        """If artifact log write raises OSError (e.g. disk full), shell returns normally."""
+        import io
+
+        class _FailingWriter(io.StringIO):
+            def write(self, s):
+                raise OSError("disk full")
+
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        # Inject a failing file handle so the first artifact write triggers OSError.
+        original_open = ex._open_shell_log
+
+        def _patched_open(caller_tag=""):
+            fh, path = original_open(caller_tag)
+            if fh is not None:
+                fh.close()
+            return _FailingWriter(), str(tmp_path / "fake_artifact.log")
+
+        monkeypatch.setattr(ex, "_open_shell_log", _patched_open)
+        # Must not raise — must return a valid result dict.
+        result = ex.execute("shell", {"command": "echo hello", "timeout": 5})
+        assert result["success"] is True
+        assert "hello" in result["output"]
+
+
+class TestSubprocessTimeoutBoundedKill:
+    """Timeout kill block must not run more than once; loop must break after kill."""
+
+    def test_timeout_kill_runs_once_for_unkillable_process(self, tmp_path, monkeypatch):
+        """Even if proc.wait() after kill keeps timing out, the drain loop exits."""
+        if sys.platform == "win32":
+            return
+        import time as _t
+
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        kill_call_count = [0]
+
+        original_run = ex._run_shell_subprocess
+
+        def _patched_run(args, caller_tag=""):
+            return original_run(args, caller_tag)
+
+        # A command that sleeps long enough to guarantee timeout triggers.
+        started = _t.monotonic()
+        result = ex.execute("shell", {"command": "sleep 30", "timeout": 1})
+        elapsed = _t.monotonic() - started
+
+        # Must finish well within 1s timeout + 5s kill wait + headroom, not loop.
+        assert elapsed < 10.0, f"Took {elapsed:.1f}s — timeout kill may be looping"
+        assert result["success"] is False
+        assert "timed out" in result["error"].lower()
