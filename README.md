@@ -104,6 +104,29 @@ cp config.toml config.toml.bak   # optional backup
 nano config.toml
 ```
 
+**Environment variable references** — any **string** value in `config.toml` can reference an environment variable:
+
+| Syntax | Behaviour |
+|--------|-----------|
+| `"env:VAR"` | The entire string must be exactly `env:VAR` — replaced with the value of `VAR` at startup. Missing variable causes a startup error. |
+
+```toml
+[telegram]
+bot_token = "env:TELEGRAM_BOT_TOKEN"
+
+[[models]]
+api_key = "env:OPENAI_API_KEY"
+```
+
+For values that need a prefix (e.g. `Bearer` tokens in MCP headers), put the full string in the env var and reference it directly:
+
+```toml
+[mcp_servers.headers]
+Authorization = "env:MY_AUTH_HEADER"   # set MY_AUTH_HEADER="Bearer sk-..." in env
+```
+
+This keeps secrets out of the file. Export the variables in your shell, a `.env` loader (e.g. `direnv`, `dotenvx`), or a `systemd` service `EnvironmentFile=`.
+
 Required settings:
 
 | Key | Description |

@@ -11,10 +11,159 @@ Usage:
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from exceptions import ConfigError
+
+
+# ---------------------------------------------------------------------------
+# Environment-variable expansion
+# ---------------------------------------------------------------------------
+
+# Strict variable-name rule: must start with letter/underscore, then alphanumeric.
+_ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Prefix that marks a whole-string env reference.
+_ENV_PREFIX = "env:"
+
+
+def _expand_value(value: Any, path: str = "") -> Any:
+    """Recursively resolve ``env:VAR`` references in raw config values.
+
+    A string value that is **exactly** ``env:VAR`` is replaced with the value
+    of environment variable ``VAR``.  Any other string is returned unchanged.
+    Non-string scalars (int, float, bool) are always returned unchanged.
+
+    Rules:
+    - ``env:VAR`` — whole-string reference; raises :class:`ConfigError` when
+      ``VAR`` is not set in the environment.
+    - ``env:`` with an empty or invalid name raises :class:`ConfigError`.
+    - Strings that are not exactly ``env:VAR`` (e.g. ``Bearer env:TOKEN``,
+      ``env:`` at start of longer text, plain values) are kept literal.
+
+    The *path* argument is used only in error messages.
+    """
+    if isinstance(value, str):
+        if value.startswith(_ENV_PREFIX):
+            var = value[len(_ENV_PREFIX):]
+            loc = f" (at {path})" if path else ""
+            if not _ENV_VAR_NAME.match(var):
+                raise ConfigError(
+                    f"empty or invalid variable name in env reference '{value}' in config{loc}: "
+                    f"name must match [A-Za-z_][A-Za-z0-9_]*"
+                )
+            resolved = os.environ.get(var)
+            if resolved is None:
+                raise ConfigError(
+                    f"Environment variable '{var}' referenced in config{loc} is not set. "
+                    f"Export it before starting: export {var}=<value>"
+                )
+            return resolved
+        return value
+
+    if isinstance(value, dict):
+        return {k: _expand_value(v, path=f"{path}.{k}" if path else k) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [_expand_value(item, path=f"{path}[{i}]") for i, item in enumerate(value)]
+
+    return value
+
+
+def expand_env(raw: dict) -> dict:
+    """Resolve all ``env:VAR`` references in a raw config dict.
+
+    Returns a new dict where every string value that is exactly ``env:VAR``
+    has been replaced with the corresponding environment variable.  All other
+    values (strings, ints, floats, booleans) are returned unchanged.
+
+    Call this once at load time before passing *raw* to :func:`parse_config`.
+    Raises :class:`ConfigError` if any referenced variable is missing or if
+    the variable name is invalid.
+    """
+    return _expand_value(raw)  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Strict typed-field helpers (prevent strings from silently coercing as bools)
+# ---------------------------------------------------------------------------
+
+def _parse_bool(value: Any, field_path: str) -> bool:
+    """Return *value* as bool, rejecting strings to prevent env refs or
+    ``"false"`` from being silently coerced to ``True``."""
+    if isinstance(value, bool):
+        return value
+    raise ConfigError(
+        f"Config field '{field_path}' must be a boolean (true/false), "
+        f"got {type(value).__name__} {value!r}"
+    )
+
+
+def _parse_int(value: Any, default: int, field_path: str) -> int:
+    """Return *value* as int, falling back to *default* when absent.
+
+    Rejects strings to prevent env-resolved values (e.g. ``"4096"``) from
+    silently coercing into numeric fields — env references must only be used
+    on string config fields.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ConfigError(
+            f"Config field '{field_path}' must be an integer, got bool {value!r}"
+        )
+    if isinstance(value, str):
+        raise ConfigError(
+            f"Config field '{field_path}' must be an integer, got string {value!r}. "
+            f"env:VAR references are only allowed on string config fields."
+        )
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"Config field '{field_path}' must be an integer, "
+            f"got {type(value).__name__} {value!r}"
+        ) from None
+
+
+def _parse_float(value: Any, default: float, field_path: str) -> float:
+    """Return *value* as float, falling back to *default* when absent.
+
+    Rejects strings for the same reason as :func:`_parse_int`.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ConfigError(
+            f"Config field '{field_path}' must be a number, got bool {value!r}"
+        )
+    if isinstance(value, str):
+        raise ConfigError(
+            f"Config field '{field_path}' must be a number, got string {value!r}. "
+            f"env:VAR references are only allowed on string config fields."
+        )
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"Config field '{field_path}' must be a number, "
+            f"got {type(value).__name__} {value!r}"
+        ) from None
+
+
+def _parse_int_list(value: Any, field_path: str) -> list[int]:
+    """Return *value* as a list of ints, rejecting env-resolved string items."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ConfigError(
+            f"Config field '{field_path}' must be a list of integers, "
+            f"got {type(value).__name__} {value!r}"
+        )
+    return [_parse_int(item, 0, f"{field_path}[{i}]") for i, item in enumerate(value)]
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +310,8 @@ def _parse_telegram(raw: dict) -> TelegramConfig:
     return TelegramConfig(
         bot_token=_require(section, "bot_token", "telegram"),
         security_mode=section.get("security_mode", "allowlist"),
-        allowed_user_ids=list(section.get("allowed_user_ids") or []),
-        pairing_timeout=int(section.get("pairing_timeout", 300)),
+        allowed_user_ids=_parse_int_list(section.get("allowed_user_ids"), "telegram.allowed_user_ids"),
+        pairing_timeout=_parse_int(section.get("pairing_timeout"), 300, "telegram.pairing_timeout"),
     )
 
 
@@ -180,14 +329,14 @@ def _parse_model(entry: dict, index: int) -> ModelConfig:
         model=model_id,
         api_key=entry.get("api_key", ""),
         base_url=entry.get("base_url", ""),
-        max_tokens=int(entry.get("max_tokens", 1024)),
-        temperature=float(entry.get("temperature", 0.2)),
-        top_p=float(entry["top_p"]) if "top_p" in entry else None,
-        request_timeout=int(entry.get("request_timeout", 120)),
-        max_retries=int(entry.get("max_retries", 5)),
-        retry_delay=int(entry.get("retry_delay", 2)),
-        vision=bool(entry.get("vision", False)),
-        reasoning=bool(entry.get("reasoning", False)),
+        max_tokens=_parse_int(entry.get("max_tokens"), 1024, f"models.{name}.max_tokens"),
+        temperature=_parse_float(entry.get("temperature"), 0.2, f"models.{name}.temperature"),
+        top_p=_parse_float(entry["top_p"], 0.0, f"models.{name}.top_p") if "top_p" in entry else None,
+        request_timeout=_parse_int(entry.get("request_timeout"), 120, f"models.{name}.request_timeout"),
+        max_retries=_parse_int(entry.get("max_retries"), 5, f"models.{name}.max_retries"),
+        retry_delay=_parse_int(entry.get("retry_delay"), 2, f"models.{name}.retry_delay"),
+        vision=_parse_bool(entry.get("vision", False), f"models.{name}.vision"),
+        reasoning=_parse_bool(entry.get("reasoning", False), f"models.{name}.reasoning"),
         aliases=list(entry.get("aliases") or []),
     )
 
@@ -205,30 +354,30 @@ def _parse_embeddings(raw: dict) -> EmbeddingsConfig:
 def _parse_agent(raw: dict) -> AgentConfig:
     section = raw.get("agent") or {}
     return AgentConfig(
-        max_iterations=int(section.get("max_iterations", 8)),
-        scheduled_max_iterations=int(section.get("scheduled_max_iterations", 100)),
-        tool_timeout=int(section.get("tool_timeout", 10)),
-        max_output_size=int(section.get("max_output_size", 4000)),
-        top_tools=int(section.get("top_tools", 3)),
-        ctx_max_tokens=int(section.get("ctx_max_tokens", 90_000)),
-        max_subagents=int(section.get("max_subagents", 6)),
-        subagent_result_timeout=int(section.get("subagent_result_timeout", 300)),
-        long_run_warn_minutes=int(section.get("long_run_warn_minutes", 30)),
-        diagnose_empty_responses=bool(section.get("diagnose_empty_responses", False)),
+        max_iterations=_parse_int(section.get("max_iterations"), 8, "agent.max_iterations"),
+        scheduled_max_iterations=_parse_int(section.get("scheduled_max_iterations"), 100, "agent.scheduled_max_iterations"),
+        tool_timeout=_parse_int(section.get("tool_timeout"), 10, "agent.tool_timeout"),
+        max_output_size=_parse_int(section.get("max_output_size"), 4000, "agent.max_output_size"),
+        top_tools=_parse_int(section.get("top_tools"), 3, "agent.top_tools"),
+        ctx_max_tokens=_parse_int(section.get("ctx_max_tokens"), 90_000, "agent.ctx_max_tokens"),
+        max_subagents=_parse_int(section.get("max_subagents"), 6, "agent.max_subagents"),
+        subagent_result_timeout=_parse_int(section.get("subagent_result_timeout"), 300, "agent.subagent_result_timeout"),
+        long_run_warn_minutes=_parse_int(section.get("long_run_warn_minutes"), 30, "agent.long_run_warn_minutes"),
+        diagnose_empty_responses=_parse_bool(section.get("diagnose_empty_responses", False), "agent.diagnose_empty_responses"),
         default_model=section.get("default_model", ""),
         background_model=section.get("background_model", ""),
         fallback_models=list(section.get("fallback_models") or []),
         shell_backend=str(section.get("shell_backend", "subprocess")),
-        shell_pty_cols=int(section.get("shell_pty_cols", 220)),
-        shell_pty_rows=int(section.get("shell_pty_rows", 50)),
-        shell_streaming=bool(section.get("shell_streaming", False)),
+        shell_pty_cols=_parse_int(section.get("shell_pty_cols"), 220, "agent.shell_pty_cols"),
+        shell_pty_rows=_parse_int(section.get("shell_pty_rows"), 50, "agent.shell_pty_rows"),
+        shell_streaming=_parse_bool(section.get("shell_streaming", False), "agent.shell_streaming"),
     )
 
 
 def _parse_scheduler(raw: dict) -> SchedulerConfig:
     section = raw.get("scheduler") or {}
     return SchedulerConfig(
-        enabled=bool(section.get("enabled", True)),
+        enabled=_parse_bool(section.get("enabled", True), "scheduler.enabled"),
     )
 
 
@@ -246,7 +395,7 @@ def _parse_paths(raw: dict) -> PathsConfig:
         skills_dir=section.get("skills_dir", "skills"),
         downloads_dir=section.get("downloads_dir", "downloads"),
         log_file=section.get("log_file", "agent.log"),
-        log_backup_count=int(section.get("log_backup_count", 30)),
+        log_backup_count=_parse_int(section.get("log_backup_count"), 30, "paths.log_backup_count"),
         pid_file=section.get("pid_file", "data/agent.pid"),
         tmp_dir=section.get("tmp_dir", ""),
     )
@@ -255,13 +404,13 @@ def _parse_paths(raw: dict) -> PathsConfig:
 def _parse_graph_memory(raw: dict) -> GraphMemoryConfig:
     section = raw.get("graph_memory") or {}
     return GraphMemoryConfig(
-        enabled=bool(section.get("enabled", False)),
+        enabled=_parse_bool(section.get("enabled", False), "graph_memory.enabled"),
         db_path=section.get("db_path", "data/graph_memory"),
-        buffer_pool_mb=int(section.get("buffer_pool_mb", 256)),
+        buffer_pool_mb=_parse_int(section.get("buffer_pool_mb"), 256, "graph_memory.buffer_pool_mb"),
         extraction_model=section.get("extraction_model", ""),
-        extract_every_n_turns=int(section.get("extract_every_n_turns", 3)),
-        min_message_length=int(section.get("min_message_length", 100)),
-        max_context_entries=int(section.get("max_context_entries", 10)),
+        extract_every_n_turns=_parse_int(section.get("extract_every_n_turns"), 3, "graph_memory.extract_every_n_turns"),
+        min_message_length=_parse_int(section.get("min_message_length"), 100, "graph_memory.min_message_length"),
+        max_context_entries=_parse_int(section.get("max_context_entries"), 10, "graph_memory.max_context_entries"),
     )
 
 
@@ -283,8 +432,8 @@ def _parse_mcp_server(entry: dict, index: int) -> MCPServerConfig:
         transport=transport,
         command=list(entry.get("command") or []),
         url=entry.get("url", ""),
-        enabled=bool(entry.get("enabled", True)),
-        timeout=int(entry.get("timeout", 30)),
+        enabled=_parse_bool(entry.get("enabled", True), f"mcp_servers.{name}.enabled"),
+        timeout=_parse_int(entry.get("timeout"), 30, f"mcp_servers.{name}.timeout"),
         env=dict(entry.get("env") or {}),
         headers=dict(entry.get("headers") or {}),
     )
@@ -337,8 +486,16 @@ def parse_config(raw: dict) -> AppConfig:
     """
     Parse and validate a raw TOML config dict into a typed AppConfig.
 
-    Raises ConfigError on missing required fields or invalid values.
+    Environment-variable placeholders (``${VAR}`` and ``${VAR:-default}``) in
+    string values are expanded before validation — this is the single place in
+    the codebase where config values are resolved against the OS environment.
+
+    Raises ConfigError on missing required fields, invalid values, or
+    unset required environment variables.
     """
+    # Expand ${VAR} / ${VAR:-default} placeholders before any other processing.
+    raw = expand_env(raw)
+
     # Require at least one model
     models_raw = raw.get("models") or []
     if not models_raw:

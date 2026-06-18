@@ -201,6 +201,9 @@ def main() -> None:
         logger.error("Config error: %s", exc)
         sys.exit(1)
 
+    # Use the resolved (env-expanded) config dict from here on.
+    raw_cfg = app_cfg._raw
+
     # ------------------------------------------------------------------
     # Check graph memory is enabled + ladybug is available
     # ------------------------------------------------------------------

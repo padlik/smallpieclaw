@@ -1,7 +1,26 @@
 # Telegram Home Agent Configuration
+#
+# Environment variables can be referenced in string config values using:
+#
+#   env:VAR_NAME
+#
+# The entire string value must be exactly "env:VAR_NAME" — no inline
+# interpolation or partial substitution. Missing variables cause a startup
+# error with a clear message.
+#
+# Examples:
+#   bot_token = "env:TELEGRAM_BOT_TOKEN"
+#   api_key   = "env:OPENAI_API_KEY"
+#
+# For values with a prefix (e.g. Bearer tokens in MCP headers), put the
+# full header value in the env var and reference it directly:
+#   Authorization = "env:MY_AUTH_HEADER"   # where MY_AUTH_HEADER="Bearer sk-..."
+#
+# This keeps secrets out of config.toml. Export the variables in your shell,
+# a .env loader (e.g. direnv, dotenvx), or a systemd EnvironmentFile=.
 
 [telegram]
-bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+bot_token = "env:TELEGRAM_BOT_TOKEN"
 # Security mode: "allowlist" or "pairing"
 security_mode = "allowlist"
 # Comma-separated list of allowed Telegram user IDs (for allowlist mode)
@@ -32,7 +51,7 @@ pairing_timeout = 300
 [[models]]
 name            = "default"
 provider        = "openai"
-api_key         = "YOUR_OPENAI_API_KEY"
+api_key         = "env:OPENAI_API_KEY"
 model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
@@ -48,7 +67,7 @@ retry_delay     = 2
 # [[models]]
 # name            = "smart"
 # provider        = "anthropic"
-# api_key         = "YOUR_ANTHROPIC_API_KEY"
+# api_key         = "env:ANTHROPIC_API_KEY"
 # model           = "claude-3-5-sonnet-20241022"
 # base_url        = ""
 # max_tokens      = 8192
@@ -65,7 +84,7 @@ retry_delay     = 2
 # [[models]]
 # name            = "ollama-cloud"
 # provider        = "ollama"
-# api_key         = "YOUR_OLLAMA_API_KEY"
+# api_key         = "env:OLLAMA_API_KEY"
 # model           = "kimi-k2:1t-cloud"
 # base_url        = "https://ollama.com"
 # max_tokens      = 4096
@@ -94,7 +113,7 @@ retry_delay     = 2
 # Use same provider as LLM or configure separately.
 # If api_key is empty, falls back to the active model's api_key.
 provider = "openai"
-api_key  = "YOUR_EMBEDDINGS_API_KEY"
+api_key  = "env:OPENAI_API_KEY"
 model    = "text-embedding-3-small"
 base_url = "https://api.openai.com/v1"
 
@@ -203,6 +222,7 @@ pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate insta
 # timeout   = 30
 # [mcp_servers.env]
 # MY_ENV_VAR = "value"
+# API_KEY    = "env:SOME_SERVICE_API_KEY"
 
 # Example: HTTP MCP server (JSON-RPC POST to HTTP/HTTPS endpoint)
 # [[mcp_servers]]
@@ -212,4 +232,4 @@ pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate insta
 # enabled   = true
 # timeout   = 30
 # [mcp_servers.headers]
-# Authorization = "Bearer your-token-here"
+# Authorization = "env:MY_AUTH_HEADER"    # set MY_AUTH_HEADER="Bearer sk-..." in env

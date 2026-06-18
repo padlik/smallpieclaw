@@ -198,20 +198,24 @@ def load_config(path="config.toml"):
         cfg = tomli.load(f)
     logger.info("Configuration loaded from %s", path)
 
-    # Validate config structure early — fail fast with clear error messages
+    # Validate config structure early — fail fast with clear error messages.
+    # parse_config() also expands ${VAR}/${VAR:-default} placeholders; we return
+    # the resolved dict so all runtime consumers see plain values, not literals.
+    # The typed AppConfig is returned too so callers never need to re-parse (a
+    # second parse would re-scan already-substituted values, which is wrong).
     from config_schema import parse_config
     from exceptions import ConfigError
     try:
-        parse_config(cfg)
+        app_cfg = parse_config(cfg)
     except ConfigError as exc:
         logger.error("Configuration error: %s", exc)
         sys.exit(1)
 
-    return cfg
+    return app_cfg._raw, app_cfg
 
 
 def main():
-    cfg = load_config()
+    cfg, app_cfg = load_config()
 
     paths = cfg.get("paths", {})
     tools_dir     = paths.get("tools_dir", "tools")
@@ -238,7 +242,7 @@ def main():
 
     with _PidFileLock(pid_file):
         _run(
-            cfg=cfg, paths=paths,
+            cfg=cfg, app_cfg=app_cfg, paths=paths,
             tools_dir=tools_dir, gen_tools_dir=gen_tools_dir, data_dir=data_dir,
             index_path=index_path, memory_path=memory_path,
             longterm_path=longterm_path, results_path=results_path,
@@ -249,7 +253,7 @@ def main():
 
 
 def _run(
-    cfg, paths,
+    cfg, app_cfg, paths,
     tools_dir, gen_tools_dir, data_dir,
     index_path, memory_path, longterm_path, results_path,
     scheduler_config_path, skills_dir,
@@ -479,18 +483,16 @@ def _run(
     graph_memory_store = None
     graph_memory_writer = None
     try:
-        from config_schema import parse_config as _parse_config
-        _app_cfg = _parse_config(cfg)
-        if _app_cfg.graph_memory.enabled:
+        if app_cfg.graph_memory.enabled:
             from graph_memory import build_extraction_llm_call as _build_extraction_llm_call
 
             def _embedder_fn(text: str) -> list[float]:
                 return llm.embed(text)
 
-            _llm_call_fn = _build_extraction_llm_call(cfg, _app_cfg, all_models)
+            _llm_call_fn = _build_extraction_llm_call(cfg, app_cfg, all_models)
 
             graph_memory_store, graph_memory_writer = create_graph_memory(
-                cfg=_app_cfg,
+                cfg=app_cfg,
                 embedder_fn=_embedder_fn,
                 llm_call_fn=_llm_call_fn,
                 embedding_dim=len(llm.embed("test")),
@@ -499,14 +501,14 @@ def _run(
                 # Wire into agent (main react_loop context)
                 agent._graph_memory = graph_memory_store
                 agent._graph_memory_writer = graph_memory_writer
-                agent._graph_memory_max_entries = _app_cfg.graph_memory.max_context_entries
+                agent._graph_memory_max_entries = app_cfg.graph_memory.max_context_entries
                 # Wire into builtin executor for memory_graph_search/store tools
                 builtin._graph_memory = graph_memory_store
                 builtin._graph_memory_writer = graph_memory_writer
                 logger.info(
                     "Graph memory enabled (db=%s, extraction_model=%s)",
-                    _app_cfg.graph_memory.db_path,
-                    _app_cfg.graph_memory.extraction_model or _app_cfg.agent.default_model,
+                    app_cfg.graph_memory.db_path,
+                    app_cfg.graph_memory.extraction_model or app_cfg.agent.default_model,
                 )
     except Exception as _gm_init_exc:
         logger.warning("Graph memory initialisation failed (continuing without it): %s", _gm_init_exc)
