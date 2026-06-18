@@ -648,10 +648,12 @@ class BuiltinExecutor:
         t_out = threading.Thread(
             target=_read_stream,
             args=(proc.stdout, _tail_out, _total_out, ""),
+            daemon=True,
         )
         t_err = threading.Thread(
             target=_read_stream,
             args=(proc.stderr, _tail_err, _total_err, "\n--- stderr ---\n"),
+            daemon=True,
         )
         t_out.start()
         t_err.start()
@@ -690,11 +692,13 @@ class BuiltinExecutor:
                 except OSError:
                     pass
 
-        # Join with a bounded cap: after kill + pipe close the threads should
-        # exit quickly; the cap guards against truly stuck reads.
-        _join_cap = max(5.0, float(timeout))
-        t_out.join(timeout=_join_cap)
-        t_err.join(timeout=_join_cap)
+        # Join with a small fixed total cap: escaped descendants can still keep
+        # inherited pipe write-ends open after leaving the process group, so
+        # cleanup must not scale with the requested command timeout.
+        _join_deadline = time.monotonic() + 2.0
+        for _thread in (t_out, t_err):
+            _remaining = max(0.0, _join_deadline - time.monotonic())
+            _thread.join(timeout=_remaining)
 
         elapsed_ms = (time.monotonic() - _start) * 1000.0
         total_combined = _total_out[0] + _total_err[0]
@@ -706,7 +710,7 @@ class BuiltinExecutor:
 
         returncode = proc.returncode if not timed_out else -1
 
-        if returncode != 0 and not output.strip() and error:
+        if not timed_out and returncode != 0 and not output.strip() and error:
             # Some commands write only to stderr (e.g. systemctl status);
             # promote stderr → output so the LLM sees the failure reason.
             output = error
@@ -721,7 +725,10 @@ class BuiltinExecutor:
             _pfx, returncode, _total_out[0], _total_err[0], elapsed_ms,
         )
         if timed_out:
-            return {"success": False, "output": output, "error": f"Command timed out after {timeout}s.",
+            timeout_error = f"Command timed out after {timeout}s."
+            if error.strip():
+                timeout_error = f"{timeout_error}\nstderr:\n{error}"
+            return {"success": False, "output": output, "error": timeout_error,
                     "exit_code": -1, "elapsed_ms": round(elapsed_ms), "full_log_path": full_log_path}
         return {
             "success": returncode == 0,

@@ -827,8 +827,20 @@ class TestSubprocessTimeoutNoBeyond:
         _started = _t.monotonic()
         ex.execute("shell", {"command": cmd, "timeout": 1})
         elapsed = _t.monotonic() - _started
-        # Must return well within 5s; allow generous headroom for CI slowness.
-        assert elapsed < 9.0, (
+        # Must not wait for the escaped child to finish sleeping; allow modest
+        # headroom for CI slowness beyond the fixed 2s reader cleanup budget.
+        assert elapsed < 4.5, (
             f"execute() took {elapsed:.1f}s — exceeded timeout+bound "
             f"(escaped descendant held pipe open)"
         )
+
+    def test_subprocess_timeout_preserves_stderr_when_stdout_present(self, tmp_path):
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        result = ex.execute(
+            "shell",
+            {"command": "echo out_before_timeout; echo err_before_timeout >&2; sleep 30", "timeout": 1},
+        )
+        assert result["success"] is False
+        assert "out_before_timeout" in result["output"]
+        assert "Command timed out after 1s." in result["error"]
+        assert "err_before_timeout" in result["error"]
