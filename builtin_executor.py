@@ -16,6 +16,7 @@ user responds.
 
 from __future__ import annotations
 
+import codecs
 import difflib
 import html as _html_mod
 import logging
@@ -640,17 +641,19 @@ class BuiltinExecutor:
             except (OSError, ValueError):
                 pass
 
-        def _append_stdout(chunk: bytes) -> None:
+        def _append_stdout(text: str) -> None:
             nonlocal _tail_out, _total_out
-            text = chunk.decode(errors="replace")
+            if not text:
+                return
             _total_out += len(text)
             _tail_out = (_tail_out + text)[-self.max_output:]
             if _log_fh is not None:
                 _log_fh.write(text)
 
-        def _append_stderr(chunk: bytes) -> None:
+        def _append_stderr(text: str) -> None:
             nonlocal _tail_err, _total_err, _stderr_header_written
-            text = chunk.decode(errors="replace")
+            if not text:
+                return
             _total_err += len(text)
             _tail_err = (_tail_err + text)[-self.max_output:]
             if _log_fh is not None:
@@ -661,13 +664,18 @@ class BuiltinExecutor:
 
         import select as _select
 
-        streams: dict[int, tuple[object, Callable[[bytes], None]]] = {}
+        # Per-stream incremental UTF-8 decoders keep multibyte characters that
+        # straddle os.read() chunk boundaries intact (a plain chunk.decode()
+        # would emit U+FFFD replacement chars for the split halves).
+        streams: dict[int, tuple[object, Callable[[str], None], codecs.IncrementalDecoder]] = {}
         for _pipe, _append in ((proc.stdout, _append_stdout), (proc.stderr, _append_stderr)):
             if _pipe is None:
                 continue
             try:
                 os.set_blocking(_pipe.fileno(), False)
-                streams[_pipe.fileno()] = (_pipe, _append)
+                streams[_pipe.fileno()] = (
+                    _pipe, _append, codecs.getincrementaldecoder("utf-8")(errors="replace"),
+                )
             except (OSError, ValueError):
                 _close_pipe(_pipe)
 
@@ -695,8 +703,8 @@ class BuiltinExecutor:
             if not ready and proc.poll() is not None:
                 break
             for fd in ready:
-                pipe, append = streams.get(fd, (None, None))
-                if pipe is None or append is None:
+                pipe, append, decoder = streams.get(fd, (None, None, None))
+                if pipe is None or append is None or decoder is None:
                     continue
                 while True:
                     try:
@@ -704,16 +712,19 @@ class BuiltinExecutor:
                     except BlockingIOError:
                         break
                     except OSError:
+                        append(decoder.decode(b"", final=True))
                         streams.pop(fd, None)
                         _close_pipe(pipe)
                         break
                     if not chunk:
+                        append(decoder.decode(b"", final=True))
                         streams.pop(fd, None)
                         _close_pipe(pipe)
                         break
-                    append(chunk)
+                    append(decoder.decode(chunk))
 
-        for _pipe, _ in list(streams.values()):
+        for _pipe, _append, _decoder in list(streams.values()):
+            _append(_decoder.decode(b"", final=True))
             _close_pipe(_pipe)
         streams.clear()
 

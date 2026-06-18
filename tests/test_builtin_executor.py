@@ -858,3 +858,37 @@ class TestSubprocessTimeoutNoBeyond:
         assert result["success"] is True
         assert "parent_done" in result["output"]
         assert elapsed < 2.0
+
+
+class TestSubprocessMultibyteDecoding:
+    """Multibyte UTF-8 characters spanning os.read() chunk boundaries must survive intact."""
+
+    def test_multibyte_output_not_corrupted_across_chunk_boundaries(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        # Emit ~6000 three-byte characters (~18 KB) so the stream is split across
+        # many 4096-byte os.read() chunks, with characters straddling boundaries.
+        count = 6000
+        char = "\u20ac"  # euro sign, 3 bytes in UTF-8
+        # large max_output so the full output (not just a tail) is returned.
+        ex = BuiltinExecutor(max_output=100000, data_dir=str(tmp_path))
+        cmd = f"python3 -c \"import sys; sys.stdout.write('{char}' * {count})\""
+        result = ex.execute("shell", {"command": cmd, "timeout": 10})
+        assert result["success"] is True
+        # No replacement characters introduced and full payload preserved intact.
+        assert "\ufffd" not in result["output"]
+        assert result["output"].count(char) == count
+
+    def test_multibyte_stderr_not_corrupted_across_chunk_boundaries(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        count = 6000
+        char = "\u4e2d"  # CJK char, 3 bytes in UTF-8
+        ex = BuiltinExecutor(max_output=100000, data_dir=str(tmp_path))
+        cmd = f"python3 -c \"import sys; sys.stderr.write('{char}' * {count})\""
+        result = ex.execute("shell", {"command": cmd, "timeout": 10})
+        # stderr-only output is promoted into 'output' on failure; here exit==0 so
+        # it stays in 'error'. Either way it must be uncorrupted.
+        combined = result["output"] + result["error"]
+        assert "\ufffd" not in combined
+        assert combined.count(char) == count
