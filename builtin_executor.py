@@ -25,7 +25,6 @@ import secrets
 import signal
 import subprocess
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -588,31 +587,11 @@ class BuiltinExecutor:
 
         # Open artifact log for incremental writing; kept only if output is large.
         _log_fh, _artifact_path = self._open_shell_log(caller_tag)
-        _log_lock = threading.Lock()
-        _tail_out: list[str] = [""]
-        _tail_err: list[str] = [""]
-        _total_out: list[int] = [0]
-        _total_err: list[int] = [0]
-
-        def _read_stream(pipe, tail_ref: list, total_ref: list, log_prefix: str = "") -> None:
-            """Drain a pipe, keeping a rolling max_output-char tail in memory."""
-            first = True
-            try:
-                while True:
-                    chunk = pipe.read(4096)
-                    if not chunk:
-                        break
-                    total_ref[0] += len(chunk)
-                    # Rolling tail: keep only the last max_output chars.
-                    tail_ref[0] = (tail_ref[0] + chunk)[-self.max_output:]
-                    if _log_fh is not None:
-                        with _log_lock:
-                            if first and log_prefix:
-                                _log_fh.write(log_prefix)
-                            _log_fh.write(chunk)
-                            first = False
-            except (OSError, ValueError):
-                pass
+        _tail_out = ""
+        _tail_err = ""
+        _total_out = 0
+        _total_err = 0
+        _stderr_header_written = False
 
         # Start the command in its own process group/session so that on timeout
         # we can kill the whole tree (the shell plus any children that inherited
@@ -630,7 +609,6 @@ class BuiltinExecutor:
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
                 **_popen_kwargs,
             )
         except OSError as exc:
@@ -642,21 +620,6 @@ class BuiltinExecutor:
                 except OSError:
                     pass
             return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
-
-        # Non-daemon threads: we join them deterministically below after the
-        # process group is dead so the pipes reach EOF and no data is lost.
-        t_out = threading.Thread(
-            target=_read_stream,
-            args=(proc.stdout, _tail_out, _total_out, ""),
-            daemon=True,
-        )
-        t_err = threading.Thread(
-            target=_read_stream,
-            args=(proc.stderr, _tail_err, _total_err, "\n--- stderr ---\n"),
-            daemon=True,
-        )
-        t_out.start()
-        t_err.start()
 
         def _kill_tree() -> None:
             """Kill the whole process group (POSIX) or the process (Windows)."""
@@ -671,42 +634,107 @@ class BuiltinExecutor:
             except OSError:
                 pass
 
-        timed_out = False
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill_tree()
+        def _close_pipe(pipe) -> None:
             try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+                pipe.close()
+            except (OSError, ValueError):
                 pass
-            timed_out = True
 
-        # After process group cleanup close the parent pipe handles to force EOF
-        # on any escaped descendants that may still hold the write end open; this
-        # ensures reader threads will return even if a child called setsid().
-        if timed_out:
-            for _pipe in (proc.stdout, proc.stderr):
+        def _append_stdout(chunk: bytes) -> None:
+            nonlocal _tail_out, _total_out
+            text = chunk.decode(errors="replace")
+            _total_out += len(text)
+            _tail_out = (_tail_out + text)[-self.max_output:]
+            if _log_fh is not None:
+                _log_fh.write(text)
+
+        def _append_stderr(chunk: bytes) -> None:
+            nonlocal _tail_err, _total_err, _stderr_header_written
+            text = chunk.decode(errors="replace")
+            _total_err += len(text)
+            _tail_err = (_tail_err + text)[-self.max_output:]
+            if _log_fh is not None:
+                if not _stderr_header_written:
+                    _log_fh.write("\n--- stderr ---\n")
+                    _stderr_header_written = True
+                _log_fh.write(text)
+
+        import select as _select
+
+        streams: dict[int, tuple[object, Callable[[bytes], None]]] = {}
+        for _pipe, _append in ((proc.stdout, _append_stdout), (proc.stderr, _append_stderr)):
+            if _pipe is None:
+                continue
+            try:
+                os.set_blocking(_pipe.fileno(), False)
+                streams[_pipe.fileno()] = (_pipe, _append)
+            except (OSError, ValueError):
+                _close_pipe(_pipe)
+
+        timed_out = False
+        deadline = _start + timeout
+        while streams:
+            now = time.monotonic()
+            if proc.poll() is None and now >= deadline:
+                timed_out = True
+                _kill_tree()
                 try:
-                    _pipe.close()
-                except OSError:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
                     pass
 
-        # Join with a small fixed total cap: escaped descendants can still keep
-        # inherited pipe write-ends open after leaving the process group, so
-        # cleanup must not scale with the requested command timeout.
-        _join_deadline = time.monotonic() + 2.0
-        for _thread in (t_out, t_err):
-            _remaining = max(0.0, _join_deadline - time.monotonic())
-            _thread.join(timeout=_remaining)
+            # If the shell has exited and no stream is immediately readable,
+            # return without waiting for EOF: escaped descendants can keep pipe
+            # fds open indefinitely.  This preserves data already available in
+            # the pipe while avoiding reader-thread leaks/hangs.
+            select_timeout = 0.05 if proc.poll() is not None else max(0.0, min(0.1, deadline - now))
+            try:
+                ready, _, _ = _select.select(list(streams), [], [], select_timeout)
+            except (OSError, ValueError):
+                break
+            if not ready and proc.poll() is not None:
+                break
+            for fd in ready:
+                pipe, append = streams.get(fd, (None, None))
+                if pipe is None or append is None:
+                    continue
+                while True:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        streams.pop(fd, None)
+                        _close_pipe(pipe)
+                        break
+                    if not chunk:
+                        streams.pop(fd, None)
+                        _close_pipe(pipe)
+                        break
+                    append(chunk)
+
+        for _pipe, _ in list(streams.values()):
+            _close_pipe(_pipe)
+        streams.clear()
+
+        if proc.poll() is None and not timed_out:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_tree()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
 
         elapsed_ms = (time.monotonic() - _start) * 1000.0
-        total_combined = _total_out[0] + _total_err[0]
+        total_combined = _total_out + _total_err
         full_log_path = self._finalize_shell_log(_log_fh, _artifact_path, total_combined, caller_tag)
 
         # Build truncated outputs from rolling tails using correct total counts.
-        output = _truncate_tail(_tail_out[0], _total_out[0], self.max_output)
-        error = _truncate_tail(_tail_err[0], _total_err[0], self.max_output)
+        output = _truncate_tail(_tail_out, _total_out, self.max_output)
+        error = _truncate_tail(_tail_err, _total_err, self.max_output)
 
         returncode = proc.returncode if not timed_out else -1
 
@@ -722,7 +750,7 @@ class BuiltinExecutor:
 
         logger.info(
             "%sBuilt-in shell exit=%s stdout=%d stderr=%d chars in %.0fms",
-            _pfx, returncode, _total_out[0], _total_err[0], elapsed_ms,
+            _pfx, returncode, _total_out, _total_err, elapsed_ms,
         )
         if timed_out:
             timeout_error = f"Command timed out after {timeout}s."

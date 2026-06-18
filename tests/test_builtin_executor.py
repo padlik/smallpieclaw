@@ -844,3 +844,17 @@ class TestSubprocessTimeoutNoBeyond:
         assert "out_before_timeout" in result["output"]
         assert "Command timed out after 1s." in result["error"]
         assert "err_before_timeout" in result["error"]
+
+    def test_successful_subprocess_preserves_output_when_descendant_keeps_pipe_open(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        import time as _t
+        child_script = "import os, time; os.setsid(); time.sleep(30)"
+        cmd = f"python3 -c \"{child_script}\" & echo parent_done"
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        _started = _t.monotonic()
+        result = ex.execute("shell", {"command": cmd, "timeout": 1})
+        elapsed = _t.monotonic() - _started
+        assert result["success"] is True
+        assert "parent_done" in result["output"]
+        assert elapsed < 2.0
