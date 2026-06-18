@@ -932,7 +932,6 @@ class TestSubprocessTimeoutBoundedKill:
         import time as _t
 
         ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
-        kill_call_count = [0]
 
         original_run = ex._run_shell_subprocess
 
