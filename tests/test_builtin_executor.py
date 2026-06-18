@@ -782,3 +782,53 @@ class TestShellLogPermissions:
         assert file_mode == 0o600, f"expected 0600, got {oct(file_mode)}"
         dir_mode = stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode)
         assert dir_mode == 0o700, f"expected 0700, got {oct(dir_mode)}"
+
+
+class TestPtyTimeoutCleanup:
+    """PTY timeout must terminate background children that ignore SIGHUP."""
+
+    def test_pty_timeout_kills_background_child_ignoring_sighup(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        import time as _t
+        # Background child ignores SIGHUP and writes to a sentinel file every 0.2s.
+        sentinel = tmp_path / "alive.txt"
+        child_script = (
+            "import signal, time, sys; "
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+            f"[open('{sentinel}', 'a').write('x') or time.sleep(0.2) for _ in range(100)]"
+        )
+        cmd = f"(python3 -c \"{child_script}\") & sleep 30"
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path),
+                             shell_backend="pty", shell_pty_cols=80, shell_pty_rows=24)
+        result = ex.execute("shell", {"command": cmd, "timeout": 1})
+        assert result["success"] is False
+        assert "timed out" in result["error"].lower()
+        # Wait, then confirm child is not still running (file stops growing).
+        _t.sleep(0.5)
+        size1 = sentinel.stat().st_size if sentinel.exists() else 0
+        _t.sleep(1.0)
+        size2 = sentinel.stat().st_size if sentinel.exists() else 0
+        assert size2 == size1, "PTY child kept running after timeout (leak)"
+
+
+class TestSubprocessTimeoutNoBeyond:
+    """Subprocess timeout must not hang past timeout when a descendant escapes the group."""
+
+    def test_subprocess_returns_within_bound_when_descendant_escapes(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        import time as _t
+        # Child calls os.setsid() to escape the process group, then sleeps 5s
+        # while keeping inherited stdout open.
+        child_script = "import os, time; os.setsid(); time.sleep(5)"
+        cmd = f"python3 -c \"{child_script}\" &"
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        _started = _t.monotonic()
+        ex.execute("shell", {"command": cmd, "timeout": 1})
+        elapsed = _t.monotonic() - _started
+        # Must return well within 5s; allow generous headroom for CI slowness.
+        assert elapsed < 9.0, (
+            f"execute() took {elapsed:.1f}s — exceeded timeout+bound "
+            f"(escaped descendant held pipe open)"
+        )

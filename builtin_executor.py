@@ -680,11 +680,21 @@ class BuiltinExecutor:
                 pass
             timed_out = True
 
-        # The process (group) has exited; the pipes will now reach EOF, so the
-        # reader threads terminate.  Join without a short timeout to avoid losing
-        # buffered output or leaving threads writing to a closed artifact file.
-        t_out.join()
-        t_err.join()
+        # After process group cleanup close the parent pipe handles to force EOF
+        # on any escaped descendants that may still hold the write end open; this
+        # ensures reader threads will return even if a child called setsid().
+        if timed_out:
+            for _pipe in (proc.stdout, proc.stderr):
+                try:
+                    _pipe.close()
+                except OSError:
+                    pass
+
+        # Join with a bounded cap: after kill + pipe close the threads should
+        # exit quickly; the cap guards against truly stuck reads.
+        _join_cap = max(5.0, float(timeout))
+        t_out.join(timeout=_join_cap)
+        t_err.join(timeout=_join_cap)
 
         elapsed_ms = (time.monotonic() - _start) * 1000.0
         total_combined = _total_out[0] + _total_err[0]
@@ -825,6 +835,13 @@ class BuiltinExecutor:
                         break
         finally:
             if timed_out:
+                # On POSIX, signal the PTY child's process group so background
+                # children that ignore SIGHUP also get terminated.
+                if sys.platform != "win32":
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
                 proc.terminate(force=True)
             proc.close(force=False)
 
