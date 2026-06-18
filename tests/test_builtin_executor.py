@@ -723,3 +723,62 @@ class TestSuccessfulStderrVisible:
         assert result["success"] is True
         assert "out" in result["output"]
         assert "warn" in result["error"]
+
+
+class TestShellTimeoutCleanup:
+    """Timeout must kill the whole process tree and not leak children."""
+
+    def test_timeout_kills_child_process_tree(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        import time as _t
+        # Parent shell spawns a background child that writes to a sentinel file
+        # every 0.2s. After the parent times out, the child must be killed too,
+        # so the sentinel stops growing.
+        sentinel = tmp_path / "alive.txt"
+        cmd = (
+            f"(for i in $(seq 1 100); do echo x >> {sentinel}; sleep 0.2; done) & "
+            "sleep 30"
+        )
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        result = ex.execute("shell", {"command": cmd, "timeout": 1})
+        assert result["success"] is False
+        assert "timed out" in result["error"].lower()
+        # Record size shortly after kill, wait, then confirm it did not grow.
+        _t.sleep(0.5)
+        size1 = sentinel.stat().st_size if sentinel.exists() else 0
+        _t.sleep(1.0)
+        size2 = sentinel.stat().st_size if sentinel.exists() else 0
+        assert size2 == size1, "child process kept running after timeout (leak)"
+
+    def test_timeout_returns_partial_tail(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        result = ex.execute(
+            "shell",
+            {"command": "echo before_timeout; sleep 30", "timeout": 1},
+        )
+        assert result["success"] is False
+        # The output produced before the timeout should still be captured.
+        assert "before_timeout" in result["output"]
+
+
+class TestShellLogPermissions:
+    """Artifact logs must be owner-only (0600) in an owner-only dir (0700)."""
+
+    def test_artifact_file_and_dir_permissions(self, tmp_path):
+        if sys.platform == "win32":
+            return
+        import stat
+        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path))
+        result = ex.execute(
+            "shell",
+            {"command": "for i in $(seq 1 40); do echo \"line$i\"; done"},
+        )
+        path = result["full_log_path"]
+        assert path is not None
+        file_mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert file_mode == 0o600, f"expected 0600, got {oct(file_mode)}"
+        dir_mode = stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode)
+        assert dir_mode == 0o700, f"expected 0700, got {oct(dir_mode)}"

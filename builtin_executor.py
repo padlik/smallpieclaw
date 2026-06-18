@@ -22,7 +22,9 @@ import logging
 import os
 import re
 import secrets
+import signal
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -518,7 +520,6 @@ class BuiltinExecutor:
     def _run_shell(self, args: dict, caller_tag: str = "",
                    chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         """Dispatch to the configured shell backend (subprocess or pty)."""
-        import sys
         if self._shell_backend == "pty" and sys.platform != "win32":
             return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         return self._run_shell_subprocess(args, caller_tag=caller_tag)
@@ -529,15 +530,25 @@ class BuiltinExecutor:
         Returns (file_handle, absolute_path) or (None, None) on failure.
         The caller must close the file handle and call _finalize_shell_log to
         either keep or remove the file.
+
+        Shell logs can contain sensitive command output, so the directory is
+        created owner-only (0700) and the file owner-only (0600).
         """
         _pfx = f"[{caller_tag}] " if caller_tag else ""
         try:
             log_dir = os.path.join(self._data_dir, "shell_logs")
-            os.makedirs(log_dir, exist_ok=True)
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+            # makedirs honours mode only when creating; tighten an existing dir.
+            try:
+                os.chmod(log_dir, 0o700)
+            except OSError:
+                pass
             ts = time.strftime("%Y%m%d-%H%M%S")
             fname = f"shell-{ts}-{secrets.token_hex(4)}.log"
             path = os.path.abspath(os.path.join(log_dir, fname))
-            fh = open(path, "w", encoding="utf-8", errors="replace")  # noqa: WPS515
+            # O_EXCL guarantees we created the file; 0o600 → owner read/write only.
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            fh = os.fdopen(fd, "w", encoding="utf-8", errors="replace")
             return fh, path
         except OSError as exc:
             logger.warning("%sBuilt-in shell: cannot open artifact log: %s", _pfx, exc)
@@ -603,6 +614,16 @@ class BuiltinExecutor:
             except (OSError, ValueError):
                 pass
 
+        # Start the command in its own process group/session so that on timeout
+        # we can kill the whole tree (the shell plus any children that inherited
+        # the stdout/stderr pipes), not just the top-level shell.  Without this,
+        # a leaked grandchild can keep the pipes open and block the reader threads.
+        _popen_kwargs: dict = {}
+        if sys.platform != "win32":
+            _popen_kwargs["start_new_session"] = True
+        else:  # pragma: no cover - Windows-only
+            _popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
         try:
             proc = subprocess.Popen(
                 command,
@@ -610,6 +631,7 @@ class BuiltinExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                **_popen_kwargs,
             )
         except OSError as exc:
             if _log_fh:
@@ -621,29 +643,48 @@ class BuiltinExecutor:
                     pass
             return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
 
+        # Non-daemon threads: we join them deterministically below after the
+        # process group is dead so the pipes reach EOF and no data is lost.
         t_out = threading.Thread(
             target=_read_stream,
             args=(proc.stdout, _tail_out, _total_out, ""),
-            daemon=True,
         )
         t_err = threading.Thread(
             target=_read_stream,
             args=(proc.stderr, _tail_err, _total_err, "\n--- stderr ---\n"),
-            daemon=True,
         )
         t_out.start()
         t_err.start()
+
+        def _kill_tree() -> None:
+            """Kill the whole process group (POSIX) or the process (Windows)."""
+            if sys.platform != "win32":
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    return
+                except (OSError, ProcessLookupError):
+                    pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
         timed_out = False
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            _kill_tree()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
             timed_out = True
 
-        t_out.join(timeout=2.0)
-        t_err.join(timeout=2.0)
+        # The process (group) has exited; the pipes will now reach EOF, so the
+        # reader threads terminate.  Join without a short timeout to avoid losing
+        # buffered output or leaving threads writing to a closed artifact file.
+        t_out.join()
+        t_err.join()
 
         elapsed_ms = (time.monotonic() - _start) * 1000.0
         total_combined = _total_out[0] + _total_err[0]
