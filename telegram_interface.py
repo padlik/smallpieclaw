@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import dataclasses
 import html
 import logging
 import os
 import re
-import threading
 import time
 from functools import partial
 from typing import Callable, Optional
@@ -44,53 +42,9 @@ from telegram_commands import (
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid, cmd_health,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models,
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
-    cmd_mad_plan, cmd_agent, cb_mad_plan_review,
 )
-from mad_plan import MadPlanSession, MadPlanState
 
 logger = logging.getLogger(__name__)
-
-
-@dataclasses.dataclass
-class PlanContext:
-    """UI-layer metadata for the active plan (not persisted inside plan dict)."""
-
-    plan_name: str = ""
-    saved_path: str = ""
-    plan_id: str = ""       # unique ID for callback button verification
-    name_override: str = ""  # user-provided name hint before planning
-
-
-@dataclasses.dataclass
-class _UserState:
-    """Per-user state: MadPlan session + asyncio lock for concurrency safety."""
-
-    session: MadPlanSession = dataclasses.field(default_factory=MadPlanSession)
-    lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
-    cancel_event: threading.Event = dataclasses.field(default_factory=threading.Event)
-    plan_context: PlanContext = dataclasses.field(default_factory=PlanContext)
-
-    # Legacy convenience properties (bridge to old code during migration)
-    @property
-    def agent_mode(self) -> str:
-        return "madplan" if self.session.is_on else "agent"
-
-    @agent_mode.setter
-    def agent_mode(self, value: str) -> None:
-        if value == "madplan" and not self.session.is_on:
-            self.session.transition(MadPlanState.PLANNING)
-        elif value == "agent" and self.session.is_on:
-            self.session.transition(MadPlanState.OFF)
-
-    @property
-    def pending_plan(self) -> dict | None:
-        return self.session.plan
-
-    @pending_plan.setter
-    def pending_plan(self, value: dict | None) -> None:
-        self.session.plan = value
-        if value is not None:
-            self.session.dirty = True
 
 
 class TelegramInterface:
@@ -136,10 +90,6 @@ class TelegramInterface:
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
 
-        # Per-user MadPlan mode state (isolated to avoid races with concurrent_updates=True)
-        self._user_state: dict[int, _UserState] = {}
-        self.sub_agent_factory: Optional[Callable] = None
-
         # Verbose mode: send each agent action as a new message instead of editing
         self._verbose: bool = False
 
@@ -147,36 +97,9 @@ class TelegramInterface:
         # Saved when run() starts — used by send_message_to_users() from threads
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    @property
-    def plans_dir(self) -> str:
-        """Centralized plans directory resolution."""
-        configured = self._config.get("paths", {}).get("plans_dir", "")
-        return configured or os.path.join(os.getcwd(), "plans")
-
-    @property
-    def _mad_plan_service(self):
-        """Lazy-initialized MadPlanService instance."""
-        if not hasattr(self, "_mad_plan_service_instance"):
-            from mad_plan_service import MadPlanService
-            self._mad_plan_service_instance = MadPlanService(
-                plans_dir=self.plans_dir,
-                llm_client=self.llm_client,
-                sub_agent_factory=self.sub_agent_factory,
-                tool_registry=self.tool_registry,
-                skill_registry=self.skill_registry,
-                mcp_manager=self.mcp_manager,
-            )
-        return self._mad_plan_service_instance
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
-
-    def _get_user_state(self, user_id: int) -> _UserState:
-        """Return (or lazily create) per-user MadPlan state."""
-        if user_id not in self._user_state:
-            self._user_state[user_id] = _UserState()
-        return self._user_state[user_id]
 
     def build(self) -> Application:
         self._app = (
@@ -229,8 +152,6 @@ class TelegramInterface:
             BotCommand("show_ctx", "Show current system prompt snapshot"),
             BotCommand("show_env", "Show runtime environment info"),
             BotCommand("stop", "Cancel the currently running task"),
-            BotCommand("mp", "Model Adaptive Planner (plan / exec / review)"),
-            BotCommand("agent", "Return to standard agent mode"),
         ]
         try:
             await app.bot.set_my_commands(commands)
@@ -266,16 +187,11 @@ class TelegramInterface:
         app.add_handler(CommandHandler("show_ctx", partial(cmd_show_ctx, self)))
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
         app.add_handler(CommandHandler("memory", partial(cmd_memory, self)))
-        # MadPlan commands (register both /mp and legacy /mad_plan)
-        app.add_handler(CommandHandler("mp", partial(cmd_mad_plan, self)))
-        app.add_handler(CommandHandler("mad_plan", partial(cmd_mad_plan, self)))
-        app.add_handler(CommandHandler("agent", partial(cmd_agent, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
-        app.add_handler(CallbackQueryHandler(partial(cb_mad_plan_review, self), pattern=r"^madplan_"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
         app.add_handler(MessageHandler(filters.PHOTO, self._on_file))
@@ -381,40 +297,8 @@ class TelegramInterface:
     async def _run_agent_task(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str,
         images: Optional[list[str]] = None,
-        *,
-        _bypass_madplan: bool = False,
     ) -> None:
         """Run the agent with a given task, showing streaming progress."""
-        user = update.effective_user
-        user_id = user.id if user else 0
-        user_state = self._get_user_state(user_id)
-        if user_state.agent_mode == "madplan" and not _bypass_madplan:
-            intent = await self._classify_madplan_intent(
-                task_text, has_pending_plan=user_state.pending_plan is not None
-            )
-            logger.info("MadPlan intent classified as: %s (pending=%s)", intent, user_state.pending_plan is not None)
-            if intent == "CONVERSATIONAL":
-                await update.effective_message.reply_text(
-                    "💬 Got it.\n\n💡 <i>Send me a task description to start planning, "
-                    "or use /mp list to see saved plans.</i>",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            if intent == "QUESTION":
-                # Route through standard agent without mutating shared mode state.
-                # _bypass_madplan=True skips the madplan gate on the recursive call.
-                prefixed = (
-                    "[CONTEXT: You are answering a question while in MadPlan mode. "
-                    "Answer concisely using available tools if needed. "
-                    "Do NOT start planning a task.]\n" + task_text
-                )
-                await self._run_agent_task(update, ctx, prefixed, images, _bypass_madplan=True)
-                return
-            if intent == "PLAN_FEEDBACK" and user_state.pending_plan is not None:
-                await self._run_mad_plan_revise(update, ctx, task_text, images)
-            else:
-                await self._run_mad_plan_task(update, ctx, task_text, images)
-            return
         user = update.effective_user
         try:
             status_msg = await update.effective_message.reply_text("🔄 Processing…")
@@ -857,331 +741,6 @@ class TelegramInterface:
             except Exception as exc:
                 logger.error("send_html_to_users fallback failed: %s", exc)
 
-    # ------------------------------------------------------------------
-    # MadPlan intent classification
-    # ------------------------------------------------------------------
-
-    _MADPLAN_CLASSIFIER_SYSTEM = """\
-You are a routing classifier for a task-planning assistant. The user is in \
-MadPlan planning mode.
-
-Classify the intent of the user's message as exactly one of:
-- PLAN_TASK: the user is describing a new task they want planned (complex or \
-  simple, as long as it is an actionable request to do something)
-- PLAN_FEEDBACK: the user is giving feedback, corrections, or additional \
-  information about a plan that was already shown to them (only applicable \
-  when a plan is pending)
-- QUESTION: the user is asking a question about the bot, its capabilities, \
-  the current mode, available plans, or anything informational — not asking \
-  for a task to be planned
-- CONVERSATIONAL: the message is a short conversational response, \
-  acknowledgment, typo, or noise (e.g. "ok", "thanks", "wait", "never mind", \
-  single words, accidental messages)
-
-Rules:
-- If no plan is pending, PLAN_FEEDBACK is impossible — use PLAN_TASK instead.
-- Prefer QUESTION over PLAN_TASK when the message ends with "?" or starts \
-  with question words (what, how, why, is, are, can, do, does, will).
-- Prefer CONVERSATIONAL for messages under 4 words that are not clear tasks.
-- Return ONLY the label — no explanation, no punctuation."""
-
-    async def _classify_madplan_intent(self, text: str, has_pending_plan: bool) -> str:
-        """
-        Classify the user's intent in MadPlan mode via a single fast LLM call.
-
-        Returns one of: PLAN_TASK, PLAN_FEEDBACK, QUESTION, CONVERSATIONAL.
-        Falls back to PLAN_TASK (or PLAN_FEEDBACK if plan pending) on any error.
-        """
-        if not self.llm_client:
-            return "PLAN_FEEDBACK" if has_pending_plan else "PLAN_TASK"
-        context_flag = "yes" if has_pending_plan else "no"
-        user_msg = f"Pending plan: {context_flag}\nMessage: {text}"
-        try:
-            loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(
-                None,
-                lambda: self.llm_client.chat(
-                    [{"role": "user", "content": user_msg}],
-                    system=self._MADPLAN_CLASSIFIER_SYSTEM,
-                ),
-            )
-            label = raw.strip().upper().split()[0] if raw.strip() else ""
-            if label in ("PLAN_TASK", "PLAN_FEEDBACK", "QUESTION", "CONVERSATIONAL"):
-                if label == "PLAN_FEEDBACK" and not has_pending_plan:
-                    return "PLAN_TASK"
-                return label
-        except Exception as exc:
-            logger.warning("MadPlan intent classification failed: %s", exc)
-        return "PLAN_FEEDBACK" if has_pending_plan else "PLAN_TASK"
-
-    # ------------------------------------------------------------------
-    # MadPlan execution
-    # ------------------------------------------------------------------
-
-    async def _run_mad_plan_task(
-        self,
-        update: Update,
-        ctx: ContextTypes.DEFAULT_TYPE,
-        task_text: str,
-        images: Optional[list[str]] = None,
-    ) -> None:
-        """Plan a task in MadPlan mode and show the enriched plan for review."""
-        from mad_plan import MadPlanError
-
-        chat_id = update.effective_chat.id
-        try:
-            status_msg = await update.effective_message.reply_text("🧠 Planning…")
-        except Exception:
-            return
-
-        async def _typing_loop():
-            while True:
-                try:
-                    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                except Exception:
-                    pass
-                await asyncio.sleep(4)
-
-        typing_task = asyncio.create_task(_typing_loop())
-
-        try:
-            uid = update.effective_user.id if update.effective_user else 0
-            user_state = self._get_user_state(uid)
-            name_override = user_state.plan_context.name_override
-            if name_override:
-                user_state.plan_context.name_override = ""
-
-            result = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: self._mad_plan_service.create_plan(task_text, name_override=name_override),
-            )
-
-            plan_id = result.plan_id
-            user_state.plan_context = PlanContext(
-                plan_name=result.plan_name, saved_path=result.saved_path, plan_id=plan_id,
-            )
-            user_state.pending_plan = result.plan
-
-            mode_footer = "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("▶️ Execute", callback_data=f"madplan_execute:{plan_id}"),
-                    InlineKeyboardButton("▶️ Traced", callback_data=f"madplan_execute_traced:{plan_id}"),
-                ],
-                [
-                    InlineKeyboardButton("💾 Save only", callback_data=f"madplan_approve:{plan_id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"madplan_reject:{plan_id}"),
-                    InlineKeyboardButton("📋 Show", callback_data="madplan_show"),
-                ],
-            ])
-
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-            chunks = self._split_message(result.html)
-            for i, chunk in enumerate(chunks):
-                text = chunk + mode_footer if i == len(chunks) - 1 else chunk
-                await update.effective_message.reply_text(
-                    text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                )
-                keyboard = None
-
-        except MadPlanError as exc:
-            await self._safe_edit(status_msg, f"❌ MadPlan error: {html.escape(str(exc))}")
-        except Exception as exc:
-            logger.exception("MadPlan planning failed")
-            await self._safe_edit(status_msg, f"❌ Planning failed: {html.escape(str(exc))}")
-        finally:
-            typing_task.cancel()
-
-    async def _run_mad_plan_revise(
-        self,
-        update: Update,
-        ctx: ContextTypes.DEFAULT_TYPE,
-        feedback: str,
-        images: Optional[list[str]] = None,
-    ) -> None:
-        """Revise the pending MadPlan plan using user feedback."""
-        from mad_plan import MadPlanError
-
-        uid = update.effective_user.id if update.effective_user else 0
-        user_state = self._get_user_state(uid)
-        original_plan = user_state.pending_plan
-        if not original_plan:
-            await self._safe_reply(
-                update.effective_message,
-                "❌ No active plan to revise.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        chat_id = update.effective_chat.id
-        try:
-            status_msg = await update.effective_message.reply_text("🔄 Revising plan…")
-        except Exception:
-            return
-
-        async def _typing_loop():
-            while True:
-                try:
-                    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                except Exception:
-                    pass
-                await asyncio.sleep(4)
-
-        typing_task = asyncio.create_task(_typing_loop())
-
-        try:
-            full_feedback = feedback
-            if images:
-                full_feedback += f"\n\n[Note: {len(images)} image attachment(s) accompany this feedback.]"
-
-            prev_plan_name = user_state.plan_context.plan_name
-            result = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: self._mad_plan_service.revise_plan(
-                    original_plan, full_feedback, plan_name=prev_plan_name,
-                ),
-            )
-
-            plan_id = result.plan_id
-            user_state.plan_context = PlanContext(
-                plan_name=result.plan_name, saved_path=result.saved_path, plan_id=plan_id,
-            )
-            user_state.pending_plan = result.plan
-
-            mode_footer = "\n\n<i>🧠 MadPlan mode · Reply to revise · /agent to exit</i>"
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("▶️ Execute", callback_data=f"madplan_execute:{plan_id}"),
-                    InlineKeyboardButton("▶️ Traced", callback_data=f"madplan_execute_traced:{plan_id}"),
-                ],
-                [
-                    InlineKeyboardButton("💾 Save only", callback_data=f"madplan_approve:{plan_id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"madplan_reject:{plan_id}"),
-                    InlineKeyboardButton("📋 Show", callback_data="madplan_show"),
-                ],
-            ])
-
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-            chunks = self._split_message(result.html)
-            for i, chunk in enumerate(chunks):
-                text = chunk + mode_footer if i == len(chunks) - 1 else chunk
-                await update.effective_message.reply_text(
-                    text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                )
-                keyboard = None
-
-        except MadPlanError as exc:
-            await self._safe_edit(status_msg, f"❌ MadPlan error: {html.escape(str(exc))}")
-        except Exception as exc:
-            logger.exception("MadPlan revision failed")
-            await self._safe_edit(status_msg, f"❌ Revision failed: {html.escape(str(exc))}")
-        finally:
-            typing_task.cancel()
-
-    async def _run_mad_plan_execute(
-        self,
-        update: Update,
-        ctx: ContextTypes.DEFAULT_TYPE,
-        plan: dict,
-        traced: bool = False,
-        skip_completed: Optional[set] = None,
-    ) -> None:
-        """Execute an approved MadPlan plan via sub-agents."""
-        uid = update.effective_user.id if update.effective_user else 0
-        user_state = self._get_user_state(uid)
-        session = user_state.session
-
-        # Acquire lock for state transition (prevents double-exec race)
-        async with user_state.lock:
-            if session.is_executing:
-                await update.effective_message.reply_text(
-                    "⚠️ Execution already in progress.",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-
-            prev_run_dir = session.run_dir
-            # Transition to Executing
-            session.transition(MadPlanState.EXECUTING)
-            user_state.cancel_event.clear()
-
-        try:
-            status_msg = await update.effective_message.reply_text(
-                "⚙️ <b>Executing plan…</b>", parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            session.transition(MadPlanState.PLANNING)
-            return
-
-        # Keep session.plan set — /mp resume needs it after a partial failure.
-        # Only clear the pending tracking ID now that execution has started.
-        user_state.plan_context.plan_id = ""
-
-        async def _notify(text: str) -> None:
-            try:
-                await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
-
-        plans_dir = self.plans_dir
-        try:
-            loop = asyncio.get_running_loop()
-
-            def _safe_notify(msg: str) -> None:
-                try:
-                    if not loop.is_closed():
-                        asyncio.run_coroutine_threadsafe(_notify(msg), loop)
-                except RuntimeError:
-                    pass
-
-            result = await loop.run_in_executor(
-                None,
-                lambda: self._mad_plan_service.execute_plan(
-                    plan,
-                    plan_name=session.plan_name,
-                    traced=traced,
-                    skip_completed=skip_completed,
-                    resume_from_dir=prev_run_dir if skip_completed else "",
-                    cancel_event=user_state.cancel_event,
-                    notify_fn=_safe_notify,
-                ),
-            )
-
-            session.last_run = result.run_ts
-            session.last_run_success = result.success
-            session.run_dir = result.run_dir
-
-            if result.failure:
-                failed_id = html.escape(str(result.failure.get("subtask_id", "?")))
-                remaining = len(result.failure.get("remaining", []))
-                await self._safe_edit(
-                    status_msg,
-                    f"⚠️ <b>Plan partially complete</b> — {result.total} sub-task(s) done, "
-                    f"failed at <code>{failed_id}</code>, {remaining} skipped",
-                )
-            else:
-                summary = f"✅ <b>Plan complete</b> — {result.total}/{result.total} sub-tasks completed"
-                await self._safe_edit(status_msg, summary)
-        except Exception as exc:
-            logger.exception("MadPlan execute failed")
-            await self._safe_edit(status_msg, f"❌ Execution error: {html.escape(str(exc))}")
-        finally:
-            if session.can_transition(MadPlanState.PLANNING):
-                session.transition(MadPlanState.PLANNING)
-            if session.plan_name and plans_dir:
-                session.persist(plans_dir)
 
 # ---------------------------------------------------------------------------
 # Module constants

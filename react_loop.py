@@ -98,7 +98,7 @@ class ReactContext:
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
     # Whether this loop owns its cancel_event. When False (event is shared,
-    # e.g. a MadPlan /mp stop signal forwarded into sub-agents), react_loop
+    # e.g. a stop signal forwarded into sub-agents), react_loop
     # must NOT clear it at startup — doing so would erase a stop request that
     # arrived just before/while the sub-agent began running.
     owns_cancel_event: bool = True

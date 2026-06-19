@@ -414,7 +414,7 @@ class SubAgentRunner:
         fallback_models: list[str] | None = None,  # None = inherit from parent config
         on_step=None,                 # Optional[Callable[[int], None]] — for iteration tracking
         on_tool_trace=None,           # Optional[Callable[[ToolTrace], None]] — for trace collection
-        cancel_event=None,            # Optional[threading.Event] — shared cancel signal (e.g. MadPlan /mp stop)
+        cancel_event=None,            # Optional[threading.Event] — shared cancel signal (e.g. forwarded from a parent agent stop)
     ):
         import uuid
         from memory_store import ShortTermMemory, WorkingMemory

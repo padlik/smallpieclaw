@@ -278,7 +278,7 @@ class TestOnToolTraceCallback:
 
 class TestCancelEventOwnership:
     """Verify react_loop only clears cancel events it owns (fix: a shared
-    MadPlan /mp stop signal must not be erased when a sub-agent starts)."""
+    stop signal forwarded to a sub-agent must not be erased when the sub-agent starts)."""
 
     def _make_controller(self, cancel_event=None):
         from unittest.mock import MagicMock
