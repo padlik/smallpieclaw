@@ -1067,42 +1067,45 @@ class Scheduler:
     def _run_loop(self) -> None:
         """Poll every 30 seconds. Fire cron jobs whose next_run has passed; run once-jobs via schedule lib."""
         while not self._stop_event.is_set():
-            self._process_pending_commands()
-            # Cron job check (local time)
-            now_local = datetime.now()
-            for tag, meta in list(self._jobs_meta.items()):
-                if not meta.get("enabled", True):
-                    continue
-                if meta.get("schedule_type") not in ("cron", "daily", "interval", None):
-                    continue
-                next_run_str = meta.get("_next_run")
-                if not next_run_str:
-                    continue
-                try:
-                    next_run = datetime.fromisoformat(next_run_str)
-                except ValueError:
-                    continue
-                if now_local >= next_run:
-                    # Fire in background thread
-                    threading.Thread(target=self._run_job, kwargs={"tag": tag}, daemon=True).start()
-                    # Schedule next occurrence using the natural (un-jittered) fire time as
-                    # the croniter base. Using now_local would return the same tick when the
-                    # job fired early due to negative startup jitter (double-execution bug).
+            try:
+                self._process_pending_commands()
+                # Cron job check (local time)
+                now_local = datetime.now()
+                for tag, meta in list(self._jobs_meta.items()):
+                    if not meta.get("enabled", True):
+                        continue
+                    if meta.get("schedule_type") not in ("cron", "daily", "interval", None):
+                        continue
+                    next_run_str = meta.get("_next_run")
+                    if not next_run_str:
+                        continue
                     try:
-                        expr = meta.get("cron")
-                        if expr:
-                            natural_str = meta.get("_natural_next_run") or next_run_str
-                            base_dt = datetime.fromisoformat(natural_str)
-                            cron_iter = croniter(expr, base_dt)
-                            next_dt = cron_iter.get_next(datetime)
-                            meta["_natural_next_run"] = next_dt.isoformat()
-                            meta["_next_run"] = next_dt.isoformat()
-                    except (CroniterBadCronError, TypeError, ValueError) as exc:
-                        logger.warning("Could not compute next_run for '%s': %s", tag, exc)
-            # Once-jobs handled by schedule library
-            schedule.run_pending()
-            if self._warn_minutes > 0:
-                self._check_long_running_agents()
+                        next_run = datetime.fromisoformat(next_run_str)
+                    except ValueError:
+                        continue
+                    if now_local >= next_run:
+                        # Fire in background thread
+                        threading.Thread(target=self._run_job, kwargs={"tag": tag}, daemon=True).start()
+                        # Schedule next occurrence using the natural (un-jittered) fire time as
+                        # the croniter base. Using now_local would return the same tick when the
+                        # job fired early due to negative startup jitter (double-execution bug).
+                        try:
+                            expr = meta.get("cron")
+                            if expr:
+                                natural_str = meta.get("_natural_next_run") or next_run_str
+                                base_dt = datetime.fromisoformat(natural_str)
+                                cron_iter = croniter(expr, base_dt)
+                                next_dt = cron_iter.get_next(datetime)
+                                meta["_natural_next_run"] = next_dt.isoformat()
+                                meta["_next_run"] = next_dt.isoformat()
+                        except (CroniterBadCronError, TypeError, ValueError) as exc:
+                            logger.warning("Could not compute next_run for '%s': %s", tag, exc)
+                # Once-jobs handled by schedule library
+                schedule.run_pending()
+                if self._warn_minutes > 0:
+                    self._check_long_running_agents()
+            except Exception:
+                logger.exception("Scheduler _run_loop: unhandled exception in loop iteration — loop will continue")
             self._stop_event.wait(timeout=30)
 
     def _check_long_running_agents(self) -> None:

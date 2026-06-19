@@ -1168,3 +1168,76 @@ async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTy
     fake_update = _FakeUpdate(deferred.source_message, deferred.user_id)
     await iface._run_agent_task(fake_update, ctx, deferred.task_text, deferred.images or None)
 
+
+async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Approve/Deny buttons for headless sub-agent sensitive file operations.
+
+    Callback data format:
+      subconfirm_yes:<token>
+      subconfirm_no:<token>
+
+    Authorization and same-operator double-press safety mirror cb_deferred:
+    - Unauthorized presses get a private alert and do not edit the prompt.
+    - The signal method atomically pops the event, so a double-press from
+      two Telegram clients (same user_id) only signals once; the second press
+      receives an "already resolved" alert.
+    """
+    query = update.callback_query
+
+    data = query.data  # "subconfirm_yes:<token>" or "subconfirm_no:<token>"
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    action, token = parts
+    approved = action == "subconfirm_yes"
+
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Access the shared BuiltinExecutor through the wired agent.
+    builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
+    if builtin is None:
+        try:
+            await query.answer("⚠️ Executor not available.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Atomically signal the executor (pops the event before any await).
+    # Returns False if the token was already resolved or expired.
+    signalled = builtin.signal_headless_confirm(token, approved)
+
+    try:
+        await query.answer()
+    except Exception as exc:
+        logger.warning("cb_subagent_confirm query.answer() failed: %s", exc)
+
+    if not signalled:
+        try:
+            await query.edit_message_text(
+                "⚠️ Sub-agent confirmation already resolved or expired.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    action_label = "✅ Approved" if approved else "❌ Denied"
+    try:
+        await query.edit_message_text(
+            f"{action_label} — sub-agent sensitive file operation.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass

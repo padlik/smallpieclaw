@@ -531,6 +531,11 @@ def _run(
     tg._graph_memory_store = graph_memory_store
     tg._graph_memory_writer = graph_memory_writer
 
+    # Wire the sub-agent Telegram confirmation bridge into the built-in executor.
+    # Sub-agents running sensitive file operations will call this to ask the
+    # operator for approval via inline buttons before executing.
+    builtin._subagent_confirm_prompt_fn = tg.send_subagent_confirmation_prompt
+
     scheduler.start()
     try:
         tg.run()

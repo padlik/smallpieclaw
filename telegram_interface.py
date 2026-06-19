@@ -44,7 +44,7 @@ from telegram_commands import (
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid, cmd_health,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models,
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
-    cb_deferred,
+    cb_deferred, cb_subagent_confirm,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,6 +227,7 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
         app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
+        app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
         app.add_handler(MessageHandler(filters.PHOTO, self._on_file))
@@ -863,11 +864,58 @@ class TelegramInterface:
                 asyncio.run(_send())
             except Exception as exc:
                 logger.error("send_html_to_users fallback failed: %s", exc)
+    def send_subagent_confirmation_prompt(
+        self, token: str, tool_name: str, description: str, caller_tag: str = ""
+    ) -> None:
+        """Send an inline-button confirmation prompt for a headless sub-agent sensitive action.
+
+        Safe to call from any thread. Sends to all authorized users because this is a
+        personal single-operator assistant — the operator is reachable on any connected client.
+        """
+        if not self._app:
+            raise RuntimeError("Bot not built yet — cannot send sub-agent confirmation prompt")
+
+        tag_text = f" <i>[{html.escape(caller_tag)}]</i>" if caller_tag else ""
+        # Route the description through the same Markdown→HTML converter used by
+        # the depth-0 confirmation prompt (_send_confirmation_prompt). This
+        # HTML-escapes untrusted content (sensitive paths, file_patch diff lines)
+        # so that file content containing <, >, & cannot break Telegram HTML
+        # parsing — which would make the prompt undeliverable and leave the
+        # blocked sub-agent waiting until the confirmation timeout.
+        html_text = (
+            f"🤖 Sub-agent{tag_text} wants to perform a sensitive file operation:\n\n"
+            f"<b>{html.escape(tool_name)}</b>\n"
+            f"{_md_to_html(description)}\n\n"
+            "Approve or deny this action."
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve", callback_data=f"subconfirm_yes:{token}"),
+            InlineKeyboardButton("❌ Deny", callback_data=f"subconfirm_no:{token}"),
+        ]])
+
+        async def _send():
+            bot = self._app.bot
+            for uid in list(self.allowed_ids):
+                try:
+                    await bot.send_message(
+                        chat_id=uid,
+                        text=html_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                    )
+                except Exception as exc:
+                    logger.warning("Could not send sub-agent confirm prompt to %d: %s", uid, exc)
+
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        else:
+            try:
+                asyncio.run(_send())
+            except Exception as exc:
+                raise RuntimeError(f"send_subagent_confirmation_prompt failed: {exc}") from exc
 
 
-# ---------------------------------------------------------------------------
-# Module constants
-# ---------------------------------------------------------------------------
 
 # Progress message prefixes that represent agent "actions" (tool calls, results,
 # errors, model switches) — shown as new messages in verbose mode.

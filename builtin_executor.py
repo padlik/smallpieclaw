@@ -355,6 +355,16 @@ class BuiltinExecutor:
         )
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
+        # Headless (sub-agent) confirmation bridge
+        # token -> threading.Event  (set when the operator responds)
+        self._headless_confirm_events: dict[str, object] = {}
+        # token -> bool  (True = approved, False = denied)
+        self._headless_confirm_results: dict[str, bool] = {}
+        # Optional prompt callback: fn(token, tool_name, description, caller_tag) -> None
+        # Set by main.py after TelegramInterface is created.
+        self._subagent_confirm_prompt_fn: Optional[Callable[[str, str, str, str], None]] = None
+        # How long (seconds) to wait for the operator to respond to a sub-agent prompt
+        self._subagent_confirm_timeout: int = 120
 
     # ------------------------------------------------------------------
     # Public API
@@ -447,6 +457,21 @@ class BuiltinExecutor:
         """Discard a pending confirmation."""
         self._pending.pop(token, None)
 
+    def signal_headless_confirm(self, token: str, approved: bool) -> bool:
+        """Signal the outcome of a headless (sub-agent) confirmation prompt.
+
+        Returns True if the token was found and signalled, False if it was
+        already expired or unknown (double-press / stale button).
+        Called from the Telegram cb_subagent_confirm callback.
+        """
+        event = self._headless_confirm_events.pop(token, None)
+        if event is None:
+            return False  # expired or already resolved
+        self._headless_confirm_results[token] = approved
+        event.set()  # type: ignore[attr-defined]
+        return True
+
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -454,9 +479,9 @@ class BuiltinExecutor:
     def _requires_confirmation(self, tool_name: str, args: dict, description: str,
                                caller_depth: int = 0, caller_tag: str = "") -> dict:
         _pfx = f"[{caller_tag}] " if caller_tag else ""
-        # In headless mode (sub-agents), there is no user to confirm — auto-handle:
-        #   shell/dangerous → deny (too risky to run destructive commands unattended)
-        #   file_read/sensitive, file_write → approve (non-destructive or expected by task)
+        # In headless mode (sub-agents, caller_depth >= 1):
+        #   shell/dangerous → always deny (too risky to run destructive commands unattended)
+        #   file_read/sensitive, file_write, file_patch → require operator confirmation via Telegram
         if caller_depth >= 1:
             if tool_name == "shell":
                 command = args.get("command", "")
@@ -473,12 +498,8 @@ class BuiltinExecutor:
                     ),
                     "exit_code": -1,
                 }
-            else:
-                # file_read sensitive or file_write — auto-approve
-                logger.info(
-                    "%sHeadless sub-agent: auto-approving %s (no user confirmation available)", _pfx, tool_name
-                )
-                return self._run(tool_name, args, caller_tag=caller_tag)
+            # Non-shell (sensitive file_read, file_write, file_patch): bridge to Telegram
+            return self._headless_confirm_bridge(tool_name, args, description, caller_tag=caller_tag)
 
         token = secrets.token_hex(12)
         self._pending[token] = (tool_name, args)
@@ -488,6 +509,88 @@ class BuiltinExecutor:
             "token": token,
             "description": description,
         }
+
+    def _headless_confirm_bridge(self, tool_name: str, args: dict, description: str,
+                                 caller_tag: str = "") -> dict:
+        """Block the sub-agent thread until the operator approves or denies via Telegram.
+
+        If the prompt callback is not wired (bot not ready) or times out, fails closed.
+        """
+        import threading as _threading
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+
+        if self._subagent_confirm_prompt_fn is None:
+            logger.warning(
+                "%sHeadless sub-agent: Telegram bridge not wired — blocking %s (fail-closed)",
+                _pfx, tool_name,
+            )
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"Sub-agent sensitive operation blocked: Telegram confirmation bridge "
+                    f"not available for '{tool_name}'."
+                ),
+                "exit_code": -1,
+            }
+
+        token = secrets.token_hex(12)
+        event = _threading.Event()
+        self._headless_confirm_events[token] = event
+        self._pending[token] = (tool_name, args)
+
+        logger.info(
+            "%sHeadless sub-agent: sending Telegram confirmation prompt for %s (token=%s)",
+            _pfx, tool_name, token[:8],
+        )
+        try:
+            self._subagent_confirm_prompt_fn(token, tool_name, description, caller_tag)
+        except Exception as exc:
+            logger.error(
+                "%sHeadless sub-agent: failed to send Telegram prompt for %s: %s — blocking (fail-closed)",
+                _pfx, tool_name, exc,
+            )
+            self._headless_confirm_events.pop(token, None)
+            self._pending.pop(token, None)
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Sub-agent sensitive operation blocked: could not send Telegram prompt ({exc}).",
+                "exit_code": -1,
+            }
+
+        answered = event.wait(timeout=self._subagent_confirm_timeout)
+        if not answered:
+            logger.warning(
+                "%sHeadless sub-agent: Telegram prompt timed out for %s (token=%s) — blocking",
+                _pfx, tool_name, token[:8],
+            )
+            self._headless_confirm_events.pop(token, None)
+            self._pending.pop(token, None)
+            self._headless_confirm_results.pop(token, None)
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"Sub-agent sensitive operation timed out waiting for operator confirmation "
+                    f"('{tool_name}', {self._subagent_confirm_timeout}s)."
+                ),
+                "exit_code": -1,
+            }
+
+        approved = self._headless_confirm_results.pop(token, False)
+        if not approved:
+            self._pending.pop(token, None)
+            logger.info("%sHeadless sub-agent: operator denied %s (token=%s)", _pfx, tool_name, token[:8])
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Sub-agent sensitive operation denied by operator ('{tool_name}').",
+                "exit_code": -1,
+            }
+
+        logger.info("%sHeadless sub-agent: operator approved %s (token=%s) — executing", _pfx, tool_name, token[:8])
+        return self.confirm(token)
 
     def _run(self, tool_name: str, args: dict, caller_tag: str = "",
              chunk_callback: Optional[Callable[[str], None]] = None) -> dict:

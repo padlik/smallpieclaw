@@ -460,16 +460,16 @@ def react_loop(
                 )
                 if json_fail_streak >= _JSON_FAIL_LIMIT:
                     logger.error(
-                        "%sNon-JSON streak reached %d — coercing to finish action",
+                        "%sNon-JSON streak reached %d — aborting with protocol error",
                         pfx, json_fail_streak,
                     )
-                    action_obj = {
-                        "action": "finish",
-                        "result": (
-                            f"⚠️ Model returned non-JSON {json_fail_streak} times in a row. "
-                            f"Last response (truncated): {raw[:500]}"
-                        ),
-                    }
+                    err_msg = (
+                        f"❌ Agent protocol error: model returned non-JSON "
+                        f"{json_fail_streak} times in a row. "
+                        f"Last response (truncated to 500 chars): {raw[:500]}"
+                    )
+                    _progress(err_msg)
+                    return err_msg
                 else:
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({
