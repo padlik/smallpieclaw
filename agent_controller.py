@@ -142,7 +142,15 @@ class AgentController:
         Optionally calls progress_callback(msg) for intermediate updates.
         Pass images=["/path/to/file.jpg", ...] to include images in the first
         user message for vision-capable models.
+
+        The primary model index is always restored on exit so transient
+        fallbacks during one run never permanently demote subsequent requests.
         """
+        # Save primary model index — mirrors the same pattern in SubAgentRunner.run().
+        # chat_with_fallback() intentionally leaves _active_idx on the working model so
+        # the rest of a run re-uses it; but we must restore it afterward so the *next*
+        # interactive request always starts on the configured primary model.
+        _primary_idx = self.llm._active_idx
         ctx = ReactContext(
             llm=self.llm,
             tool_index=self.tool_index,
@@ -174,7 +182,10 @@ class AgentController:
             graph_memory_max_entries=self._graph_memory_max_entries,
             confirmation=self._confirmation,
         )
-        return react_loop(ctx, user_goal, progress_callback, images)
+        try:
+            return react_loop(ctx, user_goal, progress_callback, images)
+        finally:
+            self.llm._active_idx = _primary_idx
 
 
     def cancel(self) -> None:

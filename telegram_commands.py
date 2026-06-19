@@ -1053,3 +1053,118 @@ async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: Conte
     except Exception:
         pass
 
+
+async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Run / Discard buttons for a deferred agent message.
+
+    Callback data format:
+      deferred_run:<token>
+      deferred_discard:<token>
+
+    The token is a per-message random hex string that uniquely identifies the
+    deferred entry in iface._deferred_messages.  Using a token instead of
+    user_id ensures that an old button cannot accidentally run a newer deferred
+    item that has since replaced the one the prompt was sent for: when a newer
+    message replaces an older deferred item, the older token is removed, so its
+    stale button resolves to "expired".
+
+    Rejected presses (unauthorized user, or a different owner) are answered with
+    a private callback alert and never edit the shared prompt message, so they
+    cannot destroy the real operator's Run/Discard controls.
+
+    To guard against the operator pressing the button simultaneously from two
+    Telegram clients (mobile + desktop), the deferred entry is popped from
+    iface._deferred_messages atomically — before any await — so only one
+    callback invocation can win the pop; the second sees None and reports
+    "expired".
+    """
+    query = update.callback_query
+
+    data = query.data  # "deferred_run:<token>" or "deferred_discard:<token>"
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        try:
+            await query.answer()
+        except Exception as exc:
+            logger.warning("cb_deferred query.answer() failed: %s", exc)
+        return
+
+    action, token = parts
+
+    # Authorization: only the authorized operator may press these buttons.
+    # Reject with a private callback alert (do NOT edit the shared prompt
+    # message — that would let an unauthorized presser destroy the operator's
+    # Run/Discard controls in a group chat).
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Ownership check — purely synchronous, no awaits.
+    # Peek at the entry to verify the caller is the owner before touching state.
+    peeked = iface._deferred_messages.get(token)
+    if peeked is not None and caller_id != peeked.user_id:
+        try:
+            await query.answer("⛔ This is not your deferred message.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Atomically consume the entry **before** any await so that concurrent
+    # callback presses from multiple Telegram clients for the same account
+    # (same user_id) cannot both see a non-None deferred and both execute
+    # the action.  asyncio is single-threaded but yields at every await, so
+    # the pop must happen before the first yield to be atomic.
+    # Whichever callback invocation pops first wins; the second gets None and
+    # will report "expired" below.
+    deferred = iface._deferred_messages.pop(token, None)
+    if deferred is not None:
+        if iface._current_deferred_token.get(deferred.user_id) == token:
+            iface._current_deferred_token.pop(deferred.user_id, None)
+
+    # Dismiss the button spinner now that state has been atomically committed.
+    try:
+        await query.answer()
+    except Exception as exc:
+        logger.warning("cb_deferred query.answer() failed: %s", exc)
+
+    if action == "deferred_discard" or deferred is None:
+        try:
+            await query.edit_message_text(
+                "🗑 <b>Deferred message discarded.</b>" if deferred is not None else "⚠️ Deferred message expired.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # action == "deferred_run"
+    try:
+        await query.edit_message_text(
+            "▶️ <b>Running deferred message…</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    # Re-use the original source_message as the effective message so progress
+    # replies thread correctly beneath it.  Build a minimal Update-like wrapper
+    # that _run_agent_task can use.
+    #
+    # We re-enter _run_agent_task which will acquire the per-user lock normally.
+    # If the lock is already held again (another message raced in), the deferred
+    # run itself will be deferred — handled correctly by the same mechanism.
+    class _FakeUpdate:
+        """Minimal Update stand-in that provides just what _run_agent_task needs."""
+        def __init__(self, message, uid):
+            self.effective_message = message
+            self.effective_chat = message.chat if hasattr(message, "chat") else message
+            self.effective_user = type("_U", (), {"id": uid})()
+
+    fake_update = _FakeUpdate(deferred.source_message, deferred.user_id)
+    await iface._run_agent_task(fake_update, ctx, deferred.task_text, deferred.images or None)
+

@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import html
 import logging
 import os
 import re
+import secrets
 import time
 from functools import partial
 from typing import Callable, Optional
@@ -42,9 +44,27 @@ from telegram_commands import (
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid, cmd_health,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models,
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
+    cb_deferred,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class _DeferredMessage:
+    """A message that arrived while the agent was busy — held for operator decision."""
+
+    task_text: str
+    images: list[str]
+    # Keep a reference to the Telegram message that was deferred so we can
+    # reply to it when the operator decides to run or discard it.
+    source_message: object  # telegram.Message
+    # Owner of this deferred message (original sender's Telegram user id).
+    user_id: int
+    # Unique token embedded in callback_data so each Run/Discard button
+    # targets exactly this deferred entry — prevents an old button from
+    # accidentally running a newer deferred item that replaced this one.
+    token: str
 
 
 class TelegramInterface:
@@ -89,6 +109,20 @@ class TelegramInterface:
 
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
+
+        # Per-user interactive agent lock + deferred-message state.
+        # At most one interactive agent run per user at a time.  If a second
+        # message arrives while the lock is held, it is stored here (replacing
+        # any earlier pending item) and the operator is offered Run / Discard
+        # controls once the current task finishes.
+        self._agent_locks: dict[int, asyncio.Lock] = {}
+        # Deferred messages are keyed by a per-message token (not user_id) so
+        # that each Run/Discard button targets exactly the entry it was created
+        # for — an old button cannot accidentally run a newer deferred item.
+        self._deferred_messages: dict[str, _DeferredMessage] = {}
+        # Maps user_id → token of the *latest* deferred item for that user.
+        # Used after a task finishes to find which token's prompt to show.
+        self._current_deferred_token: dict[int, str] = {}
 
         # Verbose mode: send each agent action as a new message instead of editing
         self._verbose: bool = False
@@ -192,6 +226,7 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
+        app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
         app.add_handler(MessageHandler(filters.PHOTO, self._on_file))
@@ -294,11 +329,82 @@ class TelegramInterface:
         logger.info("Message from user %d: %s", user.id, text[:80])
         await self._run_agent_task(update, ctx, text)
 
+    def _get_agent_lock(self, user_id: int) -> asyncio.Lock:
+        """Return (or lazily create) the per-user interactive agent lock."""
+        if user_id not in self._agent_locks:
+            self._agent_locks[user_id] = asyncio.Lock()
+        return self._agent_locks[user_id]
+
     async def _run_agent_task(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str,
         images: Optional[list[str]] = None,
     ) -> None:
-        """Run the agent with a given task, showing streaming progress."""
+        """Run the agent with a given task, showing streaming progress.
+
+        Only one interactive agent run is allowed per user at a time.  If the
+        user sends a second message while the agent is busy, it is stored as a
+        *deferred message* (replacing any earlier pending item) and the operator
+        is offered explicit Run / Discard controls once the current task ends.
+        This prevents concurrent corruption of shared WorkingMemory,
+        ShortTermMemory, and LLMClient state without auto-executing stale intent.
+        """
+        user = update.effective_user
+        user_id = user.id if user else 0
+        lock = self._get_agent_lock(user_id)
+
+        # Non-blocking lock attempt: if the agent is already running, defer this
+        # message and return immediately rather than racing the active run.
+        if lock.locked():
+            # Replacing any earlier pending item: drop the previous deferred
+            # entry for this user so its (now stale) Run/Discard button resolves
+            # to "expired" instead of running an outdated message.
+            prev_token = self._current_deferred_token.pop(user_id, None)
+            if prev_token is not None:
+                self._deferred_messages.pop(prev_token, None)
+            deferred_token = secrets.token_hex(8)
+            self._deferred_messages[deferred_token] = _DeferredMessage(
+                task_text=task_text,
+                images=list(images or []),
+                source_message=update.effective_message,
+                user_id=user_id,
+                token=deferred_token,
+            )
+            self._current_deferred_token[user_id] = deferred_token
+            preview = html.escape(task_text[:120] + ("…" if len(task_text) > 120 else ""))
+            logger.info(
+                "User %d: agent busy — message deferred: %s", user_id, task_text[:80]
+            )
+            try:
+                await update.effective_message.reply_text(
+                    f"⏳ <b>Agent is busy</b> — your message was saved.\n\n"
+                    f"<i>{preview}</i>\n\n"
+                    "It will not run automatically (it may be stale after the current task). "
+                    "You can run or discard it once the agent is done.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+        async with lock:
+            await self._run_agent_task_locked(update, ctx, task_text, images, user_id)
+
+        # After releasing the lock, check if a deferred message is waiting.
+        # Use _current_deferred_token to find the latest deferred entry for
+        # this user.  The entry itself remains in _deferred_messages until the
+        # operator presses Run or Discard — the callback is the sole owner of
+        # the pop.
+        pending_token = self._current_deferred_token.pop(user_id, None)
+        if pending_token:
+            deferred = self._deferred_messages.get(pending_token)
+            if deferred:
+                await self._send_deferred_prompt(deferred)
+
+    async def _run_agent_task_locked(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str,
+        images: Optional[list[str]], user_id: int,
+    ) -> None:
+        """Inner task runner — called with the per-user lock already held."""
         user = update.effective_user
         try:
             status_msg = await update.effective_message.reply_text("🔄 Processing…")
@@ -461,6 +567,23 @@ class TelegramInterface:
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
+
+    async def _send_deferred_prompt(self, deferred: "_DeferredMessage") -> None:
+        """After the active task finishes, ask the operator what to do with the deferred message."""
+        preview = html.escape(deferred.task_text[:200] + ("…" if len(deferred.task_text) > 200 else ""))
+        img_note = f" + {len(deferred.images)} image(s)" if deferred.images else ""
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Run it",    callback_data=f"deferred_run:{deferred.token}"),
+            InlineKeyboardButton("🗑 Discard",   callback_data=f"deferred_discard:{deferred.token}"),
+        ]])
+        try:
+            await deferred.source_message.reply_text(
+                f"💤 <b>Deferred message{img_note}</b>\n\n<i>{preview}</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            logger.warning("Could not send deferred prompt to user %d: %s", deferred.user_id, exc)
 
     async def _send_verbose_event(self, bot, chat_id: int, text: str) -> None:
         """Send a verbose progress event as a new top-level message (not a reply).
