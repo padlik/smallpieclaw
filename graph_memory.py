@@ -507,8 +507,10 @@ class GraphMemoryStore:
 
         ``admission_status`` records how the fact was admitted (``observed`` for
         auto-extraction, ``confirmed`` for operator-approved memory). The edge is
-        only upgraded — never silently downgraded — on a later MATCH, so a fact
-        that was once confirmed stays confirmed.
+        only upgraded — never silently downgraded — on a later MATCH: a confirmed
+        edge keeps its operator-approved fact text and timestamp when a later
+        non-confirmed write targets the same endpoints, so untrusted extraction
+        cannot poison a confirmed relationship.
         """
         admission_status = _coerce_admission(admission_status)
         if self._has_admission_meta:
@@ -518,7 +520,13 @@ class GraphMemoryStore:
                 MERGE (s)-[r:RELATES_TO {relation_type:$rel}]->(t)
                 ON CREATE SET r.fact=$fact, r.valid_at=TIMESTAMP($ts),
                     r.confidence=$conf, r.admission_status=$adm
-                ON MATCH SET r.fact=$fact, r.valid_at=TIMESTAMP($ts)
+                ON MATCH SET
+                    r.fact = CASE
+                        WHEN r.admission_status='confirmed' AND $adm<>'confirmed'
+                        THEN r.fact ELSE $fact END,
+                    r.valid_at = CASE
+                        WHEN r.admission_status='confirmed' AND $adm<>'confirmed'
+                        THEN r.valid_at ELSE TIMESTAMP($ts) END
                 """,
                 {
                     "src": src_id, "tgt": tgt_id, "rel": relation_type, "fact": fact,

@@ -126,3 +126,29 @@ class TestMaybeCompact:
         out = maybe_compact(msgs, "system", 100_000, "", llm)
         assert "chars omitted" in out[-1]["content"]
         assert len(out[-1]["content"]) < (_RECENT_HEAD + _RECENT_TAIL + 50_000)
+
+    def test_still_oversized_triggers_deterministic_tightening(self, monkeypatch):
+        # A char-proportional estimator so shrinking actually lowers the count.
+        def char_estimate(messages, system):
+            return sum(len(str(m.get("content") or "")) for m in messages) // 4
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+        # Enormous first (goal) and recent messages that survive normal compaction.
+        msgs = [_msg("user", "GOAL " + ("g" * 40_000))]
+        for i in range(6):
+            msgs.append(_msg("assistant", "act " + ("p" * 3000)))
+            msgs.append(_msg("user", f"res {i} " + ("r" * 5000)))
+        msgs[-1] = _msg("user", "TAILMSG " + ("z" * 40_000))
+        llm = MagicMock()
+        llm.chat.return_value = "• " + ("s" * 40_000)  # oversized summary too
+
+        # Tight budget: 0.85 * ctx must be below the post-compaction size so the
+        # deterministic tightening loop engages and drives it under budget.
+        ctx_max = 4000  # threshold = 3400 tokens
+        out = maybe_compact(msgs, "system", ctx_max, "", llm)
+
+        final_tokens = char_estimate(out, "system")
+        assert final_tokens <= int(ctx_max * 0.85)
+        # Goal is preserved (head) but bounded, not the full 40k chars.
+        assert out[0]["content"].startswith("GOAL ")
+        assert len(out[0]["content"]) < 40_000

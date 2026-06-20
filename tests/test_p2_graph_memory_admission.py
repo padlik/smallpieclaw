@@ -148,6 +148,42 @@ class TestAdmissionWrites:
         queries = [c.args[0] for c in mock_ladybug["conn"].execute.call_args_list]
         assert all("admission_status" not in q for q in queries)
 
+    def test_observed_write_protects_confirmed_fact(self, store, mock_ladybug):
+        """A non-confirmed merge must NOT overwrite a confirmed edge's fact.
+
+        The ON MATCH clause guards r.fact/r.valid_at with a CASE that keeps the
+        existing value when the stored edge is confirmed and the incoming write
+        is not, so observed extraction cannot poison operator-approved facts.
+        """
+        mock_ladybug["conn"].execute.reset_mock()
+        store.add_relation(
+            "ent:a", "ent:b", "USES", "observed overwrite", "2024-01-02T00:00:00Z",
+            admission_status=ADMISSION_OBSERVED, confidence=CONFIDENCE_OBSERVED,
+        )
+        merge_q = next(
+            c.args[0] for c in mock_ladybug["conn"].execute.call_args_list
+            if "MERGE" in c.args[0] and "RELATES_TO" in c.args[0]
+        )
+        assert "ON MATCH SET" in merge_q
+        assert "CASE" in merge_q
+        assert "r.admission_status='confirmed'" in merge_q
+        assert "$adm<>'confirmed'" in merge_q
+
+    def test_confirmed_write_upgrades_existing_edge(self, store, mock_ladybug):
+        """A confirmed merge still runs the upgrade-only status/confidence SET."""
+        mock_ladybug["conn"].execute.reset_mock()
+        store.add_relation(
+            "ent:a", "ent:b", "USES", "approved", "2024-01-02T00:00:00Z",
+            admission_status=ADMISSION_CONFIRMED, confidence=CONFIDENCE_CONFIRMED,
+        )
+        upgrade = [
+            c for c in mock_ladybug["conn"].execute.call_args_list
+            if len(c.args) > 1 and isinstance(c.args[1], dict)
+            and c.args[1].get("adm") == ADMISSION_CONFIRMED
+            and "MERGE" not in c.args[0]
+        ]
+        assert upgrade, "confirmed write should emit an upgrade SET statement"
+
 
 # ---------------------------------------------------------------------------
 # Read / format labelling
