@@ -12,34 +12,12 @@ from __future__ import annotations
 
 import os
 
+# Token estimation lives in token_estimator.py. Re-exported here so existing
+# `from prompt_builder import estimate_tokens` callers keep working.
+from token_estimator import estimate_messages_tokens, estimate_tokens
 
-# ---------------------------------------------------------------------------
-# Token estimation
-# ---------------------------------------------------------------------------
-
-def estimate_tokens(text: str) -> int:
-    """Conservative character-to-token estimate (4 chars ≈ 1 token)."""
-    return len(text) // 4
-
-
-def estimate_messages_tokens(messages: list[dict], system: str = "") -> int:
-    """Estimate total tokens across a message list + system prompt."""
-    total = estimate_tokens(system)
-    for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    total += estimate_tokens(part.get("text", ""))
-        else:
-            total += estimate_tokens(content)
-        for img_path in m.get("images") or []:
-            try:
-                if os.path.getsize(img_path) <= 20 * 1024 * 1024:
-                    total += 1000
-            except OSError:
-                pass
-    return total
+# Re-exported for backward compatibility; listed so linters treat them as used.
+__all__ = ["estimate_tokens", "estimate_messages_tokens"]
 
 
 # ---------------------------------------------------------------------------

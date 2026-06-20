@@ -46,6 +46,18 @@ _SUMMARY_CAP = 6000
 _SHRINK_FLOOR = 400
 
 
+def _active_model(llm: "LLMClient") -> str | None:
+    """Best-effort active model name for tokenizer-aware estimation.
+
+    Returns None on any failure so estimation falls back to the heuristic; this
+    keeps mocked/partial LLM objects in tests working without a real config.
+    """
+    try:
+        return llm.llm_cfg.get("model")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _build_compacted(
     first: list[dict],
     summary: str,
@@ -111,6 +123,28 @@ def _cap_recent_message(m: dict) -> dict:
     return m
 
 
+def _cap_short_overbudget_context(
+    messages: list[dict],
+    system: str,
+    threshold: int,
+    log_prefix: str,
+    llm: "LLMClient",
+) -> list[dict]:
+    """Cap a short but already-overbudget history without adding a summary."""
+    cap = _RECENT_HEAD + _RECENT_TAIL
+    capped = [_cap_string_message(m, cap) for m in messages]
+    new_total = estimate_messages_tokens(capped, system, model=_active_model(llm))
+    while new_total > threshold and cap > _SHRINK_FLOOR:
+        cap = max(_SHRINK_FLOOR, cap // 2)
+        capped = [_cap_string_message(m, cap) for m in messages]
+        new_total = estimate_messages_tokens(capped, system, model=_active_model(llm))
+    logger.warning(
+        "%sShort context exceeded budget; capped message contents to ≤%d chars → ~%d tokens",
+        log_prefix, cap, new_total,
+    )
+    return capped
+
+
 def _fallback_summary(middle: list[dict]) -> str:
     """Deterministic, bounded summary used when the compaction LLM is unavailable."""
     rendered = "\n".join(_format_middle_message(m) for m in middle)
@@ -136,12 +170,12 @@ def maybe_compact(
     a deterministic fallback summary is returned rather than the un-compacted
     oversized messages.
     """
-    total = estimate_messages_tokens(messages, system)
+    total = estimate_messages_tokens(messages, system, model=_active_model(llm))
     threshold = int(ctx_max_tokens * 0.85)
     if total <= threshold:
         return messages
     if len(messages) <= 3:
-        return messages
+        return _cap_short_overbudget_context(messages, system, threshold, log_prefix, llm)
 
     logger.warning(
         "%sContext size ~%d tokens exceeds threshold %d — compacting…",
@@ -178,7 +212,7 @@ def maybe_compact(
         first_cap=_RECENT_HEAD + _RECENT_TAIL,
     )
 
-    new_total = estimate_messages_tokens(compacted, system)
+    new_total = estimate_messages_tokens(compacted, system, model=_active_model(llm))
 
     # Deterministic budget-tightening: if the compacted context still exceeds the
     # threshold (e.g. an enormous first message or recent tool result), shrink the
@@ -199,7 +233,7 @@ def maybe_compact(
                 first, summary, last,
                 summary_cap=summary_cap, recent_cap=recent_cap, first_cap=first_cap,
             )
-            new_total = estimate_messages_tokens(compacted, system)
+            new_total = estimate_messages_tokens(compacted, system, model=_active_model(llm))
         logger.warning(
             "%sCompacted context still large; applied deterministic tightening "
             "(summary≤%d, recent≤%d, goal≤%d chars) → ~%d tokens",

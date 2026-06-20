@@ -400,7 +400,7 @@ class BuiltinExecutor:
         return list(BUILTIN_TOOLS.values())
 
     def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "",
-                chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
+                chunk_callback: Optional[Callable[[str], None]] = None, trace_id: str = "") -> dict:
         """
         Execute a built-in tool. Returns standard result dict, or a
         requires_confirmation dict if the operation needs user approval.
@@ -410,6 +410,8 @@ class BuiltinExecutor:
         caller_tag is a human-readable label for logging (e.g. "[main]", "[sa-fcf85d]").
         chunk_callback is an optional callable invoked with each output chunk during PTY
         shell execution (only when shell_streaming=True). Ignored for other tools.
+        trace_id is the request-scoped trace of the invoking run; it is propagated to
+        spawned sub-agents so their logs correlate with the parent request.
         """
         args = args or {}
         if tool_name == "shell":
@@ -424,7 +426,8 @@ class BuiltinExecutor:
         elif tool_name == "schedule":
             return self._exec_schedule(args)
         elif tool_name == "spawn_agent":
-            return self._exec_spawn_agent(args, caller_depth=caller_depth, caller_tag=caller_tag)
+            return self._exec_spawn_agent(args, caller_depth=caller_depth, caller_tag=caller_tag,
+                                          trace_id=trace_id)
         elif tool_name == "get_agent_result":
             return self._exec_get_agent_result(args, caller_tag=caller_tag)
         elif tool_name == "memory_write":
@@ -1404,7 +1407,8 @@ class BuiltinExecutor:
     # spawn_agent
     # ------------------------------------------------------------------
 
-    def _exec_spawn_agent(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_spawn_agent(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                          trace_id: str = "") -> dict:
         """
         Spawn an isolated sub-agent in a background thread.
 
@@ -1518,6 +1522,7 @@ class BuiltinExecutor:
                 max_tokens=max_tokens_override,
                 temperature=temperature_override,
                 top_p=top_p_override,
+                trace_id=trace_id or None,
             )
         except ValueError as exc:
             return {"success": False, "output": "", "error": f"spawn_agent: {exc}", "exit_code": -1}

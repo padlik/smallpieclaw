@@ -78,10 +78,31 @@ class TestMaybeCompact:
         assert out is msgs
         llm.chat.assert_not_called()
 
+    def test_short_overbudget_history_is_capped(self, monkeypatch):
+        def char_estimate(messages, system, model=None):
+            return sum(len(str(m.get("content") or "")) for m in messages) // 4
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+        msgs = [
+            _msg("user", "GOAL: inspect logs"),
+            _msg("assistant", '{"action": "shell"}'),
+            _msg("user", "Tool 'shell' succeeded.\n" + ("z" * 40_000) + "\nIMPORTANT_TAIL"),
+        ]
+        llm = MagicMock()
+
+        out = maybe_compact(msgs, "system", 4000, "", llm)
+
+        assert len(out) == 3
+        assert out[0]["content"] == "GOAL: inspect logs"
+        assert "IMPORTANT_TAIL" in out[-1]["content"]
+        assert "chars omitted" in out[-1]["content"]
+        assert char_estimate(out, "system") <= int(4000 * 0.85)
+        llm.chat.assert_not_called()
+
     def test_compaction_preserves_goal_and_uses_summary(self, monkeypatch):
         msgs = self._big_messages()
         monkeypatch.setattr(context_manager, "estimate_messages_tokens",
-                             lambda m, s: 1_000_000 if len(m) > 3 else 10)
+                             lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.return_value = "• summarized steps"
         out = maybe_compact(msgs, "system", 100_000, "", llm)
@@ -94,7 +115,7 @@ class TestMaybeCompact:
     def test_llm_failure_returns_deterministic_fallback(self, monkeypatch):
         msgs = self._big_messages()
         monkeypatch.setattr(context_manager, "estimate_messages_tokens",
-                             lambda m, s: 1_000_000 if len(m) > 3 else 10)
+                             lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.side_effect = RuntimeError("model down")
         out = maybe_compact(msgs, "system", 100_000, "", llm)
@@ -108,7 +129,7 @@ class TestMaybeCompact:
     def test_empty_summary_falls_back(self, monkeypatch):
         msgs = self._big_messages()
         monkeypatch.setattr(context_manager, "estimate_messages_tokens",
-                             lambda m, s: 1_000_000 if len(m) > 3 else 10)
+                             lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.return_value = "   "
         out = maybe_compact(msgs, "system", 100_000, "", llm)
@@ -120,7 +141,7 @@ class TestMaybeCompact:
         # Make the most recent message enormous.
         msgs[-1] = _msg("user", "Z" * (_RECENT_HEAD + _RECENT_TAIL + 50_000))
         monkeypatch.setattr(context_manager, "estimate_messages_tokens",
-                             lambda m, s: 1_000_000 if len(m) > 3 else 10)
+                             lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.return_value = "• summary"
         out = maybe_compact(msgs, "system", 100_000, "", llm)
@@ -129,7 +150,7 @@ class TestMaybeCompact:
 
     def test_still_oversized_triggers_deterministic_tightening(self, monkeypatch):
         # A char-proportional estimator so shrinking actually lowers the count.
-        def char_estimate(messages, system):
+        def char_estimate(messages, system, model=None):
             return sum(len(str(m.get("content") or "")) for m in messages) // 4
 
         monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)

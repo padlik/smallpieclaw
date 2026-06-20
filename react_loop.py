@@ -89,6 +89,11 @@ class ReactContext:
     depth: int = 0
     label: str = "main"
 
+    # Request-scoped trace ID for correlating one run across LLM, tool, and
+    # confirmation log lines. Defaulted so test/standalone constructors that omit
+    # it still work; AgentController.run() assigns a fresh ID per run.
+    trace_id: str = ""
+
     # Memory layers
     short_term: object = None   # Optional ShortTermMemory
     working: object = None      # Optional WorkingMemory
@@ -126,7 +131,16 @@ class ReactContext:
 
     @property
     def log_prefix(self) -> str:
+        if self.trace_id:
+            return f"[{self.label} {self.trace_id}] "
         return f"[{self.label}] "
+
+    @property
+    def caller_tag(self) -> str:
+        """Label + trace ID for downstream log tags (executors wrap in brackets)."""
+        if self.trace_id:
+            return f"{self.label} {self.trace_id}"
+        return self.label
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +703,8 @@ def _dispatch_tool(
 
             chunk_callback = _on_chunk
 
-        outcome = ctx.builtin_executor.execute(tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.label,
-                                                chunk_callback=chunk_callback)
+        outcome = ctx.builtin_executor.execute(tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
+                                                chunk_callback=chunk_callback, trace_id=ctx.trace_id)
 
         if outcome.get("requires_confirmation"):
             token = outcome["token"]

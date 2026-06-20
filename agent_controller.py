@@ -40,6 +40,7 @@ from react_loop import (
 from tool_creator import ToolCreator
 from tool_executor import ToolExecutor
 from tool_index import ToolIndex
+from trace_context import child_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ class AgentController:
         on_step=None,          # Optional[Callable[[int], None]] — called after each step
         on_tool_trace=None,    # Optional[Callable[[ToolTrace], None]] — called after each tool call
         job_history_fn=None,   # Optional[Callable[[], str]] — returns job execution history for prompt
+        trace_id=None,         # Optional[str] — propagate a parent run's trace; None => fresh per run
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -108,6 +110,8 @@ class AgentController:
         self._on_tool_trace = on_tool_trace
         self._job_history_fn = job_history_fn
         self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
+        # Optional parent trace to propagate; when None each run() gets a fresh ID.
+        self._trace_id = trace_id
         # Graph memory (optional — set by main.py after init when enabled)
         self._graph_memory = None          # Optional[GraphMemoryStore]
         self._graph_memory_writer = None   # Optional[GraphMemoryWriter]
@@ -151,6 +155,14 @@ class AgentController:
         # the rest of a run re-uses it; but we must restore it afterward so the *next*
         # interactive request always starts on the configured primary model.
         _primary_idx = self.llm._active_idx
+
+        # Request-scoped trace ID: reuse a propagated parent trace when present,
+        # otherwise mint a fresh one so each interactive run is correlatable.
+        trace_id = child_trace_id(self._trace_id)
+        _prev_trace = getattr(self.llm, "_trace_id", "")
+        if hasattr(self.llm, "set_trace_id"):
+            self.llm.set_trace_id(trace_id)
+
         ctx = ReactContext(
             llm=self.llm,
             tool_index=self.tool_index,
@@ -169,6 +181,7 @@ class AgentController:
             log_backup_count=self.log_backup_count,
             depth=self._depth,
             label=self.label,
+            trace_id=trace_id,
             short_term=self.short_term,
             working=self.working,
             results=self.results,
@@ -186,6 +199,8 @@ class AgentController:
             return react_loop(ctx, user_goal, progress_callback, images)
         finally:
             self.llm._active_idx = _primary_idx
+            if hasattr(self.llm, "set_trace_id"):
+                self.llm.set_trace_id(_prev_trace)
 
 
     def cancel(self) -> None:
@@ -428,6 +443,7 @@ class SubAgentRunner:
         on_step=None,                 # Optional[Callable[[int], None]] — for iteration tracking
         on_tool_trace=None,           # Optional[Callable[[ToolTrace], None]] — for trace collection
         cancel_event=None,            # Optional[threading.Event] — shared cancel signal (e.g. forwarded from a parent agent stop)
+        trace_id=None,                # Optional[str] — parent run trace to share; None => fresh per run
     ):
         import uuid
         from memory_store import ShortTermMemory, WorkingMemory
@@ -484,6 +500,7 @@ class SubAgentRunner:
             label=self.agent_id,
             on_step=on_step,
             on_tool_trace=on_tool_trace,
+            trace_id=trace_id,
         )
 
         self._model_id = model_cfg.get("model", "unknown")

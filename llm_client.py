@@ -21,6 +21,7 @@ Retry behaviour:
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
 import logging
 import math
@@ -301,7 +302,11 @@ class LLMClient:
                         identify which agent triggered an LLM call in concurrent log streams.
         """
         self.cfg = config
-        self._caller_tag = caller_tag or ""
+        self._base_caller_tag = caller_tag or ""
+        self._trace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+            f"llm_client_trace_{id(self)}",
+            default="",
+        )
 
         # Require [[models]] — no legacy [llm] fallback
         models = config.get("models")
@@ -406,6 +411,34 @@ class LLMClient:
     def llm_cfg(self) -> dict:
         """Return the currently active model config."""
         return self._models[self._active_idx]
+
+    @property
+    def _trace_id(self) -> str:
+        """Return the current execution-context trace ID."""
+        return self._trace_id_var.get()
+
+    @_trace_id.setter
+    def _trace_id(self, trace_id: str | None) -> None:
+        self._trace_id_var.set((trace_id or "").strip())
+
+    @property
+    def _caller_tag(self) -> str:
+        """Return the base caller label plus the context-local trace ID."""
+        trace_id = self._trace_id
+        if trace_id:
+            base = self._base_caller_tag.strip()
+            return f"{base} {trace_id}".strip()
+        return self._base_caller_tag
+
+    def set_trace_id(self, trace_id: str | None) -> None:
+        """Set (or clear) the request-scoped trace ID woven into log tags.
+
+        The trace ID is stored in a context-local variable, then appended to the
+        caller tag so concurrent runs sharing this LLMClient do not overwrite one
+        another's log correlation state. Passing an empty value restores the bare
+        caller label in the current execution context.
+        """
+        self._trace_id = trace_id
 
     def list_models(self) -> list[dict]:
         """Return summary of all configured models."""
@@ -549,6 +582,7 @@ class LLMClient:
         """
         primary_idx = self._active_idx
         last_exc: Exception | None = None
+        _tag = f"[{self._caller_tag.strip()}] " if self._caller_tag.strip() else ""
 
         candidates = [primary_idx] + self._fallback_indices
 
@@ -574,8 +608,8 @@ class LLMClient:
             model_id = self._models[idx].get("model", f"model_{idx}")
             if seq > 0:
                 logger.warning(
-                    "Falling back to model '%s' after error: %s",
-                    model_id, last_exc,
+                    "%sFalling back to model '%s' after error: %s",
+                    _tag, model_id, last_exc,
                 )
                 if progress_cb:
                     progress_cb(f"⚠️ Switching to fallback model '{model_id}'…")
@@ -593,11 +627,11 @@ class LLMClient:
                 self._active_idx = primary_idx  # reset before trying next candidate
                 if seq < len(candidates) - 1:
                     logger.warning(
-                        "Model '%s' failed (will try next fallback): %s",
-                        model_id, exc,
+                        "%sModel '%s' failed (will try next fallback): %s",
+                        _tag, model_id, exc,
                     )
                 else:
-                    logger.error("All %d candidate model(s) failed.", len(candidates))
+                    logger.error("%sAll %d candidate model(s) failed.", _tag, len(candidates))
 
         raise last_exc  # type: ignore[misc]
 

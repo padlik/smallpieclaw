@@ -209,6 +209,51 @@ class TestLLMParameterOverrides:
 
 
 # ---------------------------------------------------------------------------
+# Trace propagation: parent request trace reaches the spawned sub-agent
+# ---------------------------------------------------------------------------
+
+class TestTracePropagation:
+    """The invoking run's trace_id is forwarded through spawn_agent to the factory."""
+
+    def _spawn_with_trace(self, trace_id: str) -> dict:
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return _make_runner()
+
+        exc = _make_executor(factory=factory)
+        with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
+             patch.object(exc._sub_agent_pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
+            exc._exec_spawn_agent({"task": "do work"}, caller_depth=0, trace_id=trace_id)
+        return captured
+
+    def test_trace_id_forwarded_to_factory(self):
+        captured = self._spawn_with_trace("r-deadbeef")
+        assert captured.get("trace_id") == "r-deadbeef"
+
+    def test_empty_trace_id_becomes_none(self):
+        """No active trace => factory mints a fresh one (None)."""
+        captured = self._spawn_with_trace("")
+        assert captured.get("trace_id") is None
+
+    def test_execute_threads_trace_into_spawn(self):
+        """execute() forwards its trace_id argument down to the factory."""
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return _make_runner()
+
+        exc = _make_executor(factory=factory)
+        with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
+             patch.object(exc._sub_agent_pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
+            exc.execute("spawn_agent", {"task": "do work"}, caller_depth=0,
+                        caller_tag="main r-cafef00d", trace_id="r-cafef00d")
+        assert captured.get("trace_id") == "r-cafef00d"
+
+
+# ---------------------------------------------------------------------------
 # sub_agent_factory: model_cfg override merging
 # ---------------------------------------------------------------------------
 
