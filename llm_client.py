@@ -511,11 +511,34 @@ class LLMClient:
             logger.error("LLM chat error: %s", exc)
             raise
 
+    @staticmethod
+    def _messages_have_images(messages: list[dict]) -> bool:
+        """True if any message carries image data the model must be able to see.
+
+        Detects the ReAct loop's ``images`` field as well as provider-style
+        multimodal content lists (``[{"type": "image_url", ...}]``).
+        """
+        for m in messages:
+            if m.get("images"):
+                return True
+            content = m.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
+                        return True
+        return False
+
     def chat_with_fallback(self, messages: list[dict], system: str | None = None,
                            progress_cb=None, json_mode: bool = False) -> str:
         """
         Like chat(), but tries each fallback model in order if the primary fails
         with a transient error. LLMPermanentError is never retried via fallback.
+
+        When the request contains images, candidates are filtered to
+        vision-capable models (``vision = true`` in ``[[models]]``). A non-vision
+        active model is skipped in favour of a vision-capable fallback; if no
+        vision-capable model is configured a clear permanent error is raised
+        instead of cycling through unsuitable models.
 
         On success the active model index is NOT restored — the working model
         persists for subsequent calls within this job/run() lifetime.
@@ -528,6 +551,24 @@ class LLMClient:
         last_exc: Exception | None = None
 
         candidates = [primary_idx] + self._fallback_indices
+
+        if self._messages_have_images(messages):
+            vision_candidates = [i for i in candidates if self._models[i].get("vision")]
+            if not vision_candidates:
+                self._active_idx = primary_idx  # restore before propagating
+                configured = [m.get("model", "?") for m in self._models]
+                raise LLMPermanentError(
+                    "This request includes an image, but no vision-capable model is "
+                    "configured. Set `vision = true` on a model in [[models]] (and ensure "
+                    f"it is the active or a fallback model). Configured models: {configured}"
+                )
+            if not self._models[primary_idx].get("vision") and progress_cb:
+                target = self._models[vision_candidates[0]].get("model", "?")
+                progress_cb(
+                    f"⚠️ Active model is not vision-capable; switching to vision model '{target}'…"
+                )
+            candidates = vision_candidates
+
         for seq, idx in enumerate(candidates):
             self._active_idx = idx
             model_id = self._models[idx].get("model", f"model_{idx}")
@@ -556,7 +597,7 @@ class LLMClient:
                         model_id, exc,
                     )
                 else:
-                    logger.error("All models (primary + %d fallback(s)) failed.", len(self._fallback_indices))
+                    logger.error("All %d candidate model(s) failed.", len(candidates))
 
         raise last_exc  # type: ignore[misc]
 

@@ -428,7 +428,10 @@ class TestGraphMemoryStore:
         # No injected newline should create extra lines inside the fact text.
         fact_lines = [ln for ln in output.splitlines() if "SYSTEM: ignore" in ln]
         assert len(fact_lines) == 1
-        assert fact_lines[0].lstrip().startswith("Alice")
+        # The fact is rendered on a single line, prefixed with its admission label,
+        # with the injected content sanitized inline (no breakout).
+        assert "[observed" in fact_lines[0]
+        assert "Alice --[USES]--> Python" in fact_lines[0]
 
 
 # ---------------------------------------------------------------------------

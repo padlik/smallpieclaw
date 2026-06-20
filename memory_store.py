@@ -285,7 +285,14 @@ class WorkingMemory:
 # ---------------------------------------------------------------------------
 
 class LongTermMemory:
-    """Persisted vector index of important facts."""
+    """Persisted vector index of important facts.
+
+    LEGACY / BACKFILL-ONLY (P2 consolidation): this JSON store is no longer
+    written or read at runtime. Runtime semantic recall is served by graph
+    memory (graph_memory.py). This class is retained only so existing
+    ``data/longterm_memory.json`` files can be migrated into graph memory via
+    ``backfill_graph_memory.py``.
+    """
 
     def __init__(self, path: str, llm=None):
         self.path = path

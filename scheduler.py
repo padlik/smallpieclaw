@@ -240,7 +240,7 @@ class Scheduler:
         agent_fn: Optional[Callable[[str], str]] = None,
         scheduler_config_path: str = "scheduler.toml",
         data_dir: str = "data",
-        long_term_memory=None,
+        long_term_memory=None,  # LEGACY: unused at runtime (P2 consolidation); kept for compat
         builtin_executor=None,
     ):
         sched_cfg = config.get("scheduler", {})
@@ -726,12 +726,18 @@ class Scheduler:
                 self.notify(f"⚠️ <b>Scheduled job failed:</b> <code>{_html.escape(tag)}</code>\n\n{_html.escape(result)}")
             return
 
-        if tag == "longterm_memory_update" and self.long_term_memory:
-            try:
-                self.long_term_memory.add(result, source="scheduled")
-                logger.info("%sLong-term memory updated", _spfx)
-            except Exception as exc:
-                logger.warning("%sFailed to update long-term memory: %s", _spfx, exc)
+        if tag == "longterm_memory_update":
+            # P2 consolidation: the special longterm_memory_update job is
+            # deprecated. Runtime semantic recall is served by graph memory; JSON
+            # LongTermMemory is legacy/backfill-only and is no longer written at
+            # runtime. The job still runs and reports its result, but its output
+            # is not auto-persisted into any semantic store.
+            logger.warning(
+                "%sJob '%s' uses the deprecated longterm_memory_update tag: its result "
+                "is no longer auto-persisted. Use memory_graph_store (confirmed) to "
+                "remember facts.",
+                _spfx, tag,
+            )
 
         # Auto-remove once/reminder jobs after successful execution
         if is_once:

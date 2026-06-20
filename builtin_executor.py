@@ -436,7 +436,7 @@ class BuiltinExecutor:
         elif tool_name == "memory_graph_search":
             return self._exec_memory_graph_search(args, caller_tag=caller_tag)
         elif tool_name == "memory_graph_store":
-            return self._exec_memory_graph_store(args, caller_tag=caller_tag)
+            return self._exec_memory_graph_store(args, caller_depth=caller_depth, caller_tag=caller_tag)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -603,6 +603,8 @@ class BuiltinExecutor:
             return self._run_file_write(args, caller_tag=caller_tag)
         elif tool_name == "file_patch":
             return self._run_file_patch(args, caller_tag=caller_tag)
+        elif tool_name == "memory_graph_store":
+            return self._run_memory_graph_store(args, caller_tag=caller_tag)
         return {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1}
 
     # ---- shell ----
@@ -1573,14 +1575,11 @@ class BuiltinExecutor:
                 # Persist context if requested
                 if context_key:
                     _save_context(context_key, runner._short_term, self._data_dir)
-                # Write to long-term memory
-                if runner._agent.long_term and result and result != "[Cancelled]":
-                    try:
-                        runner._agent.long_term.add(
-                            f"[Sub-agent {label}] {result[:500]}", source="sub_agent"
-                        )
-                    except Exception:
-                        pass
+                # P2 consolidation: sub-agent results are NOT auto-persisted into
+                # semantic memory. JSON LongTermMemory is legacy/backfill-only and
+                # auto-writing arbitrary sub-agent output risks prompt poisoning.
+                # If a result should be remembered, the operator/main agent must
+                # explicitly (and with confirmation) call memory_graph_store.
                 if result == "[Cancelled]":
                     record.status = "cancelled"
                     record.result = "[Cancelled]"
@@ -1853,8 +1852,7 @@ class BuiltinExecutor:
 
     # ---- memory_graph_store ----
 
-    def _exec_memory_graph_store(self, args: dict, caller_tag: str = "") -> dict:
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
+    def _exec_memory_graph_store(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         if self._graph_memory is None:
             return {
                 "success": False, "output": "",
@@ -1865,19 +1863,53 @@ class BuiltinExecutor:
         content = str(args.get("content", "")).strip()
         if not content:
             return {"success": False, "output": "", "error": "memory_graph_store: 'content' is required.", "exit_code": -1}
-        entity_type = str(args.get("entity_type", "other")).strip() or "other"
+        # Writing to graph memory changes future recalled prompt context, so it is
+        # a confirmation-requiring operation. Operator approval admits the memory
+        # as "confirmed"; the model/sub-agent cannot self-approve it.
+        preview = content if len(content) <= 200 else content[:200] + "…"
+        desc = (
+            "Store this in graph memory as a *confirmed* fact "
+            "(it will influence future recalled context):\n"
+            f"`{preview}`"
+        )
+        return self._requires_confirmation(
+            "memory_graph_store", args, desc, caller_depth=caller_depth, caller_tag=caller_tag
+        )
+
+    def _run_memory_graph_store(self, args: dict, caller_tag: str = "") -> dict:
+        """Execute a confirmed graph-memory store. Only reached after operator approval."""
+        from graph_memory import ADMISSION_CONFIRMED, CONFIDENCE_CONFIRMED
+
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        if self._graph_memory is None:
+            return {
+                "success": False, "output": "",
+                "error": "memory_graph_store: graph memory is not enabled or not available.",
+                "exit_code": -1,
+            }
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return {"success": False, "output": "", "error": "memory_graph_store: 'content' is required.", "exit_code": -1}
         user_id = str(args.get("user_id", "agent")).strip() or "agent"
         try:
-            # Store as an episode (full content) and also trigger extraction
-            ep_id = self._graph_memory.add_episode(content, user_id=user_id, source="manual")
-            # Directly upsert a single entity for the content as a note
+            # Store the operator-approved note as a confirmed episode.
+            ep_id = self._graph_memory.add_episode(
+                content,
+                user_id=user_id,
+                source="manual",
+                admission_status=ADMISSION_CONFIRMED,
+                confidence=CONFIDENCE_CONFIRMED,
+            )
+            # Derived relations from background extraction remain "observed"; only
+            # the explicitly approved note itself is confirmed.
             if self._graph_memory_writer is not None:
                 self._graph_memory_writer.enqueue(content, user_id=user_id, source="manual")
                 self._graph_memory_writer.flush()
-            logger.info("%smemory_graph_store: stored episode %s type=%s", _pfx, ep_id, entity_type)
+            logger.info("%smemory_graph_store: stored confirmed episode %s", _pfx, ep_id)
             return {
                 "success": True,
-                "output": f"Stored in graph memory (episode {ep_id}). Extraction scheduled in background.",
+                "output": f"Stored in graph memory as confirmed (episode {ep_id}). "
+                          "Extraction scheduled in background.",
                 "error": "",
                 "exit_code": 0,
             }

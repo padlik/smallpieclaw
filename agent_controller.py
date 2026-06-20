@@ -392,9 +392,11 @@ class SubAgentRunner:
 
     Each runner has its own LLMClient, ShortTermMemory, and WorkingMemory.
     It shares ToolIndex, ToolExecutor, ToolCreator, BuiltinExecutor,
-    SkillRegistry, LongTermMemory, and ResultsMemory with the main agent.
+    SkillRegistry, and ResultsMemory with the main agent.
 
-    Results are delivered via notify_fn (Telegram) and written to long_term memory.
+    Results are delivered via notify_fn (Telegram). Sub-agent output is NOT
+    auto-persisted into semantic memory (P2 consolidation); to remember a fact,
+    the operator/main agent must explicitly call memory_graph_store (confirmed).
     """
 
     def __init__(
@@ -409,7 +411,7 @@ class SubAgentRunner:
         builtin_executor,             # BuiltinExecutor (shared)
         skill_registry=None,          # SkillRegistry (shared)
         mcp_manager=None,             # MCPManager (shared, optional)
-        long_term=None,               # LongTermMemory (shared)
+        long_term=None,               # LongTermMemory — legacy/backfill-only, unused at runtime
         results=None,                 # ResultsMemory (shared)
         short_term=None,              # ShortTermMemory — pre-loaded context (optional)
         notify_fn=None,               # Callable[[str], None]

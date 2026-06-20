@@ -179,7 +179,7 @@ from config_schema import resolve_model_id  # noqa: E402
 from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
-from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory  # noqa: E402
+from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
 from telegram_interface import TelegramInterface  # noqa: E402
@@ -223,7 +223,6 @@ def main():
     data_dir      = paths.get("data_dir", "data")
     index_path    = paths.get("tool_index_file", "data/tool_index.json")
     memory_path   = paths.get("memory_file", "data/memory.json")
-    longterm_path = paths.get("longterm_memory_file", "data/longterm_memory.json")
     results_path  = paths.get("results_memory_file", "data/results_memory.json")
     scheduler_config_path = paths.get("scheduler_config", "scheduler.toml")
     skills_dir    = paths.get("skills_dir", "skills")
@@ -245,7 +244,7 @@ def main():
             cfg=cfg, app_cfg=app_cfg, paths=paths,
             tools_dir=tools_dir, gen_tools_dir=gen_tools_dir, data_dir=data_dir,
             index_path=index_path, memory_path=memory_path,
-            longterm_path=longterm_path, results_path=results_path,
+            results_path=results_path,
             scheduler_config_path=scheduler_config_path, skills_dir=skills_dir,
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,
             log_file=log_file, log_backup_count=log_backup_count,
@@ -255,7 +254,7 @@ def main():
 def _run(
     cfg, app_cfg, paths,
     tools_dir, gen_tools_dir, data_dir,
-    index_path, memory_path, longterm_path, results_path,
+    index_path, memory_path, results_path,
     scheduler_config_path, skills_dir,
     downloads_dir, tmp_dir,
     log_file, log_backup_count,
@@ -336,8 +335,11 @@ def _run(
 
     short_term  = ShortTermMemory(max_turns=20)
     working     = WorkingMemory()
-    long_term   = LongTermMemory(path=longterm_path, llm=llm)
     results_mem = ResultsMemory(path=results_path, llm=llm)
+    # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime
+    # agents (P2 consolidation). Runtime semantic recall is served by graph
+    # memory; the legacy JSON store is migration/backfill-only via
+    # backfill_graph_memory.py.
 
     skills = SkillRegistry(skills_dir=skills_dir)
     logger.info("Loaded %d skill(s) from %s", skills.count(), skills_dir)
@@ -353,7 +355,6 @@ def _run(
         ctx_max_tokens=ctx_max_tokens,
         short_term=short_term,
         working=working,
-        long_term=long_term,
         results=results_mem,
         builtin_executor=builtin,
         skill_registry=skills,
@@ -445,7 +446,6 @@ def _run(
             builtin_executor=builtin,
             skill_registry=skills,
             mcp_manager=mcp_manager,
-            long_term=long_term,
             results=results_mem,
             short_term=pre_loaded_ctx,
             notify_fn=notify_fn or notify,
@@ -472,7 +472,6 @@ def _run(
         cfg, notify_fn=notify,
         scheduler_config_path=scheduler_config_path,
         data_dir=data_dir,
-        long_term_memory=long_term,
         builtin_executor=builtin,
     )
     builtin.scheduler = scheduler  # wire scheduler into built-in tool

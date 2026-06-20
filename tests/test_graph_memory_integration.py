@@ -121,14 +121,34 @@ class TestBuiltinExecutorGraphMemoryEnabled:
         assert result["success"] is True
         assert "no relevant" in result["output"].lower()
 
-    def test_memory_graph_store_enqueues_and_returns_ok(self, builtin_with_graph_memory):
+    def test_memory_graph_store_requires_confirmation_then_stores_confirmed(self, builtin_with_graph_memory):
         b, store, writer = builtin_with_graph_memory
-        result = b.execute("memory_graph_store", {"content": "Alice prefers dark mode.", "entity_type": "preference"})
+        # At depth 0 the store must request operator confirmation first.
+        staged = b.execute("memory_graph_store", {"content": "Alice prefers dark mode."})
+        assert staged.get("requires_confirmation") is True
+        token = staged["token"]
+        store.add_episode.assert_not_called()
+        writer.enqueue.assert_not_called()
+        # After operator approval the note is stored as a confirmed episode.
+        result = b.confirm(token)
         assert result["success"] is True
         assert "ep:123" in result["output"]
+        assert "confirmed" in result["output"].lower()
         store.add_episode.assert_called_once()
+        _, kwargs = store.add_episode.call_args
+        assert kwargs.get("admission_status") == "confirmed"
         writer.enqueue.assert_called_once()
         writer.flush.assert_called_once()
+
+    def test_memory_graph_store_denied_writes_nothing(self, builtin_with_graph_memory):
+        b, store, writer = builtin_with_graph_memory
+        staged = b.execute("memory_graph_store", {"content": "Alice prefers dark mode."})
+        token = staged["token"]
+        b.cancel(token)
+        # A cancelled token must not execute the store.
+        result = b.confirm(token)
+        assert result["success"] is False
+        store.add_episode.assert_not_called()
 
     def test_memory_graph_search_store_exception_handled(self, builtin_with_graph_memory):
         b, store, _ = builtin_with_graph_memory
