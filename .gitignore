@@ -208,3 +208,4 @@ __marimo__/
 
 
 .github
+data/scheduler_state.json
