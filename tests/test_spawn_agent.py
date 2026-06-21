@@ -77,6 +77,18 @@ class TestSpawnAgentGuards:
         assert result["success"] is False
         assert "cap reached" in result["error"]
 
+    def test_invalid_context_key_rejected_before_factory(self):
+        factory = MagicMock()
+        exc = _make_executor(factory=factory)
+        with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)):
+            result = exc._exec_spawn_agent(
+                {"task": "do something", "context_key": "../scheduler_state"},
+                caller_depth=0,
+            )
+        assert result["success"] is False
+        assert "invalid context_key" in result["error"]
+        factory.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Alias tolerance

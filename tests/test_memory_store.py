@@ -134,6 +134,29 @@ class TestMemoryStore:
         assert "host" in text
         assert "server1" in text
 
+    def test_as_prompt_text_excludes_internal_keys(self, store):
+        # Public keys are injected; internal ``_``-prefixed keys (e.g. the
+        # event log) must be excluded to avoid prompt noise/token waste.
+        store.set("host", "server1")
+        store.record_event("boot")
+        store.record_event("shutdown")
+        text = store.as_prompt_text()
+        assert "host" in text
+        assert "server1" in text
+        assert "_event_log" not in text
+        assert "boot" not in text
+        assert "shutdown" not in text
+
+    def test_as_prompt_text_internal_only_returns_empty_message(self, tmp_path):
+        # When only internal keys exist, the prompt block should fall back to the
+        # standard "no entries" message rather than rendering internal state.
+        path = str(tmp_path / "internal_only.json")
+        with open(path, "w") as f:
+            json.dump({}, f)
+        store = MemoryStore(path)
+        store.record_event("boot")
+        assert store.as_prompt_text() == "No persistent memory entries."
+
     def test_thread_safety(self, tmp_path):
         path = str(tmp_path / "threaded.json")
         store = MemoryStore(path)

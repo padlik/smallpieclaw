@@ -116,13 +116,20 @@ class MemoryStore:
         return len(to_delete)
 
     def as_prompt_text(self) -> str:
-        """Format memory as a short text block suitable for LLM context."""
+        """Format memory as a short text block suitable for LLM context.
+
+        Internal keys (prefixed with ``_``, e.g. ``_event_log``) are bookkeeping
+        state and are deliberately excluded — they add prompt noise/tokens with
+        no reasoning value to the model.
+        """
         with self._lock:
-            if not self._data:
-                return "No persistent memory entries."
             lines = []
             for k, v in self._data.items():
+                if k.startswith("_"):
+                    continue
                 lines.append(f"  {k}: {json.dumps(v)}")
+            if not lines:
+                return "No persistent memory entries."
             return "\n".join(lines)
 
     def record_event(self, event: str) -> None:

@@ -225,6 +225,39 @@ class TestExecutionPassesFallback:
         spawn_args = mock_executor._exec_spawn_agent.call_args[0][0]
         assert spawn_args["fallback_models"] == []
 
+    def test_preserve_context_normalizes_space_containing_tag(self, sched):
+        """Quoted TOML/static tags may contain spaces; context_key must stay safe."""
+        sched._jobs_meta["Nightly Health Check"] = {
+            "enabled": True,
+            "task": "check health",
+            "preserve_context": True,
+            "notify": False,
+        }
+
+        mock_executor = MagicMock()
+        mock_executor._exec_spawn_agent = MagicMock(return_value={
+            "success": True, "output": json.dumps({"agent_id": "sa-space"}),
+            "error": "", "exit_code": 0,
+        })
+        sched.builtin_executor = mock_executor
+
+        sched._run_job(tag="Nightly Health Check")
+
+        spawn_args = mock_executor._exec_spawn_agent.call_args[0][0]
+        assert spawn_args["context_key"] == "nightly_health_check"
+
+    def test_preserve_context_long_tag_passes_validator(self, sched):
+        """A very long tag must normalize to a validator-accepted context_key
+        (≤128 chars) so the scheduled job still runs instead of failing."""
+        from builtin_executor import _validate_context_key
+        from scheduler import _normalize_context_key
+
+        long_tag = "word " * 60  # >128 chars when normalized
+        key = _normalize_context_key(long_tag)
+        assert len(key) <= 128
+        # Must not raise — confirms spawn_agent will accept it.
+        assert _validate_context_key(key) == key
+
 
 class TestBuiltinExecutorScheduleTool:
     """The schedule tool (_exec_schedule) passes fallback_models through."""

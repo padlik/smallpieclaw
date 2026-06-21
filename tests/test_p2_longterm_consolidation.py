@@ -58,12 +58,15 @@ class TestSchedulerNoLongTermWrite:
         from scheduler import Scheduler
 
         cfg = {"agent": {"default_model": "test"}, "scheduler": {"enabled": True}}
+        # NOTE: Scheduler no longer accepts a long_term_memory parameter (the
+        # legacy JSON store is migration-only). The scheduler therefore has no
+        # path to write to long-term memory at all; ``ltm`` is retained purely to
+        # assert that no write occurs.
         s = Scheduler(
             cfg,
             notify_fn=lambda _msg: None,
             agent_fn=lambda _task: agent_result,
             data_dir=str(tmp_path),
-            long_term_memory=ltm,
         )
         return s
 

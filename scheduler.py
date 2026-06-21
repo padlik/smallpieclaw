@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import threading
 from datetime import datetime, timedelta
@@ -34,6 +35,20 @@ import schedule
 from croniter import croniter, CroniterBadCronError
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_context_key(tag: str) -> str:
+    """Convert a scheduler tag into a safe spawn_agent context_key.
+
+    The result is bounded to 128 chars to satisfy
+    ``builtin_executor._validate_context_key``; otherwise a very long job tag
+    would fail validation and prevent the whole scheduled job from running.
+    """
+    key = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+    key = re.sub(r"[^a-z0-9_]+", "_", key)
+    key = re.sub(r"_+", "_", key).strip("_")
+    key = key[:128].rstrip("_")
+    return key or "scheduled_job"
 
 try:
     import tomli
@@ -240,7 +255,6 @@ class Scheduler:
         agent_fn: Optional[Callable[[str], str]] = None,
         scheduler_config_path: str = "scheduler.toml",
         data_dir: str = "data",
-        long_term_memory=None,  # LEGACY: unused at runtime (P2 consolidation); kept for compat
         builtin_executor=None,
     ):
         sched_cfg = config.get("scheduler", {})
@@ -249,7 +263,6 @@ class Scheduler:
         self.notify = notify_fn
         self.agent = agent_fn
         self.builtin_executor = builtin_executor  # Optional[BuiltinExecutor]
-        self.long_term_memory = long_term_memory
         self._data_dir = data_dir
         self._scheduler_config_path = scheduler_config_path
         self._commands_file = os.path.join(data_dir, "scheduler_commands.json")
@@ -356,9 +369,7 @@ class Scheduler:
         max_iterations: int = None,
     ) -> dict:
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
-        tag = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
-        while "__" in tag:
-            tag = tag.replace("__", "_")
+        tag = _normalize_context_key(tag)
         # Coerce hours/minutes to int — LLM may pass them as strings
         try:
             hours = int(hours) if hours is not None else None
@@ -629,7 +640,7 @@ class Scheduler:
         # Prefer spawn_agent via builtin_executor if available
         if self.builtin_executor is not None and hasattr(self.builtin_executor, '_exec_spawn_agent'):
             preserve_ctx = meta.get("preserve_context", False)
-            context_key = tag if preserve_ctx else None
+            context_key = _normalize_context_key(tag) if preserve_ctx else None
 
             spawn_args = {"task": task, "_job_tag": tag}
             if job_model:
@@ -1151,4 +1162,3 @@ class Scheduler:
 
         # Clean up ids for agents that have since finished
         self._warned_agent_ids &= active_ids
-

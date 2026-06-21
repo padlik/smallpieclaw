@@ -66,7 +66,6 @@ class AgentController:
         ctx_max_tokens: int = 90_000,
         short_term=None,       # Optional[ShortTermMemory]
         working=None,          # Optional[WorkingMemory]
-        long_term=None,        # Optional[LongTermMemory]
         results=None,          # Optional[ResultsMemory]
         builtin_executor=None, # Optional[BuiltinExecutor]
         skill_registry=None,   # Optional[SkillRegistry]
@@ -93,7 +92,6 @@ class AgentController:
         self.ctx_max_tokens = ctx_max_tokens
         self.short_term = short_term
         self.working = working
-        self.long_term = long_term
         self.results = results
         self.builtin_executor = builtin_executor
         self.skill_registry = skill_registry
@@ -328,8 +326,36 @@ class AgentController:
                 ),
             }])
         except Exception as exc:
-            logger.error("compress_context: LLM call failed: %s", exc)
-            return f"❌ Compression failed: {exc}"
+            # Deterministic fallback: the LLM summarization call failed, but a user
+            # invoking /compress (often because the context is over budget) still
+            # needs relief. Replace the buffer with a bounded head+tail slice of the
+            # history so the next run starts smaller, matching the robustness of
+            # context_manager.maybe_compact()'s _fallback_summary path.
+            from context_manager import _truncate_head_tail
+            logger.error(
+                "compress_context: LLM call failed, applying deterministic fallback: %s",
+                exc,
+            )
+            fallback = _truncate_head_tail(history_text, 3000, 1000)
+            self.short_term.clear()
+            self.short_term.add(
+                "assistant",
+                f"[Compressed context summary — deterministic fallback]\n{fallback}",
+            )
+            after_tokens = _estimate_tokens(fallback)
+            saved = max(0, before_tokens - after_tokens)
+            pct = int(saved / before_tokens * 100) if before_tokens else 0
+            logger.info(
+                "compress_context (fallback): %d → ~%d tokens (%d%% reduction, %d messages → 1)",
+                before_tokens, after_tokens, pct, len(messages),
+            )
+            return (
+                f"⚠️ LLM compression unavailable — applied deterministic truncation.\n"
+                f"  Messages: {len(messages)} → 1\n"
+                f"  Tokens: ~{before_tokens:,} → ~{after_tokens:,} "
+                f"(−{saved:,}, {pct}% smaller)\n"
+                f"  Reason: {exc}"
+            )
 
         self.short_term.clear()
         self.short_term.add("assistant", f"[Compressed context summary]\n{summary}")
@@ -426,7 +452,6 @@ class SubAgentRunner:
         builtin_executor,             # BuiltinExecutor (shared)
         skill_registry=None,          # SkillRegistry (shared)
         mcp_manager=None,             # MCPManager (shared, optional)
-        long_term=None,               # LongTermMemory — legacy/backfill-only, unused at runtime
         results=None,                 # ResultsMemory (shared)
         short_term=None,              # ShortTermMemory — pre-loaded context (optional)
         notify_fn=None,               # Callable[[str], None]
@@ -488,7 +513,6 @@ class SubAgentRunner:
             ctx_max_tokens=ctx_max_tokens,
             short_term=self._short_term,
             working=self._working,
-            long_term=long_term,
             results=results,
             builtin_executor=builtin_executor,
             skill_registry=skill_registry,

@@ -394,6 +394,9 @@ def react_loop(
         user_goal=user_goal,
         job_history_section=_job_history_section,
         graph_context_section=_graph_context_section,
+        # Suppress ResultsMemory recall when graph memory already supplied
+        # semantic context this turn — avoids redundant/overlapping recall.
+        results_top_k=0 if _graph_context_section else 2,
     )
 
     first_msg: dict = {"role": "user", "content": user_goal}

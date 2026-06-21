@@ -33,6 +33,30 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+_CONTEXT_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
+def _validate_context_key(context_key: str) -> str:
+    """Validate a sub-agent context key before using it as a file stem."""
+    if not isinstance(context_key, str) or not _CONTEXT_KEY_RE.fullmatch(context_key):
+        raise ValueError(
+            "context_key must be 1-128 chars: letters, digits, underscore, dash, or dot; "
+            "it must start with a letter or digit"
+        )
+    if context_key in {".", ".."}:
+        raise ValueError("context_key cannot be '.' or '..'")
+    return context_key
+
+
+def _context_path(context_key: str, data_dir: str) -> str:
+    """Return the absolute context path, rejecting path traversal."""
+    safe_key = _validate_context_key(context_key)
+    ctx_dir = os.path.abspath(os.path.join(data_dir, "job_contexts"))
+    path = os.path.abspath(os.path.join(ctx_dir, f"{safe_key}.json"))
+    if os.path.commonpath([ctx_dir, path]) != ctx_dir:
+        raise ValueError("context_key resolves outside job_contexts")
+    return path
+
 
 def _truncate_output(text: str, limit: int) -> str:
     """Truncate *text* to at most *limit* chars, keeping the tail.
@@ -1469,6 +1493,16 @@ class BuiltinExecutor:
 
         model = args.get("model") or None
         context_key = args.get("context_key") or None
+        if context_key:
+            try:
+                context_key = _validate_context_key(str(context_key))
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": f"spawn_agent: invalid context_key: {exc}",
+                    "exit_code": -1,
+                }
         fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
         job_tag = args.get("_job_tag") or None       # set by scheduler; used for finish callback
         label = job_tag or context_key or "on-demand"
@@ -1562,6 +1596,7 @@ class BuiltinExecutor:
         def _run_and_notify():
             # Convenience: use HTML notify if available (results in expandable quote blocks)
             _notify_html = self._notify_html_fn
+            _context_save_attempted = False
 
             def _send_result_html(header_html: str, body: str) -> None:
                 """Send header + body, optionally wrapped in an expandable blockquote."""
@@ -1575,11 +1610,22 @@ class BuiltinExecutor:
                 else:
                     runner.notify_fn(msg)
 
+            def _save_context_before_completion() -> None:
+                """Persist context before exposing completion to get_agent_result callers."""
+                nonlocal _context_save_attempted
+                if not context_key or _context_save_attempted:
+                    return
+                _context_save_attempted = True
+                try:
+                    _save_context(context_key, runner._short_term, self._data_dir)
+                except Exception as save_exc:
+                    logger.warning(
+                        "spawn_agent: [%s] context save failed for %s: %s",
+                        label, context_key, save_exc,
+                    )
+
             try:
                 result = runner.run(task)
-                # Persist context if requested
-                if context_key:
-                    _save_context(context_key, runner._short_term, self._data_dir)
                 # P2 consolidation: sub-agent results are NOT auto-persisted into
                 # semantic memory. JSON LongTermMemory is legacy/backfill-only and
                 # auto-writing arbitrary sub-agent output risks prompt poisoning.
@@ -1588,6 +1634,7 @@ class BuiltinExecutor:
                 if result == "[Cancelled]":
                     record.status = "cancelled"
                     record.result = "[Cancelled]"
+                    _save_context_before_completion()
                     record._result_event.set()
                     elapsed = int(time.time() - record.started_at)
                     logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
@@ -1618,6 +1665,7 @@ class BuiltinExecutor:
                 else:
                     record.status = "done"
                     record.result = result
+                    _save_context_before_completion()
                     record._result_event.set()
                     elapsed = int(time.time() - record.started_at)
                     logger.info(
@@ -1652,6 +1700,7 @@ class BuiltinExecutor:
             except Exception as exc:
                 record.status = "failed"
                 record.result = str(exc)
+                _save_context_before_completion()
                 record._result_event.set()
                 elapsed = int(time.time() - record.started_at)
                 logger.error(
@@ -1684,6 +1733,10 @@ class BuiltinExecutor:
                     except Exception as notify_exc:
                         logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
             finally:
+                # Persist conversation context (if requested) regardless of
+                # success/cancellation/failure so a crash mid-task does not lose
+                # the sub-agent's short-term memory.
+                _save_context_before_completion()
                 get_agent_registry().unregister(runner.agent_id)
                 runner.close()
                 if _finish_cb:
@@ -1923,28 +1976,41 @@ class BuiltinExecutor:
 
 
 def _save_context(context_key: str, short_term, data_dir: str) -> None:
-    """Persist ShortTermMemory to data/job_contexts/<key>.json."""
-    import json as _json
-    import os
+    """Persist ShortTermMemory to data/job_contexts/<key>.json atomically.
 
-    ctx_dir = os.path.join(data_dir, "job_contexts")
+    Writes to a temporary file in the same directory and commits with
+    ``os.replace`` so a crash mid-write cannot corrupt or truncate an existing
+    context file.
+    """
+    import json as _json
+
+    path = _context_path(context_key, data_dir)
+    ctx_dir = os.path.dirname(path)
     os.makedirs(ctx_dir, exist_ok=True)
-    path = os.path.join(ctx_dir, f"{context_key}.json")
+    tmp_path = os.path.join(
+        ctx_dir,
+        f".{os.path.basename(path)}.{os.getpid()}.{secrets.token_hex(8)}.tmp",
+    )
     try:
         data = short_term.to_dict()
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             _json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
     except OSError:
         logger.warning("Failed to save context for %s", context_key, exc_info=True)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def _load_context(context_key: str, data_dir: str, max_turns: int = 50):
     """Load ShortTermMemory from data/job_contexts/<key>.json. Returns fresh on error."""
     import json as _json
-    import os
     from memory_store import ShortTermMemory
 
-    path = os.path.join(data_dir, "job_contexts", f"{context_key}.json")
+    path = _context_path(context_key, data_dir)
     if not os.path.exists(path):
         return ShortTermMemory(max_turns=max_turns)
     try:

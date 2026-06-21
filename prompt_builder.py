@@ -215,15 +215,26 @@ def build_system_prompt(
     user_goal: str = "(context snapshot)",
     job_history_section: str = "",
     graph_context_section: str = "",
+    results_top_k: int = 2,
 ) -> tuple[str, int]:
     """Build the full system prompt for the ReAct agent.
 
     Returns (prompt_text, estimated_tokens).
+
+    ``results_top_k`` controls how many ResultsMemory entries are injected.
+    Pass ``0`` to suppress ResultsMemory recall entirely — callers do this when
+    graph memory has already supplied richer semantic recall for this turn,
+    avoiding redundant/overlapping recall context in the prompt.
     """
     relevant_tools = tool_index.search(user_goal, top_k=top_tools)
     tools_text = format_tools(relevant_tools)
     memory_text = memory.as_prompt_text()
-    past_results_text = results.as_prompt_text(user_goal, top_k=2) if results else "No past results."
+    if results and results_top_k > 0:
+        past_results_text = results.as_prompt_text(user_goal, top_k=results_top_k)
+    elif results:
+        past_results_text = "(Skipped — semantic recall provided by graph memory below.)"
+    else:
+        past_results_text = "No past results."
     skills_section = format_skills(skill_registry)
     models_section = format_models(llm)
     file_storage = (
