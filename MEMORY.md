@@ -102,10 +102,11 @@ turns). `WorkingMemory` exists for two purposes:
 
 A JSON-backed vector index of completed task summaries. Each entry records:
 - `goal` — original request.
-- `summary` — task outcome. **Two write paths produce summaries of differing
-  quality:**
-  - On a `finish` action (`react_loop`), the raw `result` is stored truncated to
-    500 chars — no LLM summarization.
+- `summary` — task outcome. Both write paths now produce bounded, 2–3 sentence
+  summaries:
+  - On a `finish` action (`react_loop`), the final `result` is summarized by the
+    LLM. If the LLM call fails or returns an empty/overlong response, a
+    deterministic fallback (goal + bounded head/tail of the raw result) is stored.
   - On `/reset save` (`reset_task`), the LLM condenses the working-memory step
     log into a 2–3 sentence summary (falling back to a truncated step log if the
     LLM call fails).
@@ -125,11 +126,12 @@ redundant/overlapping recall — graph memory already provides richer, ranked
 semantic recall in that case. `ResultsMemory` remains the default recall layer
 whenever graph memory is disabled (the default configuration).
 
-**Note:** `LongTermMemory` (`data/longterm_memory.json`) is a **legacy** class
-retained only for migration. It is no longer written or read at runtime, and the
-legacy `long_term` / `long_term_memory` runtime parameters have been removed from
-`AgentController`, `SubAgentRunner`, and `Scheduler`. Existing files can be
-migrated into `GraphMemoryStore` using `backfill_graph_memory.py`.
+**Note:** `LongTermMemory` (`data/longterm_memory.json`) is a **legacy backfill
+shim** (`is_migration_only = True`). It is not wired into any runtime
+controller/scheduler and should not be written by normal runtime code. The
+legacy `long_term` / `long_term_memory` runtime parameters have been removed
+from `AgentController`, `SubAgentRunner`, and `Scheduler`. The only supported use
+case is one-time migration into graph memory via `backfill_graph_memory.py`.
 
 ---
 
@@ -177,15 +179,22 @@ in past conversations cannot override system prompt or tool-safety rules.
 
 ### Background Extraction (GraphMemoryWriter)
 
-Graph writes never block the agent turn. After each user message:
+Graph writes never block the agent turn. Two sources are enqueued:
 
-1. `react_loop` calls `graph_memory_writer.enqueue(user_goal)`.
-2. Texts accumulate in a `_pending` list.
-3. Every `extract_every_n_turns` enqueues (default: 3), the batch is pushed to
-   an internal `queue.Queue`.
-4. A **daemon thread** (`graph-memory-writer`) picks up the batch, calls the
-   LLM extraction model with `EXTRACTION_PROMPT`, parses the JSON response into
-   `entities` + `facts`, then writes them to `GraphMemoryStore`.
+1. **User messages** — after each user goal, `react_loop` calls
+   `graph_memory_writer.enqueue(user_goal, source="chat")` for general fact
+   extraction.
+2. **Task outcomes** — when a task finishes (via `finish` action or `/reset
+   save`) and graph memory is enabled, a bounded text containing the goal,
+   the final summary, and the tools used is enqueued with
+   `source="task_outcome"`. Only the already-summarized outcome is persisted;
+   raw tool output and chat history are not sent to graph memory.
+
+In both cases, texts accumulate in a `_pending` list. Every
+`extract_every_n_turns` enqueues (default: 3), the batch is pushed to an internal
+`queue.Queue`. A **daemon thread** (`graph-memory-writer`) picks up the batch,
+calls the LLM extraction model with `EXTRACTION_PROMPT`, parses the JSON
+response into `entities` + `facts`, then writes them to `GraphMemoryStore`.
 
 Extraction prompt instructs the model to produce self-contained facts with
 `SCREAMING_SNAKE_CASE` relation types. The result is parsed robustly: fenced
@@ -309,7 +318,7 @@ Estimation never uses a hard-coded divisor. Instead:
    - `ResultsMemory` — past results accumulate indefinitely.
    - `GraphMemoryStore` — the knowledge graph is never cleared by `/reset`; it
      accumulates across all sessions.
-   - `LongTermMemory` — legacy, not used at runtime.
+   - `LongTermMemory` — legacy backfill-only shim, not used at runtime.
 
 4. **Confirmation auto-approvals** are cleared so the operator is re-prompted
    for tool confirmations on the next task.

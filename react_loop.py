@@ -24,6 +24,7 @@ from typing import Callable, Optional
 from confirmation import ConfirmationManager
 from context_manager import maybe_compact
 from llm_client import LLMClient, LLMCancelledError, _encode_images
+from memory_store import _summarize_result, _task_outcome_text
 from prompt_builder import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -551,11 +552,27 @@ def react_loop(
                         for s in ctx.working.steps
                         if s["action"] == "tool"
                     ]
+                    summary = _summarize_result(
+                        ctx.llm,
+                        goal=user_goal,
+                        result=result,
+                        tools_used=list(filter(None, tools_used)),
+                    )
                     ctx.results.add_result(
                         goal=user_goal,
-                        summary=result[:500],
-                        tools_used=tools_used,
+                        summary=summary,
+                        tools_used=list(filter(None, tools_used)),
                     )
+                    if ctx.graph_memory_writer is not None:
+                        try:
+                            outcome_text = _task_outcome_text(
+                                goal=user_goal,
+                                summary=summary,
+                                tools_used=list(filter(None, tools_used)),
+                            )
+                            ctx.graph_memory_writer.enqueue(outcome_text, source="task_outcome")
+                        except Exception as _gw_exc:  # noqa: BLE001
+                            logger.debug("%sGraph memory task outcome enqueue failed: %s", pfx, _gw_exc)
                 if ctx.working:
                     ctx.working.clear()
                 return result

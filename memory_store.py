@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -42,6 +43,44 @@ def _cosine_similarity(a: list, b: list) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+def _atomic_save_json(path: str, data: Any, *, attempts: int = 3, base_delay: float = 0.05) -> None:
+    """Write *data* as pretty JSON to *path* atomically with retry.
+
+    Uses a unique same-directory temporary file and ``os.replace`` so an
+    interrupted write cannot corrupt or truncate the existing file. Exponential
+    backoff on ``OSError`` gives local I/O hiccups a chance to clear. Temp files
+    are cleaned up on both success and failure where possible.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = os.path.join(
+        directory,
+        f".{os.path.basename(path)}.{secrets.token_hex(8)}.tmp",
+    )
+    delay = base_delay
+    last_exc: OSError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt < attempts:
+                logger.warning("Atomic save %s attempt %d/%d failed: %s — retrying", path, attempt, attempts, exc)
+                time.sleep(delay)
+                delay *= 2
+            else:
+                logger.error("Atomic save %s failed after %d attempts: %s", path, attempts, exc)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if last_exc is not None:
+        raise last_exc
 
 
 class MemoryStore:
@@ -164,27 +203,8 @@ class MemoryStore:
                 self._save_with_retry()
 
     def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
-        """Write to disk with exponential-backoff retry. Caller must hold _lock."""
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
-        delay = base_delay
-        for attempt in range(1, attempts + 1):
-            try:
-                with open(tmp, "w") as f:
-                    json.dump(self._data, f, indent=2)
-                os.replace(tmp, self.path)
-                return
-            except OSError as exc:
-                if attempt < attempts:
-                    logger.warning("MemoryStore save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
-                    time.sleep(delay)
-                    delay *= 2
-                else:
-                    logger.error("MemoryStore save failed after %d attempts: %s", attempts, exc)
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+        """Write to disk atomically with exponential-backoff retry. Caller must hold _lock."""
+        _atomic_save_json(self.path, self._data, attempts=attempts, base_delay=base_delay)
 
 
 # ---------------------------------------------------------------------------
@@ -292,14 +312,17 @@ class WorkingMemory:
 # ---------------------------------------------------------------------------
 
 class LongTermMemory:
-    """Persisted vector index of important facts.
+    """Legacy JSON vector index of important facts.
 
-    LEGACY / BACKFILL-ONLY (P2 consolidation): this JSON store is no longer
-    written or read at runtime. Runtime semantic recall is served by graph
-    memory (graph_memory.py). This class is retained only so existing
+    BACKFILL-ONLY (G): this class is a migration shim. It is not wired into any
+    runtime controller/scheduler and should not be written by normal runtime
+    code. Runtime semantic recall is served by graph memory (graph_memory.py) and
+    ResultsMemory. The class is retained only so existing
     ``data/longterm_memory.json`` files can be migrated into graph memory via
     ``backfill_graph_memory.py``.
     """
+
+    is_migration_only = True
 
     def __init__(self, path: str, llm=None):
         self.path = path
@@ -309,6 +332,13 @@ class LongTermMemory:
         self._load()
 
     def add(self, content: str, source: str = "manual") -> str:
+        """DEPRECATED: LongTermMemory is read-only migration support.
+
+        Write paths remain only so existing tests and the backfill migration
+        script can operate until the legacy JSON store is fully removed.
+        Runtime code should not call this method.
+        """
+        logger.warning("LongTermMemory.add() is deprecated; write only for migration/backfill")
         entry_id = str(uuid.uuid4())
         vector = []
         if self.llm:
@@ -387,27 +417,82 @@ class LongTermMemory:
                     self._data = {}
 
     def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
-        """Write to disk with exponential-backoff retry. Caller must hold _lock."""
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
-        delay = base_delay
-        for attempt in range(1, attempts + 1):
-            try:
-                with open(tmp, "w") as f:
-                    json.dump(self._data, f, indent=2)
-                os.replace(tmp, self.path)
-                return
-            except OSError as exc:
-                if attempt < attempts:
-                    logger.warning("LongTermMemory save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
-                    time.sleep(delay)
-                    delay *= 2
-                else:
-                    logger.error("LongTermMemory save failed after %d attempts: %s", attempts, exc)
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+        """Write to disk atomically with exponential-backoff retry. Caller must hold _lock."""
+        _atomic_save_json(self.path, self._data, attempts=attempts, base_delay=base_delay)
+
+
+def _task_outcome_text(
+    goal: str,
+    summary: str,
+    tools_used: list[str] | None = None,
+    *,
+    max_len: int = 800,
+) -> str:
+    """Return a bounded, plain-text task outcome for graph/semantic indexing.
+
+    Avoids embedding raw logs, stack traces, or unbounded tool output.
+    """
+    tools = tools_used or []
+    parts = [
+        f"Goal: {goal}",
+        f"Outcome: {summary}",
+    ]
+    if tools:
+        parts.append(f"Tools used: {', '.join(str(t) for t in tools)}")
+    text = "\n".join(parts)
+    if len(text) > max_len:
+        text = text[:max_len].rsplit("\n", 1)[0] if "\n" in text[:max_len] else text[:max_len]
+        text = text.rstrip() + "…"
+    return text
+
+
+def _summarize_result(
+    llm,
+    goal: str,
+    result: str,
+    tools_used: list[str] | None = None,
+    *,
+    max_len: int = 400,
+    fallback_len: int = 300,
+) -> str:
+    """Ask the LLM for a concise task summary; fall back to bounded truncation.
+
+    The prompt asks for 2-3 sentences covering the goal, outcome, key tools, and
+    any unresolved issue. If the LLM call fails, returns empty string, or exceeds
+    the bound, a deterministic fallback is returned instead.
+    """
+    tools = tools_used or []
+    tools_clause = f" Key tools used: {', '.join(str(t) for t in tools)}." if tools else ""
+    prompt = (
+        "Summarize the completed task in 2-3 sentences. Include the goal, the "
+        "outcome, the key tools used, and any unresolved issue. Avoid logs, stack "
+        "traces, raw output, and pleasantries.\n\n"
+        f"Goal: {goal}\n"
+        f"Result: {result[:2000]}{tools_clause}"
+    )
+    try:
+        summary = llm.chat([{"role": "user", "content": prompt}])
+        if not isinstance(summary, str):
+            logger.debug("Finish-path summarization returned non-string: %r", type(summary).__name__)
+            summary = ""
+        else:
+            summary = summary.strip()
+    except Exception as exc:
+        logger.debug("Finish-path summarization failed: %s", exc)
+        summary = ""
+    if not summary or len(summary) > max_len * 3:
+        # Deterministic fallback: head+tail of the raw result plus goal.
+        half = fallback_len // 2
+        if len(result) <= fallback_len:
+            fallback = result
+        else:
+            head = result[:half].rsplit("\n", 1)[0]
+            tail = result[-half:].split("\n", 1)[-1]
+            fallback = f"{head}\n…\n{tail}"
+        summary = f"Goal: {goal}. Outcome: {fallback}"
+        if len(summary) > max_len:
+            summary = summary[:max_len].rstrip() + "…"
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -493,24 +578,5 @@ class ResultsMemory:
                     self._data = {}
 
     def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
-        """Write to disk with exponential-backoff retry. Caller must hold _lock."""
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = f"{self.path}.tmp.{os.getpid()}.{id(self)}"
-        delay = base_delay
-        for attempt in range(1, attempts + 1):
-            try:
-                with open(tmp, "w") as f:
-                    json.dump(self._data, f, indent=2)
-                os.replace(tmp, self.path)
-                return
-            except OSError as exc:
-                if attempt < attempts:
-                    logger.warning("ResultsMemory save attempt %d/%d failed: %s — retrying", attempt, attempts, exc)
-                    time.sleep(delay)
-                    delay *= 2
-                else:
-                    logger.error("ResultsMemory save failed after %d attempts: %s", attempts, exc)
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+        """Write to disk atomically with exponential-backoff retry. Caller must hold _lock."""
+        _atomic_save_json(self.path, self._data, attempts=attempts, base_delay=base_delay)
