@@ -209,3 +209,6 @@ __marimo__/
 
 .github
 data/scheduler_state.json
+
+# Local shell scripts
+set_*.sh
