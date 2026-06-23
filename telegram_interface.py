@@ -10,12 +10,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import html
 import logging
 import os
+import re
+import secrets
 import time
 from functools import partial
 from typing import Callable, Optional
+
+import httpx
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
@@ -37,11 +42,29 @@ from telegram_commands import (
     cmd_start, cmd_help, cmd_status, cmd_stop, cmd_reset, cmd_compress,
     cmd_verbose, cmd_jobs, cmd_agents, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid, cmd_health,
-    cmd_show_ctx, cmd_show_env, cmd_models,
+    cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models,
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
+    cb_deferred, cb_subagent_confirm,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class _DeferredMessage:
+    """A message that arrived while the agent was busy — held for operator decision."""
+
+    task_text: str
+    images: list[str]
+    # Keep a reference to the Telegram message that was deferred so we can
+    # reply to it when the operator decides to run or discard it.
+    source_message: object  # telegram.Message
+    # Owner of this deferred message (original sender's Telegram user id).
+    user_id: int
+    # Unique token embedded in callback_data so each Run/Discard button
+    # targets exactly this deferred entry — prevents an old button from
+    # accidentally running a newer deferred item that replaced this one.
+    token: str
 
 
 class TelegramInterface:
@@ -86,6 +109,20 @@ class TelegramInterface:
 
         # Pairing state: {token: user_id}
         self._pending_pairs: dict[str, int] = {}
+
+        # Per-user interactive agent lock + deferred-message state.
+        # At most one interactive agent run per user at a time.  If a second
+        # message arrives while the lock is held, it is stored here (replacing
+        # any earlier pending item) and the operator is offered Run / Discard
+        # controls once the current task finishes.
+        self._agent_locks: dict[int, asyncio.Lock] = {}
+        # Deferred messages are keyed by a per-message token (not user_id) so
+        # that each Run/Discard button targets exactly the entry it was created
+        # for — an old button cannot accidentally run a newer deferred item.
+        self._deferred_messages: dict[str, _DeferredMessage] = {}
+        # Maps user_id → token of the *latest* deferred item for that user.
+        # Used after a task finishes to find which token's prompt to show.
+        self._current_deferred_token: dict[int, str] = {}
 
         # Verbose mode: send each agent action as a new message instead of editing
         self._verbose: bool = False
@@ -183,11 +220,14 @@ class TelegramInterface:
         # Hidden diagnostic commands (not registered with BotFather)
         app.add_handler(CommandHandler("show_ctx", partial(cmd_show_ctx, self)))
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
+        app.add_handler(CommandHandler("memory", partial(cmd_memory, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
+        app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
+        app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
         app.add_handler(MessageHandler(filters.PHOTO, self._on_file))
@@ -290,13 +330,87 @@ class TelegramInterface:
         logger.info("Message from user %d: %s", user.id, text[:80])
         await self._run_agent_task(update, ctx, text)
 
+    def _get_agent_lock(self, user_id: int) -> asyncio.Lock:
+        """Return (or lazily create) the per-user interactive agent lock."""
+        if user_id not in self._agent_locks:
+            self._agent_locks[user_id] = asyncio.Lock()
+        return self._agent_locks[user_id]
+
     async def _run_agent_task(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str,
         images: Optional[list[str]] = None,
     ) -> None:
-        """Run the agent with a given task, showing streaming progress."""
+        """Run the agent with a given task, showing streaming progress.
+
+        Only one interactive agent run is allowed per user at a time.  If the
+        user sends a second message while the agent is busy, it is stored as a
+        *deferred message* (replacing any earlier pending item) and the operator
+        is offered explicit Run / Discard controls once the current task ends.
+        This prevents concurrent corruption of shared WorkingMemory,
+        ShortTermMemory, and LLMClient state without auto-executing stale intent.
+        """
         user = update.effective_user
-        status_msg = await update.effective_message.reply_text("🔄 Processing…")
+        user_id = user.id if user else 0
+        lock = self._get_agent_lock(user_id)
+
+        # Non-blocking lock attempt: if the agent is already running, defer this
+        # message and return immediately rather than racing the active run.
+        if lock.locked():
+            # Replacing any earlier pending item: drop the previous deferred
+            # entry for this user so its (now stale) Run/Discard button resolves
+            # to "expired" instead of running an outdated message.
+            prev_token = self._current_deferred_token.pop(user_id, None)
+            if prev_token is not None:
+                self._deferred_messages.pop(prev_token, None)
+            deferred_token = secrets.token_hex(8)
+            self._deferred_messages[deferred_token] = _DeferredMessage(
+                task_text=task_text,
+                images=list(images or []),
+                source_message=update.effective_message,
+                user_id=user_id,
+                token=deferred_token,
+            )
+            self._current_deferred_token[user_id] = deferred_token
+            preview = html.escape(task_text[:120] + ("…" if len(task_text) > 120 else ""))
+            logger.info(
+                "User %d: agent busy — message deferred: %s", user_id, task_text[:80]
+            )
+            try:
+                await update.effective_message.reply_text(
+                    f"⏳ <b>Agent is busy</b> — your message was saved.\n\n"
+                    f"<i>{preview}</i>\n\n"
+                    "It will not run automatically (it may be stale after the current task). "
+                    "You can run or discard it once the agent is done.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+        async with lock:
+            await self._run_agent_task_locked(update, ctx, task_text, images, user_id)
+
+        # After releasing the lock, check if a deferred message is waiting.
+        # Use _current_deferred_token to find the latest deferred entry for
+        # this user.  The entry itself remains in _deferred_messages until the
+        # operator presses Run or Discard — the callback is the sole owner of
+        # the pop.
+        pending_token = self._current_deferred_token.pop(user_id, None)
+        if pending_token:
+            deferred = self._deferred_messages.get(pending_token)
+            if deferred:
+                await self._send_deferred_prompt(deferred)
+
+    async def _run_agent_task_locked(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, task_text: str,
+        images: Optional[list[str]], user_id: int,
+    ) -> None:
+        """Inner task runner — called with the per-user lock already held."""
+        user = update.effective_user
+        try:
+            status_msg = await update.effective_message.reply_text("🔄 Processing…")
+        except Exception:
+            return
         loop = asyncio.get_running_loop()
         chat_id = update.effective_chat.id
 
@@ -310,6 +424,71 @@ class TelegramInterface:
                 await asyncio.sleep(4)
 
         typing_task = asyncio.create_task(_typing_loop())
+
+        # --- Scrolling step-log panel state ---
+        _steps: list[tuple[float, str]] = []   # (elapsed_secs, one-line html text)
+        _task_start = time.monotonic()
+        _last_edit_ts: list[float] = [0.0]
+        _step_n: list[int] = [0]
+        _MIN_EDIT_INTERVAL = 1.5
+        _MAX_STEPS = 10
+
+        def _classify(msg: str) -> str:
+            """Return a single-line HTML snippet for a progress message."""
+            from react_loop import _tool_icon  # local import to avoid circular at module level
+            if "Thinking" in msg or msg.startswith("⚙️"):
+                _step_n[0] += 1
+                return "⚙️ <i>Thinking…</i>"
+            if "Running tool:" in msg:
+                # e.g. "🖥️ Running tool: `shell`\n..."
+                name = msg.split("`")[1] if "`" in msg else msg.split(":")[-1].strip()
+                icon = _tool_icon(name.strip())
+                return f"{icon} Running: <code>{html.escape(name.strip())}</code>"
+            if "✅" in msg and "**" in msg:
+                # result line e.g. "🖥️ **shell** ✅\n..."
+                first_line = msg.split("\n")[0]
+                m = re.search(r"\*\*(.+?)\*\*", first_line)
+                if m:
+                    icon_part = first_line[:first_line.index("**")]
+                    suffix = first_line[first_line.rindex("**") + 2:]
+                    return f"{icon_part}<b>{html.escape(m.group(1))}</b>{html.escape(suffix)}"
+                return html.escape(first_line)
+            if "❌" in msg and "**" in msg:
+                first_line = msg.split("\n")[0]
+                m = re.search(r"\*\*(.+?)\*\*", first_line)
+                if m:
+                    icon_part = first_line[:first_line.index("**")]
+                    suffix = first_line[first_line.rindex("**") + 2:]
+                    return f"{icon_part}<b>{html.escape(m.group(1))}</b>{html.escape(suffix)}"
+                return html.escape(first_line)
+            # Fallback: plain first line, truncated
+            first_line = msg.split("\n")[0][:80]
+            return html.escape(first_line)
+
+        def _build_panel() -> str:
+            elapsed = time.monotonic() - _task_start
+            mins, secs = divmod(int(elapsed), 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            header = (
+                f"⚡ <b>Agent working</b>  •  Step {_step_n[0]}  •  {time_str}\n\n"
+            )
+            visible = _steps[-_MAX_STEPS:]
+            lines = []
+            for step_elapsed, rendered in visible:
+                sm, ss = divmod(int(step_elapsed), 60)
+                ts = f"{sm}:{ss:02d}" if sm else f"0:{ss:02d}"
+                lines.append(f"<code>[{ts}]</code> {rendered}")
+            return header + "\n".join(lines)
+
+        def _flush_panel(force: bool = False) -> None:
+            now = time.monotonic()
+            if not force and now - _last_edit_ts[0] < _MIN_EDIT_INTERVAL:
+                return
+            _last_edit_ts[0] = now
+            asyncio.run_coroutine_threadsafe(
+                self._safe_edit_html(status_msg, _build_panel()),
+                loop,
+            )
 
         def progress(msg: str):
             if msg.startswith("__CONFIRM__:"):
@@ -357,39 +536,78 @@ class TelegramInterface:
                     self._send_verbose_event(ctx.bot, chat_id, msg),
                     loop,
                 )
-            else:
-                asyncio.run_coroutine_threadsafe(
-                    self._safe_edit(status_msg, msg),
-                    loop,
-                )
+                return
+            if msg.startswith("__SHELL_CHUNK__:"):
+                # Live shell output chunk — update the last step entry in-place
+                # to show a scrolling tail rather than adding noise to the log.
+                tail_text = msg[len("__SHELL_CHUNK__:"):]
+                tail_lines = [ln for ln in tail_text.splitlines() if ln.strip()][-4:]
+                preview = " ↩ ".join(tail_lines)[:120]
+                if _steps:
+                    elapsed_s, _ = _steps[-1]
+                    _steps[-1] = (elapsed_s, f"🖥️ Running: <code>shell</code>  <i>{html.escape(preview)}</i>")
+                _flush_panel()
+                return
+            # Normal progress: append to step log and (maybe) flush the panel
+            elapsed = time.monotonic() - _task_start
+            _steps.append((elapsed, _classify(msg)))
+            _flush_panel()
 
         try:
             result = await loop.run_in_executor(
                 None,
                 lambda: self.agent_handler(user.id, task_text, progress, images=images),
             )
+            await self._safe_edit_html(status_msg, _build_panel())
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
                 await self._send_safe(update.effective_message, chunk)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
+            await self._safe_edit_html(status_msg, _build_panel())
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
 
-    async def _send_verbose_event(self, bot, chat_id: int, text: str) -> None:
-        """Send a verbose progress event as a new top-level message (not a reply)."""
+    async def _send_deferred_prompt(self, deferred: "_DeferredMessage") -> None:
+        """After the active task finishes, ask the operator what to do with the deferred message."""
+        preview = html.escape(deferred.task_text[:200] + ("…" if len(deferred.task_text) > 200 else ""))
+        img_note = f" + {len(deferred.images)} image(s)" if deferred.images else ""
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Run it",    callback_data=f"deferred_run:{deferred.token}"),
+            InlineKeyboardButton("🗑 Discard",   callback_data=f"deferred_discard:{deferred.token}"),
+        ]])
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=_md_to_html(text)[:4096],
+            await deferred.source_message.reply_text(
+                f"💤 <b>Deferred message{img_note}</b>\n\n<i>{preview}</i>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("Could not send deferred prompt to user %d: %s", deferred.user_id, exc)
+
+    async def _send_verbose_event(self, bot, chat_id: int, text: str) -> None:
+        """Send a verbose progress event as a new top-level message (not a reply).
+
+        The Markdown text is converted to HTML first (escaping <, >, & and
+        rendering code fences / bold), then chunked via split_message() so no
+        content is silently dropped.  Each chunk is a separate Telegram message.
+        """
+        from telegram_formatter import split_message as _split
+        chunks = _split(_md_to_html(text))
+        for chunk in chunks:
             try:
-                await bot.send_message(chat_id=chat_id, text=text[:4096])
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode=ParseMode.HTML,
+                )
             except Exception:
-                pass
+                try:
+                    import html as _html
+                    await bot.send_message(chat_id=chat_id, text=_html.unescape(chunk)[:4096])
+                except Exception:
+                    pass
 
     async def _send_file_to_chat(self, message, file_path: str, caption: str) -> None:
         """Send a local file or photo to the chat (called from the progress callback)."""
@@ -475,6 +693,14 @@ class TelegramInterface:
 
     async def _error_handler(self, update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Global PTB error handler — logs with full context and notifies users."""
+        _network_errs = (
+            httpx.ConnectTimeout,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+        )
+        if isinstance(ctx.error, _network_errs):
+            logger.warning("Network timeout in update handler (transient): %s", ctx.error)
+            return
         logger.error("Unhandled exception in update handler", exc_info=ctx.error)
         # Try to notify the user who triggered the error
         try:
@@ -498,13 +724,48 @@ class TelegramInterface:
             except Exception:
                 pass
 
+    async def _safe_edit_html(self, message, html_text: str) -> None:
+        """Edit a message with pre-built HTML, bypassing _md_to_html conversion.
+
+        Edit-in-place messages have a hard 4096-char Telegram limit and cannot
+        be chunked into multiple messages.  When the content exceeds the limit,
+        the tail is shown (the most recent log lines are most useful).
+        """
+        _LIMIT = 4096
+        if len(html_text) > _LIMIT:
+            # Tail semantics: keep the end; prepend a truncation notice
+            tail = html_text[-(_LIMIT - 60):]
+            html_text = f"<i>[…log truncated, showing tail]</i>\n{tail}"
+        try:
+            await message.edit_text(html_text[:_LIMIT], parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await message.edit_text(html_text[:_LIMIT])
+            except Exception:
+                pass
+
     @staticmethod
     async def _send_safe(message, text: str) -> None:
         """Convert Markdown to HTML and send; fall back to plain text on any error."""
         try:
             await message.reply_text(_md_to_html(text), parse_mode=ParseMode.HTML)
         except Exception:
-            await message.reply_text(text)
+            try:
+                await message.reply_text(text)
+            except Exception:
+                pass
+
+    async def _safe_reply(self, message, text: str, **kwargs) -> bool:
+        """Send a new message; swallow all Telegram/network errors. Returns True on success."""
+        try:
+            await message.reply_text(text, **kwargs)
+            return True
+        except Exception:
+            try:
+                await message.reply_text(text[:4096])
+                return True
+            except Exception:
+                return False
 
     def _is_authorized(self, user_id: int) -> bool:
         if self.security_mode == "allowlist":
@@ -603,11 +864,59 @@ class TelegramInterface:
                 asyncio.run(_send())
             except Exception as exc:
                 logger.error("send_html_to_users fallback failed: %s", exc)
+    def send_subagent_confirmation_prompt(
+        self, token: str, tool_name: str, description: str, caller_tag: str = ""
+    ) -> None:
+        """Send an inline-button confirmation prompt for a headless sub-agent sensitive action.
 
-# ---------------------------------------------------------------------------
-# Module constants
-# ---------------------------------------------------------------------------
+        Safe to call from any thread. Sends to all authorized users because this is a
+        personal single-operator assistant — the operator is reachable on any connected client.
+        """
+        if not self._app:
+            raise RuntimeError("Bot not built yet — cannot send sub-agent confirmation prompt")
+
+        tag_text = f" <i>[{html.escape(caller_tag)}]</i>" if caller_tag else ""
+        # Route the description through the same Markdown→HTML converter used by
+        # the depth-0 confirmation prompt (_send_confirmation_prompt). This
+        # HTML-escapes untrusted content (sensitive paths, file_patch diff lines)
+        # so that file content containing <, >, & cannot break Telegram HTML
+        # parsing — which would make the prompt undeliverable and leave the
+        # blocked sub-agent waiting until the confirmation timeout.
+        html_text = (
+            f"🤖 Sub-agent{tag_text} wants to perform a sensitive file operation:\n\n"
+            f"<b>{html.escape(tool_name)}</b>\n"
+            f"{_md_to_html(description)}\n\n"
+            "Approve or deny this action."
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve", callback_data=f"subconfirm_yes:{token}"),
+            InlineKeyboardButton("❌ Deny", callback_data=f"subconfirm_no:{token}"),
+        ]])
+
+        async def _send():
+            bot = self._app.bot
+            for uid in list(self.allowed_ids):
+                try:
+                    await bot.send_message(
+                        chat_id=uid,
+                        text=html_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                    )
+                except Exception as exc:
+                    logger.warning("Could not send sub-agent confirm prompt to %d: %s", uid, exc)
+
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        else:
+            try:
+                asyncio.run(_send())
+            except Exception as exc:
+                raise RuntimeError(f"send_subagent_confirmation_prompt failed: {exc}") from exc
+
+
 
 # Progress message prefixes that represent agent "actions" (tool calls, results,
 # errors, model switches) — shown as new messages in verbose mode.
-_VERBOSE_EVENT_PREFIXES = ("🔧", "✅ C", "❌", "🛠️", "⚡", "⚠️ ")
+_VERBOSE_EVENT_PREFIXES = ("🔧", "🖥️", "📄", "✏️", "🤖", "🧠", "🌐", "👁️", "✅ C", "❌", "🛠️", "⚡", "⚠️ ")

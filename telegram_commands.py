@@ -126,6 +126,54 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         sched_state = "enabled" if iface.scheduler.enabled else "disabled"
         scheduler_line = f"\n📅 Scheduler: <code>{sched_state}</code> | {enabled}/{total} jobs active"
 
+    # Graph memory state
+    graph_memory_line = ""
+    _gm_store = getattr(iface, "_graph_memory_store", None)
+    _gm_writer = getattr(iface, "_graph_memory_writer", None)
+    _gm_cfg = iface._config.get("graph_memory", {})
+    if _gm_cfg.get("enabled", False):
+        if _gm_store is None:
+            graph_memory_line = "\n🧠 Graph Memory: 🔴 failed (check logs)"
+        else:
+            loop = asyncio.get_event_loop()
+            _ss = await loop.run_in_executor(None, _gm_store.get_stats)
+            _ws = _gm_writer.get_stats() if _gm_writer is not None else {}
+            _ents = _ss.get("entity_count", -1)
+            _rels = _ss.get("relation_count", -1)
+            _eps = _ss.get("episode_count", -1)
+            _hits = _ss.get("retrieval_hits", 0)
+            _misses = _ss.get("retrieval_misses", 0)
+            _worker_ok = _ws.get("worker_alive", True)
+            _q = _ws.get("queue_depth", 0)
+            _wfails = _ws.get("write_failures", 0)
+            _vidx = _ss.get("vector_index_ok", False)
+            # Determine health state
+            if _ents == 0 and _eps == 0:
+                _health = "active-empty"
+                _dot = "🟡"
+            elif _hits > 0:
+                _health = "active-used"
+                _dot = "🟢"
+            elif _ws.get("batches_processed", 0) > 0 or _ws.get("episodes_stored", 0) > 0:
+                _health = "active-learning"
+                _dot = "🟢"
+            else:
+                _health = "active"
+                _dot = "🟢"
+            if not _worker_ok or _wfails > 0 or not _vidx:
+                _health += "-degraded"
+                _dot = "🟠"
+            _counts = (
+                f"{_ents:,} entities · {_rels:,} facts · {_eps:,} episodes"
+                if _ents >= 0 else "counts unavailable"
+            )
+            _writer_info = f"writer {'ok' if _worker_ok else 'stopped'}, queue {_q}"
+            graph_memory_line = (
+                f"\n🧠 Graph Memory: {_dot} <code>{html.escape(_health)}</code> | "
+                f"{_counts} | "
+                f"hits {_hits} / misses {_misses} | {_writer_info}"
+            )
+
     # Current server time
     from datetime import datetime as _dt
     now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -141,6 +189,7 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
         f"{agents_line}"
         f"{scheduler_line}"
+        f"{graph_memory_line}"
         f"{token_line}",
         parse_mode=ParseMode.HTML,
     )
@@ -734,6 +783,86 @@ async def cmd_show_env(iface: "TelegramInterface", update: Update, ctx: ContextT
         await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
 
 
+async def cmd_memory(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hidden command: show graph memory diagnostics (counts, writer health, retrieval stats)."""
+    if not iface._is_authorized(update.effective_user.id):
+        await iface._send_unauthorized(update)
+        return
+
+    _gm_cfg = iface._config.get("graph_memory", {})
+    if not _gm_cfg.get("enabled", False):
+        await update.effective_message.reply_text(
+            "🧠 <b>Graph Memory</b>\n\nDisabled in config (<code>[graph_memory] enabled = false</code>).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    _gm_store = getattr(iface, "_graph_memory_store", None)
+    _gm_writer = getattr(iface, "_graph_memory_writer", None)
+
+    if _gm_store is None:
+        await update.effective_message.reply_text(
+            "🧠 <b>Graph Memory</b>\n\n🔴 Initialisation failed — check logs for details.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    loop = asyncio.get_event_loop()
+    ss = await loop.run_in_executor(None, _gm_store.get_stats)
+    ws = _gm_writer.get_stats() if _gm_writer is not None else {}
+
+    def _v(val: object, suffix: str = "") -> str:
+        if isinstance(val, int) and val < 0:
+            return "N/A"
+        return f"{val:,}{suffix}" if isinstance(val, int) else html.escape(str(val) if val is not None else "N/A")
+
+    store_section = (
+        "<b>📦 Store</b>\n"
+        f"  Entities:  <code>{_v(ss.get('entity_count', -1))}</code>\n"
+        f"  Facts:     <code>{_v(ss.get('relation_count', -1))}</code>\n"
+        f"  Episodes:  <code>{_v(ss.get('episode_count', -1))}</code>\n"
+        f"  Latest:    <code>{html.escape(str(ss.get('latest_episode_ts') or 'none'))}</code>\n"
+        f"  Vec index: <code>{'ok' if ss.get('vector_index_ok') else 'error'}</code>"
+    )
+    if ss.get("stats_error"):
+        store_section += f"\n  ⚠️ <i>{html.escape(ss['stats_error'])}</i>"
+
+    worker_alive = ws.get("worker_alive", "N/A")
+    writer_section = (
+        "<b>✍️ Writer</b>\n"
+        f"  Worker:           <code>{'alive' if worker_alive is True else ('stopped' if worker_alive is False else 'N/A')}</code>\n"
+        f"  Queue depth:      <code>{_v(ws.get('queue_depth', 'N/A'))}</code>\n"
+        f"  Pending depth:    <code>{_v(ws.get('pending_depth', 'N/A'))}</code>\n"
+        f"  Enqueued:         <code>{_v(ws.get('enqueued', 0))}</code>\n"
+        f"  Skipped short:    <code>{_v(ws.get('skipped_short', 0))}</code>\n"
+        f"  Batches queued:   <code>{_v(ws.get('batches_queued', 0))}</code>\n"
+        f"  Batches done:     <code>{_v(ws.get('batches_processed', 0))}</code>\n"
+        f"  Entities stored:  <code>{_v(ws.get('entities_extracted', 0))}</code>\n"
+        f"  Facts stored:     <code>{_v(ws.get('facts_extracted', 0))}</code>\n"
+        f"  Episodes stored:  <code>{_v(ws.get('episodes_stored', 0))}</code>\n"
+        f"  LLM failures:     <code>{_v(ws.get('llm_failures', 0))}</code>\n"
+        f"  Parse failures:   <code>{_v(ws.get('parse_failures', 0))}</code>\n"
+        f"  Write failures:   <code>{_v(ws.get('write_failures', 0))}</code>"
+    )
+
+    retrieval_section = (
+        "<b>🔍 Retrieval</b>\n"
+        f"  Hits:             <code>{_v(ss.get('retrieval_hits', 0))}</code>\n"
+        f"  Misses:           <code>{_v(ss.get('retrieval_misses', 0))}</code>\n"
+        f"  Injections:       <code>{_v(ss.get('context_injections', 0))}</code>"
+    )
+
+    text = (
+        f"🧠 <b>Graph Memory Diagnostics</b>\n\n"
+        f"{store_section}\n\n"
+        f"{writer_section}\n\n"
+        f"{retrieval_section}"
+    )
+    chunk_size = 4096
+    for i in range(0, len(text), chunk_size):
+        await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
+
+
 async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """List configured LLM models and allow switching."""
     if not iface._is_authorized(update.effective_user.id):
@@ -744,13 +873,15 @@ async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         return
 
     models = iface.llm_client.list_models()
+
     lines = [f"🤖 <b>LLM Models</b> ({len(models)} configured)\n"]
     buttons = []
     for m in models:
-        icon = "✅" if m["active"] else "⬜"
+        active_icon = "✅" if m["active"] else "⬜"
         vision_tag = " 👁" if m.get("vision") else ""
         lines.append(
-            f"{icon} <b>{html.escape(m['name'])}</b>: <code>{html.escape(m['model'])}</code>{vision_tag}"
+            f"{active_icon} <b>{html.escape(m['name'])}</b>: "
+            f"<code>{html.escape(m['model'])}</code>{vision_tag}"
         )
         if not m["active"]:
             buttons.append([InlineKeyboardButton(
@@ -919,5 +1050,194 @@ async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: Conte
 
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Run / Discard buttons for a deferred agent message.
+
+    Callback data format:
+      deferred_run:<token>
+      deferred_discard:<token>
+
+    The token is a per-message random hex string that uniquely identifies the
+    deferred entry in iface._deferred_messages.  Using a token instead of
+    user_id ensures that an old button cannot accidentally run a newer deferred
+    item that has since replaced the one the prompt was sent for: when a newer
+    message replaces an older deferred item, the older token is removed, so its
+    stale button resolves to "expired".
+
+    Rejected presses (unauthorized user, or a different owner) are answered with
+    a private callback alert and never edit the shared prompt message, so they
+    cannot destroy the real operator's Run/Discard controls.
+
+    To guard against the operator pressing the button simultaneously from two
+    Telegram clients (mobile + desktop), the deferred entry is popped from
+    iface._deferred_messages atomically — before any await — so only one
+    callback invocation can win the pop; the second sees None and reports
+    "expired".
+    """
+    query = update.callback_query
+
+    data = query.data  # "deferred_run:<token>" or "deferred_discard:<token>"
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        try:
+            await query.answer()
+        except Exception as exc:
+            logger.warning("cb_deferred query.answer() failed: %s", exc)
+        return
+
+    action, token = parts
+
+    # Authorization: only the authorized operator may press these buttons.
+    # Reject with a private callback alert (do NOT edit the shared prompt
+    # message — that would let an unauthorized presser destroy the operator's
+    # Run/Discard controls in a group chat).
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Ownership check — purely synchronous, no awaits.
+    # Peek at the entry to verify the caller is the owner before touching state.
+    peeked = iface._deferred_messages.get(token)
+    if peeked is not None and caller_id != peeked.user_id:
+        try:
+            await query.answer("⛔ This is not your deferred message.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Atomically consume the entry **before** any await so that concurrent
+    # callback presses from multiple Telegram clients for the same account
+    # (same user_id) cannot both see a non-None deferred and both execute
+    # the action.  asyncio is single-threaded but yields at every await, so
+    # the pop must happen before the first yield to be atomic.
+    # Whichever callback invocation pops first wins; the second gets None and
+    # will report "expired" below.
+    deferred = iface._deferred_messages.pop(token, None)
+    if deferred is not None:
+        if iface._current_deferred_token.get(deferred.user_id) == token:
+            iface._current_deferred_token.pop(deferred.user_id, None)
+
+    # Dismiss the button spinner now that state has been atomically committed.
+    try:
+        await query.answer()
+    except Exception as exc:
+        logger.warning("cb_deferred query.answer() failed: %s", exc)
+
+    if action == "deferred_discard" or deferred is None:
+        try:
+            await query.edit_message_text(
+                "🗑 <b>Deferred message discarded.</b>" if deferred is not None else "⚠️ Deferred message expired.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # action == "deferred_run"
+    try:
+        await query.edit_message_text(
+            "▶️ <b>Running deferred message…</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    # Re-use the original source_message as the effective message so progress
+    # replies thread correctly beneath it.  Build a minimal Update-like wrapper
+    # that _run_agent_task can use.
+    #
+    # We re-enter _run_agent_task which will acquire the per-user lock normally.
+    # If the lock is already held again (another message raced in), the deferred
+    # run itself will be deferred — handled correctly by the same mechanism.
+    class _FakeUpdate:
+        """Minimal Update stand-in that provides just what _run_agent_task needs."""
+        def __init__(self, message, uid):
+            self.effective_message = message
+            self.effective_chat = message.chat if hasattr(message, "chat") else message
+            self.effective_user = type("_U", (), {"id": uid})()
+
+    fake_update = _FakeUpdate(deferred.source_message, deferred.user_id)
+    await iface._run_agent_task(fake_update, ctx, deferred.task_text, deferred.images or None)
+
+
+async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Approve/Deny buttons for headless sub-agent sensitive file operations.
+
+    Callback data format:
+      subconfirm_yes:<token>
+      subconfirm_no:<token>
+
+    Authorization and same-operator double-press safety mirror cb_deferred:
+    - Unauthorized presses get a private alert and do not edit the prompt.
+    - The signal method atomically pops the event, so a double-press from
+      two Telegram clients (same user_id) only signals once; the second press
+      receives an "already resolved" alert.
+    """
+    query = update.callback_query
+
+    data = query.data  # "subconfirm_yes:<token>" or "subconfirm_no:<token>"
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    action, token = parts
+    approved = action == "subconfirm_yes"
+
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Access the shared BuiltinExecutor through the wired agent.
+    builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
+    if builtin is None:
+        try:
+            await query.answer("⚠️ Executor not available.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Atomically signal the executor (pops the event before any await).
+    # Returns False if the token was already resolved or expired.
+    signalled = builtin.signal_headless_confirm(token, approved)
+
+    try:
+        await query.answer()
+    except Exception as exc:
+        logger.warning("cb_subagent_confirm query.answer() failed: %s", exc)
+
+    if not signalled:
+        try:
+            await query.edit_message_text(
+                "⚠️ Sub-agent confirmation already resolved or expired.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    action_label = "✅ Approved" if approved else "❌ Denied"
+    try:
+        await query.edit_message_text(
+            f"{action_label} — sub-agent sensitive file operation.",
+            parse_mode=ParseMode.HTML,
+        )
     except Exception:
         pass

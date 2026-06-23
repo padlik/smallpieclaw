@@ -175,9 +175,11 @@ except ImportError:
 
 from agent_controller import AgentController, SubAgentRunner  # noqa: E402
 from builtin_executor import BuiltinExecutor, _load_context  # noqa: E402
+from config_schema import resolve_model_id  # noqa: E402
+from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
-from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, LongTermMemory, ResultsMemory  # noqa: E402
+from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
 from telegram_interface import TelegramInterface  # noqa: E402
@@ -196,20 +198,24 @@ def load_config(path="config.toml"):
         cfg = tomli.load(f)
     logger.info("Configuration loaded from %s", path)
 
-    # Validate config structure early — fail fast with clear error messages
+    # Validate config structure early — fail fast with clear error messages.
+    # parse_config() also expands ${VAR}/${VAR:-default} placeholders; we return
+    # the resolved dict so all runtime consumers see plain values, not literals.
+    # The typed AppConfig is returned too so callers never need to re-parse (a
+    # second parse would re-scan already-substituted values, which is wrong).
     from config_schema import parse_config
     from exceptions import ConfigError
     try:
-        parse_config(cfg)
+        app_cfg = parse_config(cfg)
     except ConfigError as exc:
         logger.error("Configuration error: %s", exc)
         sys.exit(1)
 
-    return cfg
+    return app_cfg._raw, app_cfg
 
 
 def main():
-    cfg = load_config()
+    cfg, app_cfg = load_config()
 
     paths = cfg.get("paths", {})
     tools_dir     = paths.get("tools_dir", "tools")
@@ -217,7 +223,6 @@ def main():
     data_dir      = paths.get("data_dir", "data")
     index_path    = paths.get("tool_index_file", "data/tool_index.json")
     memory_path   = paths.get("memory_file", "data/memory.json")
-    longterm_path = paths.get("longterm_memory_file", "data/longterm_memory.json")
     results_path  = paths.get("results_memory_file", "data/results_memory.json")
     scheduler_config_path = paths.get("scheduler_config", "scheduler.toml")
     skills_dir    = paths.get("skills_dir", "skills")
@@ -236,10 +241,10 @@ def main():
 
     with _PidFileLock(pid_file):
         _run(
-            cfg=cfg, paths=paths,
+            cfg=cfg, app_cfg=app_cfg, paths=paths,
             tools_dir=tools_dir, gen_tools_dir=gen_tools_dir, data_dir=data_dir,
             index_path=index_path, memory_path=memory_path,
-            longterm_path=longterm_path, results_path=results_path,
+            results_path=results_path,
             scheduler_config_path=scheduler_config_path, skills_dir=skills_dir,
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,
             log_file=log_file, log_backup_count=log_backup_count,
@@ -247,9 +252,9 @@ def main():
 
 
 def _run(
-    cfg, paths,
+    cfg, app_cfg, paths,
     tools_dir, gen_tools_dir, data_dir,
-    index_path, memory_path, longterm_path, results_path,
+    index_path, memory_path, results_path,
     scheduler_config_path, skills_dir,
     downloads_dir, tmp_dir,
     log_file, log_backup_count,
@@ -277,6 +282,10 @@ def _run(
     ctx_max_tokens = agent_cfg.get("ctx_max_tokens", 90_000)
     max_subagents = agent_cfg.get("max_subagents", 6)
     subagent_result_timeout = agent_cfg.get("subagent_result_timeout", 300)
+    shell_backend = agent_cfg.get("shell_backend", "subprocess")
+    shell_pty_cols = int(agent_cfg.get("shell_pty_cols", 220))
+    shell_pty_rows = int(agent_cfg.get("shell_pty_rows", 50))
+    shell_streaming = bool(agent_cfg.get("shell_streaming", False))
     # Separate step cap for scheduled/background agents (chat sessions use max_iter)
     _raw_sched_max = agent_cfg.get("scheduled_max_iterations", 100)
     scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
@@ -295,6 +304,8 @@ def _run(
     builtin  = BuiltinExecutor(
         default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,
         max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
+        shell_backend=shell_backend, shell_pty_cols=shell_pty_cols, shell_pty_rows=shell_pty_rows,
+        shell_streaming=shell_streaming,
     )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
@@ -324,8 +335,11 @@ def _run(
 
     short_term  = ShortTermMemory(max_turns=20)
     working     = WorkingMemory()
-    long_term   = LongTermMemory(path=longterm_path, llm=llm)
     results_mem = ResultsMemory(path=results_path, llm=llm)
+    # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime
+    # agents (P2 consolidation). Runtime semantic recall is served by graph
+    # memory; the legacy JSON store is migration/backfill-only via
+    # backfill_graph_memory.py.
 
     skills = SkillRegistry(skills_dir=skills_dir)
     logger.info("Loaded %d skill(s) from %s", skills.count(), skills_dir)
@@ -341,7 +355,6 @@ def _run(
         ctx_max_tokens=ctx_max_tokens,
         short_term=short_term,
         working=working,
-        long_term=long_term,
         results=results_mem,
         builtin_executor=builtin,
         skill_registry=skills,
@@ -376,11 +389,12 @@ def _run(
     # Resolve background_model for sub-agents
     background_model_id = agent_cfg.get("background_model") or agent_cfg.get("default_model", "")
     all_models = cfg.get("models", [])
+    _bg_resolved = resolve_model_id(background_model_id, all_models)
     background_model_cfg = next(
-        (m for m in all_models if m.get("model") == background_model_id),
+        (m for m in all_models if m.get("model") == _bg_resolved),
         all_models[0] if all_models else {},
     )
-    if background_model_id and background_model_cfg.get("model") != background_model_id:
+    if background_model_id and background_model_cfg.get("model") != _bg_resolved:
         logger.warning(
             "background_model '%s' not found in [[models]]. Falling back to '%s'.",
             background_model_id,
@@ -389,11 +403,13 @@ def _run(
 
     def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
                           fallback_models=None, max_iterations=None,
-                          max_tokens=None, temperature=None, top_p=None):
+                          max_tokens=None, temperature=None, top_p=None,
+                          on_tool_trace=None, cancel_event=None, trace_id=None):
         """Create an isolated SubAgentRunner with the requested model override."""
-        # Resolve model config
+        # Resolve model config — accept full model ID, model name, or alias
         if model:
-            model_cfg = next((m for m in all_models if m.get("model") == model), None)
+            resolved = resolve_model_id(model, all_models)
+            model_cfg = next((m for m in all_models if m.get("model") == resolved), None)
             if model_cfg is None:
                 raise ValueError(
                     f"Model '{model}' not found in [[models]]. "
@@ -430,7 +446,6 @@ def _run(
             builtin_executor=builtin,
             skill_registry=skills,
             mcp_manager=mcp_manager,
-            long_term=long_term,
             results=results_mem,
             short_term=pre_loaded_ctx,
             notify_fn=notify_fn or notify,
@@ -444,6 +459,9 @@ def _run(
             usage_registry=get_token_registry(),
             depth=1,
             fallback_models=fallback_models,
+            on_tool_trace=on_tool_trace,
+            cancel_event=cancel_event,
+            trace_id=trace_id,
         )
         return runner
 
@@ -455,10 +473,45 @@ def _run(
         cfg, notify_fn=notify,
         scheduler_config_path=scheduler_config_path,
         data_dir=data_dir,
-        long_term_memory=long_term,
         builtin_executor=builtin,
     )
     builtin.scheduler = scheduler  # wire scheduler into built-in tool
+    # Give the main agent access to scheduled job execution history
+    agent._job_history_fn = scheduler.execution_log.format_for_prompt
+
+    # Initialise graph memory (opt-in — only when enabled in config and ladybug installed)
+    graph_memory_store = None
+    graph_memory_writer = None
+    try:
+        if app_cfg.graph_memory.enabled:
+            from graph_memory import build_extraction_llm_call as _build_extraction_llm_call
+
+            def _embedder_fn(text: str) -> list[float]:
+                return llm.embed(text)
+
+            _llm_call_fn = _build_extraction_llm_call(cfg, app_cfg, all_models)
+
+            graph_memory_store, graph_memory_writer = create_graph_memory(
+                cfg=app_cfg,
+                embedder_fn=_embedder_fn,
+                llm_call_fn=_llm_call_fn,
+                embedding_dim=len(llm.embed("test")),
+            )
+            if graph_memory_store is not None:
+                # Wire into agent (main react_loop context)
+                agent._graph_memory = graph_memory_store
+                agent._graph_memory_writer = graph_memory_writer
+                agent._graph_memory_max_entries = app_cfg.graph_memory.max_context_entries
+                # Wire into builtin executor for memory_graph_search/store tools
+                builtin._graph_memory = graph_memory_store
+                builtin._graph_memory_writer = graph_memory_writer
+                logger.info(
+                    "Graph memory enabled (db=%s, extraction_model=%s)",
+                    app_cfg.graph_memory.db_path,
+                    app_cfg.graph_memory.extraction_model or app_cfg.agent.default_model,
+                )
+    except Exception as _gm_init_exc:
+        logger.warning("Graph memory initialisation failed (continuing without it): %s", _gm_init_exc)
 
     logger.info("Starting Telegram bot...")
     tg = TelegramInterface(
@@ -475,6 +528,13 @@ def _run(
         mcp_manager=mcp_manager,
     )
     tg.agent = agent  # wire agent for confirm/resume and /models
+    tg._graph_memory_store = graph_memory_store
+    tg._graph_memory_writer = graph_memory_writer
+
+    # Wire the sub-agent Telegram confirmation bridge into the built-in executor.
+    # Sub-agents running sensitive file operations will call this to ask the
+    # operator for approval via inline buttons before executing.
+    builtin._subagent_confirm_prompt_fn = tg.send_subagent_confirmation_prompt
 
     scheduler.start()
     try:
@@ -484,6 +544,16 @@ def _run(
     finally:
         scheduler.stop()
         builtin.shutdown()
+        if graph_memory_writer is not None:
+            try:
+                graph_memory_writer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if graph_memory_store is not None:
+            try:
+                graph_memory_store.close()
+            except Exception:  # noqa: BLE001
+                pass
         llm.close()
         if mcp_manager:
             mcp_manager.close_all()

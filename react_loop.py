@@ -24,14 +24,45 @@ from typing import Callable, Optional
 from confirmation import ConfirmationManager
 from context_manager import maybe_compact
 from llm_client import LLMClient, LLMCancelledError, _encode_images
+from memory_store import _summarize_result, _task_outcome_text
 from prompt_builder import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
+
+_TOOL_ICONS: dict[str, str] = {
+    "shell":            "🖥️",
+    "file_read":        "📄",
+    "file_write":       "✏️",
+    "file_append":      "✏️",
+    "spawn_agent":      "🤖",
+    "get_agent_result": "🤖",
+    "memory_write":     "🧠",
+    "memory_read":      "🧠",
+    "web_fetch":        "🌐",
+    "http_request":     "🌐",
+    "vision_query":     "👁️",
+}
+_DEFAULT_TOOL_ICON = "🔧"
+
+
+def _tool_icon(name: str) -> str:
+    return _TOOL_ICONS.get(name, _DEFAULT_TOOL_ICON)
 
 
 # ---------------------------------------------------------------------------
 # Context object — bundles all dependencies for the loop
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolTrace:
+    """Record of a single tool call made during agent execution."""
+    tool_name: str
+    args_repr: str      # compact summary of args, never raw file contents
+    success: bool
+    duration_ms: float
+    error: str = ""     # only populated when success=False
+    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -59,6 +90,11 @@ class ReactContext:
     depth: int = 0
     label: str = "main"
 
+    # Request-scoped trace ID for correlating one run across LLM, tool, and
+    # confirmation log lines. Defaulted so test/standalone constructors that omit
+    # it still work; AgentController.run() assigns a fresh ID per run.
+    trace_id: str = ""
+
     # Memory layers
     short_term: object = None   # Optional ShortTermMemory
     working: object = None      # Optional WorkingMemory
@@ -67,15 +103,45 @@ class ReactContext:
     # Cancellation
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
+    # Whether this loop owns its cancel_event. When False (event is shared,
+    # e.g. a stop signal forwarded into sub-agents), react_loop
+    # must NOT clear it at startup — doing so would erase a stop request that
+    # arrived just before/while the sub-agent began running.
+    owns_cancel_event: bool = True
+
     # Step callback
     on_step: Optional[Callable[[int], None]] = None
+
+    # Tool trace callback — called after each tool dispatch with a ToolTrace record
+    on_tool_trace: Optional[Callable] = None  # Optional[Callable[[ToolTrace], None]]
+
+    # Scheduled job history — called to get a formatted string for the system prompt
+    job_history_fn: Optional[Callable[[], str]] = None
+
+    # Graph memory — Optional[GraphMemoryStore]; None when feature is disabled
+    graph_memory: Optional[object] = None
+
+    # Graph memory writer — Optional[GraphMemoryWriter]; for enqueuing new messages
+    graph_memory_writer: Optional[object] = None
+
+    # Max graph context entries to inject per turn
+    graph_memory_max_entries: int = 10
 
     # Confirmation coordination (shared with AgentController and Telegram)
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
 
     @property
     def log_prefix(self) -> str:
+        if self.trace_id:
+            return f"[{self.label} {self.trace_id}] "
         return f"[{self.label}] "
+
+    @property
+    def caller_tag(self) -> str:
+        """Label + trace ID for downstream log tags (executors wrap in brackets)."""
+        if self.trace_id:
+            return f"{self.label} {self.trace_id}"
+        return self.label
 
 
 # ---------------------------------------------------------------------------
@@ -165,45 +231,60 @@ def fmt_tool_call(tool_name: str, args: dict) -> str:
     """Format a tool call as a compact, readable string for progress display."""
     if tool_name == "shell":
         cmd = args.get("command", "")
-        return f"<blockquote>$ {cmd}</blockquote>"
+        return f"```\n$ {cmd}\n```"
     if tool_name == "file_read":
-        return f"<blockquote>read: {args.get('path', '?')}</blockquote>"
+        return f"```\nread: {args.get('path', '?')}\n```"
     if tool_name == "file_write":
         path = args.get("path", "?")
         size = len(args.get("content", ""))
-        return f"<blockquote>write: {path} ({size} bytes)</blockquote>"
+        return f"```\nwrite: {path} ({size} bytes)\n```"
     try:
         arg_str = json.dumps(args, ensure_ascii=False)
     except Exception:
         arg_str = str(args)
     if len(arg_str) > 200:
         arg_str = arg_str[:197] + "…"
-    return f"<blockquote>{arg_str}</blockquote>" if arg_str and arg_str != "{}" else ""
+    return f"```\n{arg_str}\n```" if arg_str and arg_str != "{}" else ""
 
 
 def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
     """Format a tool result as a short progress update."""
     call = fmt_tool_call(tool_name, args)
+    log_note = ""
+    if outcome.get("full_log_path"):
+        log_note = f"\n📄 full log: `{outcome['full_log_path']}`"
     if outcome["success"]:
         out = (outcome.get("output") or "").strip()
-        if out:
-            lines = out.splitlines()
-            preview = "\n".join(lines[:8])
-            if len(lines) > 8 or len(preview) > 400:
-                preview = preview[:400] + "\n…"
-            return f"🔧 <b>{tool_name}</b> ✅\n{call}\n<blockquote>{preview}</blockquote>"
-        return f"🔧 <b>{tool_name}</b> ✅\n{call}\n<i>(no output)</i>"
+        # Include stderr even on success (warnings, compiler diagnostics, etc.)
+        err = (outcome.get("error") or "").strip()
+        combined = "\n".join(filter(None, [out, ("--- stderr ---\n" + err) if err else ""]))
+        if combined:
+            lines = combined.splitlines()
+            # Tail semantics: show the last 8 lines (errors/results appear at the end)
+            if len(lines) > 8:
+                preview = "…\n" + "\n".join(lines[-8:])
+            else:
+                preview = "\n".join(lines)
+            if len(preview) > 400:
+                preview = "…" + preview[-399:]
+            return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n```\n{preview}\n```{log_note}"
+        return f"{_tool_icon(tool_name)} **{tool_name}** ✅\n{call}\n_(no output)_{log_note}"
     else:
         err = (outcome.get("error") or outcome.get("output") or "failed").strip()
         if len(err) > 300:
-            err = err[:297] + "…"
-        return f"🔧 <b>{tool_name}</b> ❌\n{call}\n<blockquote>{err}</blockquote>"
+            # Tail semantics for errors too
+            err = "…" + err[-297:]
+        return f"{_tool_icon(tool_name)} **{tool_name}** ❌\n{call}\n```\n{err}\n```{log_note}"
 
 
 def format_tool_result(tool_name: str, outcome: dict) -> str:
     """Format a tool result as a message for the LLM."""
     if outcome["success"]:
         output = outcome["output"] or "(no output)"
+        # Include stderr even for successful commands; warnings/diagnostics matter.
+        stderr = (outcome.get("error") or "").strip()
+        if stderr:
+            return f"Tool '{tool_name}' succeeded:\n{output}\nstderr:\n{stderr}"
         return f"Tool '{tool_name}' succeeded:\n{output}"
     else:
         parts = [f"Tool '{tool_name}' failed (exit {outcome.get('exit_code', '?')})."]
@@ -268,7 +349,8 @@ def react_loop(
             progress_callback(msg)
         logger.debug("%sAgent progress: %s", pfx, msg)
 
-    ctx.cancel_event.clear()
+    if ctx.owns_cancel_event:
+        ctx.cancel_event.clear()
 
     active_model = ctx.llm.llm_cfg.get("model", "?")
     logger.info("%sstart | model: %s | goal: %s", pfx, active_model, user_goal[:80])
@@ -277,6 +359,28 @@ def react_loop(
         ctx.working.start_task(user_goal)
 
     # 1. Build system prompt
+    _job_history_section = ""
+    if ctx.job_history_fn:
+        try:
+            _job_history_section = ctx.job_history_fn() or ""
+        except Exception as _jh_exc:
+            logger.warning("%sFailed to get job history: %s", pfx, _jh_exc)
+
+    _graph_context_section = ""
+    if ctx.graph_memory is not None:
+        try:
+            _graph_context_section = (
+                ctx.graph_memory.format_for_prompt(
+                    user_goal, max_entries=ctx.graph_memory_max_entries
+                ) or ""
+            )
+            if _graph_context_section:
+                logger.info("%sGraph memory context injected", pfx)
+            else:
+                logger.debug("%sGraph memory context: no relevant data found", pfx)
+        except Exception as _gm_exc:
+            logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
+
     system, _ = _build_system_prompt(
         tool_index=ctx.tool_index,
         memory=ctx.memory,
@@ -289,6 +393,11 @@ def react_loop(
         log_backup_count=ctx.log_backup_count,
         top_tools=ctx.top_tools,
         user_goal=user_goal,
+        job_history_section=_job_history_section,
+        graph_context_section=_graph_context_section,
+        # Suppress ResultsMemory recall when graph memory already supplied
+        # semantic context this turn — avoids redundant/overlapping recall.
+        results_top_k=0 if _graph_context_section else 2,
     )
 
     first_msg: dict = {"role": "user", "content": user_goal}
@@ -302,6 +411,13 @@ def react_loop(
     messages.append(first_msg)
 
     ctx.memory.record_event(f"User request: {user_goal[:100]}")
+
+    # Enqueue user message for background graph extraction (fire-and-forget)
+    if ctx.graph_memory_writer is not None:
+        try:
+            ctx.graph_memory_writer.enqueue(user_goal, source="chat")
+        except Exception as _gw_exc:  # noqa: BLE001
+            logger.debug("%sGraph memory enqueue failed: %s", pfx, _gw_exc)
 
     # 2. ReAct loop
     max_steps = ctx.max_iterations
@@ -362,16 +478,16 @@ def react_loop(
                 )
                 if json_fail_streak >= _JSON_FAIL_LIMIT:
                     logger.error(
-                        "%sNon-JSON streak reached %d — coercing to finish action",
+                        "%sNon-JSON streak reached %d — aborting with protocol error",
                         pfx, json_fail_streak,
                     )
-                    action_obj = {
-                        "action": "finish",
-                        "result": (
-                            f"⚠️ Model returned non-JSON {json_fail_streak} times in a row. "
-                            f"Last response (truncated): {raw[:500]}"
-                        ),
-                    }
+                    err_msg = (
+                        f"❌ Agent protocol error: model returned non-JSON "
+                        f"{json_fail_streak} times in a row. "
+                        f"Last response (truncated to 500 chars): {raw[:500]}"
+                    )
+                    _progress(err_msg)
+                    return err_msg
                 else:
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({
@@ -436,21 +552,48 @@ def react_loop(
                         for s in ctx.working.steps
                         if s["action"] == "tool"
                     ]
+                    summary = _summarize_result(
+                        ctx.llm,
+                        goal=user_goal,
+                        result=result,
+                        tools_used=list(filter(None, tools_used)),
+                    )
                     ctx.results.add_result(
                         goal=user_goal,
-                        summary=result[:500],
-                        tools_used=tools_used,
+                        summary=summary,
+                        tools_used=list(filter(None, tools_used)),
                     )
+                    if ctx.graph_memory_writer is not None:
+                        try:
+                            outcome_text = _task_outcome_text(
+                                goal=user_goal,
+                                summary=summary,
+                                tools_used=list(filter(None, tools_used)),
+                            )
+                            ctx.graph_memory_writer.enqueue(outcome_text, source="task_outcome")
+                        except Exception as _gw_exc:  # noqa: BLE001
+                            logger.debug("%sGraph memory task outcome enqueue failed: %s", pfx, _gw_exc)
                 if ctx.working:
                     ctx.working.clear()
                 return result
 
             elif action == "tool":
+                _t0 = time.time()
                 outcome = _dispatch_tool(ctx, action_obj, _progress)
+                _duration_ms = (time.time() - _t0) * 1000
                 tool_name = action_obj.get("tool", "")
                 args = action_obj.get("args", {})
                 if isinstance(args, list):
                     args = {str(i): v for i, v in enumerate(args)}
+
+                if ctx.on_tool_trace is not None:
+                    ctx.on_tool_trace(ToolTrace(
+                        tool_name=tool_name,
+                        args_repr=_compact_args_repr(tool_name, args),
+                        success=outcome["success"],
+                        duration_ms=round(_duration_ms, 1),
+                        error=outcome.get("error", "") if not outcome["success"] else "",
+                    ))
 
                 if ctx.working:
                     ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
@@ -521,6 +664,20 @@ def react_loop(
 # ---------------------------------------------------------------------------
 
 
+def _compact_args_repr(tool_name: str, args: dict, max_len: int = 200) -> str:
+    """Build a compact, single-line summary of tool arguments (never raw file contents)."""
+    skip_keys = {"code", "content", "text", "body", "data"}
+    parts = []
+    for k, v in args.items():
+        if k in skip_keys:
+            parts.append(f"{k}=<{len(str(v))}chars>")
+        else:
+            s = str(v)
+            parts.append(f"{k}={s[:60]}{'…' if len(s) > 60 else ''}")
+    summary = ", ".join(parts)
+    return summary[:max_len] + ("…" if len(summary) > max_len else "")
+
+
 def _dispatch_tool(
     ctx: ReactContext,
     action_obj: dict,
@@ -536,7 +693,7 @@ def _dispatch_tool(
     if isinstance(args, list):
         args = {str(i): v for i, v in enumerate(args)}
 
-    _progress(f"🔧 Running tool: <code>{tool_name}</code>\n{fmt_tool_call(tool_name, args)}")
+    _progress(f"{_tool_icon(tool_name)} Running tool: `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
 
     # vision_query handled directly (needs LLM access)
     if tool_name == "vision_query":
@@ -544,7 +701,30 @@ def _dispatch_tool(
 
     # Built-in tools
     if ctx.builtin_executor and ctx.builtin_executor.is_builtin(tool_name):
-        outcome = ctx.builtin_executor.execute(tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.label)
+        # For shell tool with streaming enabled, create a live-chunk callback.
+        chunk_callback: Optional[Callable[[str], None]] = None
+        if (tool_name == "shell"
+                and getattr(ctx.builtin_executor, "_shell_streaming", False)):
+            # Keep only a bounded rolling tail (last few lines) rather than the
+            # full output history — avoids O(n²) re-joins and unbounded memory
+            # growth on high-output commands. We only ever display the tail.
+            _tail_buf: list[str] = [""]
+
+            def _on_chunk(chunk: str) -> None:
+                merged = _tail_buf[0] + chunk
+                # Retain only the last 8 line-segments, and cap total length to
+                # guard against a single very long line with no newlines.
+                lines = merged.rsplit("\n", 8)
+                tail = "\n".join(lines[-8:])[-2000:]
+                _tail_buf[0] = tail
+                # Emit a special-prefixed progress message so the UI handler can
+                # update the live tail without adding new panel steps.
+                _progress(f"__SHELL_CHUNK__:{tail}")
+
+            chunk_callback = _on_chunk
+
+        outcome = ctx.builtin_executor.execute(tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
+                                                chunk_callback=chunk_callback, trace_id=ctx.trace_id)
 
         if outcome.get("requires_confirmation"):
             token = outcome["token"]
@@ -555,16 +735,16 @@ def _dispatch_tool(
                     "%sAuto-approving '%s' (operator approved all %s)",
                     pfx, tool_name, tool_name,
                 )
-                outcome = ctx.builtin_executor.confirm(token)
-                _progress(f"✅ Auto-approved <code>{tool_name}</code> (approve-all active)")
+                outcome = ctx.builtin_executor.confirm(token, chunk_callback=chunk_callback)
+                _progress(f"✅ Auto-approved `{tool_name}` (approve-all active)")
             else:
                 result_confirmed = ctx.confirmation.request_confirmation(
                     token, tool_name, description, _progress,
                 )
 
                 if result_confirmed:
-                    outcome = ctx.builtin_executor.confirm(token)
-                    _progress(f"✅ Confirmed — executing <code>{tool_name}</code>\n{fmt_tool_call(tool_name, args)}")
+                    outcome = ctx.builtin_executor.confirm(token, chunk_callback=chunk_callback)
+                    _progress(f"✅ Confirmed — executing `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
                 else:
                     ctx.builtin_executor.cancel(token)
                     outcome = {
@@ -611,15 +791,15 @@ def _dispatch_create_tool(
                 f"Tool '{result['name']}' was created successfully at {result['path']}. "
                 "You can now use it with the 'tool' action."
             )
-            _progress(f"🛠️ Tool Created: <code>{result['name']}</code>\n✅ {description}")
+            _progress(f"🛠️ Tool Created: `{result['name']}`\n✅ {description}")
         else:
             feedback = f"Tool creation failed: {result['error']}"
-            _progress(f"🛠️ Tool Creation Failed: <code>{tool_name}</code>\n❌ {result['error']}")
+            _progress(f"🛠️ Tool Creation Failed: `{tool_name}`\n❌ {result['error']}")
         logger.info("Tool creation '%s': %s", tool_name, result)
         return feedback, False
 
     elif tc_action == "run":
-        _progress(f"⚡ Running <code>{tool_name}</code> as one-off script…")
+        _progress(f"⚡ Running `{tool_name}` as one-off script…")
         try:
             if language == "python":
                 proc = subprocess.run(
@@ -634,7 +814,7 @@ def _dispatch_create_tool(
             output = (proc.stdout or "") + (proc.stderr or "")
             output = output[:2000]
             feedback = f"Script executed (exit {proc.returncode}):\n{output}" if output else f"Script executed (exit {proc.returncode}), no output."
-            _progress(f"⚡ Script result (exit {proc.returncode}):\n<blockquote>{output[:400]}</blockquote>" if output else "⚡ Script ran, no output.")
+            _progress(f"⚡ Script result (exit {proc.returncode}):\n```\n{output[:400]}\n```" if output else "⚡ Script ran, no output.")
         except Exception as exc:
             feedback = f"Script execution failed: {exc}"
             _progress(f"❌ Script failed: {exc}")

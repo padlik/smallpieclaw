@@ -16,17 +16,77 @@ user responds.
 
 from __future__ import annotations
 
+import codecs
+import difflib
 import html as _html_mod
 import logging
 import os
 import re
 import secrets
+import signal
 import subprocess
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+_CONTEXT_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
+def _validate_context_key(context_key: str) -> str:
+    """Validate a sub-agent context key before using it as a file stem."""
+    if not isinstance(context_key, str) or not _CONTEXT_KEY_RE.fullmatch(context_key):
+        raise ValueError(
+            "context_key must be 1-128 chars: letters, digits, underscore, dash, or dot; "
+            "it must start with a letter or digit"
+        )
+    if context_key in {".", ".."}:
+        raise ValueError("context_key cannot be '.' or '..'")
+    return context_key
+
+
+def _context_path(context_key: str, data_dir: str) -> str:
+    """Return the absolute context path, rejecting path traversal."""
+    safe_key = _validate_context_key(context_key)
+    ctx_dir = os.path.abspath(os.path.join(data_dir, "job_contexts"))
+    path = os.path.abspath(os.path.join(ctx_dir, f"{safe_key}.json"))
+    if os.path.commonpath([ctx_dir, path]) != ctx_dir:
+        raise ValueError("context_key resolves outside job_contexts")
+    return path
+
+
+def _truncate_output(text: str, limit: int) -> str:
+    """Truncate *text* to at most *limit* chars, keeping the tail.
+
+    Tail semantics are intentional: for build, test, and script output the
+    useful information (errors, results, summaries) almost always appears near
+    the end.  When truncation occurs a clear marker is prepended so the LLM
+    knows data was omitted.
+    """
+    if len(text) <= limit:
+        return text
+    kept = text[-limit:]
+    omitted = len(text) - limit
+    return f"[...{omitted} chars omitted, showing last {limit} chars...]\n{kept}"
+
+
+def _truncate_tail(tail: str, total_chars: int, limit: int) -> str:
+    """Build truncated output from a rolling tail when total stream size is known.
+
+    Use instead of _truncate_output when the caller only kept a rolling
+    *tail* in memory (not the full stream) but knows the *total_chars* written.
+    When total_chars <= limit the tail *is* the full output and is returned
+    as-is.  Otherwise a correct omission count is prepended.
+    """
+    if total_chars <= limit:
+        return tail
+    omitted = total_chars - limit
+    kept = tail[-limit:]
+    return f"[...{omitted} chars omitted, showing last {limit} chars...]\n{kept}"
+
 
 # ---------------------------------------------------------------------------
 # Dangerous / sensitive pattern detection
@@ -112,6 +172,18 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
         name="file_write",
         description="Write content to a file on the filesystem. Args: path (str), content (str), mode (str: 'w' or 'a', default 'w').",
     ),
+    "file_diff": BuiltinTool(
+        name="file_diff",
+        description=(
+            "Compare two files and return a traditional unified diff. "
+            "Read-only and non-destructive. "
+            "Args: path_a (str, required — first/old file), "
+            "path_b (str, required — second/new file), "
+            "context_lines (int, default 3 — lines of context around changes), "
+            "max_bytes (int, default 200000 — per-file read cap). "
+            "Returns the unified diff text, or 'Files are identical.' when there are no differences."
+        ),
+    ),
     "file_send": BuiltinTool(
         name="file_send",
         description=(
@@ -133,6 +205,8 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Legacy fields hours/minutes/time are still accepted and auto-converted to cron. "
             "notify (bool, default true). "
             "model (str, optional — model identifier to use for this job's sub-agent, e.g. 'gpt-4o'). "
+            "fallback_models (list[str], optional — ordered list of fallback model identifiers "
+            "to try if the primary model is unavailable, e.g. ['gemini-3-flash-preview:cloud', 'gpt-4o-mini']). "
             "preserve_context (bool, default false — if true, conversation history is kept between runs). "
             "max_iterations (int, optional — override the step limit for this job; "
             "default: scheduled_max_iterations from config, 0 = unlimited). "
@@ -234,6 +308,32 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Example: {\"path\": \"/etc/app/config.toml\", \"old_str\": \"port = 8080\", \"new_str\": \"port = 9090\"}"
         ),
     ),
+    "memory_graph_search": BuiltinTool(
+        name="memory_graph_search",
+        description=(
+            "Search the knowledge graph for facts, entities, people, preferences, or past events. "
+            "Returns relevant entities and relationships from the graph memory. "
+            "Args: query (str, required) — what to search for. "
+            "Only available when graph memory is enabled ([graph_memory] enabled = true in config). "
+            "ALWAYS call this before saying 'I don't have information about...' regarding past events "
+            "or user preferences. "
+            "Example: {\"query\": \"user preferred languages\"}"
+        ),
+    ),
+    "memory_graph_store": BuiltinTool(
+        name="memory_graph_store",
+        description=(
+            "Store an important fact, preference, or relationship in the knowledge graph. "
+            "Use this when the user shares important facts or preferences that should be remembered. "
+            "Args: "
+            "  content     (str, required) — the fact or information to remember. "
+            "  entity_type (str, optional) — type hint: person, tool, concept, preference, other. "
+            "  user_id     (str, optional) — user identifier (default: 'agent'). "
+            "Only available when graph memory is enabled ([graph_memory] enabled = true in config). "
+            "Example: {\"content\": \"User prefers Python over JavaScript for automation scripts\", "
+            "\"entity_type\": \"preference\"}"
+        ),
+    ),
 }
 
 
@@ -256,7 +356,9 @@ class BuiltinExecutor:
     def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
                  sub_agent_factory=None, data_dir: str = "data",
                  memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300,
-                 notify_html_fn=None):
+                 notify_html_fn=None, shell_backend: str = "subprocess",
+                 shell_pty_cols: int = 220, shell_pty_rows: int = 50,
+                 shell_streaming: bool = False):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -266,11 +368,27 @@ class BuiltinExecutor:
         self._max_subagents = max_subagents
         self._subagent_result_timeout = subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
+        self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
+        self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init
+        self._shell_backend = shell_backend   # "subprocess" or "pty"
+        self._shell_pty_cols = shell_pty_cols
+        self._shell_pty_rows = shell_pty_rows
+        self._shell_streaming = shell_streaming  # forward chunks to on_chunk callback (PTY only)
         self._sub_agent_pool = ThreadPoolExecutor(
             max_workers=max_subagents, thread_name_prefix="sub-agent"
         )
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
+        # Headless (sub-agent) confirmation bridge
+        # token -> threading.Event  (set when the operator responds)
+        self._headless_confirm_events: dict[str, object] = {}
+        # token -> bool  (True = approved, False = denied)
+        self._headless_confirm_results: dict[str, bool] = {}
+        # Optional prompt callback: fn(token, tool_name, description, caller_tag) -> None
+        # Set by main.py after TelegramInterface is created.
+        self._subagent_confirm_prompt_fn: Optional[Callable[[str, str, str, str], None]] = None
+        # How long (seconds) to wait for the operator to respond to a sub-agent prompt
+        self._subagent_confirm_timeout: int = 120
 
     # ------------------------------------------------------------------
     # Public API
@@ -305,7 +423,8 @@ class BuiltinExecutor:
     def all_tools(self) -> list[BuiltinTool]:
         return list(BUILTIN_TOOLS.values())
 
-    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "",
+                chunk_callback: Optional[Callable[[str], None]] = None, trace_id: str = "") -> dict:
         """
         Execute a built-in tool. Returns standard result dict, or a
         requires_confirmation dict if the operation needs user approval.
@@ -313,10 +432,15 @@ class BuiltinExecutor:
         caller_depth is the depth of the AgentController invoking this tool
         (0 = main agent, 1 = sub-agent). Used to enforce the no-nested-spawn rule.
         caller_tag is a human-readable label for logging (e.g. "[main]", "[sa-fcf85d]").
+        chunk_callback is an optional callable invoked with each output chunk during PTY
+        shell execution (only when shell_streaming=True). Ignored for other tools.
+        trace_id is the request-scoped trace of the invoking run; it is propagated to
+        spawned sub-agents so their logs correlate with the parent request.
         """
         args = args or {}
         if tool_name == "shell":
-            return self._exec_shell(args, caller_depth=caller_depth, caller_tag=caller_tag)
+            return self._exec_shell(args, caller_depth=caller_depth, caller_tag=caller_tag,
+                                    chunk_callback=chunk_callback)
         elif tool_name == "file_read":
             return self._exec_file_read(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "file_write":
@@ -326,28 +450,54 @@ class BuiltinExecutor:
         elif tool_name == "schedule":
             return self._exec_schedule(args)
         elif tool_name == "spawn_agent":
-            return self._exec_spawn_agent(args, caller_depth=caller_depth, caller_tag=caller_tag)
+            return self._exec_spawn_agent(args, caller_depth=caller_depth, caller_tag=caller_tag,
+                                          trace_id=trace_id)
         elif tool_name == "get_agent_result":
             return self._exec_get_agent_result(args, caller_tag=caller_tag)
         elif tool_name == "memory_write":
             return self._exec_memory_write(args, caller_tag=caller_tag)
         elif tool_name == "file_patch":
             return self._exec_file_patch(args, caller_depth=caller_depth, caller_tag=caller_tag)
+        elif tool_name == "file_diff":
+            return self._exec_file_diff(args, caller_tag=caller_tag)
+        elif tool_name == "memory_graph_search":
+            return self._exec_memory_graph_search(args, caller_tag=caller_tag)
+        elif tool_name == "memory_graph_store":
+            return self._exec_memory_graph_store(args, caller_depth=caller_depth, caller_tag=caller_tag)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
-    def confirm(self, token: str) -> dict:
-        """Execute a previously staged dangerous operation after user confirmation."""
+    def confirm(self, token: str, chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
+        """Execute a previously staged dangerous operation after user confirmation.
+
+        chunk_callback is forwarded to the shell backend so live streaming keeps
+        working for commands that required confirmation before running.
+        """
         entry = self._pending.pop(token, None)
         if entry is None:
             return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
         tool_name, args = entry
         logger.info("Executing confirmed built-in '%s' (token %s)", tool_name, token[:8])
-        return self._run(tool_name, args)
+        return self._run(tool_name, args, chunk_callback=chunk_callback)
 
     def cancel(self, token: str) -> None:
         """Discard a pending confirmation."""
         self._pending.pop(token, None)
+
+    def signal_headless_confirm(self, token: str, approved: bool) -> bool:
+        """Signal the outcome of a headless (sub-agent) confirmation prompt.
+
+        Returns True if the token was found and signalled, False if it was
+        already expired or unknown (double-press / stale button).
+        Called from the Telegram cb_subagent_confirm callback.
+        """
+        event = self._headless_confirm_events.pop(token, None)
+        if event is None:
+            return False  # expired or already resolved
+        self._headless_confirm_results[token] = approved
+        event.set()  # type: ignore[attr-defined]
+        return True
+
 
     # ------------------------------------------------------------------
     # Internals
@@ -356,9 +506,9 @@ class BuiltinExecutor:
     def _requires_confirmation(self, tool_name: str, args: dict, description: str,
                                caller_depth: int = 0, caller_tag: str = "") -> dict:
         _pfx = f"[{caller_tag}] " if caller_tag else ""
-        # In headless mode (sub-agents), there is no user to confirm — auto-handle:
-        #   shell/dangerous → deny (too risky to run destructive commands unattended)
-        #   file_read/sensitive, file_write → approve (non-destructive or expected by task)
+        # In headless mode (sub-agents, caller_depth >= 1):
+        #   shell/dangerous → always deny (too risky to run destructive commands unattended)
+        #   file_read/sensitive, file_write, file_patch → require operator confirmation via Telegram
         if caller_depth >= 1:
             if tool_name == "shell":
                 command = args.get("command", "")
@@ -375,12 +525,8 @@ class BuiltinExecutor:
                     ),
                     "exit_code": -1,
                 }
-            else:
-                # file_read sensitive or file_write — auto-approve
-                logger.info(
-                    "%sHeadless sub-agent: auto-approving %s (no user confirmation available)", _pfx, tool_name
-                )
-                return self._run(tool_name, args, caller_tag=caller_tag)
+            # Non-shell (sensitive file_read, file_write, file_patch): bridge to Telegram
+            return self._headless_confirm_bridge(tool_name, args, description, caller_tag=caller_tag)
 
         token = secrets.token_hex(12)
         self._pending[token] = (tool_name, args)
@@ -391,21 +537,107 @@ class BuiltinExecutor:
             "description": description,
         }
 
-    def _run(self, tool_name: str, args: dict, caller_tag: str = "") -> dict:
+    def _headless_confirm_bridge(self, tool_name: str, args: dict, description: str,
+                                 caller_tag: str = "") -> dict:
+        """Block the sub-agent thread until the operator approves or denies via Telegram.
+
+        If the prompt callback is not wired (bot not ready) or times out, fails closed.
+        """
+        import threading as _threading
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+
+        if self._subagent_confirm_prompt_fn is None:
+            logger.warning(
+                "%sHeadless sub-agent: Telegram bridge not wired — blocking %s (fail-closed)",
+                _pfx, tool_name,
+            )
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"Sub-agent sensitive operation blocked: Telegram confirmation bridge "
+                    f"not available for '{tool_name}'."
+                ),
+                "exit_code": -1,
+            }
+
+        token = secrets.token_hex(12)
+        event = _threading.Event()
+        self._headless_confirm_events[token] = event
+        self._pending[token] = (tool_name, args)
+
+        logger.info(
+            "%sHeadless sub-agent: sending Telegram confirmation prompt for %s (token=%s)",
+            _pfx, tool_name, token[:8],
+        )
+        try:
+            self._subagent_confirm_prompt_fn(token, tool_name, description, caller_tag)
+        except Exception as exc:
+            logger.error(
+                "%sHeadless sub-agent: failed to send Telegram prompt for %s: %s — blocking (fail-closed)",
+                _pfx, tool_name, exc,
+            )
+            self._headless_confirm_events.pop(token, None)
+            self._pending.pop(token, None)
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Sub-agent sensitive operation blocked: could not send Telegram prompt ({exc}).",
+                "exit_code": -1,
+            }
+
+        answered = event.wait(timeout=self._subagent_confirm_timeout)
+        if not answered:
+            logger.warning(
+                "%sHeadless sub-agent: Telegram prompt timed out for %s (token=%s) — blocking",
+                _pfx, tool_name, token[:8],
+            )
+            self._headless_confirm_events.pop(token, None)
+            self._pending.pop(token, None)
+            self._headless_confirm_results.pop(token, None)
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"Sub-agent sensitive operation timed out waiting for operator confirmation "
+                    f"('{tool_name}', {self._subagent_confirm_timeout}s)."
+                ),
+                "exit_code": -1,
+            }
+
+        approved = self._headless_confirm_results.pop(token, False)
+        if not approved:
+            self._pending.pop(token, None)
+            logger.info("%sHeadless sub-agent: operator denied %s (token=%s)", _pfx, tool_name, token[:8])
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Sub-agent sensitive operation denied by operator ('{tool_name}').",
+                "exit_code": -1,
+            }
+
+        logger.info("%sHeadless sub-agent: operator approved %s (token=%s) — executing", _pfx, tool_name, token[:8])
+        return self.confirm(token)
+
+    def _run(self, tool_name: str, args: dict, caller_tag: str = "",
+             chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         """Actually execute without any confirmation check."""
         if tool_name == "shell":
-            return self._run_shell(args, caller_tag=caller_tag)
+            return self._run_shell(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         elif tool_name == "file_read":
             return self._run_file_read(args, caller_tag=caller_tag)
         elif tool_name == "file_write":
             return self._run_file_write(args, caller_tag=caller_tag)
         elif tool_name == "file_patch":
             return self._run_file_patch(args, caller_tag=caller_tag)
+        elif tool_name == "memory_graph_store":
+            return self._run_memory_graph_store(args, caller_tag=caller_tag)
         return {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1}
 
     # ---- shell ----
 
-    def _exec_shell(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_shell(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                    chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         command = str(args.get("command", "")).strip()
         if not command:
             return {"success": False, "output": "", "error": "No command provided.", "exit_code": -1}
@@ -415,37 +647,436 @@ class BuiltinExecutor:
             desc = f"Run shell command: <code>{command}</code>\n⚠️ Reason for confirmation: {reason}"
             return self._requires_confirmation("shell", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
-        return self._run_shell(args, caller_tag=caller_tag)
+        return self._run_shell(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
 
-    def _run_shell(self, args: dict, caller_tag: str = "") -> dict:
+    def _run_shell(self, args: dict, caller_tag: str = "",
+                   chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
+        """Dispatch to the configured shell backend (subprocess or pty)."""
+        if self._shell_backend == "pty" and sys.platform != "win32":
+            return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
+        return self._run_shell_subprocess(args, caller_tag=caller_tag)
+
+    def _open_shell_log(self, caller_tag: str = "") -> tuple[Optional[object], Optional[str]]:
+        """Open a run-specific artifact log file for incremental writing.
+
+        Returns (file_handle, absolute_path) or (None, None) on failure.
+        The caller must close the file handle and call _finalize_shell_log to
+        either keep or remove the file.
+
+        Shell logs can contain sensitive command output, so the directory is
+        created owner-only (0700) and the file owner-only (0600).
+        """
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        try:
+            log_dir = os.path.join(self._data_dir, "shell_logs")
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+            # makedirs honours mode only when creating; tighten an existing dir.
+            try:
+                os.chmod(log_dir, 0o700)
+            except OSError:
+                pass
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            fname = f"shell-{ts}-{secrets.token_hex(4)}.log"
+            path = os.path.abspath(os.path.join(log_dir, fname))
+            # O_EXCL guarantees we created the file; 0o600 → owner read/write only.
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            fh = os.fdopen(fd, "w", encoding="utf-8", errors="replace")
+            return fh, path
+        except OSError as exc:
+            logger.warning("%sBuilt-in shell: cannot open artifact log: %s", _pfx, exc)
+            return None, None
+
+    def _finalize_shell_log(self, fh, path: Optional[str], total_chars: int,
+                            caller_tag: str = "") -> Optional[str]:
+        """Close the artifact file and decide whether to keep or delete it.
+
+        Keeps the file (and returns path) only when total_chars exceeds
+        max_output.  Otherwise removes the file and returns None.
+        """
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if path is None:
+            return None
+        if total_chars > self.max_output:
+            logger.info("%sBuilt-in shell: full output (%d chars) saved to %s",
+                        _pfx, total_chars, path)
+            return path
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+
+    def _run_shell_subprocess(self, args: dict, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self.default_timeout))
         _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in shell executing: %s", _pfx, command[:120])
+        logger.info("%sBuilt-in shell (subprocess) executing: %s", _pfx, command[:120])
+        _start = time.monotonic()
+
+        # Open artifact log for incremental writing; kept only if output is large.
+        _log_fh, _artifact_path = self._open_shell_log(caller_tag)
+        _tail_out = ""
+        _tail_err = ""
+        _total_out = 0
+        _total_err = 0
+        _stderr_header_written = False
+
+        # Start the command in its own process group/session so that on timeout
+        # we can kill the whole tree (the shell plus any children that inherited
+        # the stdout/stderr pipes), not just the top-level shell.  Without this,
+        # a leaked grandchild can keep the pipes open and block the reader threads.
+        _popen_kwargs: dict = {}
+        if sys.platform != "win32":
+            _popen_kwargs["start_new_session"] = True
+        else:  # pragma: no cover - Windows-only
+            _popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **_popen_kwargs,
             )
-            output = (proc.stdout or "")[:self.max_output]
-            error = (proc.stderr or "")[:500]
-            if proc.returncode != 0 and not output and error:
-                # Some commands write only to stderr on success (e.g. systemctl status)
-                output = error
-                error = ""
-            return {
-                "success": proc.returncode == 0,
-                "output": output,
-                "error": error,
-                "exit_code": proc.returncode,
-            }
-        except subprocess.TimeoutExpired:
-            return {"success": False, "output": "", "error": f"Command timed out after {timeout}s.", "exit_code": -1}
-        except (OSError, subprocess.SubprocessError) as exc:
+        except OSError as exc:
+            if _log_fh:
+                _log_fh.close()
+            if _artifact_path:
+                try:
+                    os.unlink(_artifact_path)
+                except OSError:
+                    pass
             return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
+
+        def _kill_tree() -> None:
+            """Kill the whole process group (POSIX) or the process (Windows)."""
+            if sys.platform != "win32":
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    return
+                except (OSError, ProcessLookupError):
+                    pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+        def _close_pipe(pipe) -> None:
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
+
+        def _disable_artifact_log() -> None:
+            """Silently close and unlink the artifact on write failure."""
+            nonlocal _log_fh, _artifact_path
+            fh, path = _log_fh, _artifact_path
+            _log_fh = None
+            _artifact_path = None
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+        def _append_stdout(text: str) -> None:
+            nonlocal _tail_out, _total_out
+            if not text:
+                return
+            _total_out += len(text)
+            _tail_out = (_tail_out + text)[-self.max_output:]
+            if _log_fh is not None:
+                try:
+                    _log_fh.write(text)
+                except OSError:
+                    _disable_artifact_log()
+
+        def _append_stderr(text: str) -> None:
+            nonlocal _tail_err, _total_err, _stderr_header_written
+            if not text:
+                return
+            _total_err += len(text)
+            _tail_err = (_tail_err + text)[-self.max_output:]
+            if _log_fh is not None:
+                try:
+                    if not _stderr_header_written:
+                        _log_fh.write("\n--- stderr ---\n")
+                        _stderr_header_written = True
+                    _log_fh.write(text)
+                except OSError:
+                    _disable_artifact_log()
+
+        import select as _select
+
+        # Per-stream incremental UTF-8 decoders keep multibyte characters that
+        # straddle os.read() chunk boundaries intact (a plain chunk.decode()
+        # would emit U+FFFD replacement chars for the split halves).
+        streams: dict[int, tuple[object, Callable[[str], None], codecs.IncrementalDecoder]] = {}
+        for _pipe, _append in ((proc.stdout, _append_stdout), (proc.stderr, _append_stderr)):
+            if _pipe is None:
+                continue
+            try:
+                os.set_blocking(_pipe.fileno(), False)
+                streams[_pipe.fileno()] = (
+                    _pipe, _append, codecs.getincrementaldecoder("utf-8")(errors="replace"),
+                )
+            except (OSError, ValueError):
+                _close_pipe(_pipe)
+
+        timed_out = False
+        deadline = _start + timeout
+        while streams:
+            now = time.monotonic()
+            if not timed_out and proc.poll() is None and now >= deadline:
+                timed_out = True
+                _kill_tree()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+
+            # If the shell has exited and no stream is immediately readable,
+            # return without waiting for EOF: escaped descendants can keep pipe
+            # fds open indefinitely.  This preserves data already available in
+            # the pipe while avoiding reader-thread leaks/hangs.
+            select_timeout = 0.05 if proc.poll() is not None else max(0.0, min(0.1, deadline - now))
+            try:
+                ready, _, _ = _select.select(list(streams), [], [], select_timeout)
+            except (OSError, ValueError):
+                break
+            if not ready and proc.poll() is not None:
+                break
+            for fd in ready:
+                pipe, append, decoder = streams.get(fd, (None, None, None))
+                if pipe is None or append is None or decoder is None:
+                    continue
+                while True:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        append(decoder.decode(b"", final=True))
+                        streams.pop(fd, None)
+                        _close_pipe(pipe)
+                        break
+                    if not chunk:
+                        append(decoder.decode(b"", final=True))
+                        streams.pop(fd, None)
+                        _close_pipe(pipe)
+                        break
+                    append(decoder.decode(chunk))
+
+        for _pipe, _append, _decoder in list(streams.values()):
+            _append(_decoder.decode(b"", final=True))
+            _close_pipe(_pipe)
+        streams.clear()
+
+        if proc.poll() is None and not timed_out:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_tree()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        elapsed_ms = (time.monotonic() - _start) * 1000.0
+        total_combined = _total_out + _total_err
+        full_log_path = self._finalize_shell_log(_log_fh, _artifact_path, total_combined, caller_tag)
+
+        # Build truncated outputs from rolling tails using correct total counts.
+        output = _truncate_tail(_tail_out, _total_out, self.max_output)
+        error = _truncate_tail(_tail_err, _total_err, self.max_output)
+
+        returncode = proc.returncode if not timed_out else -1
+
+        if not timed_out and returncode != 0 and not output.strip() and error:
+            # Some commands write only to stderr (e.g. systemctl status);
+            # promote stderr → output so the LLM sees the failure reason.
+            output = error
+            error = ""
+
+        if full_log_path:
+            notice = f"\n[full output saved to: {full_log_path} — use file_read to view it]"
+            output = output + notice
+
+        logger.info(
+            "%sBuilt-in shell exit=%s stdout=%d stderr=%d chars in %.0fms",
+            _pfx, returncode, _total_out, _total_err, elapsed_ms,
+        )
+        if timed_out:
+            timeout_error = f"Command timed out after {timeout}s."
+            if error.strip():
+                timeout_error = f"{timeout_error}\nstderr:\n{error}"
+            return {"success": False, "output": output, "error": timeout_error,
+                    "exit_code": -1, "elapsed_ms": round(elapsed_ms), "full_log_path": full_log_path}
+        return {
+            "success": returncode == 0,
+            "output": output,
+            "error": error,
+            "exit_code": returncode,
+            "elapsed_ms": round(elapsed_ms),
+            "full_log_path": full_log_path,
+        }
+
+    def _run_shell_pty(self, args: dict, caller_tag: str = "",
+                       chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
+        """Run shell command inside a pseudo-terminal.
+
+        Gives the child process a real TTY so isatty()==True, enabling:
+        - line-buffered (real-time) output instead of 64 KB block buffering
+        - ANSI colour codes from tools like git, pytest, npm
+        - progress indicators that detect a terminal
+        stdout and stderr are merged by the PTY line discipline (chronological
+        order preserved).  Falls back to subprocess on import error.
+
+        When chunk_callback is provided and self._shell_streaming is True, each
+        decoded text chunk is forwarded to the callback as it arrives.
+        """
+        command = str(args.get("command", "")).strip()
+        timeout = int(args.get("timeout", self.default_timeout))
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in shell (pty) executing: %s", _pfx, command[:120])
+        streaming = self._shell_streaming and chunk_callback is not None
+
+        try:
+            from ptyprocess import PtyProcessUnicode  # type: ignore[import]
+        except ImportError:
+            logger.warning("%sptyprocess not available, falling back to subprocess", _pfx)
+            return self._run_shell_subprocess(args, caller_tag=caller_tag)
+
+        import select as _select
+        import re as _re
+        _ANSI_RE = _re.compile(r'\x1b\[[0-9;]*[mGKHF]|\x1b\].*?\x07')
+
+        try:
+            proc = PtyProcessUnicode.spawn(
+                ['/bin/sh', '-c', command],
+                dimensions=(self._shell_pty_rows, self._shell_pty_cols),
+                echo=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%sPTY spawn failed (%s), falling back to subprocess", _pfx, exc)
+            return self._run_shell_subprocess(args, caller_tag=caller_tag)
+
+        import time as _time
+        total_chars = 0
+        timed_out = False
+        _start = _time.monotonic()
+        deadline = _start + timeout
+
+        # Rolling tail: bounded memory regardless of how much the process emits.
+        _tail = ""
+
+        # Open artifact log for incremental writing.
+        _log_fh, _artifact_path = self._open_shell_log(caller_tag)
+
+        try:
+            while proc.isalive():
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    ready, _, _ = _select.select([proc.fd], [], [], min(remaining, 0.25))
+                except (OSError, ValueError):
+                    break
+                if not ready:
+                    continue
+                try:
+                    chunk = proc.read(4096)
+                except EOFError:
+                    break
+                # Normalize TTY line endings and strip ANSI for clean LLM output
+                chunk = chunk.replace('\r\n', '\n').replace('\r', '\n')
+                chunk = _ANSI_RE.sub('', chunk)
+                total_chars += len(chunk)
+                _tail = (_tail + chunk)[-self.max_output:]
+                if _log_fh is not None:
+                    _log_fh.write(chunk)
+                if streaming:
+                    try:
+                        chunk_callback(chunk)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            # Drain remaining output after loop
+            if not timed_out:
+                for _ in range(20):
+                    try:
+                        r, _, _ = _select.select([proc.fd], [], [], 0.05)
+                        if not r:
+                            break
+                        chunk = proc.read(4096).replace('\r\n', '\n').replace('\r', '\n')
+                        chunk = _ANSI_RE.sub('', chunk)
+                        total_chars += len(chunk)
+                        _tail = (_tail + chunk)[-self.max_output:]
+                        if _log_fh is not None:
+                            _log_fh.write(chunk)
+                        if streaming:
+                            try:
+                                chunk_callback(chunk)
+                            except Exception:  # noqa: BLE001
+                                pass
+                    except (EOFError, OSError, ValueError):
+                        break
+        finally:
+            if timed_out:
+                # On POSIX, signal the PTY child's process group so background
+                # children that ignore SIGHUP also get terminated.
+                if sys.platform != "win32":
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
+                proc.terminate(force=True)
+            proc.close(force=False)
+
+        elapsed_ms = (_time.monotonic() - _start) * 1000.0
+        full_log_path = self._finalize_shell_log(_log_fh, _artifact_path, total_chars, caller_tag)
+
+        output = _truncate_tail(_tail, total_chars, self.max_output)
+        if full_log_path:
+            output = output + f"\n[full output saved to: {full_log_path} — use file_read to view it]"
+
+        exit_code = proc.exitstatus if not timed_out else -1
+        # exitstatus is None if signalled; treat as failure
+        if exit_code is None:
+            exit_code = -1
+        logger.info(
+            "%sBuilt-in shell (pty) exit=%s combined=%d chars in %.0fms",
+            _pfx, exit_code, total_chars, elapsed_ms,
+        )
+        if timed_out:
+            return {
+                "success": False, "output": output,
+                "error": f"Command timed out after {timeout}s.",
+                "exit_code": -1, "elapsed_ms": round(elapsed_ms),
+                "full_log_path": full_log_path,
+            }
+        return {
+            "success": exit_code == 0,
+            "output": output,
+            "error": "",
+            "exit_code": exit_code,
+            "elapsed_ms": round(elapsed_ms),
+            "full_log_path": full_log_path,
+        }
 
     # ---- file_read ----
 
@@ -485,6 +1116,55 @@ class BuiltinExecutor:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
         except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+    # ---- file_diff ----
+
+    def _exec_file_diff(self, args: dict, caller_tag: str = "") -> dict:
+        path_a = str(args.get("path_a", "")).strip()
+        path_b = str(args.get("path_b", "")).strip()
+        if not path_a or not path_b:
+            return {
+                "success": False, "output": "",
+                "error": "file_diff: both 'path_a' and 'path_b' are required.",
+                "exit_code": -1,
+            }
+        try:
+            context_lines = int(args.get("context_lines", 3))
+        except (TypeError, ValueError):
+            return {"success": False, "output": "", "error": "file_diff: 'context_lines' must be an integer.", "exit_code": -1}
+        if context_lines < 0:
+            context_lines = 0
+        try:
+            max_bytes = int(args.get("max_bytes", 200_000))
+        except (TypeError, ValueError):
+            return {"success": False, "output": "", "error": "file_diff: 'max_bytes' must be an integer.", "exit_code": -1}
+
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in file_diff: %s <-> %s (context=%d)", _pfx, path_a, path_b, context_lines)
+
+        try:
+            for p in (path_a, path_b):
+                if not os.path.exists(p):
+                    return {"success": False, "output": "", "error": f"File not found: {p}", "exit_code": 1}
+            with open(path_a, "r", errors="replace") as f:
+                a_text = f.read(max_bytes)
+            with open(path_b, "r", errors="replace") as f:
+                b_text = f.read(max_bytes)
+        except PermissionError as exc:
+            return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
+        except OSError as exc:
+            return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+
+        a_lines = a_text.splitlines(keepends=True)
+        b_lines = b_text.splitlines(keepends=True)
+        diff = list(difflib.unified_diff(
+            a_lines, b_lines,
+            fromfile=path_a, tofile=path_b,
+            n=context_lines,
+        ))
+        if not diff:
+            return {"success": True, "output": "Files are identical.", "error": "", "exit_code": 0}
+        return {"success": True, "output": "".join(diff), "error": "", "exit_code": 0}
 
     # ---- file_write ----
 
@@ -751,7 +1431,8 @@ class BuiltinExecutor:
     # spawn_agent
     # ------------------------------------------------------------------
 
-    def _exec_spawn_agent(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_spawn_agent(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                          trace_id: str = "") -> dict:
         """
         Spawn an isolated sub-agent in a background thread.
 
@@ -812,6 +1493,16 @@ class BuiltinExecutor:
 
         model = args.get("model") or None
         context_key = args.get("context_key") or None
+        if context_key:
+            try:
+                context_key = _validate_context_key(str(context_key))
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": f"spawn_agent: invalid context_key: {exc}",
+                    "exit_code": -1,
+                }
         fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
         job_tag = args.get("_job_tag") or None       # set by scheduler; used for finish callback
         label = job_tag or context_key or "on-demand"
@@ -819,6 +1510,8 @@ class BuiltinExecutor:
         # when multiple jobs fire concurrently.
         _finish_cb = args.get("_finish_cb") or getattr(self, '_scheduler_finish_cb', None)
         _finish_tag = job_tag or label
+        # Execution log callback — only provided by scheduler for scheduled jobs.
+        _result_log_cb = args.get("_result_log_cb") if job_tag else None
         # Scheduled jobs set expandable=False so results are shown as plain text,
         # not collapsed inside an expandable blockquote.
         _expandable = args.get("expandable", True)
@@ -863,6 +1556,7 @@ class BuiltinExecutor:
                 max_tokens=max_tokens_override,
                 temperature=temperature_override,
                 top_p=top_p_override,
+                trace_id=trace_id or None,
             )
         except ValueError as exc:
             return {"success": False, "output": "", "error": f"spawn_agent: {exc}", "exit_code": -1}
@@ -902,6 +1596,7 @@ class BuiltinExecutor:
         def _run_and_notify():
             # Convenience: use HTML notify if available (results in expandable quote blocks)
             _notify_html = self._notify_html_fn
+            _context_save_attempted = False
 
             def _send_result_html(header_html: str, body: str) -> None:
                 """Send header + body, optionally wrapped in an expandable blockquote."""
@@ -915,24 +1610,47 @@ class BuiltinExecutor:
                 else:
                     runner.notify_fn(msg)
 
+            def _save_context_before_completion() -> None:
+                """Persist context before exposing completion to get_agent_result callers."""
+                nonlocal _context_save_attempted
+                if not context_key or _context_save_attempted:
+                    return
+                _context_save_attempted = True
+                try:
+                    _save_context(context_key, runner._short_term, self._data_dir)
+                except Exception as save_exc:
+                    logger.warning(
+                        "spawn_agent: [%s] context save failed for %s: %s",
+                        label, context_key, save_exc,
+                    )
+
             try:
                 result = runner.run(task)
-                # Persist context if requested
-                if context_key:
-                    _save_context(context_key, runner._short_term, self._data_dir)
-                # Write to long-term memory
-                if runner._agent.long_term and result and result != "[Cancelled]":
-                    try:
-                        runner._agent.long_term.add(
-                            f"[Sub-agent {label}] {result[:500]}", source="sub_agent"
-                        )
-                    except Exception:
-                        pass
+                # P2 consolidation: sub-agent results are NOT auto-persisted into
+                # semantic memory. JSON LongTermMemory is legacy/backfill-only and
+                # auto-writing arbitrary sub-agent output risks prompt poisoning.
+                # If a result should be remembered, the operator/main agent must
+                # explicitly (and with confirmation) call memory_graph_store.
                 if result == "[Cancelled]":
                     record.status = "cancelled"
                     record.result = "[Cancelled]"
+                    _save_context_before_completion()
                     record._result_event.set()
+                    elapsed = int(time.time() - record.started_at)
                     logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
+                    # Record cancellation in job history log for scheduled jobs
+                    if _result_log_cb:
+                        try:
+                            _result_log_cb(
+                                tag=job_tag,
+                                task=task,
+                                result="[Cancelled]",
+                                success=False,
+                                elapsed_s=elapsed,
+                                model=runner._model_id,
+                            )
+                        except Exception as log_exc:
+                            logger.warning("spawn_agent: [%s] result_log_cb failed (cancelled): %s", label, log_exc)
                     # Suppress notification for agents cancelled due to get_agent_result timeout —
                     # the caller already received a timeout response and moved on.
                     if _notify_result and not record._timeout_cancelled:
@@ -947,12 +1665,26 @@ class BuiltinExecutor:
                 else:
                     record.status = "done"
                     record.result = result
+                    _save_context_before_completion()
                     record._result_event.set()
                     elapsed = int(time.time() - record.started_at)
                     logger.info(
                         "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
                         label, runner.agent_id, runner._model_id, elapsed,
                     )
+                    # Record execution result in job history log for scheduled jobs
+                    if _result_log_cb:
+                        try:
+                            _result_log_cb(
+                                tag=job_tag,
+                                task=task,
+                                result=result,
+                                success=True,
+                                elapsed_s=elapsed,
+                                model=runner._model_id,
+                            )
+                        except Exception as log_exc:
+                            logger.warning("spawn_agent: [%s] result_log_cb failed: %s", label, log_exc)
                     if _notify_result:
                         header_html = (
                             f"✅ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
@@ -968,12 +1700,26 @@ class BuiltinExecutor:
             except Exception as exc:
                 record.status = "failed"
                 record.result = str(exc)
+                _save_context_before_completion()
                 record._result_event.set()
                 elapsed = int(time.time() - record.started_at)
                 logger.error(
                     "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
                     label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
                 )
+                # Record failure in job history log for scheduled jobs
+                if _result_log_cb:
+                    try:
+                        _result_log_cb(
+                            tag=job_tag,
+                            task=task,
+                            result=f"Error: {exc}",
+                            success=False,
+                            elapsed_s=elapsed,
+                            model=runner._model_id,
+                        )
+                    except Exception as log_exc:
+                        logger.warning("spawn_agent: [%s] result_log_cb failed (error): %s", label, log_exc)
                 if _notify_result:
                     header_html = (
                         f"❌ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
@@ -987,7 +1733,12 @@ class BuiltinExecutor:
                     except Exception as notify_exc:
                         logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
             finally:
+                # Persist conversation context (if requested) regardless of
+                # success/cancellation/failure so a crash mid-task does not lose
+                # the sub-agent's short-term memory.
+                _save_context_before_completion()
                 get_agent_registry().unregister(runner.agent_id)
+                runner.close()
                 if _finish_cb:
                     _finish_cb(_finish_tag)
 
@@ -1134,30 +1885,132 @@ class BuiltinExecutor:
                 "exit_code": -1,
             }
 
+    # ---- memory_graph_search ----
+
+    def _exec_memory_graph_search(self, args: dict, caller_tag: str = "") -> dict:
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        if self._graph_memory is None:
+            return {
+                "success": False, "output": "",
+                "error": "memory_graph_search: graph memory is not enabled or not available. "
+                         "Set [graph_memory] enabled = true in config.toml and install ladybug.",
+                "exit_code": -1,
+            }
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return {"success": False, "output": "", "error": "memory_graph_search: 'query' is required.", "exit_code": -1}
+        try:
+            context = self._graph_memory.format_for_prompt(query)
+            if not context:
+                return {"success": True, "output": "No relevant entities or facts found in graph memory.", "error": "", "exit_code": 0}
+            logger.info("%smemory_graph_search: query=%s", _pfx, query[:60])
+            return {"success": True, "output": context, "error": "", "exit_code": 0}
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "output": "", "error": f"memory_graph_search failed: {exc}", "exit_code": -1}
+
+    # ---- memory_graph_store ----
+
+    def _exec_memory_graph_store(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+        if self._graph_memory is None:
+            return {
+                "success": False, "output": "",
+                "error": "memory_graph_store: graph memory is not enabled or not available. "
+                         "Set [graph_memory] enabled = true in config.toml and install ladybug.",
+                "exit_code": -1,
+            }
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return {"success": False, "output": "", "error": "memory_graph_store: 'content' is required.", "exit_code": -1}
+        # Writing to graph memory changes future recalled prompt context, so it is
+        # a confirmation-requiring operation. Operator approval admits the memory
+        # as "confirmed"; the model/sub-agent cannot self-approve it.
+        preview = content if len(content) <= 200 else content[:200] + "…"
+        desc = (
+            "Store this in graph memory as a *confirmed* fact "
+            "(it will influence future recalled context):\n"
+            f"`{preview}`"
+        )
+        return self._requires_confirmation(
+            "memory_graph_store", args, desc, caller_depth=caller_depth, caller_tag=caller_tag
+        )
+
+    def _run_memory_graph_store(self, args: dict, caller_tag: str = "") -> dict:
+        """Execute a confirmed graph-memory store. Only reached after operator approval."""
+        from graph_memory import ADMISSION_CONFIRMED, CONFIDENCE_CONFIRMED
+
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        if self._graph_memory is None:
+            return {
+                "success": False, "output": "",
+                "error": "memory_graph_store: graph memory is not enabled or not available.",
+                "exit_code": -1,
+            }
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return {"success": False, "output": "", "error": "memory_graph_store: 'content' is required.", "exit_code": -1}
+        user_id = str(args.get("user_id", "agent")).strip() or "agent"
+        try:
+            # Store the operator-approved note as a confirmed episode.
+            ep_id = self._graph_memory.add_episode(
+                content,
+                user_id=user_id,
+                source="manual",
+                admission_status=ADMISSION_CONFIRMED,
+                confidence=CONFIDENCE_CONFIRMED,
+            )
+            # Derived relations from background extraction remain "observed"; only
+            # the explicitly approved note itself is confirmed.
+            if self._graph_memory_writer is not None:
+                self._graph_memory_writer.enqueue(content, user_id=user_id, source="manual")
+                self._graph_memory_writer.flush()
+            logger.info("%smemory_graph_store: stored confirmed episode %s", _pfx, ep_id)
+            return {
+                "success": True,
+                "output": f"Stored in graph memory as confirmed (episode {ep_id}). "
+                          "Extraction scheduled in background.",
+                "error": "",
+                "exit_code": 0,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "output": "", "error": f"memory_graph_store failed: {exc}", "exit_code": -1}
+
 
 def _save_context(context_key: str, short_term, data_dir: str) -> None:
-    """Persist ShortTermMemory to data/job_contexts/<key>.json."""
-    import json as _json
-    import os
+    """Persist ShortTermMemory to data/job_contexts/<key>.json atomically.
 
-    ctx_dir = os.path.join(data_dir, "job_contexts")
+    Writes to a temporary file in the same directory and commits with
+    ``os.replace`` so a crash mid-write cannot corrupt or truncate an existing
+    context file.
+    """
+    import json as _json
+
+    path = _context_path(context_key, data_dir)
+    ctx_dir = os.path.dirname(path)
     os.makedirs(ctx_dir, exist_ok=True)
-    path = os.path.join(ctx_dir, f"{context_key}.json")
+    tmp_path = os.path.join(
+        ctx_dir,
+        f".{os.path.basename(path)}.{os.getpid()}.{secrets.token_hex(8)}.tmp",
+    )
     try:
         data = short_term.to_dict()
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             _json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
     except OSError:
         logger.warning("Failed to save context for %s", context_key, exc_info=True)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def _load_context(context_key: str, data_dir: str, max_turns: int = 50):
     """Load ShortTermMemory from data/job_contexts/<key>.json. Returns fresh on error."""
     import json as _json
-    import os
     from memory_store import ShortTermMemory
 
-    path = os.path.join(data_dir, "job_contexts", f"{context_key}.json")
+    path = _context_path(context_key, data_dir)
     if not os.path.exists(path):
         return ShortTermMemory(max_turns=max_turns)
     try:

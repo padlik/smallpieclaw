@@ -19,7 +19,7 @@ from typing import Callable, Optional
 
 from confirmation import ConfirmationManager
 from llm_client import LLMClient
-from memory_store import MemoryStore
+from memory_store import MemoryStore, _task_outcome_text
 from prompt_builder import (
     build_system_prompt as _build_system_prompt,
     estimate_tokens as _estimate_tokens,
@@ -40,6 +40,7 @@ from react_loop import (
 from tool_creator import ToolCreator
 from tool_executor import ToolExecutor
 from tool_index import ToolIndex
+from trace_context import child_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,6 @@ class AgentController:
         ctx_max_tokens: int = 90_000,
         short_term=None,       # Optional[ShortTermMemory]
         working=None,          # Optional[WorkingMemory]
-        long_term=None,        # Optional[LongTermMemory]
         results=None,          # Optional[ResultsMemory]
         builtin_executor=None, # Optional[BuiltinExecutor]
         skill_registry=None,   # Optional[SkillRegistry]
@@ -78,6 +78,9 @@ class AgentController:
         depth: int = 0,
         label: str = "main",   # identifies this agent in log lines
         on_step=None,          # Optional[Callable[[int], None]] — called after each step
+        on_tool_trace=None,    # Optional[Callable[[ToolTrace], None]] — called after each tool call
+        job_history_fn=None,   # Optional[Callable[[], str]] — returns job execution history for prompt
+        trace_id=None,         # Optional[str] — propagate a parent run's trace; None => fresh per run
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -89,7 +92,6 @@ class AgentController:
         self.ctx_max_tokens = ctx_max_tokens
         self.short_term = short_term
         self.working = working
-        self.long_term = long_term
         self.results = results
         self.builtin_executor = builtin_executor
         self.skill_registry = skill_registry
@@ -99,10 +101,19 @@ class AgentController:
         self.log_file = log_file
         self.log_backup_count = log_backup_count
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        self._owns_cancel_event = cancel_event is None
         self.label = label
         self._log_prefix = f"[{label}] "
         self._on_step = on_step
+        self._on_tool_trace = on_tool_trace
+        self._job_history_fn = job_history_fn
         self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
+        # Optional parent trace to propagate; when None each run() gets a fresh ID.
+        self._trace_id = trace_id
+        # Graph memory (optional — set by main.py after init when enabled)
+        self._graph_memory = None          # Optional[GraphMemoryStore]
+        self._graph_memory_writer = None   # Optional[GraphMemoryWriter]
+        self._graph_memory_max_entries = 10
 
         # ------------------------------------------------------------------
         # Cross-thread synchronisation for operator confirmation prompts.
@@ -133,7 +144,23 @@ class AgentController:
         Optionally calls progress_callback(msg) for intermediate updates.
         Pass images=["/path/to/file.jpg", ...] to include images in the first
         user message for vision-capable models.
+
+        The primary model index is always restored on exit so transient
+        fallbacks during one run never permanently demote subsequent requests.
         """
+        # Save primary model index — mirrors the same pattern in SubAgentRunner.run().
+        # chat_with_fallback() intentionally leaves _active_idx on the working model so
+        # the rest of a run re-uses it; but we must restore it afterward so the *next*
+        # interactive request always starts on the configured primary model.
+        _primary_idx = self.llm._active_idx
+
+        # Request-scoped trace ID: reuse a propagated parent trace when present,
+        # otherwise mint a fresh one so each interactive run is correlatable.
+        trace_id = child_trace_id(self._trace_id)
+        _prev_trace = getattr(self.llm, "_trace_id", "")
+        if hasattr(self.llm, "set_trace_id"):
+            self.llm.set_trace_id(trace_id)
+
         ctx = ReactContext(
             llm=self.llm,
             tool_index=self.tool_index,
@@ -152,14 +179,26 @@ class AgentController:
             log_backup_count=self.log_backup_count,
             depth=self._depth,
             label=self.label,
+            trace_id=trace_id,
             short_term=self.short_term,
             working=self.working,
             results=self.results,
             cancel_event=self._cancel_event,
+            owns_cancel_event=self._owns_cancel_event,
             on_step=self._on_step,
+            on_tool_trace=self._on_tool_trace,
+            job_history_fn=self._job_history_fn,
+            graph_memory=self._graph_memory,
+            graph_memory_writer=self._graph_memory_writer,
+            graph_memory_max_entries=self._graph_memory_max_entries,
             confirmation=self._confirmation,
         )
-        return react_loop(ctx, user_goal, progress_callback, images)
+        try:
+            return react_loop(ctx, user_goal, progress_callback, images)
+        finally:
+            self.llm._active_idx = _primary_idx
+            if hasattr(self.llm, "set_trace_id"):
+                self.llm.set_trace_id(_prev_trace)
 
 
     def cancel(self) -> None:
@@ -235,6 +274,18 @@ class AgentController:
                     summary=summary,
                     tools_used=list(filter(None, tools_used)),
                 )
+                if self._graph_memory_writer is not None:
+                    try:
+                        self._graph_memory_writer.enqueue(
+                            _task_outcome_text(
+                                goal=self.working.goal,
+                                summary=summary,
+                                tools_used=list(filter(None, tools_used)),
+                            ),
+                            source="task_outcome",
+                        )
+                    except Exception as _gw_exc:  # noqa: BLE001
+                        logger.debug("Graph memory task outcome enqueue failed: %s", _gw_exc)
             msg = "✅ Task saved to results memory. Starting fresh context."
         if self.working:
             self.working.clear()
@@ -287,8 +338,36 @@ class AgentController:
                 ),
             }])
         except Exception as exc:
-            logger.error("compress_context: LLM call failed: %s", exc)
-            return f"❌ Compression failed: {exc}"
+            # Deterministic fallback: the LLM summarization call failed, but a user
+            # invoking /compress (often because the context is over budget) still
+            # needs relief. Replace the buffer with a bounded head+tail slice of the
+            # history so the next run starts smaller, matching the robustness of
+            # context_manager.maybe_compact()'s _fallback_summary path.
+            from context_manager import _truncate_head_tail
+            logger.error(
+                "compress_context: LLM call failed, applying deterministic fallback: %s",
+                exc,
+            )
+            fallback = _truncate_head_tail(history_text, 3000, 1000)
+            self.short_term.clear()
+            self.short_term.add(
+                "assistant",
+                f"[Compressed context summary — deterministic fallback]\n{fallback}",
+            )
+            after_tokens = _estimate_tokens(fallback)
+            saved = max(0, before_tokens - after_tokens)
+            pct = int(saved / before_tokens * 100) if before_tokens else 0
+            logger.info(
+                "compress_context (fallback): %d → ~%d tokens (%d%% reduction, %d messages → 1)",
+                before_tokens, after_tokens, pct, len(messages),
+            )
+            return (
+                f"⚠️ LLM compression unavailable — applied deterministic truncation.\n"
+                f"  Messages: {len(messages)} → 1\n"
+                f"  Tokens: ~{before_tokens:,} → ~{after_tokens:,} "
+                f"(−{saved:,}, {pct}% smaller)\n"
+                f"  Reason: {exc}"
+            )
 
         self.short_term.clear()
         self.short_term.add("assistant", f"[Compressed context summary]\n{summary}")
@@ -366,9 +445,11 @@ class SubAgentRunner:
 
     Each runner has its own LLMClient, ShortTermMemory, and WorkingMemory.
     It shares ToolIndex, ToolExecutor, ToolCreator, BuiltinExecutor,
-    SkillRegistry, LongTermMemory, and ResultsMemory with the main agent.
+    SkillRegistry, and ResultsMemory with the main agent.
 
-    Results are delivered via notify_fn (Telegram) and written to long_term memory.
+    Results are delivered via notify_fn (Telegram). Sub-agent output is NOT
+    auto-persisted into semantic memory (P2 consolidation); to remember a fact,
+    the operator/main agent must explicitly call memory_graph_store (confirmed).
     """
 
     def __init__(
@@ -383,7 +464,6 @@ class SubAgentRunner:
         builtin_executor,             # BuiltinExecutor (shared)
         skill_registry=None,          # SkillRegistry (shared)
         mcp_manager=None,             # MCPManager (shared, optional)
-        long_term=None,               # LongTermMemory (shared)
         results=None,                 # ResultsMemory (shared)
         short_term=None,              # ShortTermMemory — pre-loaded context (optional)
         notify_fn=None,               # Callable[[str], None]
@@ -398,6 +478,9 @@ class SubAgentRunner:
         depth: int = 1,
         fallback_models: list[str] | None = None,  # None = inherit from parent config
         on_step=None,                 # Optional[Callable[[int], None]] — for iteration tracking
+        on_tool_trace=None,           # Optional[Callable[[ToolTrace], None]] — for trace collection
+        cancel_event=None,            # Optional[threading.Event] — shared cancel signal (e.g. forwarded from a parent agent stop)
+        trace_id=None,                # Optional[str] — parent run trace to share; None => fresh per run
     ):
         import uuid
         from memory_store import ShortTermMemory, WorkingMemory
@@ -417,7 +500,7 @@ class SubAgentRunner:
         agent_section["default_model"] = model_cfg.get("model", "")
         sub_config["agent"] = agent_section
 
-        self._cancel_event = threading.Event()
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
 
         # Own LLM instance with model override + shared token registry + cancellation
         # fallback_models=None means inherit from sub_config (which inherited from parent config)
@@ -442,7 +525,6 @@ class SubAgentRunner:
             ctx_max_tokens=ctx_max_tokens,
             short_term=self._short_term,
             working=self._working,
-            long_term=long_term,
             results=results,
             builtin_executor=builtin_executor,
             skill_registry=skill_registry,
@@ -453,6 +535,8 @@ class SubAgentRunner:
             depth=depth,
             label=self.agent_id,
             on_step=on_step,
+            on_tool_trace=on_tool_trace,
+            trace_id=trace_id,
         )
 
         self._model_id = model_cfg.get("model", "unknown")
@@ -462,6 +546,13 @@ class SubAgentRunner:
     def cancel(self) -> None:
         """Signal cooperative cancellation. Takes effect between iterations."""
         self._cancel_event.set()
+
+    def close(self) -> None:
+        """Release the sub-agent's LLM HTTP resources. Idempotent; safe to call once after run()."""
+        try:
+            self._llm.close()
+        except Exception:
+            pass
 
     @property
     def is_cancelled(self) -> bool:

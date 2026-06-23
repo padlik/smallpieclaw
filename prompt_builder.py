@@ -12,34 +12,12 @@ from __future__ import annotations
 
 import os
 
+# Token estimation lives in token_estimator.py. Re-exported here so existing
+# `from prompt_builder import estimate_tokens` callers keep working.
+from token_estimator import estimate_messages_tokens, estimate_tokens
 
-# ---------------------------------------------------------------------------
-# Token estimation
-# ---------------------------------------------------------------------------
-
-def estimate_tokens(text: str) -> int:
-    """Conservative character-to-token estimate (4 chars ≈ 1 token)."""
-    return len(text) // 4
-
-
-def estimate_messages_tokens(messages: list[dict], system: str = "") -> int:
-    """Estimate total tokens across a message list + system prompt."""
-    total = estimate_tokens(system)
-    for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    total += estimate_tokens(part.get("text", ""))
-        else:
-            total += estimate_tokens(content)
-        for img_path in m.get("images") or []:
-            try:
-                if os.path.getsize(img_path) <= 20 * 1024 * 1024:
-                    total += 1000
-            except OSError:
-                pass
-    return total
+# Re-exported for backward compatibility; listed so linters treat them as used.
+__all__ = ["estimate_tokens", "estimate_messages_tokens"]
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +107,7 @@ information is always injected fresh above and any memory entry about it will be
 RELEVANT PAST RESULTS:
 {past_results}
 
-BUILT-IN TOOLS (always available — prefer these before creating new tools):
+{graph_context_section}BUILT-IN TOOLS (always available — prefer these before creating new tools):
   shell             — execute any shell command on the host system
   file_read         — read a file from the filesystem
   file_write        — write content to a file on the filesystem
@@ -139,6 +117,9 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string; do NOT store model or provider configuration here
   vision_query      — ask the LLM to analyse an image file on disk. Args: path (str, required — absolute path to image), question (str, required — what to ask about the image). Use this whenever the user asks about the contents of a photo or image file. Do NOT use shell to base64-encode or manually analyse images.
   file_patch        — make a surgical search-and-replace edit to a file. Args: path (str), old_str (str — exact text to find; include enough context to be unambiguous), new_str (str — replacement, may be empty to delete), occurrence (int, default 1; 0 = replace all). Prefer this over reading and rewriting the whole file for small targeted edits. Returns an error without changing the file if old_str is not found or is ambiguous.
+  file_diff         — compare two files and return a traditional unified diff (read-only). Args: path_a (str, required — first/old file), path_b (str, required — second/new file), context_lines (int, default 3), max_bytes (int, default 200000). Returns the unified diff text, or 'Files are identical.' when there are no differences. Prefer this over shelling out to the `diff` command.
+  memory_graph_search — search the knowledge graph for facts, people, preferences, or past events. Args: query (str). Only available when graph memory is enabled.
+  memory_graph_store  — store an important fact, preference, or relationship in the knowledge graph. Args: content (str), entity_type (str, optional). Only available when graph memory is enabled.
 
 SUB-AGENT USAGE:
 Sub-agents run in complete isolation — they have NO access to your memory, conversation
@@ -204,6 +185,14 @@ Rules:
 - Never include dangerous commands (rm -rf /, sudo, eval, reverse shells, etc.).
 - If a tool fails, try a different approach or explain the issue.
 - Always end with a "finish" action.
+
+GRAPH MEMORY RULES (applies only when memory_graph_search / memory_graph_store are listed above):
+- ALWAYS call memory_graph_search BEFORE answering any question that might involve information
+  from a prior conversation: people, their preferences, tools they use, past events, rules.
+- Do NOT say "I don't have that information" without first calling memory_graph_search.
+- Use memory_graph_store when the user shares important facts, preferences, or rules that should
+  be remembered across sessions.
+- Graph memory persists across conversations — facts survive restarts.
 """.strip()
 
 
@@ -224,15 +213,28 @@ def build_system_prompt(
     log_backup_count: int,
     top_tools: int,
     user_goal: str = "(context snapshot)",
+    job_history_section: str = "",
+    graph_context_section: str = "",
+    results_top_k: int = 2,
 ) -> tuple[str, int]:
     """Build the full system prompt for the ReAct agent.
 
     Returns (prompt_text, estimated_tokens).
+
+    ``results_top_k`` controls how many ResultsMemory entries are injected.
+    Pass ``0`` to suppress ResultsMemory recall entirely — callers do this when
+    graph memory has already supplied richer semantic recall for this turn,
+    avoiding redundant/overlapping recall context in the prompt.
     """
     relevant_tools = tool_index.search(user_goal, top_k=top_tools)
     tools_text = format_tools(relevant_tools)
     memory_text = memory.as_prompt_text()
-    past_results_text = results.as_prompt_text(user_goal, top_k=2) if results else "No past results."
+    if results and results_top_k > 0:
+        past_results_text = results.as_prompt_text(user_goal, top_k=results_top_k)
+    elif results:
+        past_results_text = "(Skipped — semantic recall provided by graph memory below.)"
+    else:
+        past_results_text = "No past results."
     skills_section = format_skills(skill_registry)
     models_section = format_models(llm)
     file_storage = (
@@ -246,6 +248,9 @@ def build_system_prompt(
     )
     log_section = format_log_section(log_file, log_backup_count)
 
+    # Format graph context: inject as a block followed by a newline, or empty
+    graph_ctx_block = f"{graph_context_section}\n\n" if graph_context_section else ""
+
     prompt = SYSTEM_PROMPT_TEMPLATE.format(
         memory=memory_text,
         past_results=past_results_text,
@@ -254,5 +259,12 @@ def build_system_prompt(
         models_section=models_section,
         file_storage=file_storage,
         log_section=log_section,
+        graph_context_section=graph_ctx_block,
     )
+    # Inject job history only when it has content (avoids wasting tokens on blank lines)
+    if job_history_section:
+        prompt = prompt.replace(
+            "RESPONSE FORMAT — CRITICAL:",
+            f"{job_history_section}\n\nRESPONSE FORMAT — CRITICAL:",
+        )
     return prompt, estimate_tokens(prompt)

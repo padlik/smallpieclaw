@@ -21,12 +21,14 @@ Retry behaviour:
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
 import logging
 import math
 import mimetypes
 import re
 import subprocess
+import threading
 import time
 from datetime import date
 from typing import Any, Optional
@@ -300,7 +302,11 @@ class LLMClient:
                         identify which agent triggered an LLM call in concurrent log streams.
         """
         self.cfg = config
-        self._caller_tag = caller_tag or ""
+        self._base_caller_tag = caller_tag or ""
+        self._trace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+            f"llm_client_trace_{id(self)}",
+            default="",
+        )
 
         # Require [[models]] — no legacy [llm] fallback
         models = config.get("models")
@@ -355,6 +361,7 @@ class LLMClient:
         # (e.g. tool-index queries repeated across user turns).
         self._embed_cache: dict[str, list[float]] = {}
         self._embed_cache_max: int = 512
+        self._embed_cache_lock = threading.Lock()
 
         # Retry / timeout from active model config
         _ref = self._models[self._active_idx]
@@ -404,6 +411,34 @@ class LLMClient:
     def llm_cfg(self) -> dict:
         """Return the currently active model config."""
         return self._models[self._active_idx]
+
+    @property
+    def _trace_id(self) -> str:
+        """Return the current execution-context trace ID."""
+        return self._trace_id_var.get()
+
+    @_trace_id.setter
+    def _trace_id(self, trace_id: str | None) -> None:
+        self._trace_id_var.set((trace_id or "").strip())
+
+    @property
+    def _caller_tag(self) -> str:
+        """Return the base caller label plus the context-local trace ID."""
+        trace_id = self._trace_id
+        if trace_id:
+            base = self._base_caller_tag.strip()
+            return f"{base} {trace_id}".strip()
+        return self._base_caller_tag
+
+    def set_trace_id(self, trace_id: str | None) -> None:
+        """Set (or clear) the request-scoped trace ID woven into log tags.
+
+        The trace ID is stored in a context-local variable, then appended to the
+        caller tag so concurrent runs sharing this LLMClient do not overwrite one
+        another's log correlation state. Passing an empty value restores the bare
+        caller label in the current execution context.
+        """
+        self._trace_id = trace_id
 
     def list_models(self) -> list[dict]:
         """Return summary of all configured models."""
@@ -509,11 +544,34 @@ class LLMClient:
             logger.error("LLM chat error: %s", exc)
             raise
 
+    @staticmethod
+    def _messages_have_images(messages: list[dict]) -> bool:
+        """True if any message carries image data the model must be able to see.
+
+        Detects the ReAct loop's ``images`` field as well as provider-style
+        multimodal content lists (``[{"type": "image_url", ...}]``).
+        """
+        for m in messages:
+            if m.get("images"):
+                return True
+            content = m.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
+                        return True
+        return False
+
     def chat_with_fallback(self, messages: list[dict], system: str | None = None,
                            progress_cb=None, json_mode: bool = False) -> str:
         """
         Like chat(), but tries each fallback model in order if the primary fails
         with a transient error. LLMPermanentError is never retried via fallback.
+
+        When the request contains images, candidates are filtered to
+        vision-capable models (``vision = true`` in ``[[models]]``). A non-vision
+        active model is skipped in favour of a vision-capable fallback; if no
+        vision-capable model is configured a clear permanent error is raised
+        instead of cycling through unsuitable models.
 
         On success the active model index is NOT restored — the working model
         persists for subsequent calls within this job/run() lifetime.
@@ -524,15 +582,34 @@ class LLMClient:
         """
         primary_idx = self._active_idx
         last_exc: Exception | None = None
+        _tag = f"[{self._caller_tag.strip()}] " if self._caller_tag.strip() else ""
 
         candidates = [primary_idx] + self._fallback_indices
+
+        if self._messages_have_images(messages):
+            vision_candidates = [i for i in candidates if self._models[i].get("vision")]
+            if not vision_candidates:
+                self._active_idx = primary_idx  # restore before propagating
+                configured = [m.get("model", "?") for m in self._models]
+                raise LLMPermanentError(
+                    "This request includes an image, but no vision-capable model is "
+                    "configured. Set `vision = true` on a model in [[models]] (and ensure "
+                    f"it is the active or a fallback model). Configured models: {configured}"
+                )
+            if not self._models[primary_idx].get("vision") and progress_cb:
+                target = self._models[vision_candidates[0]].get("model", "?")
+                progress_cb(
+                    f"⚠️ Active model is not vision-capable; switching to vision model '{target}'…"
+                )
+            candidates = vision_candidates
+
         for seq, idx in enumerate(candidates):
             self._active_idx = idx
             model_id = self._models[idx].get("model", f"model_{idx}")
             if seq > 0:
                 logger.warning(
-                    "Falling back to model '%s' after error: %s",
-                    model_id, last_exc,
+                    "%sFalling back to model '%s' after error: %s",
+                    _tag, model_id, last_exc,
                 )
                 if progress_cb:
                     progress_cb(f"⚠️ Switching to fallback model '{model_id}'…")
@@ -550,11 +627,11 @@ class LLMClient:
                 self._active_idx = primary_idx  # reset before trying next candidate
                 if seq < len(candidates) - 1:
                     logger.warning(
-                        "Model '%s' failed (will try next fallback): %s",
-                        model_id, exc,
+                        "%sModel '%s' failed (will try next fallback): %s",
+                        _tag, model_id, exc,
                     )
                 else:
-                    logger.error("All models (primary + %d fallback(s)) failed.", len(self._fallback_indices))
+                    logger.error("%sAll %d candidate model(s) failed.", _tag, len(candidates))
 
         raise last_exc  # type: ignore[misc]
 
@@ -829,6 +906,9 @@ class LLMClient:
             }
             if system:
                 payload["system"] = system
+            temperature = self.llm_cfg.get("temperature")
+            if temperature is not None:
+                payload["temperature"] = temperature
             top_p = self.llm_cfg.get("top_p")
             if top_p is not None:
                 payload["top_p"] = top_p
@@ -1096,27 +1176,46 @@ class LLMClient:
         calls with the same text — common during tool-index searches across turns —
         skip the API round-trip entirely.
         """
-        if text in self._embed_cache:
-            return self._embed_cache[text]
+        with self._embed_cache_lock:
+            if text in self._embed_cache:
+                logger.debug("embed: cache hit (text_len=%d)", len(text))
+                return self._embed_cache[text]
 
         provider = self.emb_cfg.get("provider", "openai")
+        logger.debug("embed: calling %s provider (text_len=%d)", provider, len(text))
         try:
             if provider in ("openai", "openrouter"):
                 vector = self._openai_embed(text)
             elif provider == "google":
                 vector = self._google_embed(text)
             else:
-                # Fallback: OpenAI-compatible
+                logger.warning(
+                    "Embedding provider '%s' has no native support; "
+                    "attempting OpenAI-compatible endpoint. "
+                    "Configure [embeddings] provider as 'openai', 'openrouter', or 'google'.",
+                    provider,
+                )
                 vector = self._openai_embed(text)
         except _LLM_CALL_ERRORS as exc:
             logger.error("Embedding error: %s", exc)
             raise
 
-        # Evict oldest entry when full (FIFO via dict insertion order, Python 3.7+)
-        if len(self._embed_cache) >= self._embed_cache_max:
-            oldest = next(iter(self._embed_cache))
-            del self._embed_cache[oldest]
-        self._embed_cache[text] = vector
+        # Evict oldest entry when full (FIFO via dict insertion order, Python 3.7+).
+        # Lock is required: concurrent sub-agents share this LLMClient and can race
+        # on the check-evict-insert sequence causing a KeyError on del.
+        with self._embed_cache_lock:
+            if len(self._embed_cache) >= self._embed_cache_max:
+                oldest = next(iter(self._embed_cache))
+                del self._embed_cache[oldest]
+                logger.debug("embed: cache evicted oldest entry")
+            self._embed_cache[text] = vector
+            cache_size = len(self._embed_cache)
+        logger.debug(
+            "embed: cached vector (dim=%d, cache=%d/%d)",
+            len(vector),
+            cache_size,
+            self._embed_cache_max,
+        )
         return vector
 
     def _openai_embed(self, text: str) -> list[float]:
@@ -1156,4 +1255,14 @@ class LLMClient:
         return _cosine_similarity(a, b)
 
     def close(self):
-        self._http.close()
+        """Close all HTTP transports owned by this client. Idempotent."""
+        try:
+            self._http.close()
+        except Exception:
+            pass
+        for oc in self._ollama_clients:
+            if oc is not None:
+                try:
+                    oc._client.close()
+                except Exception:
+                    pass

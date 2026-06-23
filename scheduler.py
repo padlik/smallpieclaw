@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import threading
 from datetime import datetime, timedelta
@@ -34,6 +35,20 @@ import schedule
 from croniter import croniter, CroniterBadCronError
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_context_key(tag: str) -> str:
+    """Convert a scheduler tag into a safe spawn_agent context_key.
+
+    The result is bounded to 128 chars to satisfy
+    ``builtin_executor._validate_context_key``; otherwise a very long job tag
+    would fail validation and prevent the whole scheduled job from running.
+    """
+    key = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+    key = re.sub(r"[^a-z0-9_]+", "_", key)
+    key = re.sub(r"_+", "_", key).strip("_")
+    key = key[:128].rstrip("_")
+    return key or "scheduled_job"
 
 try:
     import tomli
@@ -71,6 +86,155 @@ def _legacy_to_cron(stype: str, time_str: str = None, hours=None, minutes=None, 
 
 
 # ---------------------------------------------------------------------------
+# JobExecutionLog
+# ---------------------------------------------------------------------------
+
+_RESULT_MAX_CHARS = 2000  # truncate result stored per entry
+
+
+class JobExecutionLog:
+    """Compact execution log for scheduled jobs, stored as JSONL.
+
+    Each entry:
+        {"ts": ISO8601, "tag": str, "task": str, "result": str,
+         "success": bool, "elapsed_s": int, "model": str}
+
+    Rotation (applied on every ``record()`` call):
+    - Drop entries older than ``max_age_hours``
+    - Keep at most ``max_per_job`` most recent entries per tag
+    """
+
+    def __init__(
+        self,
+        log_file: str,
+        max_age_hours: int = 48,
+        max_per_job: int = 10,
+    ) -> None:
+        self._log_file = log_file
+        self._max_age_hours = max_age_hours
+        self._max_per_job = max_per_job
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def record(
+        self,
+        tag: str,
+        task: str,
+        result: str,
+        success: bool,
+        elapsed_s: int = 0,
+        model: str = "",
+    ) -> None:
+        """Append a new entry and rotate old ones.  Thread-safe."""
+        entry = {
+            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "tag": tag,
+            "task": (task or "")[:200],
+            "result": (result or "")[:_RESULT_MAX_CHARS],
+            "success": bool(success),
+            "elapsed_s": int(elapsed_s),
+            "model": model or "",
+        }
+        with self._lock:
+            entries = self._load()
+            entries.append(entry)
+            entries = self._rotate(entries)
+            self._write(entries)
+        logger.debug("JobExecutionLog: recorded entry for tag=%s success=%s", tag, success)
+
+    def format_for_prompt(self, max_entries: int = 20) -> str:
+        """Return a compact human-readable summary for injection into the system prompt."""
+        with self._lock:
+            entries = self._load()
+        if not entries:
+            return ""
+        # Most recent first, capped
+        recent = entries[-max_entries:][::-1]
+        lines = ["SCHEDULED JOB EXECUTION HISTORY (most recent first):"]
+        for e in recent:
+            status = "✅" if e.get("success") else "❌"
+            ts = e.get("ts", "?")
+            tag = e.get("tag", "?")
+            elapsed = e.get("elapsed_s", 0)
+            model = e.get("model", "")
+            result_preview = (e.get("result") or "").strip()
+            if len(result_preview) > 300:
+                result_preview = result_preview[:300] + "…"
+            model_part = f" [{model}]" if model else ""
+            lines.append(f"  {status} {ts} | {tag}{model_part} ({elapsed}s)")
+            if result_preview:
+                lines.append(f"     → {result_preview}")
+        return "\n".join(lines)
+
+    def read_recent(self, n: int = 50) -> list[dict]:
+        """Return the most recent ``n`` entries (newest last)."""
+        with self._lock:
+            entries = self._load()
+        return entries[-n:]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load(self) -> list[dict]:
+        """Load all entries from the JSONL file.  Caller must hold self._lock."""
+        if not os.path.exists(self._log_file):
+            return []
+        entries = []
+        try:
+            with open(self._log_file, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        except OSError as exc:
+            logger.warning("JobExecutionLog: failed to read %s: %s", self._log_file, exc)
+        return entries
+
+    def _rotate(self, entries: list[dict]) -> list[dict]:
+        """Remove stale entries.  Returns a new (filtered) list."""
+        cutoff = datetime.utcnow() - timedelta(hours=self._max_age_hours)
+        cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Drop entries older than max_age_hours
+        entries = [e for e in entries if e.get("ts", "") >= cutoff_iso]
+
+        # Per-tag cap: keep only max_per_job most recent per tag
+        tag_counts: dict[str, int] = {}
+        kept = []
+        for e in reversed(entries):
+            tag = e.get("tag", "")
+            count = tag_counts.get(tag, 0)
+            if count < self._max_per_job:
+                tag_counts[tag] = count + 1
+                kept.append(e)
+        kept.reverse()
+        return kept
+
+    def _write(self, entries: list[dict]) -> None:
+        """Atomically write entries back to the JSONL file.  Caller must hold self._lock."""
+        tmp_file = self._log_file + ".tmp"
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as fh:
+                for e in entries:
+                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            os.replace(tmp_file, self._log_file)
+        except OSError as exc:
+            logger.warning("JobExecutionLog: failed to write %s: %s", self._log_file, exc)
+            try:
+                os.unlink(tmp_file)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 
@@ -91,7 +255,6 @@ class Scheduler:
         agent_fn: Optional[Callable[[str], str]] = None,
         scheduler_config_path: str = "scheduler.toml",
         data_dir: str = "data",
-        long_term_memory=None,
         builtin_executor=None,
     ):
         sched_cfg = config.get("scheduler", {})
@@ -100,12 +263,20 @@ class Scheduler:
         self.notify = notify_fn
         self.agent = agent_fn
         self.builtin_executor = builtin_executor  # Optional[BuiltinExecutor]
-        self.long_term_memory = long_term_memory
         self._data_dir = data_dir
         self._scheduler_config_path = scheduler_config_path
         self._commands_file = os.path.join(data_dir, "scheduler_commands.json")
         self._state_file = os.path.join(data_dir, "scheduler_state.json")
         self._dynamic_jobs_file = os.path.join(data_dir, "scheduled_jobs.json")
+
+        # Execution history log
+        _log_max_age = int(sched_cfg.get("execution_log_max_age_hours", 48))
+        _log_max_per = int(sched_cfg.get("execution_log_max_per_job", 10))
+        self.execution_log = JobExecutionLog(
+            log_file=os.path.join(data_dir, "job_execution_log.jsonl"),
+            max_age_hours=_log_max_age,
+            max_per_job=_log_max_per,
+        )
 
         # Long-running agent watcher
         self._warn_minutes: int = int(agent_cfg.get("long_run_warn_minutes", 30))
@@ -198,9 +369,7 @@ class Scheduler:
         max_iterations: int = None,
     ) -> dict:
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
-        tag = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
-        while "__" in tag:
-            tag = tag.replace("__", "_")
+        tag = _normalize_context_key(tag)
         # Coerce hours/minutes to int — LLM may pass them as strings
         try:
             hours = int(hours) if hours is not None else None
@@ -471,7 +640,7 @@ class Scheduler:
         # Prefer spawn_agent via builtin_executor if available
         if self.builtin_executor is not None and hasattr(self.builtin_executor, '_exec_spawn_agent'):
             preserve_ctx = meta.get("preserve_context", False)
-            context_key = tag if preserve_ctx else None
+            context_key = _normalize_context_key(tag) if preserve_ctx else None
 
             spawn_args = {"task": task, "_job_tag": tag}
             if job_model:
@@ -493,6 +662,8 @@ class Scheduler:
             spawn_args["expandable"] = False
             # Honour the job's notify setting — False suppresses Telegram output.
             spawn_args["_notify"] = meta.get("notify", True)
+            # Pass execution log callback so spawn_agent records the result.
+            spawn_args["_result_log_cb"] = self.execution_log.record
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now
@@ -551,17 +722,33 @@ class Scheduler:
         }
         self._save_state()
 
+        # Record in execution log
+        self.execution_log.record(
+            tag=tag,
+            task=task,
+            result=result,
+            success=not error_occurred,
+            elapsed_s=0,
+            model=job_model or "",
+        )
+
         if error_occurred:
             if meta.get("notify", True):
                 self.notify(f"⚠️ <b>Scheduled job failed:</b> <code>{_html.escape(tag)}</code>\n\n{_html.escape(result)}")
             return
 
-        if tag == "longterm_memory_update" and self.long_term_memory:
-            try:
-                self.long_term_memory.add(result, source="scheduled")
-                logger.info("%sLong-term memory updated", _spfx)
-            except Exception as exc:
-                logger.warning("%sFailed to update long-term memory: %s", _spfx, exc)
+        if tag == "longterm_memory_update":
+            # P2 consolidation: the special longterm_memory_update job is
+            # deprecated. Runtime semantic recall is served by graph memory; JSON
+            # LongTermMemory is legacy/backfill-only and is no longer written at
+            # runtime. The job still runs and reports its result, but its output
+            # is not auto-persisted into any semantic store.
+            logger.warning(
+                "%sJob '%s' uses the deprecated longterm_memory_update tag: its result "
+                "is no longer auto-persisted. Use memory_graph_store (confirmed) to "
+                "remember facts.",
+                _spfx, tag,
+            )
 
         # Auto-remove once/reminder jobs after successful execution
         if is_once:
@@ -897,42 +1084,45 @@ class Scheduler:
     def _run_loop(self) -> None:
         """Poll every 30 seconds. Fire cron jobs whose next_run has passed; run once-jobs via schedule lib."""
         while not self._stop_event.is_set():
-            self._process_pending_commands()
-            # Cron job check (local time)
-            now_local = datetime.now()
-            for tag, meta in list(self._jobs_meta.items()):
-                if not meta.get("enabled", True):
-                    continue
-                if meta.get("schedule_type") not in ("cron", "daily", "interval", None):
-                    continue
-                next_run_str = meta.get("_next_run")
-                if not next_run_str:
-                    continue
-                try:
-                    next_run = datetime.fromisoformat(next_run_str)
-                except ValueError:
-                    continue
-                if now_local >= next_run:
-                    # Fire in background thread
-                    threading.Thread(target=self._run_job, kwargs={"tag": tag}, daemon=True).start()
-                    # Schedule next occurrence using the natural (un-jittered) fire time as
-                    # the croniter base. Using now_local would return the same tick when the
-                    # job fired early due to negative startup jitter (double-execution bug).
+            try:
+                self._process_pending_commands()
+                # Cron job check (local time)
+                now_local = datetime.now()
+                for tag, meta in list(self._jobs_meta.items()):
+                    if not meta.get("enabled", True):
+                        continue
+                    if meta.get("schedule_type") not in ("cron", "daily", "interval", None):
+                        continue
+                    next_run_str = meta.get("_next_run")
+                    if not next_run_str:
+                        continue
                     try:
-                        expr = meta.get("cron")
-                        if expr:
-                            natural_str = meta.get("_natural_next_run") or next_run_str
-                            base_dt = datetime.fromisoformat(natural_str)
-                            cron_iter = croniter(expr, base_dt)
-                            next_dt = cron_iter.get_next(datetime)
-                            meta["_natural_next_run"] = next_dt.isoformat()
-                            meta["_next_run"] = next_dt.isoformat()
-                    except (CroniterBadCronError, TypeError, ValueError) as exc:
-                        logger.warning("Could not compute next_run for '%s': %s", tag, exc)
-            # Once-jobs handled by schedule library
-            schedule.run_pending()
-            if self._warn_minutes > 0:
-                self._check_long_running_agents()
+                        next_run = datetime.fromisoformat(next_run_str)
+                    except ValueError:
+                        continue
+                    if now_local >= next_run:
+                        # Fire in background thread
+                        threading.Thread(target=self._run_job, kwargs={"tag": tag}, daemon=True).start()
+                        # Schedule next occurrence using the natural (un-jittered) fire time as
+                        # the croniter base. Using now_local would return the same tick when the
+                        # job fired early due to negative startup jitter (double-execution bug).
+                        try:
+                            expr = meta.get("cron")
+                            if expr:
+                                natural_str = meta.get("_natural_next_run") or next_run_str
+                                base_dt = datetime.fromisoformat(natural_str)
+                                cron_iter = croniter(expr, base_dt)
+                                next_dt = cron_iter.get_next(datetime)
+                                meta["_natural_next_run"] = next_dt.isoformat()
+                                meta["_next_run"] = next_dt.isoformat()
+                        except (CroniterBadCronError, TypeError, ValueError) as exc:
+                            logger.warning("Could not compute next_run for '%s': %s", tag, exc)
+                # Once-jobs handled by schedule library
+                schedule.run_pending()
+                if self._warn_minutes > 0:
+                    self._check_long_running_agents()
+            except Exception:
+                logger.exception("Scheduler _run_loop: unhandled exception in loop iteration — loop will continue")
             self._stop_event.wait(timeout=30)
 
     def _check_long_running_agents(self) -> None:
@@ -972,4 +1162,3 @@ class Scheduler:
 
         # Clean up ids for agents that have since finished
         self._warned_agent_ids &= active_ids
-

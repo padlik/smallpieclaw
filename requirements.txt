@@ -5,3 +5,12 @@ tomli==2.0.1
 schedule==1.2.1
 croniter>=1.4
 ollama>=0.4.0
+# Tokenizer for accurate context accounting on OpenAI-compatible models. Optional
+# at runtime — token_estimator.py falls back to a conservative heuristic if it is
+# missing or cannot resolve a model — but installed by default for better sizing.
+tiktoken>=0.7.0
+# Optional: graph-based memory (install to enable [graph_memory] enabled = true)
+# ladybug>=0.7.0
+# PTY shell backend — enables line-buffered, TTY-aware shell execution for
+# sophisticated scripts. Already transitively present via python-telegram-bot.
+ptyprocess>=0.7.0

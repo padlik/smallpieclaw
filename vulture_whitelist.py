@@ -59,3 +59,28 @@ EmbeddingsConfig
 SchedulerConfig
 PathsConfig
 MCPServerConfig
+
+# graph_memory.py — backfill public API
+from graph_memory import (  # noqa: E402
+    BackfillEntryResult,
+    BackfillResult,
+    backfill_longterm_to_graph,
+    build_extraction_llm_call,
+)
+BackfillEntryResult
+BackfillResult
+backfill_longterm_to_graph
+build_extraction_llm_call
+backfill_longterm_to_graph
+
+# LongTermMemory.entries — safe snapshot API used by backfill CLI
+from memory_store import LongTermMemory  # noqa: E402
+LongTermMemory.entries
+
+# tests/test_graph_memory_backfill.py — pytest false positives
+# 'p' is a required lambda parameter matching the llm_call_fn protocol (str -> str)
+# 'error_llm' is a pytest fixture injected by name but not referenced directly in the
+# test body (it overrides mock_store's side effect via the fixture mechanism)
+from tests.test_graph_memory_backfill import empty_llm, error_llm  # noqa: E402
+empty_llm
+error_llm
