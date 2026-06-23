@@ -210,5 +210,8 @@ __marimo__/
 .github
 data/scheduler_state.json
 
+# OpenCode history
+.opencode/history/
+
 # Local shell scripts
 set_*.sh
