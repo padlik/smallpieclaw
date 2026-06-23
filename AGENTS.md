@@ -1,6 +1,12 @@
 # AGENTS.md — OpenCode Instructions for smallpieclaw
 
-> **Note:** `AGENT.md` (no S) is the *user-facing* reference for the Telegram bot's capabilities. This file (`AGENTS.md`) is for AI coding agents working on the codebase.
+## Overall
+Prioritize retrieval-led reasoning over pretrained-knowledge-led reasoning.
+
+## Code quality
+ - Avoid making superclasses and large files.
+ - Follow PEP 8 style guidelines. Include type hints for function parameters and return types. Write docstrings for all public modules, classes, functions, and methods.
+ - After every code change, always run `ruff check .` and `vulture . vulture_whitelist.py --min-confidence 80` to verify.
 
 ## Dev Commands
 
@@ -79,4 +85,3 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 - **PID file locking** in `main.py` uses `fcntl.flock()` — the OS releases the lock on process exit, so stale PID files from crashes are handled automatically.
 - **Log format:** `%(asctime)s [%(levelname)s] %(name)s: %(message)s` with source tags like `[main]`, `[sa-<id>]`, `[sched/<tag>]`.
 - **`tomli`** is used for TOML parsing (fallback for Python < 3.11 where `tomllib` is stdlib).
-- **`AGENT.md`** (no S) is the user-facing bot capabilities reference — do not confuse with this file.
