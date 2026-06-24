@@ -1978,31 +1978,19 @@ class BuiltinExecutor:
 def _save_context(context_key: str, short_term, data_dir: str) -> None:
     """Persist ShortTermMemory to data/job_contexts/<key>.json atomically.
 
-    Writes to a temporary file in the same directory and commits with
-    ``os.replace`` so a crash mid-write cannot corrupt or truncate an existing
-    context file.
+    Delegates to ``memory_store._atomic_save_json`` (temp file + ``os.replace``)
+    so an interrupted write cannot corrupt or truncate an existing context
+    file. Unlike the memory-store callers, a context-save failure is logged
+    and swallowed — a sub-agent finish path must not be derailed by a context
+    persistence error.
     """
-    import json as _json
+    from memory_store import _atomic_save_json
 
     path = _context_path(context_key, data_dir)
-    ctx_dir = os.path.dirname(path)
-    os.makedirs(ctx_dir, exist_ok=True)
-    tmp_path = os.path.join(
-        ctx_dir,
-        f".{os.path.basename(path)}.{os.getpid()}.{secrets.token_hex(8)}.tmp",
-    )
     try:
-        data = short_term.to_dict()
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            _json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
+        _atomic_save_json(path, short_term.to_dict(), attempts=1)
     except OSError:
         logger.warning("Failed to save context for %s", context_key, exc_info=True)
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
 
 
 def _load_context(context_key: str, data_dir: str, max_turns: int = 50):

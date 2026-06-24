@@ -24,7 +24,7 @@ from typing import Callable, Optional
 from confirmation import ConfirmationManager
 from context_manager import maybe_compact
 from llm_client import LLMClient, LLMCancelledError, _encode_images
-from memory_store import _summarize_result, _task_outcome_text
+from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from prompt_builder import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -547,32 +547,21 @@ def react_loop(
                     ctx.short_term.add("user", user_goal)
                     ctx.short_term.add("assistant", result)
                 if ctx.results and ctx.working and ctx.working.has_content():
-                    tools_used = [
-                        s["details"].get("tool", "")
-                        for s in ctx.working.steps
-                        if s["action"] == "tool"
-                    ]
+                    tools_used = list(filter(None, extract_tools_used(ctx.working.steps)))
                     summary = _summarize_result(
                         ctx.llm,
                         goal=user_goal,
                         result=result,
-                        tools_used=list(filter(None, tools_used)),
+                        tools_used=tools_used,
                     )
-                    ctx.results.add_result(
+                    save_task_outcome(
+                        results=ctx.results,
+                        graph_memory_writer=ctx.graph_memory_writer,
                         goal=user_goal,
                         summary=summary,
-                        tools_used=list(filter(None, tools_used)),
+                        tools_used=tools_used,
+                        log_prefix=pfx,
                     )
-                    if ctx.graph_memory_writer is not None:
-                        try:
-                            outcome_text = _task_outcome_text(
-                                goal=user_goal,
-                                summary=summary,
-                                tools_used=list(filter(None, tools_used)),
-                            )
-                            ctx.graph_memory_writer.enqueue(outcome_text, source="task_outcome")
-                        except Exception as _gw_exc:  # noqa: BLE001
-                            logger.debug("%sGraph memory task outcome enqueue failed: %s", pfx, _gw_exc)
                 if ctx.working:
                     ctx.working.clear()
                 return result

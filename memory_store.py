@@ -495,6 +495,51 @@ def _summarize_result(
     return summary
 
 
+def extract_tools_used(working_steps: list[dict]) -> list[str]:
+    """Return non-empty tool names from working-memory steps, in order.
+
+    Filters ``working.steps`` to ``action == "tool"`` entries and extracts the
+    ``tool`` field, dropping empties. Centralizes the pattern previously
+    duplicated across ``react_loop`` and ``AgentController.reset_task``.
+    """
+    return [
+        s["details"].get("tool", "")
+        for s in working_steps
+        if s.get("action") == "tool"
+    ]
+
+
+def save_task_outcome(
+    *,
+    results: "ResultsMemory | None",
+    graph_memory_writer: Any,
+    goal: str,
+    summary: str,
+    tools_used: list[str],
+    log_prefix: str = "",
+) -> None:
+    """Persist a finished task's outcome to ResultsMemory and graph memory.
+
+    Writes the bounded *summary* to *results* (if present) and enqueues a
+    ``_task_outcome_text`` episode to *graph_memory_writer* (if present).
+    Both writes are best-effort: a graph-memory failure is logged and never
+    raised, so a finish path cannot be derailed by the optional graph store.
+
+    *log_prefix* (e.g. a sub-agent trace prefix like ``[sa-<id>]``) is included
+    in the failure log so the originating agent is identifiable in logs.
+    """
+    if results is not None:
+        results.add_result(goal=goal, summary=summary, tools_used=tools_used)
+    if graph_memory_writer is not None:
+        try:
+            graph_memory_writer.enqueue(
+                _task_outcome_text(goal=goal, summary=summary, tools_used=tools_used),
+                source="task_outcome",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("%sGraph memory task outcome enqueue failed: %s", log_prefix, exc)
+
+
 # ---------------------------------------------------------------------------
 # ResultsMemory
 # ---------------------------------------------------------------------------
@@ -509,7 +554,7 @@ class ResultsMemory:
         self._lock = threading.RLock()
         self._load()
 
-    def add_result(self, goal: str, summary: str, tools_used: list = None) -> str:
+    def add_result(self, goal: str, summary: str, tools_used: list | None = None) -> str:
         result_id = str(uuid.uuid4())
         content = f"Goal: {goal}\nResult: {summary}"
         vector = []

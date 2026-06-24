@@ -19,7 +19,7 @@ from typing import Callable, Optional
 
 from confirmation import ConfirmationManager
 from llm_client import LLMClient
-from memory_store import MemoryStore, _task_outcome_text
+from memory_store import MemoryStore, extract_tools_used, save_task_outcome
 from prompt_builder import (
     build_system_prompt as _build_system_prompt,
     estimate_tokens as _estimate_tokens,
@@ -264,28 +264,14 @@ class AgentController:
             except Exception:
                 summary = working_text[:300]
             if self.results:
-                tools_used = [
-                    s["details"].get("tool", "")
-                    for s in self.working.steps
-                    if s["action"] == "tool"
-                ]
-                self.results.add_result(
+                tools_used = list(filter(None, extract_tools_used(self.working.steps)))
+                save_task_outcome(
+                    results=self.results,
+                    graph_memory_writer=self._graph_memory_writer,
                     goal=self.working.goal,
                     summary=summary,
-                    tools_used=list(filter(None, tools_used)),
+                    tools_used=tools_used,
                 )
-                if self._graph_memory_writer is not None:
-                    try:
-                        self._graph_memory_writer.enqueue(
-                            _task_outcome_text(
-                                goal=self.working.goal,
-                                summary=summary,
-                                tools_used=list(filter(None, tools_used)),
-                            ),
-                            source="task_outcome",
-                        )
-                    except Exception as _gw_exc:  # noqa: BLE001
-                        logger.debug("Graph memory task outcome enqueue failed: %s", _gw_exc)
             msg = "✅ Task saved to results memory. Starting fresh context."
         if self.working:
             self.working.clear()
