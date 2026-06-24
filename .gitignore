@@ -212,6 +212,7 @@ data/scheduler_state.json
 
 # OpenCode history
 .opencode/history/
+.opencode/
 
 # Local shell scripts
 set_*.sh
