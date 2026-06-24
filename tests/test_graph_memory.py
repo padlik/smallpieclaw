@@ -260,6 +260,51 @@ class TestGraphMemoryWALRecovery:
         with pytest.raises(RuntimeError, match="Corrupted wal"):
             GMS._open_db(db_path, 64 * 1024 * 1024)
 
+    def test_assertion_failed_wal_removes_and_retries(self, tmp_path, monkeypatch):
+        """UNREACHABLE_CODE assertion in wal_record.cpp is also treated as WAL corruption."""
+        db_path = str(tmp_path / "graph4")
+        wal_path = db_path + ".wal"
+        ckpt_path = db_path + ".wal.checkpoint"
+
+        open(wal_path, "w").close()
+        open(ckpt_path, "w").close()
+
+        call_count = 0
+
+        def _db_side_effect(*_args, **_kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError(
+                    'Assertion failed in file "/__w/ladybug/ladybug/src/storage/wal/wal_record.cpp" '
+                    "on line 76: UNREACHABLE_CODE"
+                )
+            return MagicMock()
+
+        self._make_ladybug_mock(monkeypatch, _db_side_effect)
+
+        from graph_memory import GraphMemoryStore as GMS
+        db = GMS._open_db(db_path, 64 * 1024 * 1024)
+        assert db is not None
+        assert call_count == 2, "Database should have been opened twice (fail then retry)"
+        assert not os.path.exists(wal_path), "WAL file should have been removed"
+        assert not os.path.exists(ckpt_path), "Checkpoint WAL file should have been removed"
+
+    def test_non_wal_assertion_error_is_reraised(self, tmp_path, monkeypatch):
+        """Assertion errors not related to WAL are not recovered."""
+        db_path = str(tmp_path / "graph5")
+
+        def _fail(*_args, **_kw):
+            raise RuntimeError(
+                "Assertion failed in file \"/some/path.cpp\" on line 42: UNREACHABLE_CODE"
+            )
+
+        self._make_ladybug_mock(monkeypatch, _fail)
+
+        from graph_memory import GraphMemoryStore as GMS
+        with pytest.raises(RuntimeError, match="UNREACHABLE_CODE"):
+            GMS._open_db(db_path, 64 * 1024 * 1024)
+
 
 class TestVectorExtensionLoader:
     """_load_vector_extension() should try LOAD first and INSTALL+LOAD on first use."""

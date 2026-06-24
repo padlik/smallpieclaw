@@ -300,7 +300,12 @@ class GraphMemoryStore:
             )
         except Exception as exc:  # noqa: BLE001
             exc_lower = str(exc).lower()
-            if "corrupted wal" not in exc_lower and "invalid wal record" not in exc_lower:
+            is_wal_corruption = (
+                "corrupted wal" in exc_lower
+                or "invalid wal record" in exc_lower
+                or "wal_record.cpp" in exc_lower
+            )
+            if not is_wal_corruption:
                 raise
             # Attempt WAL recovery: remove corrupt WAL files and retry.
             wal_path = db_path + ".wal"
