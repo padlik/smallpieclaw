@@ -360,3 +360,34 @@ class TestCancelEventOwnership:
             except Exception:
                 pass
         assert ev.is_set() is False
+
+class TestFormatToolResultRecoveryFields:
+    """format_tool_result must surface structured recovery metadata on failure."""
+
+    def test_failure_includes_recovery_metadata(self):
+        from react_loop import format_tool_result
+
+        msg = format_tool_result("shell", {
+            "success": False,
+            "output": "",
+            "error": "boom",
+            "exit_code": 124,
+            "error_type": "tool_timeout",
+            "recoverable": True,
+            "suggestion": "increase the timeout",
+        })
+        assert "error_type: tool_timeout" in msg
+        assert "recoverable: True" in msg
+        assert "suggestion: increase the timeout" in msg
+
+    def test_failure_without_metadata_omits_fields(self):
+        from react_loop import format_tool_result
+
+        msg = format_tool_result("shell", {
+            "success": False,
+            "output": "",
+            "error": "boom",
+            "exit_code": 1,
+        })
+        assert "error_type:" not in msg
+        assert "recoverable:" not in msg

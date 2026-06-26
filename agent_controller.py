@@ -20,8 +20,8 @@ from typing import Callable, Optional
 from confirmation import ConfirmationManager
 from llm_client import LLMClient
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
+from prompt_loader import build_system_prompt as _build_system_prompt
 from prompt_builder import (
-    build_system_prompt as _build_system_prompt,
     estimate_tokens as _estimate_tokens,
     format_log_section as _format_log_section_impl,
     format_models as _format_models_impl,
@@ -81,6 +81,9 @@ class AgentController:
         on_tool_trace=None,    # Optional[Callable[[ToolTrace], None]] — called after each tool call
         job_history_fn=None,   # Optional[Callable[[], str]] — returns job execution history for prompt
         trace_id=None,         # Optional[str] — propagate a parent run's trace; None => fresh per run
+        creativity_mode: str = "default",
+        plan_max_iterations: int = 50,
+        inactivity_warn_minutes: int = 15,
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -110,10 +113,17 @@ class AgentController:
         self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
         # Optional parent trace to propagate; when None each run() gets a fresh ID.
         self._trace_id = trace_id
+        # Sub-agent context sharing (set by SubAgentRunner only for sub-agents)
+        self._context_payload: dict | None = None
+        self._prompt_variant: str | None = None
         # Graph memory (optional — set by main.py after init when enabled)
         self._graph_memory = None          # Optional[GraphMemoryStore]
         self._graph_memory_writer = None   # Optional[GraphMemoryWriter]
         self._graph_memory_max_entries = 10
+        # Creativity / inactivity settings passed through to react_loop
+        self.creativity_mode = creativity_mode
+        self.plan_max_iterations = plan_max_iterations
+        self.inactivity_warn_minutes = inactivity_warn_minutes
 
         # ------------------------------------------------------------------
         # Cross-thread synchronisation for operator confirmation prompts.
@@ -191,8 +201,18 @@ class AgentController:
             graph_memory=self._graph_memory,
             graph_memory_writer=self._graph_memory_writer,
             graph_memory_max_entries=self._graph_memory_max_entries,
+            strategy_memory=getattr(self, "strategy_memory", None),
+            max_subagents=getattr(self.builtin_executor, "_max_subagents", 6),
+            creativity_mode=getattr(self, "creativity_mode", "default"),
+            plan_max_iterations=getattr(self, "plan_max_iterations", 50),
+            inactivity_warn_minutes=getattr(self, "inactivity_warn_minutes", 15),
             confirmation=self._confirmation,
         )
+        # Sub-agent context sharing: propagate the parent context payload and
+        # prompt variant (set by SubAgentRunner) so react_loop can inject the
+        # PARENT CONTEXT section and select the sub-agent prompt variant.
+        ctx._context_payload = self._context_payload
+        ctx._prompt_variant = self._prompt_variant
         try:
             return react_loop(ctx, user_goal, progress_callback, images)
         finally:
@@ -250,6 +270,7 @@ class AgentController:
             log_backup_count=self.log_backup_count,
             top_tools=self.top_tools,
             user_goal=user_goal,
+            parent_context_section="",
         )
 
     def reset_task(self, save: bool = True) -> str:
@@ -453,7 +474,7 @@ class SubAgentRunner:
         results=None,                 # ResultsMemory (shared)
         short_term=None,              # ShortTermMemory — pre-loaded context (optional)
         notify_fn=None,               # Callable[[str], None]
-        context_key: str = None,      # for context persistence
+        context_key: Optional[str] = None,  # for context persistence
         label: str = "on-demand",     # label for logging/display
         max_iterations: int = 8,
         top_tools: int = 3,
@@ -467,6 +488,8 @@ class SubAgentRunner:
         on_tool_trace=None,           # Optional[Callable[[ToolTrace], None]] — for trace collection
         cancel_event=None,            # Optional[threading.Event] — shared cancel signal (e.g. forwarded from a parent agent stop)
         trace_id=None,                # Optional[str] — parent run trace to share; None => fresh per run
+        context_payload: dict | None = None,  # Optional parent context dict to inject in system prompt
+        prompt_variant: str | None = None,    # None => default system prompts; "sub-agent" => sub-agent prompts
     ):
         import uuid
         from memory_store import ShortTermMemory, WorkingMemory
@@ -474,6 +497,8 @@ class SubAgentRunner:
         self.agent_id = "sa-" + uuid.uuid4().hex[:6]
         self.label = label
         self.context_key = context_key
+        self.context_payload = context_payload
+        self.prompt_variant = prompt_variant
         self.notify_fn = notify_fn or (lambda msg: None)
         self._log = logging.getLogger("agent").getChild(self.agent_id)
 
@@ -524,6 +549,11 @@ class SubAgentRunner:
             on_tool_trace=on_tool_trace,
             trace_id=trace_id,
         )
+        # Propagate sub-agent context sharing settings into the inner controller
+        # so react_loop can inject the parent context and select the right prompt
+        # variant when building the system prompt.
+        self._agent._context_payload = context_payload  # type: ignore[attr-defined]
+        self._agent._prompt_variant = prompt_variant    # type: ignore[attr-defined]
 
         self._model_id = model_cfg.get("model", "unknown")
 

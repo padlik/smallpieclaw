@@ -182,6 +182,7 @@ from mcp_client import MCPManager  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
+from strategy_memory import StrategyMemory  # noqa: E402
 from telegram_interface import TelegramInterface  # noqa: E402
 from token_usage import get_registry as get_token_registry  # noqa: E402
 from tool_creator import ToolCreator  # noqa: E402
@@ -286,6 +287,9 @@ def _run(
     shell_pty_cols = int(agent_cfg.get("shell_pty_cols", 220))
     shell_pty_rows = int(agent_cfg.get("shell_pty_rows", 50))
     shell_streaming = bool(agent_cfg.get("shell_streaming", False))
+    creativity_mode = agent_cfg.get("creativity_mode", "default")
+    plan_max_iterations = int(agent_cfg.get("plan_max_iterations", 50))
+    inactivity_warn_minutes = int(agent_cfg.get("inactivity_warn_minutes", 15))
     # Separate step cap for scheduled/background agents (chat sessions use max_iter)
     _raw_sched_max = agent_cfg.get("scheduled_max_iterations", 100)
     scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
@@ -333,9 +337,14 @@ def _run(
         except Exception as exc:
             logger.warning("MCP connect_all failed (agent will start without MCP): %s", exc)
 
-    short_term  = ShortTermMemory(max_turns=20)
-    working     = WorkingMemory()
-    results_mem = ResultsMemory(path=results_path, llm=llm)
+    short_term    = ShortTermMemory(max_turns=20)
+    working       = WorkingMemory()
+    results_mem   = ResultsMemory(path=results_path, llm=llm)
+    strategy_mem  = StrategyMemory(data_dir=data_dir)
+    # Wire working memory and results memory into builtin executor so that
+    # implicit spawn_agent context summaries include recent tool results.
+    builtin._working = working
+    builtin._results = results_mem
     # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime
     # agents (P2 consolidation). Runtime semantic recall is served by graph
     # memory; the legacy JSON store is migration/backfill-only via
@@ -363,7 +372,15 @@ def _run(
         downloads_dir=downloads_dir,
         log_file=log_file,
         log_backup_count=log_backup_count,
+        creativity_mode=creativity_mode,
+        plan_max_iterations=plan_max_iterations,
+        inactivity_warn_minutes=inactivity_warn_minutes,
     )
+
+    # Wire strategy memory into the agent so the ReAct loop can query learned
+    # approaches in a later iteration. Assigned post-construction to avoid
+    # changing the AgentController signature today.
+    agent.strategy_memory = strategy_mem  # type: ignore[attr-defined]
 
     logger.info("Building semantic tool index...")
     try:
@@ -404,7 +421,8 @@ def _run(
     def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
                           fallback_models=None, max_iterations=None,
                           max_tokens=None, temperature=None, top_p=None,
-                          on_tool_trace=None, cancel_event=None, trace_id=None):
+                          on_tool_trace=None, cancel_event=None, trace_id=None,
+                          context_payload=None, prompt_variant=None):
         """Create an isolated SubAgentRunner with the requested model override."""
         # Resolve model config — accept full model ID, model name, or alias
         if model:
@@ -462,6 +480,8 @@ def _run(
             on_tool_trace=on_tool_trace,
             cancel_event=cancel_event,
             trace_id=trace_id,
+            context_payload=context_payload,
+            prompt_variant=prompt_variant,
         )
         return runner
 

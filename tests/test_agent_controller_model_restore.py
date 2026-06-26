@@ -35,7 +35,7 @@ class TestAgentControllerModelRestore:
         llm = _make_llm(initial_idx=0)
         ctrl = _make_controller(llm)
 
-        def fake_react_loop(ctx, goal, cb, images):
+        def fake_react_loop(ctx, goal, _progress, images):
             # Simulate a fallback: model switched to index 1 mid-run
             ctx.llm._active_idx = 1
             return "done"
@@ -53,7 +53,7 @@ class TestAgentControllerModelRestore:
         llm = _make_llm(initial_idx=0)
         ctrl = _make_controller(llm)
 
-        def failing_react_loop(ctx, goal, cb, images):
+        def failing_react_loop(ctx, goal, _progress, images):
             ctx.llm._active_idx = 2  # fallback happened before crash
             raise RuntimeError("simulated crash")
 
@@ -72,7 +72,7 @@ class TestAgentControllerModelRestore:
         llm = _make_llm(initial_idx=0)
         ctrl = _make_controller(llm)
 
-        def cancelling_react_loop(ctx, goal, cb, images):
+        def cancelling_react_loop(ctx, goal, _progress, images):
             ctx.llm._active_idx = 1
             return "[Cancelled]"
 
@@ -89,7 +89,7 @@ class TestAgentControllerModelRestore:
         llm = _make_llm(initial_idx=0)
         ctrl = _make_controller(llm)
 
-        def normal_react_loop(ctx, goal, cb, images):
+        def normal_react_loop(ctx, goal, _progress, images):
             # No fallback — _active_idx never changes
             return "answer"
 

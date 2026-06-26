@@ -25,7 +25,7 @@ from confirmation import ConfirmationManager
 from context_manager import maybe_compact
 from llm_client import LLMClient, LLMCancelledError, _encode_images
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
-from prompt_builder import build_system_prompt as _build_system_prompt
+from prompt_loader import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,48 @@ _DEFAULT_TOOL_ICON = "🔧"
 
 def _tool_icon(name: str) -> str:
     return _TOOL_ICONS.get(name, _DEFAULT_TOOL_ICON)
+
+
+def _format_parent_context(ctx: ReactContext) -> str:
+    """Format a PARENT CONTEXT section for sub-agents from stored payload.
+
+    For main agents (depth 0) this always returns an empty string. For
+    sub-agents the payload was set on the AgentController by SubAgentRunner
+    before the run started; if present it is rendered as a short markdown
+    section.
+    """
+    if ctx.depth == 0:
+        return ""
+    payload = getattr(ctx, "_context_payload", None)
+    if not payload:
+        return ""
+    try:
+        truncated = _truncate_context_payload(payload, max_chars=2000)
+        lines = ["PARENT CONTEXT (injected by parent agent):"]
+        for key, value in truncated.items():
+            lines.append(f"  {key}: {value}")
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _truncate_context_payload(payload: dict, max_chars: int = 2000) -> dict:
+    """Truncate context payload values to fit within max_chars while preserving all keys."""
+    raw = json.dumps(payload, ensure_ascii=False)
+    if len(raw) <= max_chars:
+        return payload
+    keys = list(payload.keys())
+    header = "PARENT CONTEXT (injected by parent agent):"
+    # Allocate budget per key, reserving space for header and key formatting.
+    budget = max_chars - len(header) - sum(len(k) + 4 for k in keys)
+    per_key = max(30, budget // max(1, len(keys)))
+    result = {}
+    for k, v in payload.items():
+        text = str(v)
+        if len(text) > per_key:
+            text = text[: per_key - 3].rstrip() + "..."
+        result[k] = text
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +123,7 @@ class ReactContext:
 
     # Configuration
     max_iterations: int = 8
+    max_subagents: int = 6
     top_tools: int = 3
     ctx_max_tokens: int = 90_000
     tmp_dir: str = "/tmp/agent"
@@ -126,6 +169,22 @@ class ReactContext:
 
     # Max graph context entries to inject per turn
     graph_memory_max_entries: int = 10
+
+    # Strategy memory — Optional[StrategyMemory]; None when disabled/unconfigured
+    strategy_memory: Optional[object] = None
+
+    # Creativity mode for prompt assembly — passed through to prompt_loader
+    creativity_mode: str = "default"
+    # Maximum iterations allowed during/after a plan execution
+    plan_max_iterations: int = 50
+    # Minutes of inactivity before injecting a soft "still working?" prompt
+    inactivity_warn_minutes: int = 15
+
+    # Sub-agent context sharing (set by AgentController.run for sub-agents).
+    # _context_payload is the parent context dict injected as PARENT CONTEXT;
+    # _prompt_variant selects the sub-agent prompt variant ("sub-agent").
+    _context_payload: Optional[dict] = None
+    _prompt_variant: Optional[str] = None
 
     # Confirmation coordination (shared with AgentController and Telegram)
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
@@ -292,6 +351,13 @@ def format_tool_result(tool_name: str, outcome: dict) -> str:
             parts.append(f"stderr: {outcome['error']}")
         if outcome.get("output"):
             parts.append(f"stdout: {outcome['output']}")
+        # Surface structured recovery metadata so the (sub-)agent can echo it back
+        # in its result. PlanExecutor relies on these fields to decide retries.
+        if outcome.get("error_type"):
+            parts.append(f"error_type: {outcome['error_type']}")
+            parts.append(f"recoverable: {bool(outcome.get('recoverable', False))}")
+            if outcome.get("suggestion"):
+                parts.append(f"suggestion: {outcome['suggestion']}")
         return "\n".join(parts)
 
 
@@ -381,6 +447,19 @@ def react_loop(
         except Exception as _gm_exc:
             logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
 
+    # Strategy memory injection
+    strategies_section = ""
+    if getattr(ctx, "strategy_memory", None) is not None:
+        from strategy_memory import classify_task_type, format_strategies_for_prompt
+        task_type = classify_task_type(user_goal)
+        strategies = ctx.strategy_memory.get_top_k(task_type, k=2)
+        if strategies:
+            strategies_section = format_strategies_for_prompt(strategies)
+
+    # Sub-agent context sharing
+    parent_context_section = _format_parent_context(ctx)
+    _sub_agent_prompt_variant = getattr(ctx, "_prompt_variant", None) if ctx.depth >= 1 else None
+
     system, _ = _build_system_prompt(
         tool_index=ctx.tool_index,
         memory=ctx.memory,
@@ -395,9 +474,12 @@ def react_loop(
         user_goal=user_goal,
         job_history_section=_job_history_section,
         graph_context_section=_graph_context_section,
+        strategies_section=strategies_section,
         # Suppress ResultsMemory recall when graph memory already supplied
         # semantic context this turn — avoids redundant/overlapping recall.
         results_top_k=0 if _graph_context_section else 2,
+        parent_context_section=parent_context_section,
+        mode=_sub_agent_prompt_variant or ctx.creativity_mode,
     )
 
     first_msg: dict = {"role": "user", "content": user_goal}
@@ -424,6 +506,8 @@ def react_loop(
     step = 0
     operator_cancelled = False
     json_fail_streak = 0
+    last_action_time = time.time()
+    warned_inactivity = False
 
     while True:
         while step < max_steps:
@@ -431,7 +515,22 @@ def react_loop(
                 logger.warning("%scancelled at step %d/%d", pfx, step, max_steps)
                 return "[Cancelled]"
 
+            # Soft inactivity check — inject a "still working?" prompt if idle too long
+            if not warned_inactivity and step > 1:
+                warn_minutes = getattr(ctx, "inactivity_warn_minutes", 0)
+                if warn_minutes and (time.time() - last_action_time) > (warn_minutes * 60):
+                    warned_inactivity = True
+                    minutes = round((time.time() - last_action_time) / 60)
+                    messages.append({
+                        "role": "user",
+                        "content": f"You've been running for {minutes} minutes without finishing. Are you still working? If you're done, use finish.",
+                    })
+                    _progress(f"⏳ Inactivity prompt after {minutes}m…")
+                    continue  # re-evaluate loop condition before next LLM call
+
             step += 1
+            last_action_time = time.time()
+
             if ctx.on_step:
                 try:
                     ctx.on_step(step)
@@ -546,6 +645,8 @@ def react_loop(
                 if ctx.short_term:
                     ctx.short_term.add("user", user_goal)
                     ctx.short_term.add("assistant", result)
+                summary = ""
+                tools_used: list[str] = []
                 if ctx.results and ctx.working and ctx.working.has_content():
                     tools_used = list(filter(None, extract_tools_used(ctx.working.steps)))
                     summary = _summarize_result(
@@ -562,6 +663,30 @@ def react_loop(
                         tools_used=tools_used,
                         log_prefix=pfx,
                     )
+                # Fire-and-forget strategy extraction on background thread
+                if getattr(ctx, "strategy_memory", None) is not None:
+                    try:
+                        from strategy_memory import extract_strategy
+
+                        def _extract_and_store() -> None:
+                            """Extract strategy and store it in StrategyMemory."""
+                            _outcome = {
+                                "success": True,
+                                "summary": summary[:500] if summary else result[:500],
+                                "tools": tools_used,
+                            }
+                            strategy = extract_strategy(ctx.llm, user_goal, _outcome)
+                            if strategy is not None:
+                                ctx.strategy_memory.add(strategy)
+
+                        _thread = threading.Thread(
+                            target=_extract_and_store,
+                            daemon=True,
+                        )
+                        _thread.start()
+                        logger.debug("%sStrategy extraction thread started", pfx)
+                    except Exception as _se_exc:  # noqa: BLE001
+                        logger.debug("%sStrategy extraction start failed: %s", pfx, _se_exc)
                 if ctx.working:
                     ctx.working.clear()
                 return result
@@ -615,6 +740,61 @@ def react_loop(
                 if cancelled:
                     operator_cancelled = True
                     break
+
+            elif action == "plan":
+                # Import here to avoid a circular import: execution_plan.py imports
+                # ReactContext and parse_json from this module at runtime.
+                from execution_plan import ExecutionPlan, PlanExecutor, PlanStep
+
+                plan_data = action_obj.get("plan", {})
+                # Give the agent room to finish after the plan completes
+                old_max_steps = max_steps
+                plan_limit = getattr(ctx, "plan_max_iterations", 0) or (ctx.max_iterations + 20)
+                ABSOLUTE_PLAN_CEILING = 200
+                if plan_limit > ABSOLUTE_PLAN_CEILING:
+                    plan_limit = ABSOLUTE_PLAN_CEILING
+                    logger.warning("%splan | clamped plan_max_iterations to %d", pfx, ABSOLUTE_PLAN_CEILING)
+                if plan_limit > max_steps:
+                    max_steps = plan_limit
+                    logger.info("%splan | raised max_steps from %d to %d", pfx, old_max_steps, max_steps)
+                try:
+                    _progress("📋 Executing plan…")
+                    logger.info("%splan | description: %s", pfx, plan_data.get("description", "")[:60])
+
+                    steps_raw = plan_data.get("steps", [])
+                    steps = [
+                        PlanStep(
+                            id=s["id"],
+                            tool=s["tool"],
+                            args=s.get("args", {}),
+                            depends_on=s.get("depends_on", []),
+                            description=s.get("description", ""),
+                        )
+                        for s in steps_raw
+                    ]
+                    plan = ExecutionPlan(
+                        description=plan_data.get("description", ""),
+                        steps=steps,
+                        timeout=plan_data.get("timeout", 300),
+                    )
+
+                    executor = PlanExecutor(max_concurrent=ctx.max_subagents)
+                    plan_result = executor.execute(plan, ctx, progress_cb=_progress)
+
+                    logger.info("%splan | completed | results: %d", pfx, len(plan_result.get("results", {})))
+                    # Restore max_steps to a reasonable ceiling after plan
+                    if max_steps > old_max_steps:
+                        max_steps = old_max_steps + 10
+                        if max_steps > ABSOLUTE_PLAN_CEILING:
+                            max_steps = ABSOLUTE_PLAN_CEILING
+                        logger.info("%splan | adjusted max_steps to %d after completion", pfx, max_steps)
+                    result_msg = f"Plan execution results:\n{json.dumps(plan_result, ensure_ascii=False, indent=2)}"
+                    messages.append({"role": "user", "content": result_msg})
+
+                except Exception as exc:
+                    err_msg = f"Plan execution failed: {type(exc).__name__}: {exc}"
+                    logger.error("%s%s", pfx, err_msg)
+                    messages.append({"role": "user", "content": err_msg})
 
             else:
                 logger.warning("%sUnknown action '%s' from LLM", pfx, action)

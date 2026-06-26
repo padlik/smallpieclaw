@@ -5,7 +5,7 @@ test:
 
 lint:
 	ruff check .
-	vulture . vulture_whitelist.py --min-confidence 80 --exclude interfaces.py
+	vulture . vulture_whitelist.py --min-confidence 80 --exclude interfaces.py,.venv,venv
 
 check: lint test
 

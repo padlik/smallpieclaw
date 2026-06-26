@@ -77,6 +77,28 @@ backfill_longterm_to_graph
 from memory_store import LongTermMemory  # noqa: E402
 LongTermMemory.entries
 
+# strategy_memory.py — public API classes
+from strategy_memory import StrategyMemory, Strategy  # noqa: E402
+StrategyMemory.add
+StrategyMemory.get
+StrategyMemory.decay_all
+StrategyMemory.archive_low_confidence
+StrategyMemory.get_top_k
+StrategyMemory.save
+StrategyMemory.load
+Strategy.to_dict
+Strategy.from_dict
+
+# error_registry.py — public API
+from error_registry import ErrorTypeInfo, ErrorTypeRegistry  # noqa: E402
+ErrorTypeInfo.recoverable
+ErrorTypeInfo.max_retries
+ErrorTypeInfo.backoff_base
+ErrorTypeInfo.requires_complex_recovery
+ErrorTypeRegistry.register
+ErrorTypeRegistry.get
+ErrorTypeRegistry.register_defaults
+
 # tests/test_graph_memory_backfill.py — pytest false positives
 # 'p' is a required lambda parameter matching the llm_call_fn protocol (str -> str)
 # 'error_llm' is a pytest fixture injected by name but not referenced directly in the

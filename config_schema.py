@@ -229,6 +229,13 @@ class AgentConfig:
     # When enabled, each chunk of output is forwarded to the UI as it arrives;
     # the panel shows a rolling tail. Requires shell_backend = "pty".
     shell_streaming: bool = False
+    # Creativity mode for prompt assembly — default/planner/explorer/resilient
+    creativity_mode: str = "default"
+    # Maximum iterations for plan execution (higher than normal max_iterations
+    # to let multi-step plans complete without artificial interruption)
+    plan_max_iterations: int = 50
+    # Minutes of inactivity before a soft "still working?" prompt is injected
+    inactivity_warn_minutes: int = 15
 
 
 @dataclass(frozen=True)
@@ -263,6 +270,7 @@ class PathsConfig:
     log_backup_count: int = 30
     pid_file: str = "data/agent.pid"
     tmp_dir: str = ""
+    prompts_dir: str = "prompts"
 
 
 @dataclass(frozen=True)
@@ -371,6 +379,9 @@ def _parse_agent(raw: dict) -> AgentConfig:
         shell_pty_cols=_parse_int(section.get("shell_pty_cols"), 220, "agent.shell_pty_cols"),
         shell_pty_rows=_parse_int(section.get("shell_pty_rows"), 50, "agent.shell_pty_rows"),
         shell_streaming=_parse_bool(section.get("shell_streaming", False), "agent.shell_streaming"),
+        creativity_mode=section.get("creativity_mode", "default"),
+        plan_max_iterations=_parse_int(section.get("plan_max_iterations"), 50, "agent.plan_max_iterations"),
+        inactivity_warn_minutes=_parse_int(section.get("inactivity_warn_minutes"), 15, "agent.inactivity_warn_minutes"),
     )
 
 
@@ -398,6 +409,7 @@ def _parse_paths(raw: dict) -> PathsConfig:
         log_backup_count=_parse_int(section.get("log_backup_count"), 30, "paths.log_backup_count"),
         pid_file=section.get("pid_file", "data/agent.pid"),
         tmp_dir=section.get("tmp_dir", ""),
+        prompts_dir=section.get("prompts_dir", "prompts"),
     )
 
 

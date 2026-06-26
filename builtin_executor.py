@@ -12,6 +12,18 @@ require explicit user confirmation before execution. When confirmation is
 needed, execute() returns {"requires_confirmation": True, "token": ..., ...}
 and the caller is expected to call confirm(token) or cancel(token) after the
 user responds.
+
+Error classification (Phase 3: Agent Recovery):
+    * Transient (retryable): tool_timeout, network_error, syntax_error.
+    * Planning (no retry, needs alternative approach): wrong_model_for_task,
+      fundamentally_wrong_approach, impossible_with_current_tools.
+    * Fatal (no retry, environment/fix required): permission_denied,
+      file_not_found, command_not_found.
+
+Result dicts produced by built-in tools include the following recovery fields:
+    - error_type: kebab-case error identifier (empty string on success).
+    - recoverable: whether the error might succeed on retry (False on success).
+    - suggestion: human-readable recovery hint (empty string on success).
 """
 
 from __future__ import annotations
@@ -19,6 +31,7 @@ from __future__ import annotations
 import codecs
 import difflib
 import html as _html_mod
+import json
 import logging
 import os
 import re
@@ -29,7 +42,21 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
+
+
+class _SupportsClose(Protocol):
+    """Protocol for file-like objects that support close()."""
+
+    def close(self) -> None: ...
+
+
+class _SupportsWriteClose(Protocol):
+    """Protocol for file-like objects that support write() and close()."""
+
+    def write(self, text: str, /) -> int: ...
+    def close(self) -> None: ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +262,7 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "  response_format (str, optional) — 'text' (default) | 'json' | 'file'.\n"
             "                  json → sub-agent must return a single valid JSON object.\n"
             "                  file → sub-agent writes output to a file and returns the absolute path.\n"
+            "  context_payload (dict, optional) — parent context to inject into the sub-agent's system prompt.\n"
             "  context_key     (str, optional) — key for persisting conversation history between calls.\n"
             "  max_tokens      (int, optional) — override maximum tokens in the sub-agent's response.\n"
             "  temperature     (float, optional) — override sampling temperature (0.0–2.0).\n"
@@ -358,13 +386,15 @@ class BuiltinExecutor:
                  memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300,
                  notify_html_fn=None, shell_backend: str = "subprocess",
                  shell_pty_cols: int = 220, shell_pty_rows: int = 50,
-                 shell_streaming: bool = False):
+                 shell_streaming: bool = False, working=None, results=None):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
         self._sub_agent_factory = sub_agent_factory  # Callable[[model, context_key, label, notify_fn], SubAgentRunner]
         self._data_dir = data_dir
         self._memory = memory  # Optional[MemoryStore] — for memory_write built-in
+        self._working = working  # Optional[WorkingMemory] — for spawn_agent context summary
+        self._results = results  # Optional[ResultsMemory] — for spawn_agent context summary
         self._max_subagents = max_subagents
         self._subagent_result_timeout = subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
@@ -656,7 +686,7 @@ class BuiltinExecutor:
             return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
-    def _open_shell_log(self, caller_tag: str = "") -> tuple[Optional[object], Optional[str]]:
+    def _open_shell_log(self, caller_tag: str = "") -> tuple[Optional[_SupportsWriteClose], Optional[str]]:
         """Open a run-specific artifact log file for incremental writing.
 
         Returns (file_handle, absolute_path) or (None, None) on failure.
@@ -752,7 +782,22 @@ class BuiltinExecutor:
                     os.unlink(_artifact_path)
                 except OSError:
                     pass
-            return {"success": False, "output": "", "error": str(exc), "exit_code": -1}
+            err_text = str(exc)
+            error_type = "command_not_found" if "No such file or directory" in err_text else "tool_timeout"
+            suggestion = (
+                "Check the command name or install the missing executable."
+                if error_type == "command_not_found"
+                else "Try the command again with a longer timeout."
+            )
+            return {
+                "success": False,
+                "output": "",
+                "error": err_text,
+                "exit_code": -1,
+                "error_type": error_type,
+                "recoverable": error_type == "tool_timeout",
+                "suggestion": suggestion,
+            }
 
         def _kill_tree() -> None:
             """Kill the whole process group (POSIX) or the process (Windows)."""
@@ -923,8 +968,37 @@ class BuiltinExecutor:
             timeout_error = f"Command timed out after {timeout}s."
             if error.strip():
                 timeout_error = f"{timeout_error}\nstderr:\n{error}"
-            return {"success": False, "output": output, "error": timeout_error,
-                    "exit_code": -1, "elapsed_ms": round(elapsed_ms), "full_log_path": full_log_path}
+            return {
+                "success": False,
+                "output": output,
+                "error": timeout_error,
+                "exit_code": -1,
+                "elapsed_ms": round(elapsed_ms),
+                "full_log_path": full_log_path,
+                "error_type": "tool_timeout",
+                "recoverable": True,
+                "suggestion": "Try the command again with a longer timeout.",
+            }
+        # Classify non-zero exit codes from the shell.
+        error_type = ""
+        recoverable = False
+        suggestion = ""
+        if returncode != 0:
+            error_lower = error.lower()
+            output_lower = output.lower()
+            combined = f"{error_lower}\n{output_lower}"
+            if "permission denied" in combined:
+                error_type = "permission_denied"
+                recoverable = False
+                suggestion = "Check file permissions or use sudo."
+            elif "command not found" in combined or "not found" in error_lower and "file" not in error_lower:
+                error_type = "command_not_found"
+                recoverable = False
+                suggestion = "Check the command name or install the missing executable."
+            elif "no such file or directory" in combined:
+                error_type = "file_not_found"
+                recoverable = False
+                suggestion = "Check the file path or create the missing file."
         return {
             "success": returncode == 0,
             "output": output,
@@ -932,6 +1006,9 @@ class BuiltinExecutor:
             "exit_code": returncode,
             "elapsed_ms": round(elapsed_ms),
             "full_log_path": full_log_path,
+            "error_type": error_type,
+            "recoverable": recoverable,
+            "suggestion": suggestion,
         }
 
     def _run_shell_pty(self, args: dict, caller_tag: str = "",
@@ -1009,7 +1086,7 @@ class BuiltinExecutor:
                 _tail = (_tail + chunk)[-self.max_output:]
                 if _log_fh is not None:
                     _log_fh.write(chunk)
-                if streaming:
+                if streaming and chunk_callback is not None:
                     try:
                         chunk_callback(chunk)
                     except Exception:  # noqa: BLE001
@@ -1028,7 +1105,7 @@ class BuiltinExecutor:
                         _tail = (_tail + chunk)[-self.max_output:]
                         if _log_fh is not None:
                             _log_fh.write(chunk)
-                        if streaming:
+                        if streaming and chunk_callback is not None:
                             try:
                                 chunk_callback(chunk)
                             except Exception:  # noqa: BLE001
@@ -1064,18 +1141,40 @@ class BuiltinExecutor:
         )
         if timed_out:
             return {
-                "success": False, "output": output,
+                "success": False,
+                "output": output,
                 "error": f"Command timed out after {timeout}s.",
-                "exit_code": -1, "elapsed_ms": round(elapsed_ms),
+                "exit_code": -1,
+                "elapsed_ms": round(elapsed_ms),
                 "full_log_path": full_log_path,
+                "error_type": "tool_timeout",
+                "recoverable": True,
+                "suggestion": "Try the command again with a longer timeout.",
             }
+        error_type = ""
+        recoverable = False
+        suggestion = ""
+        if exit_code != 0:
+            output_lower = output.lower()
+            if "permission denied" in output_lower:
+                error_type = "permission_denied"
+                suggestion = "Check file permissions or use sudo."
+            elif "command not found" in output_lower:
+                error_type = "command_not_found"
+                suggestion = "Check the command name or install the missing executable."
+            elif "no such file or directory" in output_lower:
+                error_type = "file_not_found"
+                suggestion = "Check the file path or create the missing file."
         return {
             "success": exit_code == 0,
             "output": output,
-            "error": "",
+            "error": "" if exit_code == 0 else output,
             "exit_code": exit_code,
             "elapsed_ms": round(elapsed_ms),
             "full_log_path": full_log_path,
+            "error_type": error_type,
+            "recoverable": recoverable,
+            "suggestion": suggestion,
         }
 
     # ---- file_read ----
@@ -1100,7 +1199,15 @@ class BuiltinExecutor:
         logger.info("%sBuilt-in file_read: %s (offset=%d, max=%d)", _pfx, path, offset, max_bytes)
         try:
             if not os.path.exists(path):
-                return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": f"File not found: {path}",
+                    "exit_code": 1,
+                    "error_type": "file_not_found",
+                    "recoverable": False,
+                    "suggestion": "Check the file path or create the missing file.",
+                }
             size = os.path.getsize(path)
             # Negative offset = from end of file (tail semantics)
             if offset < 0:
@@ -1111,11 +1218,35 @@ class BuiltinExecutor:
                 content = f.read(max_bytes)
             truncated = size > offset + max_bytes
             note = f"\n[Showing {len(content)} of {size} bytes from offset {offset}]" if truncated else ""
-            return {"success": True, "output": content + note, "error": "", "exit_code": 0}
+            return {
+                "success": True,
+                "output": content + note,
+                "error": "",
+                "exit_code": 0,
+                "error_type": "",
+                "recoverable": False,
+                "suggestion": "",
+            }
         except PermissionError as exc:
-            return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Permission denied: {exc}",
+                "exit_code": 1,
+                "error_type": "permission_denied",
+                "recoverable": False,
+                "suggestion": "Check file permissions or use sudo.",
+            }
         except OSError as exc:
-            return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+            return {
+                "success": False,
+                "output": "",
+                "error": str(exc),
+                "exit_code": 1,
+                "error_type": "file_not_found" if "No such file" in str(exc) else "",
+                "recoverable": False,
+                "suggestion": "Check the file path or create the missing file." if "No such file" in str(exc) else "",
+            }
 
     # ---- file_diff ----
 
@@ -1193,11 +1324,35 @@ class BuiltinExecutor:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, mode) as f:
                 f.write(content)
-            return {"success": True, "output": f"Written {len(content)} chars to {path}.", "error": "", "exit_code": 0}
+            return {
+                "success": True,
+                "output": f"Written {len(content)} chars to {path}.",
+                "error": "",
+                "exit_code": 0,
+                "error_type": "",
+                "recoverable": False,
+                "suggestion": "",
+            }
         except PermissionError as exc:
-            return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Permission denied: {exc}",
+                "exit_code": 1,
+                "error_type": "permission_denied",
+                "recoverable": False,
+                "suggestion": "Check file permissions or use sudo.",
+            }
         except OSError as exc:
-            return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
+            return {
+                "success": False,
+                "output": "",
+                "error": str(exc),
+                "exit_code": 1,
+                "error_type": "file_not_found" if "No such file" in str(exc) else "",
+                "recoverable": False,
+                "suggestion": "Check the file path or create the missing file." if "No such file" in str(exc) else "",
+            }
 
     # ---- file_patch ----
 
@@ -1297,6 +1452,7 @@ class BuiltinExecutor:
             else:
                 # Find the Nth occurrence (occurrence >= 1)
                 pos = 0
+                idx = -1
                 for _ in range(occurrence):
                     idx = content.find(old_str, pos)
                     if idx == -1:
@@ -1457,29 +1613,53 @@ class BuiltinExecutor:
                     task = _v
                     break
         if not task:
-            return {"success": False, "output": "", "error": "spawn_agent: 'task' is required.", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": "spawn_agent: 'task' is required.",
+                "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Provide a clear task string describing what the sub-agent should do.",
+            }
 
         # Depth guard — prevent recursive sub-agent spawning (hard error, not a silent no-op)
         if caller_depth >= 1:
             return {
-                "success": False, "output": "",
+                "success": False,
+                "output": "",
                 "error": "spawn_agent cannot be called from within a sub-agent (max nesting depth: 1).",
                 "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Do not spawn sub-agents from within a sub-agent; perform the work directly.",
             }
 
         if self._sub_agent_factory is None:
-            return {"success": False, "output": "", "error": "spawn_agent: sub_agent_factory not configured.", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": "spawn_agent: sub_agent_factory not configured.",
+                "exit_code": -1,
+                "error_type": "impossible_with_current_tools",
+                "recoverable": False,
+                "suggestion": "The agent runtime is missing sub-agent support; this cannot be recovered in-flight.",
+            }
 
         # Concurrency cap — only count on-demand (managed) agents, not scheduler jobs
         current_managed = get_agent_registry().count_managed()
         if current_managed >= self._max_subagents:
             return {
-                "success": False, "output": "",
+                "success": False,
+                "output": "",
                 "error": (
                     f"spawn_agent: max_subagents cap reached ({current_managed}/{self._max_subagents}). "
                     "Wait for a managed sub-agent to finish or cancel one with /agents cancel managed."
                 ),
                 "exit_code": -1,
+                "error_type": "tool_timeout",
+                "recoverable": True,
+                "suggestion": "Wait for an existing sub-agent to finish, then retry.",
             }
 
         # response_format — how the sub-agent should return its result
@@ -1502,7 +1682,31 @@ class BuiltinExecutor:
                     "output": "",
                     "error": f"spawn_agent: invalid context_key: {exc}",
                     "exit_code": -1,
+                    "error_type": "permission_denied",
+                    "recoverable": False,
+                    "suggestion": "Use a context_key with only letters, digits, underscore, dash, or dot.",
                 }
+
+        # context_payload — parent context shared with sub-agent
+        context_payload = args.get("context_payload")
+        if isinstance(context_payload, str):
+            try:
+                context_payload = json.loads(context_payload)
+            except Exception:  # noqa: BLE001
+                context_payload = {"parent_note": context_payload}
+        if context_payload is None:
+            # Implicit context: build an automatic summary from available sources.
+            from prompt_loader import build_spawn_context_summary
+            context_payload = build_spawn_context_summary(
+                user_goal=task,
+                working=self._working,
+                memory=self._memory,
+                results=self._results,
+                graph_memory=self._graph_memory,
+            )
+        if not isinstance(context_payload, dict):
+            context_payload = {"parent_note": str(context_payload)}
+
         fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
         job_tag = args.get("_job_tag") or None       # set by scheduler; used for finish callback
         label = job_tag or context_key or "on-demand"
@@ -1557,9 +1761,18 @@ class BuiltinExecutor:
                 temperature=temperature_override,
                 top_p=top_p_override,
                 trace_id=trace_id or None,
+                context_payload=context_payload,
             )
         except ValueError as exc:
-            return {"success": False, "output": "", "error": f"spawn_agent: {exc}", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": f"spawn_agent: {exc}",
+                "exit_code": -1,
+                "error_type": "wrong_model_for_task",
+                "recoverable": False,
+                "suggestion": "Choose a model that exists in the configured model list.",
+            }
 
         from sub_agent_registry import SubAgentRecord
         import time
@@ -1768,7 +1981,15 @@ class BuiltinExecutor:
 
         agent_id = args.get("agent_id", "").strip()
         if not agent_id:
-            return {"success": False, "output": "", "error": "get_agent_result: 'agent_id' is required.", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": "get_agent_result: 'agent_id' is required.",
+                "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Provide the agent_id returned by spawn_agent.",
+            }
 
         timeout = args.get("timeout", self._subagent_result_timeout)
         try:
@@ -1779,10 +2000,14 @@ class BuiltinExecutor:
         record = get_agent_registry().get(agent_id)
         if record is None:
             return {
-                "success": False, "output": "",
+                "success": False,
+                "output": "",
                 "error": f"get_agent_result: no active sub-agent with id '{agent_id}'.",
                 "exit_code": -1,
                 "status": "not_found",
+                "error_type": "file_not_found",
+                "recoverable": False,
+                "suggestion": "The agent may have already finished; check /agents or recent notifications.",
             }
 
         # If already finished (event already set), return immediately
@@ -1806,8 +2031,18 @@ class BuiltinExecutor:
                 "exit_code": 0,
                 "status": "timeout",
                 "agent_id": agent_id,
+                "error_type": "tool_timeout",
+                "recoverable": True,
+                "suggestion": "Wait for the sub-agent to finish and call get_agent_result again.",
             }
 
+        error_type = ""
+        recoverable = False
+        suggestion = ""
+        if record.status == "failed":
+            error_type = "wrong_model_for_task"
+            recoverable = False
+            suggestion = "Consider using a different model or breaking the task into smaller steps."
         return {
             "success": record.status == "done",
             "output": record.result or "",
@@ -1817,6 +2052,9 @@ class BuiltinExecutor:
             "result_type": record.result_type,
             "result": record.result,
             "agent_id": agent_id,
+            "error_type": error_type,
+            "recoverable": recoverable,
+            "suggestion": suggestion,
         }
 
 
@@ -1827,20 +2065,46 @@ class BuiltinExecutor:
                 "success": False, "output": "",
                 "error": "memory_write: MemoryStore is not available in this context.",
                 "exit_code": -1,
+                "error_type": "impossible_with_current_tools",
+                "recoverable": False,
+                "suggestion": "Memory storage is disabled in this runtime; do not rely on memory_write.",
             }
 
         action = args.get("action", "").strip().lower()
         key = args.get("key", "").strip()
 
+        import json as _json
+
+        def _ok(out: str) -> dict:
+            return {
+                "success": True,
+                "output": out,
+                "error": "",
+                "exit_code": 0,
+                "error_type": "",
+                "recoverable": False,
+                "suggestion": "",
+            }
+
+        def _err(msg: str, error_type: str = "", suggestion: str = "") -> dict:
+            return {
+                "success": False,
+                "output": "",
+                "error": msg,
+                "exit_code": -1,
+                "error_type": error_type or "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": suggestion,
+            }
+
         if action == "get":
             if not key:
-                return {"success": False, "output": "", "error": "memory_write get: 'key' is required.", "exit_code": -1}
-            import json as _json
+                return _err("memory_write get: 'key' is required.")
             value = self._memory.get(key)
-            return {"success": True, "output": _json.dumps(value), "error": "", "exit_code": 0}
+            return _ok(_json.dumps(value))
 
         if not key:
-            return {"success": False, "output": "", "error": "memory_write: 'key' is required.", "exit_code": -1}
+            return _err("memory_write: 'key' is required.")
 
         if action == "set":
             value = args.get("value")
@@ -1848,7 +2112,6 @@ class BuiltinExecutor:
             # e.g. value="{\"count\":7}" → stored as {"count": 7} not a raw string.
             if isinstance(value, str):
                 try:
-                    import json as _json
                     parsed = _json.loads(value)
                     # Only replace if it decoded to a non-string type (object, list, number, bool, None)
                     if not isinstance(parsed, str):
@@ -1861,7 +2124,7 @@ class BuiltinExecutor:
                     pass  # Keep original string value
             self._memory.set(key, value)
             logger.info("memory_write set: key=%s type=%s", key, type(value).__name__)
-            return {"success": True, "output": f"Memory key '{key}' updated.", "error": "", "exit_code": 0}
+            return _ok(f"Memory key '{key}' updated.")
 
         elif action == "append":
             value = args.get("value")
@@ -1871,19 +2134,19 @@ class BuiltinExecutor:
             current.append(value)
             self._memory.set(key, current)
             logger.info("memory_write append: key=%s (now %d items)", key, len(current))
-            return {"success": True, "output": f"Appended to '{key}' ({len(current)} items total).", "error": "", "exit_code": 0}
+            return _ok(f"Appended to '{key}' ({len(current)} items total).")
 
         elif action == "delete":
             self._memory.delete(key)
             logger.info("memory_write delete: key=%s", key)
-            return {"success": True, "output": f"Memory key '{key}' deleted.", "error": "", "exit_code": 0}
+            return _ok(f"Memory key '{key}' deleted.")
 
         else:
-            return {
-                "success": False, "output": "",
-                "error": f"memory_write: unknown action '{action}'. Valid: set, append, delete, get.",
-                "exit_code": -1,
-            }
+            return _err(
+                f"memory_write: unknown action '{action}'. Valid: set, append, delete, get.",
+                error_type="fundamentally_wrong_approach",
+                suggestion="Use one of: set, append, delete, get.",
+            )
 
     # ---- memory_graph_search ----
 
@@ -1895,18 +2158,53 @@ class BuiltinExecutor:
                 "error": "memory_graph_search: graph memory is not enabled or not available. "
                          "Set [graph_memory] enabled = true in config.toml and install ladybug.",
                 "exit_code": -1,
+                "error_type": "impossible_with_current_tools",
+                "recoverable": False,
+                "suggestion": "Graph memory is disabled or ladybug is not installed; do not retry.",
             }
         query = str(args.get("query", "")).strip()
         if not query:
-            return {"success": False, "output": "", "error": "memory_graph_search: 'query' is required.", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": "memory_graph_search: 'query' is required.",
+                "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Provide a non-empty query string.",
+            }
         try:
             context = self._graph_memory.format_for_prompt(query)
             if not context:
-                return {"success": True, "output": "No relevant entities or facts found in graph memory.", "error": "", "exit_code": 0}
+                return {
+                    "success": True,
+                    "output": "No relevant entities or facts found in graph memory.",
+                    "error": "",
+                    "exit_code": 0,
+                    "error_type": "",
+                    "recoverable": False,
+                    "suggestion": "",
+                }
             logger.info("%smemory_graph_search: query=%s", _pfx, query[:60])
-            return {"success": True, "output": context, "error": "", "exit_code": 0}
+            return {
+                "success": True,
+                "output": context,
+                "error": "",
+                "exit_code": 0,
+                "error_type": "",
+                "recoverable": False,
+                "suggestion": "",
+            }
         except Exception as exc:  # noqa: BLE001
-            return {"success": False, "output": "", "error": f"memory_graph_search failed: {exc}", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": f"memory_graph_search failed: {exc}",
+                "exit_code": -1,
+                "error_type": "network_error",
+                "recoverable": True,
+                "suggestion": "Retry the graph memory search; the database may be temporarily unavailable.",
+            }
 
     # ---- memory_graph_store ----
 
@@ -1917,10 +2215,21 @@ class BuiltinExecutor:
                 "error": "memory_graph_store: graph memory is not enabled or not available. "
                          "Set [graph_memory] enabled = true in config.toml and install ladybug.",
                 "exit_code": -1,
+                "error_type": "impossible_with_current_tools",
+                "recoverable": False,
+                "suggestion": "Graph memory is disabled or ladybug is not installed; do not retry.",
             }
         content = str(args.get("content", "")).strip()
         if not content:
-            return {"success": False, "output": "", "error": "memory_graph_store: 'content' is required.", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": "memory_graph_store: 'content' is required.",
+                "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Provide the fact or relationship you want to store.",
+            }
         # Writing to graph memory changes future recalled prompt context, so it is
         # a confirmation-requiring operation. Operator approval admits the memory
         # as "confirmed"; the model/sub-agent cannot self-approve it.
@@ -1944,10 +2253,21 @@ class BuiltinExecutor:
                 "success": False, "output": "",
                 "error": "memory_graph_store: graph memory is not enabled or not available.",
                 "exit_code": -1,
+                "error_type": "impossible_with_current_tools",
+                "recoverable": False,
+                "suggestion": "Graph memory is disabled or ladybug is not installed; do not retry.",
             }
         content = str(args.get("content", "")).strip()
         if not content:
-            return {"success": False, "output": "", "error": "memory_graph_store: 'content' is required.", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": "memory_graph_store: 'content' is required.",
+                "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Provide the fact or relationship you want to store.",
+            }
         user_id = str(args.get("user_id", "agent")).strip() or "agent"
         try:
             # Store the operator-approved note as a confirmed episode.
@@ -1970,9 +2290,20 @@ class BuiltinExecutor:
                           "Extraction scheduled in background.",
                 "error": "",
                 "exit_code": 0,
+                "error_type": "",
+                "recoverable": False,
+                "suggestion": "",
             }
         except Exception as exc:  # noqa: BLE001
-            return {"success": False, "output": "", "error": f"memory_graph_store failed: {exc}", "exit_code": -1}
+            return {
+                "success": False,
+                "output": "",
+                "error": f"memory_graph_store failed: {exc}",
+                "exit_code": -1,
+                "error_type": "network_error",
+                "recoverable": True,
+                "suggestion": "Retry the graph memory store; the database may be temporarily unavailable.",
+            }
 
 
 def _save_context(context_key: str, short_term, data_dir: str) -> None:

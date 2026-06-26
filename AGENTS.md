@@ -58,6 +58,10 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `trace_context.py` | `r-<8 hex>` trace IDs for log correlation across agents/sub-agents/scheduler |
 | `sub_agent_registry.py` | Tracks all active `SubAgentRunner` instances for `/agents` command |
 | `token_usage.py` | Per-model daily prompt/completion counters; thread-safe registry |
+| `execution_plan.py` | DAG-based plan generation and execution with parallel/sequential orchestration |
+| `strategy_memory.py` | Learned task-type-to-approach persistence and context injection |
+| `prompt_loader.py` | Jinja2-based prompt section management with validation and mode filtering |
+| `error_registry.py` | Error type registry with retry policies for agent recovery |
 
 ## Testing
 

@@ -33,6 +33,7 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **`/stop` command** — immediately cancels the currently running agent task
 - **Log rotation safe** — uses `WatchedFileHandler`; re-opens log file automatically after `logrotate` without restart
 - **Structured log source tags** — every log line carries a `[source]` or `[source/model]` prefix so concurrent agents, sub-agents, and scheduled jobs are unambiguous in a single log file
+- **Orchestrated multi-agent execution** — complex requests are broken into DAG-based execution plans, steps run in parallel sub-agents, and failures are retried or diagnosed automatically (see [Orchestrated Multi-Agent](#orchestrated-multi-agent))
 
 ---
 
@@ -592,6 +593,30 @@ Restart the agent (or wait for the next query) to pick up new tools.
 ---
 
 ## Agent Limits
+
+### Orchestrated Multi-Agent
+
+For complex requests, the agent can generate a structured execution plan and
+run each step inside its own isolated sub-agent. This makes multi-step work
+faster and more reliable without blocking the chat:
+
+- **Structured prompts with creativity modes** — the prompt loader assembles the
+  system prompt from Jinja2 sections and can switch to different "modes" (e.g.
+  `planner`, `explorer`, `resilient`) that change how creative or cautious the
+  agent is.
+- **Execution planning with parallel sub-agents** — a request is converted into a
+  DAG of tool calls; independent steps run in parallel, dependent steps wait
+  for their prerequisites, and the result is summarised back to the chat.
+- **Two-tier error recovery** — transient errors (`tool_timeout`,
+  `network_error`, `syntax_error`) are retried with exponential backoff; other
+  errors spawn a diagnostic sub-agent that suggests a new approach before the
+  parent agent re-plans.
+- **Strategy memory** — the agent stores and recalls learned approaches for
+  recurring task types ("for disk checks, run `df` and `smartctl` in parallel"),
+  so it gets better at similar requests over time.
+- **Sub-agent context sharing** — a sub-agent receives a compact summary of the
+  parent agent's goal, recent tool results, and relevant memory so it starts
+  with the context it needs instead of an empty conversation.
 
 | Parameter | Default | Config key |
 |-----------|---------|------------|

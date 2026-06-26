@@ -42,7 +42,7 @@ from telegram_commands import (
     cmd_start, cmd_help, cmd_status, cmd_stop, cmd_reset, cmd_compress,
     cmd_verbose, cmd_jobs, cmd_agents, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid, cmd_health,
-    cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models,
+    cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
     cb_deferred, cb_subagent_confirm,
 )
@@ -173,6 +173,7 @@ class TelegramInterface:
             BotCommand("tools", "List available tools"),
             BotCommand("skills", "List available agent skills"),
             BotCommand("models", "List and switch LLM models"),
+            BotCommand("mode", "Set creativity mode"),
             BotCommand("jobs", "List scheduled jobs"),
             BotCommand("agents", "List and manage active sub-agents"),
             BotCommand("reset", "Save and clear current task context"),
@@ -211,6 +212,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("tools", partial(cmd_tools, self)))
         app.add_handler(CommandHandler("skills", partial(cmd_skills, self)))
         app.add_handler(CommandHandler("models", partial(cmd_models, self)))
+        app.add_handler(CommandHandler("mode", partial(cmd_mode, self)))
         app.add_handler(CommandHandler("mcp", partial(cmd_mcp, self)))
         app.add_handler(CommandHandler("reindex", partial(cmd_reindex, self)))
         app.add_handler(CommandHandler("pair", partial(cmd_pair, self)))
