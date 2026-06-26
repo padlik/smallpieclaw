@@ -16,7 +16,7 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **4-tier memory architecture** — short-term conversation history, working task context, long-term vector knowledge index, and results history
 - **Graph memory** (optional) — semantic entity/relationship/episode store backed by [LadybugDB](https://github.com/kuzudb/ladybug) (embedded graph DB); extracts entities and facts from conversations automatically in the background and injects relevant context per-turn; visible via `/status` and `/memory`; zero overhead when disabled
 - **Configurable scheduler** — jobs defined in `scheduler.toml` (auto-updated at runtime); manage jobs from chat or via `/jobs`; supports cron-style schedules and one-time reminders; jobs staggered with ±5 min jitter to avoid thundering herd
-- **Self-health diagnosis** — `/health` command and automatic 4-hour periodic job: reads log file, analyzes errors, suggests fixes, rotates logs
+- **Self-health diagnosis** — ask the agent in natural language (*"check agent health"*, *"analyze recent errors"*) or configure a periodic job in `scheduler.toml`; reads the log file, analyzes errors, suggests fixes, and rotates logs
 - **Streaming responses** — bot edits its "Processing…" message in real time as the agent works
 - **Typing indicator** — Telegram shows "typing…" while the agent is reasoning
 - **Max-steps extension** — when the agent hits its step limit, inline buttons let you extend by 10 more steps, extend **unlimited**, or cancel; dangerous built-in actions offer an **Approve All** button to skip future confirmation prompts for the same action type
@@ -26,7 +26,7 @@ and semantic tool discovery, so no heavy ML libraries run locally.
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama (cloud & local); reasoning models (DeepSeek-R1, Kimi K2.5, QwQ) supported via `reasoning` field fallback
 - **Multimodal vision** — send a photo with a caption and the agent forwards both the image and text to vision-capable models (GPT-4o, Claude, Gemini, LLaVA, etc.)
 - **File uploads** — send any file (document, photo, audio, video, voice) via Telegram to save it to the agent's `downloads/` folder; photos with a caption are automatically routed to the agent
-- **Context compaction** — auto-summarises older messages when the token budget is near the configured limit; `/compress` lets the operator trigger manual compaction at any time
+- **Context compaction** — auto-summarises older messages when the token budget approaches the configured limit (85% of `ctx_max_tokens`); keeps the context window healthy without operator intervention
 - **Token usage tracking** — daily prompt/completion counters visible in `/status`
 - **Agent Skills** — autonomous skill system (per [agentskills.io](https://agentskills.io/specification)) with progressive disclosure; skills listed via `/skills`
 - **File storage guidance** — agent directed to use `/tmp/<agent>` for temporary files and `downloads/` for files the user wants to keep
@@ -645,7 +645,7 @@ Scheduled jobs and sub-agents use `scheduled_max_iterations` (default 100) inste
 interactive limit. Set to `0` for no limit (internal safety ceiling: 500). Individual jobs
 can override this with a `max_iterations` field in `scheduler.toml`.
 
-Context compaction fires automatically at 85% of `ctx_max_tokens`. Older messages are summarised by the LLM and replaced with a compact bullet-point summary before the next request.
+Context compaction fires automatically at 85% of `ctx_max_tokens`. Older messages are summarised by the LLM and replaced with a compact bullet-point summary before the next request. This is the normal context-window protection mechanism — no manual intervention needed. Use `/reset` to save context and start fresh, or `/reset discard` to clear without saving.
 
 ---
 
@@ -732,7 +732,6 @@ Disable after diagnosing to keep logs clean.
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
 | `/status` | Uptime, LLM model, embeddings status, tools/skills count, sub-agent count, scheduler state, graph memory health (when enabled), system time, and per-model token usage today |
-| `/health` | Run self-health diagnosis, analyze logs, rotate log file |
 | `/tools` | List all built-in, generated, and MCP tools |
 | `/skills` | List all available agent skills |
 | `/models` | List available LLM models and switch the active one (👁 badge marks vision-capable models) |
@@ -742,7 +741,6 @@ Disable after diagnosing to keep logs clean.
 | `/stop` | Cancel the currently running agent task |
 | `/reset` | Save current task context to results memory and start fresh |
 | `/reset discard` | Clear task context without saving |
-| `/compress` | Summarise the current conversation history in place to reduce context size |
 | `/verbose` | Toggle live tool-call progress messages; `/verbose on` or `/verbose off` to set explicitly |
 | `/reindex` | Force re-embed all tools in the semantic index |
 | `/pair` | Generate or submit pairing token |
@@ -760,6 +758,7 @@ These commands are not shown in the Telegram menu but are available to authorize
 | `/show_ctx` | Download the current LLM system prompt as `context.md` (with estimated token count) |
 | `/show_env` | Show the shell environment the agent runs commands in — all env vars (secrets redacted), PATH entries per line, and configured agent paths |
 | `/memory` | Graph memory diagnostics — **Store** (entity/fact/episode counts, latest episode timestamp, vector index status), **Writer** (worker alive, queue depth, extraction counters, failure counts), and **Retrieval** (hit/miss/injection counts). Only shown when graph memory is enabled. |
+| `/compress` | Advanced: manually rewrite `ShortTermMemory` into a single LLM-generated summary without clearing task context. Normal users should rely on automatic compaction; use `/reset` to start fresh. |
 
 #### Graph memory health states (`/status` line)
 

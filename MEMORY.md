@@ -323,13 +323,19 @@ Estimation never uses a hard-coded divisor. Instead:
 4. **Confirmation auto-approvals** are cleared so the operator is re-prompted
    for tool confirmations on the next task.
 
-### Context compress (`/compress`)
+### Context compress (`/compress` — hidden/advanced)
 
 `AgentController.compress_context()` is a lighter alternative to `/reset`:
 it replaces the `ShortTermMemory` buffer **in place** with a single LLM-generated
 bullet-point summary, preserving key facts and decisions. Working memory is
 **not** cleared and nothing is written to `ResultsMemory`. Use this when you want
 to shrink the context window without losing the current task.
+
+`/compress` is a **hidden command** — it is not shown in Telegram's command
+menu or in `/help`. Normal users do not need it: automatic context compaction
+fires at 85% of `ctx_max_tokens` without any manual trigger. For task lifecycle
+management, use `/reset` (save and clear) or `/reset discard` (clear without saving).
+`/compress` remains available as an advanced escape hatch by typing it directly.
 
 If the LLM summarization call fails, `/compress` falls back to a **deterministic
 head+tail truncation** of the assembled history (rather than leaving the buffer

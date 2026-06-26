@@ -38,6 +38,8 @@ MemoryBackend.set
 MemoryBackend.delete
 MemoryBackend.search
 NotifyFn.__call__
+parse_mode = None
+parse_mode
 ToolRegistryProtocol.list_tools
 ToolRegistryProtocol.get_tool
 ToolRegistryProtocol.refresh

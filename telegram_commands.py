@@ -752,20 +752,6 @@ async def cmd_myid(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     await update.effective_message.reply_text(f"Your Telegram user ID: <code>{uid}</code>", parse_mode=ParseMode.HTML)
 
 
-async def cmd_health(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
-    health_task = (
-        "Perform a self-health diagnosis: "
-        "(1) Read the last 500 lines of agent.log using file_read with offset=-25000. "
-        "(2) Analyze for errors, warnings, repeated failures, and anomalies. "
-        "(3) Identify root causes and provide actionable suggestions for each issue. "
-        "(4) Report findings as a structured summary."
-    )
-    await iface._run_agent_task(update, ctx, health_task)
-
-
 async def cmd_show_ctx(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Hidden command: send the current LLM system prompt as a file attachment."""
     if not iface._is_authorized(update.effective_user.id):
