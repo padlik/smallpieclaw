@@ -3,6 +3,8 @@
 ## Overall
 Prioritize retrieval-led reasoning over pretrained-knowledge-led reasoning.
 
+For OpenSpec propose/apply/verify/archive workflows, use the local `openspec-git-discipline` skill to enforce proposal commits before apply and merge-before-archive discipline.
+
 ## Code quality
  - Avoid making superclasses and large files.
  - Follow PEP 8 style guidelines. Include type hints for function parameters and return types. Write docstrings for all public modules, classes, functions, and methods.
