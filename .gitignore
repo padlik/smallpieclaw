@@ -213,6 +213,9 @@ data/scheduler_state.json
 # OpenCode history
 .opencode/history/
 
+# Local deepwork state
+.slim/
+
 # Local shell scripts
 set_*.sh
 .agents/
@@ -241,4 +244,3 @@ openspec/tmp/
 # If you use Git WorkTrees with OpenSpec for parallel development:
 # Ignore local worktree directories if you create them inside the project root
 openspec-worktrees/
-
