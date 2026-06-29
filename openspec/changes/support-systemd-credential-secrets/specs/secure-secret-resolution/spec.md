@@ -29,6 +29,17 @@ Rule: Sensitive config values may be loaded from protected files instead of envi
 - **WHEN** the application parses the configuration
 - **THEN** startup fails with a configuration error identifying the affected field
 
+#### Scenario: Same-level value and file secret sources are rejected
+- **GIVEN** a supported secret field is configured with both a direct value and a file path at the same configuration level
+- **WHEN** the application parses the configuration
+- **THEN** startup fails with a configuration error identifying the ambiguous secret source fields
+
+#### Scenario: Intentional secret whitespace is preserved
+- **GIVEN** a string secret file contains leading or trailing spaces that are part of the secret value
+- **WHEN** the application parses the configuration
+- **THEN** the resolved secret preserves the intentional spaces
+- **AND** at most one trailing newline sequence from the file is removed
+
 ### Requirement: Systemd user service credential guidance
 Production documentation MUST include a `systemd --user` credential-file pattern for supported secrets and SHALL describe environment-value injection as a less secure compatibility fallback.
 

@@ -12,15 +12,25 @@
 #   bot_token = "env:TELEGRAM_BOT_TOKEN"
 #   api_key   = "env:OPENAI_API_KEY"
 #
+# File-backed secrets can be used for supported sensitive fields. The *_file
+# field may be a literal path or an env var containing a path:
+#   bot_token_file = "env:TELEGRAM_BOT_TOKEN_FILE"
+#   api_key_file   = "env:OPENAI_API_KEY_FILE"
+#
 # For values with a prefix (e.g. Bearer tokens in MCP headers), put the
 # full header value in the env var and reference it directly:
 #   Authorization = "env:MY_AUTH_HEADER"   # where MY_AUTH_HEADER="Bearer sk-..."
 #
-# This keeps secrets out of config.toml. Export the variables in your shell,
-# a .env loader (e.g. direnv, dotenvx), or a systemd EnvironmentFile=.
+# This keeps secrets out of config.toml. For production systemd --user
+# services, prefer LoadCredential= and *_FILE env vars so the process
+# environment contains file paths, not long-lived secret values. Environment=
+# and EnvironmentFile= secret values remain supported as compatibility
+# fallbacks, but those values are inherited by shell/tool/MCP subprocesses.
 
 [telegram]
 bot_token = "env:TELEGRAM_BOT_TOKEN"
+# Production alternative:
+# bot_token_file = "env:TELEGRAM_BOT_TOKEN_FILE"
 # Security mode: "allowlist" or "pairing"
 security_mode = "allowlist"
 # Comma-separated list of allowed Telegram user IDs (for allowlist mode)
@@ -34,10 +44,22 @@ pairing_timeout = 300
 # matching agent.default_model against the 'model' field of each entry.
 # Users can switch manually with /models.
 #
+# Provider defaults can be defined once and inherited by matching [[models]]
+# entries. Model-level fields override provider-level defaults.
+#
+# [providers.openai]
+# api_key_file    = "env:OPENAI_API_KEY_FILE"  # preferred for systemd credentials
+# # api_key       = "env:OPENAI_API_KEY"       # compatibility fallback
+# base_url        = "https://api.openai.com/v1"
+# request_timeout = 120
+# max_retries     = 5
+# retry_delay     = 2
+#
 # Fields per model:
 #   name             — display name shown in /models
 #   provider         — openai | openrouter | google | anthropic
-#   api_key          — provider API key
+#   api_key          — provider API key (or inherit from [providers.<name>])
+#   api_key_file     — file containing provider API key (model-level override)
 #   model            — exact model identifier (used to match default_model)
 #   base_url         — API base URL (leave empty for Anthropic/Google defaults)
 #   max_tokens       — max tokens in LLM response
@@ -52,6 +74,8 @@ pairing_timeout = 300
 name            = "default"
 provider        = "openai"
 api_key         = "env:OPENAI_API_KEY"
+# Production alternative: put api_key_file under [providers.openai] and omit
+# api_key here so all OpenAI models inherit the same secret file.
 model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
@@ -111,9 +135,12 @@ retry_delay     = 2
 
 [embeddings]
 # Use same provider as LLM or configure separately.
-# If api_key is empty, falls back to the active model's api_key.
+# If api_key is empty and a matching [providers.<name>] entry exists,
+# embeddings inherit provider credentials/base_url. Otherwise embeddings fall
+# back to the active model's api_key/base_url at runtime.
 provider = "openai"
 api_key  = "env:OPENAI_API_KEY"
+# Production alternative: omit api_key and inherit [providers.openai].api_key_file.
 model    = "text-embedding-3-small"
 base_url = "https://api.openai.com/v1"
 

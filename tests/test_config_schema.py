@@ -327,3 +327,183 @@ class TestParseConfigWithEnvVars:
         minimal_config["telegram"]["allowed_user_ids"] = ["env:TELEGRAM_USER_ID"]
         with pytest.raises(ConfigError, match=r"telegram\.allowed_user_ids\[0\]"):
             parse_config(minimal_config)
+
+
+class TestProviderCredentialInheritance:
+    """Provider defaults and credential inheritance behavior."""
+
+    def test_model_inherits_provider_credentials_and_transport_defaults(self, minimal_config):
+        minimal_config["providers"] = {
+            "openai": {
+                "api_key": "provider-key",
+                "base_url": "https://provider.example/v1",
+                "request_timeout": 180,
+                "max_retries": 7,
+                "retry_delay": 3,
+            }
+        }
+        model = minimal_config["models"][0]
+        del model["api_key"]
+        del model["base_url"]
+        model.pop("request_timeout", None)
+        model.pop("max_retries", None)
+        model.pop("retry_delay", None)
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.models[0].api_key == "provider-key"
+        assert cfg.models[0].base_url == "https://provider.example/v1"
+        assert cfg.models[0].request_timeout == 180
+        assert cfg.models[0].max_retries == 7
+        assert cfg.models[0].retry_delay == 3
+        assert cfg._raw["models"][0]["api_key"] == "provider-key"
+        assert cfg._raw["models"][0]["base_url"] == "https://provider.example/v1"
+        assert cfg._raw["models"][0]["request_timeout"] == 180
+
+    def test_model_level_secret_source_overrides_provider_source(self, minimal_config, tmp_path):
+        key_file = tmp_path / "model-api-key"
+        key_file.write_text("model-file-key\n")
+        minimal_config["providers"] = {"openai": {"api_key": "provider-key"}}
+        minimal_config["models"][0]["api_key_file"] = str(key_file)
+        del minimal_config["models"][0]["api_key"]
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.models[0].api_key == "model-file-key"
+        assert cfg._raw["models"][0]["api_key"] == "model-file-key"
+
+    def test_legacy_config_raw_dict_remains_unchanged(self, minimal_config):
+        cfg = parse_config(minimal_config)
+
+        assert cfg._raw == minimal_config
+
+    def test_embeddings_inherit_provider_credentials_when_section_present(self, minimal_config):
+        minimal_config["providers"] = {
+            "openai": {
+                "api_key": "provider-key",
+                "base_url": "https://provider.example/v1",
+            }
+        }
+        minimal_config["embeddings"] = {
+            "provider": "openai",
+            "model": "text-embedding-3-small",
+        }
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.embeddings.api_key == "provider-key"
+        assert cfg.embeddings.base_url == "https://provider.example/v1"
+        assert cfg._raw["embeddings"]["api_key"] == "provider-key"
+        assert cfg._raw["embeddings"]["base_url"] == "https://provider.example/v1"
+
+    def test_omitted_embeddings_section_preserves_active_model_fallback(self, minimal_config):
+        minimal_config.pop("embeddings", None)
+        minimal_config["providers"] = {
+            "openai": {
+                "api_key": "provider-key",
+                "base_url": "https://provider.example/v1",
+            }
+        }
+
+        cfg = parse_config(minimal_config)
+
+        assert "embeddings" not in cfg._raw
+        assert cfg.embeddings.api_key == ""
+        assert cfg.embeddings.base_url == ""
+
+
+class TestFileBackedSecretResolution:
+    """File-backed secret parsing and validation."""
+
+    def test_provider_api_key_file_resolves_secret(self, minimal_config, tmp_path):
+        key_file = tmp_path / "openai-key"
+        key_file.write_text("file-backed-key\n")
+        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
+        del minimal_config["models"][0]["api_key"]
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.models[0].api_key == "file-backed-key"
+        assert cfg._raw["providers"]["openai"]["api_key"] == "file-backed-key"
+        assert cfg._raw["models"][0]["api_key"] == "file-backed-key"
+
+    def test_secret_file_path_can_come_from_environment(self, minimal_config, tmp_path, monkeypatch):
+        key_file = tmp_path / "openai-key"
+        key_file.write_text("env-file-key\n")
+        monkeypatch.setenv("OPENAI_API_KEY_FILE", str(key_file))
+        minimal_config["providers"] = {"openai": {"api_key_file": "env:OPENAI_API_KEY_FILE"}}
+        del minimal_config["models"][0]["api_key"]
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.models[0].api_key == "env-file-key"
+
+    def test_missing_secret_file_raises_field_specific_error(self, minimal_config, tmp_path):
+        missing_file = tmp_path / "missing-key"
+        minimal_config["providers"] = {"openai": {"api_key_file": str(missing_file)}}
+
+        with pytest.raises(ConfigError, match=r"providers\.openai\.api_key_file"):
+            parse_config(minimal_config)
+
+    def test_empty_secret_file_raises_field_specific_error(self, minimal_config, tmp_path):
+        key_file = tmp_path / "empty-key"
+        key_file.write_text("\n")
+        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
+
+        with pytest.raises(ConfigError, match=r"providers\.openai\.api_key_file"):
+            parse_config(minimal_config)
+
+    def test_secret_file_strips_only_one_trailing_newline_sequence(self, minimal_config, tmp_path):
+        key_file = tmp_path / "openai-key"
+        key_file.write_text("  key-with-space  \n\n")
+        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
+        del minimal_config["models"][0]["api_key"]
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.models[0].api_key == "  key-with-space  \n"
+
+    def test_ambiguous_same_level_secret_sources_raise(self, minimal_config, tmp_path):
+        key_file = tmp_path / "openai-key"
+        key_file.write_text("file-key")
+        minimal_config["providers"] = {
+            "openai": {"api_key": "provider-key", "api_key_file": str(key_file)}
+        }
+
+        with pytest.raises(ConfigError, match="api_key.*api_key_file"):
+            parse_config(minimal_config)
+
+    def test_telegram_bot_token_file_resolves_secret(self, minimal_config, tmp_path):
+        token_file = tmp_path / "telegram-token"
+        token_file.write_text("123456:FILE-TOKEN\n")
+        del minimal_config["telegram"]["bot_token"]
+        minimal_config["telegram"]["bot_token_file"] = str(token_file)
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.telegram.bot_token == "123456:FILE-TOKEN"
+        assert cfg._raw["telegram"]["bot_token"] == "123456:FILE-TOKEN"
+
+    def test_non_utf8_secret_file_raises_field_specific_error(self, minimal_config, tmp_path):
+        key_file = tmp_path / "binary-key"
+        key_file.write_bytes(b"\xff\xfe")
+        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
+
+        with pytest.raises(ConfigError, match=r"providers\.openai\.api_key_file"):
+            parse_config(minimal_config)
+
+    def test_config_repr_hides_secret_values(self, minimal_config, tmp_path):
+        key_file = tmp_path / "openai-key"
+        token_file = tmp_path / "telegram-token"
+        key_file.write_text("provider-secret")
+        token_file.write_text("telegram-secret")
+        del minimal_config["telegram"]["bot_token"]
+        del minimal_config["models"][0]["api_key"]
+        minimal_config["telegram"]["bot_token_file"] = str(token_file)
+        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
+
+        cfg = parse_config(minimal_config)
+
+        rendered = repr(cfg)
+        assert "provider-secret" not in rendered
+        assert "telegram-secret" not in rendered

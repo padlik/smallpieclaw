@@ -36,7 +36,7 @@ Target deployment boundary:
                ▼
 ┌─────────────────────────────┐
 │ config parser               │
-│ file:env:OPENAI_API_KEY_FILE│
+│ env:OPENAI_API_KEY_FILE     │
 └──────────────┬──────────────┘
                │ secret string in app config only after parsing
                ▼
@@ -71,7 +71,7 @@ Introduce a top-level provider mapping keyed by provider name:
 
 ```toml
 [providers.openai]
-api_key_file = "file:env:OPENAI_API_KEY_FILE"
+api_key_file = "env:OPENAI_API_KEY_FILE"
 base_url = "https://api.openai.com/v1"
 request_timeout = 120
 max_retries = 5
@@ -110,7 +110,9 @@ api_key_file = "env:OPENAI_API_KEY_FILE"
 bot_token_file = "env:TELEGRAM_BOT_TOKEN_FILE"
 ```
 
-The resolver reads the file once during config parsing, strips one trailing newline, rejects empty secret files, and stores the resolved secret in the same typed config fields used by existing runtime code.
+The resolver reads the file once during config parsing, strips at most one trailing newline sequence, rejects empty secret files, and stores the resolved secret in the same typed config fields used by existing runtime code. It must not use broad whitespace stripping for the stored value, because intentional leading, trailing, or internal whitespace may be part of a secret.
+
+For each logical secret source, same-level value and file fields are mutually exclusive. For example, `api_key` and `api_key_file` cannot both be set on the same provider, model, or embeddings section, and `bot_token` and `bot_token_file` cannot both be set in `[telegram]`. Cross-level overrides are allowed: a model-level `api_key` or `api_key_file` overrides any provider-level `api_key` or `api_key_file`.
 
 Alternatives considered:
 
@@ -169,5 +171,5 @@ Alternatives considered:
 
 ## Open Questions
 
-- Should file-backed secrets strip only one trailing newline or all surrounding whitespace? Recommended: strip one trailing newline to support normal secret files without altering intentional spaces.
-- Should `embeddings.provider` inherit credentials from `[providers.<name>]` automatically when `embeddings.api_key` and `embeddings.api_key_file` are absent? Recommended: yes, then preserve the existing fallback to active model key only when no provider credential exists.
+- Should unused provider entries with missing secret files fail startup? Recommended: yes, provider definitions are configuration commitments and should fail fast when invalid.
+- Should `[embeddings]` inherit credentials from `[providers.<name>]` when embeddings-specific values are absent? Recommended: yes, for explicit `[embeddings]` configuration. When the embeddings section is omitted entirely, preserve the existing active-model fallback behavior.

@@ -128,6 +128,19 @@ Authorization = "env:MY_AUTH_HEADER"   # set MY_AUTH_HEADER="Bearer sk-..." in e
 
 This keeps secrets out of the file. Export the variables in your shell, a `.env` loader (e.g. `direnv`, `dotenvx`), or a `systemd` service `EnvironmentFile=`.
 
+For supported secret fields, use file-backed alternatives when possible:
+
+```toml
+[telegram]
+bot_token_file = "env:TELEGRAM_BOT_TOKEN_FILE"
+
+[providers.openai]
+api_key_file = "env:OPENAI_API_KEY_FILE"
+base_url = "https://api.openai.com/v1"
+```
+
+The environment variables above contain file paths, not secret values. This is preferred for production `systemd --user` services using `LoadCredential=`.
+
 Required settings:
 
 | Key | Description |
@@ -151,6 +164,7 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 | `name` | Display name shown in `/models` |
 | `provider` | `openai` \| `openrouter` \| `google` \| `anthropic` \| `ollama` |
 | `api_key` | Provider API key (empty string for local Ollama) |
+| `api_key_file` | File containing the provider API key; mutually exclusive with `api_key` |
 | `model` | Exact model identifier (e.g. `gpt-4o-mini`) |
 | `base_url` | API base URL (leave empty for Anthropic/Google; Ollama: `https://ollama.com` or `http://localhost:11434`) |
 | `max_tokens` | Max tokens in the LLM response |
@@ -162,17 +176,19 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 | `vision` | Set to `true` for vision-capable models; shown with 👁 badge in `/models` (optional) |
 
 ```toml
+[providers.openai]
+api_key = "env:OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+request_timeout = 120
+max_retries = 5
+retry_delay = 2
+
 [[models]]
 name            = "default"
 provider        = "openai"
-api_key         = "sk-..."
 model           = "gpt-4o-mini"
-base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
 temperature     = 0.2
-request_timeout = 120
-max_retries     = 5
-retry_delay     = 2
 
 [[models]]
 name            = "smart"
@@ -336,6 +352,43 @@ python main.py
 ```
 
 To run as a systemd service on the Raspberry Pi:
+
+For a production **systemd user service**, prefer systemd credentials and file-backed secrets:
+
+```ini
+# ~/.config/systemd/user/telegram-agent.service
+[Unit]
+Description=Telegram Home Server Agent
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/telegram-agent
+ExecStart=%h/telegram-agent/.venv/bin/python main.py
+LoadCredential=openai_api_key:%h/.local/share/smallpieclaw/secrets/openai_api_key
+LoadCredential=telegram_bot_token:%h/.local/share/smallpieclaw/secrets/telegram_bot_token
+Environment=OPENAI_API_KEY_FILE=%d/openai_api_key
+Environment=TELEGRAM_BOT_TOKEN_FILE=%d/telegram_bot_token
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Then enable it as the service user:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now telegram-agent
+```
+
+`WorkingDirectory=` must point at the project root because `config.toml`, `tools/`, `data/`, and related relative paths are resolved from the process working directory.
+
+Use `%d` for the runtime credentials directory instead of hard-coding `/run/credentials/...`; user-service credential paths vary by systemd version and runtime context.
+
+Compatibility fallback: `EnvironmentFile=` or wrappers such as 1Password, Doppler, or Infisical may inject secret values into the environment. That remains supported through `env:VAR`, but those values are inherited by shell/tool/MCP subprocesses and may be exposed through process environment inspection depending on host hardening.
+
+Legacy system service example:
 
 ```ini
 # /etc/systemd/system/telegram-agent.service

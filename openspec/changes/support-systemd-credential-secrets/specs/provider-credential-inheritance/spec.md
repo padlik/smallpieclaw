@@ -20,6 +20,13 @@ Rule: Models may inherit credentials and provider defaults from a shared provide
 - **THEN** the model uses the model-level API key source
 - **AND** the provider-level API key source remains available to other models
 
+#### Scenario: Model file credential overrides provider value credential
+- **GIVEN** a provider configuration defines a direct API key value for `openai`
+- **AND** a model entry using provider `openai` defines its own API key file source
+- **WHEN** the application parses the configuration
+- **THEN** the model uses the model-level API key file source
+- **AND** the provider-level direct API key value remains available to other models
+
 #### Scenario: Model inherits provider transport defaults
 - **GIVEN** a provider configuration defines shared transport defaults such as base URL, request timeout, retry count, and retry delay
 - **AND** a model entry for that provider omits those fields

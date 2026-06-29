@@ -20,6 +20,51 @@ from exceptions import ConfigError
 
 
 # ---------------------------------------------------------------------------
+# File-backed secret resolver
+# ---------------------------------------------------------------------------
+
+def _resolve_file_secret(file_path: str, field_path: str) -> str:
+    """Read a secret from a file at startup.
+
+    Removes at most one trailing newline sequence (``\\r\\n`` or ``\\n``),
+    preserving all other whitespace.  Rejects empty / whitespace-only content
+    after this stripping.  Wraps OS errors as :class:`ConfigError` without
+    including secret contents in the message.
+
+    Args:
+        file_path: Filesystem path to the secret file.
+        field_path: Dotted config path used in error messages (e.g.
+            ``providers.openai.api_key_file``).
+
+    Returns:
+        The secret string with at most one trailing newline removed.
+
+    Raises:
+        ConfigError: If the file cannot be read or is empty/whitespace-only.
+    """
+    try:
+        with open(file_path, encoding="utf-8") as fh:
+            content = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(
+            f"Cannot read secret file for '{field_path}': {exc}"
+        ) from None
+
+    # Remove at most one trailing newline sequence.
+    if content.endswith("\r\n"):
+        content = content[:-2]
+    elif content.endswith("\n"):
+        content = content[:-1]
+
+    if not content.strip():
+        raise ConfigError(
+            f"Secret file for '{field_path}' is empty or contains only whitespace."
+        )
+
+    return content
+
+
+# ---------------------------------------------------------------------------
 # Environment-variable expansion
 # ---------------------------------------------------------------------------
 
@@ -172,7 +217,7 @@ def _parse_int_list(value: Any, field_path: str) -> list[int]:
 
 @dataclass(frozen=True)
 class TelegramConfig:
-    bot_token: str
+    bot_token: str = field(repr=False)
     security_mode: str = "allowlist"
     allowed_user_ids: list[int] = field(default_factory=list)
     pairing_timeout: int = 300
@@ -183,7 +228,7 @@ class ModelConfig:
     name: str
     provider: str
     model: str
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     base_url: str = ""
     max_tokens: int = 1024
     temperature: float = 0.2
@@ -199,9 +244,25 @@ class ModelConfig:
 @dataclass(frozen=True)
 class EmbeddingsConfig:
     provider: str = "openai"
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     model: str = "text-embedding-3-small"
     base_url: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    """Configuration for a named LLM provider (e.g. openai, anthropic).
+
+    Provides credential and transport defaults that individual models can
+    inherit when those fields are not explicitly set at the model level.
+    """
+
+    name: str
+    api_key: str = field(default="", repr=False)
+    base_url: str = ""
+    request_timeout: int = 120
+    max_retries: int = 5
+    retry_delay: int = 2
 
 
 @dataclass(frozen=True)
@@ -296,6 +357,7 @@ class AppConfig:
     paths: PathsConfig
     graph_memory: GraphMemoryConfig = field(default_factory=GraphMemoryConfig)
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
+    providers: dict[str, ProviderConfig] = field(default_factory=dict)
 
     # Keep reference to raw dict for incremental migration — consumers that
     # haven't been updated yet can use this temporarily.
@@ -315,6 +377,16 @@ def _require(d: dict, key: str, section: str) -> Any:
 
 def _parse_telegram(raw: dict) -> TelegramConfig:
     section = raw.get("telegram") or {}
+
+    # Handle file-backed bot token — resolve before requiring the field.
+    if "bot_token" in section and "bot_token_file" in section:
+        raise ConfigError(
+            "telegram: both 'bot_token' and 'bot_token_file' are set; use only one."
+        )
+    if "bot_token_file" in section:
+        resolved = _resolve_file_secret(section["bot_token_file"], "telegram.bot_token_file")
+        section["bot_token"] = resolved  # Write back so _raw reflects the resolved value.
+
     return TelegramConfig(
         bot_token=_require(section, "bot_token", "telegram"),
         security_mode=section.get("security_mode", "allowlist"),
@@ -494,6 +566,146 @@ def resolve_model_id(selected: str, configured_models: list[dict]) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Provider parsing and credential-inheritance helpers
+# ---------------------------------------------------------------------------
+
+def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
+    """Parse ``[providers.<name>]`` sections from *raw*, resolving any
+    ``api_key_file`` entries and writing the resolved value back into *raw*
+    so that ``_raw`` reflects the runtime secret.
+
+    Raises :class:`ConfigError` on ambiguous same-level sources or file errors.
+    """
+    providers_raw = raw.get("providers") or {}
+    result: dict[str, ProviderConfig] = {}
+
+    for name, entry in providers_raw.items():
+        if not isinstance(entry, dict):
+            continue
+
+        # Reject ambiguous same-level sources.
+        if "api_key" in entry and "api_key_file" in entry:
+            raise ConfigError(
+                f"[providers.{name}] has both 'api_key' and 'api_key_file'; "
+                "use only one source."
+            )
+
+        api_key = entry.get("api_key", "")
+        if "api_key_file" in entry:
+            api_key = _resolve_file_secret(
+                entry["api_key_file"], f"providers.{name}.api_key_file"
+            )
+            # Write resolved value back so _raw["providers"][name]["api_key"] is set.
+            entry["api_key"] = api_key
+
+        result[name] = ProviderConfig(
+            name=name,
+            api_key=api_key,
+            base_url=entry.get("base_url", ""),
+            request_timeout=_parse_int(
+                entry.get("request_timeout"), 120, f"providers.{name}.request_timeout"
+            ),
+            max_retries=_parse_int(
+                entry.get("max_retries"), 5, f"providers.{name}.max_retries"
+            ),
+            retry_delay=_parse_int(
+                entry.get("retry_delay"), 2, f"providers.{name}.retry_delay"
+            ),
+        )
+
+    return result
+
+
+def _normalize_models(raw: dict, providers: dict[str, ProviderConfig]) -> None:
+    """Resolve model-level ``api_key_file`` secrets and apply provider-level
+    defaults for models that omit credential / transport fields.
+
+    Mutates *raw* in-place: writes resolved / inherited values back into each
+    ``raw["models"][i]`` entry so that ``_raw`` mirrors what the typed config
+    actually uses at runtime.
+
+    Cross-level precedence:
+    - Model-level ``api_key_file`` beats provider ``api_key`` / ``api_key_file``.
+    - Model-level ``api_key`` beats provider ``api_key``.
+    - Provider values fill in only when the model omits the field entirely.
+    """
+    for entry in (raw.get("models") or []):
+        name = entry.get("name", "")
+
+        # Reject ambiguous same-level sources at model level.
+        if "api_key" in entry and "api_key_file" in entry:
+            raise ConfigError(
+                f"[[models]] entry '{name}': both 'api_key' and 'api_key_file' are set; "
+                "use only one source."
+            )
+
+        # Resolve model-level api_key_file (takes precedence over provider).
+        if "api_key_file" in entry:
+            entry["api_key"] = _resolve_file_secret(
+                entry["api_key_file"], f"models.{name}.api_key_file"
+            )
+
+        # Apply provider inheritance for missing fields.
+        if not providers:
+            continue
+        provider_name = entry.get("provider", "")
+        prov = providers.get(provider_name)
+        if prov is None:
+            continue
+
+        if "api_key" not in entry and prov.api_key:
+            entry["api_key"] = prov.api_key
+
+        if "base_url" not in entry and prov.base_url:
+            entry["base_url"] = prov.base_url
+
+        if "request_timeout" not in entry:
+            entry["request_timeout"] = prov.request_timeout
+
+        if "max_retries" not in entry:
+            entry["max_retries"] = prov.max_retries
+
+        if "retry_delay" not in entry:
+            entry["retry_delay"] = prov.retry_delay
+
+
+def _normalize_embeddings(raw: dict, providers: dict[str, ProviderConfig]) -> None:
+    """Apply provider defaults to the ``[embeddings]`` section when present.
+
+    Only runs when ``"embeddings"`` already exists in *raw* — an omitted
+    embeddings section is left unchanged so that ``_raw`` never gains a
+    spurious key.
+    """
+    if "embeddings" not in raw or not providers:
+        return
+
+    emb = raw["embeddings"]
+    if not isinstance(emb, dict):
+        return
+
+    # Reject ambiguous same-level sources.
+    if "api_key" in emb and "api_key_file" in emb:
+        raise ConfigError(
+            "[embeddings] has both 'api_key' and 'api_key_file'; use only one source."
+        )
+
+    # Resolve embeddings-level api_key_file if present.
+    if "api_key_file" in emb:
+        emb["api_key"] = _resolve_file_secret(emb["api_key_file"], "embeddings.api_key_file")
+
+    provider_name = emb.get("provider", "openai")
+    prov = providers.get(provider_name)
+    if prov is None:
+        return
+
+    if "api_key" not in emb and prov.api_key:
+        emb["api_key"] = prov.api_key
+
+    if "base_url" not in emb and prov.base_url:
+        emb["base_url"] = prov.base_url
+
+
 def parse_config(raw: dict) -> AppConfig:
     """
     Parse and validate a raw TOML config dict into a typed AppConfig.
@@ -507,6 +719,13 @@ def parse_config(raw: dict) -> AppConfig:
     """
     # Expand ${VAR} / ${VAR:-default} placeholders before any other processing.
     raw = expand_env(raw)
+
+    # Parse providers (resolves api_key_file secrets and writes back to raw).
+    providers = _parse_providers(raw)
+
+    # Apply provider defaults and resolve model/embeddings *_file secrets.
+    _normalize_models(raw, providers)
+    _normalize_embeddings(raw, providers)
 
     # Require at least one model
     models_raw = raw.get("models") or []
@@ -527,5 +746,6 @@ def parse_config(raw: dict) -> AppConfig:
         paths=_parse_paths(raw),
         graph_memory=_parse_graph_memory(raw),
         mcp_servers=mcp_servers,
+        providers=providers,
         _raw=raw,
     )
