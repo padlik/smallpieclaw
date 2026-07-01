@@ -423,6 +423,8 @@ class GraphMemoryStore:
              "ALTER TABLE Episode ADD confidence FLOAT DEFAULT 0.5"),
             ("RELATES_TO", "admission_status",
              "ALTER TABLE RELATES_TO ADD admission_status STRING DEFAULT 'observed'"),
+            ("RELATES_TO", "confidence",
+             "ALTER TABLE RELATES_TO ADD confidence FLOAT DEFAULT 1.0"),
         ]
         for table, col, stmt in alters:
             try:
@@ -433,7 +435,11 @@ class GraphMemoryStore:
                 )
             except Exception as exc:  # noqa: BLE001
                 msg = str(exc).lower()
-                if "already exist" in msg or "duplicate" in msg:
+                if (
+                    "already exist" in msg
+                    or "duplicate" in msg
+                    or "already has property" in msg
+                ):
                     continue  # column already present — nothing to do
                 logger.warning(
                     "graph_memory: admission metadata migration for %s.%s skipped: %s",

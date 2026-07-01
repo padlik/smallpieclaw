@@ -14,6 +14,7 @@ Covers the additive, non-destructive admission metadata added to graph memory:
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from unittest.mock import MagicMock
@@ -77,10 +78,37 @@ class TestAdmissionMigration:
     def test_migration_runs_alter_statements(self, store, mock_ladybug):
         executed = [c.args[0] for c in mock_ladybug["conn"].execute.call_args_list]
         alters = [q for q in executed if isinstance(q, str) and q.startswith("ALTER TABLE")]
-        # Episode.admission_status, Episode.confidence, RELATES_TO.admission_status
+        # Episode.admission_status, Episode.confidence,
+        # RELATES_TO.admission_status, RELATES_TO.confidence
         assert any("Episode ADD admission_status" in q for q in alters)
         assert any("Episode ADD confidence" in q for q in alters)
         assert any("RELATES_TO ADD admission_status" in q for q in alters)
+        assert any("RELATES_TO ADD confidence" in q for q in alters)
+
+    def test_already_has_property_message_is_idempotent(
+        self, mock_ladybug, embedder, tmp_path, caplog,
+    ):
+        """LadybugDB reports existing columns as 'already has property'."""
+        conn = mock_ladybug["conn"]
+
+        def _execute(query, params=None):
+            if isinstance(query, str) and query.startswith("ALTER TABLE"):
+                raise RuntimeError("Episode table already has property admission_status")
+            res = MagicMock()
+            res.has_next.return_value = False
+            return res
+
+        conn.execute.side_effect = _execute
+        caplog.set_level(logging.WARNING)
+
+        GraphMemoryStore(
+            db_path=str(tmp_path / "existing"),
+            embedder_fn=embedder,
+            embedding_dim=4,
+            buffer_pool_mb=64,
+        )
+
+        assert "admission metadata migration" not in caplog.text
 
     def test_meta_available_when_probe_succeeds(self, store):
         assert store._has_admission_meta is True
