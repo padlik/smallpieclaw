@@ -50,6 +50,29 @@ from telegram_commands import (
 logger = logging.getLogger(__name__)
 
 
+def _task_text_with_artifact(
+    caption: str, filename: str, dest: str, size_str: str
+) -> str:
+    """Build an agent task text that includes the caption plus artifact metadata.
+
+    Args:
+        caption: The message caption supplied by the user.
+        filename: The original filename of the uploaded file.
+        dest: The absolute path where the file was saved.
+        size_str: Human-readable file size string (e.g. "512.0 KB").
+
+    Returns:
+        A string with the caption followed by a structured artifact section.
+    """
+    return (
+        f"{caption}\n\n"
+        f"Uploaded artifact:\n"
+        f"- name: {filename}\n"
+        f"- path: {dest}\n"
+        f"- size: {size_str}"
+    )
+
+
 @dataclasses.dataclass
 class _DeferredMessage:
     """A message that arrived while the agent was busy — held for operator decision."""
@@ -298,15 +321,22 @@ class TelegramInterface:
             size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024:.1f} MB"
             logger.info("File upload from user %d: %s (%s)", user.id, dest, size_str)
 
-            # If the message is an image (photo or image document) with a caption,
-            # forward the caption + image to the agent instead of just confirming save.
+            # If the message has a caption, forward the task to the agent with
+            # artifact metadata so the agent knows the saved path and filename.
+            # Images additionally receive the file path via the images kwarg.
             caption = (msg.caption or "").strip()
             is_image = bool(msg.photo) or (
                 msg.document and (msg.document.mime_type or "").startswith("image/")
             )
-            if caption and is_image:
+            if caption:
+                task_text = _task_text_with_artifact(
+                    caption, os.path.basename(dest), dest, size_str
+                )
                 await self._safe_edit(status_msg, f"📥 Saved ({size_str}) — sending to agent…")
-                await self._run_agent_task(update, ctx, caption, images=[dest])
+                if is_image:
+                    await self._run_agent_task(update, ctx, task_text, images=[dest])
+                else:
+                    await self._run_agent_task(update, ctx, task_text)
             else:
                 await self._safe_edit(
                     status_msg,
