@@ -148,6 +148,12 @@ model    = "text-embedding-3-small"
 base_url = "https://api.openai.com/v1"
 
 [agent]
+# Logical agent name used to derive default shared state locations.
+# Defaults to "piclaw" when omitted.
+agent_name = "piclaw"
+# Agent home directory. Defaults to ~/<agent_name> when omitted or empty.
+# The vault path is independent and defaults to ~/.local/share/<agent_name>/secrets.json.
+# agent_home = "~/piclaw"
 max_iterations = 8
 tool_timeout   = 10
 # Maximum chars returned by the shell tool and registered tools per stream

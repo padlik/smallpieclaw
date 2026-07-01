@@ -164,6 +164,13 @@ Required settings:
 | `embeddings.api_key` | API key for embeddings — if empty, falls back to the active model's key |
 | `embeddings.model` | e.g. `text-embedding-3-small` |
 
+Optional agent identity settings:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `agent.agent_name` | `"piclaw"` | Logical agent name used to derive default shared state locations such as `agent.agent_home` and the default vault directory. |
+| `agent.agent_home` | `~/<agent_name>` | Shared state directory for the agent. The vault path is independent and remains `~/.local/share/<agent_name>/secrets.json` unless `SPC_VAULT_FILE` is set. |
+
 > **Tip:** To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
 
 ### 5. Configure LLM models
@@ -239,6 +246,7 @@ retry_delay     = 2
 # model           = "grok-2"
 
 [agent]
+agent_name = "piclaw"
 default_model = "gpt-4o-mini"   # must match one of the model = "..." values above
 ```
 
@@ -695,6 +703,8 @@ faster and more reliable without blocking the chat:
 
 | Parameter | Default | Config key |
 |-----------|---------|------------|
+| Agent name | `piclaw` | `agent.agent_name` |
+| Agent home | `~/<agent_name>` | `agent.agent_home` |
 | Max agent steps (interactive) | 8 | `agent.max_iterations` |
 | Max agent steps (scheduled/sub-agents) | 100 | `agent.scheduled_max_iterations` |
 | Long-run watcher threshold | 30 min | `agent.long_run_warn_minutes` |
