@@ -187,6 +187,10 @@ class BuiltinTool:
 
 
 BUILTIN_TOOLS: dict[str, BuiltinTool] = {
+    "secret_get": BuiltinTool(
+        name="secret_get",
+        description="Retrieve a value from the vault by key. Args: key (str, REQUIRED). Requires user confirmation.",
+    ),
     "shell": BuiltinTool(
         name="shell",
         description="Execute a shell command on the host system. Args: command (str), timeout (int, default 30).",
@@ -386,7 +390,8 @@ class BuiltinExecutor:
                  memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300,
                  notify_html_fn=None, shell_backend: str = "subprocess",
                  shell_pty_cols: int = 220, shell_pty_rows: int = 50,
-                 shell_streaming: bool = False, working=None, results=None):
+                 shell_streaming: bool = False, working=None, results=None,
+                 vault_path: str = ""):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -398,6 +403,7 @@ class BuiltinExecutor:
         self._max_subagents = max_subagents
         self._subagent_result_timeout = subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
+        self._vault_path = vault_path  # Path to JSON vault file for secret_get
         self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
         self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init
         self._shell_backend = shell_backend   # "subprocess" or "pty"
@@ -494,6 +500,8 @@ class BuiltinExecutor:
             return self._exec_memory_graph_search(args, caller_tag=caller_tag)
         elif tool_name == "memory_graph_store":
             return self._exec_memory_graph_store(args, caller_depth=caller_depth, caller_tag=caller_tag)
+        elif tool_name == "secret_get":
+            return self._exec_secret_get(args, caller_depth=caller_depth, caller_tag=caller_tag)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
@@ -662,6 +670,8 @@ class BuiltinExecutor:
             return self._run_file_patch(args, caller_tag=caller_tag)
         elif tool_name == "memory_graph_store":
             return self._run_memory_graph_store(args, caller_tag=caller_tag)
+        elif tool_name == "secret_get":
+            return self._run_secret_get(args, caller_tag=caller_tag)
         return {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1}
 
     # ---- shell ----
@@ -2304,6 +2314,90 @@ class BuiltinExecutor:
                 "recoverable": True,
                 "suggestion": "Retry the graph memory store; the database may be temporarily unavailable.",
             }
+
+    def _exec_secret_get(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+        """Stage a vault lookup for operator confirmation."""
+        key = args.get("key", "")
+        if not key:
+            return {
+                "success": False,
+                "output": "",
+                "error": "secret_get: 'key' is required.",
+                "exit_code": -1,
+            }
+        desc = f"Look up vault key '{key}'"
+        if caller_depth == 0:
+            return self._requires_confirmation(
+                "secret_get", args, desc, caller_depth=caller_depth, caller_tag=caller_tag
+            )
+        return self._headless_confirm_bridge(
+            "secret_get", args, desc, caller_tag=caller_tag
+        )
+
+    def _run_secret_get(self, args: dict, caller_tag: str = "") -> dict:
+        """Read a confirmed key from the JSON vault."""
+        key = args.get("key", "")
+        _pfx = f"[{caller_tag}] " if caller_tag else ""
+        logger.info("%sBuilt-in secret_get: key=%s", _pfx, key)
+        try:
+            with open(self._vault_path, encoding="utf-8") as fh:
+                vault = json.loads(fh.read())
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Cannot read vault: {exc}",
+                "exit_code": -1,
+                "error_type": "config_error",
+                "recoverable": False,
+                "suggestion": "Check vault file path and JSON validity.",
+            }
+
+        if not isinstance(vault, dict):
+            return {
+                "success": False,
+                "output": "",
+                "error": "Vault file is not a JSON object.",
+                "exit_code": -1,
+                "error_type": "config_error",
+                "recoverable": False,
+                "suggestion": "Check vault file path and JSON validity.",
+            }
+
+        value = vault.get(key)
+        if value is None and key not in vault:
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Vault key '{key}' not found.",
+                "exit_code": -1,
+                "error_type": "not_found",
+                "recoverable": False,
+                "suggestion": "Add the key to the vault file.",
+            }
+
+        if not isinstance(value, str):
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"Vault key '{key}' has a non-string value ({type(value).__name__}). "
+                    f"All vault values must be strings."
+                ),
+                "exit_code": -1,
+                "error_type": "config_error",
+                "recoverable": False,
+                "suggestion": "Update the vault file so all values are strings.",
+            }
+
+        return {
+            "success": True,
+            "output": value,
+            "error": "",
+            "exit_code": 0,
+            "error_type": "",
+            "recoverable": True,
+        }
 
 
 def _save_context(context_key: str, short_term, data_dir: str) -> None:

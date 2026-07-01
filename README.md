@@ -128,18 +128,30 @@ Authorization = "env:MY_AUTH_HEADER"   # set MY_AUTH_HEADER="Bearer sk-..." in e
 
 This keeps secrets out of the file. Export the variables in your shell, a `.env` loader (e.g. `direnv`, `dotenvx`), or a `systemd` service `EnvironmentFile=`.
 
-For supported secret fields, use file-backed alternatives when possible:
+For supported secret fields, the recommended approach is to store values in the agent's vault and reference them with the `sec:` prefix:
 
 ```toml
 [telegram]
-bot_token_file = "env:TELEGRAM_BOT_TOKEN_FILE"
+bot_token = "sec:TELEGRAM_BOT_TOKEN"
 
 [providers.openai]
-api_key_file = "env:OPENAI_API_KEY_FILE"
+api_key = "sec:OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
 ```
 
-The environment variables above contain file paths, not secret values. This is preferred for production `systemd --user` services using `LoadCredential=`.
+The vault is a plain JSON file at `~/.local/share/<agent_name>/secrets.json` (override via `SPC_VAULT_FILE`):
+
+```json
+{
+  "OPENAI_API_KEY": "sk-...",
+  "TELEGRAM_BOT_TOKEN": "1234567890:...",
+  "OLLAMA_HOST": "http://localhost:11434"
+}
+```
+
+At runtime, the `secret_get` built-in tool lets the agent retrieve vault values with your confirmation. This is useful when skills reference unbound API keys or endpoints (e.g. "Set OLLAMA_HOST to your endpoint").
+
+You can still use `env:` as a fallback (e.g. `env:OPENAI_API_KEY`), but `sec:` is preferred because values are resolved at startup and never cached in `os.environ`, so they are not leaked to shell/tool/MCP subprocesses.
 
 Required settings:
 
@@ -163,8 +175,7 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 |-------|-------------|
 | `name` | Display name shown in `/models` |
 | `provider` | `openai` \| `openrouter` \| `google` \| `anthropic` \| `ollama` |
-| `api_key` | Provider API key (empty string for local Ollama) |
-| `api_key_file` | File containing the provider API key; mutually exclusive with `api_key` |
+| `api_key` | Provider API key (empty string for local Ollama; use `sec:` or `env:` prefix) |
 | `model` | Exact model identifier (e.g. `gpt-4o-mini`) |
 | `base_url` | API base URL (leave empty for Anthropic/Google; Ollama: `https://ollama.com` or `http://localhost:11434`) |
 | `max_tokens` | Max tokens in the LLM response |
@@ -175,9 +186,11 @@ The active model is chosen by matching `agent.default_model` to the `model` fiel
 | `retry_delay` | Base retry delay in seconds, doubles each attempt (default: 2) |
 | `vision` | Set to `true` for vision-capable models; shown with 👁 badge in `/models` (optional) |
 
+Provider-level defaults can be defined under `[providers.<name>]` and inherited by matching model entries. Supported provider fields: `api_key`, `base_url`, `request_timeout`, `max_retries`, `retry_delay`.
+
 ```toml
 [providers.openai]
-api_key = "env:OPENAI_API_KEY"
+api_key = "sec:OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
 request_timeout = 120
 max_retries = 5
@@ -193,7 +206,7 @@ temperature     = 0.2
 [[models]]
 name            = "smart"
 provider        = "anthropic"
-api_key         = "sk-ant-..."
+api_key         = "sec:ANTHROPIC_API_KEY"
 model           = "claude-3-5-sonnet-20241022"
 base_url        = ""
 max_tokens      = 8192
@@ -207,7 +220,7 @@ retry_delay     = 2
 [[models]]
 name            = "ollama-cloud"
 provider        = "ollama"
-api_key         = "YOUR_OLLAMA_API_KEY"
+api_key         = "sec:OLLAMA_API_KEY"
 model           = "gpt-oss:120b-cloud"
 base_url        = "https://ollama.com"
 max_tokens      = 4096
@@ -215,6 +228,15 @@ temperature     = 0.2
 request_timeout = 300
 max_retries     = 3
 retry_delay     = 2
+
+# OpenAI-compatible providers (e.g. xAI Grok) use provider = "openai" with a custom base_url.
+# See "Supported providers" section below for the full list.
+# [[models]]
+# name            = "grok"
+# provider        = "openai"
+# api_key         = "sec:XAI_API_KEY"
+# base_url        = "https://api.x.ai/v1"
+# model           = "grok-2"
 
 [agent]
 default_model = "gpt-4o-mini"   # must match one of the model = "..." values above
@@ -712,6 +734,9 @@ Context compaction fires automatically at 85% of `ctx_max_tokens`. Older message
 | Anthropic | `anthropic` | Claude models |
 | Ollama Cloud | `ollama` | `base_url = "https://ollama.com"` — hosted cloud models (gpt-oss, deepseek, kimi-k2, etc.) |
 | Ollama Local | `ollama` | `base_url = "http://localhost:11434"` — local instance, no API key needed |
+| xAI Grok | `openai` | `base_url = "https://api.x.ai/v1"` — OpenAI-compatible endpoint |
+
+Any provider with an OpenAI-compatible HTTP API can be used with `provider = "openai"` and a custom `base_url`. Examples: xAI Grok, Together, Fireworks, local LM Studio.
 
 Embeddings can use a different provider/key than the main LLM. If `embeddings.api_key` is empty, the agent falls back to the active model's `api_key` automatically.
 

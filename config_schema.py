@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -20,74 +21,67 @@ from exceptions import ConfigError
 
 
 # ---------------------------------------------------------------------------
-# File-backed secret resolver
+# Vault-backed secret loader
 # ---------------------------------------------------------------------------
 
-def _resolve_file_secret(file_path: str, field_path: str) -> str:
-    """Read a secret from a file at startup.
+def _load_vault(path: str) -> dict:
+    """Load a JSON vault file into a plain dict.
 
-    Removes at most one trailing newline sequence (``\\r\\n`` or ``\\n``),
-    preserving all other whitespace.  Rejects empty / whitespace-only content
-    after this stripping.  Wraps OS errors as :class:`ConfigError` without
-    including secret contents in the message.
-
-    Args:
-        file_path: Filesystem path to the secret file.
-        field_path: Dotted config path used in error messages (e.g.
-            ``providers.openai.api_key_file``).
-
-    Returns:
-        The secret string with at most one trailing newline removed.
-
-    Raises:
-        ConfigError: If the file cannot be read or is empty/whitespace-only.
+    All values in the vault must be strings.  Non-string values are rejected
+    with a :class:`ConfigError` that names the offending key.
     """
     try:
-        with open(file_path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             content = fh.read()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ConfigError(
-            f"Cannot read secret file for '{field_path}': {exc}"
-        ) from None
-
-    # Remove at most one trailing newline sequence.
-    if content.endswith("\r\n"):
-        content = content[:-2]
-    elif content.endswith("\n"):
-        content = content[:-1]
-
-    if not content.strip():
-        raise ConfigError(
-            f"Secret file for '{field_path}' is empty or contains only whitespace."
-        )
-
-    return content
+    except OSError as exc:
+        raise ConfigError(f"Cannot read vault file at {path!r}: {exc}") from None
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ConfigError(f"Invalid JSON in vault file at {path!r}: {exc}") from None
+    if not isinstance(data, dict):
+        raise ConfigError(f"Vault file at {path!r} must contain a JSON object.")
+    for key, value in data.items():
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"Vault file at {path!r}: value for key '{key}' must be a string, "
+                f"got {type(value).__name__}. All vault values must be strings."
+            )
+    return data
 
 
 # ---------------------------------------------------------------------------
-# Environment-variable expansion
+# Environment-variable and vault-secret expansion
 # ---------------------------------------------------------------------------
 
 # Strict variable-name rule: must start with letter/underscore, then alphanumeric.
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Prefix that marks a whole-string env reference.
+# Prefixes that mark whole-string references.
 _ENV_PREFIX = "env:"
+_SEC_PREFIX = "sec:"
 
 
-def _expand_value(value: Any, path: str = "") -> Any:
-    """Recursively resolve ``env:VAR`` references in raw config values.
+def _expand_value(value: Any, path: str = "", vault: dict | None = None) -> Any:
+    """Recursively resolve ``env:VAR`` and ``sec:KEY`` references in raw config values.
 
     A string value that is **exactly** ``env:VAR`` is replaced with the value
-    of environment variable ``VAR``.  Any other string is returned unchanged.
-    Non-string scalars (int, float, bool) are always returned unchanged.
+    of environment variable ``VAR``.  A string value that is exactly ``sec:KEY``
+    is replaced with the corresponding value from *vault*.
+
+    Any other string is returned unchanged.  Non-string scalars (int, float,
+    bool) are always returned unchanged.
 
     Rules:
     - ``env:VAR`` — whole-string reference; raises :class:`ConfigError` when
       ``VAR`` is not set in the environment.
-    - ``env:`` with an empty or invalid name raises :class:`ConfigError`.
-    - Strings that are not exactly ``env:VAR`` (e.g. ``Bearer env:TOKEN``,
-      ``env:`` at start of longer text, plain values) are kept literal.
+    - ``sec:KEY`` — whole-string reference; raises :class:`ConfigError` when
+      no vault is loaded, when ``KEY`` is missing, or when ``vault`` is not a
+      dict.
+    - ``env:`` or ``sec:`` with an empty or invalid key raises :class:`ConfigError`.
+    - Strings that are not exactly ``env:VAR``/``sec:KEY`` (e.g.
+      ``Bearer env:TOKEN``, ``sec:`` at start of longer text, plain values)
+      are kept literal.
 
     The *path* argument is used only in error messages.
     """
@@ -107,34 +101,78 @@ def _expand_value(value: Any, path: str = "") -> Any:
                     f"Export it before starting: export {var}=<value>"
                 )
             return resolved
+
+        if value.startswith(_SEC_PREFIX):
+            key = value[len(_SEC_PREFIX):]
+            loc = f" (at {path})" if path else ""
+            if vault is None:
+                raise ConfigError(
+                    f"Vault secret '{value}' referenced in config{loc} but no vault loaded. "
+                    f"Set a vault path or add the secret to the config."
+                )
+            if not _ENV_VAR_NAME.match(key):
+                raise ConfigError(
+                    f"empty or invalid key name in sec reference '{value}' in config{loc}: "
+                    f"name must match [A-Za-z_][A-Za-z0-9_]*"
+                )
+            if key not in vault:
+                raise ConfigError(
+                    f"Vault secret key '{key}' referenced in config{loc} is missing. "
+                    f"Add it to the vault."
+                )
+            return vault[key]
+
         return value
 
     if isinstance(value, dict):
-        return {k: _expand_value(v, path=f"{path}.{k}" if path else k) for k, v in value.items()}
+        return {k: _expand_value(v, path=f"{path}.{k}" if path else k, vault=vault) for k, v in value.items()}
 
     if isinstance(value, list):
-        return [_expand_value(item, path=f"{path}[{i}]") for i, item in enumerate(value)]
+        return [_expand_value(item, path=f"{path}[{i}]", vault=vault) for i, item in enumerate(value)]
 
     return value
 
 
-def expand_env(raw: dict) -> dict:
-    """Resolve all ``env:VAR`` references in a raw config dict.
+def expand_env(raw: dict, vault: dict | None = None) -> dict:
+    """Resolve all ``env:VAR`` and ``sec:KEY`` references in a raw config dict.
 
     Returns a new dict where every string value that is exactly ``env:VAR``
-    has been replaced with the corresponding environment variable.  All other
+    or ``sec:KEY`` has been replaced with the corresponding value.  All other
     values (strings, ints, floats, booleans) are returned unchanged.
 
     Call this once at load time before passing *raw* to :func:`parse_config`.
-    Raises :class:`ConfigError` if any referenced variable is missing or if
-    the variable name is invalid.
+    Raises :class:`ConfigError` if any referenced variable or vault key is
+    missing, or if the key name is invalid.
     """
-    return _expand_value(raw)  # type: ignore[return-value]
+    return _expand_value(raw, vault=vault)  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
-# Strict typed-field helpers (prevent strings from silently coercing as bools)
+# Vault helpers
 # ---------------------------------------------------------------------------
+
+def _has_sec_reference(value: Any) -> bool:
+    """Return True if *value* contains any ``sec:`` reference."""
+    if isinstance(value, str):
+        return value.startswith(_SEC_PREFIX)
+    if isinstance(value, dict):
+        return any(_has_sec_reference(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_sec_reference(item) for item in value)
+    return False
+
+
+def _vault_path(raw: dict) -> str:
+    """Return the vault file path for *raw*.
+
+    Uses ``$SPC_VAULT_FILE`` when set, otherwise the default location under
+    ``~/.local/share/<agent_name>/secrets.json``.
+    """
+    env_path = os.environ.get("SPC_VAULT_FILE")
+    if env_path:
+        return env_path
+    agent_name = (raw.get("agent") or {}).get("agent_name") or "piclaw"
+    return os.path.expanduser(f"~/.local/share/{agent_name}/secrets.json")
 
 def _parse_bool(value: Any, field_path: str) -> bool:
     """Return *value* as bool, rejecting strings to prevent env refs or
@@ -267,6 +305,8 @@ class ProviderConfig:
 
 @dataclass(frozen=True)
 class AgentConfig:
+    agent_name: str = "piclaw"
+    agent_home: str = ""
     max_iterations: int = 8
     scheduled_max_iterations: int = 100
     tool_timeout: int = 10
@@ -308,6 +348,11 @@ class GraphMemoryConfig:
     extract_every_n_turns: int = 3
     min_message_length: int = 100
     max_context_entries: int = 10
+
+
+@dataclass(frozen=True)
+class VaultConfig:
+    type: str = "file"
 
 
 @dataclass(frozen=True)
@@ -355,6 +400,7 @@ class AppConfig:
     embeddings: EmbeddingsConfig
     scheduler: SchedulerConfig
     paths: PathsConfig
+    vault: VaultConfig = field(default_factory=VaultConfig)
     graph_memory: GraphMemoryConfig = field(default_factory=GraphMemoryConfig)
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
@@ -362,6 +408,12 @@ class AppConfig:
     # Keep reference to raw dict for incremental migration — consumers that
     # haven't been updated yet can use this temporarily.
     _raw: dict = field(default_factory=dict, repr=False, compare=False)
+
+
+def _parse_vault(raw: dict) -> VaultConfig:
+    """Parse the [vault] config section into a VaultConfig."""
+    section = raw.get("vault") or {}
+    return VaultConfig(type=section.get("type", "file"))
 
 
 # ---------------------------------------------------------------------------
@@ -377,15 +429,6 @@ def _require(d: dict, key: str, section: str) -> Any:
 
 def _parse_telegram(raw: dict) -> TelegramConfig:
     section = raw.get("telegram") or {}
-
-    # Handle file-backed bot token — resolve before requiring the field.
-    if "bot_token" in section and "bot_token_file" in section:
-        raise ConfigError(
-            "telegram: both 'bot_token' and 'bot_token_file' are set; use only one."
-        )
-    if "bot_token_file" in section:
-        resolved = _resolve_file_secret(section["bot_token_file"], "telegram.bot_token_file")
-        section["bot_token"] = resolved  # Write back so _raw reflects the resolved value.
 
     return TelegramConfig(
         bot_token=_require(section, "bot_token", "telegram"),
@@ -433,7 +476,13 @@ def _parse_embeddings(raw: dict) -> EmbeddingsConfig:
 
 def _parse_agent(raw: dict) -> AgentConfig:
     section = raw.get("agent") or {}
+    agent_name = section.get("agent_name", "piclaw")
+    # Derive agent_home from agent_name when not set or set to empty string.
+    agent_home_raw = section.get("agent_home", "")
+    agent_home = agent_home_raw if agent_home_raw else os.path.expanduser(f"~/{agent_name}")
     return AgentConfig(
+        agent_name=agent_name,
+        agent_home=agent_home,
         max_iterations=_parse_int(section.get("max_iterations"), 8, "agent.max_iterations"),
         scheduled_max_iterations=_parse_int(section.get("scheduled_max_iterations"), 100, "agent.scheduled_max_iterations"),
         tool_timeout=_parse_int(section.get("tool_timeout"), 10, "agent.tool_timeout"),
@@ -571,12 +620,7 @@ def resolve_model_id(selected: str, configured_models: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
-    """Parse ``[providers.<name>]`` sections from *raw*, resolving any
-    ``api_key_file`` entries and writing the resolved value back into *raw*
-    so that ``_raw`` reflects the runtime secret.
-
-    Raises :class:`ConfigError` on ambiguous same-level sources or file errors.
-    """
+    """Parse ``[providers.<name>]`` sections from *raw*."""
     providers_raw = raw.get("providers") or {}
     result: dict[str, ProviderConfig] = {}
 
@@ -584,24 +628,9 @@ def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
         if not isinstance(entry, dict):
             continue
 
-        # Reject ambiguous same-level sources.
-        if "api_key" in entry and "api_key_file" in entry:
-            raise ConfigError(
-                f"[providers.{name}] has both 'api_key' and 'api_key_file'; "
-                "use only one source."
-            )
-
-        api_key = entry.get("api_key", "")
-        if "api_key_file" in entry:
-            api_key = _resolve_file_secret(
-                entry["api_key_file"], f"providers.{name}.api_key_file"
-            )
-            # Write resolved value back so _raw["providers"][name]["api_key"] is set.
-            entry["api_key"] = api_key
-
         result[name] = ProviderConfig(
             name=name,
-            api_key=api_key,
+            api_key=entry.get("api_key", ""),
             base_url=entry.get("base_url", ""),
             request_timeout=_parse_int(
                 entry.get("request_timeout"), 120, f"providers.{name}.request_timeout"
@@ -618,35 +647,17 @@ def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
 
 
 def _normalize_models(raw: dict, providers: dict[str, ProviderConfig]) -> None:
-    """Resolve model-level ``api_key_file`` secrets and apply provider-level
-    defaults for models that omit credential / transport fields.
+    """Apply provider-level defaults for models that omit credential / transport fields.
 
-    Mutates *raw* in-place: writes resolved / inherited values back into each
+    Mutates *raw* in-place: writes inherited values back into each
     ``raw["models"][i]`` entry so that ``_raw`` mirrors what the typed config
     actually uses at runtime.
 
     Cross-level precedence:
-    - Model-level ``api_key_file`` beats provider ``api_key`` / ``api_key_file``.
     - Model-level ``api_key`` beats provider ``api_key``.
     - Provider values fill in only when the model omits the field entirely.
     """
     for entry in (raw.get("models") or []):
-        name = entry.get("name", "")
-
-        # Reject ambiguous same-level sources at model level.
-        if "api_key" in entry and "api_key_file" in entry:
-            raise ConfigError(
-                f"[[models]] entry '{name}': both 'api_key' and 'api_key_file' are set; "
-                "use only one source."
-            )
-
-        # Resolve model-level api_key_file (takes precedence over provider).
-        if "api_key_file" in entry:
-            entry["api_key"] = _resolve_file_secret(
-                entry["api_key_file"], f"models.{name}.api_key_file"
-            )
-
-        # Apply provider inheritance for missing fields.
         if not providers:
             continue
         provider_name = entry.get("provider", "")
@@ -684,16 +695,6 @@ def _normalize_embeddings(raw: dict, providers: dict[str, ProviderConfig]) -> No
     if not isinstance(emb, dict):
         return
 
-    # Reject ambiguous same-level sources.
-    if "api_key" in emb and "api_key_file" in emb:
-        raise ConfigError(
-            "[embeddings] has both 'api_key' and 'api_key_file'; use only one source."
-        )
-
-    # Resolve embeddings-level api_key_file if present.
-    if "api_key_file" in emb:
-        emb["api_key"] = _resolve_file_secret(emb["api_key_file"], "embeddings.api_key_file")
-
     provider_name = emb.get("provider", "openai")
     prov = providers.get(provider_name)
     if prov is None:
@@ -706,9 +707,59 @@ def _normalize_embeddings(raw: dict, providers: dict[str, ProviderConfig]) -> No
         emb["base_url"] = prov.base_url
 
 
-def parse_config(raw: dict) -> AppConfig:
+def _reject_removed_fields(raw: dict) -> None:
+    """Reject legacy removed file-secret fields with clear migration guidance.
+
+    The following fields were removed in favor of vault-backed ``sec:`` references:
+    - ``[telegram] bot_token_file``
+    - ``[providers.<name>] api_key_file``
+    - ``[[models]] api_key_file``
+    - ``[embeddings] api_key_file``
+
+    Raises :class:`ConfigError` on the first offending field found.
     """
-    Parse and validate a raw TOML config dict into a typed AppConfig.
+    _MIGRATION = (
+        " Use 'api_key = \"sec:KEY\"' with a vault file instead. "
+        "See docs: https://github.com/smallpieclaw/docs/vault"
+    )
+
+    telegram = raw.get("telegram") or {}
+    if "bot_token_file" in telegram:
+        raise ConfigError(
+            "[telegram] 'bot_token_file' has been removed. "
+            "Use 'bot_token = \"sec:KEY\"' with a vault file instead. "
+            "Add your token to the vault and reference it as: bot_token = \"sec:bot_token\""
+        )
+
+    providers = raw.get("providers") or {}
+    for pname, entry in providers.items():
+        if isinstance(entry, dict) and "api_key_file" in entry:
+            raise ConfigError(
+                f"[providers.{pname}] 'api_key_file' has been removed."
+                + _MIGRATION
+                + f" Example: api_key = \"sec:{pname}_api_key\""
+            )
+
+    for i, entry in enumerate(raw.get("models") or []):
+        if isinstance(entry, dict) and "api_key_file" in entry:
+            name = entry.get("name") or f"model-{i}"
+            raise ConfigError(
+                f"[[models]] entry '{name}': 'api_key_file' has been removed."
+                + _MIGRATION
+                + f" Example: api_key = \"sec:{name}_api_key\""
+            )
+
+    embeddings = raw.get("embeddings") or {}
+    if isinstance(embeddings, dict) and "api_key_file" in embeddings:
+        raise ConfigError(
+            "[embeddings] 'api_key_file' has been removed."
+            + _MIGRATION
+            + " Example: api_key = \"sec:embeddings_api_key\""
+        )
+
+
+def parse_config(raw: dict) -> AppConfig:
+    """Parse and validate a raw TOML config dict into a typed AppConfig.
 
     Environment-variable placeholders (``${VAR}`` and ``${VAR:-default}``) in
     string values are expanded before validation — this is the single place in
@@ -717,13 +768,18 @@ def parse_config(raw: dict) -> AppConfig:
     Raises ConfigError on missing required fields, invalid values, or
     unset required environment variables.
     """
-    # Expand ${VAR} / ${VAR:-default} placeholders before any other processing.
-    raw = expand_env(raw)
+    _reject_removed_fields(raw)
 
-    # Parse providers (resolves api_key_file secrets and writes back to raw).
+    vault: dict | None = None
+    if _has_sec_reference(raw):
+        vault = _load_vault(_vault_path(raw))
+
+    # Expand ${VAR} / ${VAR:-default} placeholders and sec: secrets before any other processing.
+    raw = expand_env(raw, vault=vault)
+
     providers = _parse_providers(raw)
 
-    # Apply provider defaults and resolve model/embeddings *_file secrets.
+    # Apply provider defaults to models/embeddings.
     _normalize_models(raw, providers)
     _normalize_embeddings(raw, providers)
 
@@ -744,6 +800,7 @@ def parse_config(raw: dict) -> AppConfig:
         embeddings=_parse_embeddings(raw),
         scheduler=_parse_scheduler(raw),
         paths=_parse_paths(raw),
+        vault=_parse_vault(raw),
         graph_memory=_parse_graph_memory(raw),
         mcp_servers=mcp_servers,
         providers=providers,

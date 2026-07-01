@@ -1,36 +1,40 @@
 # Telegram Home Agent Configuration
 #
-# Environment variables can be referenced in string config values using:
+# Environment variables and vault secrets can be referenced in string config values
+# using two prefixes:
 #
-#   env:VAR_NAME
+#   env:VAR_NAME   — looks up VAR_NAME in the process environment
+#   sec:KEY_NAME   — looks up KEY_NAME in the agent's vault file
 #
-# The entire string value must be exactly "env:VAR_NAME" — no inline
-# interpolation or partial substitution. Missing variables cause a startup
-# error with a clear message.
+# The entire string value must be exactly "env:VAR_NAME" or "sec:KEY_NAME" —
+# no inline interpolation or partial substitution. Missing references cause a
+# startup error with a clear message.
 #
 # Examples:
 #   bot_token = "env:TELEGRAM_BOT_TOKEN"
-#   api_key   = "env:OPENAI_API_KEY"
+#   api_key   = "sec:OPENAI_API_KEY"
 #
-# File-backed secrets can be used for supported sensitive fields. The *_file
-# field may be a literal path or an env var containing a path:
-#   bot_token_file = "env:TELEGRAM_BOT_TOKEN_FILE"
-#   api_key_file   = "env:OPENAI_API_KEY_FILE"
+# Vault file location: ~/.local/share/<agent_name>/secrets.json
+# Override via the SPC_VAULT_FILE environment variable.
+#
+# Vault format (plain JSON):
+#   {
+#     "OPENAI_API_KEY": "sk-...",
+#     "OLLAMA_HOST": "http://localhost:11434"
+#   }
 #
 # For values with a prefix (e.g. Bearer tokens in MCP headers), put the
-# full header value in the env var and reference it directly:
-#   Authorization = "env:MY_AUTH_HEADER"   # where MY_AUTH_HEADER="Bearer sk-..."
+# full header value in the vault and reference it directly:
+#   Authorization = "sec:MY_AUTH_HEADER"   # where MY_AUTH_HEADER="Bearer sk-..."
 #
-# This keeps secrets out of config.toml. For production systemd --user
-# services, prefer LoadCredential= and *_FILE env vars so the process
-# environment contains file paths, not long-lived secret values. Environment=
-# and EnvironmentFile= secret values remain supported as compatibility
-# fallbacks, but those values are inherited by shell/tool/MCP subprocesses.
+# This keeps secrets out of config.toml. Values referenced with sec: are
+# resolved at startup and never cached in os.environ, so they are not leaked
+# to shell/tool/MCP subprocesses.
 
 [telegram]
-bot_token = "env:TELEGRAM_BOT_TOKEN"
-# Production alternative:
-# bot_token_file = "env:TELEGRAM_BOT_TOKEN_FILE"
+bot_token = "sec:TELEGRAM_BOT_TOKEN"
+# Alternative using an environment variable:
+# bot_token = "env:TELEGRAM_BOT_TOKEN"
 # Security mode: "allowlist" or "pairing"
 security_mode = "allowlist"
 # Comma-separated list of allowed Telegram user IDs (for allowlist mode)
@@ -48,8 +52,7 @@ pairing_timeout = 300
 # entries. Model-level fields override provider-level defaults.
 #
 # [providers.openai]
-# api_key_file    = "env:OPENAI_API_KEY_FILE"  # preferred for systemd credentials
-# # api_key       = "env:OPENAI_API_KEY"       # compatibility fallback
+# api_key         = "sec:OPENAI_API_KEY"
 # base_url        = "https://api.openai.com/v1"
 # request_timeout = 120
 # max_retries     = 5
@@ -57,9 +60,8 @@ pairing_timeout = 300
 #
 # Fields per model:
 #   name             — display name shown in /models
-#   provider         — openai | openrouter | google | anthropic
+#   provider         — openai | openrouter | google | anthropic | ollama
 #   api_key          — provider API key (or inherit from [providers.<name>])
-#   api_key_file     — file containing provider API key (model-level override)
 #   model            — exact model identifier (used to match default_model)
 #   base_url         — API base URL (leave empty for Anthropic/Google defaults)
 #   max_tokens       — max tokens in LLM response
@@ -73,9 +75,9 @@ pairing_timeout = 300
 [[models]]
 name            = "default"
 provider        = "openai"
-api_key         = "env:OPENAI_API_KEY"
-# Production alternative: put api_key_file under [providers.openai] and omit
-# api_key here so all OpenAI models inherit the same secret file.
+api_key         = "sec:OPENAI_API_KEY"
+# Alternative using an environment variable:
+# api_key       = "env:OPENAI_API_KEY"
 model           = "gpt-4o-mini"
 base_url        = "https://api.openai.com/v1"
 max_tokens      = 1024
@@ -139,8 +141,9 @@ retry_delay     = 2
 # embeddings inherit provider credentials/base_url. Otherwise embeddings fall
 # back to the active model's api_key/base_url at runtime.
 provider = "openai"
-api_key  = "env:OPENAI_API_KEY"
-# Production alternative: omit api_key and inherit [providers.openai].api_key_file.
+api_key  = "sec:OPENAI_API_KEY"
+# Alternative using an environment variable:
+# api_key = "env:OPENAI_API_KEY"
 model    = "text-embedding-3-small"
 base_url = "https://api.openai.com/v1"
 
@@ -203,6 +206,18 @@ long_run_warn_minutes = 30
 
 [scheduler]
 enabled = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vault (file-backed key-value store for secrets)
+# The vault is a plain JSON file where keys map to secret values. The agent can
+# reference vault keys with the sec: prefix in any string config value, and the
+# secret_get built-in tool can retrieve values at runtime (requires user
+# confirmation).
+# ─────────────────────────────────────────────────────────────────────────────
+[vault]
+type = "file"
+# The vault path defaults to ~/.local/share/<agent_name>/secrets.json.
+# Override via the SPC_VAULT_FILE environment variable.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Graph-Based Memory (opt-in — disabled by default)

@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from config_schema import (
     AppConfig,
     ConfigError,
+    VaultConfig,
+    _has_sec_reference,
+    _load_vault,
+    _vault_path,
     expand_env,
     parse_config,
     resolve_model_id,
@@ -21,8 +27,11 @@ class TestParseConfig:
         assert isinstance(cfg, AppConfig)
         assert cfg.telegram.bot_token == "123456:ABC-DEF"
         assert cfg.agent.max_iterations == 8
+        assert cfg.agent.agent_name == "piclaw"
+        assert cfg.agent.agent_home == os.path.expanduser("~/piclaw")
         assert len(cfg.models) == 1
         assert cfg.models[0].provider == "openai"
+        assert cfg.vault.type == "file"
 
     def test_defaults_applied(self, minimal_config):
         cfg = parse_config(minimal_config)
@@ -194,7 +203,7 @@ class TestResolveModelId:
 
 
 # ---------------------------------------------------------------------------
-# expand_env — environment variable placeholder expansion
+# expand_env — environment variable and vault-secret expansion
 # ---------------------------------------------------------------------------
 
 class TestExpandEnv:
@@ -202,57 +211,181 @@ class TestExpandEnv:
 
     def test_env_colon_var_substituted(self, monkeypatch):
         monkeypatch.setenv("MY_TOKEN", "secret123")
-        result = expand_env({"key": "env:MY_TOKEN"})
+        result = expand_env({"key": "env:MY_TOKEN"}, vault=None)
         assert result == {"key": "secret123"}
 
     def test_missing_var_raises(self, monkeypatch):
         monkeypatch.delenv("MISSING_REQUIRED", raising=False)
         with pytest.raises(ConfigError, match="MISSING_REQUIRED"):
-            expand_env({"key": "env:MISSING_REQUIRED"})
+            expand_env({"key": "env:MISSING_REQUIRED"}, vault=None)
 
     def test_literal_string_unchanged(self):
-        result = expand_env({"key": "just-a-plain-value"})
+        result = expand_env({"key": "just-a-plain-value"}, vault=None)
         assert result == {"key": "just-a-plain-value"}
 
     def test_partial_env_prefix_not_substituted(self):
         # Strings that start with "env:" but embed more content are opaque.
-        result = expand_env({"key": "Bearer env:TOKEN"})
+        result = expand_env({"key": "Bearer env:TOKEN"}, vault=None)
         assert result == {"key": "Bearer env:TOKEN"}
 
     def test_env_colon_empty_name_raises(self):
         with pytest.raises(ConfigError, match="empty or invalid"):
-            expand_env({"key": "env:"})
+            expand_env({"key": "env:"}, vault=None)
 
     def test_env_colon_invalid_name_raises(self):
         with pytest.raises(ConfigError, match="empty or invalid"):
-            expand_env({"key": "env:1INVALID"})
+            expand_env({"key": "env:1INVALID"}, vault=None)
 
     def test_recursive_dict(self, monkeypatch):
         monkeypatch.setenv("BOT_TOKEN", "abc:xyz")
-        result = expand_env({"telegram": {"bot_token": "env:BOT_TOKEN"}})
+        result = expand_env({"telegram": {"bot_token": "env:BOT_TOKEN"}}, vault=None)
         assert result == {"telegram": {"bot_token": "abc:xyz"}}
 
     def test_recursive_list(self, monkeypatch):
         monkeypatch.setenv("API_KEY", "sk-test")
-        result = expand_env({"models": [{"api_key": "env:API_KEY"}]})
+        result = expand_env({"models": [{"api_key": "env:API_KEY"}]}, vault=None)
         assert result == {"models": [{"api_key": "sk-test"}]}
 
     def test_non_string_scalars_unchanged(self):
-        result = expand_env({"count": 5, "flag": True, "rate": 0.2})
+        result = expand_env({"count": 5, "flag": True, "rate": 0.2}, vault=None)
         assert result == {"count": 5, "flag": True, "rate": 0.2}
 
     def test_error_message_includes_path(self, monkeypatch):
         monkeypatch.delenv("MISSING", raising=False)
         with pytest.raises(ConfigError, match="api_key"):
-            expand_env({"models": [{"api_key": "env:MISSING"}]})
+            expand_env({"models": [{"api_key": "env:MISSING"}]}, vault=None)
 
     def test_mcp_env_section_expanded(self, monkeypatch):
         monkeypatch.setenv("UPSTREAM_KEY", "key-value")
         result = expand_env({
             "mcp_servers": [{"env": {"API_KEY": "env:UPSTREAM_KEY"}}]
-        })
+        }, vault=None)
         assert result["mcp_servers"][0]["env"]["API_KEY"] == "key-value"
 
+    def test_sec_colon_found_key_substituted(self):
+        vault = {"openai_key": "vault-secret"}
+        result = expand_env({"key": "sec:openai_key"}, vault=vault)
+        assert result == {"key": "vault-secret"}
+
+    def test_sec_colon_missing_key_raises(self):
+        vault = {"other_key": "value"}
+        with pytest.raises(ConfigError, match="Add it to the vault"):
+            expand_env({"key": "sec:openai_key"}, vault=vault)
+
+    def test_sec_colon_no_vault_raises(self):
+        with pytest.raises(ConfigError, match="no vault loaded"):
+            expand_env({"key": "sec:openai_key"}, vault=None)
+
+    def test_sec_colon_and_env_colon_coexist(self, monkeypatch):
+        monkeypatch.setenv("BASE_URL", "https://api.example.com")
+        vault = {"api_key": "vault-key"}
+        result = expand_env(
+            {"api_key": "sec:api_key", "base_url": "env:BASE_URL"},
+            vault=vault,
+        )
+        assert result == {"api_key": "vault-key", "base_url": "https://api.example.com"}
+
+
+# ---------------------------------------------------------------------------
+# Vault loading helpers
+# ---------------------------------------------------------------------------
+
+class TestVaultLoading:
+    """Tests for vault file loading and metadata helpers."""
+
+    def test_valid_json_loads(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"openai_key": "secret"}')
+        data = _load_vault(str(vault_file))
+        assert data == {"openai_key": "secret"}
+
+    def test_missing_file_raises(self, tmp_path):
+        missing = tmp_path / "missing.json"
+        with pytest.raises(ConfigError, match="Cannot read vault file"):
+            _load_vault(str(missing))
+
+    def test_invalid_json_raises(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text("not json")
+        with pytest.raises(ConfigError, match="Invalid JSON"):
+            _load_vault(str(vault_file))
+
+    def test_non_dict_json_raises(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text("[1, 2, 3]")
+        with pytest.raises(ConfigError, match="JSON object"):
+            _load_vault(str(vault_file))
+
+    def test_has_sec_reference_detects_nested_values(self):
+        assert _has_sec_reference({"models": [{"api_key": "sec:key"}]})
+        assert _has_sec_reference({"key": "sec:key"})
+        assert _has_sec_reference(["sec:key"])
+        assert not _has_sec_reference({"key": "plain"})
+        assert not _has_sec_reference({"count": 5})
+
+    def test_vault_path_uses_env_variable(self, monkeypatch):
+        monkeypatch.setenv("SPC_VAULT_FILE", "/custom/vault.json")
+        assert _vault_path({}) == "/custom/vault.json"
+
+    def test_vault_path_defaults_to_agent_name(self):
+        raw = {"agent": {"agent_name": "testbot"}}
+        assert _vault_path(raw) == os.path.expanduser("~/.local/share/testbot/secrets.json")
+
+    def test_vault_path_default_agent_name(self):
+        assert _vault_path({}) == os.path.expanduser("~/.local/share/piclaw/secrets.json")
+
+
+# ---------------------------------------------------------------------------
+# parse_config with secrets
+# ---------------------------------------------------------------------------
+
+class TestParseConfigWithVault:
+    """Integration tests: parse_config loads and resolves vault secrets."""
+
+    def test_bot_token_from_vault(self, minimal_config, tmp_path, monkeypatch):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"bot_token": "99999:VAULT-TOKEN"}')
+        monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
+        minimal_config["telegram"]["bot_token"] = "sec:bot_token"
+        cfg = parse_config(minimal_config)
+        assert cfg.telegram.bot_token == "99999:VAULT-TOKEN"
+        assert cfg._raw["telegram"]["bot_token"] == "99999:VAULT-TOKEN"
+
+    def test_api_key_from_vault(self, minimal_config, tmp_path, monkeypatch):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"openai_key": "sk-vault"}')
+        monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
+        minimal_config["models"][0]["api_key"] = "sec:openai_key"
+        cfg = parse_config(minimal_config)
+        assert cfg.models[0].api_key == "sk-vault"
+        assert cfg._raw["models"][0]["api_key"] == "sk-vault"
+
+    def test_missing_vault_key_fails_startup(self, minimal_config, tmp_path, monkeypatch):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"other_key": "value"}')
+        monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
+        minimal_config["telegram"]["bot_token"] = "sec:bot_token"
+        with pytest.raises(ConfigError, match="bot_token"):
+            parse_config(minimal_config)
+
+    def test_no_sec_reference_skips_vault_load(self, minimal_config):
+        # With no sec: references, a missing default vault path is fine.
+        cfg = parse_config(minimal_config)
+        assert cfg.telegram.bot_token == "123456:ABC-DEF"
+
+    def test_vault_config_defaults_to_file(self, minimal_config):
+        cfg = parse_config(minimal_config)
+        assert cfg.vault == VaultConfig(type="file")
+
+    def test_vault_config_custom_type(self, minimal_config):
+        minimal_config["vault"] = {"type": "keyring"}
+        cfg = parse_config(minimal_config)
+        assert cfg.vault.type == "keyring"
+
+
+# ---------------------------------------------------------------------------
+# parse_config expands env vars before validation
+# ---------------------------------------------------------------------------
 
 class TestParseConfigWithEnvVars:
     """Integration tests: parse_config expands env vars before validation."""
@@ -329,6 +462,30 @@ class TestParseConfigWithEnvVars:
             parse_config(minimal_config)
 
 
+# ---------------------------------------------------------------------------
+# AgentConfig fields
+# ---------------------------------------------------------------------------
+
+class TestAgentConfigFields:
+    """Tests for agent_name and agent_home defaults and overrides."""
+
+    def test_defaults(self, minimal_config):
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.agent_name == "piclaw"
+        assert cfg.agent.agent_home == os.path.expanduser("~/piclaw")
+
+    def test_custom_values(self, minimal_config):
+        minimal_config["agent"]["agent_name"] = "myagent"
+        minimal_config["agent"]["agent_home"] = "/tmp/agent"
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.agent_name == "myagent"
+        assert cfg.agent.agent_home == "/tmp/agent"
+
+
+# ---------------------------------------------------------------------------
+# Provider credential inheritance
+# ---------------------------------------------------------------------------
+
 class TestProviderCredentialInheritance:
     """Provider defaults and credential inheritance behavior."""
 
@@ -360,17 +517,19 @@ class TestProviderCredentialInheritance:
         assert cfg._raw["models"][0]["base_url"] == "https://provider.example/v1"
         assert cfg._raw["models"][0]["request_timeout"] == 180
 
-    def test_model_level_secret_source_overrides_provider_source(self, minimal_config, tmp_path):
-        key_file = tmp_path / "model-api-key"
-        key_file.write_text("model-file-key\n")
-        minimal_config["providers"] = {"openai": {"api_key": "provider-key"}}
-        minimal_config["models"][0]["api_key_file"] = str(key_file)
+    def test_provider_sec_value_inherited_by_model(self, minimal_config, tmp_path, monkeypatch):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"openai_key": "provider-vault-key"}')
+        monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
+        minimal_config["providers"] = {"openai": {"api_key": "sec:openai_key"}}
         del minimal_config["models"][0]["api_key"]
 
         cfg = parse_config(minimal_config)
 
-        assert cfg.models[0].api_key == "model-file-key"
-        assert cfg._raw["models"][0]["api_key"] == "model-file-key"
+        assert cfg.providers["openai"].api_key == "provider-vault-key"
+        assert cfg.models[0].api_key == "provider-vault-key"
+        assert cfg._raw["providers"]["openai"]["api_key"] == "provider-vault-key"
+        assert cfg._raw["models"][0]["api_key"] == "provider-vault-key"
 
     def test_legacy_config_raw_dict_remains_unchanged(self, minimal_config):
         cfg = parse_config(minimal_config)
@@ -412,98 +571,134 @@ class TestProviderCredentialInheritance:
         assert cfg.embeddings.base_url == ""
 
 
-class TestFileBackedSecretResolution:
-    """File-backed secret parsing and validation."""
+# ---------------------------------------------------------------------------
+# Removed file-secret fields — must fail startup with ConfigError
+# ---------------------------------------------------------------------------
 
-    def test_provider_api_key_file_resolves_secret(self, minimal_config, tmp_path):
-        key_file = tmp_path / "openai-key"
-        key_file.write_text("file-backed-key\n")
-        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
-        del minimal_config["models"][0]["api_key"]
+class TestRemovedFileSecretFields:
+    """Legacy removed fields must be rejected with clear migration guidance."""
 
-        cfg = parse_config(minimal_config)
-
-        assert cfg.models[0].api_key == "file-backed-key"
-        assert cfg._raw["providers"]["openai"]["api_key"] == "file-backed-key"
-        assert cfg._raw["models"][0]["api_key"] == "file-backed-key"
-
-    def test_secret_file_path_can_come_from_environment(self, minimal_config, tmp_path, monkeypatch):
-        key_file = tmp_path / "openai-key"
-        key_file.write_text("env-file-key\n")
-        monkeypatch.setenv("OPENAI_API_KEY_FILE", str(key_file))
-        minimal_config["providers"] = {"openai": {"api_key_file": "env:OPENAI_API_KEY_FILE"}}
-        del minimal_config["models"][0]["api_key"]
-
-        cfg = parse_config(minimal_config)
-
-        assert cfg.models[0].api_key == "env-file-key"
-
-    def test_missing_secret_file_raises_field_specific_error(self, minimal_config, tmp_path):
-        missing_file = tmp_path / "missing-key"
-        minimal_config["providers"] = {"openai": {"api_key_file": str(missing_file)}}
-
-        with pytest.raises(ConfigError, match=r"providers\.openai\.api_key_file"):
+    def test_telegram_bot_token_file_raises(self, minimal_config):
+        minimal_config["telegram"]["bot_token_file"] = "/run/secrets/bot_token"
+        with pytest.raises(ConfigError, match="bot_token_file"):
             parse_config(minimal_config)
 
-    def test_empty_secret_file_raises_field_specific_error(self, minimal_config, tmp_path):
-        key_file = tmp_path / "empty-key"
-        key_file.write_text("\n")
-        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
-
-        with pytest.raises(ConfigError, match=r"providers\.openai\.api_key_file"):
+    def test_telegram_bot_token_file_migration_guidance(self, minimal_config):
+        minimal_config["telegram"]["bot_token_file"] = "/run/secrets/bot_token"
+        with pytest.raises(ConfigError, match="bot_token"):
             parse_config(minimal_config)
 
-    def test_secret_file_strips_only_one_trailing_newline_sequence(self, minimal_config, tmp_path):
-        key_file = tmp_path / "openai-key"
-        key_file.write_text("  key-with-space  \n\n")
-        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
-        del minimal_config["models"][0]["api_key"]
-
-        cfg = parse_config(minimal_config)
-
-        assert cfg.models[0].api_key == "  key-with-space  \n"
-
-    def test_ambiguous_same_level_secret_sources_raise(self, minimal_config, tmp_path):
-        key_file = tmp_path / "openai-key"
-        key_file.write_text("file-key")
+    def test_providers_api_key_file_raises(self, minimal_config):
         minimal_config["providers"] = {
-            "openai": {"api_key": "provider-key", "api_key_file": str(key_file)}
+            "openai": {"api_key_file": "/run/secrets/openai_key"}
         }
-
-        with pytest.raises(ConfigError, match="api_key.*api_key_file"):
+        with pytest.raises(ConfigError, match="api_key_file"):
             parse_config(minimal_config)
 
-    def test_telegram_bot_token_file_resolves_secret(self, minimal_config, tmp_path):
-        token_file = tmp_path / "telegram-token"
-        token_file.write_text("123456:FILE-TOKEN\n")
-        del minimal_config["telegram"]["bot_token"]
-        minimal_config["telegram"]["bot_token_file"] = str(token_file)
-
-        cfg = parse_config(minimal_config)
-
-        assert cfg.telegram.bot_token == "123456:FILE-TOKEN"
-        assert cfg._raw["telegram"]["bot_token"] == "123456:FILE-TOKEN"
-
-    def test_non_utf8_secret_file_raises_field_specific_error(self, minimal_config, tmp_path):
-        key_file = tmp_path / "binary-key"
-        key_file.write_bytes(b"\xff\xfe")
-        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
-
-        with pytest.raises(ConfigError, match=r"providers\.openai\.api_key_file"):
+    def test_model_api_key_file_raises(self, minimal_config):
+        minimal_config["models"][0]["api_key_file"] = "/run/secrets/openai_key"
+        with pytest.raises(ConfigError, match="api_key_file"):
             parse_config(minimal_config)
 
-    def test_config_repr_hides_secret_values(self, minimal_config, tmp_path):
-        key_file = tmp_path / "openai-key"
-        token_file = tmp_path / "telegram-token"
-        key_file.write_text("provider-secret")
-        token_file.write_text("telegram-secret")
-        del minimal_config["telegram"]["bot_token"]
-        del minimal_config["models"][0]["api_key"]
-        minimal_config["telegram"]["bot_token_file"] = str(token_file)
-        minimal_config["providers"] = {"openai": {"api_key_file": str(key_file)}}
+    def test_embeddings_api_key_file_raises(self, minimal_config):
+        minimal_config["embeddings"] = {
+            "provider": "openai",
+            "api_key_file": "/run/secrets/openai_key",
+        }
+        with pytest.raises(ConfigError, match="api_key_file"):
+            parse_config(minimal_config)
 
+    def test_error_message_includes_sec_migration_hint(self, minimal_config):
+        """Error must mention sec: or vault as the migration path."""
+        minimal_config["telegram"]["bot_token_file"] = "/run/secrets/bot_token"
+        with pytest.raises(ConfigError, match=r"sec:"):
+            parse_config(minimal_config)
+
+    def test_providers_api_key_file_includes_migration_hint(self, minimal_config):
+        minimal_config["providers"] = {
+            "openai": {"api_key_file": "/run/secrets/openai_key"}
+        }
+        with pytest.raises(ConfigError, match=r"sec:"):
+            parse_config(minimal_config)
+
+
+# ---------------------------------------------------------------------------
+# agent_home default resolution from agent_name
+# ---------------------------------------------------------------------------
+
+class TestAgentHomeDefault:
+    """agent_home default must resolve from agent_name when not set explicitly."""
+
+    def test_default_agent_name_gives_default_agent_home(self, minimal_config):
+        """Default agent_name 'piclaw' → agent_home '~/piclaw'."""
         cfg = parse_config(minimal_config)
+        assert cfg.agent.agent_home == os.path.expanduser("~/piclaw")
 
-        rendered = repr(cfg)
-        assert "provider-secret" not in rendered
-        assert "telegram-secret" not in rendered
+    def test_custom_agent_name_gives_derived_agent_home(self, minimal_config):
+        """Custom agent_name 'mybot' → agent_home '~/mybot'."""
+        minimal_config["agent"]["agent_name"] = "mybot"
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.agent_home == os.path.expanduser("~/mybot")
+
+    def test_explicit_agent_home_overrides_derived_default(self, minimal_config):
+        """Explicit agent_home is not overridden by agent_name logic."""
+        minimal_config["agent"]["agent_name"] = "mybot"
+        minimal_config["agent"]["agent_home"] = "/opt/mybot"
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.agent_home == "/opt/mybot"
+
+    def test_empty_agent_home_triggers_derived_default(self, minimal_config):
+        """Empty string agent_home in config triggers default derivation."""
+        minimal_config["agent"]["agent_home"] = ""
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.agent_home == os.path.expanduser("~/piclaw")
+
+
+# ---------------------------------------------------------------------------
+# _load_vault rejects non-string values
+# ---------------------------------------------------------------------------
+
+class TestLoadVaultNonStringValues:
+    """_load_vault must reject vault entries whose values are not strings."""
+
+    def test_non_string_int_value_raises(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"my_key": 12345}')
+        with pytest.raises(ConfigError, match="my_key"):
+            _load_vault(str(vault_file))
+
+    def test_non_string_bool_value_raises(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"flag": true}')
+        with pytest.raises(ConfigError, match="flag"):
+            _load_vault(str(vault_file))
+
+    def test_non_string_null_value_raises(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"my_key": null}')
+        with pytest.raises(ConfigError, match="my_key"):
+            _load_vault(str(vault_file))
+
+    def test_non_string_list_value_raises(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"my_key": ["a", "b"]}')
+        with pytest.raises(ConfigError, match="my_key"):
+            _load_vault(str(vault_file))
+
+    def test_non_string_dict_value_raises(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"my_key": {"nested": "value"}}')
+        with pytest.raises(ConfigError, match="my_key"):
+            _load_vault(str(vault_file))
+
+    def test_all_string_values_loads_successfully(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"api_key": "sk-abc", "token": "tok123"}')
+        data = _load_vault(str(vault_file))
+        assert data == {"api_key": "sk-abc", "token": "tok123"}
+
+    def test_error_message_includes_key_name(self, tmp_path):
+        vault_file = tmp_path / "secrets.json"
+        vault_file.write_text('{"secret_num": 99}')
+        with pytest.raises(ConfigError, match="secret_num"):
+            _load_vault(str(vault_file))

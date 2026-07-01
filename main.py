@@ -296,6 +296,11 @@ def _run(
 
     logger.info("Initialising components...")
 
+    agent_name = agent_cfg.get("agent_name", "piclaw")
+    vault_path = os.environ.get("SPC_VAULT_FILE") or os.path.expanduser(
+        f"~/.local/share/{agent_name}/secrets.json"
+    )
+
     llm      = LLMClient(cfg, usage_registry=get_token_registry(), caller_tag="main")
     memory   = MemoryStore(memory_path)
     # Purge any model/LLM facts the agent may have written in past sessions.
@@ -309,7 +314,7 @@ def _run(
         default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,
         max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
         shell_backend=shell_backend, shell_pty_cols=shell_pty_cols, shell_pty_rows=shell_pty_rows,
-        shell_streaming=shell_streaming,
+        shell_streaming=shell_streaming, vault_path=vault_path,
     )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)

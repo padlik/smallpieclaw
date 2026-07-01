@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import sys
 
+import json
+
 from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _is_sensitive_path, _truncate_output
 
 
@@ -920,6 +922,114 @@ class TestSubprocessArtifactWriteFailure:
         result = ex.execute("shell", {"command": "echo hello", "timeout": 5})
         assert result["success"] is True
         assert "hello" in result["output"]
+
+
+class TestSecretGet:
+    """Tests for the secret_get built-in vault lookup tool."""
+
+    def test_secret_get_success(self, tmp_path):
+        vault = tmp_path / "secrets.json"
+        vault.write_text(json.dumps({"api_key": "super-secret"}), encoding="utf-8")
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        # Simulate approved confirmation.
+        staged = ex.execute("secret_get", {"key": "api_key"})
+        assert staged["requires_confirmation"] is True
+        assert "api_key" in staged["description"]
+        result = ex.confirm(staged["token"])
+        assert result["success"] is True
+        assert result["output"] == "super-secret"
+        assert result["error"] == ""
+        assert result["exit_code"] == 0
+
+    def test_secret_get_missing_key(self, tmp_path):
+        vault = tmp_path / "secrets.json"
+        vault.write_text(json.dumps({"other": "value"}), encoding="utf-8")
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "missing"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "missing" in result["error"]
+        assert result["exit_code"] == -1
+
+    def test_secret_get_missing_vault(self, tmp_path):
+        missing_vault = tmp_path / "no_vault.json"
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(missing_vault))
+        staged = ex.execute("secret_get", {"key": "api_key"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "Cannot read vault" in result["error"]
+        assert result["exit_code"] == -1
+
+    def test_secret_get_corrupt_vault(self, tmp_path):
+        vault = tmp_path / "secrets.json"
+        vault.write_text("not-json", encoding="utf-8")
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "api_key"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "Cannot read vault" in result["error"]
+        assert result["exit_code"] == -1
+
+    def test_secret_get_non_object_vault(self, tmp_path):
+        vault = tmp_path / "secrets.json"
+        vault.write_text(json.dumps(["a", "list"]), encoding="utf-8")
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "api_key"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "not a JSON object" in result["error"]
+        assert result["exit_code"] == -1
+
+    def test_secret_get_requires_key(self, tmp_path):
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(tmp_path / "secrets.json"))
+        result = ex.execute("secret_get", {})
+        assert result["success"] is False
+        assert "'key' is required" in result["error"]
+        assert result["exit_code"] == -1
+
+    def test_secret_get_user_denial(self, tmp_path):
+        vault = tmp_path / "secrets.json"
+        vault.write_text(json.dumps({"api_key": "super-secret"}), encoding="utf-8")
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "api_key"})
+        assert staged["requires_confirmation"] is True
+        ex.cancel(staged["token"])
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "expired" in result["error"]
+
+    def test_secret_get_non_string_vault_value_int_fails(self, tmp_path):
+        """secret_get must reject non-string vault values instead of stringifying."""
+        vault = tmp_path / "secrets.json"
+        vault.write_text(json.dumps({"api_key": 12345}), encoding="utf-8")
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "api_key"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "api_key" in result["error"]
+        assert result["exit_code"] == -1
+
+    def test_secret_get_non_string_vault_value_bool_fails(self, tmp_path):
+        """secret_get must reject boolean vault values."""
+        vault = tmp_path / "secrets.json"
+        vault.write_text(json.dumps({"flag": True}), encoding="utf-8")
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "flag"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "flag" in result["error"]
+        assert result["exit_code"] == -1
+
+    def test_secret_get_non_string_vault_value_null_fails(self, tmp_path):
+        """secret_get must reject null vault values (distinct from missing key)."""
+        vault = tmp_path / "secrets.json"
+        vault.write_text(json.dumps({"my_key": None}), encoding="utf-8")
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "my_key"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "my_key" in result["error"]
+        assert result["exit_code"] == -1
 
 
 class TestSubprocessTimeoutBoundedKill:
