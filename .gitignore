@@ -216,6 +216,9 @@ data/scheduler_state.json
 # Local deepwork state
 .slim/
 
+# Local Claude Code project state
+.claude/
+
 # Local shell scripts
 set_*.sh
 .agents/

@@ -1,66 +1,63 @@
-# Secure Secret Resolution Specification
+# Vault Secret Manager Specification
 
 ## Purpose
 
-Define file-backed secret resolution and production deployment guidance for reducing secret exposure in environment variables.
+Define a centralized, agent-scoped vault for storing arbitrary string values (API keys, tokens, URLs, bearer headers) in a single JSON file.
 
 ## Requirements
 
+### Requirement: File-backed vault storage
+
+The application MUST support a `[vault]` config section with a `type` field, and SHALL load key-value pairs from a JSON file at startup when `type = "file"`.
+
+Feature: Vault secret manager
+Rule: Agent-scoped secrets live in a single JSON file, referenced by key name.
+
+#### Scenario: Vault file exists and contains secrets
+- **GIVEN** the `[vault]` section has `type = "file"`
+- **AND** a JSON file exists at `~/.local/share/<agent_name>/secrets.json`
+- **WHEN** the application starts
+- **THEN** the vault is loaded into memory
+- **AND** keys are accessible by exact name
+
+#### Scenario: Vault file is missing
+- **GIVEN** the config contains at least one `sec:` reference
+- **AND** the vault file does not exist
+- **WHEN** the application parses the configuration
+- **THEN** startup fails with a clear error indicating the vault file is missing
+
+#### Scenario: Vault file contains invalid JSON
+- **GIVEN** the vault file exists but is not valid JSON
+- **WHEN** the application attempts to load the vault
+- **THEN** startup fails with a clear error indicating the vault file is corrupt
+
+#### Scenario: Vault file is overridden by environment variable
+- **GIVEN** the environment variable `SPC_VAULT_FILE` is set to a valid path
+- **AND** the `[vault]` section has `type = "file"`
+- **WHEN** the application starts
+- **THEN** the vault is loaded from the path in `SPC_VAULT_FILE`
+- **AND** the default `~/.local/share/<agent_name>/secrets.json` is ignored
+
+### Requirement: Vault supports arbitrary string values
+
+The vault SHALL store any string value, not just secrets. Values are opaque strings — the application does not inspect or validate them.
+
+Feature: Vault secret manager
+Rule: Vault values are plain strings; any key can hold a key, token, URL, or header.
+
+#### Scenario: Vault contains a base URL
+- **GIVEN** the vault contains `"OLLAMA_HOST": "http://localhost:11434"`
+- **WHEN** a config field uses `sec:OLLAMA_HOST`
+- **THEN** the resolved value is `"http://localhost:11434"`
+
+#### Scenario: Vault contains a bearer header
+- **GIVEN** the vault contains `"AUTH_HEADER": "Bearer sk-xyz"`
+- **WHEN** a config field uses `sec:AUTH_HEADER`
+- **THEN** the resolved value is `"Bearer sk-xyz"`
+
+## Removed
+
 ### Requirement: File-backed secret resolution
-The application MUST support resolving supported sensitive string configuration fields from protected secret files, and SHALL fail startup with a clear configuration error when a requested secret file cannot produce a valid secret value.
+**Reason**: Replaced by the unified `sec:` vault prefix. The `api_key_file`/`bot_token_file` mechanism is removed.
 
-Feature: Secure secret resolution
-Rule: Sensitive config values may be loaded from protected files instead of environment values.
-
-#### Scenario: Secret value is loaded from a configured file path
-- **GIVEN** a string secret field is configured with a readable secret file path
-- **WHEN** the application parses the configuration
-- **THEN** the field is resolved to the contents of the secret file
-- **AND** one trailing newline from the file does not become part of the secret value
-
-#### Scenario: Secret file path is supplied by environment variable
-- **GIVEN** a string secret file field references an environment variable containing a file path
-- **AND** the referenced file contains a non-empty secret
-- **WHEN** the application parses the configuration
-- **THEN** the field is resolved to the secret file contents
-- **AND** the environment variable does not need to contain the secret value itself
-
-#### Scenario: Missing secret file fails startup clearly
-- **GIVEN** a string secret file field points to a file that does not exist
-- **WHEN** the application parses the configuration
-- **THEN** startup fails with a configuration error identifying the affected field and missing file
-
-#### Scenario: Empty secret file fails startup clearly
-- **GIVEN** a string secret file field points to a readable file with no secret value
-- **WHEN** the application parses the configuration
-- **THEN** startup fails with a configuration error identifying the affected field
-
-#### Scenario: Same-level value and file secret sources are rejected
-- **GIVEN** a supported secret field is configured with both a direct value and a file path at the same configuration level
-- **WHEN** the application parses the configuration
-- **THEN** startup fails with a configuration error identifying the ambiguous secret source fields
-
-#### Scenario: Intentional secret whitespace is preserved
-- **GIVEN** a string secret file contains leading or trailing spaces that are part of the secret value
-- **WHEN** the application parses the configuration
-- **THEN** the resolved secret preserves the intentional spaces
-- **AND** at most one trailing newline sequence from the file is removed
-
-### Requirement: Systemd user service credential guidance
-Production documentation MUST include a `systemd --user` credential-file pattern for supported secrets and SHALL describe environment-value injection as a less secure compatibility fallback.
-
-Feature: Secure secret resolution
-Rule: Production documentation should guide operators toward file-path environment variables for systemd user services.
-
-#### Scenario: Operator configures a user service with systemd credentials
-- **GIVEN** an operator runs the application as a `systemd --user` service
-- **WHEN** they follow the production deployment documentation
-- **THEN** the example service uses `LoadCredential=` for API keys or bot tokens
-- **AND** the example exposes credential file paths through environment variables
-- **AND** the example preserves a correct `WorkingDirectory=` for config and relative paths
-
-#### Scenario: Operator needs a compatibility fallback
-- **GIVEN** an operator cannot use systemd credentials on the target host
-- **WHEN** they read the production deployment documentation
-- **THEN** the documentation describes environment-value secret injection as a fallback
-- **AND** the documentation calls out that env-value secrets are inherited by subprocesses and may be exposed through process environment inspection
+**Migration**: Move secret file contents into the agent vault (`~/.local/share/<agent_name>/secrets.json`) and replace `api_key_file = "..."` with `api_key = "sec:KEY_NAME"`.
