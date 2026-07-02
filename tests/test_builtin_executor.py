@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 import sys
 
-import json
-
 from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _is_sensitive_path, _truncate_output
 
 
@@ -925,11 +923,15 @@ class TestSubprocessArtifactWriteFailure:
 
 
 class TestSecretGet:
-    """Tests for the secret_get built-in vault lookup tool."""
+    """Tests for the secret_get built-in vault lookup tool.
+
+    Vault files use TOML format: plain ``key = "value"`` assignments at
+    the top level.  All values must be strings.
+    """
 
     def test_secret_get_success(self, tmp_path):
-        vault = tmp_path / "secrets.json"
-        vault.write_text(json.dumps({"api_key": "super-secret"}), encoding="utf-8")
+        vault = tmp_path / "secrets.toml"
+        vault.write_text('api_key = "super-secret"\n', encoding="utf-8")
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         # Simulate approved confirmation.
         staged = ex.execute("secret_get", {"key": "api_key"})
@@ -942,8 +944,8 @@ class TestSecretGet:
         assert result["exit_code"] == 0
 
     def test_secret_get_missing_key(self, tmp_path):
-        vault = tmp_path / "secrets.json"
-        vault.write_text(json.dumps({"other": "value"}), encoding="utf-8")
+        vault = tmp_path / "secrets.toml"
+        vault.write_text('other = "value"\n', encoding="utf-8")
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "missing"})
         result = ex.confirm(staged["token"])
@@ -952,7 +954,7 @@ class TestSecretGet:
         assert result["exit_code"] == -1
 
     def test_secret_get_missing_vault(self, tmp_path):
-        missing_vault = tmp_path / "no_vault.json"
+        missing_vault = tmp_path / "no_vault.toml"
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(missing_vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
@@ -961,8 +963,9 @@ class TestSecretGet:
         assert result["exit_code"] == -1
 
     def test_secret_get_corrupt_vault(self, tmp_path):
-        vault = tmp_path / "secrets.json"
-        vault.write_text("not-json", encoding="utf-8")
+        """Invalid TOML content is reported as a vault read failure."""
+        vault = tmp_path / "secrets.toml"
+        vault.write_text("= orphan value\n", encoding="utf-8")  # invalid TOML
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
@@ -970,26 +973,27 @@ class TestSecretGet:
         assert "Cannot read vault" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_non_object_vault(self, tmp_path):
-        vault = tmp_path / "secrets.json"
-        vault.write_text(json.dumps(["a", "list"]), encoding="utf-8")
+    def test_secret_get_nested_table_rejected(self, tmp_path):
+        """A TOML nested table produces a dict value which is rejected."""
+        vault = tmp_path / "secrets.toml"
+        vault.write_text("[credentials]\napi_key = \"secret\"\n", encoding="utf-8")
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
-        assert "not a JSON object" in result["error"]
+        assert "credentials" in result["error"]  # error names the offending top-level key
         assert result["exit_code"] == -1
 
     def test_secret_get_requires_key(self, tmp_path):
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(tmp_path / "secrets.json"))
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(tmp_path / "secrets.toml"))
         result = ex.execute("secret_get", {})
         assert result["success"] is False
         assert "'key' is required" in result["error"]
         assert result["exit_code"] == -1
 
     def test_secret_get_user_denial(self, tmp_path):
-        vault = tmp_path / "secrets.json"
-        vault.write_text(json.dumps({"api_key": "super-secret"}), encoding="utf-8")
+        vault = tmp_path / "secrets.toml"
+        vault.write_text('api_key = "super-secret"\n', encoding="utf-8")
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         assert staged["requires_confirmation"] is True
@@ -999,9 +1003,9 @@ class TestSecretGet:
         assert "expired" in result["error"]
 
     def test_secret_get_non_string_vault_value_int_fails(self, tmp_path):
-        """secret_get must reject non-string vault values instead of stringifying."""
-        vault = tmp_path / "secrets.json"
-        vault.write_text(json.dumps({"api_key": 12345}), encoding="utf-8")
+        """secret_get must reject non-string vault values (TOML integer)."""
+        vault = tmp_path / "secrets.toml"
+        vault.write_text("api_key = 12345\n", encoding="utf-8")
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
@@ -1010,9 +1014,9 @@ class TestSecretGet:
         assert result["exit_code"] == -1
 
     def test_secret_get_non_string_vault_value_bool_fails(self, tmp_path):
-        """secret_get must reject boolean vault values."""
-        vault = tmp_path / "secrets.json"
-        vault.write_text(json.dumps({"flag": True}), encoding="utf-8")
+        """secret_get must reject TOML boolean vault values."""
+        vault = tmp_path / "secrets.toml"
+        vault.write_text("flag = true\n", encoding="utf-8")
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "flag"})
         result = ex.confirm(staged["token"])
@@ -1020,16 +1024,44 @@ class TestSecretGet:
         assert "flag" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_non_string_vault_value_null_fails(self, tmp_path):
-        """secret_get must reject null vault values (distinct from missing key)."""
-        vault = tmp_path / "secrets.json"
-        vault.write_text(json.dumps({"my_key": None}), encoding="utf-8")
+    def test_secret_get_non_string_vault_value_float_fails(self, tmp_path):
+        """secret_get must reject TOML float vault values."""
+        vault = tmp_path / "secrets.toml"
+        vault.write_text("my_key = 3.14\n", encoding="utf-8")
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "my_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
         assert "my_key" in result["error"]
         assert result["exit_code"] == -1
+
+    def test_secret_get_toml_with_comments(self, tmp_path):
+        """TOML comments in the vault file are ignored; key is retrieved."""
+        vault = tmp_path / "secrets.toml"
+        vault.write_text(
+            "# Production secrets\n"
+            'api_key = "super-secret"\n'
+            "# end\n",
+            encoding="utf-8",
+        )
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "api_key"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is True
+        assert result["output"] == "super-secret"
+
+    def test_secret_get_toml_multiple_keys(self, tmp_path):
+        """secret_get retrieves the correct key from a multi-key TOML vault."""
+        vault = tmp_path / "secrets.toml"
+        vault.write_text(
+            'api_key = "sk-abc"\nbot_token = "1234:TOKEN"\n',
+            encoding="utf-8",
+        )
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "bot_token"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is True
+        assert result["output"] == "1234:TOKEN"
 
 
 class TestSubprocessTimeoutBoundedKill:

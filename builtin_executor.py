@@ -403,7 +403,7 @@ class BuiltinExecutor:
         self._max_subagents = max_subagents
         self._subagent_result_timeout = subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
-        self._vault_path = vault_path  # Path to JSON vault file for secret_get
+        self._vault_path = vault_path  # Path to TOML vault file for secret_get
         self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
         self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init
         self._shell_backend = shell_backend   # "subprocess" or "pty"
@@ -2335,14 +2335,25 @@ class BuiltinExecutor:
         )
 
     def _run_secret_get(self, args: dict, caller_tag: str = "") -> dict:
-        """Read a confirmed key from the JSON vault."""
+        """Read a confirmed key from the TOML vault file.
+
+        Delegates format parsing to :func:`config_schema.parse_vault_content`,
+        which expects a TOML file where every top-level key maps to a string
+        secret (e.g. ``api_key = "sk-..."``).  All vault values must be
+        strings; non-string values are rejected before the key is looked up.
+        """
+        # Local imports to avoid circular-import risk at module load time.
+        from config_schema import parse_vault_content as _parse_vault_content  # noqa: PLC0415
+        from exceptions import ConfigError as _ConfigError  # noqa: PLC0415
+
         key = args.get("key", "")
         _pfx = f"[{caller_tag}] " if caller_tag else ""
         logger.info("%sBuilt-in secret_get: key=%s", _pfx, key)
+
         try:
             with open(self._vault_path, encoding="utf-8") as fh:
-                vault = json.loads(fh.read())
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+                content = fh.read()
+        except OSError as exc:
             return {
                 "success": False,
                 "output": "",
@@ -2350,18 +2361,25 @@ class BuiltinExecutor:
                 "exit_code": -1,
                 "error_type": "config_error",
                 "recoverable": False,
-                "suggestion": "Check vault file path and JSON validity.",
+                "suggestion": "Check vault file path and TOML validity.",
             }
 
-        if not isinstance(vault, dict):
+        try:
+            vault = _parse_vault_content(content, self._vault_path)
+        except _ConfigError as exc:
+            # Normalise ConfigError messages to begin with "Cannot read vault:"
+            # so the tool API surface stays stable.
+            msg = str(exc)
+            if not msg.startswith("Cannot read vault"):
+                msg = f"Cannot read vault: {msg}"
             return {
                 "success": False,
                 "output": "",
-                "error": "Vault file is not a JSON object.",
+                "error": msg,
                 "exit_code": -1,
                 "error_type": "config_error",
                 "recoverable": False,
-                "suggestion": "Check vault file path and JSON validity.",
+                "suggestion": "Check vault file path and TOML validity.",
             }
 
         value = vault.get(key)
@@ -2376,20 +2394,7 @@ class BuiltinExecutor:
                 "suggestion": "Add the key to the vault file.",
             }
 
-        if not isinstance(value, str):
-            return {
-                "success": False,
-                "output": "",
-                "error": (
-                    f"Vault key '{key}' has a non-string value ({type(value).__name__}). "
-                    f"All vault values must be strings."
-                ),
-                "exit_code": -1,
-                "error_type": "config_error",
-                "recoverable": False,
-                "suggestion": "Update the vault file so all values are strings.",
-            }
-
+        # value is guaranteed to be a string by parse_vault_content's validation.
         return {
             "success": True,
             "output": value,

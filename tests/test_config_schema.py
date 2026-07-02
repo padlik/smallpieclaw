@@ -12,10 +12,11 @@ from config_schema import (
     VaultConfig,
     _has_sec_reference,
     _load_vault,
-    _vault_path,
     expand_env,
     parse_config,
+    parse_vault_content,
     resolve_model_id,
+    vault_path,
 )
 
 
@@ -291,29 +292,85 @@ class TestExpandEnv:
 # ---------------------------------------------------------------------------
 
 class TestVaultLoading:
-    """Tests for vault file loading and metadata helpers."""
+    """Tests for vault file loading and metadata helpers.
 
-    def test_valid_json_loads(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"openai_key": "secret"}')
+    Vault files use TOML format: plain ``key = "value"`` assignments at the
+    top level.  All values must be strings; nested tables, arrays, integers,
+    booleans, and other non-string types are rejected.
+    """
+
+    def test_valid_toml_loads(self, tmp_path):
+        """A minimal TOML vault file is loaded correctly."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('openai_key = "secret"\n')
         data = _load_vault(str(vault_file))
         assert data == {"openai_key": "secret"}
 
+    def test_valid_toml_multiple_keys(self, tmp_path):
+        """Multiple top-level keys are all loaded."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('openai_key = "sk-abc"\nbot_token = "1234:TOKEN"\n')
+        data = _load_vault(str(vault_file))
+        assert data == {"openai_key": "sk-abc", "bot_token": "1234:TOKEN"}
+
     def test_missing_file_raises(self, tmp_path):
-        missing = tmp_path / "missing.json"
+        missing = tmp_path / "missing.toml"
         with pytest.raises(ConfigError, match="Cannot read vault file"):
             _load_vault(str(missing))
 
-    def test_invalid_json_raises(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text("not json")
-        with pytest.raises(ConfigError, match="Invalid JSON"):
+    def test_invalid_toml_raises(self, tmp_path):
+        """Unparseable TOML raises ConfigError referencing TOML."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text("= orphan value\n")  # no key — invalid TOML
+        with pytest.raises(ConfigError, match="Invalid TOML"):
             _load_vault(str(vault_file))
 
-    def test_non_dict_json_raises(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text("[1, 2, 3]")
-        with pytest.raises(ConfigError, match="JSON object"):
+    def test_toml_with_comments(self, tmp_path):
+        """TOML comments are silently ignored."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text(
+            "# Secrets vault\n"
+            'openai_key = "sk-abc"\n'
+            "# end\n"
+        )
+        data = _load_vault(str(vault_file))
+        assert data == {"openai_key": "sk-abc"}
+
+    def test_toml_multiline_values(self, tmp_path):
+        """Multi-line TOML format with several keys loads correctly."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text(
+            "# Production secrets\n"
+            'openai_key = "sk-abc"\n'
+            'bot_token  = "1234:TOKEN"\n'
+            'ollama_host = "http://localhost:11434"\n'
+        )
+        data = _load_vault(str(vault_file))
+        assert data == {
+            "openai_key": "sk-abc",
+            "bot_token": "1234:TOKEN",
+            "ollama_host": "http://localhost:11434",
+        }
+
+    def test_nested_table_rejected(self, tmp_path):
+        """A TOML nested table produces a dict value which is rejected."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text("[credentials]\napi_key = \"secret\"\n")
+        with pytest.raises(ConfigError, match="credentials"):
+            _load_vault(str(vault_file))
+
+    def test_array_value_rejected(self, tmp_path):
+        """A TOML array value is rejected."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('my_list = ["a", "b"]\n')
+        with pytest.raises(ConfigError, match="my_list"):
+            _load_vault(str(vault_file))
+
+    def test_integer_value_rejected(self, tmp_path):
+        """A TOML integer value is rejected."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text("port = 8080\n")
+        with pytest.raises(ConfigError, match="port"):
             _load_vault(str(vault_file))
 
     def test_has_sec_reference_detects_nested_values(self):
@@ -324,15 +381,42 @@ class TestVaultLoading:
         assert not _has_sec_reference({"count": 5})
 
     def test_vault_path_uses_env_variable(self, monkeypatch):
-        monkeypatch.setenv("SPC_VAULT_FILE", "/custom/vault.json")
-        assert _vault_path({}) == "/custom/vault.json"
+        monkeypatch.setenv("SPC_VAULT_FILE", "/custom/vault.toml")
+        assert vault_path({}) == "/custom/vault.toml"
 
     def test_vault_path_defaults_to_agent_name(self):
         raw = {"agent": {"agent_name": "testbot"}}
-        assert _vault_path(raw) == os.path.expanduser("~/.local/share/testbot/secrets.json")
+        assert vault_path(raw) == os.path.expanduser("~/.local/share/testbot/secrets.toml")
 
     def test_vault_path_default_agent_name(self):
-        assert _vault_path({}) == os.path.expanduser("~/.local/share/piclaw/secrets.json")
+        assert vault_path({}) == os.path.expanduser("~/.local/share/piclaw/secrets.toml")
+
+    # ------------------------------------------------------------------
+    # parse_vault_content public API
+    # ------------------------------------------------------------------
+
+    def test_parse_vault_content_toml(self):
+        """parse_vault_content accepts a TOML string."""
+        data = parse_vault_content('key = "value"\n', "/fake/path")
+        assert data == {"key": "value"}
+
+    def test_parse_vault_content_multiple_keys(self):
+        """parse_vault_content loads multiple TOML keys."""
+        data = parse_vault_content(
+            'key = "value"\nother_key = "v2"\n', "/fake/path"
+        )
+        assert data == {"key": "value", "other_key": "v2"}
+
+    def test_parse_vault_content_invalid_raises(self):
+        """parse_vault_content raises ConfigError on unparseable TOML."""
+        with pytest.raises(ConfigError, match="Invalid TOML"):
+            parse_vault_content("= orphan\n", "/fake/path")
+
+    def test_parse_vault_content_non_string_raises(self):
+        """parse_vault_content raises ConfigError for non-string values."""
+        with pytest.raises(ConfigError, match="my_int"):
+            parse_vault_content("my_int = 42\n", "/fake/path")
+
 
 
 # ---------------------------------------------------------------------------
@@ -340,11 +424,14 @@ class TestVaultLoading:
 # ---------------------------------------------------------------------------
 
 class TestParseConfigWithVault:
-    """Integration tests: parse_config loads and resolves vault secrets."""
+    """Integration tests: parse_config loads and resolves vault secrets.
+
+    Vault files use TOML format (``key = "value"`` at top level).
+    """
 
     def test_bot_token_from_vault(self, minimal_config, tmp_path, monkeypatch):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"bot_token": "99999:VAULT-TOKEN"}')
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('bot_token = "99999:VAULT-TOKEN"\n')
         monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
         minimal_config["telegram"]["bot_token"] = "sec:bot_token"
         cfg = parse_config(minimal_config)
@@ -352,8 +439,8 @@ class TestParseConfigWithVault:
         assert cfg._raw["telegram"]["bot_token"] == "99999:VAULT-TOKEN"
 
     def test_api_key_from_vault(self, minimal_config, tmp_path, monkeypatch):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"openai_key": "sk-vault"}')
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('openai_key = "sk-vault"\n')
         monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
         minimal_config["models"][0]["api_key"] = "sec:openai_key"
         cfg = parse_config(minimal_config)
@@ -361,8 +448,8 @@ class TestParseConfigWithVault:
         assert cfg._raw["models"][0]["api_key"] == "sk-vault"
 
     def test_missing_vault_key_fails_startup(self, minimal_config, tmp_path, monkeypatch):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"other_key": "value"}')
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('other_key = "value"\n')
         monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
         minimal_config["telegram"]["bot_token"] = "sec:bot_token"
         with pytest.raises(ConfigError, match="bot_token"):
@@ -518,8 +605,8 @@ class TestProviderCredentialInheritance:
         assert cfg._raw["models"][0]["request_timeout"] == 180
 
     def test_provider_sec_value_inherited_by_model(self, minimal_config, tmp_path, monkeypatch):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"openai_key": "provider-vault-key"}')
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('openai_key = "provider-vault-key"\n')
         monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
         minimal_config["providers"] = {"openai": {"api_key": "sec:openai_key"}}
         del minimal_config["models"][0]["api_key"]
@@ -659,46 +746,52 @@ class TestAgentHomeDefault:
 # ---------------------------------------------------------------------------
 
 class TestLoadVaultNonStringValues:
-    """_load_vault must reject vault entries whose values are not strings."""
+    """_load_vault must reject vault entries whose values are not strings.
+
+    Vault files use TOML format.  TOML integers, booleans, floats, arrays, and
+    nested tables are all non-string types and must be rejected.
+    """
 
     def test_non_string_int_value_raises(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"my_key": 12345}')
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text("my_key = 12345\n")
         with pytest.raises(ConfigError, match="my_key"):
             _load_vault(str(vault_file))
 
     def test_non_string_bool_value_raises(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"flag": true}')
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text("flag = true\n")
         with pytest.raises(ConfigError, match="flag"):
             _load_vault(str(vault_file))
 
-    def test_non_string_null_value_raises(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"my_key": null}')
+    def test_non_string_float_value_raises(self, tmp_path):
+        """TOML floats are not strings and must be rejected."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text("my_key = 3.14\n")
         with pytest.raises(ConfigError, match="my_key"):
             _load_vault(str(vault_file))
 
-    def test_non_string_list_value_raises(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"my_key": ["a", "b"]}')
+    def test_non_string_array_value_raises(self, tmp_path):
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('my_key = ["a", "b"]\n')
         with pytest.raises(ConfigError, match="my_key"):
             _load_vault(str(vault_file))
 
-    def test_non_string_dict_value_raises(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"my_key": {"nested": "value"}}')
+    def test_non_string_nested_table_raises(self, tmp_path):
+        """A TOML nested table header produces a dict value — must be rejected."""
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('[my_key]\nnested = "value"\n')
         with pytest.raises(ConfigError, match="my_key"):
             _load_vault(str(vault_file))
 
     def test_all_string_values_loads_successfully(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"api_key": "sk-abc", "token": "tok123"}')
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text('api_key = "sk-abc"\ntoken = "tok123"\n')
         data = _load_vault(str(vault_file))
         assert data == {"api_key": "sk-abc", "token": "tok123"}
 
     def test_error_message_includes_key_name(self, tmp_path):
-        vault_file = tmp_path / "secrets.json"
-        vault_file.write_text('{"secret_num": 99}')
+        vault_file = tmp_path / "secrets.toml"
+        vault_file.write_text("secret_num = 99\n")
         with pytest.raises(ConfigError, match="secret_num"):
             _load_vault(str(vault_file))

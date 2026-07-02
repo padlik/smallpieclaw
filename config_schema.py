@@ -11,11 +11,15 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+try:
+    import tomli as _tomllib  # type: ignore[import]
+except ImportError:
+    import tomllib as _tomllib  # type: ignore[no-redef]  # Python 3.11+
 
 from exceptions import ConfigError
 
@@ -24,23 +28,41 @@ from exceptions import ConfigError
 # Vault-backed secret loader
 # ---------------------------------------------------------------------------
 
-def _load_vault(path: str) -> dict:
-    """Load a JSON vault file into a plain dict.
+def parse_vault_content(content: str, path: str) -> dict:
+    """Parse vault file *content* (TOML format) into a ``{key: value}`` dict.
 
-    All values in the vault must be strings.  Non-string values are rejected
-    with a :class:`ConfigError` that names the offending key.
+    The vault is a TOML file where every top-level key maps to a string
+    secret, for example::
+
+        # ~/.local/share/<agent_name>/secrets.toml
+        openai_key = "sk-..."
+        bot_token  = "123456:ABC"
+
+    All top-level values must be strings.  Nested tables, arrays, integers,
+    booleans, floats, and other non-string types are rejected with a
+    :class:`ConfigError` that names the offending key.
+
+    Args:
+        content: Raw text content of the vault file.
+        path: File path used only in error messages.
+
+    Returns:
+        A ``dict[str, str]`` of vault entries.
+
+    Raises:
+        ConfigError: On TOML parse failure, or if any top-level value is not
+            a string.
     """
     try:
-        with open(path, encoding="utf-8") as fh:
-            content = fh.read()
-    except OSError as exc:
-        raise ConfigError(f"Cannot read vault file at {path!r}: {exc}") from None
-    try:
-        data = json.loads(content)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise ConfigError(f"Invalid JSON in vault file at {path!r}: {exc}") from None
+        data = _tomllib.loads(content)
+    except _tomllib.TOMLDecodeError as exc:
+        raise ConfigError(
+            f"Invalid TOML in vault file at {path!r}: {exc}"
+        ) from None
+
     if not isinstance(data, dict):
-        raise ConfigError(f"Vault file at {path!r} must contain a JSON object.")
+        # Defensive: TOML always produces a table at the top level.
+        raise ConfigError(f"Vault file at {path!r} is not a TOML table.")
     for key, value in data.items():
         if not isinstance(value, str):
             raise ConfigError(
@@ -48,6 +70,24 @@ def _load_vault(path: str) -> dict:
                 f"got {type(value).__name__}. All vault values must be strings."
             )
     return data
+
+
+def _load_vault(path: str) -> dict:
+    """Load a TOML vault file into a plain ``{key: value}`` dict.
+
+    The vault is a TOML file where every top-level key maps to a string
+    secret.  Non-string values (nested tables, arrays, integers, booleans,
+    etc.) are rejected with a :class:`ConfigError` that names the offending
+    key.
+
+    Delegates format parsing to :func:`parse_vault_content`.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+    except OSError as exc:
+        raise ConfigError(f"Cannot read vault file at {path!r}: {exc}") from None
+    return parse_vault_content(content, path)
 
 
 # ---------------------------------------------------------------------------
@@ -162,17 +202,18 @@ def _has_sec_reference(value: Any) -> bool:
     return False
 
 
-def _vault_path(raw: dict) -> str:
+def vault_path(raw: dict) -> str:
     """Return the vault file path for *raw*.
 
     Uses ``$SPC_VAULT_FILE`` when set, otherwise the default location under
-    ``~/.local/share/<agent_name>/secrets.json``.
+    ``~/.local/share/<agent_name>/secrets.toml``.
     """
     env_path = os.environ.get("SPC_VAULT_FILE")
     if env_path:
         return env_path
     agent_name = (raw.get("agent") or {}).get("agent_name") or "piclaw"
-    return os.path.expanduser(f"~/.local/share/{agent_name}/secrets.json")
+    return os.path.expanduser(f"~/.local/share/{agent_name}/secrets.toml")
+
 
 def _parse_bool(value: Any, field_path: str) -> bool:
     """Return *value* as bool, rejecting strings to prevent env refs or
@@ -772,7 +813,7 @@ def parse_config(raw: dict) -> AppConfig:
 
     vault: dict | None = None
     if _has_sec_reference(raw):
-        vault = _load_vault(_vault_path(raw))
+        vault = _load_vault(vault_path(raw))
 
     # Expand ${VAR} / ${VAR:-default} placeholders and sec: secrets before any other processing.
     raw = expand_env(raw, vault=vault)

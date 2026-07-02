@@ -49,10 +49,11 @@ MCPManagerProtocol.list_servers
 MCPManagerProtocol.get_tools
 
 # config_schema.py — public API classes and functions
-from config_schema import parse_config, AppConfig, TelegramConfig, AgentConfig  # noqa: E402
+from config_schema import parse_config, vault_path, AppConfig, TelegramConfig, AgentConfig  # noqa: E402
 from config_schema import ModelConfig, EmbeddingsConfig, SchedulerConfig  # noqa: E402
 from config_schema import PathsConfig, MCPServerConfig  # noqa: E402
 parse_config
+vault_path
 AppConfig
 TelegramConfig
 AgentConfig
