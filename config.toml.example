@@ -14,14 +14,12 @@
 #   bot_token = "env:TELEGRAM_BOT_TOKEN"
 #   api_key   = "sec:OPENAI_API_KEY"
 #
-# Vault file location: ~/.local/share/<agent_name>/secrets.json
+# Vault file location: ~/.local/share/<agent_name>/secrets.toml
 # Override via the SPC_VAULT_FILE environment variable.
 #
-# Vault format (plain JSON):
-#   {
-#     "OPENAI_API_KEY": "sk-...",
-#     "OLLAMA_HOST": "http://localhost:11434"
-#   }
+# Vault format (TOML — plain key = "value" pairs):
+#   OPENAI_API_KEY = "sk-..."
+#   OLLAMA_HOST    = "http://localhost:11434"
 #
 # For values with a prefix (e.g. Bearer tokens in MCP headers), put the
 # full header value in the vault and reference it directly:
@@ -215,14 +213,14 @@ enabled = true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Vault (file-backed key-value store for secrets)
-# The vault is a plain JSON file where keys map to secret values. The agent can
-# reference vault keys with the sec: prefix in any string config value, and the
-# secret_get built-in tool can retrieve values at runtime (requires user
-# confirmation).
+# The vault is a TOML file where each top-level key maps to a string secret.
+# The agent can reference vault keys with the sec: prefix in any string config
+# value, and the secret_get built-in tool can retrieve values at runtime
+# (requires user confirmation).
 # ─────────────────────────────────────────────────────────────────────────────
 [vault]
 type = "file"
-# The vault path defaults to ~/.local/share/<agent_name>/secrets.json.
+# The vault path defaults to ~/.local/share/<agent_name>/secrets.toml.
 # Override via the SPC_VAULT_FILE environment variable.
 
 # ─────────────────────────────────────────────────────────────────────────────

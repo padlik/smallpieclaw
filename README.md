@@ -139,14 +139,12 @@ api_key = "sec:OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
 ```
 
-The vault is a plain JSON file at `~/.local/share/<agent_name>/secrets.json` (override via `SPC_VAULT_FILE`):
+The vault is a TOML file at `~/.local/share/<agent_name>/secrets.toml` (override via `SPC_VAULT_FILE`):
 
-```json
-{
-  "OPENAI_API_KEY": "sk-...",
-  "TELEGRAM_BOT_TOKEN": "1234567890:...",
-  "OLLAMA_HOST": "http://localhost:11434"
-}
+```toml
+OPENAI_API_KEY     = "sk-..."
+TELEGRAM_BOT_TOKEN = "1234567890:..."
+OLLAMA_HOST        = "http://localhost:11434"
 ```
 
 At runtime, the `secret_get` built-in tool lets the agent retrieve vault values with your confirmation. This is useful when skills reference unbound API keys or endpoints (e.g. "Set OLLAMA_HOST to your endpoint").

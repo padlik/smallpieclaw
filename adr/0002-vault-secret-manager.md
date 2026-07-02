@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, supersedes ADR-0001
+Superseded by ADR-0003, supersedes ADR-0001
 
 ## Date
 
