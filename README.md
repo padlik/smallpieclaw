@@ -167,7 +167,7 @@ Optional agent identity settings:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `agent.agent_name` | `"piclaw"` | Logical agent name used to derive default shared state locations such as `agent.agent_home` and the default vault directory. |
-| `agent.agent_home` | `~/<agent_name>` | Shared state directory for the agent. The vault path is independent and remains `~/.local/share/<agent_name>/secrets.json` unless `SPC_VAULT_FILE` is set. |
+| `agent.agent_home` | `~/<agent_name>` | Shared state directory for the agent. The vault path is independent and remains `~/.local/share/<agent_name>/secrets.toml` unless `SPC_VAULT_FILE` is set. |
 
 > **Tip:** To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
 
