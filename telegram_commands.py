@@ -179,6 +179,8 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     from datetime import datetime as _dt
     now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    mode = _current_mode(iface)
+
     await update.effective_message.reply_text(
         f"✅ <b>Agent Status</b>\n\n"
         f"🕐 Time: <code>{now_str}</code>\n"
@@ -186,6 +188,7 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         f"🤖 LLM: <code>{html.escape(llm_model)}</code>\n"
         f"🔍 Embeddings: <code>{html.escape(emb_model)}</code> ({html.escape(emb_key_status)})\n"
         f"🔐 Security: <code>{html.escape(iface.security_mode)}</code>\n"
+        f"🎭 Mode: <code>{html.escape(mode)}</code> — <i>{html.escape(_MODE_DESCRIPTIONS.get(mode, ''))}</i>\n"
         f"👥 Authorized users: {len(iface.allowed_ids)}\n"
         f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
         f"{agents_line}"
@@ -274,7 +277,7 @@ async def cmd_verbose(iface: "TelegramInterface", update: Update, ctx: ContextTy
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-_MODE_CYCLE = ("default", "planner", "explorer", "resilient")
+_MODES = ("default", "planner", "explorer", "resilient")
 _MODE_DESCRIPTIONS: dict[str, str] = {
     "default": "Standard balanced behavior",
     "planner": "Adds structured planning rules to prompts",
@@ -283,44 +286,93 @@ _MODE_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-async def cmd_mode(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cycle or set the agent creativity mode."""
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
+def _apply_mode(iface: "TelegramInterface", new_mode: str) -> None:
+    """Persist ``new_mode`` to the in-memory config and update the live agent.
 
-    args = ctx.args or []
+    Writes ``agent.mode`` and ``agent.creativity_mode`` in the in-memory config
+    (this does not touch ``config.toml``, so it reverts to the file value on
+    restart) and updates the live agent's ``creativity_mode``. Because each task
+    snapshots its mode at start, the change takes effect from the next task.
+    """
     agent_cfg = iface._config.setdefault("agent", {})
-    current_mode = agent_cfg.get("mode", "default")
-
-    if args:
-        requested = args[0].strip().lower()
-        if requested not in _MODE_DESCRIPTIONS:
-            valid_list = ", ".join(f"<code>{html.escape(m)}</code>" for m in _MODE_CYCLE)
-            await update.effective_message.reply_text(
-                f"❌ Unknown mode <code>{html.escape(requested)}</code>.\n"
-                f"Valid modes: {valid_list}\n"
-                "Usage: <code>/mode</code> to cycle, or <code>/mode &lt;mode&gt;</code> to set explicitly.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        new_mode = requested
-    else:
-        idx = _MODE_CYCLE.index(current_mode) if current_mode in _MODE_CYCLE else 0
-        new_mode = _MODE_CYCLE[(idx + 1) % len(_MODE_CYCLE)]
-
     agent_cfg["mode"] = new_mode
     agent_cfg["creativity_mode"] = new_mode
-    # Update the running agent instance so the change takes effect immediately.
+    # Update the live agent so the change takes effect from the next task.
     if getattr(iface, "agent", None) is not None:
         try:
             iface.agent.creativity_mode = new_mode
         except Exception:  # noqa: BLE001
             pass
+
+
+def _current_mode(iface: "TelegramInterface") -> str:
+    """Return the effective creativity mode.
+
+    Prefers the live agent's ``creativity_mode``, then the configured
+    ``agent.creativity_mode`` (the key the agent is actually built from), then
+    the legacy ``agent.mode``, falling back to ``"default"``.
+    """
+    agent_cfg = iface._config.get("agent", {})
+    return (
+        getattr(getattr(iface, "agent", None), "creativity_mode", None)
+        or agent_cfg.get("creativity_mode")
+        or agent_cfg.get("mode")
+        or "default"
+    )
+
+
+async def cmd_mode(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the agent creativity mode, or show a selector when called without args."""
+    if not iface._is_authorized(update.effective_user.id):
+        await iface._send_unauthorized(update)
+        return
+
+    args = ctx.args or []
+    current_mode = _current_mode(iface)
+
+    if args:
+        requested = args[0].strip().lower()
+        if requested not in _MODE_DESCRIPTIONS:
+            valid_list = ", ".join(f"<code>{html.escape(m)}</code>" for m in _MODES)
+            await update.effective_message.reply_text(
+                f"❌ Unknown mode <code>{html.escape(requested)}</code>.\n"
+                f"Valid modes: {valid_list}\n"
+                "Usage: <code>/mode</code> to choose from a menu, or <code>/mode &lt;mode&gt;</code> to set explicitly.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        _apply_mode(iface, requested)
+        await update.effective_message.reply_text(
+            f"🎭 <b>Mode: {html.escape(requested)}</b>\n"
+            f"<i>{html.escape(_MODE_DESCRIPTIONS[requested])}</i>\n"
+            f"<i>Takes effect from your next task.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # No args: show current mode and a selector for the other modes.
+    lines = [
+        f"🎭 <b>Creativity Mode</b> (current: <code>{html.escape(current_mode)}</code>)",
+        f"<i>{html.escape(_MODE_DESCRIPTIONS.get(current_mode, ''))}</i>\n",
+    ]
+    buttons = []
+    for name in _MODES:
+        active_icon = "✅" if name == current_mode else "⬜"
+        lines.append(
+            f"{active_icon} <b>{html.escape(name)}</b>: "
+            f"<i>{html.escape(_MODE_DESCRIPTIONS.get(name, ''))}</i>"
+        )
+        if name != current_mode:
+            buttons.append([InlineKeyboardButton(
+                f"Switch to {name}",
+                callback_data=f"mode:{name}",
+            )])
+
+    keyboard = InlineKeyboardMarkup(buttons) if buttons else None
     await update.effective_message.reply_text(
-        f"🎭 <b>Mode: {html.escape(new_mode)}</b>\n"
-        f"<i>{html.escape(_MODE_DESCRIPTIONS[new_mode])}</i>",
+        "\n".join(lines),
         parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
     )
 
 
@@ -1084,6 +1136,28 @@ async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: Conte
             text = f"❌ Model <code>{html.escape(model_name)}</code> not found."
     else:
         text = "❌ Model switching not available."
+
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+async def cb_mode_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle creativity-mode switch button presses."""
+    query = update.callback_query
+    await query.answer()
+    new_mode = query.data.split(":", 1)[1]
+
+    if new_mode not in _MODE_DESCRIPTIONS:
+        text = f"❌ Unknown mode <code>{html.escape(new_mode)}</code>."
+    else:
+        _apply_mode(iface, new_mode)
+        text = (
+            f"🎭 <b>Mode: {html.escape(new_mode)}</b>\n"
+            f"<i>{html.escape(_MODE_DESCRIPTIONS[new_mode])}</i>\n"
+            f"<i>Takes effect from your next task.</i>"
+        )
 
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)

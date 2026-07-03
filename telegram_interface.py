@@ -43,7 +43,7 @@ from telegram_commands import (
     cmd_verbose, cmd_jobs, cmd_agents, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
-    cb_confirm, cb_extend, cb_tool_create, cb_model_switch,
+    cb_confirm, cb_extend, cb_tool_create, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
 )
 
@@ -245,6 +245,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("memory", partial(cmd_memory, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
+        app.add_handler(CallbackQueryHandler(partial(cb_mode_switch, self), pattern=r"^mode:"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
