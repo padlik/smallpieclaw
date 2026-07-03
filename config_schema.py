@@ -28,7 +28,9 @@ from exceptions import ConfigError
 # Vault-backed secret loader
 # ---------------------------------------------------------------------------
 
-def parse_vault_content(content: str, path: str) -> dict:
+def parse_vault_content(
+    content: str, path: str, *, require_all_strings: bool = True
+) -> dict:
     """Parse vault file *content* (TOML format) into a ``{key: value}`` dict.
 
     The vault is a TOML file where every top-level key maps to a string
@@ -38,20 +40,33 @@ def parse_vault_content(content: str, path: str) -> dict:
         openai_key = "sk-..."
         bot_token  = "123456:ABC"
 
-    All top-level values must be strings.  Nested tables, arrays, integers,
-    booleans, floats, and other non-string types are rejected with a
-    :class:`ConfigError` that names the offending key.
+    When *require_all_strings* is ``True`` (the default, used for fail-fast
+    startup validation) every top-level value must be a string.  Nested
+    tables, arrays, integers, booleans, floats, and other non-string types
+    are rejected with a :class:`ConfigError` that names the offending key.
+
+    When *require_all_strings* is ``False`` the per-value string check is
+    skipped and the parsed table is returned as-is, so a non-string sibling
+    key does not break the whole file.  Callers that need a string (e.g. the
+    runtime ``secret_get`` tool) must validate the specific key they read.
+    TOML-format checks (parse errors, non-table top level) are always
+    enforced regardless of this flag.
 
     Args:
         content: Raw text content of the vault file.
         path: File path used only in error messages.
+        require_all_strings: When ``True`` (default), validate that every
+            top-level value is a string.  When ``False``, skip that check and
+            return the parsed table unmodified.
 
     Returns:
-        A ``dict[str, str]`` of vault entries.
+        A ``dict`` of vault entries.  Values are all ``str`` when
+        *require_all_strings* is ``True``; otherwise they may be any TOML type.
 
     Raises:
-        ConfigError: On TOML parse failure, or if any top-level value is not
-            a string.
+        ConfigError: On TOML parse failure, on a non-table top level, or —
+            when *require_all_strings* is ``True`` — if any top-level value is
+            not a string.
     """
     try:
         data = _tomllib.loads(content)
@@ -63,12 +78,13 @@ def parse_vault_content(content: str, path: str) -> dict:
     if not isinstance(data, dict):
         # Defensive: TOML always produces a table at the top level.
         raise ConfigError(f"Vault file at {path!r} is not a TOML table.")
-    for key, value in data.items():
-        if not isinstance(value, str):
-            raise ConfigError(
-                f"Vault file at {path!r}: value for key '{key}' must be a string, "
-                f"got {type(value).__name__}. All vault values must be strings."
-            )
+    if require_all_strings:
+        for key, value in data.items():
+            if not isinstance(value, str):
+                raise ConfigError(
+                    f"Vault file at {path!r}: value for key '{key}' must be a string, "
+                    f"got {type(value).__name__}. All vault values must be strings."
+                )
     return data
 
 

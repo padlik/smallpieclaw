@@ -2337,10 +2337,12 @@ class BuiltinExecutor:
     def _run_secret_get(self, args: dict, caller_tag: str = "") -> dict:
         """Read a confirmed key from the TOML vault file.
 
-        Delegates format parsing to :func:`config_schema.parse_vault_content`,
-        which expects a TOML file where every top-level key maps to a string
-        secret (e.g. ``api_key = "sk-..."``).  All vault values must be
-        strings; non-string values are rejected before the key is looked up.
+        Delegates format parsing to :func:`config_schema.parse_vault_content`
+        with ``require_all_strings=False`` so a non-string SIBLING key (e.g. an
+        idiomatic ``[jira]`` table) no longer breaks unrelated lookups — only
+        the requested key must be a string.  The returned value is always a
+        string: if the requested key itself resolves to a non-string type, a
+        ``config_error`` result is returned instead of the raw value.
         """
         # Local imports to avoid circular-import risk at module load time.
         from config_schema import parse_vault_content as _parse_vault_content  # noqa: PLC0415
@@ -2365,7 +2367,9 @@ class BuiltinExecutor:
             }
 
         try:
-            vault = _parse_vault_content(content, self._vault_path)
+            vault = _parse_vault_content(
+                content, self._vault_path, require_all_strings=False
+            )
         except _ConfigError as exc:
             # Normalise ConfigError messages to begin with "Cannot read vault:"
             # so the tool API surface stays stable.
@@ -2394,7 +2398,26 @@ class BuiltinExecutor:
                 "suggestion": "Add the key to the vault file.",
             }
 
-        # value is guaranteed to be a string by parse_vault_content's validation.
+        # Per-key type check: siblings may be non-string (require_all_strings=False),
+        # but the value we hand back must be a string secret.
+        if not isinstance(value, str):
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"Vault key '{key}' is not a string secret "
+                    f"(got {type(value).__name__})."
+                ),
+                "exit_code": -1,
+                "error_type": "config_error",
+                "recoverable": False,
+                "suggestion": (
+                    "Store the secret as a top-level string key "
+                    '(e.g. api_key = "sk-...") in the vault file.'
+                ),
+            }
+
+        # value is guaranteed to be a string by the per-key check above.
         return {
             "success": True,
             "output": value,

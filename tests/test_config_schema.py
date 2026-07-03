@@ -417,6 +417,37 @@ class TestVaultLoading:
         with pytest.raises(ConfigError, match="my_int"):
             parse_vault_content("my_int = 42\n", "/fake/path")
 
+    def test_parse_vault_content_lenient_allows_non_string(self):
+        """require_all_strings=False returns the table including non-string values."""
+        data = parse_vault_content(
+            "my_int = 42\n", "/fake/path", require_all_strings=False
+        )
+        assert data == {"my_int": 42}
+
+    def test_parse_vault_content_lenient_allows_sibling_table(self):
+        """require_all_strings=False keeps a string key alongside a table sibling."""
+        data = parse_vault_content(
+            'api_key = "sk"\n[jira]\ntoken = "t"\n',
+            "/fake/path",
+            require_all_strings=False,
+        )
+        assert data["api_key"] == "sk"
+        assert data["jira"] == {"token": "t"}
+
+    def test_parse_vault_content_strict_still_raises_naming_key(self):
+        """require_all_strings=True (explicit) still raises ConfigError naming the key."""
+        with pytest.raises(ConfigError, match="my_int"):
+            parse_vault_content(
+                "my_int = 42\n", "/fake/path", require_all_strings=True
+            )
+
+    def test_parse_vault_content_lenient_still_checks_toml_format(self):
+        """Format checks (TOML parse) apply even when require_all_strings=False."""
+        with pytest.raises(ConfigError, match="Invalid TOML"):
+            parse_vault_content(
+                "= orphan\n", "/fake/path", require_all_strings=False
+            )
+
 
 
 # ---------------------------------------------------------------------------

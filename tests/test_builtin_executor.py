@@ -973,15 +973,85 @@ class TestSecretGet:
         assert "Cannot read vault" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_nested_table_rejected(self, tmp_path):
-        """A TOML nested table produces a dict value which is rejected."""
+    def test_secret_get_nested_key_not_found(self, tmp_path):
+        """A sibling TOML table no longer poisons the whole vault parse.
+
+        With ``[credentials]`` present, ``api_key`` lives *inside* that table,
+        so it is not a top-level key: the lookup is a clean "not found" rather
+        than a whole-file rejection (the old strict-parse footgun).
+        """
         vault = tmp_path / "secrets.toml"
-        vault.write_text("[credentials]\napi_key = \"secret\"\n", encoding="utf-8")
+        vault.write_text('[credentials]\napi_key = "secret"\n', encoding="utf-8")
         ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
-        assert "credentials" in result["error"]  # error names the offending top-level key
+        assert "not found" in result["error"]
+        assert "api_key" in result["error"]
+        assert result["error_type"] == "not_found"
+        assert result["exit_code"] == -1
+
+    def test_secret_get_string_key_with_sibling_table_succeeds(self, tmp_path):
+        """Regression: a non-string SIBLING key must not break a string lookup.
+
+        A vault that mixes a top-level string secret with an idiomatic
+        ``[jira]`` table used to fail whole-file validation, so an unrelated
+        ``secret_get("api_key")`` errored.  It must now succeed.
+        """
+        vault = tmp_path / "secrets.toml"
+        vault.write_text(
+            'api_key = "sk-abc"\n\n[jira]\ntoken = "jira-tok"\n',
+            encoding="utf-8",
+        )
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "api_key"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is True
+        assert result["output"] == "sk-abc"
+        assert result["error"] == ""
+        assert result["exit_code"] == 0
+
+    def test_secret_get_sibling_table_value_not_string(self, tmp_path):
+        """Requesting a key whose value is a table returns a config error.
+
+        Only the *requested* key's type matters; a table-valued key cannot be
+        returned as a string secret.
+        """
+        vault = tmp_path / "secrets.toml"
+        vault.write_text(
+            'api_key = "sk-abc"\n\n[jira]\ntoken = "jira-tok"\n',
+            encoding="utf-8",
+        )
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "jira"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "not a string secret" in result["error"]
+        assert "jira" in result["error"]
+        assert result["error_type"] == "config_error"
+        assert result["recoverable"] is False
+        assert result["exit_code"] == -1
+
+    def test_secret_get_requested_scalar_value_not_string(self, tmp_path):
+        """Requesting a key whose value is a non-string scalar returns a config error.
+
+        Only the *requested* key's type matters; an int-valued key cannot be
+        returned as a string secret, even when a valid string sibling exists.
+        """
+        vault = tmp_path / "secrets.toml"
+        vault.write_text(
+            'api_key = "sk-abc"\nport = 8080\n',
+            encoding="utf-8",
+        )
+        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        staged = ex.execute("secret_get", {"key": "port"})
+        result = ex.confirm(staged["token"])
+        assert result["success"] is False
+        assert "not a string secret" in result["error"]
+        assert "port" in result["error"]
+        assert "got int" in result["error"]
+        assert result["error_type"] == "config_error"
+        assert result["recoverable"] is False
         assert result["exit_code"] == -1
 
     def test_secret_get_requires_key(self, tmp_path):
