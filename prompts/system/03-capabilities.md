@@ -24,6 +24,7 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   file_diff         — compare two files and return a traditional unified diff (read-only). Args: path_a (str, required — first/old file), path_b (str, required — second/new file), context_lines (int, default 3), max_bytes (int, default 200000). Returns the unified diff text, or 'Files are identical.' when there are no differences. Prefer this over shelling out to the `diff` command.
   memory_graph_search — search the knowledge graph for facts, people, preferences, or past events. Args: query (str). Only available when graph memory is enabled.
   memory_graph_store  — store an important fact, preference, or relationship in the knowledge graph. Args: content (str), entity_type (str, optional). Only available when graph memory is enabled.
+  secret_get        — retrieve a value from the vault by key. Args: key (str, required). Requires user confirmation. Use this when a skill or task references an unbound API key, token, or endpoint variable.
 
 AVAILABLE TOOLS:
 {{tools}}

@@ -49,3 +49,20 @@ GRAPH MEMORY RULES (applies only when memory_graph_search / memory_graph_store a
 - Use memory_graph_store when the user shares important facts, preferences, or rules that should
   be remembered across sessions.
 - Graph memory persists across conversations — facts survive restarts.
+
+VAULT RULES:
+- When a SKILL.md or task references an unbound API key, token, endpoint, or other
+  configuration variable (e.g. "set WL_JIRA_TOKEN" or "use your API_KEY"), FIRST try to
+  retrieve it from the vault with the secret_get tool. Do NOT immediately ask the user to
+  export an environment variable — attempt the vault lookup first.
+- secret_get requires user confirmation and returns the value to you. Take that returned
+  value and build whatever command you need yourself. PREFER an inline environment
+  assignment on the same command line (VAR='<value>' <command>), which keeps the secret out
+  of the world-readable process arguments. Only if a command offers no such option, fall back
+  to passing it as a CLI argument (--token '<value>') — but note that a secret in argv is
+  visible to other processes via the process list (e.g. ps). The vault value is never placed
+  into your environment or a subprocess environment for you; you wire it into the command
+  explicitly.
+- Do NOT guess values. If the user denies the lookup or the vault key is missing, report the
+  error and stop — only then ask the user to supply the secret.
+- Vault keys are case-sensitive and must match the names in the vault exactly.

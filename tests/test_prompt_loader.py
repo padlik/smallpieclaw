@@ -7,6 +7,8 @@ legacy fallback path.
 
 from __future__ import annotations
 
+import os
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -543,3 +545,194 @@ class TestRequiredSectionNames:
                 mode="planner",
             )
         assert "Required." in prompt
+
+
+# ---------------------------------------------------------------------------
+# Advertised built-in tools / RULES blocks in the RUNTIME prompt
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS:
+# The prompt the model actually sees is rendered at runtime by
+# build_system_prompt() from the markdown templates in prompts/system/*.md and
+# prompts/sub-agent/*.md — NOT from prompt_builder.py:SYSTEM_PROMPT_TEMPLATE,
+# which is a legacy fallback used only when the prompts/ directory is missing.
+# A previous change added the vault `secret_get` tool + VAULT RULES to the dead
+# template only, so the feature shipped inert: it never reached the rendered
+# runtime prompt. These tests render the REAL runtime prompt for BOTH variants
+# and assert that every advertised built-in tool and every RULES block survives
+# rendering, guarding against advertised capabilities being silently absent from
+# the live prompt.
+#
+# The rosters below are the single source of truth: when a tool or RULES block
+# is added to (or removed from) the prompt markdown, update the matching list in
+# one line.
+
+# prompts/system/03-capabilities.md — BUILT-IN TOOLS block (mode="default").
+SYSTEM_BUILTIN_TOOLS = [
+    "shell",
+    "file_read",
+    "file_write",
+    "schedule",
+    "spawn_agent",
+    "get_agent_result",
+    "memory_write",
+    "vision_query",
+    "file_patch",
+    "file_diff",
+    "memory_graph_search",
+    "memory_graph_store",
+    "secret_get",
+]
+
+# prompts/system/04-execution.md — RULES headings (mode="default").
+SYSTEM_RULES_HEADINGS = [
+    "GRAPH MEMORY RULES",
+    "VAULT RULES",
+]
+
+# prompts/sub-agent/03-tools.md — built-in tools block (mode="sub-agent").
+SUB_AGENT_BUILTIN_TOOLS = [
+    "shell",
+    "file_read",
+    "file_write",
+    "file_patch",
+    "file_diff",
+    "vision_query",
+    "secret_get",
+]
+
+# prompts/sub-agent/03-tools.md — RULES headings (mode="sub-agent").
+SUB_AGENT_RULES_HEADINGS = [
+    "VAULT RULES",
+]
+
+# The real prompt templates rendered by the daemon live in <repo>/prompts.
+_RUNTIME_PROMPTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "prompts"
+)
+
+
+def _render_runtime_prompt(mode: str) -> str:
+    """Render the actual runtime system prompt for *mode* and return the text.
+
+    Points ``build_system_prompt`` at the real ``prompts/`` directory so the
+    assertions run against the SAME templates the daemon renders — not the temp
+    fixtures used elsewhere in this module and not the legacy
+    ``SYSTEM_PROMPT_TEMPLATE`` fallback. Dynamic sections (semantic tool search,
+    skills, models, log) are stubbed exactly as the other prompt tests stub them
+    (see ``tests/test_context_payload.py``); the advertised built-in tool roster
+    and RULES blocks are literal template text and are unaffected by the stubbed
+    ``{{tools}}`` semantic-search block.
+    """
+    tool_index = MagicMock()
+    tool_index.search.return_value = []
+    memory = MagicMock()
+    memory.as_prompt_text.return_value = "No memory."
+    llm = MagicMock()
+    llm._models = []
+    llm.llm_cfg = {}
+
+    with patch("prompt_builder.format_tools", return_value="No tools."), \
+         patch("prompt_builder.format_skills", return_value=""), \
+         patch("prompt_builder.format_models", return_value=""), \
+         patch("prompt_builder.format_log_section", return_value="Log section."), \
+         patch("prompt_loader.estimate_tokens", return_value=0):
+        prompt, _ = build_system_prompt(
+            tool_index=tool_index,
+            memory=memory,
+            results=None,
+            skill_registry=None,
+            llm=llm,
+            tmp_dir="/tmp/agent",
+            downloads_dir="downloads",
+            log_file="agent.log",
+            log_backup_count=30,
+            top_tools=3,
+            user_goal="context snapshot",
+            prompts_dir=_RUNTIME_PROMPTS_DIR,
+            mode=mode,
+        )
+    return prompt
+
+
+# Built-in tools render as list entries ``  <name><spaces>— <desc>`` (the
+# separator is an EM DASH, U+2014). Asserting on the ENTRY line — first token
+# followed by that em dash — rather than a bare substring stops an incidental
+# occurrence (e.g. "shell" inside "reverse shells", or a stray "schedule")
+# from satisfying the check after the real tool bullet has been deleted.
+_TOOL_ENTRY_RE = re.compile(r"^(\S+)\s+\u2014")
+
+
+def _tool_entry_names(prompt: str) -> set[str]:
+    """Return the set of built-in tool names rendered as bullet entries.
+
+    Scans each line of *prompt* and, for lines whose stripped form looks like a
+    tool entry (``<name>  — <description>``), collects the leading ``<name>``
+    token. Roster assertions check membership in this set, so they fail if a
+    tool's dedicated entry line is removed from the template — unlike a bare
+    substring match, which incidental prose (e.g. "reverse shells") could
+    satisfy.
+    """
+    names: set[str] = set()
+    for line in prompt.splitlines():
+        match = _TOOL_ENTRY_RE.match(line.strip())
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+class TestRuntimePromptAdvertisedContent:
+    """Advertised built-in tools and RULES blocks must survive into the
+    rendered runtime prompt (guards against the ``secret_get``/VAULT regression
+    where content was added to the dead template only).
+    """
+
+    def test_system_prompt_advertises_all_builtin_tools_and_rules(self):
+        """Default prompt renders every system built-in tool and both RULES blocks."""
+        prompt = _render_runtime_prompt("default")
+        tool_entries = _tool_entry_names(prompt)
+
+        for tool in SYSTEM_BUILTIN_TOOLS:
+            assert tool in tool_entries, (
+                f"Built-in tool {tool!r} advertised in "
+                f"prompts/system/03-capabilities.md is absent from the rendered "
+                f"default system prompt (no dedicated tool-entry line for it)."
+            )
+        for heading in SYSTEM_RULES_HEADINGS:
+            assert heading in prompt, (
+                f"{heading!r} block is absent from the rendered default system "
+                f"prompt (expected from prompts/system/04-execution.md)."
+            )
+
+    def test_sub_agent_prompt_advertises_all_builtin_tools_and_rules(self):
+        """Sub-agent prompt renders every sub-agent built-in tool and VAULT RULES."""
+        prompt = _render_runtime_prompt("sub-agent")
+        tool_entries = _tool_entry_names(prompt)
+
+        for tool in SUB_AGENT_BUILTIN_TOOLS:
+            assert tool in tool_entries, (
+                f"Built-in tool {tool!r} advertised in "
+                f"prompts/sub-agent/03-tools.md is absent from the rendered "
+                f"sub-agent prompt (no dedicated tool-entry line for it)."
+            )
+        for heading in SUB_AGENT_RULES_HEADINGS:
+            assert heading in prompt, (
+                f"{heading!r} block is absent from the rendered sub-agent prompt "
+                f"(expected from prompts/sub-agent/03-tools.md)."
+            )
+
+    def test_secret_get_present_in_both_variants(self):
+        """``secret_get`` reaches BOTH rendered variants (the exact shipped bug).
+
+        The vault tool was added only to the dead ``SYSTEM_PROMPT_TEMPLATE``, so
+        it never appeared in the runtime prompt. Guard both variants explicitly.
+        """
+        default_prompt = _render_runtime_prompt("default")
+        sub_agent_prompt = _render_runtime_prompt("sub-agent")
+
+        assert "secret_get" in default_prompt, (
+            "`secret_get` missing from rendered default system prompt."
+        )
+        assert "secret_get" in sub_agent_prompt, (
+            "`secret_get` missing from rendered sub-agent prompt."
+        )
