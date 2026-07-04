@@ -1,27 +1,27 @@
 ## Context
 
-Today all logging is configured in `main.py._setup_logging()`. A single prose formatter (`%(asctime)s [%(levelname)s] %(name)s: %(message)s`) feeds a stdout `StreamHandler` and a custom `_NightlyRotatingFileHandler` writing `agent.log` **inside the source checkout** (`_DEFAULT_LOG = _AGENT_DIR/agent.log`). Run identity (`trace` id like `r-9f3c`, agent `label` like `sa-1a2b`) is not a structured field: it is formatted into a `log_prefix` **string** in `react_loop.py` (`log_prefix` property) and threaded explicitly through call arguments (`context_manager`, `memory_store` all accept a `log_prefix` param). `llm_client.py` is the one exception — it already keeps its trace in a `contextvars.ContextVar` and weaves it into a caller tag.
+Today all logging is configured in `main.py._setup_logging()`. A single prose formatter (`%(asctime)s [%(levelname)s] %(name)s: %(message)s`) feeds a stdout `StreamHandler` and a custom `_NightlyRotatingFileHandler` writing `agent.log` **inside the source checkout** (`_DEFAULT_LOG = _AGENT_DIR/agent.log`). Run identity (`trace` id like `r-9f3c`, agent `label` like `sa-1a2b`) is not a structured field: it is formatted into a `log_prefix` **string** in `react_loop.py` and threaded explicitly through call arguments (`context_manager`, `memory_store` accept a `log_prefix` param). `llm_client.py` already keeps its trace in a `contextvars.ContextVar`.
 
-The agent cannot analyze its own executions except by re-reading prose through an LLM (the `scheduler.toml.example` self-health task literally reads the last 500 lines). There is no fact-level, queryable, per-step operational record.
+The agent cannot analyze its own executions except by re-reading prose through an LLM. There is no fact-level, queryable, per-step operational record. Every module already binds a stdlib logger via `logging.getLogger(__name__)`, so any solution must interoperate with stdlib logging rather than force a rewrite of ~20 call sites.
 
-**In-force ADRs** (supersession graph `0001 → 0002 → 0003`): only **ADR-0003 (TOML agent-scoped vault)** is live. It establishes an agent-scoped vault at `~/.local/share/<agent_name>/` resolved independently of `agent_home`. This design is coherent with it in two ways: (1) the new XDG log path mirrors that rule using the correct XDG *state* dir (`~/.local/state/<agent_name>/logs/`), and (2) secret redaction sources its known values from that vault. No in-force ADR needs revisiting.
+**In-force ADRs** (supersession graph `0001 → 0002 → 0003`): only **ADR-0003 (TOML agent-scoped vault)** is live. It establishes an agent-scoped vault at `~/.local/share/<agent_name>/` resolved independently of `agent_home`. This design is coherent with it: the XDG log path mirrors that rule using the XDG *state* dir (`~/.local/state/<agent_name>/logs/`), and the redaction processor sources its known values from that vault. No in-force ADR needs revisiting.
 
-**Constraint** (`trace_context.py`): trace identity is threaded explicitly and "no process-global mutable trace state is used for **correctness-critical** behavior." This design honors that — the new ambient identity lives in a logging-only `contextvars` filter, which is observability, not correctness.
+**Constraint** (`trace_context.py`): trace identity is threaded explicitly and "no process-global mutable trace state is used for **correctness-critical** behavior." This design honors that — `structlog.contextvars` carries identity for *logging only* (observability); correctness-critical trace propagation stays explicit and unchanged.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Give the agent a structured, queryable, fact-level record of its own executions (`agent.jsonl`), primary over prose.
+- Give the agent a structured, queryable, fact-level record of its own executions (`agent.jsonl`), primary over prose, using `structlog` rather than bespoke stdlib filters/formatters.
 - Let the agent query the active structured log mid-run, scoped to the current run, cheaply and in-process.
 - Move logs out of the checkout to an XDG state dir; fix rotation (date-suffixed + gzip).
-- Preserve the human prose stream (`tail -f`, `grep '[sa-xxx]'`) as a retained, secondary surface with zero format drift from the structured surface.
-- Keep the change incremental: identity + rotation land independently; structured events enrich a small hot set of call sites.
+- Preserve the human prose stream (`tail -f`, `grep '[sa-xxx]'`) with zero drift from the structured surface.
+- Interoperate with existing stdlib `logging.getLogger(__name__)` call sites; migrate only the hot set to structured key-values.
 
 **Non-Goals:**
-- No SQLite / queryable database. In-process filtering over the active JSONL is sufficient for "recent events in this run."
-- No retrofit of every `logger` call site to structured events — only the hot set.
+- No SQLite / queryable database. In-process filtering over the active JSONL is sufficient.
+- No retrofit of every `logger` call site to native `structlog` loggers — foreign stdlib records flow through unchanged.
 - No mid-run querying of rotated `.gz` history. Cross-run learning stays with `ResultsMemory` / `StrategyMemory` (logs = facts, memory = meaning; one-way flow).
-- No new external dependency.
+- No custom log framework — that is exactly what adopting `structlog` avoids.
 
 ## Decisions
 
@@ -32,7 +32,7 @@ The agent cannot analyze its own executions except by re-reading prose through a
                     │              Agent process                │
                     │   (ReAct loop, tools, LLM client, sched)  │
                     └───────────────────┬───────────────────────┘
-                                        │ emits log records
+                                        │ emits log events
                      ┌──────────────────┴───────────────────┐
                      ▼                                       ▼
           ┌────────────────────┐                 ┌────────────────────────┐
@@ -42,73 +42,78 @@ The agent cannot analyze its own executions except by re-reading prose through a
           └────────────────────┘                 └────────────────────────┘
 ```
 
-### C4 Container/Component — the logging pipeline
+### C4 Container/Component — the structlog pipeline
 
 ```
-   logger.info(msg, extra={event, tool, dur_ms, exit, err})
-        │
-        ▼
+   structlog call:  log.info("tool failed", event_type="TOOL_FAILED",
+                              tool="shell", exit=1, dur_ms=812)
+   stdlib call:     logging.getLogger(__name__).info("Compacted context ...")
+        │                              │
+        │ (native structlog)           │ (foreign stdlib record)
+        ▼                              ▼
    ┌──────────────────────────────────────────────────────────────┐
-   │  RootLogger                                                    │
-   │   ├─ TraceIdentityFilter  (NEW)                                │
-   │   │    reads contextvars → sets record.trace / .agent / .label │
-   │   └─ SecretRedactionFilter (NEW)                               │
-   │        scrubs known vault values from record.msg + extra       │
+   │  Shared processor chain                                        │
+   │   merge_contextvars   ← trace/agent/label from structlog.ctxvars│
+   │   add_log_level, TimeStamper(iso)                              │
+   │   redact_secrets (NEW) ← scrub known vault values              │
+   │   ProcessorFormatter.wrap_for_formatter                        │
+   │   (foreign stdlib records enter via foreign_pre_chain)         │
    └───────┬───────────────────────────────────┬──────────────────┘
            ▼                                    ▼
-   ┌───────────────────┐              ┌────────────────────────────┐
-   │ ProseHandler       │              │ JsonlHandler                │
-   │  StreamHandler +   │              │  GzipRotatingFileHandler    │
-   │  file (agent.log)  │              │  → agent.jsonl              │
-   │  renders "[label   │              │  JsonFormatter reads        │
-   │  trace] msg" from  │              │  record attrs → one JSON    │
-   │  record attrs      │              │  object per line            │
-   └───────────────────┘              └──────────────┬─────────────┘
-                                                      ▲
-                                    log_query tool ───┘ (in-process read of
-                                    filters active agent.jsonl by trace/level/event
+   ┌───────────────────────────┐      ┌────────────────────────────┐
+   │ ProcessorFormatter         │      │ ProcessorFormatter          │
+   │  processor=plain renderer  │      │  processor=JSONRenderer     │
+   │  → "[label trace] message" │      │                             │
+   │  → GzipRotatingFileHandler │      │  → GzipRotatingFileHandler  │
+   │    + StreamHandler         │      │    → agent.jsonl            │
+   │    → agent.log (prose)     │      └──────────────┬─────────────┘
+   └───────────────────────────┘                     ▲
+                                      log_query tool ─┘ in-process read of
+                                      active agent.jsonl, filter by trace/level/event
 ```
 
-**D1 — Lift identity into `LogRecord` via a `contextvars` filter (not prose-parsing).**
-A `TraceIdentityFilter` reads context-local `trace`/`agent`/`label` and sets them as record attributes. Both formatters render from those attributes: prose reconstructs `[label trace] msg`; JSON emits fields. *Alternatives:* (a) regex identity back out of the prose message — rejected as fragile/lossy, every call site formats differently; (b) pass a struct to every call — rejected, that's the status quo `log_prefix` threading we want to shed. The `contextvars` approach generalizes an in-tree, proven pattern (`llm_client.py`). Explicit `log_prefix` args at touched sites are retired; correctness-critical trace threading is untouched.
+**D1 — Adopt `structlog`, integrated through stdlib `ProcessorFormatter`.**
+Configure `structlog` with `wrapper_class=structlog.stdlib.BoundLogger` and route rendering through `structlog.stdlib.ProcessorFormatter` set on stdlib handlers. Existing `logging.getLogger(__name__)` calls become "foreign" records processed via `foreign_pre_chain`; hot-set sites use `structlog.get_logger()` with structured kwargs. *Alternatives:* (a) hand-rolled stdlib `logging.Filter` + custom `JsonFormatter` (the prior design) — rejected: reinvents structlog's processor chain, contextvars merge, and JSON rendering; (b) `structlog` with its own non-stdlib output — rejected: would bypass existing stdlib loggers and force a full call-site rewrite. `ProcessorFormatter` is the documented bridge that lets both coexist.
 
-**D2 — Dual sink, structured-primary.**
-Two handlers off one logger. `agent.jsonl` is the optimized surface; `agent.log` is retained prose. One log call, one filtered record, two renders → no drift. *Alternative:* JSONL-only with a rendered `piclaw logs` viewer (Variant C) — rejected because the user wants `tail -f` to keep working with no new tooling.
+**D2 — Dual sink, structured-primary, one processor chain.**
+Two stdlib handlers, each with a `ProcessorFormatter` differing only in final renderer: `JSONRenderer` → `agent.jsonl` (primary), a plain key-value renderer that reproduces the current `[label trace] message` shape → `agent.log` + stdout (secondary). The shared pre-render chain guarantees identical content; only serialization differs, so no drift. *Alternative:* JSONL-only with a rendered viewer (Variant C) — rejected; `tail -f` must keep working with no new tooling.
 
-**D3 — Closed `LogEvent` enum for the taxonomy.**
-A small `enum` (`TOOL_START`, `TOOL_END`, `TOOL_FAILED`, `LLM_CALL`, `LLM_FAILED`, `STEP_BEGIN`, `STEP_END`, `RUN_BEGIN`, `RUN_END`, `ERROR`) in one module. *Alternative:* ad-hoc `extra={"event": "..."}` strings — rejected: drift (`tool_fail`/`tool_failed`) defeats machine querying, and the agent cannot enumerate valid events to query against. The enum is the discoverable contract.
+**D3 — Closed `LogEvent` enum, emitted as `event_type`.**
+A small `enum` (`TOOL_START/END/FAILED`, `LLM_CALL/FAILED`, `STEP_BEGIN/END`, `RUN_BEGIN/END`, `ERROR`) passed as the `event_type` key (structlog reserves `event` for the message). *Alternative:* ad-hoc `event_type` strings — rejected: drift defeats machine querying and the agent cannot enumerate valid values. The enum is the discoverable contract.
 
-**D4 — `log_query` as a built-in tool, in-process, active-file-only.**
-Registered alongside `shell`/`file_read` in `builtin_executor`. Reads only the active `agent.jsonl`, filters in Python by `trace` (defaulting to the current run), `level`, `event`, `tool`, `since`, with a result cap. *Alternatives:* shell out to `grep`/`jq` — rejected (adds process spawn latency mid-loop, external dep on `jq`); SQLite — deferred (Non-Goal). Active-file-only keeps reads bounded by daily rotation.
+**D4 — Identity via `structlog.contextvars`.**
+`bind_contextvars(trace=…, agent=…, label=…)` at run entry (`react_loop` start), sub-agent runner start, and scheduler job start; `merge_contextvars` injects them into every event; `clear_contextvars`/token reset on exit. Reconcile `llm_client.py`'s existing `ContextVar` by having it bind through `structlog.contextvars` (single source). *Alternative:* keep threading `log_prefix` strings — rejected; that is the status quo we are shedding.
 
-**D5 — Rotation: date-suffixed + gzip, 30-day.**
-Replace `_NightlyRotatingFileHandler`'s numbered shift with date-suffixed backups compressed to `.gz`, retention 30. Applies to both sinks. *Alternative:* keep numbered shift — rejected (the "primitive rotation" complaint; no compression).
+**D5 — `log_query` built-in tool, in-process, active-file-only.**
+Registered in `builtin_executor`. Reads only the active `agent.jsonl` (JSON-per-line from `JSONRenderer`), filters in Python by `trace` (default = current run), `level`, `event_type`, `tool`, `since`, with a result cap. The default filter (when no level is given) returns anomalies (`WARNING`+) **plus** `TOOL_START/END` and `LLM_CALL` regardless of level, while excluding high-volume `STEP_BEGIN/END` boundary chatter — so repeated-action patterns are visible without drowning the result cap in step noise. *Alternatives:* shell out to `jq` — rejected (process spawn latency, external dep); SQLite — deferred.
 
-**D6 — Secret redaction filter.**
-A `SecretRedactionFilter` scrubs known vault values (sourced from the ADR-0003 vault) from `record.msg` and structured `extra` before either handler serializes. Structured fields (`err`, `tool` args) invite dumping stderr/args that may contain secrets, so redaction runs at the filter layer, covering both sinks uniformly.
+**D6 — Secret redaction as a `structlog` processor.**
+A `redact_secrets` processor early in the chain scrubs known vault values (from the ADR-0003 vault) from the event dict — message and all key-values — before either renderer runs, covering both sinks uniformly.
 
-**D7 — XDG state path resolution.**
-Log directory resolves to `~/.local/state/<agent_name>/logs/` independently of `agent_home`, mirroring the vault rule. `[paths] log_file` semantics shift from a checkout-relative filename to a name within the resolved XDG dir; an explicit absolute `log_file` still overrides.
+**D7 — Rotation + XDG path via stdlib handlers.**
+`structlog` renders into stdlib rotating handlers; use date-suffixed + gzip daily backups (retention 30) for both sinks. Log directory resolves to `~/.local/state/<agent_name>/logs/` independent of `agent_home`; an explicit absolute `log_file` overrides.
 
 ## Risks / Trade-offs
 
-- **JSONL volume > prose** -> active-file-only queries + daily rotation + gzip backups bound size; only the hot set emits verbose structured fields.
-- **`contextvars` not propagated to a new thread/executor** (identity lost on sub-agent/background threads) -> set the context vars at thread entry points (sub-agent runner, scheduler job start) exactly where `trace_id` is already forwarded.
-- **Redaction misses a secret shape** -> source values from the vault (exact-match scrub) and default to redacting known keys; treat redaction as defense-in-depth, not a guarantee, and keep secrets out of `extra` by convention at emit sites.
-- **`log_query` returns too much mid-loop, blowing context budget** -> mandatory result cap + default `level>=WARNING` + trace-scoped default; summarize counts when over cap.
-- **Migration breaks tests/tooling asserting `agent.log` in the checkout** -> update tests; document the path move as BREAKING in proposal and README.
-- **Two sinks diverge** -> mitigated structurally by D1/D2: both render from the same filtered record; no second code path builds identity.
+- **New dependency (`structlog`)** -> it is mature, widely used, pure-Python, dependency-light, and stdlib-compatible; pin a minimum version in `requirements.txt`.
+- **`contextvars` not propagated to a new thread/executor** (identity lost on sub-agent/background threads) -> bind at each thread entry point exactly where `trace_id` is already forwarded; cover with a sub-agent test.
+- **Double-configuration of stdlib + structlog** (foreign records mis-rendered or duplicated) -> single `configure()` in one logging module; `foreign_pre_chain` handles third-party (`httpx`, `telegram`) records; assert no duplicate handlers in a test.
+- **JSONL volume > prose** -> active-file-only queries + daily rotation + gzip; verbose key-values only at the hot set.
+- **`log_query` floods context mid-loop** -> mandatory result cap + trace-scoped default + a default filter of anomalies plus tool/LLM lifecycle minus step-boundary chatter (Option C); summarize counts when over cap.
+- **Migration breaks tests asserting `agent.log` in the checkout** -> update tests; document the path move as BREAKING.
+- **`llm_client` trace divergence** -> route its existing `ContextVar` through `structlog.contextvars` so there is one identity source.
 
 ## Migration Plan
 
-1. Land D1 (identity filter) + D5/D7 (rotation + XDG path) first — these stand alone, fix the stated annoyance, and change no call sites' semantics beyond retiring `log_prefix` at touched sites.
-2. Add D2/D3/D6 (JSONL sink, `LogEvent` enum, redaction) — additive; prose behavior unchanged.
-3. Emit structured `extra={}` at the hot set (tool, LLM, step/run, error paths).
-4. Add D4 (`log_query`) and switch the `scheduler.toml.example` self-health task to structured querying.
-5. **Rollback:** each step is independent; reverting D2–D4 leaves the relocated prose log fully functional. No data migration — historical `agent.log(.N)` files are left in place at the old path.
+1. Add `structlog` to `requirements.txt`; create the logging config module (processor chain, renderers, `LogEvent` enum, redaction processor) and swap `main.py._setup_logging` to `structlog.configure` + stdlib handlers. Land XDG path + gzip rotation here (D1/D2/D6/D7). Existing stdlib call sites keep working via `foreign_pre_chain`.
+2. Bind identity via `structlog.contextvars` at run/thread entry; retire `log_prefix` threading at touched sites; reconcile `llm_client` (D4).
+3. Emit `LogEvent` structured key-values at the hot set — tool, LLM, step/run, error paths (D3).
+4. Add `log_query` (D5) and switch the `scheduler.toml.example` self-health task to structured querying.
+5. **Rollback:** steps are independent; reverting D3–D5 leaves the relocated dual-sink logs working. Removing `structlog` entirely means reverting step 1. No data migration — historical `agent.log(.N)` files are left at the old path.
 
 ## Open Questions
 
-- **`level>=WARNING` default for `log_query`** — is warning-and-above the right default filter for self-correction, or should the agent see `INFO` step boundaries by default? (Refined in the `runtime-log-introspection` spec.)
-- **Redaction scope** — scrub only exact vault values, or also apply pattern heuristics (e.g., bearer-token shapes)? Starting exact-match; heuristics deferred.
-- No in-force ADR requires supersession. The XDG-state-path decision (D7) is durable and cross-cutting enough that the `adr` step should record it as a new ADR alongside the vault path rule.
+- **`log_query` default filter** — RESOLVED (Option C): the no-level default returns anomalies (`WARNING`+) plus `TOOL_START/END` and `LLM_CALL` regardless of level, excluding `STEP_BEGIN/END` boundary chatter — surfacing repeated-action patterns without step noise. Captured in the `runtime-log-introspection` spec.
+- **Prose renderer choice** — RESOLVED: use a plain key-value renderer that reproduces the current `[label trace] message` shape, preserving existing `grep`/`tail -f` habits, rather than `structlog.dev.ConsoleRenderer`.
+- **Redaction scope** — RESOLVED (Option A): exact vault-value match only, paired with an emit-site convention to keep secrets out of `extra`. Deterministic, no false positives, no corruption of legitimate structured fields. A narrow high-confidence heuristic set (Option B) is a possible data-driven fast-follow once real tool-output leakage is observed; broad entropy heuristics are rejected.
+- No in-force ADR requires supersession. Adopting `structlog` as the logging backbone is durable and cross-cutting; the `adr` step records it as a new ADR.

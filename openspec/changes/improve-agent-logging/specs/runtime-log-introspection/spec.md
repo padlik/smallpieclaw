@@ -14,8 +14,14 @@ Rule: Queries read the active `agent.jsonl` only and default to the current run'
 
 #### Scenario: Filter by level and event
 - **GIVEN** the active log contains mixed-level records for the current run
-- **WHEN** the agent invokes `log_query` with a minimum level of `WARNING` and `event = "TOOL_FAILED"`
+- **WHEN** the agent invokes `log_query` with a minimum level of `WARNING` and event type `TOOL_FAILED`
 - **THEN** only `TOOL_FAILED` records at `WARNING` or above are returned
+
+#### Scenario: Default filter surfaces anomalies and tool/LLM lifecycle without step noise
+- **GIVEN** the current run has emitted `STEP_BEGIN`/`STEP_END`, `TOOL_START`/`TOOL_END`, `LLM_CALL`, and a `TOOL_FAILED` record
+- **WHEN** the agent invokes `log_query` without specifying a level
+- **THEN** the `TOOL_FAILED` record and the `TOOL_START`/`TOOL_END` and `LLM_CALL` records are returned
+- **AND** the `STEP_BEGIN`/`STEP_END` boundary records are excluded
 
 #### Scenario: Results are capped to protect context budget
 - **GIVEN** a run that has emitted more matching records than the result cap
