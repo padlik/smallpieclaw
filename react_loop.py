@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+import agent_logging
 from confirmation import ConfirmationManager
 from context_manager import maybe_compact
 from llm_client import LLMClient, LLMCancelledError, _encode_images
@@ -28,6 +29,7 @@ from memory_store import _summarize_result, extract_tools_used, save_task_outcom
 from prompt_loader import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
+slog = agent_logging.get_logger(__name__)
 
 _TOOL_ICONS: dict[str, str] = {
     "shell":            "🖥️",
@@ -408,424 +410,443 @@ def react_loop(
     Returns the final answer string.
     """
     run_start = time.time()
-    pfx = ctx.log_prefix
+    pfx = ""  # run identity is now supplied by structlog contextvars (see agent_logging); avoid double-prefixing
+    _ctx_tokens = agent_logging.bind_run_context(trace=ctx.trace_id, agent=ctx.label)
+    agent_logging.log_event(agent_logging.LogEvent.RUN_BEGIN, "run begin", level=logging.INFO, logger=slog)
 
     def _progress(msg: str):
         if progress_callback:
             progress_callback(msg)
         logger.debug("%sAgent progress: %s", pfx, msg)
 
-    if ctx.owns_cancel_event:
-        ctx.cancel_event.clear()
+    try:
+        if ctx.owns_cancel_event:
+            ctx.cancel_event.clear()
 
-    active_model = ctx.llm.llm_cfg.get("model", "?")
-    logger.info("%sstart | model: %s | goal: %s", pfx, active_model, user_goal[:80])
+        active_model = ctx.llm.llm_cfg.get("model", "?")
+        logger.info("%sstart | model: %s | goal: %s", pfx, active_model, user_goal[:80])
 
-    if ctx.working:
-        ctx.working.start_task(user_goal)
+        if ctx.working:
+            ctx.working.start_task(user_goal)
 
-    # 1. Build system prompt
-    _job_history_section = ""
-    if ctx.job_history_fn:
-        try:
-            _job_history_section = ctx.job_history_fn() or ""
-        except Exception as _jh_exc:
-            logger.warning("%sFailed to get job history: %s", pfx, _jh_exc)
+        # 1. Build system prompt
+        _job_history_section = ""
+        if ctx.job_history_fn:
+            try:
+                _job_history_section = ctx.job_history_fn() or ""
+            except Exception as _jh_exc:
+                logger.warning("%sFailed to get job history: %s", pfx, _jh_exc)
 
-    _graph_context_section = ""
-    if ctx.graph_memory is not None:
-        try:
-            _graph_context_section = (
-                ctx.graph_memory.format_for_prompt(
-                    user_goal, max_entries=ctx.graph_memory_max_entries
-                ) or ""
-            )
-            if _graph_context_section:
-                logger.info("%sGraph memory context injected", pfx)
-            else:
-                logger.debug("%sGraph memory context: no relevant data found", pfx)
-        except Exception as _gm_exc:
-            logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
-
-    # Strategy memory injection
-    strategies_section = ""
-    if getattr(ctx, "strategy_memory", None) is not None:
-        from strategy_memory import classify_task_type, format_strategies_for_prompt
-        task_type = classify_task_type(user_goal)
-        strategies = ctx.strategy_memory.get_top_k(task_type, k=2)
-        if strategies:
-            strategies_section = format_strategies_for_prompt(strategies)
-
-    # Sub-agent context sharing
-    parent_context_section = _format_parent_context(ctx)
-    _sub_agent_prompt_variant = getattr(ctx, "_prompt_variant", None) if ctx.depth >= 1 else None
-
-    system, _ = _build_system_prompt(
-        tool_index=ctx.tool_index,
-        memory=ctx.memory,
-        results=ctx.results,
-        skill_registry=ctx.skill_registry,
-        llm=ctx.llm,
-        tmp_dir=ctx.tmp_dir,
-        downloads_dir=ctx.downloads_dir,
-        log_file=ctx.log_file,
-        log_backup_count=ctx.log_backup_count,
-        top_tools=ctx.top_tools,
-        user_goal=user_goal,
-        job_history_section=_job_history_section,
-        graph_context_section=_graph_context_section,
-        strategies_section=strategies_section,
-        # Suppress ResultsMemory recall when graph memory already supplied
-        # semantic context this turn — avoids redundant/overlapping recall.
-        results_top_k=0 if _graph_context_section else 2,
-        parent_context_section=parent_context_section,
-        mode=_sub_agent_prompt_variant or ctx.creativity_mode,
-    )
-
-    first_msg: dict = {"role": "user", "content": user_goal}
-    if images:
-        first_msg["images"] = images
-        logger.info("%s%d image(s) attached to request", pfx, len(images))
-
-    messages: list[dict] = []
-    if ctx.short_term:
-        messages.extend(ctx.short_term.get_messages())
-    messages.append(first_msg)
-
-    ctx.memory.record_event(f"User request: {user_goal[:100]}")
-
-    # Enqueue user message for background graph extraction (fire-and-forget)
-    if ctx.graph_memory_writer is not None:
-        try:
-            ctx.graph_memory_writer.enqueue(user_goal, source="chat")
-        except Exception as _gw_exc:  # noqa: BLE001
-            logger.debug("%sGraph memory enqueue failed: %s", pfx, _gw_exc)
-
-    # 2. ReAct loop
-    max_steps = ctx.max_iterations
-    step = 0
-    operator_cancelled = False
-    json_fail_streak = 0
-    last_action_time = time.time()
-    warned_inactivity = False
-
-    while True:
-        while step < max_steps:
-            if ctx.cancel_event.is_set():
-                logger.warning("%scancelled at step %d/%d", pfx, step, max_steps)
-                return "[Cancelled]"
-
-            # Soft inactivity check — inject a "still working?" prompt if idle too long
-            if not warned_inactivity and step > 1:
-                warn_minutes = getattr(ctx, "inactivity_warn_minutes", 0)
-                if warn_minutes and (time.time() - last_action_time) > (warn_minutes * 60):
-                    warned_inactivity = True
-                    minutes = round((time.time() - last_action_time) / 60)
-                    messages.append({
-                        "role": "user",
-                        "content": f"You've been running for {minutes} minutes without finishing. Are you still working? If you're done, use finish.",
-                    })
-                    _progress(f"⏳ Inactivity prompt after {minutes}m…")
-                    continue  # re-evaluate loop condition before next LLM call
-
-            step += 1
-            last_action_time = time.time()
-
-            if ctx.on_step:
-                try:
-                    ctx.on_step(step)
-                except Exception:
-                    pass
-            active_model = ctx.llm.llm_cfg.get("model", "?")
-            logger.info("%sstep %d/%d | model: %s", pfx, step, max_steps, active_model)
-            _progress(f"⚙️ Thinking… (step {step})")
-
-            # Context compaction check
-            messages = maybe_compact(messages, system, ctx.ctx_max_tokens, pfx, ctx.llm)
-
-            # LLM call with retry on empty response
-            _MAX_EMPTY_RETRIES = 2
-            raw = ""
-            for attempt in range(1 + _MAX_EMPTY_RETRIES):
-                try:
-                    raw = ctx.llm.chat_with_fallback(
-                        messages, system=system, progress_cb=_progress, json_mode=True,
-                    )
-                except LLMCancelledError:
-                    logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
-                    return "[Cancelled]"
-                except Exception as exc:
-                    err = f"❌ LLM error: {type(exc).__name__}: {exc}"
-                    _progress(err)
-                    return err
-                if raw.strip():
-                    break
-                if attempt < _MAX_EMPTY_RETRIES:
-                    logger.warning(
-                        "%sLLM returned empty response (step %d/%d), retrying (%d/%d)…",
-                        pfx, step, max_steps, attempt + 1, _MAX_EMPTY_RETRIES,
-                    )
-                    _progress(f"⏳ Empty LLM response, retrying ({attempt + 1}/{_MAX_EMPTY_RETRIES})…")
-
-            # Parse JSON
-            action_obj = parse_json(raw)
-            if action_obj is None:
-                json_fail_streak += 1
-                logger.warning(
-                    "%sLLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
-                    pfx, step, max_steps, json_fail_streak, len(raw), raw[:1000],
+        _graph_context_section = ""
+        if ctx.graph_memory is not None:
+            try:
+                _graph_context_section = (
+                    ctx.graph_memory.format_for_prompt(
+                        user_goal, max_entries=ctx.graph_memory_max_entries
+                    ) or ""
                 )
-                if json_fail_streak >= _JSON_FAIL_LIMIT:
-                    logger.error(
-                        "%sNon-JSON streak reached %d — aborting with protocol error",
-                        pfx, json_fail_streak,
-                    )
-                    err_msg = (
-                        f"❌ Agent protocol error: model returned non-JSON "
-                        f"{json_fail_streak} times in a row. "
-                        f"Last response (truncated to 500 chars): {raw[:500]}"
-                    )
-                    _progress(err_msg)
-                    return err_msg
+                if _graph_context_section:
+                    logger.info("%sGraph memory context injected", pfx)
                 else:
-                    messages.append({"role": "assistant", "content": raw})
+                    logger.debug("%sGraph memory context: no relevant data found", pfx)
+            except Exception as _gm_exc:
+                logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
+
+        # Strategy memory injection
+        strategies_section = ""
+        if getattr(ctx, "strategy_memory", None) is not None:
+            from strategy_memory import classify_task_type, format_strategies_for_prompt
+            task_type = classify_task_type(user_goal)
+            strategies = ctx.strategy_memory.get_top_k(task_type, k=2)
+            if strategies:
+                strategies_section = format_strategies_for_prompt(strategies)
+
+        # Sub-agent context sharing
+        parent_context_section = _format_parent_context(ctx)
+        _sub_agent_prompt_variant = getattr(ctx, "_prompt_variant", None) if ctx.depth >= 1 else None
+
+        system, _ = _build_system_prompt(
+            tool_index=ctx.tool_index,
+            memory=ctx.memory,
+            results=ctx.results,
+            skill_registry=ctx.skill_registry,
+            llm=ctx.llm,
+            tmp_dir=ctx.tmp_dir,
+            downloads_dir=ctx.downloads_dir,
+            log_file=ctx.log_file,
+            log_backup_count=ctx.log_backup_count,
+            top_tools=ctx.top_tools,
+            user_goal=user_goal,
+            job_history_section=_job_history_section,
+            graph_context_section=_graph_context_section,
+            strategies_section=strategies_section,
+            # Suppress ResultsMemory recall when graph memory already supplied
+            # semantic context this turn — avoids redundant/overlapping recall.
+            results_top_k=0 if _graph_context_section else 2,
+            parent_context_section=parent_context_section,
+            mode=_sub_agent_prompt_variant or ctx.creativity_mode,
+        )
+
+        first_msg: dict = {"role": "user", "content": user_goal}
+        if images:
+            first_msg["images"] = images
+            logger.info("%s%d image(s) attached to request", pfx, len(images))
+
+        messages: list[dict] = []
+        if ctx.short_term:
+            messages.extend(ctx.short_term.get_messages())
+        messages.append(first_msg)
+
+        ctx.memory.record_event(f"User request: {user_goal[:100]}")
+
+        # Enqueue user message for background graph extraction (fire-and-forget)
+        if ctx.graph_memory_writer is not None:
+            try:
+                ctx.graph_memory_writer.enqueue(user_goal, source="chat")
+            except Exception as _gw_exc:  # noqa: BLE001
+                logger.debug("%sGraph memory enqueue failed: %s", pfx, _gw_exc)
+
+        # 2. ReAct loop
+        max_steps = ctx.max_iterations
+        step = 0
+        operator_cancelled = False
+        json_fail_streak = 0
+        last_action_time = time.time()
+        warned_inactivity = False
+
+        while True:
+            while step < max_steps:
+                if ctx.cancel_event.is_set():
+                    logger.warning("%scancelled at step %d/%d", pfx, step, max_steps)
+                    return "[Cancelled]"
+
+                # Soft inactivity check — inject a "still working?" prompt if idle too long
+                if not warned_inactivity and step > 1:
+                    warn_minutes = getattr(ctx, "inactivity_warn_minutes", 0)
+                    if warn_minutes and (time.time() - last_action_time) > (warn_minutes * 60):
+                        warned_inactivity = True
+                        minutes = round((time.time() - last_action_time) / 60)
+                        messages.append({
+                            "role": "user",
+                            "content": f"You've been running for {minutes} minutes without finishing. Are you still working? If you're done, use finish.",
+                        })
+                        _progress(f"⏳ Inactivity prompt after {minutes}m…")
+                        continue  # re-evaluate loop condition before next LLM call
+
+                step += 1
+                last_action_time = time.time()
+
+                agent_logging.log_event(
+                    agent_logging.LogEvent.STEP_BEGIN, "step begin", level=logging.INFO, logger=slog, step=step,
+                )
+
+                if ctx.on_step:
+                    try:
+                        ctx.on_step(step)
+                    except Exception:
+                        pass
+                active_model = ctx.llm.llm_cfg.get("model", "?")
+                logger.info("%sstep %d/%d | model: %s", pfx, step, max_steps, active_model)
+                _progress(f"⚙️ Thinking… (step {step})")
+
+                # Context compaction check
+                messages = maybe_compact(messages, system, ctx.ctx_max_tokens, ctx.llm)
+
+                # LLM call with retry on empty response
+                _MAX_EMPTY_RETRIES = 2
+                raw = ""
+                for attempt in range(1 + _MAX_EMPTY_RETRIES):
+                    try:
+                        raw = ctx.llm.chat_with_fallback(
+                            messages, system=system, progress_cb=_progress, json_mode=True,
+                        )
+                    except LLMCancelledError:
+                        logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
+                        return "[Cancelled]"
+                    except Exception as exc:
+                        err = f"❌ LLM error: {type(exc).__name__}: {exc}"
+                        _progress(err)
+                        return err
+                    if raw.strip():
+                        break
+                    if attempt < _MAX_EMPTY_RETRIES:
+                        logger.warning(
+                            "%sLLM returned empty response (step %d/%d), retrying (%d/%d)…",
+                            pfx, step, max_steps, attempt + 1, _MAX_EMPTY_RETRIES,
+                        )
+                        _progress(f"⏳ Empty LLM response, retrying ({attempt + 1}/{_MAX_EMPTY_RETRIES})…")
+
+                # Parse JSON
+                action_obj = parse_json(raw)
+                if action_obj is None:
+                    json_fail_streak += 1
+                    logger.warning(
+                        "%sLLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
+                        pfx, step, max_steps, json_fail_streak, len(raw), raw[:1000],
+                    )
+                    if json_fail_streak >= _JSON_FAIL_LIMIT:
+                        logger.error(
+                            "%sNon-JSON streak reached %d — aborting with protocol error",
+                            pfx, json_fail_streak,
+                        )
+                        err_msg = (
+                            f"❌ Agent protocol error: model returned non-JSON "
+                            f"{json_fail_streak} times in a row. "
+                            f"Last response (truncated to 500 chars): {raw[:500]}"
+                        )
+                        _progress(err_msg)
+                        return err_msg
+                    else:
+                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                'ERROR: Your response was not valid JSON. '
+                                'You MUST respond with ONLY a raw JSON object — no markdown, '
+                                'no prose, no ```json fences. Example: '
+                                '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
+                            )
+                        })
+                        continue
+
+                json_fail_streak = 0
+                messages.append({"role": "assistant", "content": raw})
+                action = action_obj.get("action", "")
+
+                # Normalize shorthand actions
+                if action in _BUILTIN_NAMES:
+                    logger.warning("%sLLM used shorthand action '%s' — normalizing to tool call", pfx, action)
+                    if "args" in action_obj:
+                        shorthand_args = action_obj["args"]
+                        if isinstance(shorthand_args, str):
+                            try:
+                                parsed = json.loads(shorthand_args)
+                                if isinstance(parsed, (dict, list)):
+                                    shorthand_args = parsed
+                                else:
+                                    logger.warning(
+                                        "Shorthand action '%s' args parsed to non-dict type %s — keeping string",
+                                        action, type(parsed).__name__,
+                                    )
+                            except (ValueError, TypeError):
+                                logger.warning(
+                                    "Shorthand action '%s' args is a non-JSON string — keeping as-is: %s",
+                                    action, shorthand_args[:200],
+                                )
+                    else:
+                        shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
+                    action_obj = {"action": "tool", "tool": action, "args": shorthand_args}
+                    action = "tool"
+
+                # ---- Dispatch ----
+
+                if action == "finish":
+                    result = action_obj.get("result", "Done.")
+                    if not isinstance(result, str):
+                        if isinstance(result, (dict, list)):
+                            result = json.dumps(result, ensure_ascii=False)
+                        else:
+                            result = str(result) if result else "Done."
+                    elapsed = time.time() - run_start
+                    active_model = ctx.llm.llm_cfg.get("model", "?")
+                    logger.info("%sfinish | model: %s | steps: %d | elapsed: %.1fs", pfx, active_model, step, elapsed)
+                    ctx.memory.record_event(f"Agent finished: {result[:80]}")
+                    if ctx.short_term:
+                        ctx.short_term.add("user", user_goal)
+                        ctx.short_term.add("assistant", result)
+                    summary = ""
+                    tools_used: list[str] = []
+                    if ctx.results and ctx.working and ctx.working.has_content():
+                        tools_used = list(filter(None, extract_tools_used(ctx.working.steps)))
+                        summary = _summarize_result(
+                            ctx.llm,
+                            goal=user_goal,
+                            result=result,
+                            tools_used=tools_used,
+                        )
+                        save_task_outcome(
+                            results=ctx.results,
+                            graph_memory_writer=ctx.graph_memory_writer,
+                            goal=user_goal,
+                            summary=summary,
+                            tools_used=tools_used,
+                        )
+                    # Fire-and-forget strategy extraction on background thread
+                    if getattr(ctx, "strategy_memory", None) is not None:
+                        try:
+                            from strategy_memory import extract_strategy
+
+                            def _extract_and_store() -> None:
+                                """Extract strategy and store it in StrategyMemory."""
+                                _outcome = {
+                                    "success": True,
+                                    "summary": summary[:500] if summary else result[:500],
+                                    "tools": tools_used,
+                                }
+                                strategy = extract_strategy(ctx.llm, user_goal, _outcome)
+                                if strategy is not None:
+                                    ctx.strategy_memory.add(strategy)
+
+                            _thread = threading.Thread(
+                                target=_extract_and_store,
+                                daemon=True,
+                            )
+                            _thread.start()
+                            logger.debug("%sStrategy extraction thread started", pfx)
+                        except Exception as _se_exc:  # noqa: BLE001
+                            logger.debug("%sStrategy extraction start failed: %s", pfx, _se_exc)
+                    if ctx.working:
+                        ctx.working.clear()
+                    return result
+
+                elif action == "tool":
+                    _t0 = time.time()
+                    outcome = _dispatch_tool(ctx, action_obj, _progress)
+                    _duration_ms = (time.time() - _t0) * 1000
+                    tool_name = action_obj.get("tool", "")
+                    args = action_obj.get("args", {})
+                    if isinstance(args, list):
+                        args = {str(i): v for i, v in enumerate(args)}
+
+                    if ctx.on_tool_trace is not None:
+                        ctx.on_tool_trace(ToolTrace(
+                            tool_name=tool_name,
+                            args_repr=_compact_args_repr(tool_name, args),
+                            success=outcome["success"],
+                            duration_ms=round(_duration_ms, 1),
+                            error=outcome.get("error", "") if not outcome["success"] else "",
+                        ))
+
+                    if ctx.working:
+                        ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
+
+                    if outcome.get("send_file"):
+                        path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
+                        caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
+                        _progress(f"__FILE__:{path_b64}:{caption_b64}")
+
+                    tool_result = format_tool_result(tool_name, outcome)
+                    if outcome["success"]:
+                        logger.info("%sTool '%s' result: success=True", pfx, tool_name)
+                    else:
+                        logger.warning(
+                            "%sTool '%s' result: success=False | error=%s | args=%s",
+                            pfx, tool_name,
+                            outcome.get("error", ""),
+                            {k: str(v)[:120] for k, v in args.items()},
+                        )
+                    _progress(fmt_tool_result_progress(tool_name, args, outcome))
+                    messages.append({"role": "user", "content": tool_result})
+
+                    if outcome.get("_operator_cancelled"):
+                        operator_cancelled = True
+                        break
+
+                elif action == "create_tool":
+                    feedback, cancelled = _dispatch_create_tool(ctx, action_obj, _progress)
+                    messages.append({"role": "user", "content": feedback})
+                    if cancelled:
+                        operator_cancelled = True
+                        break
+
+                elif action == "plan":
+                    # Import here to avoid a circular import: execution_plan.py imports
+                    # ReactContext and parse_json from this module at runtime.
+                    from execution_plan import ExecutionPlan, PlanExecutor, PlanStep
+
+                    plan_data = action_obj.get("plan", {})
+                    # Give the agent room to finish after the plan completes
+                    old_max_steps = max_steps
+                    plan_limit = getattr(ctx, "plan_max_iterations", 0) or (ctx.max_iterations + 20)
+                    ABSOLUTE_PLAN_CEILING = 200
+                    if plan_limit > ABSOLUTE_PLAN_CEILING:
+                        plan_limit = ABSOLUTE_PLAN_CEILING
+                        logger.warning("%splan | clamped plan_max_iterations to %d", pfx, ABSOLUTE_PLAN_CEILING)
+                    if plan_limit > max_steps:
+                        max_steps = plan_limit
+                        logger.info("%splan | raised max_steps from %d to %d", pfx, old_max_steps, max_steps)
+                    try:
+                        _progress("📋 Executing plan…")
+                        logger.info("%splan | description: %s", pfx, plan_data.get("description", "")[:60])
+
+                        steps_raw = plan_data.get("steps", [])
+                        steps = [
+                            PlanStep(
+                                id=s["id"],
+                                tool=s["tool"],
+                                args=s.get("args", {}),
+                                depends_on=s.get("depends_on", []),
+                                description=s.get("description", ""),
+                            )
+                            for s in steps_raw
+                        ]
+                        plan = ExecutionPlan(
+                            description=plan_data.get("description", ""),
+                            steps=steps,
+                            timeout=plan_data.get("timeout", 300),
+                        )
+
+                        executor = PlanExecutor(max_concurrent=ctx.max_subagents)
+                        plan_result = executor.execute(plan, ctx, progress_cb=_progress)
+
+                        logger.info("%splan | completed | results: %d", pfx, len(plan_result.get("results", {})))
+                        # Restore max_steps to a reasonable ceiling after plan
+                        if max_steps > old_max_steps:
+                            max_steps = old_max_steps + 10
+                            if max_steps > ABSOLUTE_PLAN_CEILING:
+                                max_steps = ABSOLUTE_PLAN_CEILING
+                            logger.info("%splan | adjusted max_steps to %d after completion", pfx, max_steps)
+                        result_msg = f"Plan execution results:\n{json.dumps(plan_result, ensure_ascii=False, indent=2)}"
+                        messages.append({"role": "user", "content": result_msg})
+
+                    except Exception as exc:
+                        err_msg = f"Plan execution failed: {type(exc).__name__}: {exc}"
+                        logger.error("%s%s", pfx, err_msg)
+                        messages.append({"role": "user", "content": err_msg})
+
+                else:
+                    logger.warning("%sUnknown action '%s' from LLM", pfx, action)
                     messages.append({
                         "role": "user",
-                        "content": (
-                            'ERROR: Your response was not valid JSON. '
-                            'You MUST respond with ONLY a raw JSON object — no markdown, '
-                            'no prose, no ```json fences. Example: '
-                            '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
-                        )
+                        "content": f'Unknown action "{action}". Use "tool", "create_tool", or "finish".',
                     })
-                    continue
 
-            json_fail_streak = 0
-            messages.append({"role": "assistant", "content": raw})
-            action = action_obj.get("action", "")
+                agent_logging.log_event(
+                    agent_logging.LogEvent.STEP_END, "step end", level=logging.INFO, logger=slog, step=step,
+                )
 
-            # Normalize shorthand actions
-            if action in _BUILTIN_NAMES:
-                logger.warning("%sLLM used shorthand action '%s' — normalizing to tool call", pfx, action)
-                if "args" in action_obj:
-                    shorthand_args = action_obj["args"]
-                    if isinstance(shorthand_args, str):
-                        try:
-                            parsed = json.loads(shorthand_args)
-                            if isinstance(parsed, (dict, list)):
-                                shorthand_args = parsed
-                            else:
-                                logger.warning(
-                                    "Shorthand action '%s' args parsed to non-dict type %s — keeping string",
-                                    action, type(parsed).__name__,
-                                )
-                        except (ValueError, TypeError):
-                            logger.warning(
-                                "Shorthand action '%s' args is a non-JSON string — keeping as-is: %s",
-                                action, shorthand_args[:200],
-                            )
-                else:
-                    shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
-                action_obj = {"action": "tool", "tool": action, "args": shorthand_args}
-                action = "tool"
+            # Inner while exited
+            if operator_cancelled:
+                ctx.memory.record_event("Task cancelled by operator")
+                return "⚠️ Task stopped by operator."
 
-            # ---- Dispatch ----
+            # Max steps reached — ask user to extend
+            ext_response = ctx.confirmation.request_extension(max_steps, _progress)
 
-            if action == "finish":
-                result = action_obj.get("result", "Done.")
-                if not isinstance(result, str):
-                    if isinstance(result, (dict, list)):
-                        result = json.dumps(result, ensure_ascii=False)
-                    else:
-                        result = str(result) if result else "Done."
-                elapsed = time.time() - run_start
-                active_model = ctx.llm.llm_cfg.get("model", "?")
-                logger.info("%sfinish | model: %s | steps: %d | elapsed: %.1fs", pfx, active_model, step, elapsed)
-                ctx.memory.record_event(f"Agent finished: {result[:80]}")
-                if ctx.short_term:
-                    ctx.short_term.add("user", user_goal)
-                    ctx.short_term.add("assistant", result)
-                summary = ""
-                tools_used: list[str] = []
-                if ctx.results and ctx.working and ctx.working.has_content():
-                    tools_used = list(filter(None, extract_tools_used(ctx.working.steps)))
-                    summary = _summarize_result(
-                        ctx.llm,
-                        goal=user_goal,
-                        result=result,
-                        tools_used=tools_used,
-                    )
-                    save_task_outcome(
-                        results=ctx.results,
-                        graph_memory_writer=ctx.graph_memory_writer,
-                        goal=user_goal,
-                        summary=summary,
-                        tools_used=tools_used,
-                        log_prefix=pfx,
-                    )
-                # Fire-and-forget strategy extraction on background thread
-                if getattr(ctx, "strategy_memory", None) is not None:
-                    try:
-                        from strategy_memory import extract_strategy
+            if ext_response == "unlimited":
+                max_steps = 10_000_000
+                logger.info("%sAgent steps set to unlimited by user", pfx)
+                _progress("♾️ Running until done (unlimited steps)…")
+                continue
+            elif ext_response == "yes":
+                max_steps += 10
+                logger.info("%sAgent steps extended to %d by user", pfx, max_steps)
+                _progress(f"⏩ Extended — continuing to step {max_steps}…")
+                continue
 
-                        def _extract_and_store() -> None:
-                            """Extract strategy and store it in StrategyMemory."""
-                            _outcome = {
-                                "success": True,
-                                "summary": summary[:500] if summary else result[:500],
-                                "tools": tools_used,
-                            }
-                            strategy = extract_strategy(ctx.llm, user_goal, _outcome)
-                            if strategy is not None:
-                                ctx.strategy_memory.add(strategy)
+            break
 
-                        _thread = threading.Thread(
-                            target=_extract_and_store,
-                            daemon=True,
-                        )
-                        _thread.start()
-                        logger.debug("%sStrategy extraction thread started", pfx)
-                    except Exception as _se_exc:  # noqa: BLE001
-                        logger.debug("%sStrategy extraction start failed: %s", pfx, _se_exc)
-                if ctx.working:
-                    ctx.working.clear()
-                return result
-
-            elif action == "tool":
-                _t0 = time.time()
-                outcome = _dispatch_tool(ctx, action_obj, _progress)
-                _duration_ms = (time.time() - _t0) * 1000
-                tool_name = action_obj.get("tool", "")
-                args = action_obj.get("args", {})
-                if isinstance(args, list):
-                    args = {str(i): v for i, v in enumerate(args)}
-
-                if ctx.on_tool_trace is not None:
-                    ctx.on_tool_trace(ToolTrace(
-                        tool_name=tool_name,
-                        args_repr=_compact_args_repr(tool_name, args),
-                        success=outcome["success"],
-                        duration_ms=round(_duration_ms, 1),
-                        error=outcome.get("error", "") if not outcome["success"] else "",
-                    ))
-
-                if ctx.working:
-                    ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
-
-                if outcome.get("send_file"):
-                    path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
-                    caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
-                    _progress(f"__FILE__:{path_b64}:{caption_b64}")
-
-                tool_result = format_tool_result(tool_name, outcome)
-                if outcome["success"]:
-                    logger.info("%sTool '%s' result: success=True", pfx, tool_name)
-                else:
-                    logger.warning(
-                        "%sTool '%s' result: success=False | error=%s | args=%s",
-                        pfx, tool_name,
-                        outcome.get("error", ""),
-                        {k: str(v)[:120] for k, v in args.items()},
-                    )
-                _progress(fmt_tool_result_progress(tool_name, args, outcome))
-                messages.append({"role": "user", "content": tool_result})
-
-                if outcome.get("_operator_cancelled"):
-                    operator_cancelled = True
-                    break
-
-            elif action == "create_tool":
-                feedback, cancelled = _dispatch_create_tool(ctx, action_obj, _progress)
-                messages.append({"role": "user", "content": feedback})
-                if cancelled:
-                    operator_cancelled = True
-                    break
-
-            elif action == "plan":
-                # Import here to avoid a circular import: execution_plan.py imports
-                # ReactContext and parse_json from this module at runtime.
-                from execution_plan import ExecutionPlan, PlanExecutor, PlanStep
-
-                plan_data = action_obj.get("plan", {})
-                # Give the agent room to finish after the plan completes
-                old_max_steps = max_steps
-                plan_limit = getattr(ctx, "plan_max_iterations", 0) or (ctx.max_iterations + 20)
-                ABSOLUTE_PLAN_CEILING = 200
-                if plan_limit > ABSOLUTE_PLAN_CEILING:
-                    plan_limit = ABSOLUTE_PLAN_CEILING
-                    logger.warning("%splan | clamped plan_max_iterations to %d", pfx, ABSOLUTE_PLAN_CEILING)
-                if plan_limit > max_steps:
-                    max_steps = plan_limit
-                    logger.info("%splan | raised max_steps from %d to %d", pfx, old_max_steps, max_steps)
-                try:
-                    _progress("📋 Executing plan…")
-                    logger.info("%splan | description: %s", pfx, plan_data.get("description", "")[:60])
-
-                    steps_raw = plan_data.get("steps", [])
-                    steps = [
-                        PlanStep(
-                            id=s["id"],
-                            tool=s["tool"],
-                            args=s.get("args", {}),
-                            depends_on=s.get("depends_on", []),
-                            description=s.get("description", ""),
-                        )
-                        for s in steps_raw
-                    ]
-                    plan = ExecutionPlan(
-                        description=plan_data.get("description", ""),
-                        steps=steps,
-                        timeout=plan_data.get("timeout", 300),
-                    )
-
-                    executor = PlanExecutor(max_concurrent=ctx.max_subagents)
-                    plan_result = executor.execute(plan, ctx, progress_cb=_progress)
-
-                    logger.info("%splan | completed | results: %d", pfx, len(plan_result.get("results", {})))
-                    # Restore max_steps to a reasonable ceiling after plan
-                    if max_steps > old_max_steps:
-                        max_steps = old_max_steps + 10
-                        if max_steps > ABSOLUTE_PLAN_CEILING:
-                            max_steps = ABSOLUTE_PLAN_CEILING
-                        logger.info("%splan | adjusted max_steps to %d after completion", pfx, max_steps)
-                    result_msg = f"Plan execution results:\n{json.dumps(plan_result, ensure_ascii=False, indent=2)}"
-                    messages.append({"role": "user", "content": result_msg})
-
-                except Exception as exc:
-                    err_msg = f"Plan execution failed: {type(exc).__name__}: {exc}"
-                    logger.error("%s%s", pfx, err_msg)
-                    messages.append({"role": "user", "content": err_msg})
-
-            else:
-                logger.warning("%sUnknown action '%s' from LLM", pfx, action)
-                messages.append({
-                    "role": "user",
-                    "content": f'Unknown action "{action}". Use "tool", "create_tool", or "finish".',
-                })
-
-        # Inner while exited
-        if operator_cancelled:
-            ctx.memory.record_event("Task cancelled by operator")
-            return "⚠️ Task stopped by operator."
-
-        # Max steps reached — ask user to extend
-        ext_response = ctx.confirmation.request_extension(max_steps, _progress)
-
-        if ext_response == "unlimited":
-            max_steps = 10_000_000
-            logger.info("%sAgent steps set to unlimited by user", pfx)
-            _progress("♾️ Running until done (unlimited steps)…")
-            continue
-        elif ext_response == "yes":
-            max_steps += 10
-            logger.info("%sAgent steps extended to %d by user", pfx, max_steps)
-            _progress(f"⏩ Extended — continuing to step {max_steps}…")
-            continue
-
-        break
-
-    ctx.memory.record_event("Agent hit max iterations")
-    return "⚠️ Agent reached maximum steps. Operation cancelled."
+        ctx.memory.record_event("Agent hit max iterations")
+        return "⚠️ Agent reached maximum steps. Operation cancelled."
+    finally:
+        agent_logging.log_event(
+            agent_logging.LogEvent.RUN_END,
+            "run end",
+            level=logging.INFO,
+            logger=slog,
+            dur_ms=int((time.time() - run_start) * 1000),
+        )
+        agent_logging.reset_run_context(_ctx_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -856,7 +877,7 @@ def _dispatch_tool(
 
     Adds '_operator_cancelled' key to outcome if the user cancelled.
     """
-    pfx = ctx.log_prefix
+    pfx = ""  # run identity is now supplied by structlog contextvars (see agent_logging); avoid double-prefixing
     tool_name = action_obj.get("tool", "")
     args = action_obj.get("args", {})
     if isinstance(args, list):
@@ -928,9 +949,57 @@ def _dispatch_tool(
                     _progress("❌ Cancelled by operator — stopping task.")
         return outcome
 
-    # MCP tools
+    # MCP tools — wrap dispatch with TOOL_* lifecycle events so MCP calls are
+    # visible to log_query. They bypass both executors (which emit these events
+    # themselves), so without this wrapping MCP tools never appear as TOOL_*
+    # events. Field conventions match the builtin/tool executors.
     if ctx.mcp_manager and ctx.mcp_manager.has_tool(tool_name):
-        return ctx.mcp_manager.call_tool(tool_name, args)
+        _mcp_start = time.perf_counter()
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_START,
+            f"tool start: {tool_name}",
+            level=logging.INFO,
+            logger=slog,
+            tool=tool_name,
+        )
+        try:
+            outcome = ctx.mcp_manager.call_tool(tool_name, args)
+        except Exception as exc:
+            dur_ms = int((time.perf_counter() - _mcp_start) * 1000)
+            agent_logging.log_event(
+                agent_logging.LogEvent.TOOL_FAILED,
+                f"tool failed: {tool_name}",
+                level=logging.ERROR,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=-1,
+                err=str(exc),
+            )
+            raise
+        dur_ms = int((time.perf_counter() - _mcp_start) * 1000)
+        if isinstance(outcome, dict) and outcome.get("success"):
+            agent_logging.log_event(
+                agent_logging.LogEvent.TOOL_END,
+                f"tool end: {tool_name}",
+                level=logging.INFO,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=0,
+            )
+        else:
+            agent_logging.log_event(
+                agent_logging.LogEvent.TOOL_FAILED,
+                f"tool failed: {tool_name}",
+                level=logging.ERROR,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=-1,
+                err=(outcome.get("error", "") if isinstance(outcome, dict) else "") or "",
+            )
+        return outcome
 
     # Registered tools
     return ctx.executor.execute(tool_name, args)

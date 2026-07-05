@@ -143,7 +143,7 @@ class TestAgentControllerTrace:
 
 
 class TestReactLoopTraceLogging:
-    def test_start_log_contains_trace_id(self, caplog):
+    def test_start_log_contains_trace_id(self, monkeypatch):
         llm = MagicMock()
         llm.chat_with_fallback.return_value = '{"action": "finish", "result": "done"}'
         llm.llm_cfg = {"model": "test-model"}
@@ -152,10 +152,15 @@ class TestReactLoopTraceLogging:
             memory=MagicMock(), builtin_executor=None, mcp_manager=None, skill_registry=None,
             cancel_event=threading.Event(), label="main", trace_id="r-trace777",
         )
+        # Run identity is bound into structlog contextvars at run entry now, not
+        # embedded in the raw log message text.
+        import agent_logging
+        seen: dict = {}
+        monkeypatch.setattr(agent_logging, "bind_run_context", lambda **kw: seen.update(kw))
         with patch("react_loop._build_system_prompt", return_value=("sys", None)):
-            with caplog.at_level(logging.INFO, logger="react_loop"):
-                react_loop(ctx, "task")
-        assert any("r-trace777" in rec.getMessage() for rec in caplog.records)
+            react_loop(ctx, "task")
+        assert seen.get("trace") == "r-trace777"
+        assert seen.get("agent") == "main"
 
 
 class TestFallbackLogTraceCorrelation:

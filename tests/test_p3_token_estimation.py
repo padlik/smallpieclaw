@@ -128,7 +128,7 @@ class TestCompactionUsesEstimator:
         llm = MagicMock()
         llm.llm_cfg = {"model": "ollama-local"}  # unknown => heuristic path
         llm.chat.return_value = "• compacted summary"
-        out = context_manager.maybe_compact(msgs, "system", 2000, "", llm)
+        out = context_manager.maybe_compact(msgs, "system", 2000, llm)
         assert len(out) < len(msgs)
         assert out[0]["content"] == "GOAL: do the task"
         assert any("Compacted context" in str(m.get("content")) for m in out)

@@ -231,6 +231,34 @@ def vault_path(raw: dict) -> str:
     return os.path.expanduser(f"~/.local/share/{agent_name}/secrets.toml")
 
 
+def log_dir(raw: dict) -> str:
+    """Return the XDG state log directory for *raw*.
+
+    Uses ``$SPC_LOG_DIR`` when set, otherwise the default location under
+    ``~/.local/state/<agent_name>/logs``. Resolved from ``agent_name`` only and
+    is therefore independent of ``agent_home`` (mirrors :func:`vault_path`).
+    """
+    env_dir = os.environ.get("SPC_LOG_DIR")
+    if env_dir:
+        return os.path.expanduser(env_dir)
+    agent_name = (raw.get("agent") or {}).get("agent_name") or "piclaw"
+    return os.path.expanduser(f"~/.local/state/{agent_name}/logs")
+
+
+def log_path(raw: dict) -> str:
+    """Resolve the active log file path for *raw*.
+
+    An absolute ``[paths] log_file`` overrides and is returned as-is. Otherwise
+    the configured filename (default ``agent.log``) is placed under
+    :func:`log_dir`, so logs never land inside the source checkout.
+    """
+    configured = (raw.get("paths") or {}).get("log_file", "agent.log")
+    if configured and os.path.isabs(configured):
+        return configured
+    filename = os.path.basename(configured) if configured else "agent.log"
+    return os.path.join(log_dir(raw), filename or "agent.log")
+
+
 def _parse_bool(value: Any, field_path: str) -> bool:
     """Return *value* as bool, rejecting strings to prevent env refs or
     ``"false"`` from being silently coerced to ``True``."""

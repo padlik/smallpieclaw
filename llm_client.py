@@ -36,7 +36,10 @@ from typing import Any, Optional
 import httpx
 import ollama as _ollama_lib
 
+import agent_logging
+
 logger = logging.getLogger(__name__)
+slog = agent_logging.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +440,10 @@ class LLMClient:
         caller tag so concurrent runs sharing this LLMClient do not overwrite one
         another's log correlation state. Passing an empty value restores the bare
         caller label in the current execution context.
+
+        Structured-log run identity (including ``trace``) is owned solely by
+        ``agent_logging.bind_run_context`` at run entry; this method only manages
+        the llm-local ``_trace_id`` used by the caller tag.
         """
         self._trace_id = trace_id
 
@@ -529,6 +536,15 @@ class LLMClient:
         and Ollama (format="json"). Anthropic falls back to prompt-only enforcement.
         """
         provider = self.llm_cfg["provider"]
+        model_id = self.llm_cfg.get("model", "?")
+        agent_logging.log_event(
+            agent_logging.LogEvent.LLM_CALL,
+            f"LLM request \u2192 {model_id}",
+            level=logging.INFO,
+            logger=slog,
+            model=model_id,
+        )
+        _t0 = time.perf_counter()
         try:
             if provider in ("openai", "openrouter"):
                 return self._openai_chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
@@ -542,6 +558,15 @@ class LLMClient:
                 raise ValueError(f"Unknown LLM provider: {provider}")
         except _LLM_CHAT_ERRORS as exc:
             logger.error("LLM chat error: %s", exc)
+            agent_logging.log_event(
+                agent_logging.LogEvent.LLM_FAILED,
+                f"LLM request failed: {model_id}",
+                level=logging.ERROR,
+                logger=slog,
+                model=model_id,
+                dur_ms=int((time.perf_counter() - _t0) * 1000),
+                err=str(exc),
+            )
             raise
 
     @staticmethod

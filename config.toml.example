@@ -247,8 +247,10 @@ tool_index_file    = "data/tool_index.json"
 memory_file        = "data/memory.json"
 skills_dir         = "skills"
 downloads_dir      = "downloads"
-log_file           = "agent.log"
-log_backup_count   = 30         # number of daily rotated files to keep
+log_file           = "agent.log"   # relative name → ~/.local/state/<agent_name>/logs/agent.log
+                                    # (from agent_name, independent of agent_home); absolute path overrides.
+                                    # Structured agent.jsonl is written alongside.
+log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups to keep
 pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate instances
 # tmp_dir defaults to /tmp/<working_dir_name> if not set
 # tmp_dir = "/tmp/agent"

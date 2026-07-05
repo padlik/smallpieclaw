@@ -516,7 +516,6 @@ def save_task_outcome(
     goal: str,
     summary: str,
     tools_used: list[str],
-    log_prefix: str = "",
 ) -> None:
     """Persist a finished task's outcome to ResultsMemory and graph memory.
 
@@ -524,9 +523,6 @@ def save_task_outcome(
     ``_task_outcome_text`` episode to *graph_memory_writer* (if present).
     Both writes are best-effort: a graph-memory failure is logged and never
     raised, so a finish path cannot be derailed by the optional graph store.
-
-    *log_prefix* (e.g. a sub-agent trace prefix like ``[sa-<id>]``) is included
-    in the failure log so the originating agent is identifiable in logs.
     """
     if results is not None:
         results.add_result(goal=goal, summary=summary, tools_used=tools_used)
@@ -537,7 +533,7 @@ def save_task_outcome(
                 source="task_outcome",
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("%sGraph memory task outcome enqueue failed: %s", log_prefix, exc)
+            logger.debug("Graph memory task outcome enqueue failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

@@ -3,18 +3,11 @@
 #
 # Each entry uses a dummy reference so vulture sees the symbol as "used".
 
-from main import _NightlyRotatingFileHandler
 from memory_store import ShortTermMemory
 from sub_agent_registry import SubAgentRegistry
 from skill_registry import Skill
 from interfaces import LLMProvider, ToolBackend, MemoryBackend, NotifyFn  # noqa: E402
 from interfaces import ToolRegistryProtocol, MCPManagerProtocol  # noqa: E402
-
-# _NightlyRotatingFileHandler: overrides logging.handlers.TimedRotatingFileHandler
-# — doRollover and rolloverAt are called by the Python logging framework internals,
-#   not by application code directly.
-_NightlyRotatingFileHandler.doRollover
-_NightlyRotatingFileHandler.rolloverAt
 
 # ShortTermMemory.get_messages: public API — may be used by external callers or tests
 ShortTermMemory.get_messages
@@ -62,6 +55,31 @@ EmbeddingsConfig
 SchedulerConfig
 PathsConfig
 MCPServerConfig
+
+# config_schema.py — XDG log path helpers
+from config_schema import log_dir, log_path  # noqa: E402
+log_dir
+log_path
+
+# agent_logging.py — structlog logging backbone public API
+from agent_logging import (  # noqa: E402
+    LogEvent,
+    setup_bootstrap,
+    setup_logging,
+    bind_run_context,
+    reset_run_context,
+    clear_run_context,
+    get_logger,
+    log_event,
+)
+LogEvent
+setup_bootstrap
+setup_logging
+bind_run_context
+reset_run_context
+clear_run_context
+get_logger
+log_event
 
 # graph_memory.py — backfill public API
 from graph_memory import (  # noqa: E402

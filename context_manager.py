@@ -127,7 +127,6 @@ def _cap_short_overbudget_context(
     messages: list[dict],
     system: str,
     threshold: int,
-    log_prefix: str,
     llm: "LLMClient",
 ) -> list[dict]:
     """Cap a short but already-overbudget history without adding a summary."""
@@ -139,8 +138,8 @@ def _cap_short_overbudget_context(
         capped = [_cap_string_message(m, cap) for m in messages]
         new_total = estimate_messages_tokens(capped, system, model=_active_model(llm))
     logger.warning(
-        "%sShort context exceeded budget; capped message contents to ≤%d chars → ~%d tokens",
-        log_prefix, cap, new_total,
+        "Short context exceeded budget; capped message contents to ≤%d chars → ~%d tokens",
+        cap, new_total,
     )
     return capped
 
@@ -155,7 +154,6 @@ def maybe_compact(
     messages: list[dict],
     system: str,
     ctx_max_tokens: int,
-    log_prefix: str,
     llm: "LLMClient",
 ) -> list[dict]:
     """Return a (possibly compacted) copy of *messages*.
@@ -175,11 +173,11 @@ def maybe_compact(
     if total <= threshold:
         return messages
     if len(messages) <= 3:
-        return _cap_short_overbudget_context(messages, system, threshold, log_prefix, llm)
+        return _cap_short_overbudget_context(messages, system, threshold, llm)
 
     logger.warning(
-        "%sContext size ~%d tokens exceeds threshold %d — compacting…",
-        log_prefix, total, threshold,
+        "Context size ~%d tokens exceeds threshold %d — compacting…",
+        total, threshold,
     )
 
     first = messages[:1]
@@ -235,10 +233,10 @@ def maybe_compact(
             )
             new_total = estimate_messages_tokens(compacted, system, model=_active_model(llm))
         logger.warning(
-            "%sCompacted context still large; applied deterministic tightening "
+            "Compacted context still large; applied deterministic tightening "
             "(summary≤%d, recent≤%d, goal≤%d chars) → ~%d tokens",
-            log_prefix, summary_cap, recent_cap, first_cap, new_total,
+            summary_cap, recent_cap, first_cap, new_total,
         )
 
-    logger.info("%sCompacted context: %d → ~%d tokens", log_prefix, total, new_total)
+    logger.info("Compacted context: %d → ~%d tokens", total, new_total)
     return compacted

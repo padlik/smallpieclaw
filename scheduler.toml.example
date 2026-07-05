@@ -36,7 +36,7 @@ notify = false
 enabled = true
 schedule = "cron"
 cron = "0 */4 * * *"
-task = "Perform a self-health diagnosis: (1) Read the last 500 lines of agent.log using file_read. (2) Analyze for errors, warnings, repeated failures, and anomalies. (3) Identify root causes and provide actionable suggestions. (4) Report findings as a structured summary."
+task = "Perform a self-health diagnosis: (1) Use the log_query built-in tool to retrieve recent WARNING+ and failed events (warnings, errors, and TOOL_FAILED/LLM_FAILED entries) from the structured log instead of reading raw prose lines. (2) Analyze them for repeated failures and anomalies. (3) Identify root causes and provide actionable suggestions. (4) Report findings as a structured summary."
 notify = true
 # Use a smarter model for deep log analysis; preserve context to track trends over time
 # model = "claude-3-5-sonnet-20241022"
