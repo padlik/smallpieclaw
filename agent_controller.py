@@ -106,7 +106,6 @@ class AgentController:
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._owns_cancel_event = cancel_event is None
         self.label = label
-        self._log_prefix = f"[{label}] "
         self._on_step = on_step
         self._on_tool_trace = on_tool_trace
         self._job_history_fn = job_history_fn
@@ -224,7 +223,7 @@ class AgentController:
     def cancel(self) -> None:
         """Cancel the currently-running task. Safe to call from any thread."""
         self._cancel_event.set()
-        logger.info("%sCancel requested by operator", self._log_prefix)
+        logger.info("Cancel requested by operator label=%s", self.label)
 
     def resume(self, token: str, confirmed: bool) -> None:
         """Called by TelegramInterface when user responds to a file_write/shell confirmation."""

@@ -74,7 +74,7 @@ class TestMaybeCompact:
     def test_under_threshold_returns_unchanged(self):
         msgs = [_msg("user", "hi"), _msg("assistant", "{}"), _msg("user", "ok")]
         llm = MagicMock()
-        out = maybe_compact(msgs, "system", 100_000, "", llm)
+        out = maybe_compact(msgs, "system", 100_000, llm)
         assert out is msgs
         llm.chat.assert_not_called()
 
@@ -90,7 +90,7 @@ class TestMaybeCompact:
         ]
         llm = MagicMock()
 
-        out = maybe_compact(msgs, "system", 4000, "", llm)
+        out = maybe_compact(msgs, "system", 4000, llm)
 
         assert len(out) == 3
         assert out[0]["content"] == "GOAL: inspect logs"
@@ -105,7 +105,7 @@ class TestMaybeCompact:
                              lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.return_value = "• summarized steps"
-        out = maybe_compact(msgs, "system", 100_000, "", llm)
+        out = maybe_compact(msgs, "system", 100_000, llm)
         # First message (goal) preserved.
         assert out[0]["content"] == "GOAL: do the big task"
         # Summary message injected.
@@ -118,7 +118,7 @@ class TestMaybeCompact:
                              lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.side_effect = RuntimeError("model down")
-        out = maybe_compact(msgs, "system", 100_000, "", llm)
+        out = maybe_compact(msgs, "system", 100_000, llm)
         # Not the oversized original; compacted to first + summary + last (4 msgs).
         assert len(out) < len(msgs)
         assert out[0]["content"] == "GOAL: do the big task"
@@ -132,7 +132,7 @@ class TestMaybeCompact:
                              lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.return_value = "   "
-        out = maybe_compact(msgs, "system", 100_000, "", llm)
+        out = maybe_compact(msgs, "system", 100_000, llm)
         summary_msg = next(m for m in out if "Compacted context" in str(m.get("content")))
         assert "ERR_TAIL" in summary_msg["content"]
 
@@ -144,7 +144,7 @@ class TestMaybeCompact:
                              lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.return_value = "• summary"
-        out = maybe_compact(msgs, "system", 100_000, "", llm)
+        out = maybe_compact(msgs, "system", 100_000, llm)
         assert "chars omitted" in out[-1]["content"]
         assert len(out[-1]["content"]) < (_RECENT_HEAD + _RECENT_TAIL + 50_000)
 
@@ -166,7 +166,7 @@ class TestMaybeCompact:
         # Tight budget: 0.85 * ctx must be below the post-compaction size so the
         # deterministic tightening loop engages and drives it under budget.
         ctx_max = 4000  # threshold = 3400 tokens
-        out = maybe_compact(msgs, "system", ctx_max, "", llm)
+        out = maybe_compact(msgs, "system", ctx_max, llm)
 
         final_tokens = char_estimate(out, "system")
         assert final_tokens <= int(ctx_max * 0.85)

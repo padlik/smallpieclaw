@@ -34,7 +34,7 @@ The agent uses a hybrid async/threaded architecture:
 │  │  Scheduler       │  │  MCP stderr drains (daemon)  │    │
 │  │  • Single thread │  │  • One per stdio MCP server  │    │
 │  │  • Spawns sub-   │  │  • Reads subprocess stderr   │    │
-│  │    agent threads  │  │  • Logs to agent.log         │    │
+│  │    agent threads  │  │  • Logs: jsonl + prose (XDG)  │    │
 │  └─────────────────┘  └──────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```

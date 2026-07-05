@@ -15,92 +15,18 @@ from __future__ import annotations
 
 import fcntl
 import logging
-import logging.handlers
 import os
 import signal
 import sys
 
+import agent_logging
+
 # Directory containing main.py — used as the agent's base directory
 _AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_LOG = os.path.join(_AGENT_DIR, "agent.log")
 
 
-# ---------------------------------------------------------------------------
-# Nightly log rotation — Linux-style numbered suffixes
-# ---------------------------------------------------------------------------
-class _NightlyRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
-    """
-    Rotates at midnight using Linux-style numbered suffixes:
-      agent.log.30 (oldest, deleted)
-      agent.log.N  → agent.log.(N+1)
-      agent.log.1  → agent.log.2
-      agent.log    → agent.log.1   (active log renamed)
-      (new empty)  → agent.log     (agent always writes here)
-    """
-
-    def doRollover(self) -> None:
-        if self.stream:
-            self.stream.close()
-            self.stream = None
-
-        base = self.baseFilename
-
-        # Shift numbered backups: .N → .(N+1), oldest removed
-        for i in range(self.backupCount - 1, 0, -1):
-            src = f"{base}.{i}"
-            dst = f"{base}.{i + 1}"
-            if os.path.exists(dst):
-                os.remove(dst)
-            if os.path.exists(src):
-                os.rename(src, dst)
-
-        # Rotate active log: agent.log → agent.log.1
-        dst1 = f"{base}.1"
-        if os.path.exists(dst1):
-            os.remove(dst1)
-        if os.path.exists(base):
-            os.rename(base, dst1)
-
-        # Open fresh agent.log (always the active log)
-        self.mode = "a"
-        self.stream = self._open()
-
-        # Advance the next rollover time
-        self.rolloverAt += self.interval
-
-
-def _setup_logging(log_file: str = _DEFAULT_LOG, backup_count: int = 30) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    stream_h = logging.StreamHandler(sys.stdout)
-    stream_h.setFormatter(fmt)
-
-    # Rotate at 00:00 local time; keep last backup_count daily files.
-    # Active log is always log_file; rotated copies become .1, .2, …
-    file_h = _NightlyRotatingFileHandler(
-        log_file,
-        when="midnight",
-        interval=1,
-        backupCount=backup_count,
-        encoding="utf-8",
-        utc=False,
-    )
-    file_h.setFormatter(fmt)
-
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(stream_h)
-    root.addHandler(file_h)
-
-    # Suppress high-volume INFO noise from HTTP/Telegram internals
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.WARNING)
-    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-
-
-# Bootstrap with default path; reconfigured after config load if needed
-_setup_logging()
+# Bootstrap logging to stdout until config (and the resolved XDG log path) load.
+agent_logging.setup_bootstrap()
 logger = logging.getLogger(__name__)
 
 
@@ -175,7 +101,7 @@ except ImportError:
 
 from agent_controller import AgentController, SubAgentRunner  # noqa: E402
 from builtin_executor import BuiltinExecutor, _load_context  # noqa: E402
-from config_schema import resolve_model_id, vault_path  # noqa: E402
+from config_schema import resolve_model_id, vault_path, log_path, parse_vault_content  # noqa: E402
 from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
@@ -215,6 +141,23 @@ def load_config(path="config.toml"):
     return app_cfg._raw, app_cfg
 
 
+def _read_vault_secrets(vault_file: str) -> list[str]:
+    """Return all string values stored in the vault, for log redaction.
+
+    Best-effort: returns an empty list if the vault is absent or unreadable so
+    logging setup never fails on account of the vault.
+    """
+    try:
+        if not os.path.exists(vault_file):
+            return []
+        with open(vault_file, encoding="utf-8") as f:
+            vault = parse_vault_content(f.read(), vault_file, require_all_strings=False)
+        return [v for v in vault.values() if isinstance(v, str) and v]
+    except Exception as exc:  # noqa: BLE001 — redaction is best-effort
+        logger.warning("Could not read vault secrets for log redaction: %s", exc)
+        return []
+
+
 def main():
     cfg, app_cfg = load_config()
 
@@ -230,7 +173,7 @@ def main():
     downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
     _agent_name   = os.path.basename(os.path.abspath("."))
     tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
-    log_file         = paths.get("log_file", _DEFAULT_LOG)
+    log_file         = log_path(cfg)
     log_backup_count = int(paths.get("log_backup_count", 30))
     pid_file      = os.path.join(
         _AGENT_DIR,
@@ -261,11 +204,13 @@ def _run(
     log_file, log_backup_count,
 ):
     """Core startup after PID lock is acquired."""
-    # Re-initialise logging with the configured path (replaces the bootstrap handler)
-    for h in logging.root.handlers[:]:
-        logging.root.removeHandler(h)
-        h.close()
-    _setup_logging(log_file, backup_count=log_backup_count)
+    # Re-initialise logging with the configured XDG path and structlog dual sink.
+    # Vault secret values are passed so they are redacted from every log record.
+    json_log_path = agent_logging.setup_logging(
+        log_file,
+        backup_count=log_backup_count,
+        secret_values=_read_vault_secrets(vault_path(cfg)),
+    )
 
     os.makedirs(tools_dir, exist_ok=True)
     os.makedirs(gen_tools_dir, exist_ok=True)
@@ -311,7 +256,7 @@ def _run(
         default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,
         max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
         shell_backend=shell_backend, shell_pty_cols=shell_pty_cols, shell_pty_rows=shell_pty_rows,
-        shell_streaming=shell_streaming, vault_path=vault_file,
+        shell_streaming=shell_streaming, vault_path=vault_file, log_jsonl_path=json_log_path,
     )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
     executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)

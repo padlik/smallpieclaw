@@ -53,7 +53,7 @@ The agent cannot analyze its own executions except by re-reading prose through a
         ▼                              ▼
    ┌──────────────────────────────────────────────────────────────┐
    │  Shared processor chain                                        │
-   │   merge_contextvars   ← trace/agent/label from structlog.ctxvars│
+   │   merge_contextvars   ← trace/agent from structlog.ctxvars      │
    │   add_log_level, TimeStamper(iso)                              │
    │   redact_secrets (NEW) ← scrub known vault values              │
    │   ProcessorFormatter.wrap_for_formatter                        │
@@ -82,7 +82,7 @@ Two stdlib handlers, each with a `ProcessorFormatter` differing only in final re
 A small `enum` (`TOOL_START/END/FAILED`, `LLM_CALL/FAILED`, `STEP_BEGIN/END`, `RUN_BEGIN/END`, `ERROR`) passed as the `event_type` key (structlog reserves `event` for the message). *Alternative:* ad-hoc `event_type` strings — rejected: drift defeats machine querying and the agent cannot enumerate valid values. The enum is the discoverable contract.
 
 **D4 — Identity via `structlog.contextvars`.**
-`bind_contextvars(trace=…, agent=…, label=…)` at run entry (`react_loop` start), sub-agent runner start, and scheduler job start; `merge_contextvars` injects them into every event; `clear_contextvars`/token reset on exit. Reconcile `llm_client.py`'s existing `ContextVar` by having it bind through `structlog.contextvars` (single source). *Alternative:* keep threading `log_prefix` strings — rejected; that is the status quo we are shedding.
+`bind_contextvars(trace=…, agent=…)` (where `agent` is the run label) at run entry (`react_loop` start — the common chokepoint for main, sub-agent, and scheduled runs); `merge_contextvars` injects them into every event; token-based reset on exit. Reconcile `llm_client.py`'s existing `ContextVar` by having it bind through `structlog.contextvars` (single source). *Alternative:* keep threading `log_prefix` strings — rejected; that is the status quo we are shedding.
 
 **D5 — `log_query` built-in tool, in-process, active-file-only.**
 Registered in `builtin_executor`. Reads only the active `agent.jsonl` (JSON-per-line from `JSONRenderer`), filters in Python by `trace` (default = current run), `level`, `event_type`, `tool`, `since`, with a result cap. The default filter (when no level is given) returns anomalies (`WARNING`+) **plus** `TOOL_START/END` and `LLM_CALL` regardless of level, while excluding high-volume `STEP_BEGIN/END` boundary chatter — so repeated-action patterns are visible without drowning the result cap in step noise. *Alternatives:* shell out to `jq` — rejected (process spawn latency, external dep); SQLite — deferred.

@@ -12,8 +12,6 @@ guard the P0/P1/P2 behaviors that are easy to silently regress:
 
 from __future__ import annotations
 
-import logging
-
 from tests.execution_harness import (
     RecordingExecutor,
     ScriptedLLM,
@@ -107,9 +105,14 @@ class TestVisionRouting:
 
 
 class TestTraceCorrelation:
-    def test_run_logs_include_trace_id(self, caplog):
+    def test_run_logs_include_trace_id(self, monkeypatch):
+        # Trace identity is now bound into structlog contextvars at run entry
+        # (a structured field on run/step events) rather than embedded in the raw
+        # log message text.
+        import agent_logging
+        seen: dict = {}
+        monkeypatch.setattr(agent_logging, "bind_run_context", lambda **kw: seen.update(kw))
         llm = ScriptedLLM(['{"action": "finish", "result": "ok"}'])
         ex = RecordingExecutor()
-        with caplog.at_level(logging.INFO, logger="react_loop"):
-            run_react(llm, ex, "trivial", trace_id="r-scenario1")
-        assert any("r-scenario1" in rec.getMessage() for rec in caplog.records)
+        run_react(llm, ex, "trivial", trace_id="r-scenario1")
+        assert seen.get("trace") == "r-scenario1"

@@ -50,7 +50,7 @@ Rule: The event vocabulary is a fixed, discoverable contract so the agent can qu
 #### Scenario: Tool failure emits a structured event
 - **GIVEN** a tool invocation that exits non-zero
 - **WHEN** the failure is logged
-- **THEN** the record carries `event = "TOOL_FAILED"` with structured `tool`, `exit`, and `dur_ms` fields
+- **THEN** the record carries `event_type = "TOOL_FAILED"` with structured `tool`, `exit`, and `dur_ms` fields
 
 #### Scenario: Event vocabulary is closed and discoverable
 - **GIVEN** the set of defined event types
@@ -62,7 +62,7 @@ Rule: The event vocabulary is a fixed, discoverable contract so the agent can qu
 - **GIVEN** a call site outside the hot set that emits a plain message
 - **WHEN** the record is written
 - **THEN** it appears in both sinks with identity fields
-- **AND** it simply has no `event` field
+- **AND** it simply has no `event_type` field
 
 ### Requirement: Secret redaction in logs
 

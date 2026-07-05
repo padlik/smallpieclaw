@@ -44,6 +44,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol
 
+import structlog
+
+import agent_logging
+
+slog = agent_logging.get_logger(__name__)
+
 
 class _SupportsClose(Protocol):
     """Protocol for file-like objects that support close()."""
@@ -171,6 +177,99 @@ def _is_sensitive_path(path: str) -> tuple[bool, str]:
         if re.search(pattern, path, re.IGNORECASE):
             return True, f"matches sensitive pattern: {pattern}"
     return False, ""
+
+
+# ---------------------------------------------------------------------------
+# log_query helpers (structured-log introspection built-in)
+# ---------------------------------------------------------------------------
+_WARNING_LEVEL_NUM: int = logging.WARNING
+# Option C default view: with no explicit level/event_type filter, surface the
+# high-signal lifecycle events below (plus anything WARNING+); routine per-step
+# bookkeeping (STEP_*) is omitted unless it is itself WARNING+.
+_LOG_QUERY_DEFAULT_INCLUDE_EVENTS: frozenset[str] = frozenset(
+    {"TOOL_START", "TOOL_END", "LLM_CALL"}
+)
+# Bounds for the log_query built-in: cap disk I/O, parse work, and per-field
+# size so a mid-loop introspection call cannot blow the context/token budget.
+_LOG_QUERY_TAIL_BYTES: int = 1_000_000
+_LOG_QUERY_MAX_SCAN_LINES: int = 5000
+_LOG_QUERY_FIELD_MAXLEN: int = 500
+
+
+def _log_level_to_num(level: object) -> int:
+    """Map a level NAME or number to its numeric value (unknown/blank -> 0).
+
+    Accepts the lowercase level names emitted by structlog's ``add_log_level``
+    (e.g. ``"info"``) as well as standard uppercase names; comparison is
+    case-insensitive. Non-numeric/unknown levels sort below every real level.
+    """
+    if isinstance(level, bool):
+        return 0
+    if isinstance(level, (int, float)):
+        return int(level)
+    if not level:
+        return 0
+    num = logging.getLevelName(str(level).upper())
+    return num if isinstance(num, int) else 0
+
+
+def _log_query_default_keep(rec: dict) -> bool:
+    """Option C default-view predicate for a single structured log record.
+
+    Keep the record if it is WARNING+ or a high-signal lifecycle event
+    (TOOL_START/TOOL_END/LLM_CALL); routine STEP_* events are dropped unless
+    they are themselves WARNING+.
+    """
+    level_num = _log_level_to_num(rec.get("level"))
+    event_type = str(rec.get("event_type", ""))
+    is_warn = level_num >= _WARNING_LEVEL_NUM
+    return is_warn or event_type in _LOG_QUERY_DEFAULT_INCLUDE_EVENTS
+
+
+def _read_tail_lines(path: str, max_bytes: int, max_lines: int) -> tuple[list[str], bool]:
+    """Return ``(lines, window_saturated)`` for the trailing window of *path*.
+
+    Reads at most the final *max_bytes* and returns at most the most recent
+    *max_lines*, so scanning the active log stays cheap regardless of total file
+    size. When the read starts mid-file the leading partial line is dropped, so
+    callers never see a truncated (unparseable) JSON record.
+
+    ``window_saturated`` is True when the window did NOT cover the whole file —
+    either the byte read began mid-file (``max_bytes`` reached) or more lines
+    were present than *max_lines* (``max_lines`` reached) — so older records fell
+    outside the returned tail and counts derived from it are recent-window lower
+    bounds, not full-file totals.
+    """
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        start = max(0, size - max_bytes)
+        fh.seek(start)
+        data = fh.read()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]  # drop the partial first line from a mid-file seek
+    window_saturated = start > 0 or len(lines) > max_lines
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return lines, window_saturated
+
+
+def _log_query_project(rec: dict) -> dict:
+    """Return a shallow copy of *rec* with over-long string values truncated.
+
+    Caps any single field at ``_LOG_QUERY_FIELD_MAXLEN`` chars so one verbose
+    record (e.g. a large ``err`` or ``msg``) cannot dominate the log_query
+    output — the field-level analogue of ToolExecutor.max_output.
+    """
+    projected: dict = {}
+    for key, value in rec.items():
+        if isinstance(value, str) and len(value) > _LOG_QUERY_FIELD_MAXLEN:
+            omitted = len(value) - _LOG_QUERY_FIELD_MAXLEN
+            projected[key] = f"{value[:_LOG_QUERY_FIELD_MAXLEN]}…[+{omitted} chars]"
+        else:
+            projected[key] = value
+    return projected
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +465,34 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "\"entity_type\": \"preference\"}"
         ),
     ),
+    "log_query": BuiltinTool(
+        name="log_query",
+        description=(
+            "Query the agent's own structured run log (the active JSONL sink) to inspect "
+            "recent tool activity, errors, and events for the current or a specified run. "
+            "Reads ONLY the recent TAIL of the active log (the most recent lines/bytes), so "
+            "results reflect a recent window, not the entire run history. "
+            "Read-only and non-destructive; all arguments are optional. "
+            "Args: "
+            "  trace       (str) — run trace id (e.g. 'r-1a2b3c4d'); defaults to the CURRENT run. "
+            "                      Use '*' (or '') to search across all runs/traces. "
+            "  level       (str) — minimum level NAME to include: DEBUG|INFO|WARNING|ERROR|CRITICAL. "
+            "  event_type  (str) — exact event type to match: TOOL_START|TOOL_END|TOOL_FAILED|"
+            "LLM_CALL|LLM_FAILED|STEP_BEGIN|STEP_END|RUN_BEGIN|RUN_END|ERROR. "
+            "  tool        (str) — exact tool name to match (e.g. 'shell', 'file_read'). "
+            "  since       (str) — ISO timestamp; only include records at or after this time. "
+            "  limit       (int, default 50) — max records to return (the most recent are kept if more match). "
+            "When neither level nor event_type is given, a high-signal default view is returned: "
+            "warnings/errors plus TOOL_START/TOOL_END/LLM_CALL events (routine STEP_* events are omitted). "
+            "Returns a JSON object with 'records', 'count', 'truncated', 'total_matched', "
+            "'window_saturated', and 'scanned_lines'. NOTE: the active log is shared across all "
+            "traces, so 'total_matched' is a count within the scanned recent window (over "
+            "'scanned_lines' lines), NOT a full-run total; when 'window_saturated' is true, older "
+            "records fell outside the scanned window — narrow with 'since'/'tool'/'event_type' or "
+            "treat counts as a recent-window lower bound. "
+            "Example: {\"tool\": \"shell\", \"limit\": 20}"
+        ),
+    ),
 }
 
 
@@ -391,7 +518,7 @@ class BuiltinExecutor:
                  notify_html_fn=None, shell_backend: str = "subprocess",
                  shell_pty_cols: int = 220, shell_pty_rows: int = 50,
                  shell_streaming: bool = False, working=None, results=None,
-                 vault_path: str = ""):
+                 vault_path: str = "", log_jsonl_path: str = ""):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -404,6 +531,7 @@ class BuiltinExecutor:
         self._subagent_result_timeout = subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
         self._vault_path = vault_path  # Path to TOML vault file for secret_get
+        self._log_jsonl_path = log_jsonl_path  # Active JSONL log sink for the log_query built-in
         self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
         self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init
         self._shell_backend = shell_backend   # "subprocess" or "pty"
@@ -472,8 +600,98 @@ class BuiltinExecutor:
         shell execution (only when shell_streaming=True). Ignored for other tools.
         trace_id is the request-scoped trace of the invoking run; it is propagated to
         spawned sub-agents so their logs correlate with the parent request.
+
+        Emits TOOL_START before dispatch and TOOL_END/TOOL_FAILED afterwards
+        (plus ERROR on an unexpected exception). These lifecycle events wrap the
+        existing dispatch without altering its result-dict contract or exception
+        propagation. A deferred result (requires_confirmation) gets no completion
+        event — the underlying operation has not run yet.
         """
         args = args or {}
+        start = time.perf_counter()
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_START,
+            f"tool start: {tool_name}",
+            level=logging.INFO,
+            logger=slog,
+            tool=tool_name,
+        )
+        try:
+            result = self._dispatch(
+                tool_name, args, caller_depth=caller_depth, caller_tag=caller_tag,
+                chunk_callback=chunk_callback, trace_id=trace_id,
+            )
+        except Exception as exc:
+            dur_ms = int((time.perf_counter() - start) * 1000)
+            self._emit_tool_lifecycle_error(tool_name, exc, dur_ms)
+            raise
+        dur_ms = int((time.perf_counter() - start) * 1000)
+        self._emit_tool_lifecycle_end(tool_name, result, dur_ms)
+        return result
+
+    def _emit_tool_lifecycle_end(self, tool_name: str, result: dict, dur_ms: int) -> None:
+        """Emit TOOL_END on a successful result or TOOL_FAILED on an error result.
+
+        A ``requires_confirmation`` result is a deferred operation (nothing has
+        executed yet), so no completion event is emitted for it.
+        """
+        if isinstance(result, dict) and result.get("requires_confirmation"):
+            return
+        if isinstance(result, dict) and result.get("success"):
+            agent_logging.log_event(
+                agent_logging.LogEvent.TOOL_END,
+                f"tool end: {tool_name}",
+                level=logging.INFO,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=result.get("exit_code", 0),
+            )
+        else:
+            exit_code = result.get("exit_code", -1) if isinstance(result, dict) else -1
+            err = (result.get("error", "") if isinstance(result, dict) else "") or ""
+            agent_logging.log_event(
+                agent_logging.LogEvent.TOOL_FAILED,
+                f"tool failed: {tool_name}",
+                level=logging.ERROR,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=exit_code,
+                err=err,
+            )
+
+    def _emit_tool_lifecycle_error(self, tool_name: str, exc: BaseException, dur_ms: int) -> None:
+        """Emit ERROR + TOOL_FAILED for an unexpected exception during a tool run.
+
+        Shared by the ``execute()`` dispatch wrapper and the confirmed-run path
+        in ``confirm()`` so a raised (rather than returned-as-dict) failure still
+        closes the TOOL_START span.
+        """
+        agent_logging.log_event(
+            agent_logging.LogEvent.ERROR,
+            f"tool error: {tool_name}: {exc}",
+            level=logging.ERROR,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=-1,
+            err=str(exc),
+        )
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_FAILED,
+            f"tool failed: {tool_name}",
+            level=logging.ERROR,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=-1,
+            err=str(exc),
+        )
+
+    def _dispatch(self, tool_name: str, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                  chunk_callback: Optional[Callable[[str], None]] = None, trace_id: str = "") -> dict:
+        """Route a built-in tool call to its handler (no lifecycle logging)."""
         if tool_name == "shell":
             return self._exec_shell(args, caller_depth=caller_depth, caller_tag=caller_tag,
                                     chunk_callback=chunk_callback)
@@ -502,25 +720,62 @@ class BuiltinExecutor:
             return self._exec_memory_graph_store(args, caller_depth=caller_depth, caller_tag=caller_tag)
         elif tool_name == "secret_get":
             return self._exec_secret_get(args, caller_depth=caller_depth, caller_tag=caller_tag)
+        elif tool_name == "log_query":
+            return self._exec_log_query(args, caller_depth=caller_depth, caller_tag=caller_tag)
         else:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
 
-    def confirm(self, token: str, chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
+    def confirm(self, token: str, chunk_callback: Optional[Callable[[str], None]] = None,
+                *, _emit_lifecycle: bool = True) -> dict:
         """Execute a previously staged dangerous operation after user confirmation.
 
         chunk_callback is forwarded to the shell backend so live streaming keeps
         working for commands that required confirmation before running.
+
+        execute() deferred the TOOL_END/TOOL_FAILED when it returned
+        ``requires_confirmation`` (nothing had run yet), so the confirmed run
+        emits the matching completion here — with ``tool`` and ``dur_ms`` — to
+        close the TOOL_START span. ``_emit_lifecycle`` is set False by the
+        headless bridge, whose own execute() wrapper still owns the span and
+        would otherwise double-log the completion.
         """
         entry = self._pending.pop(token, None)
         if entry is None:
             return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
         tool_name, args = entry
         logger.info("Executing confirmed built-in '%s' (token %s)", tool_name, token[:8])
-        return self._run(tool_name, args, chunk_callback=chunk_callback)
+        start = time.perf_counter()
+        try:
+            result = self._run(tool_name, args, chunk_callback=chunk_callback)
+        except Exception as exc:
+            if _emit_lifecycle:
+                dur_ms = int((time.perf_counter() - start) * 1000)
+                self._emit_tool_lifecycle_error(tool_name, exc, dur_ms)
+            raise
+        if _emit_lifecycle:
+            dur_ms = int((time.perf_counter() - start) * 1000)
+            self._emit_tool_lifecycle_end(tool_name, result, dur_ms)
+        return result
 
     def cancel(self, token: str) -> None:
-        """Discard a pending confirmation."""
-        self._pending.pop(token, None)
+        """Discard a pending confirmation.
+
+        Closes the TOOL_START span left open when execute() deferred the
+        operation: emits a cancelled TOOL_END (``cancelled=True``) when the
+        token was still pending. An unknown/expired token is a no-op.
+        """
+        entry = self._pending.pop(token, None)
+        if entry is None:
+            return
+        tool_name = entry[0]
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_END,
+            f"tool cancelled: {tool_name}",
+            level=logging.INFO,
+            logger=slog,
+            tool=tool_name,
+            cancelled=True,
+        )
 
     def signal_headless_confirm(self, token: str, approved: bool) -> bool:
         """Signal the outcome of a headless (sub-agent) confirmation prompt.
@@ -543,7 +798,6 @@ class BuiltinExecutor:
 
     def _requires_confirmation(self, tool_name: str, args: dict, description: str,
                                caller_depth: int = 0, caller_tag: str = "") -> dict:
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
         # In headless mode (sub-agents, caller_depth >= 1):
         #   shell/dangerous → always deny (too risky to run destructive commands unattended)
         #   file_read/sensitive, file_write, file_patch → require operator confirmation via Telegram
@@ -551,8 +805,8 @@ class BuiltinExecutor:
             if tool_name == "shell":
                 command = args.get("command", "")
                 logger.warning(
-                    "%sHeadless sub-agent: dangerous shell command blocked (requires confirmation): %s",
-                    _pfx, command[:120],
+                    "Headless sub-agent: dangerous shell command blocked (requires confirmation): %s",
+                    command[:120],
                 )
                 return {
                     "success": False,
@@ -568,7 +822,7 @@ class BuiltinExecutor:
 
         token = secrets.token_hex(12)
         self._pending[token] = (tool_name, args)
-        logger.info("%sBuilt-in '%s' requires confirmation, token=%s", _pfx, tool_name, token[:8])
+        logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
         return {
             "requires_confirmation": True,
             "token": token,
@@ -582,12 +836,11 @@ class BuiltinExecutor:
         If the prompt callback is not wired (bot not ready) or times out, fails closed.
         """
         import threading as _threading
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
 
         if self._subagent_confirm_prompt_fn is None:
             logger.warning(
-                "%sHeadless sub-agent: Telegram bridge not wired — blocking %s (fail-closed)",
-                _pfx, tool_name,
+                "Headless sub-agent: Telegram bridge not wired — blocking %s (fail-closed)",
+                tool_name,
             )
             return {
                 "success": False,
@@ -605,15 +858,15 @@ class BuiltinExecutor:
         self._pending[token] = (tool_name, args)
 
         logger.info(
-            "%sHeadless sub-agent: sending Telegram confirmation prompt for %s (token=%s)",
-            _pfx, tool_name, token[:8],
+            "Headless sub-agent: sending Telegram confirmation prompt for %s (token=%s)",
+            tool_name, token[:8],
         )
         try:
             self._subagent_confirm_prompt_fn(token, tool_name, description, caller_tag)
         except Exception as exc:
             logger.error(
-                "%sHeadless sub-agent: failed to send Telegram prompt for %s: %s — blocking (fail-closed)",
-                _pfx, tool_name, exc,
+                "Headless sub-agent: failed to send Telegram prompt for %s: %s — blocking (fail-closed)",
+                tool_name, exc,
             )
             self._headless_confirm_events.pop(token, None)
             self._pending.pop(token, None)
@@ -627,8 +880,8 @@ class BuiltinExecutor:
         answered = event.wait(timeout=self._subagent_confirm_timeout)
         if not answered:
             logger.warning(
-                "%sHeadless sub-agent: Telegram prompt timed out for %s (token=%s) — blocking",
-                _pfx, tool_name, token[:8],
+                "Headless sub-agent: Telegram prompt timed out for %s (token=%s) — blocking",
+                tool_name, token[:8],
             )
             self._headless_confirm_events.pop(token, None)
             self._pending.pop(token, None)
@@ -646,7 +899,7 @@ class BuiltinExecutor:
         approved = self._headless_confirm_results.pop(token, False)
         if not approved:
             self._pending.pop(token, None)
-            logger.info("%sHeadless sub-agent: operator denied %s (token=%s)", _pfx, tool_name, token[:8])
+            logger.info("Headless sub-agent: operator denied %s (token=%s)", tool_name, token[:8])
             return {
                 "success": False,
                 "output": "",
@@ -654,8 +907,10 @@ class BuiltinExecutor:
                 "exit_code": -1,
             }
 
-        logger.info("%sHeadless sub-agent: operator approved %s (token=%s) — executing", _pfx, tool_name, token[:8])
-        return self.confirm(token)
+        logger.info("Headless sub-agent: operator approved %s (token=%s) — executing", tool_name, token[:8])
+        # The enclosing execute() call already owns this tool's lifecycle span,
+        # so suppress confirm()'s own completion event to avoid double-logging.
+        return self.confirm(token, _emit_lifecycle=False)
 
     def _run(self, tool_name: str, args: dict, caller_tag: str = "",
              chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
@@ -706,7 +961,6 @@ class BuiltinExecutor:
         Shell logs can contain sensitive command output, so the directory is
         created owner-only (0700) and the file owner-only (0600).
         """
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
         try:
             log_dir = os.path.join(self._data_dir, "shell_logs")
             os.makedirs(log_dir, mode=0o700, exist_ok=True)
@@ -723,7 +977,7 @@ class BuiltinExecutor:
             fh = os.fdopen(fd, "w", encoding="utf-8", errors="replace")
             return fh, path
         except OSError as exc:
-            logger.warning("%sBuilt-in shell: cannot open artifact log: %s", _pfx, exc)
+            logger.warning("Built-in shell: cannot open artifact log: %s", exc)
             return None, None
 
     def _finalize_shell_log(self, fh, path: Optional[str], total_chars: int,
@@ -733,7 +987,6 @@ class BuiltinExecutor:
         Keeps the file (and returns path) only when total_chars exceeds
         max_output.  Otherwise removes the file and returns None.
         """
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
         if fh is not None:
             try:
                 fh.close()
@@ -742,8 +995,8 @@ class BuiltinExecutor:
         if path is None:
             return None
         if total_chars > self.max_output:
-            logger.info("%sBuilt-in shell: full output (%d chars) saved to %s",
-                        _pfx, total_chars, path)
+            logger.info("Built-in shell: full output (%d chars) saved to %s",
+                        total_chars, path)
             return path
         try:
             os.unlink(path)
@@ -754,8 +1007,7 @@ class BuiltinExecutor:
     def _run_shell_subprocess(self, args: dict, caller_tag: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self.default_timeout))
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in shell (subprocess) executing: %s", _pfx, command[:120])
+        logger.info("Built-in shell (subprocess) executing: %s", command[:120])
         _start = time.monotonic()
 
         # Open artifact log for incremental writing; kept only if output is large.
@@ -971,8 +1223,8 @@ class BuiltinExecutor:
             output = output + notice
 
         logger.info(
-            "%sBuilt-in shell exit=%s stdout=%d stderr=%d chars in %.0fms",
-            _pfx, returncode, _total_out, _total_err, elapsed_ms,
+            "Built-in shell exit=%s stdout=%d stderr=%d chars in %.0fms",
+            returncode, _total_out, _total_err, elapsed_ms,
         )
         if timed_out:
             timeout_error = f"Command timed out after {timeout}s."
@@ -1037,14 +1289,13 @@ class BuiltinExecutor:
         """
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self.default_timeout))
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in shell (pty) executing: %s", _pfx, command[:120])
+        logger.info("Built-in shell (pty) executing: %s", command[:120])
         streaming = self._shell_streaming and chunk_callback is not None
 
         try:
             from ptyprocess import PtyProcessUnicode  # type: ignore[import]
         except ImportError:
-            logger.warning("%sptyprocess not available, falling back to subprocess", _pfx)
+            logger.warning("ptyprocess not available, falling back to subprocess")
             return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
         import select as _select
@@ -1058,7 +1309,7 @@ class BuiltinExecutor:
                 echo=False,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("%sPTY spawn failed (%s), falling back to subprocess", _pfx, exc)
+            logger.warning("PTY spawn failed (%s), falling back to subprocess", exc)
             return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
         import time as _time
@@ -1146,8 +1397,8 @@ class BuiltinExecutor:
         if exit_code is None:
             exit_code = -1
         logger.info(
-            "%sBuilt-in shell (pty) exit=%s combined=%d chars in %.0fms",
-            _pfx, exit_code, total_chars, elapsed_ms,
+            "Built-in shell (pty) exit=%s combined=%d chars in %.0fms",
+            exit_code, total_chars, elapsed_ms,
         )
         if timed_out:
             return {
@@ -1205,8 +1456,7 @@ class BuiltinExecutor:
         path = str(args.get("path", "")).strip()
         max_bytes = int(args.get("max_bytes", 50_000))
         offset = int(args.get("offset", 0))
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in file_read: %s (offset=%d, max=%d)", _pfx, path, offset, max_bytes)
+        logger.info("Built-in file_read: %s (offset=%d, max=%d)", path, offset, max_bytes)
         try:
             if not os.path.exists(path):
                 return {
@@ -1280,8 +1530,7 @@ class BuiltinExecutor:
         except (TypeError, ValueError):
             return {"success": False, "output": "", "error": "file_diff: 'max_bytes' must be an integer.", "exit_code": -1}
 
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in file_diff: %s <-> %s (context=%d)", _pfx, path_a, path_b, context_lines)
+        logger.info("Built-in file_diff: %s <-> %s (context=%d)", path_a, path_b, context_lines)
 
         try:
             for p in (path_a, path_b):
@@ -1328,8 +1577,7 @@ class BuiltinExecutor:
         mode = str(args.get("mode", "w"))
         if mode not in ("w", "a"):
             mode = "w"
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in file_write: %s (mode=%s, len=%d)", _pfx, path, mode, len(content))
+        logger.info("Built-in file_write: %s (mode=%s, len=%d)", path, mode, len(content))
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, mode) as f:
@@ -1444,8 +1692,7 @@ class BuiltinExecutor:
             occurrence = int(args.get("occurrence", 1))
         except (ValueError, TypeError):
             occurrence = 1
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in file_patch: %s (occurrence=%d)", _pfx, path, occurrence)
+        logger.info("Built-in file_patch: %s (occurrence=%d)", path, occurrence)
         try:
             with open(path, "r", errors="replace") as fh:
                 content = fh.read()
@@ -1509,8 +1756,7 @@ class BuiltinExecutor:
                 "success": False, "output": "",
                 "error": f"File too large ({size // 1024 // 1024} MB). Max 50 MB.", "exit_code": 1,
             }
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in file_send: %s (%d bytes)", _pfx, path, size)
+        logger.info("Built-in file_send: %s (%d bytes)", path, size)
         return {
             "success": True,
             "output": f"Sending {os.path.basename(path)} to chat…",
@@ -1809,11 +2055,10 @@ class BuiltinExecutor:
         get_agent_registry().register(record)
 
         # Log spawn params for observability
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
         _fb_log = str(fallback_models) if fallback_models is not None else "inherited"
         logger.info(
-            "%sspawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
-            _pfx, runner.agent_id, label, runner._model_id, _fb_log, task[:100],
+            "spawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
+            runner.agent_id, label, runner._model_id, _fb_log, task[:100],
         )
 
         def _run_and_notify():
@@ -2161,7 +2406,6 @@ class BuiltinExecutor:
     # ---- memory_graph_search ----
 
     def _exec_memory_graph_search(self, args: dict, caller_tag: str = "") -> dict:
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
         if self._graph_memory is None:
             return {
                 "success": False, "output": "",
@@ -2195,7 +2439,7 @@ class BuiltinExecutor:
                     "recoverable": False,
                     "suggestion": "",
                 }
-            logger.info("%smemory_graph_search: query=%s", _pfx, query[:60])
+            logger.info("memory_graph_search: query=%s", query[:60])
             return {
                 "success": True,
                 "output": context,
@@ -2257,7 +2501,6 @@ class BuiltinExecutor:
         """Execute a confirmed graph-memory store. Only reached after operator approval."""
         from graph_memory import ADMISSION_CONFIRMED, CONFIDENCE_CONFIRMED
 
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
         if self._graph_memory is None:
             return {
                 "success": False, "output": "",
@@ -2293,7 +2536,7 @@ class BuiltinExecutor:
             if self._graph_memory_writer is not None:
                 self._graph_memory_writer.enqueue(content, user_id=user_id, source="manual")
                 self._graph_memory_writer.flush()
-            logger.info("%smemory_graph_store: stored confirmed episode %s", _pfx, ep_id)
+            logger.info("memory_graph_store: stored confirmed episode %s", ep_id)
             return {
                 "success": True,
                 "output": f"Stored in graph memory as confirmed (episode {ep_id}). "
@@ -2349,8 +2592,7 @@ class BuiltinExecutor:
         from exceptions import ConfigError as _ConfigError  # noqa: PLC0415
 
         key = args.get("key", "")
-        _pfx = f"[{caller_tag}] " if caller_tag else ""
-        logger.info("%sBuilt-in secret_get: key=%s", _pfx, key)
+        logger.info("Built-in secret_get: key=%s", key)
 
         try:
             with open(self._vault_path, encoding="utf-8") as fh:
@@ -2421,6 +2663,146 @@ class BuiltinExecutor:
         return {
             "success": True,
             "output": value,
+            "error": "",
+            "exit_code": 0,
+            "error_type": "",
+            "recoverable": True,
+        }
+
+    # ---- log_query ----
+
+    def _exec_log_query(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+        """Query the active JSONL log sink and return matching records.
+
+        Read-only introspection over ``self._log_jsonl_path`` (one JSON object
+        per line). Only the trailing ``_LOG_QUERY_TAIL_BYTES`` bytes / most
+        recent ``_LOG_QUERY_MAX_SCAN_LINES`` lines are scanned, so a mid-loop
+        call does bounded work regardless of total log size (``total_matched``
+        therefore counts matches within that tail window). Supports
+        trace/level/event_type/tool/since filters, a useful default view
+        (Option C) when neither level nor event_type is supplied, and
+        most-recent-N truncation via ``limit``. A missing or unset log path
+        yields a well-formed EMPTY result rather than an error. ``caller_depth``
+        and ``caller_tag`` are accepted for dispatch symmetry with peer handlers.
+        """
+        # limit (most-recent-N kept); fall back to the default on bad input.
+        try:
+            limit = int(args.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        if limit <= 0:
+            limit = 50
+
+        # Resolve the trace scope: an explicit arg wins, else the current run's
+        # trace from contextvars; "*" or "" widens the query to all traces.
+        if args.get("trace") is not None:
+            trace = str(args.get("trace"))
+        else:
+            trace = str(structlog.contextvars.get_contextvars().get("trace", "") or "")
+        all_traces = trace in ("*", "")
+
+        level_arg = args.get("level") or ""
+        event_type_arg = args.get("event_type") or ""
+        tool_arg = args.get("tool") or ""
+        since_arg = str(args.get("since") or "")
+        use_default_view = not level_arg and not event_type_arg
+        min_level = _log_level_to_num(level_arg) if level_arg else 0
+
+        logger.info(
+            "log_query: trace=%s level=%s event_type=%s tool=%s since=%s limit=%d",
+            trace or "<all>", level_arg or "-", event_type_arg or "-",
+            tool_arg or "-", since_arg or "-", limit,
+        )
+
+        path = self._log_jsonl_path
+        if not path or not os.path.exists(path):
+            return self._log_query_result([], 0, False)
+
+        # Bounded tail read: never scan more than the trailing window even if the
+        # active log has grown large within the day (before rotation).
+        try:
+            lines, window_saturated = _read_tail_lines(
+                path, _LOG_QUERY_TAIL_BYTES, _LOG_QUERY_MAX_SCAN_LINES
+            )
+        except OSError as exc:
+            logger.warning("log_query: cannot read log sink %s: %s", path, exc)
+            return self._log_query_result([], 0, False)
+        scanned_lines = len(lines)
+
+        matched: list[dict] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (ValueError, TypeError):
+                continue  # skip malformed (non-JSON) lines gracefully
+            if not isinstance(rec, dict):
+                continue
+
+            if not all_traces and str(rec.get("trace", "")) != trace:
+                continue
+            if since_arg and str(rec.get("ts", "")) < since_arg:
+                continue
+            if tool_arg and rec.get("tool") != tool_arg:
+                continue
+            if level_arg and _log_level_to_num(rec.get("level")) < min_level:
+                continue
+            if event_type_arg and rec.get("event_type") != event_type_arg:
+                continue
+            if use_default_view and not _log_query_default_keep(rec):
+                continue
+
+            matched.append(rec)
+
+        total_matched = len(matched)
+        truncated = total_matched > limit
+        out_records = matched[-limit:] if truncated else matched
+        return self._log_query_result(
+            out_records, total_matched, truncated,
+            window_saturated=window_saturated, scanned_lines=scanned_lines,
+        )
+
+    def _log_query_result(self, records: list, total_matched: int, truncated: bool,
+                          *, window_saturated: bool = False, scanned_lines: int = 0) -> dict:
+        """Render a log_query payload using the peer result-dict convention.
+
+        Records are projected (over-long field values truncated) and only the
+        most recent records whose compact serialization fits within
+        ``self.max_output`` are kept — mirroring ToolExecutor.max_output so a
+        mid-loop call cannot blow the context budget. The metadata keys (count,
+        truncated, total_matched) are preserved; ``truncated`` also reflects any
+        size cap. The newest record is always kept even if it alone is large.
+
+        ``window_saturated``/``scanned_lines`` disclose the recent-window scope:
+        ``total_matched`` counts matches only within the ``scanned_lines`` lines
+        of the scanned tail, and when ``window_saturated`` is True older records
+        fell outside that window (so it is a recent-window lower bound).
+        """
+        projected = [_log_query_project(rec) for rec in records]
+        # Single pass newest→oldest: keep records until the serialized size would
+        # exceed the budget (O(n); avoids re-serializing the whole list).
+        kept_rev: list = []
+        size = 2  # the enclosing "[]"
+        for rec in reversed(projected):
+            size += len(json.dumps(rec, ensure_ascii=False)) + 1  # +1 separator
+            if kept_rev and size > self.max_output:
+                truncated = True
+                break
+            kept_rev.append(rec)
+        kept = list(reversed(kept_rev))
+        payload = {
+            "records": kept,
+            "count": len(kept),
+            "truncated": truncated,
+            "total_matched": total_matched,
+            "window_saturated": window_saturated,
+            "scanned_lines": scanned_lines,
+        }
+        return {
+            "success": True,
+            "output": json.dumps(payload, ensure_ascii=False),
             "error": "",
             "exit_code": 0,
             "error_type": "",

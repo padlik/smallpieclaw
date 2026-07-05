@@ -11,11 +11,14 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from typing import Optional
 
+import agent_logging
 from tool_registry import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
+slog = agent_logging.get_logger(__name__)
 
 
 class ToolExecutor:
@@ -47,7 +50,73 @@ class ToolExecutor:
             "error":   str,   # stderr or exception message
             "exit_code": int
           }
+
+        Wraps the subprocess execution with TOOL_START/TOOL_END/TOOL_FAILED
+        lifecycle events (and ERROR on an unexpected exception). Logging is
+        purely additive: the result-dict contract and exception propagation are
+        unchanged.
         """
+        start = time.perf_counter()
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_START,
+            f"tool start: {tool_name}",
+            level=logging.INFO,
+            logger=slog,
+            tool=tool_name,
+        )
+        try:
+            result = self._execute_impl(tool_name, args)
+        except Exception as exc:
+            dur_ms = int((time.perf_counter() - start) * 1000)
+            agent_logging.log_event(
+                agent_logging.LogEvent.ERROR,
+                f"tool error: {tool_name}: {exc}",
+                level=logging.ERROR,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=-1,
+                err=str(exc),
+            )
+            agent_logging.log_event(
+                agent_logging.LogEvent.TOOL_FAILED,
+                f"tool failed: {tool_name}",
+                level=logging.ERROR,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=-1,
+                err=str(exc),
+            )
+            raise
+        dur_ms = int((time.perf_counter() - start) * 1000)
+        if isinstance(result, dict) and result.get("success"):
+            agent_logging.log_event(
+                agent_logging.LogEvent.TOOL_END,
+                f"tool end: {tool_name}",
+                level=logging.INFO,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=result.get("exit_code", 0),
+            )
+        else:
+            exit_code = result.get("exit_code", -1) if isinstance(result, dict) else -1
+            err = (result.get("error", "") if isinstance(result, dict) else "") or ""
+            agent_logging.log_event(
+                agent_logging.LogEvent.TOOL_FAILED,
+                f"tool failed: {tool_name}",
+                level=logging.ERROR,
+                logger=slog,
+                tool=tool_name,
+                dur_ms=dur_ms,
+                exit=exit_code,
+                err=err,
+            )
+        return result
+
+    def _execute_impl(self, tool_name: str, args: Optional[dict] = None) -> dict:
+        """Run the named tool in a subprocess and return the raw result dict."""
         tool = self.registry.get(tool_name)
         if tool is None:
             known = ", ".join(sorted(self.registry._registry.keys())) or "none"
