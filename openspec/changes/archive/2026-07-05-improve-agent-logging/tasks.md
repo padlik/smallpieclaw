@@ -17,7 +17,7 @@
 - [x] 3.1 Bind `trace`/`agent`/`label` via `structlog.contextvars.bind_contextvars` at ReAct run entry (`react_loop`), sub-agent runner start, and scheduler job start; clear/reset on exit.
 - [x] 3.2 Reconcile `llm_client.py`'s existing trace `ContextVar` to bind through `structlog.contextvars` so identity has one source.
 - [x] 3.3 Retire explicit `log_prefix` string threading at touched sites (`react_loop`, `context_manager`, `memory_store`), relying on `merge_contextvars`.
-- [ ] 3.4 Verify identity survives into sub-agent/background threads (bound at each thread entry).
+- [x] 3.4 Verify identity survives into sub-agent/background threads (bound at each thread entry).
 
 ## 4. Structured events at the hot set
 
