@@ -391,3 +391,57 @@ class TestFormatToolResultRecoveryFields:
         })
         assert "error_type:" not in msg
         assert "recoverable:" not in msg
+
+
+class TestCompactionGoalAnchoring:
+    """react_loop-level regression: the goal survives repeated in-loop compaction.
+
+    Drives a real multi-step ReAct run through the execution harness with
+    short-term history preceding the goal (so ``goal_idx > 0``) and an estimator
+    that forces compaction on every step. The goal must remain in the context
+    handed to the model on the final step, proving ``react_loop`` threads the
+    index returned by ``maybe_compact`` back into the next compaction correctly.
+    """
+
+    def test_goal_survives_repeated_compaction(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import context_manager
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, run_react
+
+        # Force compaction whenever more than three messages are present.
+        monkeypatch.setattr(
+            context_manager, "estimate_messages_tokens",
+            lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10,
+        )
+
+        goal = "CURRENT GOAL: reconcile the ledger end to end"
+        short_term = MagicMock()
+        short_term.get_messages.return_value = [
+            {"role": "user", "content": "old goal 0"},
+            {"role": "assistant", "content": "old answer 0"},
+            {"role": "user", "content": "old goal 1"},
+            {"role": "assistant", "content": "old answer 1"},
+        ]
+
+        llm = ScriptedLLM([
+            '{"action": "tool", "tool": "noop", "args": {}}',
+            '{"action": "tool", "tool": "noop", "args": {}}',
+            '{"action": "tool", "tool": "noop", "args": {}}',
+            '{"action": "finish", "result": "done"}',
+        ])
+        executor = RecordingExecutor()
+
+        result, _calls, _progress = run_react(llm, executor, goal, short_term=short_term)
+
+        assert result == "done"
+        # The final context handed to the model must still contain the goal
+        # verbatim (not swept into the summary) after repeated compaction …
+        final_msgs = llm.calls[-1].messages
+        assert any(m.get("content") == goal for m in final_msgs), (
+            "current goal must survive verbatim across repeated in-loop compaction"
+        )
+        # … and compaction must actually have fired (summary message present).
+        assert any("Compacted context" in str(m.get("content")) for m in final_msgs), (
+            "compaction must have fired during the multi-step run"
+        )
