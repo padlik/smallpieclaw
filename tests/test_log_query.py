@@ -274,3 +274,201 @@ def test_window_saturation_byte_cap(tmp_path):
     assert payload["window_saturated"] is True
     assert 0 < payload["scanned_lines"] < n_lines        # older lines outside the byte window
     assert payload["scanned_lines"] <= _LOG_QUERY_MAX_SCAN_LINES
+
+
+# ---------------------------------------------------------------------------
+# text / query argument — new bounded text search
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def text_search_executor(tmp_path):
+    """Executor with a log containing records that span traces, levels, and a
+    distinctive INFO startup message dropped by the Option C default view."""
+    records = [
+        # TRACE_A — two TOOL_START events
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "tool": "shell"},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "tool": "schedule"},
+        # TRACE_A — INFO startup message that Option C default view drops
+        {"ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "info",
+         "event_type": "STEP_BEGIN",
+         "msg": "GraphMemoryStore initialised at data/graph_memory (dim=1536)"},
+        # TRACE_B — one TOOL_START event
+        {"ts": "2026-07-05T10:00:03", "trace": TRACE_B, "level": "info",
+         "event_type": "TOOL_START", "tool": "file_read"},
+    ]
+    path = tmp_path / "text.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return BuiltinExecutor(log_jsonl_path=str(path))
+
+
+def test_text_search_finds_dropped_info_record(text_search_executor):
+    """text= finds an INFO STEP_BEGIN record that the default view would drop."""
+    # Verify that default view drops the record.
+    default_payload = _query(text_search_executor, trace="*")
+    default_events = [r["event_type"] for r in default_payload["records"]]
+    assert "STEP_BEGIN" not in default_events
+
+    # text= should surface the same record.
+    payload = _query(text_search_executor, trace="*", text="GraphMemoryStore")
+    assert payload["total_matched"] == 1
+    assert payload["records"][0]["event_type"] == "STEP_BEGIN"
+    assert "GraphMemoryStore" in payload["records"][0]["msg"]
+
+
+def test_query_alias_behaves_same(text_search_executor):
+    """query= alias produces the same results as text=."""
+    payload_text = _query(text_search_executor, trace="*", text="GraphMemoryStore")
+    payload_query = _query(text_search_executor, trace="*", query="GraphMemoryStore")
+    assert payload_text["total_matched"] == payload_query["total_matched"]
+    assert payload_text["records"] == payload_query["records"]
+
+
+def test_text_search_case_insensitive(text_search_executor):
+    """text= search is case-insensitive."""
+    payload_upper = _query(text_search_executor, trace="*", text="GRAPHMEMORYSTORE")
+    payload_lower = _query(text_search_executor, trace="*", text="graphmemorystore")
+    payload_mixed = _query(text_search_executor, trace="*", text="GraphMemoryStore")
+    assert payload_upper["total_matched"] == payload_lower["total_matched"] == payload_mixed["total_matched"]
+    assert payload_upper["records"] == payload_lower["records"] == payload_mixed["records"]
+    assert payload_upper["total_matched"] == 1
+
+
+def test_text_search_auto_widens_without_explicit_trace(text_search_executor):
+    """Without an explicit trace, a text search auto-widens to all traces.
+
+    Startup records may carry no trace or a different trace; the auto-widen
+    ensures they are found by a bare {"text": "…"} call regardless of the
+    current-run contextvars binding.
+    """
+    # Binding TRACE_B should NOT restrict results: auto-widen ignores contextvars.
+    structlog.contextvars.bind_contextvars(trace=TRACE_B)
+    try:
+        payload = _query(text_search_executor, text="TOOL_START")
+    finally:
+        structlog.contextvars.clear_contextvars()
+    # TRACE_A has 2, TRACE_B has 1 — all three are found.
+    assert payload["total_matched"] == 3
+    assert {r["trace"] for r in payload["records"]} == {TRACE_A, TRACE_B}
+
+
+def test_text_search_explicit_trace_scopes(text_search_executor):
+    """An explicit trace restricts the text search to that trace only."""
+    payload = _query(text_search_executor, trace=TRACE_B, text="TOOL_START")
+    assert payload["total_matched"] == 1
+    assert all(r["trace"] == TRACE_B for r in payload["records"])
+
+
+def test_text_search_wildcard_finds_all_traces(text_search_executor):
+    """With trace='*', text search covers all traces."""
+    payload = _query(text_search_executor, trace="*", text="TOOL_START")
+    # TRACE_A has two TOOL_START records, TRACE_B has one.
+    assert payload["total_matched"] == 3
+    assert {r["trace"] for r in payload["records"]} == {TRACE_A, TRACE_B}
+
+
+# ---------------------------------------------------------------------------
+# Regression: auto-widen finds startup records with no trace field
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def no_trace_startup_executor(tmp_path):
+    """Log with a traceless startup record and a current-run record on TRACE_A.
+
+    Simulates the real scenario: the process emits INFO messages before the
+    trace ID is bound to contextvars, so those records carry no 'trace' key.
+    """
+    records = [
+        # Traceless startup record — emitted before trace ID is available.
+        {"ts": "2026-07-05T09:59:58", "level": "info",
+         "event_type": "RUN_BEGIN",
+         "msg": "GraphMemoryStore initialised at data/graph_memory (dim=1536)"},
+        # Same-run record on TRACE_A.
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "tool": "shell"},
+    ]
+    path = tmp_path / "startup.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return BuiltinExecutor(log_jsonl_path=str(path))
+
+
+def test_text_auto_widens_finds_no_trace_startup_record(no_trace_startup_executor):
+    """Bare text search finds a startup record that carries no trace field.
+
+    This is the real bug shape: the agent asks "how many dimensions does graph
+    memory have?" and log_query must find the startup INFO record even though
+    the current contextvars trace is TRACE_A and the record has no trace key.
+    Auto-widening (no explicit trace + text given) makes this work.
+    """
+    structlog.contextvars.bind_contextvars(trace=TRACE_A)
+    try:
+        payload = _query(no_trace_startup_executor, text="GraphMemoryStore")
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    # The traceless startup record must be found despite a different active trace.
+    assert payload["total_matched"] == 1
+    assert payload["records"][0]["msg"].startswith("GraphMemoryStore")
+    assert "dim=1536" in payload["records"][0]["msg"]
+
+
+def test_text_explicit_trace_excludes_no_trace_record(no_trace_startup_executor):
+    """An explicit trace scopes out records that carry no trace field."""
+    # Explicitly searching TRACE_A should NOT return the traceless startup record.
+    payload = _query(no_trace_startup_executor, trace=TRACE_A, text="GraphMemoryStore")
+    assert payload["total_matched"] == 0
+
+
+def test_text_null_trace_auto_widens(no_trace_startup_executor):
+    """trace=None is treated as unset, so bare text search still auto-widens."""
+    structlog.contextvars.bind_contextvars(trace=TRACE_A)
+    try:
+        payload = _query(no_trace_startup_executor, trace=None, text="GraphMemoryStore")
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    assert payload["total_matched"] == 1
+    assert "dim=1536" in payload["records"][0]["msg"]
+
+
+# ---------------------------------------------------------------------------
+# Unicode / casefold correctness
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def unicode_executor(tmp_path):
+    """Log with a record whose msg contains non-ASCII characters (Straße, café)."""
+    records = [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "STEP_BEGIN",
+         "msg": "Straße café: vector store ready"},
+    ]
+    path = tmp_path / "unicode.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return BuiltinExecutor(log_jsonl_path=str(path))
+
+
+def test_text_search_casefold_unicode(unicode_executor):
+    """casefold() matches German sharp-s and accented characters case-insensitively.
+
+    'straße' casefolds to 'strasse'; 'STRASSE' also casefolds to 'strasse'.
+    'CAFÉ' casefolds to 'café'. Both must match the stored record.
+    """
+    # German ß: "STRASSE" should match "Straße" via casefold (ß → ss).
+    payload_ss = _query(unicode_executor, trace="*", text="STRASSE")
+    assert payload_ss["total_matched"] == 1, "STRASSE should match Straße via casefold"
+
+    # Accented character: "CAFÉ" should match "café".
+    payload_cafe = _query(unicode_executor, trace="*", text="CAFÉ")
+    assert payload_cafe["total_matched"] == 1, "CAFÉ should match café via casefold"
+
+    # Lowercase variant also matches.
+    payload_lower = _query(unicode_executor, trace="*", text="straße café")
+    assert payload_lower["total_matched"] == 1
