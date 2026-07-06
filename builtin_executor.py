@@ -474,23 +474,27 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "results reflect a recent window, not the entire run history. "
             "Read-only and non-destructive; all arguments are optional. "
             "Args: "
-            "  trace       (str) — run trace id (e.g. 'r-1a2b3c4d'); defaults to the CURRENT run. "
-            "                      Use '*' (or '') to search across all runs/traces. "
+            "  trace       (str) — run trace id (e.g. 'r-1a2b3c4d'); defaults to the CURRENT run "
+            "                      when no text/query is given. "
+            "                      Use '*' (or '') to explicitly search across all runs/traces. "
             "  level       (str) — minimum level NAME to include: DEBUG|INFO|WARNING|ERROR|CRITICAL. "
             "  event_type  (str) — exact event type to match: TOOL_START|TOOL_END|TOOL_FAILED|"
             "LLM_CALL|LLM_FAILED|STEP_BEGIN|STEP_END|RUN_BEGIN|RUN_END|ERROR. "
             "  tool        (str) — exact tool name to match (e.g. 'shell', 'file_read'). "
             "  since       (str) — ISO timestamp; only include records at or after this time. "
             "  limit       (int, default 50) — max records to return (the most recent are kept if more match). "
-            "  text        (str) — case-insensitive substring to search across the full JSON "
-            "                      representation of each record (all fields: msg, event, logger, etc.). "
+            "  text        (str) — Unicode-aware case-insensitive (casefold) substring search "
+            "                      against the compact JSON serialisation of each record "
+            "                      (keys, string values, and all punctuation are all searchable). "
             "                      Alias 'query' is also accepted. "
             "                      When text/query is given without level or event_type, the "
             "                      high-signal default view is NOT applied, so all INFO records "
             "                      (including startup messages such as 'GraphMemoryStore initialised') "
             "                      are visible. "
-            "                      For natural-language / log-wide text searches, pass trace='*' "
-            "                      together with text='…' to cover all runs. "
+            "                      When text/query is given and no explicit trace is provided, the "
+            "                      scope is automatically widened to ALL traces so that startup "
+            "                      records (which may carry no trace or a different trace) are found. "
+            "                      Pass an explicit trace to restrict a text search to a single run. "
             "When neither level, event_type, nor text/query is given, a high-signal default view "
             "is returned: warnings/errors plus TOOL_START/TOOL_END/LLM_CALL events (routine "
             "STEP_* events are omitted). "
@@ -501,7 +505,7 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "records fell outside the scanned window — narrow with 'since'/'tool'/'event_type' or "
             "treat counts as a recent-window lower bound. "
             "Examples: {\"tool\": \"shell\", \"limit\": 20}, "
-            "{\"trace\": \"*\", \"text\": \"GraphMemoryStore\", \"limit\": 10}"
+            "{\"text\": \"GraphMemoryStore\", \"limit\": 10}"
         ),
     ),
 }
@@ -2694,13 +2698,23 @@ class BuiltinExecutor:
         (Option C) when neither level, event_type, nor text is supplied, and
         most-recent-N truncation via ``limit``.
 
-        The ``text`` argument (alias: ``query``) performs a case-insensitive
-        substring search across the full compact JSON serialisation of each
-        record so that any field — msg, event, logger, tool output, etc. — is
-        searchable.  When ``text`` is provided without an explicit ``level`` or
+        The ``text`` argument (alias: ``query``) performs a Unicode-aware
+        case-insensitive (casefold) substring search against the compact JSON
+        serialisation of each record so that any key or value — msg, event,
+        logger, tool output, etc. — is searchable.
+
+        When ``text`` is provided without an explicit ``level`` or
         ``event_type``, the Option C high-signal default view is **not** applied,
         allowing routine INFO startup records (e.g. "GraphMemoryStore
         initialised at data/graph_memory (dim=1536)") to be surfaced.
+
+        When ``text``/``query`` is given and the caller did **not** supply an
+        explicit ``trace`` argument, the scope is automatically widened to all
+        traces (equivalent to ``trace='*'``). This ensures that startup records
+        — which often carry no trace tag or a different trace — are found by a
+        bare ``{"text": "…"}`` call without the caller needing to know the
+        right trace. Passing an explicit ``trace`` always overrides this
+        auto-widening.
 
         A missing or unset log path yields a well-formed EMPTY result rather
         than an error. ``caller_depth`` and ``caller_tag`` are accepted for
@@ -2714,26 +2728,38 @@ class BuiltinExecutor:
         if limit <= 0:
             limit = 50
 
-        # Resolve the trace scope: an explicit arg wins, else the current run's
-        # trace from contextvars; "*" or "" widens the query to all traces.
-        if args.get("trace") is not None:
-            trace = str(args.get("trace"))
-        else:
-            trace = str(structlog.contextvars.get_contextvars().get("trace", "") or "")
-        all_traces = trace in ("*", "")
-
         level_arg = args.get("level") or ""
         event_type_arg = args.get("event_type") or ""
         tool_arg = args.get("tool") or ""
         since_arg = str(args.get("since") or "")
-        # text/query: case-insensitive full-record substring search.
+        # text/query: Unicode-aware case-insensitive full-record substring search.
         # Accept "query" as an alias for "text"; "text" takes precedence.
         text_arg = str(args.get("text") or args.get("query") or "").strip()
         # Option C default view is suppressed when text/query is given so that
         # INFO-level records (e.g. startup messages) are not silently excluded.
         use_default_view = not level_arg and not event_type_arg and not text_arg
         min_level = _log_level_to_num(level_arg) if level_arg else 0
-        text_lower = text_arg.lower() if text_arg else ""
+        # casefold gives correct Unicode case-folding (e.g. German ß → ss).
+        text_folded = text_arg.casefold() if text_arg else ""
+
+        # Trace scope resolution (priority: explicit arg > auto-widen > current-run).
+        #
+        # When text/query is given and the caller did NOT supply a non-null
+        # ``trace`` value, the scope auto-widens to all traces so that startup
+        # records (no trace or a different trace) are surfaced by a bare
+        # text search.  An explicit non-null trace always overrides this; JSON
+        # null is treated as unset because LLM function calls may emit it for
+        # omitted optional parameters.
+        trace_val = args.get("trace")
+        if trace_val is not None:
+            trace = str(trace_val)
+            all_traces = trace in ("*", "")
+        elif text_arg:
+            trace = "*"
+            all_traces = True
+        else:
+            trace = str(structlog.contextvars.get_contextvars().get("trace", "") or "")
+            all_traces = trace in ("*", "")
 
         logger.info(
             "log_query: trace=%s level=%s event_type=%s tool=%s since=%s text=%s limit=%d",
@@ -2780,7 +2806,7 @@ class BuiltinExecutor:
                 continue
             if use_default_view and not _log_query_default_keep(rec):
                 continue
-            if text_lower and text_lower not in json.dumps(rec, ensure_ascii=False).lower():
+            if text_folded and text_folded not in json.dumps(rec, ensure_ascii=False).casefold():
                 continue
 
             matched.append(rec)

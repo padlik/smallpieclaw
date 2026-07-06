@@ -337,15 +337,27 @@ def test_text_search_case_insensitive(text_search_executor):
     assert payload_upper["total_matched"] == 1
 
 
-def test_text_search_scoped_to_current_trace(text_search_executor):
-    """Without an explicit trace, text search remains scoped to the current run's trace."""
-    # Both TRACE_A and TRACE_B have TOOL_START records, but binding TRACE_B should
-    # restrict results to TRACE_B only.
+def test_text_search_auto_widens_without_explicit_trace(text_search_executor):
+    """Without an explicit trace, a text search auto-widens to all traces.
+
+    Startup records may carry no trace or a different trace; the auto-widen
+    ensures they are found by a bare {"text": "…"} call regardless of the
+    current-run contextvars binding.
+    """
+    # Binding TRACE_B should NOT restrict results: auto-widen ignores contextvars.
     structlog.contextvars.bind_contextvars(trace=TRACE_B)
     try:
         payload = _query(text_search_executor, text="TOOL_START")
     finally:
         structlog.contextvars.clear_contextvars()
+    # TRACE_A has 2, TRACE_B has 1 — all three are found.
+    assert payload["total_matched"] == 3
+    assert {r["trace"] for r in payload["records"]} == {TRACE_A, TRACE_B}
+
+
+def test_text_search_explicit_trace_scopes(text_search_executor):
+    """An explicit trace restricts the text search to that trace only."""
+    payload = _query(text_search_executor, trace=TRACE_B, text="TOOL_START")
     assert payload["total_matched"] == 1
     assert all(r["trace"] == TRACE_B for r in payload["records"])
 
@@ -356,3 +368,107 @@ def test_text_search_wildcard_finds_all_traces(text_search_executor):
     # TRACE_A has two TOOL_START records, TRACE_B has one.
     assert payload["total_matched"] == 3
     assert {r["trace"] for r in payload["records"]} == {TRACE_A, TRACE_B}
+
+
+# ---------------------------------------------------------------------------
+# Regression: auto-widen finds startup records with no trace field
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def no_trace_startup_executor(tmp_path):
+    """Log with a traceless startup record and a current-run record on TRACE_A.
+
+    Simulates the real scenario: the process emits INFO messages before the
+    trace ID is bound to contextvars, so those records carry no 'trace' key.
+    """
+    records = [
+        # Traceless startup record — emitted before trace ID is available.
+        {"ts": "2026-07-05T09:59:58", "level": "info",
+         "event_type": "RUN_BEGIN",
+         "msg": "GraphMemoryStore initialised at data/graph_memory (dim=1536)"},
+        # Same-run record on TRACE_A.
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "tool": "shell"},
+    ]
+    path = tmp_path / "startup.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return BuiltinExecutor(log_jsonl_path=str(path))
+
+
+def test_text_auto_widens_finds_no_trace_startup_record(no_trace_startup_executor):
+    """Bare text search finds a startup record that carries no trace field.
+
+    This is the real bug shape: the agent asks "how many dimensions does graph
+    memory have?" and log_query must find the startup INFO record even though
+    the current contextvars trace is TRACE_A and the record has no trace key.
+    Auto-widening (no explicit trace + text given) makes this work.
+    """
+    structlog.contextvars.bind_contextvars(trace=TRACE_A)
+    try:
+        payload = _query(no_trace_startup_executor, text="GraphMemoryStore")
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    # The traceless startup record must be found despite a different active trace.
+    assert payload["total_matched"] == 1
+    assert payload["records"][0]["msg"].startswith("GraphMemoryStore")
+    assert "dim=1536" in payload["records"][0]["msg"]
+
+
+def test_text_explicit_trace_excludes_no_trace_record(no_trace_startup_executor):
+    """An explicit trace scopes out records that carry no trace field."""
+    # Explicitly searching TRACE_A should NOT return the traceless startup record.
+    payload = _query(no_trace_startup_executor, trace=TRACE_A, text="GraphMemoryStore")
+    assert payload["total_matched"] == 0
+
+
+def test_text_null_trace_auto_widens(no_trace_startup_executor):
+    """trace=None is treated as unset, so bare text search still auto-widens."""
+    structlog.contextvars.bind_contextvars(trace=TRACE_A)
+    try:
+        payload = _query(no_trace_startup_executor, trace=None, text="GraphMemoryStore")
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    assert payload["total_matched"] == 1
+    assert "dim=1536" in payload["records"][0]["msg"]
+
+
+# ---------------------------------------------------------------------------
+# Unicode / casefold correctness
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def unicode_executor(tmp_path):
+    """Log with a record whose msg contains non-ASCII characters (Straße, café)."""
+    records = [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "STEP_BEGIN",
+         "msg": "Straße café: vector store ready"},
+    ]
+    path = tmp_path / "unicode.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return BuiltinExecutor(log_jsonl_path=str(path))
+
+
+def test_text_search_casefold_unicode(unicode_executor):
+    """casefold() matches German sharp-s and accented characters case-insensitively.
+
+    'straße' casefolds to 'strasse'; 'STRASSE' also casefolds to 'strasse'.
+    'CAFÉ' casefolds to 'café'. Both must match the stored record.
+    """
+    # German ß: "STRASSE" should match "Straße" via casefold (ß → ss).
+    payload_ss = _query(unicode_executor, trace="*", text="STRASSE")
+    assert payload_ss["total_matched"] == 1, "STRASSE should match Straße via casefold"
+
+    # Accented character: "CAFÉ" should match "café".
+    payload_cafe = _query(unicode_executor, trace="*", text="CAFÉ")
+    assert payload_cafe["total_matched"] == 1, "CAFÉ should match café via casefold"
+
+    # Lowercase variant also matches.
+    payload_lower = _query(unicode_executor, trace="*", text="straße café")
+    assert payload_lower["total_matched"] == 1
