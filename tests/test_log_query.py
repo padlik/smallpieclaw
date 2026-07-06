@@ -274,3 +274,85 @@ def test_window_saturation_byte_cap(tmp_path):
     assert payload["window_saturated"] is True
     assert 0 < payload["scanned_lines"] < n_lines        # older lines outside the byte window
     assert payload["scanned_lines"] <= _LOG_QUERY_MAX_SCAN_LINES
+
+
+# ---------------------------------------------------------------------------
+# text / query argument — new bounded text search
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def text_search_executor(tmp_path):
+    """Executor with a log containing records that span traces, levels, and a
+    distinctive INFO startup message dropped by the Option C default view."""
+    records = [
+        # TRACE_A — two TOOL_START events
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "tool": "shell"},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "tool": "schedule"},
+        # TRACE_A — INFO startup message that Option C default view drops
+        {"ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "info",
+         "event_type": "STEP_BEGIN",
+         "msg": "GraphMemoryStore initialised at data/graph_memory (dim=1536)"},
+        # TRACE_B — one TOOL_START event
+        {"ts": "2026-07-05T10:00:03", "trace": TRACE_B, "level": "info",
+         "event_type": "TOOL_START", "tool": "file_read"},
+    ]
+    path = tmp_path / "text.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return BuiltinExecutor(log_jsonl_path=str(path))
+
+
+def test_text_search_finds_dropped_info_record(text_search_executor):
+    """text= finds an INFO STEP_BEGIN record that the default view would drop."""
+    # Verify that default view drops the record.
+    default_payload = _query(text_search_executor, trace="*")
+    default_events = [r["event_type"] for r in default_payload["records"]]
+    assert "STEP_BEGIN" not in default_events
+
+    # text= should surface the same record.
+    payload = _query(text_search_executor, trace="*", text="GraphMemoryStore")
+    assert payload["total_matched"] == 1
+    assert payload["records"][0]["event_type"] == "STEP_BEGIN"
+    assert "GraphMemoryStore" in payload["records"][0]["msg"]
+
+
+def test_query_alias_behaves_same(text_search_executor):
+    """query= alias produces the same results as text=."""
+    payload_text = _query(text_search_executor, trace="*", text="GraphMemoryStore")
+    payload_query = _query(text_search_executor, trace="*", query="GraphMemoryStore")
+    assert payload_text["total_matched"] == payload_query["total_matched"]
+    assert payload_text["records"] == payload_query["records"]
+
+
+def test_text_search_case_insensitive(text_search_executor):
+    """text= search is case-insensitive."""
+    payload_upper = _query(text_search_executor, trace="*", text="GRAPHMEMORYSTORE")
+    payload_lower = _query(text_search_executor, trace="*", text="graphmemorystore")
+    payload_mixed = _query(text_search_executor, trace="*", text="GraphMemoryStore")
+    assert payload_upper["total_matched"] == payload_lower["total_matched"] == payload_mixed["total_matched"]
+    assert payload_upper["records"] == payload_lower["records"] == payload_mixed["records"]
+    assert payload_upper["total_matched"] == 1
+
+
+def test_text_search_scoped_to_current_trace(text_search_executor):
+    """Without an explicit trace, text search remains scoped to the current run's trace."""
+    # Both TRACE_A and TRACE_B have TOOL_START records, but binding TRACE_B should
+    # restrict results to TRACE_B only.
+    structlog.contextvars.bind_contextvars(trace=TRACE_B)
+    try:
+        payload = _query(text_search_executor, text="TOOL_START")
+    finally:
+        structlog.contextvars.clear_contextvars()
+    assert payload["total_matched"] == 1
+    assert all(r["trace"] == TRACE_B for r in payload["records"])
+
+
+def test_text_search_wildcard_finds_all_traces(text_search_executor):
+    """With trace='*', text search covers all traces."""
+    payload = _query(text_search_executor, trace="*", text="TOOL_START")
+    # TRACE_A has two TOOL_START records, TRACE_B has one.
+    assert payload["total_matched"] == 3
+    assert {r["trace"] for r in payload["records"]} == {TRACE_A, TRACE_B}

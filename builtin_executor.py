@@ -482,15 +482,26 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "  tool        (str) — exact tool name to match (e.g. 'shell', 'file_read'). "
             "  since       (str) — ISO timestamp; only include records at or after this time. "
             "  limit       (int, default 50) — max records to return (the most recent are kept if more match). "
-            "When neither level nor event_type is given, a high-signal default view is returned: "
-            "warnings/errors plus TOOL_START/TOOL_END/LLM_CALL events (routine STEP_* events are omitted). "
+            "  text        (str) — case-insensitive substring to search across the full JSON "
+            "                      representation of each record (all fields: msg, event, logger, etc.). "
+            "                      Alias 'query' is also accepted. "
+            "                      When text/query is given without level or event_type, the "
+            "                      high-signal default view is NOT applied, so all INFO records "
+            "                      (including startup messages such as 'GraphMemoryStore initialised') "
+            "                      are visible. "
+            "                      For natural-language / log-wide text searches, pass trace='*' "
+            "                      together with text='…' to cover all runs. "
+            "When neither level, event_type, nor text/query is given, a high-signal default view "
+            "is returned: warnings/errors plus TOOL_START/TOOL_END/LLM_CALL events (routine "
+            "STEP_* events are omitted). "
             "Returns a JSON object with 'records', 'count', 'truncated', 'total_matched', "
             "'window_saturated', and 'scanned_lines'. NOTE: the active log is shared across all "
             "traces, so 'total_matched' is a count within the scanned recent window (over "
             "'scanned_lines' lines), NOT a full-run total; when 'window_saturated' is true, older "
             "records fell outside the scanned window — narrow with 'since'/'tool'/'event_type' or "
             "treat counts as a recent-window lower bound. "
-            "Example: {\"tool\": \"shell\", \"limit\": 20}"
+            "Examples: {\"tool\": \"shell\", \"limit\": 20}, "
+            "{\"trace\": \"*\", \"text\": \"GraphMemoryStore\", \"limit\": 10}"
         ),
     ),
 }
@@ -2679,11 +2690,21 @@ class BuiltinExecutor:
         recent ``_LOG_QUERY_MAX_SCAN_LINES`` lines are scanned, so a mid-loop
         call does bounded work regardless of total log size (``total_matched``
         therefore counts matches within that tail window). Supports
-        trace/level/event_type/tool/since filters, a useful default view
-        (Option C) when neither level nor event_type is supplied, and
-        most-recent-N truncation via ``limit``. A missing or unset log path
-        yields a well-formed EMPTY result rather than an error. ``caller_depth``
-        and ``caller_tag`` are accepted for dispatch symmetry with peer handlers.
+        trace/level/event_type/tool/since/text filters, a useful default view
+        (Option C) when neither level, event_type, nor text is supplied, and
+        most-recent-N truncation via ``limit``.
+
+        The ``text`` argument (alias: ``query``) performs a case-insensitive
+        substring search across the full compact JSON serialisation of each
+        record so that any field — msg, event, logger, tool output, etc. — is
+        searchable.  When ``text`` is provided without an explicit ``level`` or
+        ``event_type``, the Option C high-signal default view is **not** applied,
+        allowing routine INFO startup records (e.g. "GraphMemoryStore
+        initialised at data/graph_memory (dim=1536)") to be surfaced.
+
+        A missing or unset log path yields a well-formed EMPTY result rather
+        than an error. ``caller_depth`` and ``caller_tag`` are accepted for
+        dispatch symmetry with peer handlers.
         """
         # limit (most-recent-N kept); fall back to the default on bad input.
         try:
@@ -2705,13 +2726,19 @@ class BuiltinExecutor:
         event_type_arg = args.get("event_type") or ""
         tool_arg = args.get("tool") or ""
         since_arg = str(args.get("since") or "")
-        use_default_view = not level_arg and not event_type_arg
+        # text/query: case-insensitive full-record substring search.
+        # Accept "query" as an alias for "text"; "text" takes precedence.
+        text_arg = str(args.get("text") or args.get("query") or "").strip()
+        # Option C default view is suppressed when text/query is given so that
+        # INFO-level records (e.g. startup messages) are not silently excluded.
+        use_default_view = not level_arg and not event_type_arg and not text_arg
         min_level = _log_level_to_num(level_arg) if level_arg else 0
+        text_lower = text_arg.lower() if text_arg else ""
 
         logger.info(
-            "log_query: trace=%s level=%s event_type=%s tool=%s since=%s limit=%d",
+            "log_query: trace=%s level=%s event_type=%s tool=%s since=%s text=%s limit=%d",
             trace or "<all>", level_arg or "-", event_type_arg or "-",
-            tool_arg or "-", since_arg or "-", limit,
+            tool_arg or "-", since_arg or "-", text_arg or "-", limit,
         )
 
         path = self._log_jsonl_path
@@ -2752,6 +2779,8 @@ class BuiltinExecutor:
             if event_type_arg and rec.get("event_type") != event_type_arg:
                 continue
             if use_default_view and not _log_query_default_keep(rec):
+                continue
+            if text_lower and text_lower not in json.dumps(rec, ensure_ascii=False).lower():
                 continue
 
             matched.append(rec)
