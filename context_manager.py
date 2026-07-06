@@ -155,33 +155,71 @@ def maybe_compact(
     system: str,
     ctx_max_tokens: int,
     llm: "LLMClient",
-) -> list[dict]:
-    """Return a (possibly compacted) copy of *messages*.
+    *,
+    goal_idx: int = 0,
+) -> tuple[list[dict], int]:
+    """Return a (possibly compacted) copy of *messages* and the goal's new index.
 
     If the estimated token count of *messages* plus *system* exceeds 85 % of
     *ctx_max_tokens*, the middle portion of the conversation is summarised and
     replaced with a single compaction summary message.
 
-    The first message (user goal) and the two most recent messages are
-    preserved, but very large recent tool-result content is capped head+tail so
-    it cannot overflow the real model context. If the compaction LLM call fails,
-    a deterministic fallback summary is returned rather than the un-compacted
+    The current active goal and the two most recent messages are preserved, but
+    very large recent tool-result content is capped head+tail so it cannot
+    overflow the real model context. If the compaction LLM call fails, a
+    deterministic fallback summary is returned rather than the un-compacted
     oversized messages.
+
+    The goal message is preserved verbatim on every path, but its position in
+    the returned list is *not* fixed: on full compaction it becomes the ``first``
+    anchor at index 0 when it precedes the recent tail, or it is kept inside the
+    preserved ``last`` tail (at index 2 or 3 of the length-4 compacted list) when
+    it already lies within the two most recent messages. The returned index
+    locates the goal precisely so callers never have to guess after compaction.
+
+    Args:
+        messages: Conversation history to (potentially) compact.
+        system: System prompt string (used for token estimation only).
+        ctx_max_tokens: Hard context-window limit in tokens.
+        llm: LLM client used for the compaction summary call.
+        goal_idx: Index of the current active goal message within *messages*.
+            When ``react_loop`` prepends short-term history before the current
+            user goal, ``messages[0]`` is stale prior conversation, not the
+            goal.  Passing the correct index ensures the goal is pinned into
+            the ``first`` slot rather than being swept into the summarised
+            middle.  Defaults to ``0`` for backward-compatibility when no
+            history precedes the goal.
+
+    Returns:
+        A ``(compacted_messages, new_goal_idx)`` tuple where ``new_goal_idx`` is
+        the index of the goal message within ``compacted_messages``. All call
+        sites must unpack this tuple.
     """
     total = estimate_messages_tokens(messages, system, model=_active_model(llm))
     threshold = int(ctx_max_tokens * 0.85)
     if total <= threshold:
-        return messages
+        # Under threshold: messages returned unchanged, so is the goal position.
+        return messages, goal_idx
     if len(messages) <= 3:
-        return _cap_short_overbudget_context(messages, system, threshold, llm)
+        # Capping-only path preserves order and length, so the goal keeps its
+        # index (clamped defensively into the valid range).
+        capped = _cap_short_overbudget_context(messages, system, threshold, llm)
+        return capped, min(max(0, goal_idx), len(capped) - 1)
 
     logger.warning(
         "Context size ~%d tokens exceeds threshold %d — compacting…",
         total, threshold,
     )
 
-    first = messages[:1]
-    middle = messages[1:-2]
+    # Clamp goal_idx so there is always at least one message in middle and two
+    # in last. When the goal is very close to the end (e.g. compaction fires on
+    # the first step before any ReAct messages accumulate), the goal will land
+    # in `last` rather than `first`, but it is still preserved verbatim.
+    _goal = min(goal_idx, max(0, len(messages) - 3))
+    first = [messages[_goal]]
+    # Short-term history that precedes the goal (messages[:_goal]) is fed into
+    # the middle so it is summarised rather than silently dropped.
+    middle = messages[:_goal] + messages[_goal + 1:-2]
     # The two most recent messages are preserved; _build_compacted caps oversized
     # content head+tail so a single huge tool result cannot overflow the context.
     last = messages[-2:]
@@ -239,4 +277,13 @@ def maybe_compact(
         )
 
     logger.info("Compacted context: %d → ~%d tokens", total, new_total)
-    return compacted
+
+    # Locate the goal in the compacted list. `_build_compacted` returns
+    # [first_msg, summary_msg, last[0], last[1]] (length 4). When the goal
+    # preceded the recent tail it became the `first` anchor (index 0); otherwise
+    # it was clamped into `last` and keeps its offset from the end of the list.
+    if goal_idx <= len(messages) - 3:
+        new_goal_idx = 0
+    else:
+        new_goal_idx = len(compacted) - (len(messages) - goal_idx)
+    return compacted, new_goal_idx

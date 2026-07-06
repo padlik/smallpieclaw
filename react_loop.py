@@ -495,6 +495,10 @@ def react_loop(
         messages: list[dict] = []
         if ctx.short_term:
             messages.extend(ctx.short_term.get_messages())
+        # Record the index of the current goal before appending it so that
+        # maybe_compact can pin the goal as the preserved anchor rather than
+        # treating messages[0] (stale short-term history) as the goal.
+        goal_idx: int = len(messages)
         messages.append(first_msg)
 
         ctx.memory.record_event(f"User request: {user_goal[:100]}")
@@ -549,8 +553,12 @@ def react_loop(
                 logger.info("%sstep %d/%d | model: %s", pfx, step, max_steps, active_model)
                 _progress(f"⚙️ Thinking… (step {step})")
 
-                # Context compaction check
-                messages = maybe_compact(messages, system, ctx.ctx_max_tokens, ctx.llm)
+                # Context compaction check. maybe_compact returns the goal's
+                # updated index within the (possibly compacted) list, so the
+                # caller never has to guess where the preserved goal landed.
+                messages, goal_idx = maybe_compact(
+                    messages, system, ctx.ctx_max_tokens, ctx.llm, goal_idx=goal_idx,
+                )
 
                 # LLM call with retry on empty response
                 _MAX_EMPTY_RETRIES = 2
