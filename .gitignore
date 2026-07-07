@@ -221,6 +221,7 @@ data/scheduler_state.json
 
 # Local shell scripts
 set_*.sh
+.shellguard-lab/
 .agents/
 # ==============================================================================
 # OpenCode Rules
