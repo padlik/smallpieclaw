@@ -23,6 +23,12 @@ from typing import Any, Callable, Optional
 from error_registry import ErrorTypeRegistry
 from exceptions import AgentError
 from react_loop import ReactContext, parse_json
+from sub_agent_registry import (
+    SOURCE_DIAGNOSTIC,
+    SOURCE_PLAN_STEP,
+    deregister_run,
+    register_run,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -455,15 +461,31 @@ class PlanExecutor:
                 trace_id=ctx.trace_id,
                 cancel_event=cancel_event,
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Diagnostic sub-agent failed to build for step '%s'", step.id)
+            return f"Diagnostic analysis unavailable: {exc}"
+
+        # Registration happens only after construction succeeds. run()/close()
+        # run under try/finally so a swallowed diagnostic failure never leaves a
+        # stale "diagnostic" record in the registry.
+        register_run(
+            runner,
+            source=SOURCE_DIAGNOSTIC,
+            label=runner.label,
+            task_preview=task,
+        )
+        try:
             result = runner.run(task)
-            try:
-                runner.close()
-            except Exception:  # noqa: BLE001
-                pass
             return str(result)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Diagnostic sub-agent failed for step '%s'", step.id)
             return f"Diagnostic analysis unavailable: {exc}"
+        finally:
+            deregister_run(runner.agent_id)
+            try:
+                runner.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _execute_step_with_recovery(
         self,
@@ -511,9 +533,23 @@ class PlanExecutor:
                 except Exception:  # noqa: BLE001
                     pass
                 return self._skip_step(step, "cancelled during runner creation")
+            # Make the plan step visible in the global registry with source
+            # "plan-step". Registration and deregistration are co-located with
+            # the _active_runners add/pop and owned by this step thread so a
+            # cancel/timeout leaves no stale record once the thread unwinds.
             self._active_runners[step.id] = runner
-            outcome = self._execute_runner(runner, task, response_format)
-            self._active_runners.pop(step.id, None)
+            register_run(
+                runner,
+                source=SOURCE_PLAN_STEP,
+                label=runner.label,
+                task_preview=task,
+                result_type=response_format,
+            )
+            try:
+                outcome = self._execute_runner(runner, task, response_format)
+            finally:
+                self._active_runners.pop(step.id, None)
+                deregister_run(runner.agent_id)
             try:
                 runner.close()
             except Exception:  # noqa: BLE001

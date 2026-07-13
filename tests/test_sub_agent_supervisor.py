@@ -325,8 +325,8 @@ class TestCapacityAndSourcePreservation:
         assert rec.source == "on-demand"
         assert local_reg.count_managed() == 1
 
-    def test_scheduled_launch_record_source_preserved(self, tmp_path):
-        """Scheduled launches (job_tag via options) still record source=on-demand."""
+    def test_scheduled_launch_record_source_is_scheduled_and_counts(self, tmp_path):
+        """Scheduled launches (source via options) record source=scheduled and count."""
         runner = FakeRunner(agent_id="sa-sched-src")
         exc = BuiltinExecutor(
             sub_agent_factory=_seq_factory([runner]),
@@ -339,12 +339,15 @@ class TestCapacityAndSourcePreservation:
             res = exc._exec_spawn_agent(
                 {"task": "x", "context_payload": {"n": "y"}},
                 caller_depth=0,
-                options=SupervisionOptions(job_tag="nightly", notify=False),
+                options=SupervisionOptions(
+                    job_tag="nightly", source="scheduled", notify=False,
+                ),
             )
 
         rec = local_reg.get(res["agent_id"])
-        assert rec.source == "on-demand"
+        assert rec.source == "scheduled"
         assert rec.label == "nightly"
+        # Scheduled runs still count against the global capacity guard.
         assert local_reg.count_managed() == 1
 
     def test_cap_reached_rejects_before_submission(self, tmp_path):

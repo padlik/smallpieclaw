@@ -506,16 +506,17 @@ async def cmd_agents(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     if not active:
         await update.effective_message.reply_text(
             "🤖 No sub-agents currently running.\n"
-            "<i>Tip: /agents cancel &lt;id&gt; — cancel specific agent\n"
-            "/agents cancel managed — cancel all managed agents</i>",
+            "<i>Tip: /agents cancel &lt;id&gt; — cancel any visible agent (any source)\n"
+            "/agents cancel managed — cancel all capacity-counted agents "
+            "(on-demand + scheduled)</i>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     lines = [f"🤖 <b>Active Sub-Agents</b> ({len(active)})\n"]
     for rec in active:
-        tag = "[autonomous]" if rec.source == "scheduled" else "[managed]"
-        lines.append(f"<code>{html.escape(rec.agent_id)}</code> <b>{tag}</b>")
+        tag = f"[{rec.source}]"
+        lines.append(f"<code>{html.escape(rec.agent_id)}</code> <b>{html.escape(tag)}</b>")
         lines.append(f"   Model:   <code>{html.escape(rec.model)}</code>")
         lines.append(f"   Task:    {html.escape(rec.task_preview)}{'…' if len(rec.task_preview) >= 80 else ''}")
         lines.append(f"   Started: {rec.elapsed_str()} ago")
@@ -525,8 +526,9 @@ async def cmd_agents(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         lines.append("")
 
     lines.append(
-        "<i>Tip: /agents cancel &lt;id&gt; — cancel specific agent\n"
-        "/agents cancel managed — cancel all managed agents</i>"
+        "<i>Tip: /agents cancel &lt;id&gt; — cancel any visible agent (any source)\n"
+        "/agents cancel managed — cancel all capacity-counted agents "
+        "(on-demand + scheduled)</i>"
     )
     for chunk in iface._split_message("\n".join(lines)):
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)

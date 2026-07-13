@@ -10,17 +10,38 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
+
+# Closed set of source categories for visible sub-agent executions.
+# See ADR-0006 (use-source-categories-for-agent-visibility).
+SOURCE_ON_DEMAND = "on-demand"
+SOURCE_SCHEDULED = "scheduled"
+SOURCE_PLAN_STEP = "plan-step"
+SOURCE_DIAGNOSTIC = "diagnostic"
+
+# All source categories visible to operators through /agents and counted by
+# /status. Ordering is display order.
+VISIBLE_SOURCES = (
+    SOURCE_ON_DEMAND,
+    SOURCE_SCHEDULED,
+    SOURCE_PLAN_STEP,
+    SOURCE_DIAGNOSTIC,
+)
+
+# Sources that count against the global ``max_subagents`` capacity guard and are
+# targeted by ``/agents cancel managed``. Plan-step and diagnostic runs are
+# visible/cancellable but governed by PlanExecutor's own concurrency controls.
+CAPACITY_COUNTED_SOURCES = frozenset({SOURCE_ON_DEMAND, SOURCE_SCHEDULED})
 
 
 @dataclass
 class SubAgentRecord:
     agent_id: str
-    label: str          # context_key or "on-demand"
+    label: str          # context_key, job tag, or "on-demand"
     model: str
     task_preview: str   # first 80 chars of task
     started_at: float   # time.time()
-    source: str         # "scheduled" | "on-demand"
+    source: str         # one of VISIBLE_SOURCES
     # mutable fields updated by the runner
     iteration: int = 0
     max_iterations: int = 8
@@ -124,14 +145,28 @@ class SubAgentRegistry:
             return len(self._agents)
 
     def count_managed(self) -> int:
-        """Return count of on-demand (managed) sub-agents only."""
+        """Return count of globally capacity-counted sub-agents.
+
+        Managed (capacity-counted) sources are ``on-demand`` and ``scheduled``;
+        ``plan-step`` and ``diagnostic`` records are visible but excluded.
+        """
         with self._lock:
-            return sum(1 for r in self._agents.values() if r.source == "on-demand")
+            return sum(
+                1 for r in self._agents.values()
+                if r.source in CAPACITY_COUNTED_SOURCES
+            )
 
     def cancel_all_managed(self) -> int:
-        """Cancel all on-demand sub-agents atomically. Returns count cancelled."""
+        """Cancel all globally capacity-counted sub-agents atomically.
+
+        Targets only ``on-demand`` and ``scheduled`` records — the sources that
+        consume the global ``max_subagents`` cap. Returns count cancelled.
+        """
         with self._lock:
-            targets = [r for r in self._agents.values() if r.source == "on-demand"]
+            targets = [
+                r for r in self._agents.values()
+                if r.source in CAPACITY_COUNTED_SOURCES
+            ]
         for rec in targets:
             rec.cancel()
         return len(targets)
@@ -143,3 +178,55 @@ _registry = SubAgentRegistry()
 
 def get_registry() -> SubAgentRegistry:
     return _registry
+
+
+def register_run(
+    runner: Any,
+    *,
+    source: str,
+    label: str,
+    task_preview: str,
+    result_type: str = "text",
+) -> SubAgentRecord:
+    """Create, wire, and register a ``SubAgentRecord`` for a runner.
+
+    Shared by ``SubAgentSupervisor`` and ``PlanExecutor`` so record creation and
+    cancel-event / LLM-client / on-step wiring stay identical across launch
+    paths. Shares the runner's cancel event and LLM client with the record so
+    ``/agents cancel`` can interrupt an in-progress HTTP request, and wires
+    iteration tracking so ``/agents`` shows step progress.
+
+    Args:
+        runner: A ``SubAgentRunner``-like object exposing ``agent_id``,
+            ``_model_id``, ``_cancel_event``, ``_llm``, and ``_agent``.
+        source: One of :data:`VISIBLE_SOURCES`.
+        label: Display label (context_key, job tag, or plan/diagnostic label).
+        task_preview: Task text; truncated to 80 chars for display.
+        result_type: ``"text"`` | ``"json"`` | ``"file"``.
+
+    Returns:
+        The registered :class:`SubAgentRecord`.
+    """
+    record = SubAgentRecord(
+        agent_id=runner.agent_id,
+        label=label,
+        model=runner._model_id,
+        task_preview=task_preview[:80],
+        started_at=time.time(),
+        source=source,
+        max_iterations=runner._agent.max_iterations,
+        result_type=result_type,
+    )
+    record._cancel_event = runner._cancel_event
+    record._llm_client = runner._llm
+
+    agent_id = runner.agent_id
+    runner._agent._on_step = lambda s: get_registry().update_iteration(agent_id, s)
+
+    get_registry().register(record)
+    return record
+
+
+def deregister_run(agent_id: str) -> None:
+    """Remove a run's record from the global registry. Symmetric to register_run."""
+    get_registry().unregister(agent_id)

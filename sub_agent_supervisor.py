@@ -24,6 +24,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from sub_agent_registry import SOURCE_ON_DEMAND
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +44,7 @@ class SupervisionOptions:
     result_log_cb: Optional[Callable[..., None]] = None  # scheduler execution-log recorder
     notify: bool = True                                 # deliver Telegram notification
     expandable: bool = True                             # wrap result in expandable blockquote
+    source: str = SOURCE_ON_DEMAND                      # registry source category (internal only)
 
 
 @dataclass
@@ -87,7 +90,7 @@ class SubAgentSupervisor:
         runs reach ``submit``. No background task and no ``finish_cb`` fire on
         synchronous admission failure.
         """
-        from sub_agent_registry import SubAgentRecord, get_registry
+        from sub_agent_registry import register_run
 
         try:
             runner = request.factory(**request.factory_kwargs)
@@ -102,26 +105,17 @@ class SubAgentSupervisor:
                 "suggestion": "Choose a model that exists in the configured model list.",
             }
 
-        record = SubAgentRecord(
-            agent_id=runner.agent_id,
+        # Create + wire (cancel_event/LLM client/on-step) + register the record
+        # through the shared helper so spawn and plan/diagnostic paths stay in
+        # sync. ``options.source`` distinguishes on-demand from scheduled runs;
+        # both count against the global capacity guard.
+        record = register_run(
+            runner,
+            source=options.source,
             label=request.label,
-            model=runner._model_id,
-            task_preview=request.task[:80],
-            started_at=time.time(),
-            source="on-demand",
-            max_iterations=runner._agent.max_iterations,
+            task_preview=request.task,
             result_type=request.response_format,
         )
-        # Share cancel_event and LLM client with the registry record so that
-        # /agents cancel can immediately interrupt any in-progress HTTP request.
-        record._cancel_event = runner._cancel_event
-        record._llm_client = runner._llm
-
-        # Wire iteration tracking: update registry on each step
-        _agent_id = runner.agent_id
-        runner._agent._on_step = lambda s: get_registry().update_iteration(_agent_id, s)
-
-        get_registry().register(record)
 
         # Log spawn params for observability
         fallback_models = request.factory_kwargs.get("fallback_models")
@@ -160,7 +154,7 @@ class SubAgentSupervisor:
         and ``finish_cb`` fires exactly once after unregister/close on every
         background terminal path.
         """
-        from sub_agent_registry import get_registry
+        from sub_agent_registry import deregister_run
 
         task = request.task
         label = request.label
@@ -310,7 +304,7 @@ class SubAgentSupervisor:
             # success/cancellation/failure so a crash mid-task does not lose
             # the sub-agent's short-term memory.
             _save_context_before_completion()
-            get_registry().unregister(runner.agent_id)
+            deregister_run(runner.agent_id)
             runner.close()
             if options.finish_cb:
                 options.finish_cb(finish_tag)

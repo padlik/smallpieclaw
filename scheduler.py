@@ -34,6 +34,7 @@ from typing import Callable, Optional
 import schedule
 from croniter import croniter, CroniterBadCronError
 
+from sub_agent_registry import SOURCE_SCHEDULED
 from sub_agent_supervisor import SupervisionOptions
 
 logger = logging.getLogger(__name__)
@@ -669,6 +670,9 @@ class Scheduler:
                 # scheduled results are shown as plain text, not collapsed in an
                 # expandable blockquote (which hides the result by default)
                 expandable=False,
+                # tag the registry record as a scheduled run (internal channel,
+                # never a model-facing spawn_agent arg); still capacity-counted.
+                source=SOURCE_SCHEDULED,
             )
 
             # Update last_run before spawning (we know it started)
