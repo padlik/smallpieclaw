@@ -54,3 +54,8 @@
 
 ### 🔴 Outstanding
 - None.
+
+## implementation review note — 2026-07-13
+
+### 🟡 Addressed
+- Clarified `agent-runtime-construction` spec wording so `MAIN` is covered by runtime-owned per-run context assembly while top-level main controller construction remains outside this change.

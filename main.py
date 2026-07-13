@@ -99,8 +99,9 @@ try:
 except ImportError:
     import tomllib as tomli  # Python 3.11+
 
-from agent_controller import AgentController, SubAgentRunner  # noqa: E402
-from builtin_executor import BuiltinExecutor, _load_context  # noqa: E402
+from agent_controller import AgentController  # noqa: E402
+from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile  # noqa: E402
+from builtin_executor import BuiltinExecutor  # noqa: E402
 from config_schema import resolve_model_id, vault_path, log_path, parse_vault_content  # noqa: E402
 from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
@@ -365,72 +366,72 @@ def _run(
             background_model_cfg.get("model", "none"),
         )
 
+    # Construction boundary for all sub-agent products (ADR-0007). The runtime
+    # holds the shared, run-independent collaborators; per-call construction
+    # knobs are passed through RuntimeOptions. Construction is uniform across the
+    # sub-agent profiles — the visibility source (on-demand/scheduled/plan-step/
+    # diagnostic) is assigned later by register_run, not by the runtime.
+    agent_runtime = AgentRuntime(
+        config=cfg,
+        all_models=all_models,
+        background_model_cfg=background_model_cfg,
+        tool_index=index,
+        executor=executor,
+        creator=creator,
+        base_memory=memory,
+        builtin_executor=builtin,
+        skill_registry=skills,
+        mcp_manager=mcp_manager,
+        results=results_mem,
+        usage_registry=get_token_registry(),
+        notify_fn=notify,
+        data_dir=data_dir,
+        tmp_dir=tmp_dir,
+        downloads_dir=downloads_dir,
+        top_tools=top_tools,
+        ctx_max_tokens=ctx_max_tokens,
+        scheduled_max_iterations=scheduled_max_iter,
+    )
+
     def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
                           fallback_models=None, max_iterations=None,
                           max_tokens=None, temperature=None, top_p=None,
                           on_tool_trace=None, cancel_event=None, trace_id=None,
-                          context_payload=None, prompt_variant=None):
-        """Create an isolated SubAgentRunner with the requested model override."""
-        # Resolve model config — accept full model ID, model name, or alias
-        if model:
-            resolved = resolve_model_id(model, all_models)
-            model_cfg = next((m for m in all_models if m.get("model") == resolved), None)
-            if model_cfg is None:
-                raise ValueError(
-                    f"Model '{model}' not found in [[models]]. "
-                    f"Available: {[m.get('model') for m in all_models]}"
-                )
-        else:
-            model_cfg = background_model_cfg
+                          context_payload=None, prompt_variant=None,
+                          runtime_profile=RuntimeProfile.ON_DEMAND_SUBAGENT):
+        """Create an isolated SubAgentRunner with the requested model override.
 
-        # Apply per-call LLM parameter overrides — always shallow-copy to protect shared config
-        llm_overrides = {}
-        if max_tokens is not None:
-            llm_overrides["max_tokens"] = max_tokens
-        if temperature is not None:
-            llm_overrides["temperature"] = temperature
-        if top_p is not None:
-            llm_overrides["top_p"] = top_p
-        model_cfg = {**model_cfg, **llm_overrides}
+        Thin frontend over ``AgentRuntime.create``; the signature is preserved for
+        existing callers (``BuiltinExecutor.spawn_agent``, the scheduler, and
+        ``PlanExecutor``).
 
-        # max_iterations: explicit override > scheduled default (never use chat max_iter here)
-        effective_max_iter = max_iterations if max_iterations is not None else scheduled_max_iter
-
-        ctx_max_turns = 50
-        pre_loaded_ctx = None
-        if context_key:
-            pre_loaded_ctx = _load_context(context_key, data_dir, max_turns=ctx_max_turns)
-
-        runner = SubAgentRunner(
-            model_cfg=model_cfg,
-            config=cfg,
-            tool_index=index,
-            executor=executor,
-            creator=creator,
-            base_memory=memory,
-            builtin_executor=builtin,
-            skill_registry=skills,
-            mcp_manager=mcp_manager,
-            results=results_mem,
-            short_term=pre_loaded_ctx,
-            notify_fn=notify_fn or notify,
-            context_key=context_key,
-            label=label,
-            max_iterations=effective_max_iter,
-            top_tools=top_tools,
-            ctx_max_tokens=ctx_max_tokens,
-            tmp_dir=tmp_dir,
-            downloads_dir=downloads_dir,
-            usage_registry=get_token_registry(),
-            depth=1,
+        ``runtime_profile`` selects the construction profile (default
+        ``ON_DEMAND_SUBAGENT``); scheduler, plan-step, and diagnostic call sites
+        pass their matching profile through this internal parameter. Construction
+        is behavior-equivalent across the sub-agent profiles today — the profile
+        is threaded so the visibility source assigned later stays consistent with
+        the construction origin.
+        """
+        options = RuntimeOptions(
+            model=model,
             fallback_models=fallback_models,
-            on_tool_trace=on_tool_trace,
-            cancel_event=cancel_event,
-            trace_id=trace_id,
+            max_iterations=max_iterations,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            context_key=context_key,
             context_payload=context_payload,
             prompt_variant=prompt_variant,
+            trace_id=trace_id,
+            cancel_event=cancel_event,
+            label=label,
         )
-        return runner
+        return agent_runtime.create(
+            runtime_profile,
+            options,
+            notify_fn=notify_fn,
+            on_tool_trace=on_tool_trace,
+        )
 
     # Wire sub_agent_factory into builtin executor
     builtin._sub_agent_factory = sub_agent_factory

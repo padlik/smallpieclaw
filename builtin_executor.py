@@ -2011,6 +2011,18 @@ class BuiltinExecutor:
         except (ValueError, TypeError):
             top_p_override = None
 
+        # Construction profile travels through the internal factory channel only
+        # (never through the model-facing ``args`` dict). Scheduled launches carry
+        # source="scheduled" via SupervisionOptions and construct under the
+        # SCHEDULED_AGENT profile; model-facing spawns use ON_DEMAND_SUBAGENT.
+        from agent_runtime import RuntimeProfile
+        from sub_agent_registry import SOURCE_SCHEDULED
+        runtime_profile = (
+            RuntimeProfile.SCHEDULED_AGENT
+            if options.source == SOURCE_SCHEDULED
+            else RuntimeProfile.ON_DEMAND_SUBAGENT
+        )
+
         factory_kwargs = dict(
             model=model,
             context_key=context_key,
@@ -2023,6 +2035,7 @@ class BuiltinExecutor:
             top_p=top_p_override,
             trace_id=trace_id or None,
             context_payload=context_payload,
+            runtime_profile=runtime_profile,
         )
         request = SubmissionRequest(
             task=task,

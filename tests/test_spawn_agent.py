@@ -118,8 +118,8 @@ class TestTaskAliases:
 class TestResponseFormat:
     """response_format modifies the task string before passing it to the factory."""
 
-    def _call_with_format(self, fmt: str) -> tuple[str, dict]:
-        """Call _exec_spawn_agent with the given response_format; return (task_used, factory_kwargs)."""
+    def _call_with_format(self, fmt: str) -> dict:
+        """Call _exec_spawn_agent with the given response_format; return captured factory_kwargs."""
         captured = {}
 
         def factory(**kwargs):
@@ -415,3 +415,53 @@ class TestGetAgentResultCancelOnTimeout:
         _notify_result = True
         should_notify = _notify_result and not record._timeout_cancelled
         assert should_notify is False, "notification must be suppressed when _timeout_cancelled is True"
+
+
+# ---------------------------------------------------------------------------
+# Runtime profile threading (Phase 3 profile wiring)
+# ---------------------------------------------------------------------------
+
+class TestRuntimeProfileThreading:
+    """spawn/scheduler construction threads the matching RuntimeProfile through
+    the internal factory channel (never through model-facing args)."""
+
+    def _capture_factory_kwargs(self, *, args=None, options=None) -> dict:
+        captured: dict = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return _make_runner()
+
+        exc = _make_executor(factory=factory)
+        with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
+             patch.object(exc._supervisor._pool, "submit",
+                          side_effect=lambda fn, *a, **kw: MagicMock()):
+            exc._exec_spawn_agent(
+                {"task": "do work", **(args or {})}, caller_depth=0, options=options,
+            )
+        return captured
+
+    def test_default_spawn_uses_on_demand_profile(self):
+        from agent_runtime import RuntimeProfile
+
+        captured = self._capture_factory_kwargs()
+        assert captured.get("runtime_profile") == RuntimeProfile.ON_DEMAND_SUBAGENT
+
+    def test_scheduled_source_uses_scheduled_profile(self):
+        from agent_runtime import RuntimeProfile
+        from sub_agent_registry import SOURCE_SCHEDULED
+        from sub_agent_supervisor import SupervisionOptions
+
+        captured = self._capture_factory_kwargs(
+            options=SupervisionOptions(source=SOURCE_SCHEDULED, notify=False),
+        )
+        assert captured.get("runtime_profile") == RuntimeProfile.SCHEDULED_AGENT
+
+    def test_runtime_profile_is_not_a_model_facing_arg(self):
+        # The model-facing spawn_agent args must not carry runtime_profile; it is
+        # derived internally from the supervision source.
+        from agent_runtime import RuntimeProfile
+
+        captured = self._capture_factory_kwargs(args={"runtime_profile": "attempted-injection"})
+        # Injection through model args is ignored; the internal derivation wins.
+        assert captured.get("runtime_profile") == RuntimeProfile.ON_DEMAND_SUBAGENT

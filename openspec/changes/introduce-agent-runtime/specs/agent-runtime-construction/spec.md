@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Profile-based runtime construction
-The system SHALL provide a runtime construction boundary that builds agent execution products from an explicit runtime profile and runtime options.
+The system SHALL provide a runtime construction boundary that builds agent execution products or per-run contexts from an explicit runtime profile and runtime options.
 
 #### Scenario: Runtime profiles are distinct from visibility sources
 - **GIVEN** the runtime constructs an agent execution using a runtime profile
@@ -12,7 +12,8 @@ The system SHALL provide a runtime construction boundary that builds agent execu
 #### Scenario: Supported runtime profiles exist
 - **GIVEN** the runtime construction boundary is available
 - **WHEN** callers request `MAIN`, `ON_DEMAND_SUBAGENT`, `SCHEDULED_AGENT`, `PLAN_STEP_AGENT`, or `DIAGNOSTIC_AGENT`
-- **THEN** each profile has defined construction defaults for depth, prompt variant, memory layering, trace/cancel behavior, and model configuration
+- **THEN** sub-agent profiles have defined construction defaults for depth, prompt variant, memory layering, trace/cancel behavior, and model configuration
+- **AND** the `MAIN` profile has defined per-run context assembly semantics while top-level main controller construction remains outside this change
 
 ### Requirement: Runtime options preserve construction knobs
 The runtime SHALL accept per-execution options for construction values currently duplicated across agent construction call sites.
@@ -45,11 +46,11 @@ Runtime-built sub-agent products SHALL preserve the surface consumed by existing
 - **THEN** the product supports `.run()`, `.agent_id`, `._model_id`, `._cancel_event`, `._llm`, `._agent`, `._short_term`, `.close()`, and `.notify_fn`
 
 ### Requirement: Runtime context equivalence
-Runtime construction SHALL be behavior-preserving and verified by golden-equivalence tests over generated controller, runner, and `ReactContext` state.
+Runtime construction and per-run context assembly SHALL be behavior-preserving and verified by golden-equivalence tests over generated controller, runner, and `ReactContext` state.
 
 #### Scenario: Main context equivalence
-- **GIVEN** a main agent execution is constructed through the runtime
-- **WHEN** its `ReactContext` is compared to the legacy construction path
+- **GIVEN** a main agent execution uses runtime-owned per-run context assembly
+- **WHEN** its `ReactContext` is compared to the legacy context assembly path
 - **THEN** equivalent fields are present for LLM, tool registry, builtin executor, memory, working memory, results memory, confirmation, trace, cancel ownership, graph memory, strategy memory, and iteration limits
 
 #### Scenario: Sub-agent context equivalence

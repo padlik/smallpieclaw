@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent_runtime import RuntimeProfile
 from execution_plan import (
     ExecutionPlan,
     PlanExecutor,
@@ -811,3 +812,56 @@ class TestParentCancelBridge:
         assert result["success"] is False
         # The runner's run() must not have been invoked.
         assert run_called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Runtime profile threading (Phase 3 profile wiring)
+# ---------------------------------------------------------------------------
+
+
+class TestRuntimeProfileThreading:
+    """Plan-step and diagnostic construction pass their matching RuntimeProfile.
+
+    Construction remains behavior-equivalent; only the profile threaded to the
+    factory differs, so the visibility source assigned later stays consistent
+    with the construction origin.
+    """
+
+    def test_plan_step_construction_uses_plan_step_profile(self, minimal_ctx, recorder_factory):
+        factory = recorder_factory()
+        executor = PlanExecutor(max_concurrent=1, sub_agent_factory=factory)
+        step = PlanStep(id="s1", tool="shell", args={})
+        cancel = threading.Event()
+
+        runner, err = executor._create_runner(step, minimal_ctx, cancel, factory)
+
+        assert err is None
+        assert runner is not None
+        assert factory.calls[0]["kwargs"]["runtime_profile"] == RuntimeProfile.PLAN_STEP_AGENT
+
+    def test_diagnostic_construction_uses_diagnostic_profile(self, minimal_ctx, recorder_factory):
+        factory = recorder_factory()
+        executor = PlanExecutor(max_concurrent=1, sub_agent_factory=factory)
+        step = PlanStep(id="s1", tool="shell", args={})
+        cancel = threading.Event()
+        outcome = {"error_type": "tool_timeout", "error": "boom"}
+
+        # _diagnose_step_failure registers/deregisters the runner in the global
+        # registry itself (try/finally), so no external cleanup is required.
+        executor._diagnose_step_failure(step, outcome, minimal_ctx, factory, cancel)
+
+        assert factory.calls[0]["kwargs"]["runtime_profile"] == RuntimeProfile.DIAGNOSTIC_AGENT
+
+    def test_plan_step_and_diagnostic_profiles_differ(self, minimal_ctx, recorder_factory):
+        factory = recorder_factory()
+        executor = PlanExecutor(max_concurrent=1, sub_agent_factory=factory)
+        step = PlanStep(id="s1", tool="shell", args={})
+        cancel = threading.Event()
+
+        executor._create_runner(step, minimal_ctx, cancel, factory)
+        executor._diagnose_step_failure(
+            step, {"error_type": "x", "error": "e"}, minimal_ctx, factory, cancel,
+        )
+
+        profiles = [c["kwargs"]["runtime_profile"] for c in factory.calls]
+        assert profiles == [RuntimeProfile.PLAN_STEP_AGENT, RuntimeProfile.DIAGNOSTIC_AGENT]
