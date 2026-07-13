@@ -5,7 +5,6 @@
 Define a centralized, agent-scoped vault for storing arbitrary string values (API keys, tokens, URLs, bearer headers) in a single TOML file.
 
 ## Requirements
-
 ### Requirement: File-backed vault storage
 
 The application MUST support a `[vault]` config section with a `type` field, and SHALL load key-value pairs from a TOML file at startup when `type = "file"`.
@@ -55,9 +54,3 @@ Rule: Vault values are plain strings; any key can hold a key, token, URL, or hea
 - **WHEN** a config field uses `sec:AUTH_HEADER`
 - **THEN** the resolved value is `"Bearer sk-xyz"`
 
-## Removed
-
-### Requirement: File-backed secret resolution
-**Reason**: Replaced by the unified `sec:` vault prefix. The `api_key_file`/`bot_token_file` mechanism is removed.
-
-**Migration**: Move secret file contents into the agent vault (`~/.local/share/<agent_name>/secrets.toml`) and replace `api_key_file = "..."` with `api_key = "sec:KEY_NAME"`.
