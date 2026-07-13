@@ -17,6 +17,7 @@ import logging
 import threading
 from typing import Callable, Optional
 
+from agent_runtime import AgentRuntime
 from confirmation import ConfirmationManager
 from llm_client import LLMClient
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
@@ -29,7 +30,6 @@ from prompt_builder import (
     format_tools as _format_tools_impl,
 )
 from react_loop import (
-    ReactContext,
     extract_json_candidates,
     fmt_tool_call,
     fmt_tool_result_progress,
@@ -170,48 +170,10 @@ class AgentController:
         if hasattr(self.llm, "set_trace_id"):
             self.llm.set_trace_id(trace_id)
 
-        ctx = ReactContext(
-            llm=self.llm,
-            tool_index=self.tool_index,
-            executor=self.executor,
-            creator=self.creator,
-            memory=self.memory,
-            builtin_executor=self.builtin_executor,
-            mcp_manager=self.mcp_manager,
-            skill_registry=self.skill_registry,
-            max_iterations=self.max_iterations,
-            top_tools=self.top_tools,
-            ctx_max_tokens=self.ctx_max_tokens,
-            tmp_dir=self.tmp_dir,
-            downloads_dir=self.downloads_dir,
-            log_file=self.log_file,
-            log_backup_count=self.log_backup_count,
-            depth=self._depth,
-            label=self.label,
-            trace_id=trace_id,
-            short_term=self.short_term,
-            working=self.working,
-            results=self.results,
-            cancel_event=self._cancel_event,
-            owns_cancel_event=self._owns_cancel_event,
-            on_step=self._on_step,
-            on_tool_trace=self._on_tool_trace,
-            job_history_fn=self._job_history_fn,
-            graph_memory=self._graph_memory,
-            graph_memory_writer=self._graph_memory_writer,
-            graph_memory_max_entries=self._graph_memory_max_entries,
-            strategy_memory=getattr(self, "strategy_memory", None),
-            max_subagents=getattr(self.builtin_executor, "_max_subagents", 6),
-            creativity_mode=getattr(self, "creativity_mode", "default"),
-            plan_max_iterations=getattr(self, "plan_max_iterations", 50),
-            inactivity_warn_minutes=getattr(self, "inactivity_warn_minutes", 15),
-            confirmation=self._confirmation,
-        )
-        # Sub-agent context sharing: propagate the parent context payload and
-        # prompt variant (set by SubAgentRunner) so react_loop can inject the
-        # PARENT CONTEXT section and select the sub-agent prompt variant.
-        ctx._context_payload = self._context_payload
-        ctx._prompt_variant = self._prompt_variant
+        # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
+        # keeps only the per-run concerns: trace minting (above), model
+        # _active_idx save/restore (below), and progress/image passthrough.
+        ctx = AgentRuntime.build_react_context(self, trace_id)
         try:
             return react_loop(ctx, user_goal, progress_callback, images)
         finally:

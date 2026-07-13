@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from error_registry import ErrorTypeRegistry
+from agent_runtime import RuntimeProfile
 from exceptions import AgentError
 from react_loop import ReactContext, parse_json
 from sub_agent_registry import (
@@ -374,6 +375,7 @@ class PlanExecutor:
                 cancel_event=cancel_event,
                 context_payload=payload,
                 prompt_variant="sub-agent",
+                runtime_profile=RuntimeProfile.PLAN_STEP_AGENT,
             )
             return runner, None
         except Exception as exc:  # noqa: BLE001
@@ -460,6 +462,7 @@ class PlanExecutor:
                 max_iterations=_STEP_MAX_ITERATIONS,
                 trace_id=ctx.trace_id,
                 cancel_event=cancel_event,
+                runtime_profile=RuntimeProfile.DIAGNOSTIC_AGENT,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Diagnostic sub-agent failed to build for step '%s'", step.id)
