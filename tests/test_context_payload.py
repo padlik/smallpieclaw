@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from builtin_executor import BuiltinExecutor
 from memory_store import ShortTermMemory
+from sub_agent_supervisor import SupervisionOptions
 from react_loop import (
     ReactContext,
     _format_parent_context,
@@ -117,7 +118,7 @@ class TestSpawnAgentContextPayload:
         exc = BuiltinExecutor(sub_agent_factory=factory)
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", return_value=MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
             result = exc._exec_spawn_agent(
                 {
                     "task": "do work",
@@ -142,7 +143,7 @@ class TestSpawnAgentContextPayload:
         payload = {"conversation_summary": "User asked about disk space"}
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", return_value=MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
             exc._exec_spawn_agent(
                 {"task": "do work", "context_payload": payload},
                 caller_depth=0,
@@ -166,7 +167,7 @@ class TestSpawnAgentContextPayload:
         exc._graph_memory = graph_memory  # type: ignore[attr-defined]
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", return_value=MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
             exc._exec_spawn_agent(
                 {"task": "do work"},
                 caller_depth=0,
@@ -184,16 +185,16 @@ class TestSpawnAgentContextPayload:
         exc = BuiltinExecutor(sub_agent_factory=factory, data_dir=str(tmp_path))
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit",
+             patch.object(exc._supervisor._pool, "submit",
                           side_effect=lambda fn, *_args, **_kwargs: fn()):
             exc._exec_spawn_agent(
                 {
                     "task": "do work",
                     "context_key": "ctx-payload-test",
                     "context_payload": {"secret": "must not persist"},
-                    "_notify": False,
                 },
                 caller_depth=0,
+                options=SupervisionOptions(notify=False),
             )
 
         context_file = tmp_path / "job_contexts" / "ctx-payload-test.json"
@@ -250,7 +251,7 @@ class TestPromptVariant:
         exc = BuiltinExecutor(sub_agent_factory=factory)
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", return_value=MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
             exc._exec_spawn_agent(
                 {"task": "do work"},
                 caller_depth=0,

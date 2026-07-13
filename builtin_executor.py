@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import codecs
 import difflib
-import html as _html_mod
 import json
 import logging
 import os
@@ -40,13 +39,17 @@ import signal
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol
 
 import structlog
 
 import agent_logging
+from sub_agent_supervisor import (
+    SubAgentSupervisor,
+    SubmissionRequest,
+    SupervisionOptions,
+)
 
 slog = agent_logging.get_logger(__name__)
 
@@ -553,9 +556,10 @@ class BuiltinExecutor:
         self._shell_pty_cols = shell_pty_cols
         self._shell_pty_rows = shell_pty_rows
         self._shell_streaming = shell_streaming  # forward chunks to on_chunk callback (PTY only)
-        self._sub_agent_pool = ThreadPoolExecutor(
-            max_workers=max_subagents, thread_name_prefix="sub-agent"
-        )
+        # Background sub-agent lifecycle is owned by the supervisor, which also
+        # owns the thread pool. The model-facing _exec_spawn_agent shim and the
+        # scheduler both delegate accepted runs to it.
+        self._supervisor = SubAgentSupervisor(max_subagents=max_subagents)
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
         # Headless (sub-agent) confirmation bridge
@@ -576,25 +580,11 @@ class BuiltinExecutor:
     def shutdown(self, graceful_timeout: float = 10.0) -> None:
         """Shut down the sub-agent thread pool.
 
-        Signals all active sub-agents to cancel, waits up to graceful_timeout
-        seconds for them to finish, then forces shutdown of any stragglers.
+        Delegates to the supervisor, which signals all active sub-agents to
+        cancel, waits up to graceful_timeout seconds for them to finish, then
+        forces shutdown of any stragglers.
         """
-        from sub_agent_registry import get_registry as _get_registry
-        registry = _get_registry()
-        active = registry.list_active()
-        if active:
-            logger.info("Shutdown: cancelling %d active sub-agent(s)…", len(active))
-            for record in active:
-                record.cancel()
-            # Wait briefly for cancelled agents to wind down before forcing pool shutdown
-            import time as _time
-            deadline = _time.monotonic() + graceful_timeout
-            while _time.monotonic() < deadline:
-                if not any(r.status == "running" for r in registry.list_active()):
-                    break
-                _time.sleep(0.25)
-        self._sub_agent_pool.shutdown(wait=False, cancel_futures=True)
-        logger.debug("Sub-agent pool shut down.")
+        self._supervisor.shutdown(graceful_timeout)
 
     def is_builtin(self, name: str) -> bool:
         return name in BUILTIN_TOOLS
@@ -1859,18 +1849,27 @@ class BuiltinExecutor:
     # ------------------------------------------------------------------
 
     def _exec_spawn_agent(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
-                          trace_id: str = "") -> dict:
+                          trace_id: str = "", options: Optional[SupervisionOptions] = None) -> dict:
         """
-        Spawn an isolated sub-agent in a background thread.
+        Model-facing compatibility shim for the ``spawn_agent`` tool.
 
-        The sub-agent runs to completion then delivers its result via
-        notify_fn (Telegram) and writes to long-term memory.
-        Returns immediately with {status: "spawned", agent_id: "sa-..."}.
+        Validates tool arguments (task aliases, depth guard, response_format,
+        context_key syntax), builds the parent context payload, and delegates
+        accepted runs to ``SubAgentSupervisor.submit`` which owns the background
+        lifecycle. Returns immediately with an ``agent_id`` (or a friendly
+        rejection dict).
+
+        ``options`` carries internal supervision controls (scheduler job tag,
+        finish/result-log callbacks, notify/expandable flags). These are NOT
+        model-facing tool arguments and must never be read from ``args``; the
+        scheduler passes them here as a per-submission ``SupervisionOptions``.
 
         caller_depth is the depth of the AgentController that invoked this tool.
         Sub-agents (depth ≥ 1) are not allowed to spawn further sub-agents.
         """
         from sub_agent_registry import get_registry as get_agent_registry
+
+        options = options or SupervisionOptions()
 
         task = args.get("task", "").strip()
         # Accept common LLM aliases for the 'task' parameter
@@ -1917,7 +1916,9 @@ class BuiltinExecutor:
                 "suggestion": "The agent runtime is missing sub-agent support; this cannot be recovered in-flight.",
             }
 
-        # Concurrency cap — only count on-demand (managed) agents, not scheduler jobs
+        # Concurrency cap — preserve current managed-record semantics.
+        # Scheduled launches still use source="on-demand" until the later
+        # running-agent visibility/cap policy change decides otherwise.
         current_managed = get_agent_registry().count_managed()
         if current_managed >= self._max_subagents:
             return {
@@ -1979,19 +1980,9 @@ class BuiltinExecutor:
             context_payload = {"parent_note": str(context_payload)}
 
         fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
-        job_tag = args.get("_job_tag") or None       # set by scheduler; used for finish callback
-        label = job_tag or context_key or "on-demand"
-        # Finish callback passed directly from scheduler to avoid shared-attribute race
-        # when multiple jobs fire concurrently.
-        _finish_cb = args.get("_finish_cb") or getattr(self, '_scheduler_finish_cb', None)
-        _finish_tag = job_tag or label
-        # Execution log callback — only provided by scheduler for scheduled jobs.
-        _result_log_cb = args.get("_result_log_cb") if job_tag else None
-        # Scheduled jobs set expandable=False so results are shown as plain text,
-        # not collapsed inside an expandable blockquote.
-        _expandable = args.get("expandable", True)
-        # _notify=False suppresses Telegram output for silent scheduled jobs.
-        _notify_result = args.get("_notify", True)
+        # Internal supervision controls (job tag, callbacks, notify/expandable)
+        # arrive via `options`, never through the model-facing `args` dict.
+        label = options.job_tag or context_key or "on-demand"
 
         # Build the sub-agent via factory
         max_iterations = args.get("max_iterations")  # None = use factory default (scheduled_max_iter)
@@ -2020,225 +2011,34 @@ class BuiltinExecutor:
         except (ValueError, TypeError):
             top_p_override = None
 
-        try:
-            runner = self._sub_agent_factory(
-                model=model,
-                context_key=context_key,
-                label=label,
-                notify_fn=None,   # factory sets this from main notify_fn
-                fallback_models=fallback_models,
-                max_iterations=max_iterations,
-                max_tokens=max_tokens_override,
-                temperature=temperature_override,
-                top_p=top_p_override,
-                trace_id=trace_id or None,
-                context_payload=context_payload,
-            )
-        except ValueError as exc:
-            return {
-                "success": False,
-                "output": "",
-                "error": f"spawn_agent: {exc}",
-                "exit_code": -1,
-                "error_type": "wrong_model_for_task",
-                "recoverable": False,
-                "suggestion": "Choose a model that exists in the configured model list.",
-            }
-
-        from sub_agent_registry import SubAgentRecord
-        import time
-
-        record = SubAgentRecord(
-            agent_id=runner.agent_id,
+        factory_kwargs = dict(
+            model=model,
+            context_key=context_key,
             label=label,
-            model=runner._model_id,
-            task_preview=task[:80],
-            started_at=time.time(),
-            source="on-demand",
-            max_iterations=runner._agent.max_iterations,
-            result_type=response_format,
+            notify_fn=None,   # factory sets this from main notify_fn
+            fallback_models=fallback_models,
+            max_iterations=max_iterations,
+            max_tokens=max_tokens_override,
+            temperature=temperature_override,
+            top_p=top_p_override,
+            trace_id=trace_id or None,
+            context_payload=context_payload,
         )
-        # Share cancel_event and LLM client with the registry record so that
-        # /agents cancel can immediately interrupt any in-progress HTTP request.
-        record._cancel_event = runner._cancel_event
-        record._llm_client = runner._llm
-
-        # Wire iteration tracking: update registry on each step
-        _agent_id = runner.agent_id
-        runner._agent._on_step = lambda s: get_agent_registry().update_iteration(_agent_id, s)
-
-        get_agent_registry().register(record)
-
-        # Log spawn params for observability
-        _fb_log = str(fallback_models) if fallback_models is not None else "inherited"
-        logger.info(
-            "spawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
-            runner.agent_id, label, runner._model_id, _fb_log, task[:100],
+        request = SubmissionRequest(
+            task=task,
+            response_format=response_format,
+            label=label,
+            context_key=context_key,
+            factory=self._sub_agent_factory,
+            factory_kwargs=factory_kwargs,
+            data_dir=self._data_dir,
+            notify_html_fn=self._notify_html_fn,
+            save_context=_save_context,
         )
-
-        def _run_and_notify():
-            # Convenience: use HTML notify if available (results in expandable quote blocks)
-            _notify_html = self._notify_html_fn
-            _context_save_attempted = False
-
-            def _send_result_html(header_html: str, body: str) -> None:
-                """Send header + body, optionally wrapped in an expandable blockquote."""
-                escaped = _html_mod.escape(body)
-                if _expandable:
-                    msg = f"{header_html}\n<blockquote expandable>{escaped}</blockquote>"
-                else:
-                    msg = f"{header_html}\n\n{escaped}"
-                if _notify_html:
-                    _notify_html(msg)
-                else:
-                    runner.notify_fn(msg)
-
-            def _save_context_before_completion() -> None:
-                """Persist context before exposing completion to get_agent_result callers."""
-                nonlocal _context_save_attempted
-                if not context_key or _context_save_attempted:
-                    return
-                _context_save_attempted = True
-                try:
-                    _save_context(context_key, runner._short_term, self._data_dir)
-                except Exception as save_exc:
-                    logger.warning(
-                        "spawn_agent: [%s] context save failed for %s: %s",
-                        label, context_key, save_exc,
-                    )
-
-            try:
-                result = runner.run(task)
-                # P2 consolidation: sub-agent results are NOT auto-persisted into
-                # semantic memory. JSON LongTermMemory is legacy/backfill-only and
-                # auto-writing arbitrary sub-agent output risks prompt poisoning.
-                # If a result should be remembered, the operator/main agent must
-                # explicitly (and with confirmation) call memory_graph_store.
-                if result == "[Cancelled]":
-                    record.status = "cancelled"
-                    record.result = "[Cancelled]"
-                    _save_context_before_completion()
-                    record._result_event.set()
-                    elapsed = int(time.time() - record.started_at)
-                    logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
-                    # Record cancellation in job history log for scheduled jobs
-                    if _result_log_cb:
-                        try:
-                            _result_log_cb(
-                                tag=job_tag,
-                                task=task,
-                                result="[Cancelled]",
-                                success=False,
-                                elapsed_s=elapsed,
-                                model=runner._model_id,
-                            )
-                        except Exception as log_exc:
-                            logger.warning("spawn_agent: [%s] result_log_cb failed (cancelled): %s", label, log_exc)
-                    # Suppress notification for agents cancelled due to get_agent_result timeout —
-                    # the caller already received a timeout response and moved on.
-                    if _notify_result and not record._timeout_cancelled:
-                        try:
-                            runner.notify_fn(
-                                f"🛑 Sub-agent {runner.agent_id} cancelled\n"
-                                f"Job: **{label}**\n"
-                                f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
-                            )
-                        except Exception as notify_exc:
-                            logger.warning("spawn_agent: [%s] notify failed (cancelled): %s", label, notify_exc)
-                else:
-                    record.status = "done"
-                    record.result = result
-                    _save_context_before_completion()
-                    record._result_event.set()
-                    elapsed = int(time.time() - record.started_at)
-                    logger.info(
-                        "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
-                        label, runner.agent_id, runner._model_id, elapsed,
-                    )
-                    # Record execution result in job history log for scheduled jobs
-                    if _result_log_cb:
-                        try:
-                            _result_log_cb(
-                                tag=job_tag,
-                                task=task,
-                                result=result,
-                                success=True,
-                                elapsed_s=elapsed,
-                                model=runner._model_id,
-                            )
-                        except Exception as log_exc:
-                            logger.warning("spawn_agent: [%s] result_log_cb failed: %s", label, log_exc)
-                    if _notify_result:
-                        header_html = (
-                            f"✅ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
-                            f" finished ({elapsed}s)\n"
-                            f"<b>Job:</b> {_html_mod.escape(label)}"
-                            f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
-                            f"<b>Task:</b> {_html_mod.escape(task[:120])}"
-                        )
-                        try:
-                            _send_result_html(header_html, result)
-                        except Exception as notify_exc:
-                            logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
-            except Exception as exc:
-                record.status = "failed"
-                record.result = str(exc)
-                _save_context_before_completion()
-                record._result_event.set()
-                elapsed = int(time.time() - record.started_at)
-                logger.error(
-                    "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
-                    label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
-                )
-                # Record failure in job history log for scheduled jobs
-                if _result_log_cb:
-                    try:
-                        _result_log_cb(
-                            tag=job_tag,
-                            task=task,
-                            result=f"Error: {exc}",
-                            success=False,
-                            elapsed_s=elapsed,
-                            model=runner._model_id,
-                        )
-                    except Exception as log_exc:
-                        logger.warning("spawn_agent: [%s] result_log_cb failed (error): %s", label, log_exc)
-                if _notify_result:
-                    header_html = (
-                        f"❌ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
-                        f" failed ({elapsed}s)\n"
-                        f"<b>Job:</b> {_html_mod.escape(label)}"
-                        f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
-                        f"<b>Task:</b> {_html_mod.escape(task[:120])}"
-                    )
-                    try:
-                        _send_result_html(header_html, f"Error: {exc}")
-                    except Exception as notify_exc:
-                        logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
-            finally:
-                # Persist conversation context (if requested) regardless of
-                # success/cancellation/failure so a crash mid-task does not lose
-                # the sub-agent's short-term memory.
-                _save_context_before_completion()
-                get_agent_registry().unregister(runner.agent_id)
-                runner.close()
-                if _finish_cb:
-                    _finish_cb(_finish_tag)
-
-        self._sub_agent_pool.submit(_run_and_notify)
-
-        return {
-            "success": True,
-            "output": (
-                f"Sub-agent spawned (id: {runner.agent_id}, model: {runner._model_id}, "
-                f"response_format: {response_format}). "
-                f"Call get_agent_result(\"{runner.agent_id}\") to retrieve the result when needed."
-            ),
-            "error": "",
-            "exit_code": 0,
-            "agent_id": runner.agent_id,
-            "response_format": response_format,
-        }
+        # Accepted run — the supervisor owns registration, background execution,
+        # result signalling, context persistence, notification, scheduler
+        # callbacks, and cleanup.
+        return self._supervisor.submit(request, options)
 
 
     def _exec_get_agent_result(self, args: dict, caller_tag: str = "") -> dict:

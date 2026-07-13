@@ -34,6 +34,8 @@ from typing import Callable, Optional
 import schedule
 from croniter import croniter, CroniterBadCronError
 
+from sub_agent_supervisor import SupervisionOptions
+
 logger = logging.getLogger(__name__)
 
 
@@ -640,7 +642,7 @@ class Scheduler:
             preserve_ctx = meta.get("preserve_context", False)
             context_key = _normalize_context_key(tag) if preserve_ctx else None
 
-            spawn_args = {"task": task, "_job_tag": tag}
+            spawn_args = {"task": task}
             if job_model:
                 spawn_args["model"] = job_model
             if context_key:
@@ -652,23 +654,29 @@ class Scheduler:
             # max_iterations: per-job override; None = factory uses scheduled_max_iterations
             if "max_iterations" in meta:
                 spawn_args["max_iterations"] = meta["max_iterations"]
-            # Pass finish callback directly in spawn_args to avoid race when
-            # multiple jobs fire concurrently and overwrite the shared attribute.
-            spawn_args["_finish_cb"] = self._mark_job_finished
-            # Scheduled job results should be shown as plain text, not in a
-            # collapsed expandable blockquote (which hides the result by default).
-            spawn_args["expandable"] = False
-            # Honour the job's notify setting — False suppresses Telegram output.
-            spawn_args["_notify"] = meta.get("notify", True)
-            # Pass execution log callback so spawn_agent records the result.
-            spawn_args["_result_log_cb"] = self.execution_log.record
+
+            # Internal supervision controls travel through per-submission options,
+            # NOT through the model-facing spawn_args dict. Per-submission options
+            # avoid the shared-attribute race when multiple jobs fire concurrently.
+            options = SupervisionOptions(
+                job_tag=tag,
+                # finish callback → cleans up _running_jobs when the sub-agent ends
+                finish_cb=self._mark_job_finished,
+                # execution-log recorder so the supervisor logs the job result
+                result_log_cb=self.execution_log.record,
+                # honour the job's notify setting — False suppresses Telegram output
+                notify=meta.get("notify", True),
+                # scheduled results are shown as plain text, not collapsed in an
+                # expandable blockquote (which hides the result by default)
+                expandable=False,
+            )
 
             # Update last_run before spawning (we know it started)
             meta["last_run"] = now
             self._run_history.setdefault(tag, {})["last_run"] = now
             self._save_state()
 
-            result = self.builtin_executor._exec_spawn_agent(spawn_args)
+            result = self.builtin_executor._exec_spawn_agent(spawn_args, options=options)
             if not result.get("success"):
                 logger.error("Job %s spawn failed: %s", tag, result.get("error"))
                 meta["last_error"] = result.get("error", "spawn failed")

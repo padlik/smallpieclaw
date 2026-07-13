@@ -104,7 +104,7 @@ class TestTaskAliases:
         exc = _make_executor(factory=factory)
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", return_value=MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
             result = exc._exec_spawn_agent({alias: "my task text"}, caller_depth=0)
 
         # Should not be an error about missing task
@@ -128,7 +128,7 @@ class TestResponseFormat:
 
         exc = _make_executor(factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc._exec_spawn_agent({"task": "base task", "response_format": fmt}, caller_depth=0)
 
         return captured
@@ -144,12 +144,12 @@ class TestResponseFormat:
 
         exc._sub_agent_factory = track_factory
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc._exec_spawn_agent({"task": "base task", "response_format": "json"}, caller_depth=0)
 
-        # The task is augmented before being stored in the record — check the factory was called
-        # (task augmentation is part of the _run_and_notify closure, but the record preview
-        #  is captured from task[:80]. We verify the overall flow succeeds here.)
+        # The task is augmented by the shim before delegation to the supervisor —
+        # check the factory was called (the supervisor captures the record preview
+        # from task[:80]). We verify the overall flow succeeds here.
         assert len(modified_tasks) == 1  # factory was called exactly once
 
     def test_unknown_format_defaults_to_text(self):
@@ -157,7 +157,7 @@ class TestResponseFormat:
         factory = MagicMock(return_value=runner)
         exc = _make_executor(factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             result = exc._exec_spawn_agent(
                 {"task": "base task", "response_format": "xml"}, caller_depth=0
             )
@@ -182,7 +182,7 @@ class TestLLMParameterOverrides:
 
         exc = _make_executor(factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc._exec_spawn_agent({"task": "do work", **args}, caller_depth=0)
         return captured
 
@@ -236,7 +236,7 @@ class TestTracePropagation:
 
         exc = _make_executor(factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc._exec_spawn_agent({"task": "do work"}, caller_depth=0, trace_id=trace_id)
         return captured
 
@@ -259,7 +259,7 @@ class TestTracePropagation:
 
         exc = _make_executor(factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
+             patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc.execute("spawn_agent", {"task": "do work"}, caller_depth=0,
                         caller_tag="main r-cafef00d", trace_id="r-cafef00d")
         assert captured.get("trace_id") == "r-cafef00d"

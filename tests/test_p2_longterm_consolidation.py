@@ -18,6 +18,7 @@ import pytest
 
 from builtin_executor import BuiltinExecutor
 from memory_store import LongTermMemory
+from sub_agent_supervisor import SupervisionOptions
 
 
 def _make_runner(agent_id: str = "sa-p2", model_id: str = "test-model") -> MagicMock:
@@ -45,10 +46,11 @@ class TestSubAgentNoLongTermWrite:
         exc = BuiltinExecutor(sub_agent_factory=MagicMock(return_value=runner))
         # Run the spawn closure synchronously so completion logic executes inline.
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
-             patch.object(exc._sub_agent_pool, "submit",
+             patch.object(exc._supervisor._pool, "submit",
                           side_effect=lambda fn, *a, **_kw: fn()):
             result = exc._exec_spawn_agent(
-                {"task": "do something", "_notify": False}, caller_depth=0
+                {"task": "do something"}, caller_depth=0,
+                options=SupervisionOptions(notify=False),
             )
         assert result["success"] is True
         runner.run.assert_called_once()
