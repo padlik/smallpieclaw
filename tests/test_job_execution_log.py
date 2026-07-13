@@ -8,8 +8,8 @@ Covers:
 - format_for_prompt() output
 - read_recent()
 - Atomic write (no partial file corruption)
-- _result_log_cb wiring in builtin_executor via spawn_args
-- Scheduler wires execution_log and passes _result_log_cb in spawn path
+- Result-log callback wiring through per-submission supervision options
+- Scheduler wires execution_log and passes result_log_cb outside model-facing args
 - Scheduler legacy path calls execution_log.record()
 - Config keys execution_log_max_age_hours / execution_log_max_per_job
 """
@@ -269,7 +269,12 @@ def test_scheduler_legacy_path_records_failure(tmp_path):
 
 
 def test_scheduler_spawn_path_passes_result_log_cb(tmp_path):
-    """Scheduler passes _result_log_cb in spawn_args when builtin_executor is available."""
+    """Scheduler delivers result_log_cb via supervision options, not spawn_args.
+
+    Migrated from asserting an ``_result_log_cb`` key inside the model-facing
+    spawn_args dict: scheduler/internal controls now flow through the
+    per-submission ``SupervisionOptions`` channel.
+    """
     s = _sched(tmp_path)
     s._jobs_meta["spawn_job"] = {"task": "do spawn task", "enabled": True, "notify": False}
     mock_executor = MagicMock()
@@ -279,6 +284,17 @@ def test_scheduler_spawn_path_passes_result_log_cb(tmp_path):
     s._run_job("spawn_job")
 
     mock_executor._exec_spawn_agent.assert_called_once()
+    # Internal controls must NOT leak into the model-facing args dict.
     spawn_args = mock_executor._exec_spawn_agent.call_args[0][0]
-    assert "_result_log_cb" in spawn_args
-    assert callable(spawn_args["_result_log_cb"])
+    assert "_result_log_cb" not in spawn_args
+    assert "_finish_cb" not in spawn_args
+    assert "_job_tag" not in spawn_args
+    assert "_notify" not in spawn_args
+    assert "expandable" not in spawn_args
+    # They arrive through the supervision options channel instead.
+    options = mock_executor._exec_spawn_agent.call_args.kwargs["options"]
+    assert options.job_tag == "spawn_job"
+    assert callable(options.result_log_cb)
+    assert callable(options.finish_cb)
+    assert options.notify is False
+    assert options.expandable is False

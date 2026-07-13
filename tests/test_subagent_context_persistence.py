@@ -14,6 +14,7 @@ import pytest
 
 from builtin_executor import _load_context, _save_context
 from memory_store import ShortTermMemory
+from sub_agent_supervisor import SupervisionOptions
 
 
 def _stm(turns):
@@ -128,11 +129,12 @@ class TestSpawnSavesContextInFinally:
             data_dir=str(tmp_path),
         )
         with patch("sub_agent_registry.get_registry", return_value=_make_reg()), \
-             patch.object(exc._sub_agent_pool, "submit",
+             patch.object(exc._supervisor._pool, "submit",
                           side_effect=lambda fn, *a, **kw: fn()):
             exc._exec_spawn_agent(
-                {"task": "do work", "context_key": context_key, "_notify": False},
+                {"task": "do work", "context_key": context_key},
                 caller_depth=0,
+                options=SupervisionOptions(notify=False),
             )
         return tmp_path / "job_contexts" / f"{context_key}.json"
 
@@ -191,11 +193,12 @@ class TestSpawnSavesContextInFinally:
         )
         with patch("sub_agent_registry.get_registry", return_value=registry), \
              patch("builtin_executor._save_context", side_effect=_save_spy), \
-             patch.object(exc._sub_agent_pool, "submit",
+             patch.object(exc._supervisor._pool, "submit",
                           side_effect=lambda fn, *a, **kw: fn()):
             exc._exec_spawn_agent(
-                {"task": "do work", "context_key": "ctx-order", "_notify": False},
+                {"task": "do work", "context_key": "ctx-order"},
                 caller_depth=0,
+                options=SupervisionOptions(notify=False),
             )
 
         assert registry.record._result_event.is_set()
