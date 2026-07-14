@@ -31,6 +31,14 @@ and are unchanged by this behaviour.
 - **WHEN** a caller queries `is_builtin` for a name or lists `all_tools`
 - **THEN** the same fixed set of 15 built-in tools is enumerated by `is_builtin` and `all_tools`
 
+#### Scenario: Dispatch result is independent of which internal module implements a handler
+- **GIVEN** the built-in executor
+- **WHEN** a caller invokes `execute` for a known built-in tool
+- **THEN** the result depends only on the tool name and arguments, never on which
+  internal module or function holds that handler's implementation
+- **AND** a caller cannot distinguish, from `execute`'s result or from
+  `is_builtin`/`all_tools` enumeration, which module implements a given handler
+
 ### Requirement: Dangerous and sensitive tools gate through two-phase confirmation
 
 A confirmation-capable built-in MUST NOT perform its effect until confirmed. In
