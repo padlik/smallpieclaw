@@ -17,7 +17,34 @@ without explicit inheritance — no code changes needed to existing classes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
+
+
+# ---------------------------------------------------------------------------
+# Native Tool Calling Types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolCall:
+    """A single tool call from a native tool-calling response."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ChatResponse:
+    """Unified response from chat_with_tools — either text or tool calls."""
+
+    text: str | None = None
+    tool_calls: list[ToolCall] | None = None
+
+    @property
+    def is_tool_call(self) -> bool:
+        """True when the response contains structured tool calls."""
+        return bool(self.tool_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +73,30 @@ class LLMProvider(Protocol):
         json_mode: bool = False,
     ) -> str:
         """Chat with automatic fallback to alternative models on failure."""
+        ...
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system: str | None = None,
+        progress_cb=None,
+    ) -> ChatResponse:
+        """
+        Send a chat request with tool definitions and return a structured
+        response (text or tool calls). Providers that do not support native
+        tool calling should raise NotImplementedError.
+        """
+        ...
+
+    def chat_with_tools_fallback(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system: str | None = None,
+        progress_cb=None,
+    ) -> ChatResponse:
+        """Chat with tools and automatic fallback to alternative models on failure."""
         ...
 
     def embed(self, text: str) -> list[float]:

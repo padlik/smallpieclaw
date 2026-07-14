@@ -22,9 +22,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import agent_logging
+from builtin_tools.schemas import build_tool_definitions
 from confirmation import ConfirmationManager
 from context_manager import maybe_compact
-from llm_client import LLMClient, LLMCancelledError, _encode_images
+from interfaces import ToolCall
+from llm_client import LLMClient, LLMCancelledError, LLMError, LLMPermanentError, _encode_images
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
 
@@ -190,6 +192,9 @@ class ReactContext:
 
     # Confirmation coordination (shared with AgentController and Telegram)
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
+
+    # Native tool calling — cached tool definitions built once at loop start
+    _tool_defs: Optional[list[dict]] = None
 
     @property
     def log_prefix(self) -> str:
@@ -386,6 +391,86 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     return {"success": True, "output": answer, "error": ""}
 
 
+def _append_native_tool_result(messages: list[dict], tc: ToolCall, content: str) -> None:
+    """Append the assistant tool-call turn and its matching tool-result message.
+
+    Native multi-turn dispatch requires the OpenAI wire shape: an assistant
+    message carrying the ``tool_calls`` entry, immediately followed by a ``tool``
+    message keyed by the same ``tool_call_id``. Centralising this keeps every
+    intercept site (standard tool, create_tool, plan, vision_query) identical.
+
+    Guards two provider-rejection cases: an empty ``tc.id`` (some models omit it)
+    is replaced with a generated ``call_<hex>`` id so the assistant and tool
+    turns stay linked, and a non-string ``content`` is coerced to ``""`` because
+    OpenAI 400s on ``content: null`` in a ``role:"tool"`` message.
+    """
+    call_id = tc.id or f"call_{secrets.token_hex(4)}"
+    if not isinstance(content, str):
+        content = ""
+    messages.append({"role": "assistant", "content": None, "tool_calls": [{
+        "id": call_id, "type": "function",
+        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+    }]})
+    messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+
+
+def _linearize_native_turns(messages: list[dict]) -> list[dict]:
+    """Flatten native tool-calling turns into plain text for the json_mode path.
+
+    Native multi-turn dispatch writes OpenAI wire-format messages into the shared
+    ``messages`` list (see ``_append_native_tool_result``): an assistant message
+    carrying ``tool_calls`` with ``content: None``, immediately followed by a
+    ``tool`` message keyed by ``tool_call_id``. The plain-chat builders
+    (``_openai_chat``/``_google_chat``/``_ollama_chat``) used by the json_mode
+    fallback only preserve ``role`` and ``content``, dropping ``tool_calls`` and
+    ``tool_call_id``. Sending those stripped messages produces malformed payloads
+    (an assistant with ``content: null`` and no ``tool_calls``, an orphan
+    ``role: "tool"`` with no ``tool_call_id``) that providers reject with a 400,
+    aborting the run.
+
+    This returns a *new* list in which native-format turns are converted to plain
+    text the json_mode builders can serialize safely:
+
+    - Assistant messages with ``tool_calls`` become
+      ``{"role": "assistant", "content": "Called tool: <name>(<args_summary>)"}``.
+    - ``tool`` messages become ``{"role": "user", "content": <tool_result>}``.
+
+    All other messages pass through unchanged. Conversion is 1:1, so the message
+    count is preserved and any goal-index anchor into the list stays valid. It is
+    also idempotent: already-linearized (plain) messages have no native fields and
+    pass through untouched.
+    """
+    linearized: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        tool_calls = m.get("tool_calls")
+        if role == "assistant" and tool_calls:
+            parts = []
+            for tc in tool_calls:
+                func = tc.get("function") or {}
+                name = func.get("name", "tool")
+                raw_args = func.get("arguments", "")
+                try:
+                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except (json.JSONDecodeError, TypeError):
+                    parsed_args = {}
+                if not isinstance(parsed_args, dict):
+                    parsed_args = {}
+                parts.append(f"{name}({_compact_args_repr(name, parsed_args)})")
+            linearized.append({
+                "role": "assistant",
+                "content": "Called tool: " + ", ".join(parts),
+            })
+        elif role == "tool":
+            linearized.append({
+                "role": "user",
+                "content": m.get("content") or "",
+            })
+        else:
+            linearized.append(m)
+    return linearized
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -420,6 +505,12 @@ def react_loop(
         logger.debug("%sAgent progress: %s", pfx, msg)
 
     try:
+        # Reset cached tool definitions so every run rebuilds them — MCP servers
+        # may have reconnected/re-registered since the last run, or this
+        # ReactContext may be reused across runs. The lazy-build check below
+        # repopulates it (once) for this run.
+        ctx._tool_defs = None
+
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
 
@@ -510,6 +601,21 @@ def react_loop(
             except Exception as _gw_exc:  # noqa: BLE001
                 logger.debug("%sGraph memory enqueue failed: %s", pfx, _gw_exc)
 
+        # Build native tool definitions once at loop start. A flaky MCP server
+        # or a malformed tool schema must not abort the whole run before step 1,
+        # so on failure we fall back to builtins + pseudo-tools only (no MCP).
+        if ctx._tool_defs is None:
+            try:
+                ctx._tool_defs = build_tool_definitions(
+                    mcp_manager=ctx.mcp_manager,
+                )
+            except Exception as _btd_exc:  # noqa: BLE001
+                logger.warning(
+                    "%sbuild_tool_definitions failed: %s — MCP tools skipped",
+                    pfx, _btd_exc,
+                )
+                ctx._tool_defs = build_tool_definitions(mcp_manager=None)
+
         # 2. ReAct loop
         max_steps = ctx.max_iterations
         step = 0
@@ -560,32 +666,214 @@ def react_loop(
                     messages, system, ctx.ctx_max_tokens, ctx.llm, goal_idx=goal_idx,
                 )
 
-                # LLM call with retry on empty response
+                # LLM call — try native tool calling first, fall back to json_mode
                 _MAX_EMPTY_RETRIES = 2
                 raw = ""
-                for attempt in range(1 + _MAX_EMPTY_RETRIES):
-                    try:
-                        raw = ctx.llm.chat_with_fallback(
-                            messages, system=system, progress_cb=_progress, json_mode=True,
-                        )
-                    except LLMCancelledError:
-                        logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
-                        return "[Cancelled]"
-                    except Exception as exc:
-                        err = f"❌ LLM error: {type(exc).__name__}: {exc}"
-                        _progress(err)
-                        return err
-                    if raw.strip():
-                        break
-                    if attempt < _MAX_EMPTY_RETRIES:
-                        logger.warning(
-                            "%sLLM returned empty response (step %d/%d), retrying (%d/%d)…",
-                            pfx, step, max_steps, attempt + 1, _MAX_EMPTY_RETRIES,
-                        )
-                        _progress(f"⏳ Empty LLM response, retrying ({attempt + 1}/{_MAX_EMPTY_RETRIES})…")
+                tool_calls: list[ToolCall] = []
+                native_attempted = False
+                text_from_native = False
 
-                # Parse JSON
+                # --- Native tool calling path ---
+                # Capability check (not isinstance): any LLM exposing a callable
+                # `chat_with_tools_fallback` may take the native path. This admits
+                # non-LLMClient LLMProvider implementers and stops inheritance
+                # alone from forcing every LLMClient subclass through native.
+                _supports_native = hasattr(ctx.llm, "chat_with_tools_fallback") and callable(
+                    ctx.llm.chat_with_tools_fallback
+                )
+                if ctx._tool_defs and _supports_native:
+                    try:
+                        response = ctx.llm.chat_with_tools_fallback(
+                            messages, tools=ctx._tool_defs, system=system, progress_cb=_progress,
+                        )
+                        native_attempted = True
+                        if response.is_tool_call and response.tool_calls:
+                            tool_calls = response.tool_calls
+                        elif response.text:
+                            raw = response.text
+                            text_from_native = True
+                    except NotImplementedError:
+                        logger.debug("%sNative tool calling not supported by provider — falling back to json_mode", pfx)
+                    except LLMPermanentError:
+                        raise
+                    except LLMError:
+                        # chat_with_tools_fallback already retried every model in the
+                        # chain; a second attempt here just doubles worst-case
+                        # latency/cost. Fall through to json_mode directly.
+                        logger.warning("%sNative tool calling failed (LLMError) — falling back to json_mode", pfx)
+                    except Exception as exc:
+                        logger.warning(
+                            "%sNative tool calling unexpected error: %s — falling back to json_mode",
+                            pfx, exc,
+                        )
+
+                # --- Native dispatch ---
+                if tool_calls:
+                    # Dispatch the first tool call only (single tool per turn)
+                    tc = tool_calls[0]
+
+                    # Special-case intercepts
+                    if tc.name == "create_tool":
+                        action_obj = {"action": "create_tool", "name": tc.arguments.get("name", "unnamed_tool"),
+                                      "language": tc.arguments.get("language", "python"),
+                                      "code": tc.arguments.get("code", ""),
+                                      "description": tc.arguments.get("description", "")}
+                        _t0 = time.time()
+                        feedback, cancelled = _dispatch_create_tool(ctx, action_obj, _progress)
+                        _duration_ms = (time.time() - _t0) * 1000
+                        # working.add_step for create_tool is emitted inside
+                        # _dispatch_create_tool (shared with the json_mode path);
+                        # only the tool trace is added here for native parity.
+                        if ctx.on_tool_trace is not None:
+                            ctx.on_tool_trace(ToolTrace(
+                                tool_name=tc.name,
+                                args_repr=_compact_args_repr(tc.name, tc.arguments),
+                                success=not cancelled,
+                                duration_ms=round(_duration_ms, 1),
+                                error="cancelled by operator" if cancelled else "",
+                            ))
+                        _append_native_tool_result(messages, tc, feedback)
+                        if cancelled:
+                            operator_cancelled = True
+                            break
+                        continue
+
+                    if tc.name == "plan":
+                        from execution_plan import ExecutionPlan, PlanExecutor, PlanStep
+                        plan_data = tc.arguments
+                        old_max_steps = max_steps
+                        plan_limit = getattr(ctx, "plan_max_iterations", 0) or (ctx.max_iterations + 20)
+                        ABSOLUTE_PLAN_CEILING = 200
+                        if plan_limit > ABSOLUTE_PLAN_CEILING:
+                            plan_limit = ABSOLUTE_PLAN_CEILING
+                        if plan_limit > max_steps:
+                            max_steps = plan_limit
+                        _t0 = time.time()
+                        plan_success = True
+                        try:
+                            _progress("📋 Executing plan…")
+                            steps_raw = plan_data.get("steps", [])
+                            steps = [
+                                PlanStep(id=s["id"], tool=s["tool"], args=s.get("args", {}),
+                                         depends_on=s.get("depends_on", []),
+                                         description=s.get("description", ""))
+                                for s in steps_raw
+                            ]
+                            plan = ExecutionPlan(description=plan_data.get("description", ""),
+                                                 steps=steps, timeout=plan_data.get("timeout", 300))
+                            executor = PlanExecutor(max_concurrent=ctx.max_subagents)
+                            plan_result = executor.execute(plan, ctx, progress_cb=_progress)
+                            if max_steps > old_max_steps:
+                                max_steps = old_max_steps + 10
+                                if max_steps > ABSOLUTE_PLAN_CEILING:
+                                    max_steps = ABSOLUTE_PLAN_CEILING
+                            result_msg = f"Plan execution results:\n{json.dumps(plan_result, ensure_ascii=False, indent=2)}"
+                            _append_native_tool_result(messages, tc, result_msg)
+                        except Exception as exc:
+                            plan_success = False
+                            err_msg = f"Plan execution failed: {type(exc).__name__}: {exc}"
+                            logger.error("%s%s", pfx, err_msg)
+                            _append_native_tool_result(messages, tc, err_msg)
+                        _duration_ms = (time.time() - _t0) * 1000
+                        if ctx.on_tool_trace is not None:
+                            ctx.on_tool_trace(ToolTrace(
+                                tool_name=tc.name,
+                                args_repr=_compact_args_repr(tc.name, tc.arguments),
+                                success=plan_success,
+                                duration_ms=round(_duration_ms, 1),
+                                error="" if plan_success else "plan execution failed",
+                            ))
+                        if ctx.working:
+                            ctx.working.add_step("plan", {"description": plan_data.get("description", ""), "success": plan_success})
+                        continue
+
+                    if tc.name == "vision_query":
+                        _t0 = time.time()
+                        outcome = _exec_vision_query(ctx, tc.arguments)
+                        _duration_ms = (time.time() - _t0) * 1000
+                        if ctx.on_tool_trace is not None:
+                            ctx.on_tool_trace(ToolTrace(
+                                tool_name=tc.name,
+                                args_repr=_compact_args_repr(tc.name, tc.arguments),
+                                success=outcome["success"],
+                                duration_ms=round(_duration_ms, 1),
+                                error=outcome.get("error", "") if not outcome["success"] else "",
+                            ))
+                        if ctx.working:
+                            ctx.working.add_step("tool", {"tool": tc.name, "args": tc.arguments, "success": outcome["success"]})
+                        tool_result = format_tool_result(tc.name, outcome)
+                        _progress(fmt_tool_result_progress(tc.name, tc.arguments, outcome))
+                        _append_native_tool_result(messages, tc, tool_result)
+                        continue
+
+                    # Standard tool dispatch
+                    action_obj = {"action": "tool", "tool": tc.name, "args": tc.arguments}
+                    _t0 = time.time()
+                    outcome = _dispatch_tool(ctx, action_obj, _progress)
+                    _duration_ms = (time.time() - _t0) * 1000
+                    if ctx.on_tool_trace is not None:
+                        ctx.on_tool_trace(ToolTrace(
+                            tool_name=tc.name,
+                            args_repr=_compact_args_repr(tc.name, tc.arguments),
+                            success=outcome["success"],
+                            duration_ms=round(_duration_ms, 1),
+                            error=outcome.get("error", "") if not outcome["success"] else "",
+                        ))
+                    if ctx.working:
+                        ctx.working.add_step("tool", {"tool": tc.name, "args": tc.arguments, "success": outcome["success"]})
+                    if outcome.get("send_file"):
+                        path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
+                        caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
+                        _progress(f"__FILE__:{path_b64}:{caption_b64}")
+                    tool_result = format_tool_result(tc.name, outcome)
+                    _progress(fmt_tool_result_progress(tc.name, tc.arguments, outcome))
+                    _append_native_tool_result(messages, tc, tool_result)
+                    if outcome.get("_operator_cancelled"):
+                        operator_cancelled = True
+                        break
+                    continue
+
+                # --- Text-based path (parse in place or fallback json_mode) ---
+                if not raw and not native_attempted:
+                    # No native attempt was made (or it raised) — use json_mode.
+                    # Native tool-calling turns already in `messages` carry OpenAI
+                    # wire-format fields (tool_calls / tool_call_id) that the plain
+                    # json_mode chat builders drop, yielding malformed 400-triggering
+                    # payloads. Flatten them to plain text before the fallback call.
+                    messages = _linearize_native_turns(messages)
+                    for attempt in range(1 + _MAX_EMPTY_RETRIES):
+                        try:
+                            raw = ctx.llm.chat_with_fallback(
+                                messages, system=system, progress_cb=_progress, json_mode=True,
+                            )
+                        except LLMCancelledError:
+                            logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
+                            return "[Cancelled]"
+                        except Exception as exc:
+                            err = f"❌ LLM error: {type(exc).__name__}: {exc}"
+                            _progress(err)
+                            return err
+                        if raw.strip():
+                            break
+                        if attempt < _MAX_EMPTY_RETRIES:
+                            logger.warning(
+                                "%sLLM returned empty response (step %d/%d), retrying (%d/%d)…",
+                                pfx, step, max_steps, attempt + 1, _MAX_EMPTY_RETRIES,
+                            )
+                            _progress(f"⏳ Empty LLM response, retrying ({attempt + 1}/{_MAX_EMPTY_RETRIES})…")
+
+                # Parse JSON (from native text or json_mode response)
                 action_obj = parse_json(raw)
+                if action_obj is None and text_from_native:
+                    # Native tool calling returned prose with no tool call and no
+                    # parseable JSON action. Treat the text as the final answer
+                    # rather than burning json_fail_streak — that streak is a
+                    # json_mode protocol guard and does not apply to native text.
+                    logger.info(
+                        "%sNative mode returned plain text with no tool call — treating as finish",
+                        pfx,
+                    )
+                    action_obj = {"action": "finish", "result": raw}
                 if action_obj is None:
                     json_fail_streak += 1
                     logger.warning(

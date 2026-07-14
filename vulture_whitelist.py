@@ -8,6 +8,7 @@ from sub_agent_registry import SubAgentRegistry
 from skill_registry import Skill
 from interfaces import LLMProvider, ToolBackend, MemoryBackend, NotifyFn  # noqa: E402
 from interfaces import ToolRegistryProtocol, MCPManagerProtocol  # noqa: E402
+from interfaces import ToolCall, ChatResponse  # noqa: E402
 
 # ShortTermMemory.get_messages: public API — may be used by external callers or tests
 ShortTermMemory.get_messages
@@ -24,6 +25,8 @@ Skill.metadata
 # Protocol interface methods — abstract contracts, not called directly
 LLMProvider.chat
 LLMProvider.chat_with_fallback
+LLMProvider.chat_with_tools
+LLMProvider.chat_with_tools_fallback
 LLMProvider.embed
 ToolBackend.execute
 MemoryBackend.get
@@ -127,3 +130,13 @@ ErrorTypeRegistry.register_defaults
 from tests.test_graph_memory_backfill import empty_llm, error_llm  # noqa: E402
 empty_llm
 error_llm
+
+# builtin_tools/schemas.py — public API for native tool calling
+from builtin_tools.schemas import build_tool_definitions, BUILTIN_TOOL_SCHEMAS, PSEUDO_TOOL_SCHEMAS  # noqa: E402
+build_tool_definitions
+BUILTIN_TOOL_SCHEMAS
+PSEUDO_TOOL_SCHEMAS
+
+# interfaces.py — native tool calling types
+ToolCall
+ChatResponse

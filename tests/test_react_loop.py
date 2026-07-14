@@ -445,3 +445,180 @@ class TestCompactionGoalAnchoring:
         assert any("Compacted context" in str(m.get("content")) for m in final_msgs), (
             "compaction must have fired during the multi-step run"
         )
+
+
+class TestNativeMultiTurnDispatch:
+    """B3: native tool-calling multi-turn dispatch sends well-formed payloads.
+
+    Step 1 returns a native tool call; step 2 returns finish text. The messages
+    handed to the model on step 2 must carry a well-formed assistant ``tool_calls``
+    entry plus a ``tool`` message keyed by ``tool_call_id`` — the exact shape the
+    payload builders must preserve (regression guard for B1).
+    """
+
+    def test_tool_call_then_finish_preserves_wire_shape(self):
+        from interfaces import ChatResponse, ToolCall
+        from tests.execution_harness import (
+            NativeScriptedLLM,
+            RecordingExecutor,
+            make_outcome,
+            run_react,
+        )
+
+        llm = NativeScriptedLLM([
+            ChatResponse(tool_calls=[
+                ToolCall(id="1", name="shell", arguments={"command": "echo hello"}),
+            ]),
+            ChatResponse(text='{"action": "finish", "result": "done"}'),
+        ])
+        ex = RecordingExecutor({"shell": make_outcome(output="hello")})
+
+        result, _calls, _progress = run_react(llm, ex, "say hello")
+
+        assert result == "done"
+        assert ex.tool_order == ["shell"]
+
+        # The second native call must have seen a well-formed assistant tool_calls
+        # entry plus a tool message carrying the matching tool_call_id.
+        assert len(llm.tool_calls_seen) == 2
+        second = llm.tool_calls_seen[1]
+
+        assistant_msgs = [m for m in second if m.get("role") == "assistant" and m.get("tool_calls")]
+        assert assistant_msgs, "expected an assistant message carrying tool_calls"
+        entry = assistant_msgs[0]["tool_calls"][0]
+        assert entry["id"] == "1"
+        assert entry["type"] == "function"
+        assert entry["function"]["name"] == "shell"
+        # arguments are JSON-encoded on the wire
+        assert json.loads(entry["function"]["arguments"]) == {"command": "echo hello"}
+
+        tool_msgs = [m for m in second if m.get("role") == "tool"]
+        assert tool_msgs, "expected a tool-result message"
+        assert tool_msgs[0]["tool_call_id"] == "1"
+        assert "hello" in str(tool_msgs[0]["content"])
+
+    def test_native_prose_without_tool_call_is_treated_as_finish(self):
+        """M1: native text that is not JSON becomes a finish, not a protocol error."""
+        from interfaces import ChatResponse
+        from tests.execution_harness import NativeScriptedLLM, RecordingExecutor, run_react
+
+        llm = NativeScriptedLLM([ChatResponse(text="All done — nothing else to do.")])
+        ex = RecordingExecutor()
+
+        result, _calls, _progress = run_react(llm, ex, "wrap up")
+
+        assert result == "All done — nothing else to do."
+        assert not result.startswith("❌ Agent protocol error:")
+        assert ex.calls == []
+
+
+class TestNativeFallbackLinearization:
+    """H1: native→json_mode fallback must not leak OpenAI wire-format messages.
+
+    Native dispatch writes assistant ``tool_calls`` (content=None) + ``tool``
+    (tool_call_id) turns into shared history. When a later step falls back to
+    json_mode, the plain chat builders drop those fields, producing malformed
+    payloads the provider rejects with a 400 (assistant with null content and no
+    tool_calls, orphan role=tool with no tool_call_id). ``_linearize_native_turns``
+    flattens them to plain text before the fallback call.
+    """
+
+    def test_linearize_flattens_native_wire_shape(self):
+        from react_loop import _linearize_native_turns
+
+        messages = [
+            {"role": "user", "content": "goal"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "1", "type": "function",
+                "function": {"name": "shell", "arguments": json.dumps({"command": "df -h"})},
+            }]},
+            {"role": "tool", "tool_call_id": "1", "content": "Tool 'shell' succeeded:\nout"},
+        ]
+        out = _linearize_native_turns(messages)
+
+        # 1:1 conversion keeps any goal-index anchor into the list valid.
+        assert len(out) == len(messages)
+        # The plain goal message passes through untouched (same object).
+        assert out[0] is messages[0]
+
+        # Assistant tool_calls turn → plain text: no null content, no tool_calls.
+        assert out[1]["role"] == "assistant"
+        assert out[1]["content"] is not None
+        assert out[1]["content"].startswith("Called tool: shell(")
+        assert "command=df -h" in out[1]["content"]
+        assert "tool_calls" not in out[1]
+
+        # Tool-result turn → user text: no tool role, no tool_call_id.
+        assert out[2]["role"] == "user"
+        assert "tool_call_id" not in out[2]
+        assert out[2]["content"].startswith("Tool 'shell' succeeded")
+
+    def test_linearize_summarizes_bulky_args_without_inlining(self):
+        from react_loop import _linearize_native_turns
+
+        big = "x" * 5000
+        messages = [{"role": "assistant", "content": None, "tool_calls": [{
+            "id": "9", "type": "function",
+            "function": {"name": "file_write",
+                         "arguments": json.dumps({"path": "/tmp/a", "content": big})},
+        }]}]
+        out = _linearize_native_turns(messages)
+
+        # Bulky argument values are summarized, never inlined verbatim.
+        assert big not in out[0]["content"]
+        assert "content=<" in out[0]["content"]
+        assert "path=/tmp/a" in out[0]["content"]
+
+    def test_linearize_is_idempotent_on_plain_messages(self):
+        from react_loop import _linearize_native_turns
+
+        plain = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        once = _linearize_native_turns(plain)
+        assert once == plain
+        assert _linearize_native_turns(once) == once
+
+    def test_native_failure_falls_back_to_linearized_json_mode(self):
+        """End-to-end: step-1 native tool call, step-2 native failure → the
+        json_mode fallback receives clean, linearized history (H1 regression)."""
+        from interfaces import ChatResponse, ToolCall
+        from llm_client import LLMError
+        from tests.execution_harness import (
+            NativeScriptedLLM,
+            RecordingExecutor,
+            make_outcome,
+            run_react,
+        )
+
+        llm = NativeScriptedLLM([
+            ChatResponse(tool_calls=[
+                ToolCall(id="1", name="shell", arguments={"command": "echo hi"}),
+            ]),
+            LLMError("native tool calling unavailable"),
+        ])
+        ex = RecordingExecutor({"shell": make_outcome(output="hi")})
+
+        result, _calls, _progress = run_react(llm, ex, "do it")
+
+        assert result == "done"
+        assert ex.tool_order == ["shell"]
+
+        # The json_mode fallback ran and received a fully linearized payload.
+        assert llm.json_mode_calls, "expected a json_mode fallback call"
+        fallback_msgs = llm.json_mode_calls[0]
+        for m in fallback_msgs:
+            assert m.get("content") is not None, "assistant content=None leaked into json_mode"
+            assert "tool_calls" not in m, "tool_calls leaked into json_mode payload"
+            assert m.get("role") != "tool", "role=tool leaked into json_mode payload"
+            assert "tool_call_id" not in m, "tool_call_id leaked into json_mode payload"
+        # The step-1 tool call and its result survive as readable plain text.
+        assert any(
+            m["role"] == "assistant" and str(m.get("content", "")).startswith("Called tool: shell(")
+            for m in fallback_msgs
+        )
+        assert any(
+            m["role"] == "user" and "hi" in str(m.get("content", ""))
+            for m in fallback_msgs
+        )
