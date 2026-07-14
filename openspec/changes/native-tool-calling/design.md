@@ -79,7 +79,7 @@ def chat_with_tools_fallback(
 |----------|--------|---------------|-------|
 | OpenAI-compat (Kimi, GLM, DeepSeek) | `_openai_chat_with_tools()` | `"auto"` | Kimi/GLM don't support `"required"` |
 | Google Gemini | `_google_chat_with_tools()` | `"auto"` | Via OpenAI-compatible endpoint |
-| Ollama | `_ollama_chat_with_tools()` | `"auto"` | Model-dependent support |
+| Ollama | `_ollama_chat_with_tools()` | n/a (implicit) | SDK/API has no `tool_choice`; passing `tools` implies auto. Model-dependent support |
 
 **Payload differences from `_openai_chat()`:**
 - Add `"tools": tools` to payload
@@ -87,6 +87,8 @@ def chat_with_tools_fallback(
 - Remove `"response_format": {"type": "json_object"}` — mutually exclusive with tools
 - Parse `choices[0].message.tool_calls` instead of `choices[0].message.content`
 - If `tool_calls` is empty/missing, return `ChatResponse(text=content)`
+
+The list above describes the OpenAI-compatible and Google HTTP payloads. Ollama differs: it uses the `ollama` SDK client (`client.chat(..., tools=tools)`), which accepts no `tool_choice` and no `response_format` — tool selection is always implicitly auto.
 
 **`chat_with_tools_fallback()`** mirrors `chat_with_fallback()` exactly: same fallback chain logic, same vision-model filtering, same `_active_idx` management. Calls `chat_with_tools()` instead of `chat()`.
 
@@ -161,6 +163,8 @@ messages.append({
     "content": tool_result,
 })
 ```
+
+When a later step falls back to `json_mode`, these native-wire turns are first flattened to plain text (`_linearize_native_turns` in `react_loop.py`) — the plain-chat builders preserve only `role`/`content`, so the raw wire shape would otherwise produce a provider 400. Conversion is 1:1 and idempotent.
 
 **`finish` detection:** When the model returns text with no tool calls, `parse_json()` must find `{"action": "finish"}`. Non-JSON text is treated as a protocol error (same as today's `json_fail_streak` path). This means every successful task completion via the native path involves one LLM call (the native call that returns text), not two — the text is parsed in place.
 

@@ -27,6 +27,8 @@ def _make_ctx(llm_responses: list[str]) -> tuple[ReactContext, list[str]]:
 
     llm = MagicMock()
     llm.chat_with_fallback.side_effect = fake_chat_with_fallback
+    # Native tool calling not supported in these tests — fall through to json_mode
+    llm.chat_with_tools_fallback.side_effect = NotImplementedError("native tools not mocked")
     llm.llm_cfg = {"model": "test-model"}
 
     ctx = ReactContext(

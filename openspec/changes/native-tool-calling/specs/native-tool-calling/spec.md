@@ -48,6 +48,13 @@ The ReAct loop SHALL attempt native tool calling before falling back to the text
 - **THEN** the loop SHALL log a warning
 - **AND** the loop SHALL fall through to the existing `chat_with_fallback(json_mode=True)` path
 
+#### Scenario: Message history linearized before json_mode fallback
+- **GIVEN** a prior step dispatched a native tool call, appending an assistant `tool_calls` message (`content: null`) and a `role: "tool"` result message to the history
+- **AND** a later step falls through to the `chat_with_fallback(json_mode=True)` path (unsupported provider, transient error after retry, or unexpected exception)
+- **WHEN** the loop issues the json_mode call
+- **THEN** the native-wire-format turns SHALL be flattened to plain text, so the payload contains no `content: null`, `tool_calls`, `role: "tool"`, or `tool_call_id` fields
+- **AND** the flattening SHALL be 1:1 (message count preserved) so any pinned goal index stays valid
+
 ### Requirement: Special-case tool interception
 
 The ReAct loop SHALL intercept `create_tool`, `plan`, and `vision_query` native tool calls before `_dispatch_tool()` and route them to their existing special-case handlers.
@@ -141,10 +148,11 @@ Each supported provider SHALL have a native tool calling implementation that sen
 - **WHEN** `_google_chat_with_tools()` is called
 - **THEN** the API payload SHALL include `"tools"` and `"tool_choice": "auto"`
 
-#### Scenario: Ollama provider sends tools in payload
+#### Scenario: Ollama provider sends tools to the client
 - **GIVEN** the active model uses Ollama
 - **WHEN** `_ollama_chat_with_tools()` is called
-- **THEN** the API payload SHALL include `"tools"` and `"tool_choice": "auto"`
+- **THEN** the request SHALL pass `tools` to the Ollama client
+- **AND** the request SHALL NOT set `tool_choice` — the Ollama SDK/API exposes no such parameter; tool selection is implicitly auto (the model decides)
 
 ## MODIFIED Requirements
 

@@ -146,6 +146,7 @@ class TestReactLoopTraceLogging:
     def test_start_log_contains_trace_id(self, monkeypatch):
         llm = MagicMock()
         llm.chat_with_fallback.return_value = '{"action": "finish", "result": "done"}'
+        llm.chat_with_tools_fallback.side_effect = NotImplementedError("native tools not mocked")
         llm.llm_cfg = {"model": "test-model"}
         ctx = ReactContext(
             llm=llm, tool_index=MagicMock(), executor=MagicMock(), creator=MagicMock(),

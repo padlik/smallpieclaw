@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import patch
 
+from llm_client import LLMClient
 from react_loop import ReactContext, react_loop
 
 
@@ -122,6 +123,67 @@ def build_real_llm(models: list[dict], default: str, fallback: list[str],
 
     client.chat = fake_chat
     return client, used
+
+
+class NativeScriptedLLM(LLMClient):
+    """A fake LLMClient that scripts native tool-calling responses.
+
+    Subclasses ``LLMClient`` (bypassing ``__init__``) so react_loop's
+    ``isinstance(ctx.llm, LLMClient)`` gate admits it into the native
+    tool-calling path. Each ``chat_with_tools_fallback`` call returns the next
+    scripted ``ChatResponse`` and snapshots the messages it was handed, so a
+    multi-turn payload's shape can be asserted after the run.
+
+    When the script is exhausted the final response repeats, mirroring
+    ``ScriptedLLM``.
+    """
+
+    def __init__(self, responses: list, model: str = "test-model"):
+        if not responses:
+            raise ValueError("NativeScriptedLLM needs at least one response")
+        self._responses = list(responses)
+        self._idx = 0
+        self._model = model
+        self._active_idx = 0
+        # Snapshot of the messages list handed to each native call.
+        self.tool_calls_seen: list[list[dict]] = []
+        # Snapshot of messages handed to the json_mode fallback
+        # (chat_with_fallback), captured after react_loop linearizes any native
+        # tool-calling turns already in history.
+        self.json_mode_calls: list[list[dict]] = []
+
+    @property
+    def llm_cfg(self) -> dict:
+        return {"model": self._model}
+
+    def set_trace_id(self, trace_id: str | None = None) -> None:
+        # Base LLMClient.set_trace_id writes through a context-local property
+        # backed by state built in the real __init__ (which we bypass); store to
+        # a plain attribute instead so the base property is never touched.
+        self._trace_id_value = (trace_id or "").strip()
+
+    def chat_with_tools_fallback(self, messages, tools, system=None, progress_cb=None):
+        # Shallow-copy each message so later in-place mutation of the shared
+        # list does not retroactively change what we assert was sent this turn.
+        self.tool_calls_seen.append([dict(m) for m in messages])
+        resp = self._responses[min(self._idx, len(self._responses) - 1)]
+        self._idx += 1
+        # A scripted exception simulates the native path failing on this turn,
+        # exercising react_loop's fallback to json_mode.
+        if isinstance(resp, BaseException):
+            raise resp
+        return resp
+
+    def chat_with_fallback(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
+        # Reached when the native path is skipped or a scripted native failure
+        # falls back to json_mode. Record what the builder received (after
+        # react_loop linearizes native turns) so the payload's shape can be
+        # asserted, then return a finish so the loop terminates deterministically.
+        self.json_mode_calls.append([dict(m) for m in messages])
+        return '{"action": "finish", "result": "done"}'
+
+    def chat(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
+        return "• scripted compaction summary"
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,7 @@ import httpx
 import ollama as _ollama_lib
 
 import agent_logging
+from interfaces import ChatResponse, ToolCall
 
 logger = logging.getLogger(__name__)
 slog = agent_logging.get_logger(__name__)
@@ -659,6 +660,555 @@ class LLMClient:
                     logger.error("%sAll %d candidate model(s) failed.", _tag, len(candidates))
 
         raise last_exc  # type: ignore[misc]
+
+    # ------------------------------------------------------------------
+    # Native tool calling methods
+    # ------------------------------------------------------------------
+
+    def chat_with_tools(
+        self, messages: list[dict], tools: list[dict],
+        system: str | None = None, progress_cb=None,
+    ) -> ChatResponse:
+        """Send a chat request with tool definitions and return a structured response.
+
+        Providers without a native implementation (e.g., ``anthropic``) raise
+        ``NotImplementedError`` so the caller can fall back to ``chat(json_mode=True)``.
+        """
+        provider = self.llm_cfg["provider"]
+        model_id = self.llm_cfg.get("model", "?")
+        agent_logging.log_event(
+            agent_logging.LogEvent.LLM_CALL,
+            f"LLM request (tools) → {model_id}",
+            level=logging.INFO,
+            logger=slog,
+            model=model_id,
+        )
+        _t0 = time.perf_counter()
+        try:
+            if provider in ("openai", "openrouter"):
+                return self._openai_chat_with_tools(messages, tools, system, progress_cb=progress_cb)
+            elif provider == "google":
+                return self._google_chat_with_tools(messages, tools, system, progress_cb=progress_cb)
+            elif provider == "ollama":
+                return self._ollama_chat_with_tools(messages, tools, system, progress_cb=progress_cb)
+            else:
+                raise NotImplementedError(
+                    f"Native tool calling not implemented for provider '{provider}'"
+                )
+        except _LLM_CHAT_ERRORS as exc:
+            logger.error("LLM chat (tools) error: %s", exc)
+            agent_logging.log_event(
+                agent_logging.LogEvent.LLM_FAILED,
+                f"LLM request (tools) failed: {model_id}",
+                level=logging.ERROR,
+                logger=slog,
+                model=model_id,
+                dur_ms=int((time.perf_counter() - _t0) * 1000),
+                err=str(exc),
+            )
+            raise
+
+    def chat_with_tools_fallback(
+        self, messages: list[dict], tools: list[dict],
+        system: str | None = None, progress_cb=None,
+    ) -> ChatResponse:
+        """Like chat_with_tools(), but tries each fallback model in order on failure.
+
+        Mirrors ``chat_with_fallback()``: same fallback chain logic, same vision-model
+        filtering, same ``_active_idx`` management. Calls ``chat_with_tools()`` instead
+        of ``chat()``.
+        """
+        primary_idx = self._active_idx
+        last_exc: Exception | None = None
+        _tag = f"[{self._caller_tag.strip()}] " if self._caller_tag.strip() else ""
+
+        candidates = [primary_idx] + self._fallback_indices
+
+        if self._messages_have_images(messages):
+            vision_candidates = [i for i in candidates if self._models[i].get("vision")]
+            if not vision_candidates:
+                self._active_idx = primary_idx
+                configured = [m.get("model", "?") for m in self._models]
+                raise LLMPermanentError(
+                    "This request includes an image, but no vision-capable model is "
+                    "configured. Set `vision = true` on a model in [[models]] (and ensure "
+                    f"it is the active or a fallback model). Configured models: {configured}"
+                )
+            if not self._models[primary_idx].get("vision") and progress_cb:
+                target = self._models[vision_candidates[0]].get("model", "?")
+                progress_cb(
+                    f"⚠️ Active model is not vision-capable; switching to vision model '{target}'…"
+                )
+            candidates = vision_candidates
+
+        for seq, idx in enumerate(candidates):
+            self._active_idx = idx
+            model_id = self._models[idx].get("model", f"model_{idx}")
+            if seq > 0:
+                logger.warning(
+                    "%sFalling back to model '%s' after error: %s",
+                    _tag, model_id, last_exc,
+                )
+                if progress_cb:
+                    progress_cb(f"⚠️ Switching to fallback model '{model_id}'…")
+            try:
+                return self.chat_with_tools(messages, tools, system, progress_cb=progress_cb)
+            except LLMPermanentError:
+                self._active_idx = primary_idx
+                raise
+            except LLMCancelledError:
+                self._active_idx = primary_idx
+                raise
+            except _LLM_CALL_ERRORS as exc:
+                last_exc = exc
+                self._active_idx = primary_idx
+                if seq < len(candidates) - 1:
+                    logger.warning(
+                        "%sModel '%s' failed (will try next fallback): %s",
+                        _tag, model_id, exc,
+                    )
+                else:
+                    logger.error("%sAll %d candidate model(s) failed.", _tag, len(candidates))
+
+        raise last_exc  # type: ignore[misc]
+
+    def _openai_chat_with_tools(
+        self, messages: list[dict], tools: list[dict],
+        system: str | None, progress_cb=None,
+    ) -> ChatResponse:
+        """OpenAI-compatible chat with native tool calling.
+
+        Mirrors ``_openai_chat()`` but adds ``tools``/``tool_choice`` to the payload
+        and parses ``tool_calls`` from the response. ``response_format`` is omitted
+        (mutually exclusive with tools).
+        """
+        _initial_model = self.llm_cfg["model"]
+
+        # Pre-encode images once (same as _openai_chat). Native tool-calling
+        # fields (`tool_calls` on assistant turns, `tool_call_id` on tool turns)
+        # are carried through so multi-turn payloads stay well-formed.
+        encoded_messages: list[dict] = []
+        for m in messages:
+            imgs = m.get("images")
+            if imgs:
+                encoded = _encode_images(imgs)
+                if encoded:
+                    encoded_messages.append({
+                        "_role": m["role"],
+                        "_content": m.get("content", ""),
+                        "_encoded": encoded,
+                        "_tool_calls": m.get("tool_calls"),
+                        "_tool_call_id": m.get("tool_call_id"),
+                    })
+                    continue
+            encoded_messages.append({
+                "_role": m["role"],
+                "_content": m.get("content", ""),
+                "_encoded": None,
+                "_tool_calls": m.get("tool_calls"),
+                "_tool_call_id": m.get("tool_call_id"),
+            })
+
+        def _on_retry(attempt, max_retries, reason):
+            if progress_cb:
+                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
+
+        def _do_request():
+            model = self.llm_cfg["model"]
+            reasoning = _is_reasoning_model(model)
+
+            payload_messages = []
+            if system:
+                if reasoning:
+                    payload_messages.append({
+                        "role": "user",
+                        "content": f"[Instructions]\n{system}",
+                    })
+                else:
+                    payload_messages.append({"role": "system", "content": system})
+            for em in encoded_messages:
+                if em["_encoded"]:
+                    img_content: list[Any] = [{"type": "text", "text": em["_content"]}]
+                    for b64, mime in em["_encoded"]:
+                        img_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        })
+                    payload_messages.append({"role": em["_role"], "content": img_content})
+                else:
+                    pm: dict[str, Any] = {"role": em["_role"], "content": em["_content"]}
+                    # Preserve native tool-calling fields on the wire: assistant
+                    # messages carry `tool_calls`, tool-result messages carry
+                    # `tool_call_id`. Dropping either yields an API 400 on turn 2.
+                    if em.get("_tool_calls"):
+                        pm["tool_calls"] = em["_tool_calls"]
+                    if em.get("_tool_call_id"):
+                        pm["tool_call_id"] = em["_tool_call_id"]
+                    payload_messages.append(pm)
+
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": payload_messages,
+                # `max_completion_tokens` is correct for OpenAI. NOTE: some
+                # OpenRouter-proxied models expect `max_tokens` instead and will
+                # reject this key — resolve that via provider config, not here.
+                "max_completion_tokens": self.llm_cfg.get("max_tokens", 1024),
+                "tools": tools,
+                "tool_choice": "auto",
+            }
+            if reasoning:
+                logger.debug("Reasoning model detected (%s) — omitting sampling params", model)
+            else:
+                payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
+                top_p = self.llm_cfg.get("top_p")
+                if top_p is not None:
+                    payload["top_p"] = top_p
+            url = f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.llm_cfg['api_key']}",
+                "Content-Type": "application/json",
+            }
+            r = self._http.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            d = r.json()
+            usage = d.get("usage", {})
+            self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
+            if "error" in d and "choices" not in d:
+                err = d["error"]
+                err_msg = err.get("message") or err.get("msg") or str(err)
+                err_code = str(err.get("code") or err.get("type") or "").lower()
+                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
+                raise exc_class(
+                    f"API error from model '{model}'"
+                    + (f" [{err_code}]" if err_code else "")
+                    + f": {err_msg}"
+                )
+
+            choices = d.get("choices") or []
+            if not choices:
+                logger.error(
+                    "Model '%s': response missing 'choices'. Raw body: %s",
+                    model, str(d)[:500],
+                )
+                raise LLMEmptyResponseError(
+                    f"Model '{model}' returned no choices. Body: {str(d)[:300]}"
+                )
+
+            msg = choices[0].get("message") or {}
+
+            # Check for native tool calls
+            tool_calls_raw = msg.get("tool_calls") or []
+            if tool_calls_raw:
+                parsed: list[ToolCall] = []
+                for tc in tool_calls_raw:
+                    func = tc.get("function") or {}
+                    try:
+                        args = json.loads(func.get("arguments", "{}"))
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    parsed.append(ToolCall(
+                        id=tc.get("id", ""),
+                        name=func.get("name", ""),
+                        arguments=args,
+                    ))
+                return ChatResponse(tool_calls=parsed)
+
+            # No tool calls — return text
+            text = (msg.get("content") or "").strip()
+            text = _strip_thinking_tags(text)
+
+            if not text:
+                for fallback_key in ("reasoning", "reasoning_content"):
+                    fallback = (msg.get(fallback_key) or "").strip()
+                    if fallback:
+                        logger.warning(
+                            "Model '%s': content field is empty, using '%s' field as fallback",
+                            model, fallback_key,
+                        )
+                        return ChatResponse(text=fallback)
+
+            if not text:
+                raise LLMEmptyResponseError(f"OpenAI returned empty content (model: {model})")
+            return ChatResponse(text=text)
+
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
+                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
+
+    def _google_chat_with_tools(
+        self, messages: list[dict], tools: list[dict],
+        system: str | None, progress_cb=None,
+    ) -> ChatResponse:
+        """Google Gemini chat with native tool calling via the OpenAI-compatible endpoint.
+
+        Google exposes an OpenAI-compatible surface at
+        ``/v1beta/openai/chat/completions`` that accepts the same
+        ``tools``/``tool_choice`` payload and returns ``choices[0].message.tool_calls``
+        in OpenAI format. This mirrors ``_openai_chat_with_tools`` exactly except for
+        the request URL and the ``x-goog-api-key`` auth header — the native Gemini
+        ``:generateContent`` endpoint does not understand OpenAI-format tools.
+        """
+        _initial_model = self.llm_cfg["model"]
+
+        # Pre-encode images once (same as _openai_chat_with_tools). Native
+        # tool-calling fields are carried through so multi-turn payloads stay
+        # well-formed.
+        encoded_messages: list[dict] = []
+        for m in messages:
+            imgs = m.get("images")
+            if imgs:
+                encoded = _encode_images(imgs)
+                if encoded:
+                    encoded_messages.append({
+                        "_role": m["role"],
+                        "_content": m.get("content", ""),
+                        "_encoded": encoded,
+                        "_tool_calls": m.get("tool_calls"),
+                        "_tool_call_id": m.get("tool_call_id"),
+                    })
+                    continue
+            encoded_messages.append({
+                "_role": m["role"],
+                "_content": m.get("content", ""),
+                "_encoded": None,
+                "_tool_calls": m.get("tool_calls"),
+                "_tool_call_id": m.get("tool_call_id"),
+            })
+
+        def _on_retry(attempt, max_retries, reason):
+            if progress_cb:
+                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
+
+        def _do_request():
+            model = self.llm_cfg["model"]
+
+            payload_messages: list[dict[str, Any]] = []
+            if system:
+                payload_messages.append({"role": "system", "content": system})
+            for em in encoded_messages:
+                if em["_encoded"]:
+                    img_content: list[Any] = [{"type": "text", "text": em["_content"]}]
+                    for b64, mime in em["_encoded"]:
+                        img_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        })
+                    payload_messages.append({"role": em["_role"], "content": img_content})
+                else:
+                    pm: dict[str, Any] = {"role": em["_role"], "content": em["_content"]}
+                    if em.get("_tool_calls"):
+                        pm["tool_calls"] = em["_tool_calls"]
+                    if em.get("_tool_call_id"):
+                        pm["tool_call_id"] = em["_tool_call_id"]
+                    payload_messages.append(pm)
+
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": payload_messages,
+                # Google's OpenAI-compat surface expects `max_tokens`, not
+                # `max_completion_tokens` — the latter 400s and drops the run to
+                # the json_mode fallback (see M1, native-tool-calling review).
+                "max_tokens": self.llm_cfg.get("max_tokens", 1024),
+                "tools": tools,
+                "tool_choice": "auto",
+                "temperature": self.llm_cfg.get("temperature", 0.2),
+            }
+            top_p = self.llm_cfg.get("top_p")
+            if top_p is not None:
+                payload["top_p"] = top_p
+            url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+            headers = {
+                "x-goog-api-key": self.llm_cfg["api_key"],
+                "Content-Type": "application/json",
+            }
+            r = self._http.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            d = r.json()
+            usage = d.get("usage", {})
+            self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
+            if "error" in d and "choices" not in d:
+                err = d["error"]
+                err_msg = err.get("message") or err.get("msg") or str(err)
+                err_code = str(err.get("code") or err.get("type") or "").lower()
+                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
+                raise exc_class(
+                    f"API error from model '{model}'"
+                    + (f" [{err_code}]" if err_code else "")
+                    + f": {err_msg}"
+                )
+
+            choices = d.get("choices") or []
+            if not choices:
+                logger.error(
+                    "Google model '%s': response missing 'choices'. Raw body: %s",
+                    model, str(d)[:500],
+                )
+                raise LLMEmptyResponseError(
+                    f"Google model '{model}' returned no choices. Body: {str(d)[:300]}"
+                )
+
+            msg = choices[0].get("message") or {}
+
+            # Check for native tool calls (OpenAI format)
+            tool_calls_raw = msg.get("tool_calls") or []
+            if tool_calls_raw:
+                parsed: list[ToolCall] = []
+                for tc in tool_calls_raw:
+                    func = tc.get("function") or {}
+                    try:
+                        args = json.loads(func.get("arguments", "{}"))
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    parsed.append(ToolCall(
+                        id=tc.get("id", ""),
+                        name=func.get("name", ""),
+                        arguments=args,
+                    ))
+                return ChatResponse(tool_calls=parsed)
+
+            # No tool calls — return text
+            text = (msg.get("content") or "").strip()
+            text = _strip_thinking_tags(text)
+            if not text:
+                raise LLMEmptyResponseError(f"Google returned empty content (model: {model})")
+            return ChatResponse(text=text)
+
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
+                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
+
+    def _ollama_chat_with_tools(
+        self, messages: list[dict], tools: list[dict],
+        system: str | None, progress_cb=None,
+    ) -> ChatResponse:
+        """Ollama chat with native tool calling.
+
+        Mirrors ``_ollama_chat()`` but passes ``tools`` to the Ollama client
+        and parses ``tool_calls`` from the response.
+        """
+        _initial_model = self.llm_cfg["model"]
+
+        payload_messages: list[dict] = []
+        if system:
+            payload_messages.append({"role": "system", "content": system})
+        for m in messages:
+            imgs = m.get("images")
+            if imgs:
+                encoded = _encode_images(imgs)
+                if encoded:
+                    payload_messages.append({
+                        "role": m["role"],
+                        "content": m.get("content", ""),
+                        "images": [b64 for b64, _ in encoded],
+                    })
+                    continue
+            # Preserve native tool-calling fields across turns: assistant
+            # messages carry `tool_calls`, tool-result messages carry
+            # `tool_call_id`. `content` is coerced to "" (never None) for Ollama.
+            pm: dict[str, Any] = {"role": m["role"], "content": m.get("content") or ""}
+            if m.get("tool_calls"):
+                pm["tool_calls"] = m["tool_calls"]
+            if m.get("tool_call_id"):
+                pm["tool_call_id"] = m["tool_call_id"]
+            payload_messages.append(pm)
+
+        def _on_retry(attempt, max_retries, reason):
+            if progress_cb:
+                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
+
+        def _do_request():
+            model = self.llm_cfg["model"]
+            if self.llm_cfg.get("provider") != "ollama":
+                raise LLMPermanentError(
+                    f"Active model switched away from Ollama provider during retry "
+                    f"(now '{self.llm_cfg.get('provider')}' / '{model}'). Aborting."
+                )
+            client = self._ollama_clients[self._active_idx]
+            if client is None:
+                raise RuntimeError(
+                    f"_ollama_chat_with_tools called but no ollama.Client found for model '{model}' "
+                    f"(index {self._active_idx}). This is a bug — check _ollama_clients init."
+                )
+            options = {
+                "num_predict": self.llm_cfg.get("max_tokens", 1024),
+                "temperature": self.llm_cfg.get("temperature", 0.2),
+            }
+            top_p = self.llm_cfg.get("top_p")
+            if top_p is not None:
+                options["top_p"] = top_p
+            try:
+                response = client.chat(
+                    model=model,
+                    messages=payload_messages,
+                    options=options,
+                    tools=tools,
+                )
+                # Track usage before the tool-call check so it runs regardless of
+                # whether the response carries tool calls or plain text.
+                _eval_count = getattr(response, "eval_count", None) or 0
+                _prompt_eval_count = getattr(response, "prompt_eval_count", None) or 0
+                if _prompt_eval_count or _eval_count:
+                    self._track_usage(_prompt_eval_count, _eval_count)
+                # Check for native tool calls
+                if response.message.tool_calls:
+                    parsed: list[ToolCall] = []
+                    for tc in response.message.tool_calls:
+                        args = tc.function.arguments
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError:
+                                args = {}
+                        if not isinstance(args, dict):
+                            args = {}
+                        parsed.append(ToolCall(
+                            id=getattr(tc, "id", "") or "",
+                            name=tc.function.name,
+                            arguments=args,  # type: ignore[arg-type]
+                        ))
+                    return ChatResponse(tool_calls=parsed)
+
+                text = (response.message.content or "").strip()
+            except _ollama_lib.ResponseError as exc:
+                status = exc.status_code
+                _PERMANENT_STATUSES = {401, 403, 404}
+                if status in _PERMANENT_STATUSES:
+                    raise LLMPermanentError(
+                        f"Ollama permanent error (HTTP {status}) for model '{model}': {exc.error}"
+                    ) from exc
+                raise LLMError(
+                    f"Ollama API error (HTTP {status}) for model '{model}': {exc.error}"
+                ) from exc
+
+            text = _strip_thinking_tags(text)
+
+            if not text:
+                _tag = f"[{self._caller_tag}/{model}]" if self._caller_tag else f"[{model}]"
+                thinking_field = (getattr(response.message, "thinking", None) or "").strip()
+                if thinking_field:
+                    logger.warning(
+                        "%s content field is empty — using 'thinking' field as fallback",
+                        _tag,
+                    )
+                    return ChatResponse(text=thinking_field)
+                think_content = _extract_thinking_content(text)
+                if think_content:
+                    logger.warning(
+                        "%s content empty after stripping — using  thinking block content as fallback",
+                        _tag,
+                    )
+                    return ChatResponse(text=think_content)
+
+            if not text:
+                raise LLMEmptyResponseError(f"Ollama returned empty content (model: {model})")
+            return ChatResponse(text=text)
+
+        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
+                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
 
     def _openai_chat(self, messages: list[dict], system: str | None, progress_cb=None,
                      json_mode: bool = False) -> str:
