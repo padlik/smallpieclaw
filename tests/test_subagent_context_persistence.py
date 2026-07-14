@@ -192,7 +192,7 @@ class TestSpawnSavesContextInFinally:
             data_dir=str(tmp_path),
         )
         with patch("sub_agent_registry.get_registry", return_value=registry), \
-             patch("builtin_executor._save_context", side_effect=_save_spy), \
+             patch("builtin_tools.context_io._save_context", side_effect=_save_spy) as _save_mock, \
              patch.object(exc._supervisor._pool, "submit",
                           side_effect=lambda fn, *a, **kw: fn()):
             exc._exec_spawn_agent(
@@ -201,6 +201,7 @@ class TestSpawnSavesContextInFinally:
                 options=SupervisionOptions(notify=False),
             )
 
+        assert _save_mock.called, "context_io._save_context must be invoked (patch not a silent no-op)"
         assert registry.record._result_event.is_set()
 
 

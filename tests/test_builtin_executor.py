@@ -907,7 +907,7 @@ class TestSubprocessArtifactWriteFailure:
 
         ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
         # Inject a failing file handle so the first artifact write triggers OSError.
-        original_open = ex._open_shell_log
+        original_open = ex._shell._open_shell_log
 
         def _patched_open(caller_tag=""):
             fh, path = original_open(caller_tag)
@@ -915,7 +915,7 @@ class TestSubprocessArtifactWriteFailure:
                 fh.close()
             return _FailingWriter(), str(tmp_path / "fake_artifact.log")
 
-        monkeypatch.setattr(ex, "_open_shell_log", _patched_open)
+        monkeypatch.setattr(ex._shell, "_open_shell_log", _patched_open)
         # Must not raise — must return a valid result dict.
         result = ex.execute("shell", {"command": "echo hello", "timeout": 5})
         assert result["success"] is True
@@ -1145,7 +1145,7 @@ class TestSubprocessTimeoutBoundedKill:
 
         ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
 
-        original_run = ex._run_shell_subprocess
+        original_run = ex._shell._run_shell_subprocess
 
         def _patched_run(args, caller_tag=""):
             return original_run(args, caller_tag)
