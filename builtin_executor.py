@@ -1,11 +1,10 @@
 """
 builtin_executor.py
 -------------------
-Always-available built-in tools: shell, file_read, file_write.
-
-These tools are injected into every agent run regardless of what is in the
-tools/ or tools_generated/ directories. The agent is instructed to prefer
-built-in tools before creating new ones.
+Always-available built-in tools, injected into every agent run regardless of
+what is in tools/ or tools_generated/. See BUILTIN_TOOLS in
+builtin_tools/descriptors.py for the full current list. The agent is
+instructed to prefer built-in tools before creating new ones.
 
 Dangerous operations (destructive commands, sensitive file access, any write)
 require explicit user confirmation before execution. When confirmation is
@@ -13,7 +12,8 @@ needed, execute() returns {"requires_confirmation": True, "token": ..., ...}
 and the caller is expected to call confirm(token) or cancel(token) after the
 user responds.
 
-Error classification (Phase 3: Agent Recovery):
+Error classification contract implemented by the builtin_tools/* handlers
+(Phase 3: Agent Recovery):
     * Transient (retryable): tool_timeout, network_error, syntax_error.
     * Planning (no retry, needs alternative approach): wrong_model_for_task,
       fundamentally_wrong_approach, impossible_with_current_tools.
@@ -30,10 +30,10 @@ from __future__ import annotations
 
 import logging
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
-
 
 import agent_logging
 from builtin_tools.agents import AgentTools
@@ -53,6 +53,7 @@ from builtin_tools.patterns import (
     _is_dangerous_shell,  # noqa: F401  re-exported for tests
     _is_sensitive_path,  # noqa: F401  re-exported for tests
 )
+from builtin_tools.schedule import exec_schedule
 from builtin_tools.secrets_log import LogQueryTools, SecretsTools
 from builtin_tools.shell import ShellTools
 from builtin_tools.text_utils import (
@@ -65,7 +66,6 @@ from sub_agent_supervisor import (
 )
 
 slog = agent_logging.get_logger(__name__)
-
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ class BuiltinExecutor:
         self._pending: dict[str, tuple[str, dict]] = {}
         # Headless (sub-agent) confirmation bridge
         # token -> threading.Event  (set when the operator responds)
-        self._headless_confirm_events: dict[str, object] = {}
+        self._headless_confirm_events: dict[str, threading.Event] = {}
         # token -> bool  (True = approved, False = denied)
         self._headless_confirm_results: dict[str, bool] = {}
         # Optional prompt callback: fn(token, tool_name, description, caller_tag) -> None
@@ -396,9 +396,8 @@ class BuiltinExecutor:
         if event is None:
             return False  # expired or already resolved
         self._headless_confirm_results[token] = approved
-        event.set()  # type: ignore[attr-defined]
+        event.set()
         return True
-
 
     # ------------------------------------------------------------------
     # Internals
@@ -443,8 +442,6 @@ class BuiltinExecutor:
 
         If the prompt callback is not wired (bot not ready) or times out, fails closed.
         """
-        import threading as _threading
-
         if self._subagent_confirm_prompt_fn is None:
             logger.warning(
                 "Headless sub-agent: Telegram bridge not wired — blocking %s (fail-closed)",
@@ -461,7 +458,7 @@ class BuiltinExecutor:
             }
 
         token = secrets.token_hex(12)
-        event = _threading.Event()
+        event = threading.Event()
         self._headless_confirm_events[token] = event
         self._pending[token] = (tool_name, args)
 
@@ -532,80 +529,11 @@ class BuiltinExecutor:
     # ---- schedule ----
 
     def _exec_schedule(self, args: dict) -> dict:
-        if not self.scheduler:
-            return {"success": False, "output": "", "error": "Scheduler not available.", "exit_code": -1}
-        action = str(args.get("action", "list")).lower()
-        tag = str(args.get("tag", "")).strip()
-
-        if action == "list":
-            jobs = self.scheduler.list_jobs()
-            if not jobs:
-                return {"success": True, "output": "No scheduled jobs.", "error": "", "exit_code": 0}
-            lines = []
-            for j in jobs:
-                status = "✅" if j["enabled"] else "⏸"
-                stype = j.get("schedule_type", "interval")
-                task_label = "Message" if stype == "once" else "Task"
-                err = f"\n   ⚠️ last error: {j['last_error'][:120]}" if j.get("last_error") else ""
-                lines.append(
-                    f"{status} {j['tag']} ({j['schedule']})\n"
-                    f"   {task_label}: {j['task']}\n"
-                    f"   Last run: {j['last_run'] or 'never'}{err}"
-                )
-            return {"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}
-
-        if action == "add":
-            if not tag:
-                return {"success": False, "output": "", "error": "tag is required for add", "exit_code": -1}
-            result = self.scheduler.add_job(
-                tag=tag,
-                schedule_type=str(args.get("schedule_type", args.get("schedule", "cron"))),
-                task=str(args.get("task", "")),
-                notify=bool(args.get("notify", True)),
-                hours=int(args["hours"]) if args.get("hours") is not None else None,
-                minutes=int(args["minutes"]) if args.get("minutes") is not None else None,
-                time_str=str(args.get("time", "")) or None,
-                run_at=str(args.get("run_at", "")) or None,
-                cron=str(args.get("cron", "")) or None,
-                model=str(args["model"]) if args.get("model") else None,
-                fallback_models=args.get("fallback_models"),
-                preserve_context=bool(args.get("preserve_context", False)),
-                max_iterations=int(args["max_iterations"]) if args.get("max_iterations") is not None else None,
-            )
-            if result["success"]:
-                return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}
-            return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
-
-        if action == "remove":
-            ok = self.scheduler.remove_job(tag)
-            if ok:
-                return {"success": True, "output": f"Job '{tag}' removed.", "error": "", "exit_code": 0}
-            return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
-
-        if action == "pause":
-            ok = self.scheduler.pause_job(tag)
-            if ok:
-                return {"success": True, "output": f"Job '{tag}' paused.", "error": "", "exit_code": 0}
-            return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
-
-        if action == "resume":
-            ok = self.scheduler.resume_job(tag)
-            if ok:
-                return {"success": True, "output": f"Job '{tag}' resumed.", "error": "", "exit_code": 0}
-            return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
-
-        if action == "run_now":
-            result = self.scheduler.run_now(tag)
-            if result["success"]:
-                return {"success": True, "output": f"Job '{tag}' triggered.", "error": "", "exit_code": 0}
-            return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
-
-        return {"success": False, "output": "", "error": f"Unknown action '{action}'. Use: list, add, remove, pause, resume, run_now", "exit_code": -1}
+        return exec_schedule(self.scheduler, args)
 
     # ------------------------------------------------------------------
     # spawn_agent
     # ------------------------------------------------------------------
-
 
     def _exec_spawn_agent(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
                           trace_id: str = "", options: Optional[SupervisionOptions] = None) -> dict:
