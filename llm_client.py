@@ -1111,7 +1111,22 @@ class LLMClient:
             # `tool_call_id`. `content` is coerced to "" (never None) for Ollama.
             pm: dict[str, Any] = {"role": m["role"], "content": m.get("content") or ""}
             if m.get("tool_calls"):
-                pm["tool_calls"] = m["tool_calls"]
+                # The native feedback stores arguments as json.dumps(dict) for the
+                # OpenAI HTTP wire format, but the Ollama SDK Pydantic Message model
+                # requires arguments to be a dict. Normalize on the way in.
+                normalized_tcs = []
+                for tc in m["tool_calls"]:
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    normalized_tcs.append({**tc, "function": {**fn, "arguments": args}})
+                pm["tool_calls"] = normalized_tcs
             if m.get("tool_call_id"):
                 pm["tool_call_id"] = m["tool_call_id"]
             payload_messages.append(pm)
