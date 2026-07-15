@@ -22,6 +22,7 @@ import httpx
 
 from llm_client import LLMClient, LLMError
 from tool_registry import Tool, ToolRegistry
+from vector_utils import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +198,7 @@ class ToolIndex:
         for name, entry in index_snapshot.items():
             if name not in tool_lookup:
                 continue
-            sim = self.llm.cosine_similarity(query_vec, entry["vector"])
+            sim = cosine_similarity(query_vec, entry["vector"])
             scores.append((sim, name))
 
         scores.sort(reverse=True)

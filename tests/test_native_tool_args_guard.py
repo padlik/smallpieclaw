@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMError
 
 
 def _make_client(provider: str) -> LLMClient:
@@ -59,9 +59,7 @@ def _invoke(provider: str, body: dict):
     client._http = MagicMock()
     client._http.post.return_value = resp_obj
     messages = [{"role": "user", "content": "hi"}]
-    if provider == "openai":
-        return client._openai_chat_with_tools(messages, tools=[], system=None)
-    return client._google_chat_with_tools(messages, tools=[], system=None)
+    return client.chat_with_tools(messages, tools=[], system=None)
 
 
 # (label, wire value for the arguments field)
@@ -112,3 +110,24 @@ def test_valid_object_arguments_still_parse(provider):
     assert resp.is_tool_call
     assert resp.tool_calls  # native parser must populate tool_calls (narrows Optional)
     assert resp.tool_calls[0].arguments == {"command": "df -h"}
+
+
+# ---------------------------------------------------------------------------
+# Provider routing guards
+# ---------------------------------------------------------------------------
+
+def test_anthropic_chat_with_tools_raises_not_implemented():
+    # Anthropic has no native tool-calling backend, so chat_with_tools() must
+    # raise NotImplementedError — the signal the ReAct loop uses to fall back to
+    # the json_mode path.
+    client = _make_client("anthropic")
+    with pytest.raises(NotImplementedError):
+        client.chat_with_tools([{"role": "user", "content": "hi"}], tools=[], system=None)
+
+
+def test_unknown_provider_chat_raises_llm_error():
+    # An unrecognised provider string has no _PROVIDER_MODULES entry; chat() must
+    # surface a clear LLMError rather than a bare KeyError/AttributeError.
+    client = _make_client("unknown_xyz")
+    with pytest.raises(LLMError):
+        client.chat([{"role": "user", "content": "hi"}])

@@ -8,7 +8,7 @@ from sub_agent_registry import SubAgentRegistry
 from skill_registry import Skill
 from interfaces import LLMProvider, ToolBackend, MemoryBackend, NotifyFn  # noqa: E402
 from interfaces import ToolRegistryProtocol, MCPManagerProtocol  # noqa: E402
-from interfaces import ToolCall, ChatResponse  # noqa: E402
+from interfaces import ToolCall, ChatResponse, ProviderContext  # noqa: E402
 
 # ShortTermMemory.get_messages: public API — may be used by external callers or tests
 ShortTermMemory.get_messages
@@ -140,3 +140,6 @@ PSEUDO_TOOL_SCHEMAS
 # interfaces.py — native tool calling types
 ToolCall
 ChatResponse
+
+# interfaces.py — provider backend dependency bag (imported by llm_client for Phase 2)
+ProviderContext

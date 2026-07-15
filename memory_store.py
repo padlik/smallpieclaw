@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import secrets
 import threading
@@ -26,6 +25,8 @@ from collections import deque
 from datetime import datetime
 from typing import Any
 
+from vector_utils import cosine_similarity
+
 logger = logging.getLogger(__name__)
 
 _JSON_FILE_ERRORS = (OSError, json.JSONDecodeError)
@@ -34,16 +35,6 @@ _JSON_FILE_ERRORS = (OSError, json.JSONDecodeError)
 # ---------------------------------------------------------------------------
 # Shared helper
 # ---------------------------------------------------------------------------
-
-def _cosine_similarity(a: list, b: list) -> float:
-    """Pure-Python cosine similarity — no numpy required."""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
 
 def _atomic_save_json(path: str, data: Any, *, attempts: int = 3, base_delay: float = 0.05) -> None:
     """Write *data* as pretty JSON to *path* atomically with retry.
@@ -374,7 +365,7 @@ class LongTermMemory:
             for entry_id, entry in self._data.items():
                 vec = entry.get("vector", [])
                 if vec:
-                    score = _cosine_similarity(query_vec, vec)
+                    score = cosine_similarity(query_vec, vec)
                     scored.append((score, entry))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in scored[:top_k]]
@@ -588,7 +579,7 @@ class ResultsMemory:
             for entry_id, entry in self._data.items():
                 vec = entry.get("vector", [])
                 if vec:
-                    score = _cosine_similarity(query_vec, vec)
+                    score = cosine_similarity(query_vec, vec)
                     scored.append((score, entry))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in scored[:top_k]]

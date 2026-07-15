@@ -420,9 +420,9 @@ def _linearize_native_turns(messages: list[dict]) -> list[dict]:
     Native multi-turn dispatch writes OpenAI wire-format messages into the shared
     ``messages`` list (see ``_append_native_tool_result``): an assistant message
     carrying ``tool_calls`` with ``content: None``, immediately followed by a
-    ``tool`` message keyed by ``tool_call_id``. The plain-chat builders
-    (``_openai_chat``/``_google_chat``/``_ollama_chat``) used by the json_mode
-    fallback only preserve ``role`` and ``content``, dropping ``tool_calls`` and
+    ``tool`` message keyed by ``tool_call_id``. The provider ``chat`` backends
+    used by the json_mode fallback only preserve ``role`` and ``content``,
+    dropping ``tool_calls`` and
     ``tool_call_id``. Sending those stripped messages produces malformed payloads
     (an assistant with ``content: null`` and no ``tool_calls``, an orphan
     ``role: "tool"`` with no ``tool_call_id``) that providers reject with a 400,

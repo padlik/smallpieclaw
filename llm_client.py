@@ -20,14 +20,9 @@ Retry behaviour:
 
 from __future__ import annotations
 
-import base64
 import contextvars
 import json
 import logging
-import math
-import mimetypes
-import re
-import subprocess
 import threading
 import time
 from datetime import date
@@ -37,60 +32,19 @@ import httpx
 import ollama as _ollama_lib
 
 import agent_logging
-from interfaces import ChatResponse, ToolCall
+from interfaces import ChatResponse, ProviderContext
+from providers import anthropic_provider, google_provider, ollama_provider, openai_provider
+from providers._errors import (
+    LLMCancelledError,
+    LLMEmptyResponseError,  # noqa: F401 — re-exported for module-path callers
+    LLMError,
+    LLMPermanentError,
+)
+from providers._utils import _encode_images  # noqa: F401 — re-exported for module-path callers
 
 logger = logging.getLogger(__name__)
 slog = agent_logging.get_logger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Retry helper
-# ---------------------------------------------------------------------------
-
-# HTTP status codes that are safe to retry
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-
-
-class LLMEmptyResponseError(RuntimeError):
-    """Raised when the LLM provider returns an empty or whitespace-only response."""
-
-
-class LLMError(RuntimeError):
-    """Raised when the LLM provider returns an API-level error (HTTP 200 with error body)."""
-
-
-class LLMPermanentError(LLMError):
-    """
-    Raised for API-level errors that should never be retried — e.g. content filter
-    violations, invalid API keys, bad request parameters.  Propagates immediately out
-    of _with_retry without consuming any retry attempts.
-    """
-
-
-# Error codes (from OpenAI / OpenRouter / Anthropic) that are permanent — retrying
-# them wastes quota, burns time, and can trigger duplicate billing on some providers.
-_PERMANENT_ERROR_CODES = frozenset({
-    # OpenAI / OpenRouter
-    "content_filter",
-    "content_policy_violation",
-    "invalid_request_error",
-    "invalid_api_key",
-    "authentication_error",
-    "model_not_found",
-    # Anthropic
-    "invalid_api_key",
-    "permission_error",
-    "not_found_error",
-    "invalid_request",
-})
-
-
-class LLMCancelledError(RuntimeError):
-    """Raised when the LLM request is cancelled via cancel_event."""
-
-
-_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
 _LLM_CALL_ERRORS = (
     LLMError,
@@ -101,175 +55,22 @@ _LLM_CALL_ERRORS = (
 )
 _LLM_CHAT_ERRORS = _LLM_CALL_ERRORS + (LLMCancelledError,)
 
+# Provider dispatch: maps the config `provider` string to the backend module
+# whose `chat()` (and, for openai/google, `embed()`) implements it. Adding a
+# provider means one new entry here plus the module — not editing routing
+# elif-chains scattered across the class.
+_PROVIDER_MODULES: dict[str, Any] = {
+    "openai": openai_provider,
+    "openrouter": openai_provider,   # OpenAI-compatible wire format
+    "anthropic": anthropic_provider,
+    "google": google_provider,
+    "ollama": ollama_provider,
+}
 
-def _strip_thinking_tags(text: str) -> str:
-    """Remove <think>…</think> reasoning blocks from LLM output.
-
-    Reasoning models (DeepSeek-R1, QwQ, etc.) sometimes embed chain-of-thought
-    inside these tags. Strip them before returning so thinking tokens never reach
-    the caller or the Telegram UI.
-    """
-    return _THINK_TAG_RE.sub("", text).strip()
-
-
-def _extract_thinking_content(text: str) -> str:
-    """Extract and concatenate text inside all <think>…</think> blocks.
-
-    Last-resort fallback when a model places its entire answer inside thinking
-    tags with nothing outside. Returns empty string if no blocks are found.
-    """
-    parts = [m.strip() for m in _THINK_CONTENT_RE.findall(text) if m.strip()]
-    return " ".join(parts)
-
-
-def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_event=None,
-                model_name: str | None = None, caller_tag: str | None = None):
-    """
-    Call fn(), retrying on transient httpx errors, retryable HTTP status codes,
-    and LLMError (e.g. OpenRouter 200-OK with error body for server overload).
-    LLMPermanentError propagates immediately without consuming retries.
-    Uses exponential backoff: base_delay, base_delay*2, base_delay*4, …
-    Non-retryable exceptions (e.g. 400 Bad Request) propagate immediately.
-    on_retry(attempt, max_retries, exc_str) is called before each retry delay.
-    model_name and caller_tag are included in log messages when provided.
-    """
-    _parts = []
-    if caller_tag and caller_tag.strip():
-        _parts.append(caller_tag.strip())
-    if model_name and model_name.strip():
-        _parts.append(model_name.strip())
-    _model_tag = f"[{'/'.join(_parts)}] " if _parts else ""
-    last_exc: Exception = RuntimeError("No attempts made")
-    for attempt in range(1, max_retries + 1):
-        # Check cancellation before each attempt (including before the first)
-        if cancel_event and cancel_event.is_set():
-            raise LLMCancelledError("LLM request cancelled")
-        try:
-            return fn()
-        except LLMCancelledError:
-            raise  # propagate immediately — never retry a cancel
-        except LLMError as exc:
-            if isinstance(exc, LLMPermanentError):
-                raise  # permanent errors are never retried
-            last_exc = exc
-            logger.warning("%sAPI error body (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"api error: {exc}")
-        except httpx.TimeoutException as exc:
-            last_exc = exc
-            logger.warning("%sRequest timed out (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"timeout: {exc}")
-        except LLMEmptyResponseError as exc:
-            last_exc = exc
-            logger.warning("%sEmpty LLM response (attempt %d/%d)", _model_tag, attempt, max_retries)
-            if on_retry:
-                on_retry(attempt, max_retries, "empty response")
-        except httpx.RemoteProtocolError as exc:
-            if cancel_event and cancel_event.is_set():
-                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
-            last_exc = exc
-            logger.warning("%sRemote protocol error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"protocol error: {exc}")
-        except httpx.ConnectError as exc:
-            if cancel_event and cancel_event.is_set():
-                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
-            last_exc = exc
-            logger.warning("%sConnection error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"connection error: {exc}")
-        except (httpx.TransportError, httpx.PoolTimeout) as exc:
-            if cancel_event and cancel_event.is_set():
-                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
-            last_exc = exc
-            logger.warning("%sTransport error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"transport error: {exc}")
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in _RETRYABLE_STATUS:
-                last_exc = exc
-                logger.warning(
-                    "%sHTTP %d (attempt %d/%d): %s",
-                    _model_tag, exc.response.status_code, attempt, max_retries, exc,
-                )
-                if on_retry:
-                    on_retry(attempt, max_retries, f"HTTP {exc.response.status_code}")
-            else:
-                # Log full response body to aid debugging (e.g. "invalid parameter" messages)
-                logger.error(
-                    "%sHTTP %d error — response body: %s",
-                    _model_tag, exc.response.status_code,
-                    exc.response.text[:2000],
-                )
-                raise  # 4xx errors are not retryable
-        if attempt < max_retries:
-            delay = base_delay * (2 ** (attempt - 1))
-            # Don't sleep if already cancelled
-            if cancel_event:
-                # Use event.wait() so cancellation wakes us up immediately
-                cancelled = cancel_event.wait(timeout=delay)
-                if cancelled:
-                    raise LLMCancelledError("LLM request cancelled during retry delay")
-            else:
-                logger.info("%sRetrying in %.1fs…", _model_tag, delay)
-                time.sleep(delay)
-    raise last_exc
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Pure-Python cosine similarity — no numpy required."""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-# Matches OpenAI reasoning / o-series model names:
-#   o1, o1-mini, o1-preview, o3, o3-mini, o4-mini, gpt-5, gpt-5-pro, …
-_REASONING_MODEL_RE = re.compile(
-    r"^(o\d+(-mini|-preview|-pro)?|gpt-5\S*)$",
-    re.IGNORECASE,
-)
-
-
-def _is_reasoning_model(model_name: str) -> bool:
-    """
-    Return True if the model is an OpenAI reasoning model that does not
-    accept temperature, top_p, frequency_penalty, or presence_penalty.
-    """
-    return bool(_REASONING_MODEL_RE.match(model_name.strip()))
-
-
-def _encode_images(paths: list[str]) -> list[tuple[str, str]]:
-    """
-    Load image files and return [(base64_data, mime_type), ...].
-    Files that cannot be read or are too large (> 20 MB) are skipped with a
-    warning. Telegram photos are typically ≤ 1 MB so the size guard rarely fires.
-    """
-    result = []
-    for path in paths:
-        try:
-            mime, _ = mimetypes.guess_type(path)
-            if not mime or not mime.startswith("image/"):
-                mime = "image/jpeg"  # reasonable default for Telegram photos
-            with open(path, "rb") as fh:
-                data = fh.read()
-            if len(data) > 20 * 1024 * 1024:
-                logger.warning(
-                    "Image too large to encode (%d bytes), skipping: %s", len(data), path
-                )
-                continue
-            result.append((base64.b64encode(data).decode("ascii"), mime))
-        except OSError as exc:
-            logger.warning("Could not encode image %s: %s", path, exc)
-    return result
+# Providers with a native tool-calling implementation. Others (e.g. anthropic)
+# raise NotImplementedError from chat_with_tools() so the ReAct loop falls back
+# to the json_mode path.
+_NATIVE_TOOL_PROVIDERS = {"openai", "openrouter", "google", "ollama"}
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +326,62 @@ class LLMClient:
         }
 
     # ------------------------------------------------------------------
+    # Provider backend context
+    # ------------------------------------------------------------------
+
+    def _ctx(self) -> ProviderContext:
+        """Build the dependency bag passed to extracted provider backends.
+
+        Bundles the mutable client state each provider module needs — the
+        active-model config accessor, HTTP transport, retry settings,
+        cancellation event, caller tag, usage tracking, and empty-response
+        diagnostics — so backends run without a reference to LLMClient itself.
+        """
+        return ProviderContext(
+            get_cfg=lambda: self.llm_cfg,
+            http=self._http,
+            max_retries=self._max_retries,
+            retry_delay=self._retry_delay,
+            cancel_event=self._cancel_event,
+            caller_tag=self._caller_tag,
+            diagnose_empty=self._diagnose_empty,
+            track_usage=self._track_usage,
+            emb_cfg=self.emb_cfg,
+        )
+
+    def _provider_chat(
+        self,
+        messages: list[dict],
+        system: str | None,
+        *,
+        tools: list[dict] | None = None,
+        json_mode: bool = False,
+        progress_cb=None,
+    ) -> str | ChatResponse:
+        """Route a chat request to the active provider's backend ``chat()``.
+
+        The single dispatch seam for every provider: looks up the backend module
+        in ``_PROVIDER_MODULES`` by the active model's ``provider`` and forwards
+        the shared kwargs. Ollama additionally needs its per-model
+        ``ollama.Client``. Returns ``str`` on the text path (``tools`` is None)
+        and ``ChatResponse`` on the native tool-calling path.
+        """
+        provider = self.llm_cfg.get("provider", "openai")
+        mod = _PROVIDER_MODULES.get(provider)
+        if mod is None:
+            raise LLMError(f"Unknown LLM provider: {provider!r}")
+        kwargs: dict[str, Any] = dict(
+            tools=tools, json_mode=json_mode, progress_cb=progress_cb,
+        )
+        ctx = self._ctx()
+        if provider == "ollama":
+            # Resolve the active ollama.Client lazily on each attempt so a
+            # mid-flight set_model() to a different ollama host is picked up by
+            # retries instead of POSTing the new model to a stale client.
+            ctx.get_ollama_client = lambda: self._ollama_clients[self._active_idx]
+        return mod.chat(ctx, messages, system, **kwargs)
+
+    # ------------------------------------------------------------------
     # Chat
     # ------------------------------------------------------------------
 
@@ -536,7 +393,6 @@ class LLMClient:
         Supported by OpenAI/OpenRouter (response_format), Google (responseMimeType),
         and Ollama (format="json"). Anthropic falls back to prompt-only enforcement.
         """
-        provider = self.llm_cfg["provider"]
         model_id = self.llm_cfg.get("model", "?")
         agent_logging.log_event(
             agent_logging.LogEvent.LLM_CALL,
@@ -547,16 +403,9 @@ class LLMClient:
         )
         _t0 = time.perf_counter()
         try:
-            if provider in ("openai", "openrouter"):
-                return self._openai_chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
-            elif provider == "google":
-                return self._google_chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
-            elif provider == "anthropic":
-                return self._anthropic_chat(messages, system, progress_cb=progress_cb)
-            elif provider == "ollama":
-                return self._ollama_chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
-            else:
-                raise ValueError(f"Unknown LLM provider: {provider}")
+            return self._provider_chat(
+                messages, system, json_mode=json_mode, progress_cb=progress_cb,
+            )  # type: ignore[return-value]
         except _LLM_CHAT_ERRORS as exc:
             logger.error("LLM chat error: %s", exc)
             agent_logging.log_event(
@@ -674,8 +523,15 @@ class LLMClient:
         Providers without a native implementation (e.g., ``anthropic``) raise
         ``NotImplementedError`` so the caller can fall back to ``chat(json_mode=True)``.
         """
-        provider = self.llm_cfg["provider"]
+        provider = self.llm_cfg.get("provider", "openai")
         model_id = self.llm_cfg.get("model", "?")
+        # Guard before logging: providers without a native backend (e.g.
+        # anthropic) must raise NotImplementedError without emitting a phantom
+        # LLM_CALL entry for a request that is never dispatched.
+        if provider not in _NATIVE_TOOL_PROVIDERS:
+            raise NotImplementedError(
+                f"Native tool calling not implemented for provider '{provider}'"
+            )
         agent_logging.log_event(
             agent_logging.LogEvent.LLM_CALL,
             f"LLM request (tools) → {model_id}",
@@ -685,16 +541,9 @@ class LLMClient:
         )
         _t0 = time.perf_counter()
         try:
-            if provider in ("openai", "openrouter"):
-                return self._openai_chat_with_tools(messages, tools, system, progress_cb=progress_cb)
-            elif provider == "google":
-                return self._google_chat_with_tools(messages, tools, system, progress_cb=progress_cb)
-            elif provider == "ollama":
-                return self._ollama_chat_with_tools(messages, tools, system, progress_cb=progress_cb)
-            else:
-                raise NotImplementedError(
-                    f"Native tool calling not implemented for provider '{provider}'"
-                )
+            return self._provider_chat(
+                messages, system, tools=tools, progress_cb=progress_cb,
+            )  # type: ignore[return-value]
         except _LLM_CHAT_ERRORS as exc:
             logger.error("LLM chat (tools) error: %s", exc)
             agent_logging.log_event(
@@ -772,1002 +621,6 @@ class LLMClient:
 
         raise last_exc  # type: ignore[misc]
 
-    def _openai_chat_with_tools(
-        self, messages: list[dict], tools: list[dict],
-        system: str | None, progress_cb=None,
-    ) -> ChatResponse:
-        """OpenAI-compatible chat with native tool calling.
-
-        Mirrors ``_openai_chat()`` but adds ``tools``/``tool_choice`` to the payload
-        and parses ``tool_calls`` from the response. ``response_format`` is omitted
-        (mutually exclusive with tools).
-        """
-        _initial_model = self.llm_cfg["model"]
-
-        # Pre-encode images once (same as _openai_chat). Native tool-calling
-        # fields (`tool_calls` on assistant turns, `tool_call_id` on tool turns)
-        # are carried through so multi-turn payloads stay well-formed.
-        encoded_messages: list[dict] = []
-        for m in messages:
-            imgs = m.get("images")
-            if imgs:
-                encoded = _encode_images(imgs)
-                if encoded:
-                    encoded_messages.append({
-                        "_role": m["role"],
-                        "_content": m.get("content", ""),
-                        "_encoded": encoded,
-                        "_tool_calls": m.get("tool_calls"),
-                        "_tool_call_id": m.get("tool_call_id"),
-                    })
-                    continue
-            encoded_messages.append({
-                "_role": m["role"],
-                "_content": m.get("content", ""),
-                "_encoded": None,
-                "_tool_calls": m.get("tool_calls"),
-                "_tool_call_id": m.get("tool_call_id"),
-            })
-
-        def _on_retry(attempt, max_retries, reason):
-            if progress_cb:
-                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-
-        def _do_request():
-            model = self.llm_cfg["model"]
-            reasoning = _is_reasoning_model(model)
-
-            payload_messages = []
-            if system:
-                if reasoning:
-                    payload_messages.append({
-                        "role": "user",
-                        "content": f"[Instructions]\n{system}",
-                    })
-                else:
-                    payload_messages.append({"role": "system", "content": system})
-            for em in encoded_messages:
-                if em["_encoded"]:
-                    img_content: list[Any] = [{"type": "text", "text": em["_content"]}]
-                    for b64, mime in em["_encoded"]:
-                        img_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime};base64,{b64}"},
-                        })
-                    payload_messages.append({"role": em["_role"], "content": img_content})
-                else:
-                    pm: dict[str, Any] = {"role": em["_role"], "content": em["_content"]}
-                    # Preserve native tool-calling fields on the wire: assistant
-                    # messages carry `tool_calls`, tool-result messages carry
-                    # `tool_call_id`. Dropping either yields an API 400 on turn 2.
-                    if em.get("_tool_calls"):
-                        pm["tool_calls"] = em["_tool_calls"]
-                    if em.get("_tool_call_id"):
-                        pm["tool_call_id"] = em["_tool_call_id"]
-                    payload_messages.append(pm)
-
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": payload_messages,
-                # `max_completion_tokens` is correct for OpenAI. NOTE: some
-                # OpenRouter-proxied models expect `max_tokens` instead and will
-                # reject this key — resolve that via provider config, not here.
-                "max_completion_tokens": self.llm_cfg.get("max_tokens", 1024),
-                "tools": tools,
-                "tool_choice": "auto",
-            }
-            if reasoning:
-                logger.debug("Reasoning model detected (%s) — omitting sampling params", model)
-            else:
-                payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
-                top_p = self.llm_cfg.get("top_p")
-                if top_p is not None:
-                    payload["top_p"] = top_p
-            url = f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.llm_cfg['api_key']}",
-                "Content-Type": "application/json",
-            }
-            r = self._http.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            d = r.json()
-            usage = d.get("usage", {})
-            self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-
-            if "error" in d and "choices" not in d:
-                err = d["error"]
-                err_msg = err.get("message") or err.get("msg") or str(err)
-                err_code = str(err.get("code") or err.get("type") or "").lower()
-                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
-                raise exc_class(
-                    f"API error from model '{model}'"
-                    + (f" [{err_code}]" if err_code else "")
-                    + f": {err_msg}"
-                )
-
-            choices = d.get("choices") or []
-            if not choices:
-                logger.error(
-                    "Model '%s': response missing 'choices'. Raw body: %s",
-                    model, str(d)[:500],
-                )
-                raise LLMEmptyResponseError(
-                    f"Model '{model}' returned no choices. Body: {str(d)[:300]}"
-                )
-
-            msg = choices[0].get("message") or {}
-
-            # Check for native tool calls
-            tool_calls_raw = msg.get("tool_calls") or []
-            if tool_calls_raw:
-                parsed: list[ToolCall] = []
-                for tc in tool_calls_raw:
-                    func = tc.get("function") or {}
-                    try:
-                        args = json.loads(func.get("arguments", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                    if not isinstance(args, dict):
-                        args = {}
-                    parsed.append(ToolCall(
-                        id=tc.get("id", ""),
-                        name=func.get("name", ""),
-                        arguments=args,
-                    ))
-                return ChatResponse(tool_calls=parsed)
-
-            # No tool calls — return text
-            text = (msg.get("content") or "").strip()
-            text = _strip_thinking_tags(text)
-
-            if not text:
-                for fallback_key in ("reasoning", "reasoning_content"):
-                    fallback = (msg.get(fallback_key) or "").strip()
-                    if fallback:
-                        logger.warning(
-                            "Model '%s': content field is empty, using '%s' field as fallback",
-                            model, fallback_key,
-                        )
-                        return ChatResponse(text=fallback)
-
-            if not text:
-                raise LLMEmptyResponseError(f"OpenAI returned empty content (model: {model})")
-            return ChatResponse(text=text)
-
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
-
-    def _google_chat_with_tools(
-        self, messages: list[dict], tools: list[dict],
-        system: str | None, progress_cb=None,
-    ) -> ChatResponse:
-        """Google Gemini chat with native tool calling via the OpenAI-compatible endpoint.
-
-        Google exposes an OpenAI-compatible surface at
-        ``/v1beta/openai/chat/completions`` that accepts the same
-        ``tools``/``tool_choice`` payload and returns ``choices[0].message.tool_calls``
-        in OpenAI format. This mirrors ``_openai_chat_with_tools`` exactly except for
-        the request URL and the ``x-goog-api-key`` auth header — the native Gemini
-        ``:generateContent`` endpoint does not understand OpenAI-format tools.
-        """
-        _initial_model = self.llm_cfg["model"]
-
-        # Pre-encode images once (same as _openai_chat_with_tools). Native
-        # tool-calling fields are carried through so multi-turn payloads stay
-        # well-formed.
-        encoded_messages: list[dict] = []
-        for m in messages:
-            imgs = m.get("images")
-            if imgs:
-                encoded = _encode_images(imgs)
-                if encoded:
-                    encoded_messages.append({
-                        "_role": m["role"],
-                        "_content": m.get("content", ""),
-                        "_encoded": encoded,
-                        "_tool_calls": m.get("tool_calls"),
-                        "_tool_call_id": m.get("tool_call_id"),
-                    })
-                    continue
-            encoded_messages.append({
-                "_role": m["role"],
-                "_content": m.get("content", ""),
-                "_encoded": None,
-                "_tool_calls": m.get("tool_calls"),
-                "_tool_call_id": m.get("tool_call_id"),
-            })
-
-        def _on_retry(attempt, max_retries, reason):
-            if progress_cb:
-                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-
-        def _do_request():
-            model = self.llm_cfg["model"]
-
-            payload_messages: list[dict[str, Any]] = []
-            if system:
-                payload_messages.append({"role": "system", "content": system})
-            for em in encoded_messages:
-                if em["_encoded"]:
-                    img_content: list[Any] = [{"type": "text", "text": em["_content"]}]
-                    for b64, mime in em["_encoded"]:
-                        img_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime};base64,{b64}"},
-                        })
-                    payload_messages.append({"role": em["_role"], "content": img_content})
-                else:
-                    pm: dict[str, Any] = {"role": em["_role"], "content": em["_content"]}
-                    if em.get("_tool_calls"):
-                        pm["tool_calls"] = em["_tool_calls"]
-                    if em.get("_tool_call_id"):
-                        pm["tool_call_id"] = em["_tool_call_id"]
-                    payload_messages.append(pm)
-
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": payload_messages,
-                # Google's OpenAI-compat surface expects `max_tokens`, not
-                # `max_completion_tokens` — the latter 400s and drops the run to
-                # the json_mode fallback (see M1, native-tool-calling review).
-                "max_tokens": self.llm_cfg.get("max_tokens", 1024),
-                "tools": tools,
-                "tool_choice": "auto",
-                "temperature": self.llm_cfg.get("temperature", 0.2),
-            }
-            top_p = self.llm_cfg.get("top_p")
-            if top_p is not None:
-                payload["top_p"] = top_p
-            url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-            headers = {
-                "x-goog-api-key": self.llm_cfg["api_key"],
-                "Content-Type": "application/json",
-            }
-            r = self._http.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            d = r.json()
-            usage = d.get("usage", {})
-            self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-
-            if "error" in d and "choices" not in d:
-                err = d["error"]
-                err_msg = err.get("message") or err.get("msg") or str(err)
-                err_code = str(err.get("code") or err.get("type") or "").lower()
-                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
-                raise exc_class(
-                    f"API error from model '{model}'"
-                    + (f" [{err_code}]" if err_code else "")
-                    + f": {err_msg}"
-                )
-
-            choices = d.get("choices") or []
-            if not choices:
-                logger.error(
-                    "Google model '%s': response missing 'choices'. Raw body: %s",
-                    model, str(d)[:500],
-                )
-                raise LLMEmptyResponseError(
-                    f"Google model '{model}' returned no choices. Body: {str(d)[:300]}"
-                )
-
-            msg = choices[0].get("message") or {}
-
-            # Check for native tool calls (OpenAI format)
-            tool_calls_raw = msg.get("tool_calls") or []
-            if tool_calls_raw:
-                parsed: list[ToolCall] = []
-                for tc in tool_calls_raw:
-                    func = tc.get("function") or {}
-                    try:
-                        args = json.loads(func.get("arguments", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                    if not isinstance(args, dict):
-                        args = {}
-                    parsed.append(ToolCall(
-                        id=tc.get("id", ""),
-                        name=func.get("name", ""),
-                        arguments=args,
-                    ))
-                return ChatResponse(tool_calls=parsed)
-
-            # No tool calls — return text
-            text = (msg.get("content") or "").strip()
-            text = _strip_thinking_tags(text)
-            if not text:
-                raise LLMEmptyResponseError(f"Google returned empty content (model: {model})")
-            return ChatResponse(text=text)
-
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
-
-    def _ollama_chat_with_tools(
-        self, messages: list[dict], tools: list[dict],
-        system: str | None, progress_cb=None,
-    ) -> ChatResponse:
-        """Ollama chat with native tool calling.
-
-        Mirrors ``_ollama_chat()`` but passes ``tools`` to the Ollama client
-        and parses ``tool_calls`` from the response.
-        """
-        _initial_model = self.llm_cfg["model"]
-
-        payload_messages: list[dict] = []
-        if system:
-            payload_messages.append({"role": "system", "content": system})
-        # Pre-pass: build tool_call_id → tool_name map for role:"tool" result messages.
-        # The Ollama SDK Message model uses tool_name (not tool_call_id) to associate
-        # tool results with prior tool calls.
-        _call_id_to_name: dict[str, str] = {}
-        for _m in messages:
-            for _tc in _m.get("tool_calls") or []:
-                _tc_id = _tc.get("id") or ""
-                _tc_name = (_tc.get("function") or {}).get("name") or ""
-                if _tc_id and _tc_name:
-                    _call_id_to_name[_tc_id] = _tc_name
-        for m in messages:
-            imgs = m.get("images")
-            if imgs:
-                encoded = _encode_images(imgs)
-                if encoded:
-                    payload_messages.append({
-                        "role": m["role"],
-                        "content": m.get("content", ""),
-                        "images": [b64 for b64, _ in encoded],
-                    })
-                    continue
-            # Preserve native tool-calling fields across turns: assistant
-            # messages carry `tool_calls`, tool-result messages carry
-            # `tool_call_id`. `content` is coerced to "" (never None) for Ollama.
-            pm: dict[str, Any] = {"role": m["role"], "content": m.get("content") or ""}
-            if m.get("tool_calls"):
-                # The native feedback stores arguments as json.dumps(dict) for the
-                # OpenAI HTTP wire format, but the Ollama SDK Pydantic Message model
-                # requires arguments to be a dict. Normalize on the way in.
-                normalized_tcs = []
-                for tc in m["tool_calls"]:
-                    fn = tc.get("function") or {}
-                    args = fn.get("arguments", {})
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except (json.JSONDecodeError, TypeError):
-                            args = {}
-                    if not isinstance(args, dict):
-                        args = {}
-                    normalized_tcs.append({**tc, "function": {**fn, "arguments": args}})
-                pm["tool_calls"] = normalized_tcs
-            if m.get("tool_call_id"):
-                # Ollama SDK uses tool_name, not tool_call_id; resolve via pre-built lookup.
-                _resolved_name = _call_id_to_name.get(m["tool_call_id"], "")
-                if _resolved_name:
-                    pm["tool_name"] = _resolved_name
-            payload_messages.append(pm)
-
-        def _on_retry(attempt, max_retries, reason):
-            if progress_cb:
-                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-
-        def _do_request():
-            model = self.llm_cfg["model"]
-            if self.llm_cfg.get("provider") != "ollama":
-                raise LLMPermanentError(
-                    f"Active model switched away from Ollama provider during retry "
-                    f"(now '{self.llm_cfg.get('provider')}' / '{model}'). Aborting."
-                )
-            client = self._ollama_clients[self._active_idx]
-            if client is None:
-                raise RuntimeError(
-                    f"_ollama_chat_with_tools called but no ollama.Client found for model '{model}' "
-                    f"(index {self._active_idx}). This is a bug — check _ollama_clients init."
-                )
-            options = {
-                "num_predict": self.llm_cfg.get("max_tokens", 1024),
-                "temperature": self.llm_cfg.get("temperature", 0.2),
-            }
-            top_p = self.llm_cfg.get("top_p")
-            if top_p is not None:
-                options["top_p"] = top_p
-            try:
-                response = client.chat(
-                    model=model,
-                    messages=payload_messages,
-                    options=options,
-                    tools=tools,
-                )
-                # Track usage before the tool-call check so it runs regardless of
-                # whether the response carries tool calls or plain text.
-                _eval_count = getattr(response, "eval_count", None) or 0
-                _prompt_eval_count = getattr(response, "prompt_eval_count", None) or 0
-                if _prompt_eval_count or _eval_count:
-                    self._track_usage(_prompt_eval_count, _eval_count)
-                # Check for native tool calls
-                if response.message.tool_calls:
-                    parsed: list[ToolCall] = []
-                    for tc in response.message.tool_calls:
-                        args = tc.function.arguments
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(args)
-                            except json.JSONDecodeError:
-                                args = {}
-                        if not isinstance(args, dict):
-                            args = {}
-                        parsed.append(ToolCall(
-                            id=getattr(tc, "id", "") or "",
-                            name=tc.function.name,
-                            arguments=args,  # type: ignore[arg-type]
-                        ))
-                    return ChatResponse(tool_calls=parsed)
-
-                text = (response.message.content or "").strip()
-            except _ollama_lib.ResponseError as exc:
-                status = exc.status_code
-                _PERMANENT_STATUSES = {401, 403, 404}
-                if status in _PERMANENT_STATUSES:
-                    raise LLMPermanentError(
-                        f"Ollama permanent error (HTTP {status}) for model '{model}': {exc.error}"
-                    ) from exc
-                raise LLMError(
-                    f"Ollama API error (HTTP {status}) for model '{model}': {exc.error}"
-                ) from exc
-
-            text = _strip_thinking_tags(text)
-
-            if not text:
-                _tag = f"[{self._caller_tag}/{model}]" if self._caller_tag else f"[{model}]"
-                thinking_field = (getattr(response.message, "thinking", None) or "").strip()
-                if thinking_field:
-                    logger.warning(
-                        "%s content field is empty — using 'thinking' field as fallback",
-                        _tag,
-                    )
-                    return ChatResponse(text=thinking_field)
-                think_content = _extract_thinking_content(text)
-                if think_content:
-                    logger.warning(
-                        "%s content empty after stripping — using  thinking block content as fallback",
-                        _tag,
-                    )
-                    return ChatResponse(text=think_content)
-
-            if not text:
-                raise LLMEmptyResponseError(f"Ollama returned empty content (model: {model})")
-            return ChatResponse(text=text)
-
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
-
-    def _openai_chat(self, messages: list[dict], system: str | None, progress_cb=None,
-                     json_mode: bool = False) -> str:
-        _initial_model = self.llm_cfg["model"]
-
-        # Pre-encode images once — this is pure data transformation that does not
-        # depend on the active model. Results are reused across retries.
-        encoded_messages: list[dict] = []
-        for m in messages:
-            imgs = m.get("images")
-            if imgs:
-                encoded = _encode_images(imgs)
-                if encoded:
-                    encoded_messages.append({
-                        "_role": m["role"],
-                        "_content": m.get("content", ""),
-                        "_encoded": encoded,
-                    })
-                    continue
-            encoded_messages.append({"_role": m["role"], "_content": m.get("content", ""), "_encoded": None})
-
-        def _on_retry(attempt, max_retries, reason):
-            if progress_cb:
-                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-
-        def _do_request():
-            # Re-read active model config on every attempt so that a mid-flight
-            # model switch (set_model) is picked up by subsequent retries.
-            model = self.llm_cfg["model"]
-            reasoning = _is_reasoning_model(model)
-
-            # Rebuild payload_messages each attempt: the system role format depends
-            # on whether the (potentially new) model is a reasoning model.
-            payload_messages = []
-            if system:
-                if reasoning:
-                    # o-series models don't support the "system" role — embed it as
-                    # the first user turn so context is still passed through.
-                    payload_messages.append({
-                        "role": "user",
-                        "content": f"[Instructions]\n{system}",
-                    })
-                else:
-                    payload_messages.append({"role": "system", "content": system})
-            # Encode images for any messages that carry them; build multipart content
-            # for providers that support vision (all 4 providers use the same path here).
-            for em in encoded_messages:
-                if em["_encoded"]:
-                    img_content: list[Any] = [{"type": "text", "text": em["_content"]}]
-                    for b64, mime in em["_encoded"]:
-                        img_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime};base64,{b64}"},
-                        })
-                    payload_messages.append({"role": em["_role"], "content": img_content})
-                else:
-                    payload_messages.append({"role": em["_role"], "content": em["_content"]})
-
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": payload_messages,
-                "max_completion_tokens": self.llm_cfg.get("max_tokens", 1024),
-            }
-            if reasoning:
-                # Reasoning models (o1, o3, o4-mini, gpt-5, …) reject temperature,
-                # top_p, frequency_penalty, and presence_penalty entirely.
-                logger.debug("Reasoning model detected (%s) — omitting sampling params", model)
-            else:
-                payload["temperature"] = self.llm_cfg.get("temperature", 0.2)
-                top_p = self.llm_cfg.get("top_p")
-                if top_p is not None:
-                    payload["top_p"] = top_p
-                if json_mode:
-                    # Request strict JSON output. Not supported by reasoning models.
-                    payload["response_format"] = {"type": "json_object"}
-            url = f"{self.llm_cfg['base_url'].rstrip('/')}/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.llm_cfg['api_key']}",
-                "Content-Type": "application/json",
-            }
-            r = self._http.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            d = r.json()
-            usage = d.get("usage", {})
-            self._track_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-
-            # Some APIs return HTTP 200 with an error body (e.g. rate limit, content filter).
-            # Detect this before trying to access 'choices'.
-            if "error" in d and "choices" not in d:
-                err = d["error"]
-                err_msg = err.get("message") or err.get("msg") or str(err)
-                err_code = str(err.get("code") or err.get("type") or "").lower()
-                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
-                raise exc_class(
-                    f"API error from model '{model}'"
-                    + (f" [{err_code}]" if err_code else "")
-                    + f": {err_msg}"
-                )
-
-            choices = d.get("choices") or []
-            if not choices:
-                logger.error(
-                    "Model '%s': response missing 'choices'. Raw body: %s",
-                    model, str(d)[:500],
-                )
-                if self._diagnose_empty:
-                    curl_cmd = [
-                        "curl", "-s", "-X", "POST", url,
-                        "-H", f"Authorization: Bearer {self.llm_cfg['api_key']}",
-                        "-H", "Content-Type: application/json",
-                        "-d", json.dumps(payload),
-                    ]
-                    report = self._diagnose_empty_response(r, "openai", model, curl_cmd=curl_cmd)
-                    raise LLMEmptyResponseError(
-                        f"Model '{model}' returned no choices.\n{report}"
-                    )
-                raise LLMEmptyResponseError(
-                    f"Model '{model}' returned no choices. Body: {str(d)[:300]}"
-                )
-
-            msg = choices[0].get("message") or {}
-            text = (msg.get("content") or "").strip()
-            # Strip inline <think>…</think> reasoning blocks before any further checks
-            text = _strip_thinking_tags(text)
-
-            # Some reasoning/thinking models (DeepSeek-R1, Kimi K2.5, QwQ, etc.)
-            # leave "content" empty and put the actual response in "reasoning" or
-            # "reasoning_content". Fall back to those fields transparently.
-            if not text:
-                for fallback_key in ("reasoning", "reasoning_content"):
-                    fallback = (msg.get(fallback_key) or "").strip()
-                    if fallback:
-                        logger.warning(
-                            "Model '%s': content field is empty, using '%s' field as fallback",
-                            model, fallback_key,
-                        )
-                        return fallback
-
-            if not text:
-                if self._diagnose_empty:
-                    curl_cmd = [
-                        "curl", "-s", "-X", "POST", url,
-                        "-H", f"Authorization: Bearer {self.llm_cfg['api_key']}",
-                        "-H", "Content-Type: application/json",
-                        "-d", json.dumps(payload),
-                    ]
-                    report = self._diagnose_empty_response(r, "openai", model, curl_cmd=curl_cmd)
-                    raise LLMEmptyResponseError(
-                        f"OpenAI returned empty content (model: {model})\n{report}"
-                    )
-                raise LLMEmptyResponseError(f"OpenAI returned empty content (model: {model})")
-            return text
-
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
-
-    def _google_chat(self, messages: list[dict], system: str | None, progress_cb=None,
-                     json_mode: bool = False) -> str:
-        # Convert to Gemini format
-        contents = []
-        if system:
-            contents.append({"role": "user", "parts": [{"text": f"[System]: {system}"}]})
-            contents.append({"role": "model", "parts": [{"text": "Understood."}]})
-        for m in messages:
-            role = "user" if m["role"] == "user" else "model"
-            imgs = m.get("images")
-            if imgs:
-                encoded = _encode_images(imgs)
-                if encoded:
-                    parts: list[Any] = [{"text": m.get("content", "")}]
-                    for b64, mime in encoded:
-                        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
-                    contents.append({"role": role, "parts": parts})
-                    continue
-            contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
-
-        _initial_model = self.llm_cfg["model"]
-
-        def _on_retry(attempt, max_retries, reason):
-            if progress_cb:
-                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-
-        def _do_request():
-            # Re-read active model config on every attempt so that a mid-flight
-            # model switch (set_model) is picked up by subsequent retries.
-            api_key = self.llm_cfg["api_key"]
-            model = self.llm_cfg["model"]
-            google_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            google_headers = {
-                "x-goog-api-key": api_key,
-                "Content-Type": "application/json",
-            }
-            google_payload = {
-                "contents": contents,
-                "generationConfig": {
-                    "maxOutputTokens": self.llm_cfg.get("max_tokens", 1024),
-                    "temperature": self.llm_cfg.get("temperature", 0.2),
-                },
-            }
-            if json_mode:
-                google_payload["generationConfig"]["responseMimeType"] = "application/json"
-            top_p = self.llm_cfg.get("top_p")
-            if top_p is not None:
-                google_payload["generationConfig"]["topP"] = top_p
-            r = self._http.post(google_url, headers=google_headers, json=google_payload)
-            r.raise_for_status()
-            d = r.json()
-            if "error" in d:
-                err = d["error"]
-                err_code = str(err.get("code") or err.get("status") or "").lower()
-                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
-                raise exc_class(f"Google API error (model: {model}): {err.get('message', err)}")
-            meta = d.get("usageMetadata", {})
-            self._track_usage(meta.get("promptTokenCount", 0), meta.get("candidatesTokenCount", 0))
-            candidates = d.get("candidates") or []
-            if not candidates:
-                logger.error("Google model '%s': response missing 'candidates'. Raw: %s", model, str(d)[:500])
-                raise LLMEmptyResponseError(f"Google model '{model}' returned no candidates. Body: {str(d)[:300]}")
-            content = candidates[0].get("content") or {}
-            parts = content.get("parts") or []
-            text = (parts[0].get("text", "") if parts else "").strip()
-            if not text:
-                if self._diagnose_empty:
-                    curl_cmd = [
-                        "curl", "-s", "-X", "POST", google_url,
-                        "-H", f"x-goog-api-key: {api_key}",
-                        "-H", "Content-Type: application/json",
-                        "-d", json.dumps(google_payload),
-                    ]
-                    report = self._diagnose_empty_response(r, "google", model, curl_cmd=curl_cmd)
-                    raise LLMEmptyResponseError(
-                        f"Google returned empty content (model: {model})\n{report}"
-                    )
-                raise LLMEmptyResponseError(f"Google returned empty content (model: {model})")
-            return text
-
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
-
-    def _anthropic_chat(self, messages: list[dict], system: str | None, progress_cb=None) -> str:
-        _initial_model = self.llm_cfg["model"]
-        anthropic_messages: list[dict] = []
-        for m in messages:
-            imgs = m.get("images")
-            if imgs:
-                encoded = _encode_images(imgs)
-                if encoded:
-                    ant_content: list[Any] = [{"type": "text", "text": m.get("content", "")}]
-                    for b64, mime in encoded:
-                        ant_content.append({
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": mime, "data": b64},
-                        })
-                    anthropic_messages.append({"role": m["role"], "content": ant_content})
-                    continue
-            anthropic_messages.append({"role": m["role"], "content": m.get("content", "")})
-
-        def _on_retry(attempt, max_retries, reason):
-            if progress_cb:
-                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-
-        def _do_request():
-            # Re-read active model config on every attempt so that a mid-flight
-            # model switch (set_model) is picked up by subsequent retries.
-            model = self.llm_cfg["model"]
-            payload: dict[str, Any] = {
-                "model": model,
-                "max_tokens": self.llm_cfg.get("max_tokens", 1024),
-                "messages": anthropic_messages,
-            }
-            if system:
-                payload["system"] = system
-            temperature = self.llm_cfg.get("temperature")
-            if temperature is not None:
-                payload["temperature"] = temperature
-            top_p = self.llm_cfg.get("top_p")
-            if top_p is not None:
-                payload["top_p"] = top_p
-            anthropic_url = "https://api.anthropic.com/v1/messages"
-            anthropic_headers = {
-                "x-api-key": self.llm_cfg["api_key"],
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            }
-            r = self._http.post(anthropic_url, headers=anthropic_headers, json=payload)
-            r.raise_for_status()
-            d = r.json()
-            if "error" in d:
-                err = d["error"]
-                err_code = str(err.get("type") or err.get("code") or "").lower()
-                exc_class = LLMPermanentError if err_code in _PERMANENT_ERROR_CODES else LLMError
-                raise exc_class(f"Anthropic API error (model: {model}): {err.get('message', err)}")
-            usage = d.get("usage", {})
-            self._track_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
-            content_blocks = d.get("content") or []
-            if not content_blocks:
-                logger.error("Anthropic model '%s': response missing 'content'. Raw: %s", model, str(d)[:500])
-                raise LLMEmptyResponseError(f"Anthropic model '{model}' returned no content. Body: {str(d)[:300]}")
-            text = (content_blocks[0].get("text", "") or "").strip()
-            if not text:
-                if self._diagnose_empty:
-                    curl_cmd = [
-                        "curl", "-s", "-X", "POST", anthropic_url,
-                        "-H", f"x-api-key: {self.llm_cfg['api_key']}",
-                        "-H", "anthropic-version: 2023-06-01",
-                        "-H", "Content-Type: application/json",
-                        "-d", json.dumps(payload),
-                    ]
-                    report = self._diagnose_empty_response(r, "anthropic", model, curl_cmd=curl_cmd)
-                    raise LLMEmptyResponseError(
-                        f"Anthropic returned empty content (model: {model})\n{report}"
-                    )
-                raise LLMEmptyResponseError(f"Anthropic returned empty content (model: {model})")
-            return text
-
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
-
-    def _ollama_chat(self, messages: list[dict], system: str | None, progress_cb=None,
-                     json_mode: bool = False) -> str:
-        """
-        Chat via the Ollama Python library.
-
-        Supports both the Ollama Cloud API (https://ollama.com) and a local Ollama
-        instance. The host and optional bearer token come from the model's base_url
-        and api_key config fields.
-
-        progress_cb is used only for retry status messages, never for raw content
-        tokens. Reasoning/thinking content wrapped in <think>…</think> tags is
-        stripped from the final response before returning.
-        """
-        _initial_model = self.llm_cfg["model"]
-
-        # Build message list (Ollama supports the system role natively)
-        payload_messages: list[dict] = []
-        if system:
-            payload_messages.append({"role": "system", "content": system})
-        for m in messages:
-            imgs = m.get("images")
-            if imgs:
-                encoded = _encode_images(imgs)
-                if encoded:
-                    # Ollama vision: pass base64 strings in the "images" field
-                    payload_messages.append({
-                        "role": m["role"],
-                        "content": m.get("content", ""),
-                        "images": [b64 for b64, _ in encoded],
-                    })
-                    continue
-            payload_messages.append({"role": m["role"], "content": m.get("content", "")})
-
-        def _on_retry(attempt, max_retries, reason):
-            if progress_cb:
-                progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
-
-        def _do_request():
-            # Re-read active model config and client on every attempt so that a
-            # mid-flight model switch (set_model) is picked up by subsequent retries.
-            model = self.llm_cfg["model"]
-            # If set_model switched to a non-Ollama provider mid-retry, abort
-            # immediately rather than attempting to use a None client.
-            if self.llm_cfg.get("provider") != "ollama":
-                raise LLMPermanentError(
-                    f"Active model switched away from Ollama provider during retry "
-                    f"(now '{self.llm_cfg.get('provider')}' / '{model}'). Aborting."
-                )
-            client = self._ollama_clients[self._active_idx]
-            if client is None:
-                raise RuntimeError(
-                    f"_ollama_chat called but no ollama.Client found for model '{model}' "
-                    f"(index {self._active_idx}). This is a bug — check _ollama_clients init."
-                )
-            options = {
-                "num_predict": self.llm_cfg.get("max_tokens", 1024),
-                "temperature": self.llm_cfg.get("temperature", 0.2),
-            }
-            top_p = self.llm_cfg.get("top_p")
-            if top_p is not None:
-                options["top_p"] = top_p
-            try:
-                response = client.chat(
-                    model=model,
-                    messages=payload_messages,
-                    options=options,
-                    **({"format": "json"} if json_mode else {}),
-                )
-                text = (response.message.content or "").strip()
-                # Track token usage from response metadata if available
-                _eval_count = getattr(response, "eval_count", None) or 0
-                _prompt_eval_count = getattr(response, "prompt_eval_count", None) or 0
-                if _prompt_eval_count or _eval_count:
-                    self._track_usage(_prompt_eval_count, _eval_count)
-            except _ollama_lib.ResponseError as exc:
-                # Map to our error hierarchy so _with_retry handles retries correctly
-                status = exc.status_code
-                _PERMANENT_STATUSES = {401, 403, 404}
-                if status in _PERMANENT_STATUSES:
-                    raise LLMPermanentError(
-                        f"Ollama permanent error (HTTP {status}) for model '{model}': {exc.error}"
-                    ) from exc
-                raise LLMError(
-                    f"Ollama API error (HTTP {status}) for model '{model}': {exc.error}"
-                ) from exc
-
-            # Strip inline <think>…</think> reasoning blocks (DeepSeek-R1, QwQ, etc.)
-            raw_text = text
-            text = _strip_thinking_tags(raw_text)
-
-            # Some Ollama thinking models (Kimi K2.5, DeepSeek-R1, QwQ, etc.) leave
-            # "content" empty or wrap their entire answer in <think> tags. Apply the
-            # same two-level fallback as the OpenAI path:
-            #   1. response.message.thinking — dedicated field (populated when
-            #      the Ollama server separates thinking from content)
-            #   2. content of the <think> tags themselves — when the model
-            #      placed its answer inside the tags with nothing outside
-            if not text:
-                _tag = f"[{self._caller_tag}/{model}]" if self._caller_tag else f"[{model}]"
-                thinking_field = (getattr(response.message, "thinking", None) or "").strip()
-                if thinking_field:
-                    logger.warning(
-                        "%s content field is empty — using 'thinking' field as fallback",
-                        _tag,
-                    )
-                    return thinking_field
-                think_content = _extract_thinking_content(raw_text)
-                if think_content:
-                    logger.warning(
-                        "%s content empty after stripping — using <think> block content as fallback",
-                        _tag,
-                    )
-                    return think_content
-
-            if not text:
-                raise LLMEmptyResponseError(f"Ollama returned empty content (model: {model})")
-            return text
-
-        return _with_retry(_do_request, self._max_retries, self._retry_delay, on_retry=_on_retry,
-                           cancel_event=self._cancel_event, model_name=_initial_model, caller_tag=self._caller_tag)
-
-    def _diagnose_empty_response(
-        self,
-        raw_response,   # httpx.Response captured before raising
-        provider: str,
-        model: str,
-        curl_cmd: Optional[list] = None,
-    ) -> str:
-        """
-        Run diagnostic checks after an empty LLM response and return a
-        human-readable report string. Also logs at ERROR level.
-        """
-        lines = [
-            "=== Empty LLM Response Diagnostics ===",
-            f"Provider: {provider} | Model: {model}",
-        ]
-
-        # 1. Raw HTTP response
-        status = getattr(raw_response, "status_code", "N/A")
-        lines.append(f"HTTP status: {status}")
-
-        try:
-            hdrs = dict(raw_response.headers)
-            hdr_str = ", ".join(f"{k}={v}" for k, v in list(hdrs.items())[:10])
-            lines.append(f"Headers: {hdr_str}")
-        except Exception:
-            lines.append("Headers: (unavailable)")
-
-        try:
-            raw_body = raw_response.text[:4000]
-        except Exception:
-            raw_body = "(could not read body)"
-        lines.append(f"Raw body (first 4000 chars):\n{raw_body}")
-
-        # 2. Stream/non-stream mismatch check
-        lines.append("--- Checks ---")
-        stripped_body = raw_body.lstrip()
-        if stripped_body.startswith("data:"):
-            lines.append(
-                "[STREAM MISMATCH] ⚠️  Raw body starts with 'data:' — this is SSE/streaming format. "
-                "The client is not configured for streaming but received a streaming response. "
-                "Set stream=false in your API payload or enable streaming in the client."
-            )
-        else:
-            lines.append("[STREAM MISMATCH] OK — body does not look like SSE stream")
-
-        # 3. finish_reason check
-        finish_reason = None
-        try:
-            parsed = json.loads(raw_body)
-            choices = parsed.get("choices") or []
-            if choices:
-                finish_reason = choices[0].get("finish_reason")
-            # Anthropic uses stop_reason
-            if finish_reason is None:
-                finish_reason = parsed.get("stop_reason")
-        except Exception:
-            pass
-
-        if finish_reason is not None:
-            reason_note = {
-                "stop": "normal completion",
-                "length": "⚠️  max_tokens reached — response truncated",
-                "content_filter": "⚠️  content blocked by provider safety filter",
-                "null": "⚠️  still streaming or incomplete response",
-                "end_turn": "normal completion (Anthropic)",
-                "max_tokens": "⚠️  max_tokens reached",
-            }.get(str(finish_reason).lower(), "unknown reason")
-            lines.append(f"[FINISH REASON]   finish_reason = '{finish_reason}' — {reason_note}")
-        else:
-            lines.append("[FINISH REASON]   finish_reason not found in response body")
-
-        # 4. curl fallback attempt
-        if curl_cmd:
-            lines.append("--- curl attempt ---")
-            try:
-                result = subprocess.run(
-                    curl_cmd,
-                    capture_output=True, text=True, timeout=30
-                )
-                curl_out = (result.stdout + result.stderr)[:2000]
-                lines.append(f"curl exit code: {result.returncode}")
-                lines.append(f"curl output:\n{curl_out}")
-            except subprocess.TimeoutExpired:
-                lines.append("curl attempt timed out after 30s")
-            except (subprocess.SubprocessError, OSError) as exc:
-                lines.append(f"curl attempt failed: {exc}")
-
-        lines.append("=======================================")
-        report = "\n".join(lines)
-        logger.error("Empty LLM response diagnostic:\n%s", report)
-        return report
-
     # ------------------------------------------------------------------
     # Embeddings
     # ------------------------------------------------------------------
@@ -1788,9 +641,9 @@ class LLMClient:
         logger.debug("embed: calling %s provider (text_len=%d)", provider, len(text))
         try:
             if provider in ("openai", "openrouter"):
-                vector = self._openai_embed(text)
+                vector = openai_provider.embed(self._ctx(), text)
             elif provider == "google":
-                vector = self._google_embed(text)
+                vector = google_provider.embed(self._ctx(), text)
             else:
                 logger.warning(
                     "Embedding provider '%s' has no native support; "
@@ -1798,7 +651,7 @@ class LLMClient:
                     "Configure [embeddings] provider as 'openai', 'openrouter', or 'google'.",
                     provider,
                 )
-                vector = self._openai_embed(text)
+                vector = openai_provider.embed(self._ctx(), text)
         except _LLM_CALL_ERRORS as exc:
             logger.error("Embedding error: %s", exc)
             raise
@@ -1821,41 +674,9 @@ class LLMClient:
         )
         return vector
 
-    def _openai_embed(self, text: str) -> list[float]:
-        resp = _with_retry(
-            lambda: self._http.post(
-                f"{self.emb_cfg['base_url'].rstrip('/')}/embeddings",
-                headers={
-                    "Authorization": f"Bearer {self.emb_cfg['api_key']}",
-                    "Content-Type": "application/json",
-                },
-                json={"model": self.emb_cfg["model"], "input": text},
-            ),
-            self._max_retries, self._retry_delay,
-        )
-        resp.raise_for_status()
-        return resp.json()["data"][0]["embedding"]
-
-    def _google_embed(self, text: str) -> list[float]:
-        api_key = self.emb_cfg["api_key"]
-        model = self.emb_cfg.get("model", "models/text-embedding-004")
-        resp = _with_retry(
-            lambda: self._http.post(
-                f"https://generativelanguage.googleapis.com/v1beta/{model}:embedContent?key={api_key}",
-                json={"content": {"parts": [{"text": text}]}},
-            ),
-            self._max_retries, self._retry_delay,
-        )
-        resp.raise_for_status()
-        return resp.json()["embedding"]["values"]
-
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def cosine_similarity(a: list[float], b: list[float]) -> float:
-        return _cosine_similarity(a, b)
 
     def close(self):
         """Close all HTTP transports owned by this client. Idempotent."""

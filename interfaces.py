@@ -17,8 +17,31 @@ without explicit inheritance — no code changes needed to existing classes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional, Protocol, runtime_checkable
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
+
+import httpx
+
+
+# ---------------------------------------------------------------------------
+# Provider Backend Context
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProviderContext:
+    """Dependency bag passed to provider backend functions."""
+
+    get_cfg: Callable[[], dict]
+    http: httpx.Client
+    max_retries: int
+    retry_delay: float
+    cancel_event: Optional[threading.Event]
+    caller_tag: str
+    diagnose_empty: bool
+    track_usage: Callable[[int, int], None]
+    emb_cfg: dict = field(default_factory=dict)
+    get_ollama_client: Optional[Callable[[], Any]] = None
 
 
 # ---------------------------------------------------------------------------

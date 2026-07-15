@@ -1,9 +1,9 @@
-"""Regression tests for _ollama_chat_with_tools() message history normalization.
+"""Regression tests for Ollama tool-call message history normalization.
 
 The native tool-call feedback stores arguments as json.dumps(dict) for the OpenAI
 HTTP wire format. The Ollama SDK Pydantic Message model requires arguments to be a
-dict. These tests verify that _ollama_chat_with_tools() normalizes the history
-before handing it to client.chat().
+dict. These tests verify that the Ollama backend normalizes the history via
+``chat_with_tools()`` before handing it to the Ollama SDK client.
 """
 import json
 from typing import Any
@@ -76,7 +76,7 @@ class TestOllamaHistoryArgumentsNormalization:
     def test_json_string_normalized_to_dict(self):
         """Core regression: JSON string arguments must become a dict."""
         client = _make_client()
-        client._ollama_chat_with_tools(
+        client.chat_with_tools(
             _history(json.dumps({"query": "PTO approval pending SharePoint list"})),
             tools=[],
             system=None,
@@ -97,7 +97,7 @@ class TestOllamaHistoryArgumentsNormalization:
     )
     def test_non_dict_wire_values_coerced_to_empty_dict(self, wire: str):
         client = _make_client()
-        client._ollama_chat_with_tools(_history(wire), tools=[], system=None)
+        client.chat_with_tools(_history(wire), tools=[], system=None)
         assert _sent_args(client) == {}
 
     @pytest.mark.parametrize(
@@ -110,13 +110,13 @@ class TestOllamaHistoryArgumentsNormalization:
     )
     def test_non_string_python_values_coerced_to_empty_dict(self, wire):
         client = _make_client()
-        client._ollama_chat_with_tools(_history(wire), tools=[], system=None)
+        client.chat_with_tools(_history(wire), tools=[], system=None)
         assert _sent_args(client) == {}
 
     def test_already_parsed_dict_passes_through(self):
         """Arguments already a dict must not be double-processed."""
         client = _make_client()
-        client._ollama_chat_with_tools(
+        client.chat_with_tools(
             _history({"command": "df -h"}), tools=[], system=None
         )
         assert _sent_args(client) == {"command": "df -h"}
@@ -126,7 +126,7 @@ class TestOllamaHistoryArgumentsNormalization:
         original = json.dumps({"query": "x"})
         messages = _history(original)
         client = _make_client()
-        client._ollama_chat_with_tools(messages, tools=[], system=None)
+        client.chat_with_tools(messages, tools=[], system=None)
         assert messages[0]["tool_calls"][0]["function"]["arguments"] == original
 
     def test_normalized_payload_passes_real_ollama_validation(self) -> None:
@@ -138,7 +138,7 @@ class TestOllamaHistoryArgumentsNormalization:
         import ollama._types as _ollama_types
 
         client = _make_client()
-        client._ollama_chat_with_tools(
+        client.chat_with_tools(
             _history(json.dumps({"query": "validate me"})),
             tools=[],
             system=None,
@@ -165,7 +165,7 @@ class TestOllamaHistoryArgumentsNormalization:
                 function=Message.ToolCall.Function(name="shell", arguments={"cmd": "ls"})
             )
         ]
-        result = client._ollama_chat_with_tools([], tools=[], system=None)
+        result = client.chat_with_tools([], tools=[], system=None)
         assert result.tool_calls is not None
         assert result.tool_calls[0].name == "shell"
         assert result.tool_calls[0].arguments == {"cmd": "ls"}
@@ -180,7 +180,7 @@ class TestOllamaHistoryArgumentsNormalization:
 
         client = _make_client()
         history = [{"role": "tool", "tool_call_id": "call_ghost", "content": "ok"}]
-        client._ollama_chat_with_tools(history, tools=[], system=None)
+        client.chat_with_tools(history, tools=[], system=None)
         mock_sdk: Any = client._ollama_clients[0]
         sent: list[dict] = mock_sdk.chat.call_args.kwargs["messages"]
         tool_msg = next(m for m in sent if m["role"] == "tool")

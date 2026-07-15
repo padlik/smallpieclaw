@@ -33,7 +33,6 @@ def _make_registry(*tool_names: str) -> ToolRegistry:
 def _make_llm(vector: list[float] | None = None) -> MagicMock:
     llm = MagicMock()
     llm.embed.return_value = vector or [0.1] * 128
-    llm.cosine_similarity.return_value = 0.9
     return llm
 
 
