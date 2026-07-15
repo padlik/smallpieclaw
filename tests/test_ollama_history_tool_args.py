@@ -147,3 +147,42 @@ class TestOllamaHistoryArgumentsNormalization:
         sent: list[dict] = mock_sdk.chat.call_args.kwargs["messages"]
         for m in sent:
             _ollama_types.Message.model_validate(m)
+
+    def test_turn1_tool_call_response_is_parsed(self) -> None:
+        """Response parsing: SDK .message.tool_calls -> ChatResponse.tool_calls.
+
+        The other tests only inspect the request payload sent to the SDK. This
+        one drives the response path: a turn-1 reply carrying a native tool call
+        must be parsed into ChatResponse.tool_calls with name and arguments.
+        """
+        from ollama import Message
+
+        client = _make_client()
+        mock_sdk: Any = client._ollama_clients[0]
+        resp: Any = mock_sdk.chat.return_value
+        resp.message.tool_calls = [
+            Message.ToolCall(
+                function=Message.ToolCall.Function(name="shell", arguments={"cmd": "ls"})
+            )
+        ]
+        result = client._ollama_chat_with_tools([], tools=[], system=None)
+        assert result.tool_calls is not None
+        assert result.tool_calls[0].name == "shell"
+        assert result.tool_calls[0].arguments == {"cmd": "ls"}
+
+    def test_unmatched_tool_call_id_still_valid_ollama_message(self) -> None:
+        """A tool result whose tool_call_id matches no prior call stays valid.
+
+        With no matching assistant tool_call, tool_name is omitted from the sent
+        message. The real Ollama SDK Message model must still validate it.
+        """
+        import ollama._types as _ollama_types
+
+        client = _make_client()
+        history = [{"role": "tool", "tool_call_id": "call_ghost", "content": "ok"}]
+        client._ollama_chat_with_tools(history, tools=[], system=None)
+        mock_sdk: Any = client._ollama_clients[0]
+        sent: list[dict] = mock_sdk.chat.call_args.kwargs["messages"]
+        tool_msg = next(m for m in sent if m["role"] == "tool")
+        assert "tool_name" not in tool_msg
+        _ollama_types.Message.model_validate(tool_msg)

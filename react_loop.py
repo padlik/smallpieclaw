@@ -869,8 +869,9 @@ def react_loop(
                     # parseable JSON action. Treat the text as the final answer
                     # rather than burning json_fail_streak — that streak is a
                     # json_mode protocol guard and does not apply to native text.
-                    logger.info(
-                        "%sNative mode returned plain text with no tool call — treating as finish",
+                    logger.warning(
+                        "%sNative path: model returned prose (no tool_calls) — treating as finish. "
+                        "In json_mode this would re-prompt; with native tool calling the run ends here.",
                         pfx,
                     )
                     action_obj = {"action": "finish", "result": raw}
