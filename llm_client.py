@@ -1095,6 +1095,16 @@ class LLMClient:
         payload_messages: list[dict] = []
         if system:
             payload_messages.append({"role": "system", "content": system})
+        # Pre-pass: build tool_call_id → tool_name map for role:"tool" result messages.
+        # The Ollama SDK Message model uses tool_name (not tool_call_id) to associate
+        # tool results with prior tool calls.
+        _call_id_to_name: dict[str, str] = {}
+        for _m in messages:
+            for _tc in _m.get("tool_calls") or []:
+                _tc_id = _tc.get("id") or ""
+                _tc_name = (_tc.get("function") or {}).get("name") or ""
+                if _tc_id and _tc_name:
+                    _call_id_to_name[_tc_id] = _tc_name
         for m in messages:
             imgs = m.get("images")
             if imgs:
@@ -1128,7 +1138,10 @@ class LLMClient:
                     normalized_tcs.append({**tc, "function": {**fn, "arguments": args}})
                 pm["tool_calls"] = normalized_tcs
             if m.get("tool_call_id"):
-                pm["tool_call_id"] = m["tool_call_id"]
+                # Ollama SDK uses tool_name, not tool_call_id; resolve via pre-built lookup.
+                _resolved_name = _call_id_to_name.get(m["tool_call_id"], "")
+                if _resolved_name:
+                    pm["tool_name"] = _resolved_name
             payload_messages.append(pm)
 
         def _on_retry(attempt, max_retries, reason):

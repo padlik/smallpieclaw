@@ -128,3 +128,22 @@ class TestOllamaHistoryArgumentsNormalization:
         client = _make_client()
         client._ollama_chat_with_tools(messages, tools=[], system=None)
         assert messages[0]["tool_calls"][0]["function"]["arguments"] == original
+
+    def test_normalized_payload_passes_real_ollama_validation(self) -> None:
+        """Verify the normalized payload satisfies the Ollama SDK Pydantic model.
+
+        The mock-based tests verify we send a dict; this test exercises the actual
+        SDK validation that raised in production.
+        """
+        import ollama._types as _ollama_types
+
+        client = _make_client()
+        client._ollama_chat_with_tools(
+            _history(json.dumps({"query": "validate me"})),
+            tools=[],
+            system=None,
+        )
+        mock_sdk: Any = client._ollama_clients[0]
+        sent: list[dict] = mock_sdk.chat.call_args.kwargs["messages"]
+        for m in sent:
+            _ollama_types.Message.model_validate(m)
