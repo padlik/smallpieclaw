@@ -92,7 +92,7 @@ class _SdkClientWrapper:
                         req.future.set_result(_tool_outcome(error=str(e), success=False))
 ```
 
-**Sync bridge**: `call_tool()` enqueues a request by scheduling `self._queue.put(req)` on the event loop via `asyncio.run_coroutine_threadsafe(self._queue.put(req), loop)`, then blocks on `req.future.result(timeout=...)`. The session runner processes it on the event loop and sets the result. `asyncio.Queue` is not thread-safe, so all `put()` calls must be dispatched to the loop thread.
+**Sync bridge**: `call_tool()` enqueues a request via `self._loop.call_soon_threadsafe(self._queue.put_nowait, req)`, then blocks on `req.future.result(timeout=...)`. The session runner processes it on the event loop and sets the result. `call_soon_threadsafe` + `put_nowait` is used instead of `run_coroutine_threadsafe(queue.put)` because the coroutine form returns a `concurrent.futures.Future` for the `put` itself — on caller timeout that future is abandoned, leaving `req.future` unresolved and the caller hanging indefinitely. `put_nowait` is synchronous and safe to schedule this way since the queue is unbounded and the session runner always drains it.
 
 **Alternatives considered**:
 - `asyncio.run()` per call: creates/destroys event loop per tool call, can't reuse connections, conflicts if called from within an existing loop. Rejected.
@@ -112,18 +112,20 @@ SDK v1.27.x uses these symbols (confirmed by SDK research):
 
 ```python
 from mcp import ClientSession
-from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.client.stdio import stdio_client, StdioServerParameters, get_default_environment
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.sse import sse_client
 ```
 
 | Config `transport` | SDK path |
 |---|---|
 | `"stdio"` | `stdio_client(StdioServerParameters(command=cfg.command[0], args=cfg.command[1:], env=merged_env))` → yields `(read, write)` → `ClientSession(read, write)` |
 | `"http"` | `streamablehttp_client(cfg.url, headers=cfg.headers)` → yields `(read, write, _)` → `ClientSession(read, write)` |
+| `"sse"` | `sse_client(cfg.url, headers=cfg.headers)` → yields `(read, write)` → `ClientSession(read, write)` |
 
-**Stdio env merge**: The SDK does not inherit the parent process environment. We must merge `os.environ` with `cfg.env` before passing to `StdioServerParameters`, preserving the current behavior where stdio servers have access to `PATH` and other system env vars.
+**Stdio env merge**: The SDK does not inherit the parent process environment. `get_default_environment()` provides a safe allowlist of env vars (PATH, HOME, etc.) which is merged with `cfg.env` before passing to `StdioServerParameters`. This replaces a raw `os.environ` merge to avoid leaking secrets to subprocess stdio servers.
 
-**HTTP**: Always use `streamablehttp_client` (one code path). The v1.x function returns a 3-tuple `(read, write, _)`; we discard the third element.
+**HTTP / SSE**: `streamablehttp_client` returns a 3-tuple `(read, write, _)`; we discard the third element. `sse_client` returns a 2-tuple `(read, write)`. Both accept `headers` for auth tokens.
 
 ### D4: Result mapping
 
