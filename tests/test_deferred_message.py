@@ -221,7 +221,7 @@ class TestDeferredMessageState:
 
         async def _run():
             iface._run_agent_task = AsyncMock()
-            from telegram_commands import cb_deferred
+            from telegram_callbacks import cb_deferred
             update = MagicMock()
             update.callback_query = MagicMock()
             update.callback_query.data = f"deferred_run:{token}"
@@ -242,7 +242,7 @@ class TestDeferredMessageState:
         token = _make_deferred(iface, user_id=42, text="stale message")
 
         async def _run():
-            from telegram_commands import cb_deferred
+            from telegram_callbacks import cb_deferred
             update = MagicMock()
             update.callback_query = MagicMock()
             update.callback_query.data = f"deferred_discard:{token}"
@@ -263,7 +263,7 @@ class TestDeferredMessageState:
 
         async def _run():
             iface._run_agent_task = AsyncMock()
-            from telegram_commands import cb_deferred
+            from telegram_callbacks import cb_deferred
             update = MagicMock()
             update.callback_query = MagicMock()
             update.callback_query.data = f"deferred_run:{token}"
@@ -292,7 +292,7 @@ class TestDeferredMessageState:
 
         async def _run():
             iface._run_agent_task = AsyncMock()
-            from telegram_commands import cb_deferred
+            from telegram_callbacks import cb_deferred
             update = MagicMock()
             update.callback_query = MagicMock()
             update.callback_query.data = f"deferred_run:{token}"
@@ -386,7 +386,7 @@ class TestDeferredMessageState:
 
             # Now the operator presses the OLD (stale) button.
             iface._run_agent_task = fake_run
-            from telegram_commands import cb_deferred
+            from telegram_callbacks import cb_deferred
             update = MagicMock()
             update.callback_query = MagicMock()
             update.callback_query.data = f"deferred_run:{old_token}"
@@ -421,7 +421,7 @@ class TestDeferredMessageState:
 
             iface._run_agent_task = fake_run
 
-            from telegram_commands import cb_deferred
+            from telegram_callbacks import cb_deferred
 
             def _make_cb_update(tok):
                 u = MagicMock()
