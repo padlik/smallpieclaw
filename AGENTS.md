@@ -37,12 +37,23 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 
 **Exception hierarchy:** `exceptions.py` — `AgentError` → `LLMError`, `ToolError`, `MCPError`, `ConfigError`, `SecurityError`. Use specific exceptions; broad `except Exception` is tolerated for daemon resilience but narrowing is the goal.
 
+**Built-in tools package:** `builtin_executor.py` is now a dispatcher/facade that imports from the `builtin_tools/` subpackage. Tool logic lives in submodules (`shell.py`, `files.py`, `memory.py`, `agents.py`, `schedule.py`, `context_io.py`, etc.); `descriptors.py` owns the `BUILTIN_TOOLS` registry. `builtin_executor.py` retains confirmation-token management and error-classification contract.
+
+**Agent runtime (ADR-0007):** `agent_runtime.py` introduces `RuntimeProfile` (MAIN, ON_DEMAND_SUBAGENT, SCHEDULED_AGENT, PLAN_STEP_AGENT, DIAGNOSTIC_AGENT) as a construction-time policy enum. `AgentRuntime.create` is Phase 2 scaffolding — intentionally unimplemented.
+
+**Sub-agent supervision:** `sub_agent_supervisor.py` centralizes sub-agent lifecycle (admission, execution, cleanup, callbacks) via `SubAgentSupervisor`. Replaces ad-hoc supervision in `agent_controller.py`. Uses `SupervisionOptions` and `SubmissionRequest` dataclasses.
+
 ## Key Modules
 
 | Module | Role |
 |---|---|
 | `llm_client.py` | Multi-provider LLM (openai, openrouter, google, anthropic, ollama) + embeddings |
-| `builtin_executor.py` | All built-in tools: shell, file_read/write, schedule, spawn_agent, memory_write, memory_graph_* |
+| `builtin_executor.py` | Dispatcher/facade for built-in tools; confirmation-token management and error-classification contract; imports from `builtin_tools/` |
+| `builtin_tools/` | Built-in tool subpackage: `shell.py`, `files.py`, `memory.py`, `agents.py`, `schedule.py`, `context_io.py`, `descriptors.py` (registry), `schemas.py`, `patterns.py`, `logquery_helpers.py`, `secrets_log.py`, `text_utils.py` |
+| `agent_logging.py` | structlog-based dual-sink logging; `LogEvent` enum (TOOL_START/END/FAILED, LLM_CALL/FAILED, STEP_BEGIN/END, RUN_BEGIN/END, ERROR); `setup_logging()`, `log_event()`, `bind_run_context()` |
+| `agent_runtime.py` | Construction-time policy via `RuntimeProfile` enum (MAIN, ON_DEMAND_SUBAGENT, SCHEDULED_AGENT, PLAN_STEP_AGENT, DIAGNOSTIC_AGENT); ADR-0007 scaffolding |
+| `sub_agent_supervisor.py` | Sub-agent lifecycle (admission, execution, cleanup, callbacks) via `SubAgentSupervisor`; `SupervisionOptions` + `SubmissionRequest` dataclasses |
+| `vector_utils.py` | Vector math utilities for embeddings; `cosine_similarity(a, b) → float` |
 | `tool_registry.py` | Discovers `.sh`/`.py` tools from `tools/` and `tools_generated/`; `Tool` dataclass |
 | `tool_index.py` | Semantic tool search via embedding cosine similarity; persists to `data/tool_index.json` |
 | `tool_executor.py` | Runs tools in subprocess with timeout |
@@ -56,6 +67,7 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `telegram_interface.py` | Telegram bot with allowlist/pairing security, streaming, inline confirmations |
 | `telegram_formatter.py` | Pure formatting: md→html, message splitting, job list formatting |
 | `telegram_commands.py` | All `/` command handlers |
+| `telegram_callbacks.py` | Inline-button callback handlers (split from `telegram_commands.py`) |
 | `prompt_builder.py` | System prompt assembly; re-exports `estimate_tokens` from `token_estimator.py` for backward compat |
 | `token_estimator.py` | Two-layer token counting: tiktoken (OpenAI models) + conservative heuristic fallback |
 | `context_manager.py` | Auto-compaction at 85% of `ctx_max_tokens`; content-aware trimming |
