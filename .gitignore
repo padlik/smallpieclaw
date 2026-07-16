@@ -250,3 +250,7 @@ openspec/tmp/
 openspec-worktrees/
 
 opencode.json
+
+#Opencode custom agents and commands 
+.opencode/agent/
+.opencode/commands/
