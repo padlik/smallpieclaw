@@ -20,19 +20,27 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-import os
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.sse import sse_client
 from mcp.types import CallToolResult
 
 from tool_registry import Tool
 
 logger = logging.getLogger(__name__)
+
+_MAX_TOOL_PAGES = 50
+_MAX_TOOLS = 500
+
+_VALID_TOOL_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
+_MAX_DESCRIPTION_LEN = 2048
+_CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,7 +77,11 @@ def _sdk_tools_to_registry(server_name: str, sdk_tools: list) -> list[Tool]:
         name: str = getattr(t, "name", "") or ""
         if not name:
             continue
-        description: str = getattr(t, "description", None) or f"MCP tool '{name}' from {server_name}"
+        if not _VALID_TOOL_NAME_RE.match(name):
+            logger.warning("MCP [%s] skipping tool with invalid name: %r", server_name, name)
+            continue
+        raw_desc: str = getattr(t, "description", None) or f"MCP tool '{name}' from {server_name}"
+        description = _CONTROL_CHARS_RE.sub("", raw_desc)[:_MAX_DESCRIPTION_LEN]
         input_schema: dict[str, Any] = getattr(t, "inputSchema", {}) or {}
         result.append(Tool(
             name=name,
@@ -81,6 +93,12 @@ def _sdk_tools_to_registry(server_name: str, sdk_tools: list) -> list[Tool]:
             input_schema=input_schema,
         ))
     return result
+
+async def _cancel_and_wait(tasks: list) -> None:
+    """Cancel asyncio tasks and await their completion so context managers finalize."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 # ---------------------------------------------------------------------------
 # Per-server SDK wrapper
@@ -99,7 +117,8 @@ class _SdkClientWrapper:
     The session runner coroutine enters the transport + ClientSession context once
     and stays alive, processing tool calls from an asyncio.Queue.  All sync-to-async
     bridging goes through concurrent.futures.Future (thread-safe) and
-    asyncio.run_coroutine_threadsafe.
+    asyncio.run_coroutine_threadsafe. Tool calls are serialized — only one outstanding
+    call per server at a time.
     """
 
     def __init__(self, cfg: dict, loop: asyncio.AbstractEventLoop) -> None:
@@ -132,6 +151,9 @@ class _SdkClientWrapper:
         except concurrent.futures.TimeoutError:
             self.last_error = f"MCP [{self.name}] connect timeout"
             self.connected = False
+            # Cancel the background task so it doesn't spin orphaned
+            if self._task is not None:
+                self._loop.call_soon_threadsafe(self._task.cancel)
             logger.error("MCP [%s] connect timed out", self.name)
             return []
         except Exception as exc:
@@ -147,7 +169,10 @@ class _SdkClientWrapper:
                 error=f"MCP server '{self.name}' not connected", success=False
             )
         req = _ToolRequest(name=tool_name, args=args)
-        asyncio.run_coroutine_threadsafe(self._queue.put(req), self._loop)
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, req)
+        except RuntimeError:
+            return _tool_outcome(error=f"MCP server '{self.name}' is closing", success=False)
         try:
             return req.future.result(timeout=self._timeout)
         except concurrent.futures.TimeoutError:
@@ -164,6 +189,18 @@ class _SdkClientWrapper:
         if self._task is not None:
             self._loop.call_soon_threadsafe(self._task.cancel)
 
+    def _drain_queue(self, error_msg: str) -> None:
+        """Resolve all pending queued requests so callers do not hang."""
+        if self._queue is None:
+            return
+        while True:
+            try:
+                req = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if req is not None and not req.future.done():
+                req.future.set_result(_tool_outcome(error=error_msg, success=False))
+
     async def _session_runner(self) -> None:
         """Long-lived coroutine — owns the transport + ClientSession for this server."""
         self._queue = asyncio.Queue()
@@ -171,7 +208,7 @@ class _SdkClientWrapper:
         transport = cfg.get("transport", "stdio").lower()
         try:
             if transport == "stdio":
-                merged_env = {**os.environ, **(cfg.get("env") or {})}
+                merged_env = {**get_default_environment(), **(cfg.get("env") or {})}
                 params = StdioServerParameters(
                     command=cfg["command"][0],
                     args=cfg["command"][1:],
@@ -179,10 +216,15 @@ class _SdkClientWrapper:
                 )
                 async with stdio_client(params) as (read, write):
                     await self._run_session(read, write)
-            elif transport in ("http", "sse"):
+            elif transport == "http":
                 async with streamablehttp_client(
                     cfg["url"], headers=cfg.get("headers") or {}
                 ) as (read, write, _):
+                    await self._run_session(read, write)
+            elif transport == "sse":
+                async with sse_client(
+                    cfg["url"], headers=cfg.get("headers") or {}
+                ) as (read, write):
                     await self._run_session(read, write)
             else:
                 raise ValueError(f"Unknown transport: {transport!r}")
@@ -200,25 +242,52 @@ class _SdkClientWrapper:
             await session.initialize()
             all_tools: list = []
             cursor: Optional[str] = None
+            seen_cursors: set[str] = set()
+            page_count = 0
             while True:
                 page = await session.list_tools(cursor=cursor) if cursor else await session.list_tools()
                 all_tools.extend(page.tools)
+                page_count += 1
+                if len(all_tools) > _MAX_TOOLS:
+                    raise RuntimeError(
+                        f"MCP server '{self.name}' exceeded {_MAX_TOOLS} tool limit"
+                    )
                 cursor = getattr(page, "nextCursor", None)
                 if not cursor:
                     break
+                if page_count >= _MAX_TOOL_PAGES:
+                    raise RuntimeError(
+                        f"MCP server '{self.name}' exceeded {_MAX_TOOL_PAGES} pagination pages"
+                    )
+                if cursor in seen_cursors:
+                    raise RuntimeError(
+                        f"MCP server '{self.name}' returned duplicate pagination cursor"
+                    )
+                seen_cursors.add(cursor)
             self._tools = _sdk_tools_to_registry(self.name, all_tools)
             self._ready_future.set_result(True)
-            while True:
-                req = await self._queue.get()
-                if req is None:
-                    break
-                try:
-                    result = await session.call_tool(req.name, req.args)
-                    req.future.set_result(_sdk_result_to_outcome(result))
-                except Exception as exc:
-                    self.connected = False
-                    self.last_error = str(exc)
-                    req.future.set_result(_tool_outcome(error=str(exc), success=False))
+            try:
+                while True:
+                    req = await self._queue.get()
+                    if req is None:
+                        break
+                    try:
+                        result = await session.call_tool(req.name, req.args)
+                        if not req.future.done():
+                            req.future.set_result(_sdk_result_to_outcome(result))
+                    except asyncio.CancelledError:
+                        if not req.future.done():
+                            req.future.set_result(_tool_outcome(
+                                error=f"MCP server '{self.name}' closing", success=False
+                            ))
+                        raise
+                    except Exception as exc:
+                        self.connected = False
+                        self.last_error = str(exc)
+                        if not req.future.done():
+                            req.future.set_result(_tool_outcome(error=str(exc), success=False))
+            finally:
+                self._drain_queue(f"MCP server '{self.name}' session ended")
 
 # ---------------------------------------------------------------------------
 # MCPManager
@@ -241,8 +310,11 @@ class MCPManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._connecting: set[str] = set()
 
     def _start_loop(self) -> None:
+        if self._loop is not None and self._loop.is_running():
+            return
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
             target=self._loop.run_forever,
@@ -256,6 +328,13 @@ class MCPManager:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=5)
+        if self._loop is not None:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+        self._loop = None
+        self._loop_thread = None
 
     def connect_all(self) -> None:
         """Connect all enabled servers. Errors are logged but do not abort startup."""
@@ -283,20 +362,36 @@ class MCPManager:
                     self._tool_to_server[tool.name] = name
 
     def close_all(self) -> None:
+        tasks: list = []
         with self._lock:
             for name, wrapper in list(self._wrappers.items()):
                 try:
-                    wrapper.close()
+                    wrapper.connected = False
+                    if self._loop is not None and wrapper._queue is not None:
+                        self._loop.call_soon_threadsafe(wrapper._queue.put_nowait, None)
+                    if wrapper._task is not None:
+                        tasks.append(wrapper._task)
                 except Exception as exc:
                     logger.warning("MCP [%s] close error: %s", name, exc)
             self._wrappers.clear()
             self._tool_to_server.clear()
+        # Drive cancellation to completion so stdio_client.__aexit__ runs and terminates children
+        if tasks and self._loop is not None and self._loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _cancel_and_wait(tasks), self._loop
+                ).result(timeout=10)
+            except Exception:
+                pass
         self._stop_loop()
 
     def has_tool(self, tool_name: str) -> bool:
-        return tool_name in self._tool_to_server
+        with self._lock:
+            return tool_name in self._tool_to_server
 
     def call_tool(self, tool_name: str, args: dict) -> dict:
+        if self._loop is None or not self._loop.is_running():
+            return _tool_outcome(error="MCP event loop not running", success=False)
         with self._lock:
             server_name = self._tool_to_server.get(tool_name)
             if not server_name:
@@ -318,12 +413,30 @@ class MCPManager:
         """Enable or disable a server at runtime. Returns False if name not found."""
         if name not in self._cfgs:
             return False
-        self._enabled[name] = on
+        with self._lock:
+            self._enabled[name] = on
         if on:
             with self._lock:
-                already = name in self._wrappers
-            if not already:
+                existing = self._wrappers.get(name)
+                # Allow reconnect if wrapper is present but not connected
+                if (existing is not None and existing.connected) or name in self._connecting:
+                    return True
+                self._connecting.add(name)
+            try:
                 self._connect_server(name, self._cfgs[name])
+            finally:
+                with self._lock:
+                    self._connecting.discard(name)
+                    # If disabled during the connect window, close the just-registered wrapper
+                    if not self._enabled.get(name, True):
+                        wrapper = self._wrappers.pop(name, None)
+                        for tool_name in [k for k, v in self._tool_to_server.items() if v == name]:
+                            del self._tool_to_server[tool_name]
+                        if wrapper:
+                            try:
+                                wrapper.close()
+                            except Exception:
+                                pass
         else:
             with self._lock:
                 wrapper = self._wrappers.pop(name, None)
@@ -339,11 +452,14 @@ class MCPManager:
 
     def list_servers(self) -> list[dict]:
         """Return status info for all configured servers (for /mcp list)."""
+        with self._lock:
+            wrappers_snap = dict(self._wrappers)
+            enabled_snap = dict(self._enabled)
         result = []
         for name, cfg in self._cfgs.items():
             transport = cfg.get("transport", "stdio").lower()
-            wrapper = self._wrappers.get(name)
-            enabled = self._enabled.get(name, True)
+            wrapper = wrappers_snap.get(name)
+            enabled = enabled_snap.get(name, True)
             if not enabled:
                 status = "off"
             elif wrapper and wrapper.connected:
@@ -364,9 +480,10 @@ class MCPManager:
         cfg = self._cfgs.get(name)
         if not cfg:
             return None
+        with self._lock:
+            wrapper = self._wrappers.get(name)
+            enabled = self._enabled.get(name, True)
         transport = cfg.get("transport", "stdio").lower()
-        wrapper = self._wrappers.get(name)
-        enabled = self._enabled.get(name, True)
         if not enabled:
             status = "off"
         elif wrapper and wrapper.connected:
@@ -387,5 +504,6 @@ class MCPManager:
         }
 
     def last_error(self, name: str) -> str:
-        wrapper = self._wrappers.get(name)
+        with self._lock:
+            wrapper = self._wrappers.get(name)
         return wrapper.last_error if wrapper else ""
