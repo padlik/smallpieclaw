@@ -10,6 +10,9 @@ For OpenSpec propose/apply/verify/archive workflows, use the local `openspec-git
  - Follow PEP 8 style guidelines. Include type hints for function parameters and return types. Write docstrings for all public modules, classes, functions, and methods.
  - After every code change, always run `ruff check .` and `vulture . vulture_whitelist.py --min-confidence 80` to verify.
 
+## Dev discipline 
+ - **Never** code in **main** branch, do it either in a feature/fix branch (single agent is modifying code) or a workspace when many agents are trying to do different tasks at the same time (e.g. two different features in parralel).  
+
 ## Dev Commands
 
 ```bash
