@@ -481,6 +481,325 @@ _BUILTIN_NAMES = frozenset({
 })
 
 _JSON_FAIL_LIMIT = 3
+_ABSOLUTE_PLAN_CEILING = 200
+
+
+@dataclass
+class _LoopState:
+    """Mutable per-run loop state."""
+    messages: list[dict]
+    goal_idx: int
+    max_steps: int
+    step: int = 0
+    json_fail_streak: int = 0
+    operator_cancelled: bool = False
+    last_action_time: float = field(default_factory=time.time)
+    warned_inactivity: bool = False
+
+
+@dataclass
+class _Turn:
+    """Result of one LLM call."""
+    tool_calls: list          # non-empty → native path
+    raw: str                  # LLM text output
+    text_from_native: bool
+    early_return: Optional[str]            # cancelled or error; if set, return immediately
+    linearized_messages: Optional[list] = None  # set when messages were linearized for fallback
+
+
+def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
+    """Assemble the full system prompt string for a run."""
+    pfx = ""
+    _job_history_section = ""
+    if ctx.job_history_fn:
+        try:
+            _job_history_section = ctx.job_history_fn() or ""
+        except Exception as _jh_exc:
+            logger.warning("%sFailed to get job history: %s", pfx, _jh_exc)
+
+    _graph_context_section = ""
+    if ctx.graph_memory is not None:
+        try:
+            _graph_context_section = (
+                ctx.graph_memory.format_for_prompt(
+                    user_goal, max_entries=ctx.graph_memory_max_entries
+                ) or ""
+            )
+            if _graph_context_section:
+                logger.info("%sGraph memory context injected", pfx)
+            else:
+                logger.debug("%sGraph memory context: no relevant data found", pfx)
+        except Exception as _gm_exc:
+            logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
+
+    strategies_section = ""
+    if getattr(ctx, "strategy_memory", None) is not None:
+        from strategy_memory import classify_task_type, format_strategies_for_prompt
+        task_type = classify_task_type(user_goal)
+        strategies = ctx.strategy_memory.get_top_k(task_type, k=2)
+        if strategies:
+            strategies_section = format_strategies_for_prompt(strategies)
+
+    parent_context_section = _format_parent_context(ctx)
+    _sub_agent_prompt_variant = getattr(ctx, "_prompt_variant", None) if ctx.depth >= 1 else None
+
+    system, _ = _build_system_prompt(
+        tool_index=ctx.tool_index,
+        memory=ctx.memory,
+        results=ctx.results,
+        skill_registry=ctx.skill_registry,
+        llm=ctx.llm,
+        tmp_dir=ctx.tmp_dir,
+        downloads_dir=ctx.downloads_dir,
+        log_file=ctx.log_file,
+        log_backup_count=ctx.log_backup_count,
+        top_tools=ctx.top_tools,
+        user_goal=user_goal,
+        job_history_section=_job_history_section,
+        graph_context_section=_graph_context_section,
+        strategies_section=strategies_section,
+        # Suppress ResultsMemory recall when graph memory already supplied
+        # semantic context this turn — avoids redundant/overlapping recall.
+        results_top_k=0 if _graph_context_section else 2,
+        parent_context_section=parent_context_section,
+        mode=_sub_agent_prompt_variant or ctx.creativity_mode,
+    )
+    return system
+
+
+def _init_messages(
+    ctx: ReactContext,
+    user_goal: str,
+    images: Optional[list[str]],
+) -> tuple[list[dict], int]:
+    """Build the initial messages list and return (messages, goal_idx)."""
+    pfx = ""
+    first_msg: dict = {"role": "user", "content": user_goal}
+    if images:
+        first_msg["images"] = images
+        logger.info("%s%d image(s) attached to request", pfx, len(images))
+
+    messages: list[dict] = []
+    if ctx.short_term:
+        messages.extend(ctx.short_term.get_messages())
+    # Record the index of the current goal before appending it so that
+    # maybe_compact can pin the goal as the preserved anchor rather than
+    # treating messages[0] (stale short-term history) as the goal.
+    goal_idx: int = len(messages)
+    messages.append(first_msg)
+    return messages, goal_idx
+
+
+def _ensure_tool_defs(ctx: ReactContext) -> None:
+    """Lazily build _tool_defs if not already populated."""
+    pfx = ""
+    if ctx._tool_defs is None:
+        try:
+            ctx._tool_defs = build_tool_definitions(
+                mcp_manager=ctx.mcp_manager,
+            )
+        except Exception as _btd_exc:  # noqa: BLE001
+            logger.warning(
+                "%sbuild_tool_definitions failed: %s — MCP tools skipped",
+                pfx, _btd_exc,
+            )
+            ctx._tool_defs = build_tool_definitions(mcp_manager=None)
+
+
+def _normalize_shorthand_action(action_obj: dict) -> dict:
+    """Normalize shorthand action keys to canonical form. Returns the (possibly mutated) dict."""
+    pfx = ""
+    action = action_obj.get("action", "")
+    if action not in _BUILTIN_NAMES:
+        return action_obj
+    logger.warning("%sLLM used shorthand action '%s' — normalizing to tool call", pfx, action)
+    if "args" in action_obj:
+        shorthand_args = action_obj["args"]
+        if isinstance(shorthand_args, str):
+            try:
+                parsed = json.loads(shorthand_args)
+                if isinstance(parsed, (dict, list)):
+                    shorthand_args = parsed
+                else:
+                    logger.warning(
+                        "Shorthand action '%s' args parsed to non-dict type %s — keeping string",
+                        action, type(parsed).__name__,
+                    )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Shorthand action '%s' args is a non-JSON string — keeping as-is: %s",
+                    action, shorthand_args[:200],
+                )
+    else:
+        shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
+    return {"action": "tool", "tool": action, "args": shorthand_args}
+
+
+def _request_turn(
+    ctx: ReactContext,
+    state: _LoopState,
+    system: str,
+    progress: Callable[[str], None],
+) -> _Turn:
+    """Make one LLM call and return the structured turn result."""
+    pfx = ""
+    raw = ""
+    tool_calls: list[ToolCall] = []
+    native_attempted = False
+    text_from_native = False
+    linearized_messages = None
+    _MAX_EMPTY_RETRIES = 2
+
+    _supports_native = hasattr(ctx.llm, "chat_with_tools_fallback") and callable(
+        ctx.llm.chat_with_tools_fallback
+    )
+    if ctx._tool_defs and _supports_native:
+        try:
+            response = ctx.llm.chat_with_tools_fallback(
+                state.messages, tools=ctx._tool_defs, system=system, progress_cb=progress,
+            )
+            native_attempted = True
+            if response.is_tool_call and response.tool_calls:
+                tool_calls = response.tool_calls
+            elif response.text:
+                raw = response.text
+                text_from_native = True
+        except NotImplementedError:
+            logger.debug("%sNative tool calling not supported by provider — falling back to json_mode", pfx)
+        except LLMPermanentError:
+            raise
+        except LLMError:
+            logger.warning("%sNative tool calling failed (LLMError) — falling back to json_mode", pfx)
+        except Exception as exc:
+            logger.warning(
+                "%sNative tool calling unexpected error: %s — falling back to json_mode",
+                pfx, exc,
+            )
+
+    if not raw and not native_attempted:
+        linearized_messages = _linearize_native_turns(state.messages)
+        for attempt in range(1 + _MAX_EMPTY_RETRIES):
+            try:
+                raw = ctx.llm.chat_with_fallback(
+                    linearized_messages, system=system, progress_cb=progress, json_mode=True,
+                )
+            except LLMCancelledError:
+                logger.info("Agent LLM call cancelled at step %d/%d", state.step, state.max_steps)
+                return _Turn([], "", False, "[Cancelled]")
+            except Exception as exc:
+                err = f"❌ LLM error: {type(exc).__name__}: {exc}"
+                progress(err)
+                return _Turn([], "", False, err)
+            if raw.strip():
+                break
+            if attempt < _MAX_EMPTY_RETRIES:
+                logger.warning(
+                    "%sLLM returned empty response (step %d/%d), retrying (%d/%d)…",
+                    pfx, state.step, state.max_steps, attempt + 1, _MAX_EMPTY_RETRIES,
+                )
+                progress(f"⏳ Empty LLM response, retrying ({attempt + 1}/{_MAX_EMPTY_RETRIES})…")
+
+    return _Turn(tool_calls, raw, text_from_native, None, linearized_messages)
+
+
+def _result_sink(
+    state: _LoopState,
+    tc: Optional[ToolCall] = None,
+) -> Callable[[str], None]:
+    # Lambdas capture `state` (the dataclass), not `state.messages` directly.
+    # This means they read state.messages at *call* time, so they correctly
+    # append to the new list after any maybe_compact or linearization reassignment.
+    """Return a function that appends a tool result to messages in the correct format."""
+    if tc is not None:
+        return lambda content: _append_native_tool_result(state.messages, tc, content)
+    return lambda content: state.messages.append({"role": "user", "content": content})
+
+
+def _dispatch_action(
+    ctx: ReactContext,
+    action_obj: dict,
+    sink: Callable[[str], None],
+    state: _LoopState,
+    user_goal: str,
+    run_start: float,
+    progress: Callable[[str], None],
+) -> Optional[str]:
+    """Dispatch one action. Returns final result string on finish; None otherwise.
+
+    May mutate state.max_steps when dispatching a plan action (to give the agent
+    room to complete the plan steps).
+    """
+    action = action_obj.get("action", "")
+
+    if action == "finish":
+        return _finish_run(ctx, action_obj, user_goal, state.step, run_start)
+
+    if action == "tool":
+        tool_name = action_obj.get("tool", "")
+        args = action_obj.get("args", {})
+        if isinstance(args, list):
+            args = {str(i): v for i, v in enumerate(args)}
+            action_obj = {**action_obj, "args": args}
+        _t0 = time.time()
+        # vision_query needs LLM access — call directly, never through _dispatch_tool
+        if tool_name == "vision_query":
+            outcome = _exec_vision_query(ctx, args)
+        else:
+            outcome = _dispatch_tool(ctx, action_obj, progress)
+        _duration_ms = (time.time() - _t0) * 1000
+        _emit_tool_trace(
+            ctx, tool_name, args, success=outcome["success"],
+            duration_ms=_duration_ms,
+            error=outcome.get("error", "") if not outcome["success"] else "",
+        )
+        if ctx.working:
+            ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
+        if outcome.get("send_file"):
+            path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
+            caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
+            progress(f"__FILE__:{path_b64}:{caption_b64}")
+        tool_result = format_tool_result(tool_name, outcome)
+        if outcome["success"]:
+            logger.info("Tool '%s' result: success=True", tool_name)
+        else:
+            logger.warning(
+                "Tool '%s' result: success=False | error=%s | args=%s",
+                tool_name, outcome.get("error", ""),
+                {k: str(v)[:120] for k, v in args.items()},
+            )
+        progress(fmt_tool_result_progress(tool_name, args, outcome))
+        sink(tool_result)
+        if outcome.get("_operator_cancelled") or ctx.cancel_event.is_set():
+            state.operator_cancelled = True
+        return None
+
+    if action == "create_tool":
+        _t0 = time.time()
+        feedback, cancelled = _dispatch_create_tool(ctx, action_obj, progress)
+        _emit_tool_trace(
+            ctx, "create_tool", {k: v for k, v in action_obj.items() if k != "action"},
+            success=not cancelled,
+            duration_ms=(time.time() - _t0) * 1000,
+            error="cancelled by operator" if cancelled else "",
+        )
+        sink(feedback)
+        if cancelled or ctx.cancel_event.is_set():
+            state.operator_cancelled = True
+        return None
+
+    if action == "plan":
+        plan_data = action_obj.get("plan", {})
+        result_msg, new_max_steps, _ = _run_plan(ctx, plan_data, state.max_steps, progress)
+        if new_max_steps is not None:
+            state.max_steps = max(state.step, min(int(new_max_steps), _ABSOLUTE_PLAN_CEILING))
+        sink(result_msg)
+        if ctx.cancel_event.is_set():
+            state.operator_cancelled = True
+        return None
+
+    logger.warning("Unknown action '%s' from LLM", action)
+    sink(f'Unknown action "{action}". Use "tool", "create_tool", or "finish".')
+    return None
 
 
 def react_loop(
@@ -489,13 +808,9 @@ def react_loop(
     progress_callback: Optional[Callable[[str], None]] = None,
     images: Optional[list[str]] = None,
 ) -> str:
-    """
-    Execute the ReAct loop: LLM → parse → dispatch → repeat.
-
-    Returns the final answer string.
-    """
+    """Execute the ReAct loop: LLM → parse → dispatch → repeat. Returns the final answer string."""
     run_start = time.time()
-    pfx = ""  # run identity is now supplied by structlog contextvars (see agent_logging); avoid double-prefixing
+    pfx = ""
     _ctx_tokens = agent_logging.bind_run_context(trace=ctx.trace_id, agent=ctx.label)
     agent_logging.log_event(agent_logging.LogEvent.RUN_BEGIN, "run begin", level=logging.INFO, logger=slog)
 
@@ -505,12 +820,7 @@ def react_loop(
         logger.debug("%sAgent progress: %s", pfx, msg)
 
     try:
-        # Reset cached tool definitions so every run rebuilds them — MCP servers
-        # may have reconnected/re-registered since the last run, or this
-        # ReactContext may be reused across runs. The lazy-build check below
-        # repopulates it (once) for this run.
         ctx._tool_defs = None
-
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
 
@@ -520,617 +830,153 @@ def react_loop(
         if ctx.working:
             ctx.working.start_task(user_goal)
 
-        # 1. Build system prompt
-        _job_history_section = ""
-        if ctx.job_history_fn:
-            try:
-                _job_history_section = ctx.job_history_fn() or ""
-            except Exception as _jh_exc:
-                logger.warning("%sFailed to get job history: %s", pfx, _jh_exc)
-
-        _graph_context_section = ""
-        if ctx.graph_memory is not None:
-            try:
-                _graph_context_section = (
-                    ctx.graph_memory.format_for_prompt(
-                        user_goal, max_entries=ctx.graph_memory_max_entries
-                    ) or ""
-                )
-                if _graph_context_section:
-                    logger.info("%sGraph memory context injected", pfx)
-                else:
-                    logger.debug("%sGraph memory context: no relevant data found", pfx)
-            except Exception as _gm_exc:
-                logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
-
-        # Strategy memory injection
-        strategies_section = ""
-        if getattr(ctx, "strategy_memory", None) is not None:
-            from strategy_memory import classify_task_type, format_strategies_for_prompt
-            task_type = classify_task_type(user_goal)
-            strategies = ctx.strategy_memory.get_top_k(task_type, k=2)
-            if strategies:
-                strategies_section = format_strategies_for_prompt(strategies)
-
-        # Sub-agent context sharing
-        parent_context_section = _format_parent_context(ctx)
-        _sub_agent_prompt_variant = getattr(ctx, "_prompt_variant", None) if ctx.depth >= 1 else None
-
-        system, _ = _build_system_prompt(
-            tool_index=ctx.tool_index,
-            memory=ctx.memory,
-            results=ctx.results,
-            skill_registry=ctx.skill_registry,
-            llm=ctx.llm,
-            tmp_dir=ctx.tmp_dir,
-            downloads_dir=ctx.downloads_dir,
-            log_file=ctx.log_file,
-            log_backup_count=ctx.log_backup_count,
-            top_tools=ctx.top_tools,
-            user_goal=user_goal,
-            job_history_section=_job_history_section,
-            graph_context_section=_graph_context_section,
-            strategies_section=strategies_section,
-            # Suppress ResultsMemory recall when graph memory already supplied
-            # semantic context this turn — avoids redundant/overlapping recall.
-            results_top_k=0 if _graph_context_section else 2,
-            parent_context_section=parent_context_section,
-            mode=_sub_agent_prompt_variant or ctx.creativity_mode,
-        )
-
-        first_msg: dict = {"role": "user", "content": user_goal}
-        if images:
-            first_msg["images"] = images
-            logger.info("%s%d image(s) attached to request", pfx, len(images))
-
-        messages: list[dict] = []
-        if ctx.short_term:
-            messages.extend(ctx.short_term.get_messages())
-        # Record the index of the current goal before appending it so that
-        # maybe_compact can pin the goal as the preserved anchor rather than
-        # treating messages[0] (stale short-term history) as the goal.
-        goal_idx: int = len(messages)
-        messages.append(first_msg)
-
+        system = _assemble_system_prompt(ctx, user_goal)
+        messages, goal_idx = _init_messages(ctx, user_goal, images)
         ctx.memory.record_event(f"User request: {user_goal[:100]}")
 
-        # Enqueue user message for background graph extraction (fire-and-forget)
         if ctx.graph_memory_writer is not None:
             try:
                 ctx.graph_memory_writer.enqueue(user_goal, source="chat")
             except Exception as _gw_exc:  # noqa: BLE001
                 logger.debug("%sGraph memory enqueue failed: %s", pfx, _gw_exc)
 
-        # Build native tool definitions once at loop start. A flaky MCP server
-        # or a malformed tool schema must not abort the whole run before step 1,
-        # so on failure we fall back to builtins + pseudo-tools only (no MCP).
-        if ctx._tool_defs is None:
-            try:
-                ctx._tool_defs = build_tool_definitions(
-                    mcp_manager=ctx.mcp_manager,
-                )
-            except Exception as _btd_exc:  # noqa: BLE001
-                logger.warning(
-                    "%sbuild_tool_definitions failed: %s — MCP tools skipped",
-                    pfx, _btd_exc,
-                )
-                ctx._tool_defs = build_tool_definitions(mcp_manager=None)
+        _ensure_tool_defs(ctx)
 
-        # 2. ReAct loop
-        max_steps = ctx.max_iterations
-        step = 0
-        operator_cancelled = False
-        json_fail_streak = 0
-        last_action_time = time.time()
-        warned_inactivity = False
+        state = _LoopState(messages=messages, goal_idx=goal_idx, max_steps=ctx.max_iterations)
 
         while True:
-            while step < max_steps:
+            while state.step < state.max_steps:
                 if ctx.cancel_event.is_set():
-                    logger.warning("%scancelled at step %d/%d", pfx, step, max_steps)
+                    logger.warning("%scancelled at step %d/%d", pfx, state.step, state.max_steps)
                     return "[Cancelled]"
 
-                # Soft inactivity check — inject a "still working?" prompt if idle too long
-                if not warned_inactivity and step > 1:
+                if not state.warned_inactivity and state.step > 1:
                     warn_minutes = getattr(ctx, "inactivity_warn_minutes", 0)
-                    if warn_minutes and (time.time() - last_action_time) > (warn_minutes * 60):
-                        warned_inactivity = True
-                        minutes = round((time.time() - last_action_time) / 60)
-                        messages.append({
+                    if warn_minutes and (time.time() - state.last_action_time) > (warn_minutes * 60):
+                        state.warned_inactivity = True
+                        minutes = round((time.time() - state.last_action_time) / 60)
+                        state.messages.append({
                             "role": "user",
                             "content": f"You've been running for {minutes} minutes without finishing. Are you still working? If you're done, use finish.",
                         })
                         _progress(f"⏳ Inactivity prompt after {minutes}m…")
-                        continue  # re-evaluate loop condition before next LLM call
+                        continue
 
-                step += 1
-                last_action_time = time.time()
+                state.step += 1
+                state.last_action_time = time.time()
 
                 agent_logging.log_event(
-                    agent_logging.LogEvent.STEP_BEGIN, "step begin", level=logging.INFO, logger=slog, step=step,
+                    agent_logging.LogEvent.STEP_BEGIN, "step begin",
+                    level=logging.INFO, logger=slog, step=state.step,
                 )
 
                 if ctx.on_step:
                     try:
-                        ctx.on_step(step)
+                        ctx.on_step(state.step)
                     except Exception:
                         pass
                 active_model = ctx.llm.llm_cfg.get("model", "?")
-                logger.info("%sstep %d/%d | model: %s", pfx, step, max_steps, active_model)
-                _progress(f"⚙️ Thinking… (step {step})")
+                logger.info("%sstep %d/%d | model: %s", pfx, state.step, state.max_steps, active_model)
+                _progress(f"⚙️ Thinking… (step {state.step})")
 
-                # Context compaction check. maybe_compact returns the goal's
-                # updated index within the (possibly compacted) list, so the
-                # caller never has to guess where the preserved goal landed.
-                messages, goal_idx = maybe_compact(
-                    messages, system, ctx.ctx_max_tokens, ctx.llm, goal_idx=goal_idx,
+                state.messages, state.goal_idx = maybe_compact(
+                    state.messages, system, ctx.ctx_max_tokens, ctx.llm, goal_idx=state.goal_idx,
                 )
 
-                # LLM call — try native tool calling first, fall back to json_mode
-                _MAX_EMPTY_RETRIES = 2
-                raw = ""
-                tool_calls: list[ToolCall] = []
-                native_attempted = False
-                text_from_native = False
+                turn = _request_turn(ctx, state, system, _progress)
+                if turn.early_return is not None:
+                    return turn.early_return
+                if turn.linearized_messages is not None:
+                    state.messages = turn.linearized_messages
 
-                # --- Native tool calling path ---
-                # Capability check (not isinstance): any LLM exposing a callable
-                # `chat_with_tools_fallback` may take the native path. This admits
-                # non-LLMClient LLMProvider implementers and stops inheritance
-                # alone from forcing every LLMClient subclass through native.
-                _supports_native = hasattr(ctx.llm, "chat_with_tools_fallback") and callable(
-                    ctx.llm.chat_with_tools_fallback
-                )
-                if ctx._tool_defs and _supports_native:
-                    try:
-                        response = ctx.llm.chat_with_tools_fallback(
-                            messages, tools=ctx._tool_defs, system=system, progress_cb=_progress,
-                        )
-                        native_attempted = True
-                        if response.is_tool_call and response.tool_calls:
-                            tool_calls = response.tool_calls
-                        elif response.text:
-                            raw = response.text
-                            text_from_native = True
-                    except NotImplementedError:
-                        logger.debug("%sNative tool calling not supported by provider — falling back to json_mode", pfx)
-                    except LLMPermanentError:
-                        raise
-                    except LLMError:
-                        # chat_with_tools_fallback already retried every model in the
-                        # chain; a second attempt here just doubles worst-case
-                        # latency/cost. Fall through to json_mode directly.
-                        logger.warning("%sNative tool calling failed (LLMError) — falling back to json_mode", pfx)
-                    except Exception as exc:
-                        logger.warning(
-                            "%sNative tool calling unexpected error: %s — falling back to json_mode",
-                            pfx, exc,
-                        )
-
-                # --- Native dispatch ---
-                if tool_calls:
-                    # Dispatch the first tool call only (single tool per turn)
-                    tc = tool_calls[0]
-
-                    # Special-case intercepts
+                if turn.tool_calls:
+                    tc = turn.tool_calls[0]
                     if tc.name == "create_tool":
-                        action_obj = {"action": "create_tool", "name": tc.arguments.get("name", "unnamed_tool"),
-                                      "language": tc.arguments.get("language", "python"),
-                                      "code": tc.arguments.get("code", ""),
-                                      "description": tc.arguments.get("description", "")}
-                        _t0 = time.time()
-                        feedback, cancelled = _dispatch_create_tool(ctx, action_obj, _progress)
-                        _duration_ms = (time.time() - _t0) * 1000
-                        # working.add_step for create_tool is emitted inside
-                        # _dispatch_create_tool (shared with the json_mode path);
-                        # only the tool trace is added here for native parity.
-                        if ctx.on_tool_trace is not None:
-                            ctx.on_tool_trace(ToolTrace(
-                                tool_name=tc.name,
-                                args_repr=_compact_args_repr(tc.name, tc.arguments),
-                                success=not cancelled,
-                                duration_ms=round(_duration_ms, 1),
-                                error="cancelled by operator" if cancelled else "",
-                            ))
-                        _append_native_tool_result(messages, tc, feedback)
-                        if cancelled:
-                            operator_cancelled = True
-                            break
-                        continue
-
-                    if tc.name == "plan":
-                        from execution_plan import ExecutionPlan, PlanExecutor, PlanStep
-                        plan_data = tc.arguments
-                        old_max_steps = max_steps
-                        plan_limit = getattr(ctx, "plan_max_iterations", 0) or (ctx.max_iterations + 20)
-                        ABSOLUTE_PLAN_CEILING = 200
-                        if plan_limit > ABSOLUTE_PLAN_CEILING:
-                            plan_limit = ABSOLUTE_PLAN_CEILING
-                        if plan_limit > max_steps:
-                            max_steps = plan_limit
-                        _t0 = time.time()
-                        plan_success = True
-                        try:
-                            _progress("📋 Executing plan…")
-                            steps_raw = plan_data.get("steps", [])
-                            steps = [
-                                PlanStep(id=s["id"], tool=s["tool"], args=s.get("args", {}),
-                                         depends_on=s.get("depends_on", []),
-                                         description=s.get("description", ""))
-                                for s in steps_raw
-                            ]
-                            plan = ExecutionPlan(description=plan_data.get("description", ""),
-                                                 steps=steps, timeout=plan_data.get("timeout", 300))
-                            executor = PlanExecutor(max_concurrent=ctx.max_subagents)
-                            plan_result = executor.execute(plan, ctx, progress_cb=_progress)
-                            if max_steps > old_max_steps:
-                                max_steps = old_max_steps + 10
-                                if max_steps > ABSOLUTE_PLAN_CEILING:
-                                    max_steps = ABSOLUTE_PLAN_CEILING
-                            result_msg = f"Plan execution results:\n{json.dumps(plan_result, ensure_ascii=False, indent=2)}"
-                            _append_native_tool_result(messages, tc, result_msg)
-                        except Exception as exc:
-                            plan_success = False
-                            err_msg = f"Plan execution failed: {type(exc).__name__}: {exc}"
-                            logger.error("%s%s", pfx, err_msg)
-                            _append_native_tool_result(messages, tc, err_msg)
-                        _duration_ms = (time.time() - _t0) * 1000
-                        if ctx.on_tool_trace is not None:
-                            ctx.on_tool_trace(ToolTrace(
-                                tool_name=tc.name,
-                                args_repr=_compact_args_repr(tc.name, tc.arguments),
-                                success=plan_success,
-                                duration_ms=round(_duration_ms, 1),
-                                error="" if plan_success else "plan execution failed",
-                            ))
-                        if ctx.working:
-                            ctx.working.add_step("plan", {"description": plan_data.get("description", ""), "success": plan_success})
-                        continue
-
-                    if tc.name == "vision_query":
-                        _t0 = time.time()
-                        outcome = _exec_vision_query(ctx, tc.arguments)
-                        _duration_ms = (time.time() - _t0) * 1000
-                        if ctx.on_tool_trace is not None:
-                            ctx.on_tool_trace(ToolTrace(
-                                tool_name=tc.name,
-                                args_repr=_compact_args_repr(tc.name, tc.arguments),
-                                success=outcome["success"],
-                                duration_ms=round(_duration_ms, 1),
-                                error=outcome.get("error", "") if not outcome["success"] else "",
-                            ))
-                        if ctx.working:
-                            ctx.working.add_step("tool", {"tool": tc.name, "args": tc.arguments, "success": outcome["success"]})
-                        tool_result = format_tool_result(tc.name, outcome)
-                        _progress(fmt_tool_result_progress(tc.name, tc.arguments, outcome))
-                        _append_native_tool_result(messages, tc, tool_result)
-                        continue
-
-                    # Standard tool dispatch
-                    action_obj = {"action": "tool", "tool": tc.name, "args": tc.arguments}
-                    _t0 = time.time()
-                    outcome = _dispatch_tool(ctx, action_obj, _progress)
-                    _duration_ms = (time.time() - _t0) * 1000
-                    if ctx.on_tool_trace is not None:
-                        ctx.on_tool_trace(ToolTrace(
-                            tool_name=tc.name,
-                            args_repr=_compact_args_repr(tc.name, tc.arguments),
-                            success=outcome["success"],
-                            duration_ms=round(_duration_ms, 1),
-                            error=outcome.get("error", "") if not outcome["success"] else "",
-                        ))
-                    if ctx.working:
-                        ctx.working.add_step("tool", {"tool": tc.name, "args": tc.arguments, "success": outcome["success"]})
-                    if outcome.get("send_file"):
-                        path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
-                        caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
-                        _progress(f"__FILE__:{path_b64}:{caption_b64}")
-                    tool_result = format_tool_result(tc.name, outcome)
-                    _progress(fmt_tool_result_progress(tc.name, tc.arguments, outcome))
-                    _append_native_tool_result(messages, tc, tool_result)
-                    if outcome.get("_operator_cancelled"):
-                        operator_cancelled = True
-                        break
-                    continue
-
-                # --- Text-based path (parse in place or fallback json_mode) ---
-                if not raw and not native_attempted:
-                    # No native attempt was made (or it raised) — use json_mode.
-                    # Native tool-calling turns already in `messages` carry OpenAI
-                    # wire-format fields (tool_calls / tool_call_id) that the plain
-                    # json_mode chat builders drop, yielding malformed 400-triggering
-                    # payloads. Flatten them to plain text before the fallback call.
-                    messages = _linearize_native_turns(messages)
-                    for attempt in range(1 + _MAX_EMPTY_RETRIES):
-                        try:
-                            raw = ctx.llm.chat_with_fallback(
-                                messages, system=system, progress_cb=_progress, json_mode=True,
-                            )
-                        except LLMCancelledError:
-                            logger.info("Agent LLM call cancelled at step %d/%d", step, max_steps)
-                            return "[Cancelled]"
-                        except Exception as exc:
-                            err = f"❌ LLM error: {type(exc).__name__}: {exc}"
-                            _progress(err)
-                            return err
-                        if raw.strip():
-                            break
-                        if attempt < _MAX_EMPTY_RETRIES:
-                            logger.warning(
-                                "%sLLM returned empty response (step %d/%d), retrying (%d/%d)…",
-                                pfx, step, max_steps, attempt + 1, _MAX_EMPTY_RETRIES,
-                            )
-                            _progress(f"⏳ Empty LLM response, retrying ({attempt + 1}/{_MAX_EMPTY_RETRIES})…")
-
-                # Parse JSON (from native text or json_mode response)
-                action_obj = parse_json(raw)
-                if action_obj is None and text_from_native:
-                    # Native tool calling returned prose with no tool call and no
-                    # parseable JSON action. Treat the text as the final answer
-                    # rather than burning json_fail_streak — that streak is a
-                    # json_mode protocol guard and does not apply to native text.
-                    logger.warning(
-                        "%sNative path: model returned prose (no tool_calls) — treating as finish. "
-                        "In json_mode this would re-prompt; with native tool calling the run ends here.",
-                        pfx,
-                    )
-                    action_obj = {"action": "finish", "result": raw}
-                if action_obj is None:
-                    json_fail_streak += 1
-                    logger.warning(
-                        "%sLLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
-                        pfx, step, max_steps, json_fail_streak, len(raw), raw[:1000],
-                    )
-                    if json_fail_streak >= _JSON_FAIL_LIMIT:
-                        logger.error(
-                            "%sNon-JSON streak reached %d — aborting with protocol error",
-                            pfx, json_fail_streak,
-                        )
-                        err_msg = (
-                            f"❌ Agent protocol error: model returned non-JSON "
-                            f"{json_fail_streak} times in a row. "
-                            f"Last response (truncated to 500 chars): {raw[:500]}"
-                        )
-                        _progress(err_msg)
-                        return err_msg
+                        action_obj: dict = {
+                            "action": "create_tool",
+                            "name": tc.arguments.get("name", "unnamed_tool"),
+                            "language": tc.arguments.get("language", "python"),
+                            "code": tc.arguments.get("code", ""),
+                            "description": tc.arguments.get("description", ""),
+                        }
+                    elif tc.name == "plan":
+                        action_obj = {"action": "plan", "plan": tc.arguments}
+                    elif tc.name == "finish":
+                        action_obj = {"action": "finish", "result": (tc.arguments or {}).get("result", "Done.")}
                     else:
-                        messages.append({"role": "assistant", "content": raw})
-                        messages.append({
+                        action_obj = {"action": "tool", "tool": tc.name, "args": tc.arguments}
+                    sink = _result_sink(state, tc)
+                else:
+                    action_obj = parse_json(turn.raw)
+                    if action_obj is None and turn.text_from_native:
+                        logger.warning(
+                            "%sNative path: model returned prose (no tool_calls) — treating as finish. "
+                            "In json_mode this would re-prompt; with native tool calling the run ends here.",
+                            pfx,
+                        )
+                        action_obj = {"action": "finish", "result": turn.raw}
+                    if action_obj is None:
+                        state.json_fail_streak += 1
+                        logger.warning(
+                            "%sLLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
+                            pfx, state.step, state.max_steps, state.json_fail_streak,
+                            len(turn.raw), turn.raw[:1000],
+                        )
+                        if state.json_fail_streak >= _JSON_FAIL_LIMIT:
+                            logger.error(
+                                "%sNon-JSON streak reached %d — aborting with protocol error",
+                                pfx, state.json_fail_streak,
+                            )
+                            err_msg = (
+                                f"❌ Agent protocol error: model returned non-JSON "
+                                f"{state.json_fail_streak} times in a row. "
+                                f"Last response (truncated to 500 chars): {turn.raw[:500]}"
+                            )
+                            _progress(err_msg)
+                            return err_msg
+                        state.messages.append({"role": "assistant", "content": turn.raw})
+                        state.messages.append({
                             "role": "user",
                             "content": (
                                 'ERROR: Your response was not valid JSON. '
                                 'You MUST respond with ONLY a raw JSON object — no markdown, '
                                 'no prose, no ```json fences. Example: '
                                 '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
-                            )
+                            ),
                         })
                         continue
+                    state.json_fail_streak = 0
+                    state.messages.append({"role": "assistant", "content": turn.raw})
+                    action_obj = _normalize_shorthand_action(action_obj)
+                    sink = _result_sink(state)
 
-                json_fail_streak = 0
-                messages.append({"role": "assistant", "content": raw})
-                action = action_obj.get("action", "")
-
-                # Normalize shorthand actions
-                if action in _BUILTIN_NAMES:
-                    logger.warning("%sLLM used shorthand action '%s' — normalizing to tool call", pfx, action)
-                    if "args" in action_obj:
-                        shorthand_args = action_obj["args"]
-                        if isinstance(shorthand_args, str):
-                            try:
-                                parsed = json.loads(shorthand_args)
-                                if isinstance(parsed, (dict, list)):
-                                    shorthand_args = parsed
-                                else:
-                                    logger.warning(
-                                        "Shorthand action '%s' args parsed to non-dict type %s — keeping string",
-                                        action, type(parsed).__name__,
-                                    )
-                            except (ValueError, TypeError):
-                                logger.warning(
-                                    "Shorthand action '%s' args is a non-JSON string — keeping as-is: %s",
-                                    action, shorthand_args[:200],
-                                )
-                    else:
-                        shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
-                    action_obj = {"action": "tool", "tool": action, "args": shorthand_args}
-                    action = "tool"
-
-                # ---- Dispatch ----
-
-                if action == "finish":
-                    result = action_obj.get("result", "Done.")
-                    if not isinstance(result, str):
-                        if isinstance(result, (dict, list)):
-                            result = json.dumps(result, ensure_ascii=False)
-                        else:
-                            result = str(result) if result else "Done."
-                    elapsed = time.time() - run_start
-                    active_model = ctx.llm.llm_cfg.get("model", "?")
-                    logger.info("%sfinish | model: %s | steps: %d | elapsed: %.1fs", pfx, active_model, step, elapsed)
-                    ctx.memory.record_event(f"Agent finished: {result[:80]}")
-                    if ctx.short_term:
-                        ctx.short_term.add("user", user_goal)
-                        ctx.short_term.add("assistant", result)
-                    summary = ""
-                    tools_used: list[str] = []
-                    if ctx.results and ctx.working and ctx.working.has_content():
-                        tools_used = list(filter(None, extract_tools_used(ctx.working.steps)))
-                        summary = _summarize_result(
-                            ctx.llm,
-                            goal=user_goal,
-                            result=result,
-                            tools_used=tools_used,
-                        )
-                        save_task_outcome(
-                            results=ctx.results,
-                            graph_memory_writer=ctx.graph_memory_writer,
-                            goal=user_goal,
-                            summary=summary,
-                            tools_used=tools_used,
-                        )
-                    # Fire-and-forget strategy extraction on background thread
-                    if getattr(ctx, "strategy_memory", None) is not None:
-                        try:
-                            from strategy_memory import extract_strategy
-
-                            def _extract_and_store() -> None:
-                                """Extract strategy and store it in StrategyMemory."""
-                                _outcome = {
-                                    "success": True,
-                                    "summary": summary[:500] if summary else result[:500],
-                                    "tools": tools_used,
-                                }
-                                strategy = extract_strategy(ctx.llm, user_goal, _outcome)
-                                if strategy is not None:
-                                    ctx.strategy_memory.add(strategy)
-
-                            _thread = threading.Thread(
-                                target=_extract_and_store,
-                                daemon=True,
-                            )
-                            _thread.start()
-                            logger.debug("%sStrategy extraction thread started", pfx)
-                        except Exception as _se_exc:  # noqa: BLE001
-                            logger.debug("%sStrategy extraction start failed: %s", pfx, _se_exc)
-                    if ctx.working:
-                        ctx.working.clear()
-                    return result
-
-                elif action == "tool":
-                    _t0 = time.time()
-                    outcome = _dispatch_tool(ctx, action_obj, _progress)
-                    _duration_ms = (time.time() - _t0) * 1000
-                    tool_name = action_obj.get("tool", "")
-                    args = action_obj.get("args", {})
-                    if isinstance(args, list):
-                        args = {str(i): v for i, v in enumerate(args)}
-
-                    if ctx.on_tool_trace is not None:
-                        ctx.on_tool_trace(ToolTrace(
-                            tool_name=tool_name,
-                            args_repr=_compact_args_repr(tool_name, args),
-                            success=outcome["success"],
-                            duration_ms=round(_duration_ms, 1),
-                            error=outcome.get("error", "") if not outcome["success"] else "",
-                        ))
-
-                    if ctx.working:
-                        ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
-
-                    if outcome.get("send_file"):
-                        path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
-                        caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
-                        _progress(f"__FILE__:{path_b64}:{caption_b64}")
-
-                    tool_result = format_tool_result(tool_name, outcome)
-                    if outcome["success"]:
-                        logger.info("%sTool '%s' result: success=True", pfx, tool_name)
-                    else:
-                        logger.warning(
-                            "%sTool '%s' result: success=False | error=%s | args=%s",
-                            pfx, tool_name,
-                            outcome.get("error", ""),
-                            {k: str(v)[:120] for k, v in args.items()},
-                        )
-                    _progress(fmt_tool_result_progress(tool_name, args, outcome))
-                    messages.append({"role": "user", "content": tool_result})
-
-                    if outcome.get("_operator_cancelled"):
-                        operator_cancelled = True
-                        break
-
-                elif action == "create_tool":
-                    feedback, cancelled = _dispatch_create_tool(ctx, action_obj, _progress)
-                    messages.append({"role": "user", "content": feedback})
-                    if cancelled:
-                        operator_cancelled = True
-                        break
-
-                elif action == "plan":
-                    # Import here to avoid a circular import: execution_plan.py imports
-                    # ReactContext and parse_json from this module at runtime.
-                    from execution_plan import ExecutionPlan, PlanExecutor, PlanStep
-
-                    plan_data = action_obj.get("plan", {})
-                    # Give the agent room to finish after the plan completes
-                    old_max_steps = max_steps
-                    plan_limit = getattr(ctx, "plan_max_iterations", 0) or (ctx.max_iterations + 20)
-                    ABSOLUTE_PLAN_CEILING = 200
-                    if plan_limit > ABSOLUTE_PLAN_CEILING:
-                        plan_limit = ABSOLUTE_PLAN_CEILING
-                        logger.warning("%splan | clamped plan_max_iterations to %d", pfx, ABSOLUTE_PLAN_CEILING)
-                    if plan_limit > max_steps:
-                        max_steps = plan_limit
-                        logger.info("%splan | raised max_steps from %d to %d", pfx, old_max_steps, max_steps)
-                    try:
-                        _progress("📋 Executing plan…")
-                        logger.info("%splan | description: %s", pfx, plan_data.get("description", "")[:60])
-
-                        steps_raw = plan_data.get("steps", [])
-                        steps = [
-                            PlanStep(
-                                id=s["id"],
-                                tool=s["tool"],
-                                args=s.get("args", {}),
-                                depends_on=s.get("depends_on", []),
-                                description=s.get("description", ""),
-                            )
-                            for s in steps_raw
-                        ]
-                        plan = ExecutionPlan(
-                            description=plan_data.get("description", ""),
-                            steps=steps,
-                            timeout=plan_data.get("timeout", 300),
-                        )
-
-                        executor = PlanExecutor(max_concurrent=ctx.max_subagents)
-                        plan_result = executor.execute(plan, ctx, progress_cb=_progress)
-
-                        logger.info("%splan | completed | results: %d", pfx, len(plan_result.get("results", {})))
-                        # Restore max_steps to a reasonable ceiling after plan
-                        if max_steps > old_max_steps:
-                            max_steps = old_max_steps + 10
-                            if max_steps > ABSOLUTE_PLAN_CEILING:
-                                max_steps = ABSOLUTE_PLAN_CEILING
-                            logger.info("%splan | adjusted max_steps to %d after completion", pfx, max_steps)
-                        result_msg = f"Plan execution results:\n{json.dumps(plan_result, ensure_ascii=False, indent=2)}"
-                        messages.append({"role": "user", "content": result_msg})
-
-                    except Exception as exc:
-                        err_msg = f"Plan execution failed: {type(exc).__name__}: {exc}"
-                        logger.error("%s%s", pfx, err_msg)
-                        messages.append({"role": "user", "content": err_msg})
-
-                else:
-                    logger.warning("%sUnknown action '%s' from LLM", pfx, action)
-                    messages.append({
-                        "role": "user",
-                        "content": f'Unknown action "{action}". Use "tool", "create_tool", or "finish".',
-                    })
-
+                final = _dispatch_action(
+                    ctx, action_obj, sink, state, user_goal, run_start, _progress,
+                )
+                if final is not None:
+                    return final
+                if state.operator_cancelled:
+                    break
                 agent_logging.log_event(
-                    agent_logging.LogEvent.STEP_END, "step end", level=logging.INFO, logger=slog, step=step,
+                    agent_logging.LogEvent.STEP_END, "step end",
+                    level=logging.INFO, logger=slog, step=state.step,
                 )
 
-            # Inner while exited
-            if operator_cancelled:
+            if state.operator_cancelled:
                 ctx.memory.record_event("Task cancelled by operator")
                 return "⚠️ Task stopped by operator."
 
-            # Max steps reached — ask user to extend
-            ext_response = ctx.confirmation.request_extension(max_steps, _progress)
-
+            ext_response = ctx.confirmation.request_extension(state.max_steps, _progress)
             if ext_response == "unlimited":
-                max_steps = 10_000_000
+                state.max_steps = 10_000_000
                 logger.info("%sAgent steps set to unlimited by user", pfx)
                 _progress("♾️ Running until done (unlimited steps)…")
                 continue
             elif ext_response == "yes":
-                max_steps += 10
-                logger.info("%sAgent steps extended to %d by user", pfx, max_steps)
-                _progress(f"⏩ Extended — continuing to step {max_steps}…")
+                state.max_steps += 10
+                logger.info("%sAgent steps extended to %d by user", pfx, state.max_steps)
+                _progress(f"⏩ Extended — continuing to step {state.max_steps}…")
                 continue
-
             break
 
         ctx.memory.record_event("Agent hit max iterations")
@@ -1163,6 +1009,157 @@ def _compact_args_repr(tool_name: str, args: dict, max_len: int = 200) -> str:
             parts.append(f"{k}={s[:60]}{'…' if len(s) > 60 else ''}")
     summary = ", ".join(parts)
     return summary[:max_len] + ("…" if len(summary) > max_len else "")
+
+
+def _emit_tool_trace(
+    ctx: ReactContext,
+    tool_name: str,
+    args: dict,
+    *,
+    success: bool,
+    duration_ms: float,
+    error: str = "",
+) -> None:
+    """Emit a tool trace event if a handler is registered."""
+    if ctx.on_tool_trace is not None:
+        ctx.on_tool_trace(ToolTrace(
+            tool_name=tool_name,
+            args_repr=_compact_args_repr(tool_name, args),
+            success=success,
+            duration_ms=round(duration_ms, 1),
+            error=error,
+        ))
+
+
+def _run_plan(
+    ctx: ReactContext,
+    plan_data: dict,
+    max_steps: int,
+    progress: Callable[[str], None],
+) -> tuple[str, int, bool]:
+    """Execute a plan. Returns (result_message, new_max_steps, success)."""
+    from execution_plan import ExecutionPlan, PlanExecutor, PlanStep  # noqa: PLC0415
+
+    pfx = ""
+    old_max_steps = max_steps
+    plan_limit = getattr(ctx, "plan_max_iterations", 0) or (ctx.max_iterations + 20)
+    if plan_limit > _ABSOLUTE_PLAN_CEILING:
+        plan_limit = _ABSOLUTE_PLAN_CEILING
+        logger.warning("%splan | clamped plan_max_iterations to %d", pfx, _ABSOLUTE_PLAN_CEILING)
+    if plan_limit > max_steps:
+        max_steps = plan_limit
+        logger.info("%splan | raised max_steps from %d to %d", pfx, old_max_steps, max_steps)
+
+    _t0 = time.time()
+    plan_success = True
+    progress("📋 Executing plan…")
+    logger.info("%splan | description: %s", pfx, plan_data.get("description", "")[:60])
+    try:
+        steps_raw = plan_data.get("steps", [])
+        steps = [
+            PlanStep(
+                id=s["id"],
+                tool=s["tool"],
+                args=s.get("args", {}),
+                depends_on=s.get("depends_on", []),
+                description=s.get("description", ""),
+            )
+            for s in steps_raw
+        ]
+        plan = ExecutionPlan(
+            description=plan_data.get("description", ""),
+            steps=steps,
+            timeout=plan_data.get("timeout", 300),
+        )
+        executor = PlanExecutor(max_concurrent=ctx.max_subagents)
+        plan_result = executor.execute(plan, ctx, progress_cb=progress)
+        logger.info("%splan | completed | results: %d", pfx, len(plan_result.get("results", {})))
+        if max_steps > old_max_steps:
+            max_steps = old_max_steps + 10
+            if max_steps > _ABSOLUTE_PLAN_CEILING:
+                max_steps = _ABSOLUTE_PLAN_CEILING
+            logger.info("%splan | adjusted max_steps to %d after completion", pfx, max_steps)
+        result_msg = f"Plan execution results:\n{json.dumps(plan_result, ensure_ascii=False, indent=2)}"
+    except Exception as exc:
+        plan_success = False
+        result_msg = f"Plan execution failed: {type(exc).__name__}: {exc}"
+        logger.error("%s%s", pfx, result_msg)
+
+    _duration_ms = (time.time() - _t0) * 1000
+    _emit_tool_trace(ctx, "plan", plan_data, success=plan_success, duration_ms=_duration_ms,
+                     error="" if plan_success else "plan execution failed")
+    if ctx.working:
+        ctx.working.add_step("plan", {"description": plan_data.get("description", ""), "success": plan_success})
+
+    return result_msg, max_steps, plan_success
+
+
+def _finish_run(
+    ctx: ReactContext,
+    action_obj: dict,
+    user_goal: str,
+    step: int,
+    run_start: float,
+) -> str:
+    """Handle a finish action: coerce result, summarize, persist outcome. Returns the final result string."""
+    pfx = ""
+    result = action_obj.get("result", "Done.")
+    if not isinstance(result, str):
+        if isinstance(result, (dict, list)):
+            result = json.dumps(result, ensure_ascii=False)
+        else:
+            result = str(result) if result else "Done."
+    elapsed = time.time() - run_start
+    active_model = ctx.llm.llm_cfg.get("model", "?")
+    logger.info("%sfinish | model: %s | steps: %d | elapsed: %.1fs", pfx, active_model, step, elapsed)
+    ctx.memory.record_event(f"Agent finished: {result[:80]}")
+    if ctx.short_term:
+        ctx.short_term.add("user", user_goal)
+        ctx.short_term.add("assistant", result)
+    summary = ""
+    tools_used: list[str] = []
+    if ctx.results and ctx.working and ctx.working.has_content():
+        tools_used = list(filter(None, extract_tools_used(ctx.working.steps)))
+        summary = _summarize_result(
+            ctx.llm,
+            goal=user_goal,
+            result=result,
+            tools_used=tools_used,
+        )
+        save_task_outcome(
+            results=ctx.results,
+            graph_memory_writer=ctx.graph_memory_writer,
+            goal=user_goal,
+            summary=summary,
+            tools_used=tools_used,
+        )
+    # Fire-and-forget strategy extraction on background thread
+    if getattr(ctx, "strategy_memory", None) is not None:
+        try:
+            from strategy_memory import extract_strategy  # noqa: PLC0415
+
+            def _extract_and_store() -> None:
+                """Extract strategy and store it in StrategyMemory."""
+                _outcome = {
+                    "success": True,
+                    "summary": summary[:500] if summary else result[:500],
+                    "tools": tools_used,
+                }
+                strategy = extract_strategy(ctx.llm, user_goal, _outcome)
+                if strategy is not None:
+                    ctx.strategy_memory.add(strategy)
+
+            _thread = threading.Thread(
+                target=_extract_and_store,
+                daemon=True,
+            )
+            _thread.start()
+            logger.debug("%sStrategy extraction thread started", pfx)
+        except Exception as _se_exc:  # noqa: BLE001
+            logger.debug("%sStrategy extraction start failed: %s", pfx, _se_exc)
+    if ctx.working:
+        ctx.working.clear()
+    return result
 
 
 def _dispatch_tool(
