@@ -1,9 +1,11 @@
 ## ADDED Requirements
 
-### Requirement: Plan execution emits tool trace and working-memory step regardless of dispatch path
+### Requirement: Plan execution MUST emit tool trace and working-memory step regardless of dispatch path
+
+The agent MUST emit a tool trace event and MUST record a working-memory step for every plan action, regardless of whether the LLM used native tool calls or json_mode text output to express the plan.
 
 Feature: Plan execution observability
-Rule: When the agent executes a plan action, it must emit a tool trace event and record a working-memory step regardless of whether the LLM used native tool calls or json_mode text output to express the plan.
+Rule: When the agent executes a plan action, it SHALL emit a tool trace event and MUST record a working-memory step regardless of whether the LLM used native tool calls or json_mode text output to express the plan.
 
 #### Scenario: json_mode plan emits tool trace
 - **GIVEN** the agent is running in json_mode (no native tool calls)
