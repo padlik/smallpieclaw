@@ -43,6 +43,8 @@ from telegram_commands import (
     cmd_verbose, cmd_jobs, cmd_agents, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
+)
+from telegram_callbacks import (
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
 )

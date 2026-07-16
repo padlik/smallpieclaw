@@ -22,10 +22,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from telegram_commands import (  # noqa: E402
     _MODES,
     _MODE_DESCRIPTIONS,
-    cb_mode_switch,
     cmd_mode,
     cmd_status,
 )
+from telegram_callbacks import cb_mode_switch  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
