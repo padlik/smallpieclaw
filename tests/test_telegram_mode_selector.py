@@ -112,6 +112,8 @@ def _make_callback_update(data: str):
     query.data = data
     query.answer = AsyncMock()
     query.edit_message_text = AsyncMock()
+    query.from_user = MagicMock()
+    query.from_user.id = 42  # matches allowed_ids in _make_iface
 
     update = MagicMock()
     update.callback_query = query

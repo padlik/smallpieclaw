@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import html
 import io
 import logging
 import os
+import re as _re
 import secrets
 import time
+from datetime import datetime as _dt
 from typing import TYPE_CHECKING
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
+from sub_agent_registry import get_registry as _get_agent_registry
 
 if TYPE_CHECKING:
     from telegram_interface import TelegramInterface
@@ -21,11 +25,66 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _require_auth(fn):
+    """Decorator: reject unauthorized callers before running a command."""
+    @functools.wraps(fn)
+    async def _wrapper(
+        iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        user = update.effective_user
+        if user is None or not iface._is_authorized(user.id):
+            await iface._send_unauthorized(update)
+            return
+        return await fn(iface, update, ctx)
+    return _wrapper
+
+
+async def _ack_query(query) -> None:
+    """Best-effort button-press acknowledgment (Telegram requires within ~10 s)."""
+    try:
+        await query.answer()
+    except Exception as exc:
+        logger.warning("query.answer() failed: %s", exc)
+
+
+def _truncate_desc(text: str, limit: int = 80) -> str:
+    """Normalize whitespace, HTML-escape, and truncate for display."""
+    normalized = " ".join(html.escape(text).split())
+    if len(normalized) > limit:
+        return normalized[: limit - 1] + "…"
+    return normalized
+
+
+_ENV_REDACT_KEYWORDS = {"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "API", "CREDENTIAL", "AUTH"}
+
+_CREDENTIAL_URL_RE = _re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^@\s]{1,200}@")
+
+
+def _redact_env_var(name: str, value: str) -> str:
+    """Return '***' when the var name looks like a secret or value contains embedded credentials."""
+    if any(kw in name.upper() for kw in _ENV_REDACT_KEYWORDS):
+        return "***"
+    if _CREDENTIAL_URL_RE.search(value):
+        return "***"
+    return value
+
+
+def _tool_entry(t) -> str:
+    """Format one tool as a display line."""
+    return f"  • <code>{html.escape(t.name)}</code> — {_truncate_desc(t.description)}"
+
+
+def _fmt_stat(val: object, suffix: str = "") -> str:
+    """Format a stat counter: negative int → 'N/A', int → comma-separated, other → escaped."""
+    if isinstance(val, int) and val < 0:
+        return "N/A"
+    return f"{val:,}{suffix}" if isinstance(val, int) else html.escape(
+        str(val) if val is not None else "N/A"
+    )
+
+
+@_require_auth
 async def cmd_start(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not iface._is_authorized(user.id):
-        await iface._send_unauthorized(update)
-        return
     await update.effective_message.reply_text(
         "👋 Home Server Agent ready.\n"
         "Send me a command like:\n"
@@ -37,10 +96,8 @@ async def cmd_start(iface: "TelegramInterface", update: Update, ctx: ContextType
     )
 
 
+@_require_auth
 async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     await update.effective_message.reply_text(
         "🤖 <b>Home Server Agent</b>\n\n"
         "Just send a natural language request, e.g.:\n"
@@ -61,11 +118,8 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     )
 
 
+@_require_auth
 async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
-
     uptime_secs = int(time.time() - iface._start_time)
     h = uptime_secs // 3600
     m = (uptime_secs % 3600) // 60
@@ -84,8 +138,7 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     skills_count = iface.skill_registry.count() if iface.skill_registry else 0
 
     # Sub-agent count
-    from sub_agent_registry import get_registry as _get_agents
-    active_agents = _get_agents().count()
+    active_agents = _get_agent_registry().count()
     agents_line = f"\n🤖 Sub-agents: {active_agents} running" if active_agents > 0 else ""
 
     # Per-model token usage from shared registry
@@ -136,7 +189,7 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         if _gm_store is None:
             graph_memory_line = "\n🧠 Graph Memory: 🔴 failed (check logs)"
         else:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             _ss = await loop.run_in_executor(None, _gm_store.get_stats)
             _ws = _gm_writer.get_stats() if _gm_writer is not None else {}
             _ents = _ss.get("entity_count", -1)
@@ -176,7 +229,6 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
             )
 
     # Current server time
-    from datetime import datetime as _dt
     now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
 
     mode = _current_mode(iface)
@@ -199,10 +251,8 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     )
 
 
+@_require_auth
 async def cmd_stop(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     if iface.agent:
         iface.agent.cancel()
         await update.effective_message.reply_text(
@@ -212,10 +262,8 @@ async def cmd_stop(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         await update.effective_message.reply_text("ℹ️ No active agent to stop.")
 
 
+@_require_auth
 async def cmd_reset(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     args = ctx.args or []
     discard = "discard" in [a.lower() for a in args]
 
@@ -224,7 +272,7 @@ async def cmd_reset(iface: "TelegramInterface", update: Update, ctx: ContextType
     )
 
     if iface.agent_reset_fn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None, lambda: iface.agent_reset_fn(save=not discard)
         )
@@ -233,25 +281,20 @@ async def cmd_reset(iface: "TelegramInterface", update: Update, ctx: ContextType
         await iface._safe_edit(status_msg, "✅ Context cleared.")
 
 
+@_require_auth
 async def cmd_compress(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
-
     status_msg = await update.effective_message.reply_text("🗜️ Compressing context…")
 
     if iface.agent_compress_fn:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, iface.agent_compress_fn)
         await iface._safe_edit(status_msg, result)
     else:
         await iface._safe_edit(status_msg, "ℹ️ Compress not available.")
 
 
+@_require_auth
 async def cmd_verbose(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     args = ctx.args or []
     if args:
         sub = args[0].lower()
@@ -321,12 +364,9 @@ def _current_mode(iface: "TelegramInterface") -> str:
     )
 
 
+@_require_auth
 async def cmd_mode(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Set the agent creativity mode, or show a selector when called without args."""
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
-
     args = ctx.args or []
     current_mode = _current_mode(iface)
 
@@ -376,10 +416,8 @@ async def cmd_mode(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     )
 
 
+@_require_auth
 async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     if not iface.scheduler:
         await update.effective_message.reply_text("Scheduler not available.")
         return
@@ -453,13 +491,8 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
+@_require_auth
 async def cmd_agents(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
-
-    from sub_agent_registry import get_registry as _get_agent_registry
-
     args = ctx.args or []
 
     # /agents cancel managed  — atomically cancel all on-demand agents
@@ -534,10 +567,8 @@ async def cmd_agents(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
+@_require_auth
 async def cmd_tools(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     if not iface.tool_registry:
         await update.effective_message.reply_text("Tool registry not available.")
         return
@@ -551,12 +582,6 @@ async def cmd_tools(iface: "TelegramInterface", update: Update, ctx: ContextType
     local_tools = [t for t in tools if not t.is_generated and not t.is_mcp]
     generated = [t for t in tools if t.is_generated and not t.is_mcp]
     mcp_tools = [t for t in tools if t.is_mcp]
-
-    def _tool_entry(t) -> str:
-        desc = " ".join(html.escape(t.description).split())
-        if len(desc) > 80:
-            desc = desc[:77] + "…"
-        return f"  • <code>{html.escape(t.name)}</code> — {desc}"
 
     lines = [f"🔧 <b>Available Tools</b> ({len(tools)} total)\n"]
     if local_tools:
@@ -582,10 +607,8 @@ async def cmd_tools(iface: "TelegramInterface", update: Update, ctx: ContextType
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
+@_require_auth
 async def cmd_skills(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     if not iface.skill_registry:
         await update.effective_message.reply_text("Skills not available.")
         return
@@ -597,20 +620,15 @@ async def cmd_skills(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 
     lines = [f"📚 <b>Available Skills</b> ({len(skills)} total)\n"]
     for s in skills:
-        # Normalize and truncate description
-        desc = " ".join(html.escape(s.description).split())
-        if len(desc) > 80:
-            desc = desc[:77] + "…"
+        desc = _truncate_desc(s.description)
         lines.append(f"  • <b>{html.escape(s.name)}</b> — {desc}")
     for chunk in iface._split_message("\n".join(lines)):
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
+@_require_auth
 async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /mcp [list|on|off|info] [name]"""
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     if not iface.mcp_manager:
         await update.effective_message.reply_text(
             "🔌 No MCP servers configured.\n"
@@ -723,16 +741,14 @@ async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
+@_require_auth
 async def cmd_reindex(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     if not iface._tool_index:
         await update.effective_message.reply_text("⚠️ Tool index not available.")
         return
 
     status_msg = await update.effective_message.reply_text("⏳ Reindexing tools…")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, iface._tool_index.rebuild)
 
     msg = (
@@ -784,10 +800,8 @@ async def cmd_pair(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     )
 
 
+@_require_auth
 async def cmd_unpair(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     args = ctx.args or []
     if not args:
         await update.effective_message.reply_text("Usage: /unpair <user_id>")
@@ -806,11 +820,9 @@ async def cmd_myid(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     await update.effective_message.reply_text(f"Your Telegram user ID: <code>{uid}</code>", parse_mode=ParseMode.HTML)
 
 
+@_require_auth
 async def cmd_show_ctx(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Hidden command: send the current LLM system prompt as a file attachment."""
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     if not iface.agent:
         await update.effective_message.reply_text("Agent not available.")
         return
@@ -828,19 +840,9 @@ async def cmd_show_ctx(iface: "TelegramInterface", update: Update, ctx: ContextT
     )
 
 
+@_require_auth
 async def cmd_show_env(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Hidden command: show the shell environment available to the agent."""
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
-
-    _REDACT = {"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "API", "CREDENTIAL", "AUTH"}
-
-    def _redact(name: str, value: str) -> str:
-        if any(kw in name.upper() for kw in _REDACT):
-            return "***"
-        return value
-
     env = os.environ
     lines = ["<b>🌐 Shell Environment</b>\n"]
 
@@ -857,7 +859,7 @@ async def cmd_show_env(iface: "TelegramInterface", update: Update, ctx: ContextT
     for key in sorted(env.keys()):
         if key == "PATH":
             continue
-        val = _redact(key, env[key])
+        val = _redact_env_var(key, env[key])
         lines.append(f"  <code>{html.escape(key)}</code> = {html.escape(val)}")
 
     # Agent-configured paths
@@ -874,12 +876,9 @@ async def cmd_show_env(iface: "TelegramInterface", update: Update, ctx: ContextT
         await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
 
 
+@_require_auth
 async def cmd_memory(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Hidden command: show graph memory diagnostics (counts, writer health, retrieval stats)."""
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
-
     _gm_cfg = iface._config.get("graph_memory", {})
     if not _gm_cfg.get("enabled", False):
         await update.effective_message.reply_text(
@@ -898,20 +897,15 @@ async def cmd_memory(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         )
         return
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ss = await loop.run_in_executor(None, _gm_store.get_stats)
     ws = _gm_writer.get_stats() if _gm_writer is not None else {}
 
-    def _v(val: object, suffix: str = "") -> str:
-        if isinstance(val, int) and val < 0:
-            return "N/A"
-        return f"{val:,}{suffix}" if isinstance(val, int) else html.escape(str(val) if val is not None else "N/A")
-
     store_section = (
         "<b>📦 Store</b>\n"
-        f"  Entities:  <code>{_v(ss.get('entity_count', -1))}</code>\n"
-        f"  Facts:     <code>{_v(ss.get('relation_count', -1))}</code>\n"
-        f"  Episodes:  <code>{_v(ss.get('episode_count', -1))}</code>\n"
+        f"  Entities:  <code>{_fmt_stat(ss.get('entity_count', -1))}</code>\n"
+        f"  Facts:     <code>{_fmt_stat(ss.get('relation_count', -1))}</code>\n"
+        f"  Episodes:  <code>{_fmt_stat(ss.get('episode_count', -1))}</code>\n"
         f"  Latest:    <code>{html.escape(str(ss.get('latest_episode_ts') or 'none'))}</code>\n"
         f"  Vec index: <code>{'ok' if ss.get('vector_index_ok') else 'error'}</code>"
     )
@@ -922,25 +916,25 @@ async def cmd_memory(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     writer_section = (
         "<b>✍️ Writer</b>\n"
         f"  Worker:           <code>{'alive' if worker_alive is True else ('stopped' if worker_alive is False else 'N/A')}</code>\n"
-        f"  Queue depth:      <code>{_v(ws.get('queue_depth', 'N/A'))}</code>\n"
-        f"  Pending depth:    <code>{_v(ws.get('pending_depth', 'N/A'))}</code>\n"
-        f"  Enqueued:         <code>{_v(ws.get('enqueued', 0))}</code>\n"
-        f"  Skipped short:    <code>{_v(ws.get('skipped_short', 0))}</code>\n"
-        f"  Batches queued:   <code>{_v(ws.get('batches_queued', 0))}</code>\n"
-        f"  Batches done:     <code>{_v(ws.get('batches_processed', 0))}</code>\n"
-        f"  Entities stored:  <code>{_v(ws.get('entities_extracted', 0))}</code>\n"
-        f"  Facts stored:     <code>{_v(ws.get('facts_extracted', 0))}</code>\n"
-        f"  Episodes stored:  <code>{_v(ws.get('episodes_stored', 0))}</code>\n"
-        f"  LLM failures:     <code>{_v(ws.get('llm_failures', 0))}</code>\n"
-        f"  Parse failures:   <code>{_v(ws.get('parse_failures', 0))}</code>\n"
-        f"  Write failures:   <code>{_v(ws.get('write_failures', 0))}</code>"
+        f"  Queue depth:      <code>{_fmt_stat(ws.get('queue_depth', 'N/A'))}</code>\n"
+        f"  Pending depth:    <code>{_fmt_stat(ws.get('pending_depth', 'N/A'))}</code>\n"
+        f"  Enqueued:         <code>{_fmt_stat(ws.get('enqueued', 0))}</code>\n"
+        f"  Skipped short:    <code>{_fmt_stat(ws.get('skipped_short', 0))}</code>\n"
+        f"  Batches queued:   <code>{_fmt_stat(ws.get('batches_queued', 0))}</code>\n"
+        f"  Batches done:     <code>{_fmt_stat(ws.get('batches_processed', 0))}</code>\n"
+        f"  Entities stored:  <code>{_fmt_stat(ws.get('entities_extracted', 0))}</code>\n"
+        f"  Facts stored:     <code>{_fmt_stat(ws.get('facts_extracted', 0))}</code>\n"
+        f"  Episodes stored:  <code>{_fmt_stat(ws.get('episodes_stored', 0))}</code>\n"
+        f"  LLM failures:     <code>{_fmt_stat(ws.get('llm_failures', 0))}</code>\n"
+        f"  Parse failures:   <code>{_fmt_stat(ws.get('parse_failures', 0))}</code>\n"
+        f"  Write failures:   <code>{_fmt_stat(ws.get('write_failures', 0))}</code>"
     )
 
     retrieval_section = (
         "<b>🔍 Retrieval</b>\n"
-        f"  Hits:             <code>{_v(ss.get('retrieval_hits', 0))}</code>\n"
-        f"  Misses:           <code>{_v(ss.get('retrieval_misses', 0))}</code>\n"
-        f"  Injections:       <code>{_v(ss.get('context_injections', 0))}</code>"
+        f"  Hits:             <code>{_fmt_stat(ss.get('retrieval_hits', 0))}</code>\n"
+        f"  Misses:           <code>{_fmt_stat(ss.get('retrieval_misses', 0))}</code>\n"
+        f"  Injections:       <code>{_fmt_stat(ss.get('context_injections', 0))}</code>"
     )
 
     text = (
@@ -954,11 +948,9 @@ async def cmd_memory(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
 
 
+@_require_auth
 async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """List configured LLM models and allow switching."""
-    if not iface._is_authorized(update.effective_user.id):
-        await iface._send_unauthorized(update)
-        return
     if not iface.llm_client or not hasattr(iface.llm_client, "list_models"):
         await update.effective_message.reply_text("Multi-model support not available.")
         return
@@ -991,6 +983,14 @@ async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Yes / No / Approve-all confirmation button presses."""
     query = update.callback_query
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
     data = query.data  # "confirm_yes:<token>" | "confirm_no:<token>" | "confirm_all:<token>:<tool>"
 
     if data.startswith("confirm_all:"):
@@ -1003,10 +1003,7 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
             iface.agent.resume_approve_all(token, tool_name)
         else:
             logger.warning("_cb_confirm: iface.agent is None — cannot resume agent")
-        try:
-            await query.answer()
-        except Exception as exc:
-            logger.warning("query.answer() failed: %s", exc)
+        await _ack_query(query)
         result_text = f"✅✅ All future <code>{html.escape(tool_name)}</code> operations in this task auto-approved."
         try:
             await query.edit_message_text(
@@ -1030,10 +1027,7 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         logger.warning("_cb_confirm: iface.agent is None — cannot resume agent")
 
     # Acknowledge the button press (best-effort; Telegram requires this within ~10s)
-    try:
-        await query.answer()
-    except Exception as exc:
-        logger.warning("query.answer() failed (button may show spinner): %s", exc)
+    await _ack_query(query)
 
     # Edit the message to reflect the decision (best-effort)
     result_text = "✅ Confirmed — executing…" if confirmed else "❌ Cancelled."
@@ -1049,6 +1043,14 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 async def cb_extend(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Extend / Unlimited / Cancel button presses for max-steps extension."""
     query = update.callback_query
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
     data = query.data  # "extend_yes:<token>" | "extend_unlimited:<token>" | "extend_no:<token>"
 
     if data.startswith("extend_unlimited:"):
@@ -1069,10 +1071,7 @@ async def cb_extend(iface: "TelegramInterface", update: Update, ctx: ContextType
     else:
         logger.warning("_cb_extend: agent is None")
 
-    try:
-        await query.answer()
-    except Exception as exc:
-        logger.warning("query.answer() failed: %s", exc)
+    await _ack_query(query)
 
     try:
         await query.edit_message_text(
@@ -1086,6 +1085,14 @@ async def cb_extend(iface: "TelegramInterface", update: Update, ctx: ContextType
 async def cb_tool_create(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Create Tool / Run Once / Cancel button presses."""
     query = update.callback_query
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
     data = query.data
     if data.startswith("tool_create_yes:"):
         action = "create"
@@ -1105,10 +1112,7 @@ async def cb_tool_create(iface: "TelegramInterface", update: Update, ctx: Contex
     else:
         logger.warning("_cb_tool_create: agent is None")
 
-    try:
-        await query.answer()
-    except Exception as exc:
-        logger.warning("query.answer() failed: %s", exc)
+    await _ack_query(query)
 
     try:
         await query.edit_message_text(
@@ -1122,7 +1126,15 @@ async def cb_tool_create(iface: "TelegramInterface", update: Update, ctx: Contex
 async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle model switch button presses."""
     query = update.callback_query
-    await query.answer()
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+    await _ack_query(query)
     model_name = query.data.split(":", 1)[1]
 
     if iface.llm_client and hasattr(iface.llm_client, "set_model"):
@@ -1148,7 +1160,15 @@ async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: Conte
 async def cb_mode_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle creativity-mode switch button presses."""
     query = update.callback_query
-    await query.answer()
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+    await _ack_query(query)
     new_mode = query.data.split(":", 1)[1]
 
     if new_mode not in _MODE_DESCRIPTIONS:
@@ -1196,10 +1216,7 @@ async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTy
     data = query.data  # "deferred_run:<token>" or "deferred_discard:<token>"
     parts = data.split(":", 1)
     if len(parts) != 2:
-        try:
-            await query.answer()
-        except Exception as exc:
-            logger.warning("cb_deferred query.answer() failed: %s", exc)
+        await _ack_query(query)
         return
 
     action, token = parts
@@ -1240,10 +1257,7 @@ async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTy
             iface._current_deferred_token.pop(deferred.user_id, None)
 
     # Dismiss the button spinner now that state has been atomically committed.
-    try:
-        await query.answer()
-    except Exception as exc:
-        logger.warning("cb_deferred query.answer() failed: %s", exc)
+    await _ack_query(query)
 
     if action == "deferred_discard" or deferred is None:
         try:
@@ -1300,10 +1314,7 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
     data = query.data  # "subconfirm_yes:<token>" or "subconfirm_no:<token>"
     parts = data.split(":", 1)
     if len(parts) != 2:
-        try:
-            await query.answer()
-        except Exception:
-            pass
+        await _ack_query(query)
         return
 
     action, token = parts
@@ -1331,10 +1342,7 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
     # Returns False if the token was already resolved or expired.
     signalled = builtin.signal_headless_confirm(token, approved)
 
-    try:
-        await query.answer()
-    except Exception as exc:
-        logger.warning("cb_subagent_confirm query.answer() failed: %s", exc)
+    await _ack_query(query)
 
     if not signalled:
         try:
