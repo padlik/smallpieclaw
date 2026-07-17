@@ -971,3 +971,54 @@ async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         reply_markup=keyboard,
     )
 
+
+
+@_require_auth
+async def cmd_dir(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Operator command to list or remove user-added trusted directories.
+
+    Usage:
+      /dir list     -- show user-added trusted dirs
+      /dir del N    -- remove entry N (1-based)
+    """
+    msg = update.effective_message
+    if msg is None:
+        return
+
+    text = (msg.text or "").strip()
+    parts = text.split()
+    sub = parts[1].lower() if len(parts) > 1 else "list"
+
+    builtin = getattr(iface, "agent", None)
+    builtin = getattr(builtin, "builtin_executor", None) if builtin else None
+    checker = getattr(builtin, "trusted_zone_checker", None) if builtin else None
+
+    if checker is None:
+        await msg.reply_text("⚠️ Trusted zone checker not available.")
+        return
+
+    if sub == "list":
+        dirs = checker.list_user_trusted()
+        if not dirs:
+            await msg.reply_text("No custom trusted directories added yet.")
+            return
+        lines = [f"  {i}. {d.path} [{d.mode}]" for i, d in enumerate(dirs, 1)]
+        await msg.reply_text("Trusted directories:\n" + "\n".join(lines))
+
+    elif sub == "del":
+        if len(parts) < 3:
+            await msg.reply_text("Usage: /dir del N")
+            return
+        try:
+            n = int(parts[2])
+        except ValueError:
+            await msg.reply_text("Usage: /dir del N (N must be a number)")
+            return
+        try:
+            removed = checker.remove_trusted(n)
+            await msg.reply_text(f"Removed: {removed}")
+        except IndexError:
+            await msg.reply_text(f"No trusted directory #{n}.")
+
+    else:
+        await msg.reply_text("Usage: /dir list | /dir del N")

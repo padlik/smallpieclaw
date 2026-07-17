@@ -38,6 +38,8 @@ _CONFIRMATION_TOOLS = frozenset({
     "file_read",
     "file_write",
     "file_patch",
+    "file_diff",
+    "file_send",
     "memory_graph_store",
     "secret_get",
 })

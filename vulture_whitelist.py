@@ -59,6 +59,31 @@ SchedulerConfig
 PathsConfig
 MCPServerConfig
 
+# config_schema.py — PathsConfig new field
+from config_schema import PathsConfig as _PathsConfig2  # noqa: E402
+_PathsConfig2.workspace_dir
+
+# builtin_tools/access_control.py — public API
+from builtin_tools.access_control import (  # noqa: E402
+    ZoneClassification,
+    TrustedDir,
+    TrustedZoneChecker,
+    GrantTracker,
+)
+ZoneClassification.TRUSTED
+ZoneClassification.REQUEST_GRANT
+ZoneClassification.UNRECOGNISED
+TrustedDir.path
+TrustedDir.added
+TrustedZoneChecker.classify
+TrustedZoneChecker.add_trusted
+TrustedZoneChecker.remove_trusted
+TrustedZoneChecker.list_user_trusted
+GrantTracker
+GrantTracker.add
+GrantTracker.reset
+GrantTracker.snapshot
+
 # config_schema.py — XDG log path helpers
 from config_schema import log_dir, log_path  # noqa: E402
 log_dir
@@ -143,3 +168,7 @@ ChatResponse
 
 # interfaces.py — provider backend dependency bag (imported by llm_client for Phase 2)
 ProviderContext
+
+# config_schema.py — PathsConfig.workspace_dir field
+from config_schema import PathsConfig as _PathsConfig  # noqa: E402, F811
+_PathsConfig.workspace_dir

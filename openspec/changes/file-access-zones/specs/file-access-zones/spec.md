@@ -71,7 +71,7 @@ The system MUST resolve every path via `os.path.realpath()` and classify it into
 
 ### Requirement: Trusted directories support read-only mode
 
-A user-added trusted directory entry MAY carry a `mode` field: `"r"` (read-only) or `"rw"` (read-write, default). The mode is checked at classify time based on the requested operation type passed by each `file_*` tool.
+A user-added trusted directory entry SHALL support a `mode` field: `"r"` (read-only) or `"rw"` (read-write, default). The system MUST check the mode at classify time against the operation type passed by each `file_*` tool; a read-only directory SHALL return UNRECOGNISED for any write operation.
 
 #### Scenario: Read-only trusted dir auto-allows reads
 - **GIVEN** `/srv/archive` is a trusted directory with `mode: "r"`

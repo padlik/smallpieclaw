@@ -11,7 +11,10 @@ For OpenSpec propose/apply/verify/archive workflows, use the local `openspec-git
  - After every code change, always run `ruff check .` and `vulture . vulture_whitelist.py --min-confidence 80` to verify.
 
 ## Dev discipline 
- - **Never** code in **main** branch, do it either in a feature/fix branch (single agent is modifying code) or a workspace when many agents are trying to do different tasks at the same time (e.g. two different features in parralel).  
+- **Never** code directly in the main branch. Use a **feature/fix branch** when a single agent is modifying code, or a workspace when multiple agents are working on different tasks in parallel (e.g., two features simultaneously).
+- Do **not** initiate a code review unless explicitly instructed by the user — either via direct command or written instructions.
+- When following **OpenSpec**, adhere strictly to the defined steps in order. Do not skip steps or advance to the next step without an explicit command from the user.
+- Do **not** merge or commit changes without explicit user approval or a direct command.
 
 ## Dev Commands
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from telegram import Update
@@ -410,3 +411,85 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
         )
     except Exception:
         pass
+
+
+async def cb_zone_allow(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle [Allow this request] zone button — grants parent dir for current request cycle."""
+    query = update.callback_query
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    token = query.data.split(":", 1)[1]
+
+    builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
+    if builtin is None:
+        try:
+            await query.answer("⚠️ Executor not available.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    zone_path = builtin._zone_paths.pop(token, "")
+    if zone_path:
+        builtin.grant_tracker.add(zone_path)
+
+    if iface.agent:
+        iface.agent.resume(token, True)
+
+    await _ack_query(query)
+    try:
+        await query.edit_message_text(
+            "🔓 <b>Access granted for this request.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        logger.debug("Could not edit zone_allow message: %s", exc)
+
+
+async def cb_zone_trusted(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle [Add to trusted] zone button — permanently trusts the parent directory."""
+    query = update.callback_query
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    token = query.data.split(":", 1)[1]
+
+    builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
+    if builtin is None:
+        try:
+            await query.answer("⚠️ Executor not available.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    zone_path = builtin._zone_paths.pop(token, "")
+    checker = getattr(builtin, "trusted_zone_checker", None)
+    trusted_dir = ""
+    if zone_path and checker is not None:
+        trusted_dir = os.path.dirname(os.path.realpath(zone_path))
+        checker.add_trusted(trusted_dir)
+
+    if iface.agent:
+        iface.agent.resume(token, True)
+
+    await _ack_query(query)
+    label = f"<code>{html.escape(trusted_dir)}</code>" if trusted_dir else "directory"
+    try:
+        await query.edit_message_text(
+            f"📁 <b>Added to trusted directories:</b> {label}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        logger.debug("Could not edit zone_trusted message: %s", exc)

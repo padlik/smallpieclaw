@@ -293,6 +293,14 @@ def _run(
     # implicit spawn_agent context summaries include recent tool results.
     builtin._working = working
     builtin._results = results_mem
+    from builtin_tools.access_control import TrustedZoneChecker as _TrustedZoneChecker
+    _trusted_zone_checker = _TrustedZoneChecker(
+        paths_config=app_cfg.paths,
+        data_dir=data_dir,
+        agent_name=app_cfg.agent.agent_name,
+        vault_path=vault_file,
+    )
+    builtin.trusted_zone_checker = _trusted_zone_checker
     # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime
     # agents (P2 consolidation). Runtime semantic recall is served by graph
     # memory; the legacy JSON store is migration/backfill-only via
@@ -329,6 +337,7 @@ def _run(
     # approaches in a later iteration. Assigned post-construction to avoid
     # changing the AgentController signature today.
     agent.strategy_memory = strategy_mem  # type: ignore[attr-defined]
+    agent.trusted_zone_checker = _trusted_zone_checker  # type: ignore[attr-defined]
 
     logger.info("Building semantic tool index...")
     try:
