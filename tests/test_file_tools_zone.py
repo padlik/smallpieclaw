@@ -265,8 +265,10 @@ class TestFileDiffZone:
             path_b = self._write_file(tmp, "b.txt")
             ft, owner = _make_file_tools_diff(ZoneClassification.TRUSTED, ZoneClassification.TRUSTED)
 
+            real_path_a = os.path.realpath(path_a)
+
             def _sensitive(path: str) -> tuple[bool, str]:
-                return (True, "sensitive") if path == path_a else (False, "")
+                return (True, "sensitive") if path == real_path_a else (False, "")
 
             with patch("builtin_tools.files._is_sensitive_path", side_effect=_sensitive):
                 result = ft._exec_file_diff({"path_a": path_a, "path_b": path_b})
@@ -280,9 +282,10 @@ class TestFileDiffZone:
         with tempfile.TemporaryDirectory() as tmp:
             path_a = self._write_file(tmp, "a.txt")
             path_b = self._write_file(tmp, "b.txt")
+            real_path_a = os.path.realpath(path_a)
 
             def _sensitive(path: str) -> tuple[bool, str]:
-                return (True, "sensitive") if path == path_a else (False, "")
+                return (True, "sensitive") if path == real_path_a else (False, "")
 
             with patch("builtin_tools.files._is_sensitive_path", side_effect=_sensitive):
                 result = ft._exec_file_diff({"path_a": path_a, "path_b": path_b})

@@ -50,11 +50,11 @@ class FileTools:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
 
         checker = self._checker
+        real_path = os.path.realpath(os.path.expanduser(path))
+        args["_resolved_path"] = real_path
         if checker is not None:
-            real_path = os.path.realpath(os.path.expanduser(path))
-            args["_resolved_path"] = real_path
             zone = checker.classify(path, operation="read", request_grants=self._request_grants())
-            sensitive, reason = _is_sensitive_path(path)
+            sensitive, reason = _is_sensitive_path(real_path)
             if zone == ZoneClassification.UNRECOGNISED:
                 desc = f"Read file: <code>{path}</code>"
                 if real_path != path:
@@ -78,7 +78,7 @@ class FileTools:
 
         # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
         logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_read")
-        sensitive, reason = _is_sensitive_path(path)
+        sensitive, reason = _is_sensitive_path(real_path)
         if sensitive:
             desc = f"Read file: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
             return self._owner._requires_confirmation("file_read", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
@@ -168,8 +168,8 @@ class FileTools:
             grants = self._request_grants()
             zone_a = checker.classify(path_a, operation="read", request_grants=grants)
             zone_b = checker.classify(path_b, operation="read", request_grants=grants)
-            sensitive_a, reason_a = _is_sensitive_path(path_a)
-            sensitive_b, reason_b = _is_sensitive_path(path_b)
+            sensitive_a, reason_a = _is_sensitive_path(real_path_a)
+            sensitive_b, reason_b = _is_sensitive_path(real_path_b)
 
             # Prefer the actually-unrecognised path for zone_path so zone buttons grant the right dir
             unrecognised_path = None
@@ -201,8 +201,12 @@ class FileTools:
         else:
             # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
             logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_diff")
-            sensitive_a, reason_a = _is_sensitive_path(path_a)
-            sensitive_b, reason_b = _is_sensitive_path(path_b)
+            real_path_a = os.path.realpath(os.path.expanduser(path_a))
+            real_path_b = os.path.realpath(os.path.expanduser(path_b))
+            args["_resolved_path_a"] = real_path_a
+            args["_resolved_path_b"] = real_path_b
+            sensitive_a, reason_a = _is_sensitive_path(real_path_a)
+            sensitive_b, reason_b = _is_sensitive_path(real_path_b)
             if sensitive_a or sensitive_b:
                 diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
                 if sensitive_a:
@@ -275,7 +279,7 @@ class FileTools:
             if real_path != path:
                 desc += f"\n(→ <code>{real_path}</code>)"
             zone = checker.classify(path, operation="write", request_grants=self._request_grants())
-            sensitive, _ = _is_sensitive_path(path)
+            sensitive, _ = _is_sensitive_path(real_path)
             if zone == ZoneClassification.UNRECOGNISED:
                 if sensitive:
                     desc += "\n⚠️ Sensitive file"
@@ -376,7 +380,7 @@ class FileTools:
             f"Patch file: <code>{path}</code>{replace_note}\n"
             f"{removed}\n{added}"
         )
-        sensitive, _ = _is_sensitive_path(path)
+        sensitive, _ = _is_sensitive_path(real_path)
         if sensitive:
             desc += "\n⚠️ Sensitive file"
         if checker is not None and real_path != path:
@@ -469,7 +473,7 @@ class FileTools:
         args["_resolved_path"] = real_path
         if checker is not None:
             zone = checker.classify(path, operation="read", request_grants=self._request_grants())
-            sensitive, reason = _is_sensitive_path(path)
+            sensitive, reason = _is_sensitive_path(real_path)
             if zone == ZoneClassification.UNRECOGNISED:
                 send_desc = f"Send file: <code>{path}</code>"
                 if real_path != path:
@@ -492,7 +496,7 @@ class FileTools:
         else:
             # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
             logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_send")
-            sensitive, reason = _is_sensitive_path(path)
+            sensitive, reason = _is_sensitive_path(real_path)
             if sensitive:
                 send_desc = f"Send file: <code>{path}</code>\n⚠️ {reason}"
                 return self._owner._requires_confirmation(

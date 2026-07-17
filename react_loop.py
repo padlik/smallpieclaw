@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -380,10 +381,59 @@ def format_tool_result(tool_name: str, outcome: dict) -> str:
 
 def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     """Execute a vision_query built-in: ask the LLM to analyse a local image file."""
-    path = args.get("path", "")
+    from builtin_tools.access_control import ZoneClassification
+    from builtin_tools.patterns import _is_sensitive_path
+
+    path = str(args.get("path", "")).strip()
     question = args.get("question", "What is in this image?")
     if not path:
         return {"success": False, "output": "", "error": "vision_query: 'path' argument is required."}
+
+    # Zone gate: vision_query reads a file, so apply the same gate as file_read.
+    real_path = os.path.realpath(os.path.expanduser(path))
+    checker = getattr(ctx, "trusted_zone_checker", None)
+    if checker is not None:
+        zone = checker.classify(
+            path, operation="read",
+            request_grants=ctx.grant_tracker.snapshot() if ctx.grant_tracker else frozenset(),
+        )
+        sensitive, reason = _is_sensitive_path(real_path)
+        if zone == ZoneClassification.UNRECOGNISED or sensitive:
+            builtin = getattr(ctx, "builtin_executor", None)
+            if builtin is None:
+                return {
+                    "success": False, "output": "",
+                    "error": "vision_query: confirmation infrastructure not available.",
+                }
+            desc = f"Vision query: <code>{path}</code>"
+            if real_path != path:
+                desc += f"\n(→ <code>{real_path}</code>)"
+            if sensitive:
+                desc += f"\n⚠️ Reason: {reason}"
+            return builtin._requires_confirmation(
+                "vision_query", args, desc,
+                caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
+                zone_path=real_path,
+            )
+    else:
+        # Checker unwired: degrade to sensitive-only gate (same as file_read).
+        logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for vision_query")
+        sensitive, reason = _is_sensitive_path(real_path)
+        if sensitive:
+            builtin = getattr(ctx, "builtin_executor", None)
+            if builtin is None:
+                return {
+                    "success": False, "output": "",
+                    "error": "vision_query: confirmation infrastructure not available.",
+                }
+            desc = f"Vision query: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
+            if real_path != path:
+                desc += f"\n(→ <code>{real_path}</code>)"
+            return builtin._requires_confirmation(
+                "vision_query", args, desc,
+                caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
+            )
+
     encoded = _encode_images([path])
     if not encoded:
         return {

@@ -973,6 +973,7 @@ async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 
 
 
+@_require_auth
 async def cmd_dir(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Operator command to list or remove user-added trusted directories.
 

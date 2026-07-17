@@ -462,7 +462,7 @@ class PathsConfig:
     pid_file: str = "data/agent.pid"
     tmp_dir: str = ""
     prompts_dir: str = "prompts"
-    workspace_dir: str = ""
+    workspace_dir: str = "~/Documents"
 
 
 @dataclass(frozen=True)
@@ -617,7 +617,7 @@ def _parse_paths(raw: dict) -> PathsConfig:
         pid_file=section.get("pid_file", "data/agent.pid"),
         tmp_dir=section.get("tmp_dir", ""),
         prompts_dir=section.get("prompts_dir", "prompts"),
-        workspace_dir=section.get("workspace_dir", ""),
+        workspace_dir=section.get("workspace_dir", "~/Documents"),
     )
 
 
