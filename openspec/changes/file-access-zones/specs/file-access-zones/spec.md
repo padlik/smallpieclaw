@@ -10,10 +10,11 @@ Define zone-based access control for all `file_*` built-in tool operations. A `T
 
 The system MUST resolve every path via `os.path.realpath()` and classify it into exactly one zone before executing any `file_*` tool operation.
 
-#### Scenario: Internal agent path is auto-allowed without confirmation
-- **GIVEN** a `file_*` tool is invoked with a path inside an agent-internal directory (`data/`, `tools/`, `tools_generated/`, `skills/`, `prompts/`, log dir, vault dir)
+#### Scenario: Agent-internal path requires confirmation
+- **GIVEN** a `file_*` operation is invoked with a path inside an agent-internal directory (`data/`, `tools/`, `tools_generated/`, `skills/`, `prompts/`, log dir, vault dir)
 - **WHEN** zone classification runs
-- **THEN** the operation proceeds immediately without any confirmation prompt
+- **THEN** the operation is staged and a confirmation prompt is sent
+- **AND** the LLM should use dedicated built-in tools (`memory_read`, `secret_get`, `log_query`) for internal data access instead
 
 #### Scenario: Default trusted path is auto-allowed without confirmation
 - **GIVEN** a `file_*` tool is invoked with a path inside a default trusted directory (`workspace_dir`, `downloads_dir`, `tmp_dir`)
@@ -21,13 +22,13 @@ The system MUST resolve every path via `os.path.realpath()` and classify it into
 - **THEN** the operation proceeds immediately without any confirmation prompt
 
 #### Scenario: User-added trusted path is auto-allowed without confirmation
-- **GIVEN** a user has added `/srv/shared` to the trusted directory list
+- **GIVEN** a user has added `/srv/shared` to the trusted directory list (with default `"rw"` mode)
 - **AND** a `file_*` tool is invoked with a path under `/srv/shared/`
 - **WHEN** zone classification runs
 - **THEN** the operation proceeds immediately without any confirmation prompt
 
 #### Scenario: Unrecognised path triggers a confirmation prompt
-- **GIVEN** a `file_*` tool is invoked with a path outside all trusted and internal zones
+- **GIVEN** a `file_*` tool is invoked with a path outside all trusted zones
 - **WHEN** zone classification runs
 - **THEN** the operation is staged and a confirmation prompt is sent
 - **AND** the prompt includes options: `[Approve]`, `[Deny]`, `[Allow this request]`, `[Add to trusted]`
@@ -39,6 +40,48 @@ The system MUST resolve every path via `os.path.realpath()` and classify it into
 - **WHEN** zone classification runs
 - **THEN** the resolved absolute real path is used for zone comparison
 - **AND** a symlink inside a trusted dir that resolves to a path outside all trusted zones is treated as unrecognised
+
+#### Scenario: Vault file path is UNRECOGNISED and confirmation-gated
+- **GIVEN** the vault file (`~/.local/share/<agent>/secrets.toml`) is an agent-internal path
+- **WHEN** `file_read` is invoked with the vault file path
+- **THEN** the path classifies as UNRECOGNISED and a confirmation prompt is sent
+- **AND** the `secret_get` built-in tool remains the intended interface for reading secrets
+
+#### Scenario: Trust-store and vault remain UNRECOGNISED even when parent dir is trusted
+- **GIVEN** a user has added `data/` or `~/.local/share/<agent>/` to their trusted directories
+- **WHEN** `file_read` or `file_write` is invoked with the path of `data/trusted_dirs.json` or the vault file
+- **THEN** the path classifies as UNRECOGNISED and a confirmation prompt is sent
+- **AND** the parent-dir trust entry does not grant access to the trust store or the vault
+
+### Requirement: file_diff zone-checks both paths independently
+
+`file_diff` MUST classify both `path_a` and `path_b` before executing. If either path is UNRECOGNISED, the entire operation is staged for confirmation.
+
+#### Scenario: file_diff with one unrecognised path stages confirmation
+- **GIVEN** `path_a` is inside `workspace_dir` (TRUSTED)
+- **AND** `path_b` is outside all trusted zones (UNRECOGNISED)
+- **WHEN** `file_diff` is invoked
+- **THEN** the operation is staged and a confirmation prompt is sent
+- **AND** neither path has been read at the time of the prompt
+
+#### Scenario: file_diff with both trusted paths proceeds without confirmation
+- **GIVEN** both `path_a` and `path_b` are inside `workspace_dir` (TRUSTED)
+- **WHEN** `file_diff` is invoked
+- **THEN** the diff executes immediately without any confirmation prompt
+
+### Requirement: Trusted directories support read-only mode
+
+A user-added trusted directory entry MAY carry a `mode` field: `"r"` (read-only) or `"rw"` (read-write, default). The mode is checked at classify time based on the requested operation type passed by each `file_*` tool.
+
+#### Scenario: Read-only trusted dir auto-allows reads
+- **GIVEN** `/srv/archive` is a trusted directory with `mode: "r"`
+- **WHEN** `file_read` is invoked with a path under `/srv/archive/`
+- **THEN** the operation proceeds immediately without any confirmation prompt
+
+#### Scenario: Read-only trusted dir requires confirmation for writes
+- **GIVEN** `/srv/archive` is a trusted directory with `mode: "r"`
+- **WHEN** `file_write` is invoked with a path under `/srv/archive/`
+- **THEN** the operation is staged and a confirmation prompt is sent
 
 ### Requirement: Sensitive pattern gate stacks on top of zone classification
 
@@ -57,7 +100,7 @@ The existing sensitive-path confirmation (matching `.key`, `.env`, `secrets.*`, 
 
 ### Requirement: file_write and file_patch inside trusted zones do not require confirmation
 
-`file_write` and `file_patch` MUST NOT stage confirmation for paths in trusted or internal zones (unless the sensitive-pattern gate applies).
+`file_write` and `file_patch` MUST NOT stage confirmation for paths in trusted (`rw`) or request-granted zones (unless the sensitive-pattern gate applies).
 
 #### Scenario: file_write to workspace proceeds without confirmation
 - **GIVEN** `workspace_dir` is `~/Documents` (default)
@@ -65,7 +108,7 @@ The existing sensitive-path confirmation (matching `.key`, `.env`, `secrets.*`, 
 - **THEN** the write executes immediately without any confirmation prompt
 
 #### Scenario: file_write outside trusted zones is staged for confirmation
-- **GIVEN** a path is outside all trusted and internal zones
+- **GIVEN** a path is outside all trusted zones (including agent-internal directories)
 - **WHEN** `file_write` is invoked
 - **THEN** the operation is staged and a confirmation prompt is sent
 
@@ -107,15 +150,3 @@ starts with the zone directory followed by the OS path separator.
 - **GIVEN** `/srv/shared` is a trusted directory
 - **WHEN** a `file_*` tool is invoked with path `/srv/shared/file.txt`
 - **THEN** the operation proceeds without confirmation
-
-### Requirement: Sensitive-pattern gate does not apply to INTERNAL zone paths
-
-Agent-internal paths (data dir, tools, skills, prompts, logs, vault dir) are auto-allowed
-regardless of filename patterns. The sensitive-pattern gate applies only to TRUSTED and
-REQUEST_GRANT zones.
-
-#### Scenario: Vault directory path is INTERNAL and bypasses sensitive-pattern gate
-- **GIVEN** the vault directory is an INTERNAL zone path
-- **WHEN** `file_read` is invoked with the vault directory path
-- **THEN** the operation is classified INTERNAL and auto-allowed without confirmation
-- **AND** the `secret_get` built-in tool remains the intended interface for vault values

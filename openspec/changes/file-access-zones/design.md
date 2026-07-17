@@ -1,6 +1,8 @@
 ## Overview
 
-A `TrustedZoneChecker` component wraps all `file_*` built-in tool operations. Every path request is classified into one of four zones; the zone determines whether the operation proceeds silently or triggers a confirmation prompt. Path resolution uses `os.path.realpath()` throughout (resolves symlinks and normalises `..`) to prevent zone bypass via symlink or traversal.
+A `TrustedZoneChecker` component wraps all `file_*` built-in tool operations. Every path request is classified into one of three zones; the zone determines whether the operation proceeds silently or triggers a confirmation prompt. Path resolution uses `os.path.realpath()` throughout (resolves symlinks and normalises `..`) to prevent zone bypass via symlink or traversal.
+
+Agent-internal directories (data, tools, skills, prompts, XDG dirs) are intentionally outside the trusted set. The LLM accesses internal data through dedicated built-in tools (`memory_read`, `secret_get`, `log_query`, etc.); direct `file_*` access to internal paths requires user confirmation like any other unrecognised path.
 
 ## Component: TrustedZoneChecker
 
@@ -9,25 +11,10 @@ A `TrustedZoneChecker` component wraps all `file_*` built-in tool operations. Ev
 ### Zone classification (priority order)
 
 ```
-1. INTERNAL      → auto-allow (agent-owned dirs, no gate)
-2. TRUSTED       → auto-allow (default + user-added dirs, no gate)
-3. REQUEST_GRANT → auto-allow (per-request dir grant, cleared each request)
-4. UNRECOGNISED  → confirmation prompt with extended options
+1. TRUSTED       → auto-allow (default + user-added dirs; subject to mode)
+2. REQUEST_GRANT → auto-allow (per-request dir grant, cleared each request)
+3. UNRECOGNISED  → confirmation prompt with extended options
 ```
-
-### Internal dirs (auto-bypass, built from PathsConfig at construction)
-
-| Field | Default |
-|-------|---------|
-| `paths.tools_dir` | `tools/` |
-| `paths.tools_generated_dir` | `tools_generated/` |
-| `paths.data_dir` | `data/` |
-| `paths.skills_dir` | `skills/` |
-| `paths.prompts_dir` | `prompts/` |
-| `log_path(cfg)` | `~/.local/state/<agent>/logs/` |
-| `vault_path(cfg)` | `~/.local/share/<agent>/secrets.toml` |
-
-All resolved via `os.path.realpath()` at construction time.
 
 ### Default trusted dirs (protected, non-removable)
 
@@ -37,45 +24,56 @@ All resolved via `os.path.realpath()` at construction time.
 | `paths.downloads_dir` | `<agent_home>/downloads` |
 | `paths.tmp_dir` | `/tmp/<agent_name>` |
 
+All resolved via `os.path.expanduser()` then `os.path.realpath()` at construction time.
+
 ### User-added trusted dirs
 
 Persisted in `data/trusted_dirs.json` (written atomically via `_atomic_save_json()`):
 
 ```json
 [
-  {"path": "/abs/resolved/path", "added": "2026-07-17T14:30:00"}
+  {"path": "/abs/resolved/path", "added": "2026-07-17T14:30:00", "mode": "rw"}
 ]
 ```
 
-Loaded at startup. Updated in-place when user taps **[Add to trusted]**.
+The `mode` field controls write access:
+- `"rw"` (default, and default when field absent): auto-allow reads and writes
+- `"r"`: auto-allow reads; confirm writes
+
+Loaded at startup. Updated in-place when user taps **[Add to trusted]** (always `"rw"` when added from button). Default trusted dirs are always `"rw"`.
 
 ### Request grants
 
-In-memory `set[str]` of absolute directory paths. Populated by **[Allow this request]** — stores `os.path.dirname(realpath(path))` of the requested file. Cleared by `reset_request_grants()` at `react_loop()` entry (once per user message cycle).
+In-memory `set[str]` of absolute directory paths. Populated by **[Allow this request]** — stores `os.path.dirname(realpath(path))` of the requested file. Cleared by `GrantTracker.reset()` at `react_loop()` entry (once per user message cycle).
 
 ### Public API
 
 ```python
 class TrustedZoneChecker:
-    def classify(self, path: str) -> ZoneClassification: ...
-    def grant_for_request(self, path: str) -> None: ...
-    def reset_request_grants(self) -> None: ...
-    def add_trusted(self, path: str) -> None: ...  # persists
-    def remove_trusted(self, index: int) -> str: ...  # returns removed path
+    def classify(self, path: str, operation: str = "write", request_grants: frozenset[str] = frozenset()) -> ZoneClassification: ...
+    # operation: "read" | "write" — defaults to "write" (fail-safe: omitting operation never silently allows writes to r-mode dirs)
+    def add_trusted(self, path: str, mode: str = "rw") -> None: ...   # persists to data/trusted_dirs.json
+    def remove_trusted(self, index: int) -> str: ...    # returns removed path
     def list_user_trusted(self) -> list[TrustedDir]: ...
 
+class GrantTracker:
+    """Per-executor ephemeral request grant set. One instance per BuiltinExecutor."""
+    def add(self, path: str) -> None: ...       # grants parent dir of path
+    def reset(self) -> None: ...                # called at react_loop() entry
+    def snapshot(self) -> frozenset[str]: ...   # thread-safe snapshot for classify()
+
 class ZoneClassification(Enum):
-    INTERNAL = "internal"
     TRUSTED = "trusted"
     REQUEST_GRANT = "request_grant"
     UNRECOGNISED = "unrecognised"
 
-# Derived action: INTERNAL / TRUSTED / REQUEST_GRANT → allow; UNRECOGNISED → confirm
+# Derived action: TRUSTED / REQUEST_GRANT → allow; UNRECOGNISED → confirm
 
 @dataclass
 class TrustedDir:
     path: str
-    added: str  # ISO8601
+    added: str   # ISO8601
+    mode: str = "rw"  # "r" | "rw"
 ```
 
 ## Changes to file_* tools (`builtin_tools/files.py`)
@@ -84,21 +82,19 @@ Current confirmation triggers replaced by zone check:
 
 | Tool | Before | After |
 |------|--------|-------|
-| `file_write` | always confirms | confirms only if `classify(path) == UNRECOGNISED` |
-| `file_patch` | always confirms | confirms only if `classify(path) == UNRECOGNISED` |
-| `file_read` | confirms if sensitive pattern | confirms if `classify(path) == UNRECOGNISED` |
-| `file_diff` | no confirmation | zone-checked before each read; if either path is UNRECOGNISED, stage confirmation |
-| `file_send` | no confirmation | zone-checked before read; if UNRECOGNISED, stage confirmation |
+| `file_write` | always confirms | auto-allow if TRUSTED(rw)/REQUEST_GRANT; confirm otherwise |
+| `file_patch` | always confirms | auto-allow if TRUSTED(rw)/REQUEST_GRANT; confirm otherwise |
+| `file_read` | confirms if sensitive pattern | auto-allow if TRUSTED/REQUEST_GRANT; confirm if UNRECOGNISED |
+| `file_diff` | no confirmation | zone-checked before each read (`operation="read"`); if either path is UNRECOGNISED, stage confirmation |
+| `file_send` | no confirmation | zone-checked before read (`operation="read"`); if UNRECOGNISED, stage confirmation |
 
-The existing `_is_sensitive_path()` check stacks on top of zone classification — a path inside a trusted zone that matches a sensitive pattern (`.key`, `.env`, `secrets.*`, etc.) still triggers confirmation.
-
-The existing `_is_sensitive_path()` gate stacks on top of zone classification for ALL `file_*` tools including `file_diff` and `file_send`. A sensitive-pattern match on either path triggers confirmation regardless of zone membership, preventing silent reads of `.env`, `.key`, or `secrets.*` files even through the comparison and send paths.
+Each tool passes `operation="read"` or `operation="write"` to `classify()`. The existing `_is_sensitive_path()` check stacks on top of zone classification for ALL `file_*` tools — a sensitive-pattern match triggers confirmation regardless of zone membership, preventing silent reads of `.env`, `.key`, or `secrets.*` files even inside trusted zones, through comparison paths, and through send paths.
 
 ## Confirmation UX: Extended options
 
 Out-of-zone prompts gain two new inline buttons alongside the existing `[Approve]` / `[Deny]`:
 
-- **[Allow this request]** — calls `checker.grant_for_request(path)`; operation proceeds; future accesses to the same directory within this request are silent.
+- **[Allow this request]** — calls `grant_tracker.add(path)`; operation proceeds; future accesses to the same directory within this request are silent.
 - **[Add to trusted]** — calls `checker.add_trusted(os.path.dirname(realpath(path)))`; persists to `data/trusted_dirs.json`; operation proceeds; future accesses silent permanently.
 
 Both new buttons are handled in `telegram_callbacks.py`.
@@ -115,8 +111,8 @@ The `[Allow this request]` and `[Add to trusted]` buttons are shown ONLY when th
 Output format for `/dir list`:
 ```
 Trusted directories:
-  1. /Users/paul/projects/myapp
-  2. /srv/shared/data
+  1. /Users/paul/projects/myapp  [rw]
+  2. /srv/archive  [r]
 ```
 
 Empty state: `No custom trusted directories added yet.`
@@ -126,35 +122,33 @@ Default trusted dirs are intentionally excluded from the listing — they are fi
 
 ## ReactContext changes
 
-`ReactContext` dataclass (`react_loop.py`) gains:
+`ReactContext` dataclass (`react_loop.py`) gains two fields:
 
 ```python
 trusted_zone_checker: TrustedZoneChecker
+grant_tracker: Optional[GrantTracker]   # per-executor GrantTracker for request-grant isolation
 ```
 
-`react_loop()` calls `trusted_zone_checker.reset_request_grants()` once at loop entry, before tool dispatch begins.
+`react_loop()` calls `ctx.grant_tracker.reset()` once at loop entry, before tool dispatch begins. This clears all in-request directory grants from the previous cycle.
+
+`file_*` handlers call `classify(path, operation, request_grants=ctx.grant_tracker.snapshot())` to pass the current grant set without holding a lock across I/O. The `GrantTracker` lives on `BuiltinExecutor` (one per executor); `ReactContext` holds a reference to the same object for lifecycle management (`reset()`).
 
 All `file_*` handlers receive `TrustedZoneChecker` via the existing `owner` / context pattern (same as `_owner.max_output`, `_owner._requires_confirmation()`).
 
 ## Concurrency and sub-agent scoping
 
-Each agent instance (main agent and each sub-agent) receives its OWN `TrustedZoneChecker`
-instance. They share the same persisted `data/trusted_dirs.json` (loaded once at construction),
-but the in-memory request grant set is NOT shared. This prevents concurrent sub-agents from
-clearing each other's grants via `reset_request_grants()`.
+Each `BuiltinExecutor` instance owns its own `GrantTracker`. The persistent trust store
+(`_user_trusted`, `_default_trusted_dirs`) and the `TrustedZoneChecker` instance are shared
+between the main agent and sub-agents. The `GrantTracker` is per-executor, but since
+sub-agents currently reuse the main agent's executor, grant sets are effectively shared in
+practice. Full per-sub-agent `GrantTracker` isolation is tracked as a follow-up improvement.
+`GrantTracker.reset()` is called at each `react_loop()` entry; a sub-agent loop-entry reset
+clears the parent's in-flight grants (fail-safe behavior).
 
 Sub-agents are headless callers. The existing `_headless_confirm_bridge` remains active for
 UNRECOGNISED zone prompts from sub-agents — the operator is notified out of band and the
 sub-agent blocks for approval. Writes inside TRUSTED zones by sub-agents proceed silently
 (same as the main agent), which is the intended relaxation of prior always-confirm behavior.
-
-## Trust store protection
-
-`data/trusted_dirs.json` is inside `data_dir` (INTERNAL zone), but is explicitly excluded
-from the INTERNAL auto-allow rule. `file_write` and `file_patch` targeting `trusted_dirs.json`
-are treated as UNRECOGNISED and require confirmation. The `TrustedZoneChecker.add_trusted()`
-method writes directly via `_atomic_save_json()` (bypasses `file_write`) and is only reachable
-through the confirmed `[Add to trusted]` button — it is not an LLM-accessible path.
 
 ## main.py wiring
 
@@ -165,11 +159,14 @@ trusted_zone_checker = TrustedZoneChecker(
     paths_config=app_cfg.paths,
     data_dir=str(paths.data_dir),
     agent_name=app_cfg.agent.agent_name,
+    vault_path=vault_path(cfg),
 )
 builtin_executor.trusted_zone_checker = trusted_zone_checker  # files.py reads via self._owner.trusted_zone_checker.classify()
+# grant_tracker is owned by BuiltinExecutor; ReactContext holds a reference for lifecycle (reset at loop entry)
 react_context = ReactContext(
     ...,
-    trusted_zone_checker=trusted_zone_checker,  # used for reset_request_grants()
+    trusted_zone_checker=trusted_zone_checker,
+    grant_tracker=builtin_executor.grant_tracker,
 )
 ```
 
@@ -185,4 +182,6 @@ Resolved via `os.path.expanduser()` at `TrustedZoneChecker` construction (then `
 
 ## New data file
 
-`data/trusted_dirs.json` — created on first **[Add to trusted]** action, absent until then. The `TrustedZoneChecker` handles missing file gracefully (starts with empty user-added list).
+`data/trusted_dirs.json` — created on first **[Add to trusted]** action, absent until then. The `TrustedZoneChecker` handles missing file gracefully (starts with empty user-added list). Entries without a `mode` field are treated as `"rw"` for backward compatibility.
+
+**Defense-in-depth overrides:** `data/trusted_dirs.json` and the vault file (resolved from `vault_path(cfg)`, honoring `$SPC_VAULT_FILE`) are always classified as UNRECOGNISED by `classify()`, even if a parent directory (e.g. `data/` or `~/.local/share/<agent>/`) appears in the trusted set. This prevents a user-added trusted dir from accidentally making the trust store itself silently writable or the vault silently readable. The vault path must be injected into `TrustedZoneChecker` at construction time (via `vault_path=vault_path(cfg)`) so the override follows the resolved env-configurable location rather than any hardcoded default.
