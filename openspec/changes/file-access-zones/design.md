@@ -159,6 +159,7 @@ trusted_zone_checker = TrustedZoneChecker(
     paths_config=app_cfg.paths,
     data_dir=str(paths.data_dir),
     agent_name=app_cfg.agent.agent_name,
+    vault_path=vault_path(cfg),
 )
 builtin_executor.trusted_zone_checker = trusted_zone_checker  # files.py reads via self._owner.trusted_zone_checker.classify()
 # grant_tracker is owned by BuiltinExecutor; ReactContext holds a reference for lifecycle (reset at loop entry)

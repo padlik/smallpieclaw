@@ -165,3 +165,17 @@ All 8 Round 4 findings resolved. Two optional items added (vault-UNRECOGNISED sc
 |---|----------|---------|--------|
 | 1 | critical | Round 5 fix hardcoded vault path (`~/.local/share/<agent>/secrets.toml`) and dropped `vault_path` arg — silently breaks the safeguard under `$SPC_VAULT_FILE` | ✅ fixed — tasks.md 2.2/4.3 + design.md updated to pass resolved `vault_path(cfg)` |
 | 2 | should-fix | No spec scenario or test task asserting trust-store/vault remain UNRECOGNISED when parent dir is trusted | ✅ fixed — new scenario added to spec.md:50-54; 7.1 test list extended |
+
+---
+
+## Round 7 — 2026-07-18
+
+**Reviewer:** openspec-reviewer
+**Verdict:** `needs-revision`
+
+### Findings
+
+| # | Severity | Finding | Status |
+|---|----------|---------|--------|
+| 1 | critical | `design.md` wiring block (lines 158-162) omitted `vault_path=vault_path(cfg)` — contradicted `design.md:186` and silently reinstated the vault-override gap if copied literally | ✅ fixed — `vault_path=vault_path(cfg),` added to wiring block |
+| 2 | should-fix | `tasks.md:34` (4.3) Round 6 edit swapped `agent_name` for `vault_path` instead of keeping both — literal copy would yield `TypeError` | ✅ fixed — both args now shown: `agent_name=app_cfg.agent.agent_name, vault_path=vault_path(cfg)` |

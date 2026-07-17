@@ -31,7 +31,7 @@
 
 - [x] 4.1 `ReactContext` dataclass in `react_loop.py` has `trusted_zone_checker: TrustedZoneChecker` and `grant_tracker: Optional[GrantTracker]` fields; verify both present
 - [x] 4.2 Call `ctx.grant_tracker.reset()` at the start of `react_loop()`, before the tool dispatch loop
-- [ ] 4.3 Update `main.py`: construct ONE `TrustedZoneChecker(paths_config=app_cfg.paths, data_dir=..., vault_path=vault_path(cfg))` — pass the resolved vault path from `vault_path(cfg)` so `$SPC_VAULT_FILE` overrides are honoured; inject same instance into `BuiltinExecutor.trusted_zone_checker` AND `ReactContext`; also inject `builtin_executor.grant_tracker` into `ReactContext.grant_tracker`
+- [ ] 4.3 Update `main.py`: construct ONE `TrustedZoneChecker(paths_config=app_cfg.paths, data_dir=..., agent_name=app_cfg.agent.agent_name, vault_path=vault_path(cfg))` — pass the resolved vault path from `vault_path(cfg)` so `$SPC_VAULT_FILE` overrides are honoured; inject same instance into `BuiltinExecutor.trusted_zone_checker` AND `ReactContext`; also inject `builtin_executor.grant_tracker` into `ReactContext.grant_tracker`
 
 ## 5. Telegram: extended confirmation buttons
 
