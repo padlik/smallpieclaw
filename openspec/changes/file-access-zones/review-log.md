@@ -163,6 +163,45 @@ All 8 Round 4 findings resolved. Two optional items added (vault-UNRECOGNISED sc
 
 | # | Severity | Finding | Status |
 |---|----------|---------|--------|
+| 1 | critical | Vault path hardcoded / `vault_path` arg dropped — breaks `$SPC_VAULT_FILE` override | ✅ fixed |
+| 2 | should-fix | No spec scenario / test task for parent-trusted-but-override guarantee | ✅ fixed |
+
+---
+
+## Round 7 — 2026-07-18
+
+**Reviewer:** openspec-reviewer
+**Verdict:** `needs-revision`
+
+### Findings
+
+| # | Severity | Finding | Status |
+|---|----------|---------|--------|
+| 1 | critical | `design.md` wiring block omitted `vault_path` — contradicting same file's defense-in-depth prose | ✅ fixed |
+| 2 | should-fix | `tasks.md:34` (4.3) dropped required `agent_name` arg from constructor snippet | ✅ fixed |
+
+---
+
+## Round 8 — 2026-07-18
+
+**Reviewer:** openspec-reviewer
+**Verdict:** `approve`
+
+### Summary
+
+All findings from rounds 4–7 resolved. Both construction snippets (`design.md:158-163`, `tasks.md:34`) now show the complete 4-argument call matching the real constructor and `main.py`. `openspec validate --type change --strict` expected to pass. Ready to proceed to `/opsx-apply`.
+
+---
+
+## Round 6 — 2026-07-18
+
+**Reviewer:** openspec-reviewer
+**Verdict:** `needs-revision`
+
+### Findings
+
+| # | Severity | Finding | Status |
+|---|----------|---------|--------|
 | 1 | critical | Round 5 fix hardcoded vault path (`~/.local/share/<agent>/secrets.toml`) and dropped `vault_path` arg — silently breaks the safeguard under `$SPC_VAULT_FILE` | ✅ fixed — tasks.md 2.2/4.3 + design.md updated to pass resolved `vault_path(cfg)` |
 | 2 | should-fix | No spec scenario or test task asserting trust-store/vault remain UNRECOGNISED when parent dir is trusted | ✅ fixed — new scenario added to spec.md:50-54; 7.1 test list extended |
 
