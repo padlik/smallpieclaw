@@ -43,10 +43,12 @@ from telegram_commands import (
     cmd_verbose, cmd_jobs, cmd_agents, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
+    cmd_dir,
 )
 from telegram_callbacks import (
     cb_confirm, cb_extend, cb_tool_create, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
+    cb_zone_allow, cb_zone_trusted,
 )
 
 logger = logging.getLogger(__name__)
@@ -245,6 +247,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("show_ctx", partial(cmd_show_ctx, self)))
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
         app.add_handler(CommandHandler("memory", partial(cmd_memory, self)))
+        app.add_handler(CommandHandler("dir", partial(cmd_dir, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(partial(cb_mode_switch, self), pattern=r"^mode:"))
@@ -253,6 +256,8 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
         app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
         app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
+        app.add_handler(CallbackQueryHandler(partial(cb_zone_allow,   self), pattern=r"^zone_allow:"))
+        app.add_handler(CallbackQueryHandler(partial(cb_zone_trusted, self), pattern=r"^zone_trusted:"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
         app.add_handler(MessageHandler(filters.PHOTO, self._on_file))
@@ -529,8 +534,12 @@ class TelegramInterface:
                 token = parts[1]
                 tool_name = parts[2] if len(parts) > 2 else ""
                 description = parts[3] if len(parts) > 3 else tool_name
+                builtin = getattr(getattr(self, "agent", None), "builtin_executor", None)
+                zone_path = builtin._zone_paths.get(token, "") if builtin is not None else ""
                 asyncio.run_coroutine_threadsafe(
-                    self._send_confirmation_prompt(update.effective_message, token, tool_name, description),
+                    self._send_confirmation_prompt(
+                        update.effective_message, token, tool_name, description, zone_path=zone_path
+                    ),
                     loop,
                 )
                 return
@@ -667,15 +676,26 @@ class TelegramInterface:
                 parse_mode=ParseMode.HTML,
             )
 
-    async def _send_confirmation_prompt(self, message, token: str, tool_name: str, description: str) -> None:
+    async def _send_confirmation_prompt(
+        self, message, token: str, tool_name: str, description: str, zone_path: str = ""
+    ) -> None:
         """Send an inline-button confirmation prompt for a dangerous operation."""
         approve_all_label = f"✅✅ Approve all {tool_name}" if tool_name else "✅✅ Approve all"
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes, execute", callback_data=f"confirm_yes:{token}"),
-            InlineKeyboardButton("❌ No, cancel",   callback_data=f"confirm_no:{token}"),
-        ], [
-            InlineKeyboardButton(approve_all_label, callback_data=f"confirm_all:{token}:{tool_name}"),
-        ]])
+        rows = [
+            [
+                InlineKeyboardButton("✅ Yes, execute", callback_data=f"confirm_yes:{token}"),
+                InlineKeyboardButton("❌ No, cancel",   callback_data=f"confirm_no:{token}"),
+            ],
+            [
+                InlineKeyboardButton(approve_all_label, callback_data=f"confirm_all:{token}:{tool_name}"),
+            ],
+        ]
+        if zone_path:
+            rows.append([
+                InlineKeyboardButton("🔓 Allow this request", callback_data=f"zone_allow:{token}"),
+                InlineKeyboardButton("📁 Add to trusted",     callback_data=f"zone_trusted:{token}"),
+            ])
+        keyboard = InlineKeyboardMarkup(rows)
         await message.reply_text(
             f"⚠️ <b>Confirmation required</b>\n\n{_md_to_html(description)}",
             parse_mode=ParseMode.HTML,

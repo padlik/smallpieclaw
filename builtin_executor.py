@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import agent_logging
+from builtin_tools.access_control import GrantTracker
 from builtin_tools.agents import AgentTools
 from builtin_tools.context_io import (
     _load_context,  # noqa: F401  re-exported for agent_runtime + tests
@@ -151,6 +152,12 @@ class BuiltinExecutor:
         self._logquery = LogQueryTools(self)
         self._shell = ShellTools(self)
         self._agents = AgentTools(self)
+        # Zone-based access control — set by main.py after construction
+        self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
+        # Per-executor ephemeral request grant tracker (isolated per agent/sub-agent)
+        self.grant_tracker: GrantTracker = GrantTracker()
+        # Per-confirmation zone_path store: token -> original path (for Telegram zone buttons)
+        self._zone_paths: dict[str, str] = {}
         # Name-keyed dispatch registries (replace the former if/elif chains).
         # Each value is a per-tool adapter that forwards exactly the kwargs that
         # tool accepts today (Decision 3); vision_query has no entry — it is
@@ -166,7 +173,7 @@ class BuiltinExecutor:
             "file_write": lambda a, ctx: self._files._exec_file_write(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
             ),
-            "file_send": lambda a, ctx: self._files._exec_file_send(a, caller_tag=ctx.caller_tag),
+            "file_send": lambda a, ctx: self._files._exec_file_send(a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag),
             "schedule": lambda a, ctx: self._exec_schedule(a),
             "spawn_agent": lambda a, ctx: self._exec_spawn_agent(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
@@ -177,7 +184,7 @@ class BuiltinExecutor:
             "file_patch": lambda a, ctx: self._files._exec_file_patch(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
             ),
-            "file_diff": lambda a, ctx: self._files._exec_file_diff(a, caller_tag=ctx.caller_tag),
+            "file_diff": lambda a, ctx: self._files._exec_file_diff(a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag),
             "memory_graph_search": lambda a, ctx: self._memory_tools._exec_memory_graph_search(a, caller_tag=ctx.caller_tag),
             "memory_graph_store": lambda a, ctx: self._memory_tools._exec_memory_graph_store(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
@@ -348,6 +355,7 @@ class BuiltinExecutor:
         would otherwise double-log the completion.
         """
         entry = self._pending.pop(token, None)
+        self._zone_paths.pop(token, None)
         if entry is None:
             return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
         tool_name, args = entry
@@ -373,6 +381,7 @@ class BuiltinExecutor:
         token was still pending. An unknown/expired token is a no-op.
         """
         entry = self._pending.pop(token, None)
+        self._zone_paths.pop(token, None)
         if entry is None:
             return
         tool_name = entry[0]
@@ -404,7 +413,8 @@ class BuiltinExecutor:
     # ------------------------------------------------------------------
 
     def _requires_confirmation(self, tool_name: str, args: dict, description: str,
-                               caller_depth: int = 0, caller_tag: str = "") -> dict:
+                               caller_depth: int = 0, caller_tag: str = "",
+                               zone_path: str = "") -> dict:
         # In headless mode (sub-agents, caller_depth >= 1):
         #   shell/dangerous → always deny (too risky to run destructive commands unattended)
         #   file_read/sensitive, file_write, file_patch → require operator confirmation via Telegram
@@ -429,6 +439,8 @@ class BuiltinExecutor:
 
         token = secrets.token_hex(12)
         self._pending[token] = (tool_name, args)
+        if zone_path:
+            self._zone_paths[token] = zone_path
         logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
         return {
             "requires_confirmation": True,

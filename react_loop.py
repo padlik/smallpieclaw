@@ -19,7 +19,10 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+if TYPE_CHECKING:
+    from builtin_tools.access_control import GrantTracker, TrustedZoneChecker
 
 import agent_logging
 from builtin_tools.schemas import build_tool_definitions
@@ -176,6 +179,13 @@ class ReactContext:
 
     # Strategy memory — Optional[StrategyMemory]; None when disabled/unconfigured
     strategy_memory: Optional[object] = None
+
+    # Zone-based file access control — Optional to allow existing tests/sub-agents to construct
+    # ReactContext without wiring; production paths always inject this from main.py.
+    trusted_zone_checker: Optional["TrustedZoneChecker"] = None
+
+    # Per-agent request grant tracker — isolated from other sub-agents; reset each run
+    grant_tracker: Optional["GrantTracker"] = None
 
     # Creativity mode for prompt assembly — passed through to prompt_loader
     creativity_mode: str = "default"
@@ -823,6 +833,9 @@ def react_loop(
         ctx._tool_defs = None
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
+
+        if ctx.grant_tracker is not None:
+            ctx.grant_tracker.reset()
 
         active_model = ctx.llm.llm_cfg.get("model", "?")
         logger.info("%sstart | model: %s | goal: %s", pfx, active_model, user_goal[:80])

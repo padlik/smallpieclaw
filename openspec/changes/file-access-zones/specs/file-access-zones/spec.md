@@ -10,10 +10,21 @@ Define zone-based access control for all `file_*` built-in tool operations. A `T
 
 The system MUST resolve every path via `os.path.realpath()` and classify it into exactly one zone before executing any `file_*` tool operation.
 
-#### Scenario: Internal agent path is auto-allowed without confirmation
-- **GIVEN** a `file_*` tool is invoked with a path inside an agent-internal directory (`data/`, `tools/`, `tools_generated/`, `skills/`, `prompts/`, log dir, vault dir)
+#### Scenario: Read of internal agent path is auto-allowed without confirmation
+- **GIVEN** a `file_*` read operation (`file_read`, `file_diff`) is invoked with a path inside an agent-internal directory (`data/`, `tools/`, `tools_generated/`, `skills/`, `prompts/`, log dir, vault dir)
 - **WHEN** zone classification runs
 - **THEN** the operation proceeds immediately without any confirmation prompt
+
+#### Scenario: Write to agent code directories requires confirmation
+- **GIVEN** a `file_*` write operation (`file_write`, `file_patch`, `file_send`) is invoked with a path inside an agent code directory (`tools/`, `tools_generated/`, `prompts/`, `skills/`)
+- **WHEN** zone classification runs
+- **THEN** the operation is staged and a confirmation prompt is sent
+- **AND** `[Allow this request]` and `[Add to trusted]` buttons are shown
+
+#### Scenario: Write to agent data directories is auto-allowed
+- **GIVEN** a `file_*` write operation is invoked with a path inside an agent data directory (`data/`, `downloads/`, log dir)
+- **WHEN** zone classification runs
+- **THEN** the write proceeds immediately without any confirmation prompt
 
 #### Scenario: Default trusted path is auto-allowed without confirmation
 - **GIVEN** a `file_*` tool is invoked with a path inside a default trusted directory (`workspace_dir`, `downloads_dir`, `tmp_dir`)
@@ -110,9 +121,9 @@ starts with the zone directory followed by the OS path separator.
 
 ### Requirement: Sensitive-pattern gate does not apply to INTERNAL zone paths
 
-Agent-internal paths (data dir, tools, skills, prompts, logs, vault dir) are auto-allowed
-regardless of filename patterns. The sensitive-pattern gate applies only to TRUSTED and
-REQUEST_GRANT zones.
+Agent-internal paths (data dir, tools, skills, prompts, logs, vault dir) MUST be auto-allowed
+regardless of filename patterns. The sensitive-pattern gate MUST NOT apply to INTERNAL zone
+paths; it applies only to TRUSTED and REQUEST_GRANT zones.
 
 #### Scenario: Vault directory path is INTERNAL and bypasses sensitive-pattern gate
 - **GIVEN** the vault directory is an INTERNAL zone path

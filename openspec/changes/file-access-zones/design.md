@@ -57,12 +57,17 @@ In-memory `set[str]` of absolute directory paths. Populated by **[Allow this req
 
 ```python
 class TrustedZoneChecker:
-    def classify(self, path: str) -> ZoneClassification: ...
-    def grant_for_request(self, path: str) -> None: ...
-    def reset_request_grants(self) -> None: ...
-    def add_trusted(self, path: str) -> None: ...  # persists
-    def remove_trusted(self, index: int) -> str: ...  # returns removed path
+    def classify(self, path: str, request_grants: frozenset[str] = frozenset()) -> ZoneClassification: ...
+    def add_trusted(self, path: str) -> None: ...       # persists to data/trusted_dirs.json
+    def remove_trusted(self, index: int) -> str: ...    # returns removed path
     def list_user_trusted(self) -> list[TrustedDir]: ...
+    def is_write_protected_internal(self, real_path: str) -> bool: ...
+
+class GrantTracker:
+    """Per-executor ephemeral request grant set. One instance per BuiltinExecutor."""
+    def add(self, path: str) -> None: ...       # grants parent dir of path
+    def reset(self) -> None: ...                # called at react_loop() entry
+    def snapshot(self) -> frozenset[str]: ...   # thread-safe snapshot for classify()
 
 class ZoneClassification(Enum):
     INTERNAL = "internal"
@@ -71,6 +76,8 @@ class ZoneClassification(Enum):
     UNRECOGNISED = "unrecognised"
 
 # Derived action: INTERNAL / TRUSTED / REQUEST_GRANT → allow; UNRECOGNISED → confirm
+# Exception: INTERNAL writes to agent code dirs (tools/, tools_generated/, prompts/, skills/)
+# are downgraded to UNRECOGNISED and require confirmation.
 
 @dataclass
 class TrustedDir:
@@ -84,11 +91,15 @@ Current confirmation triggers replaced by zone check:
 
 | Tool | Before | After |
 |------|--------|-------|
-| `file_write` | always confirms | confirms only if `classify(path) == UNRECOGNISED` |
-| `file_patch` | always confirms | confirms only if `classify(path) == UNRECOGNISED` |
+| `file_write` | always confirms | auto-allow if TRUSTED/INTERNAL-data; confirm if UNRECOGNISED or INTERNAL-code (tools/, tools_generated/, prompts/, skills/) |
+| `file_patch` | always confirms | auto-allow if TRUSTED/INTERNAL-data; confirm if UNRECOGNISED or INTERNAL-code (tools/, tools_generated/, prompts/, skills/) |
 | `file_read` | confirms if sensitive pattern | confirms if `classify(path) == UNRECOGNISED` |
 | `file_diff` | no confirmation | zone-checked before each read; if either path is UNRECOGNISED, stage confirmation |
 | `file_send` | no confirmation | zone-checked before read; if UNRECOGNISED, stage confirmation |
+
+**Write-protected internal directories:** `tools/`, `tools_generated/`, `prompts/`, `skills/`
+are INTERNAL for reads (auto-allow) but require confirmation for writes. This protects against
+prompt-injection attacks that attempt to implant executable tools or modify agent instructions.
 
 The existing `_is_sensitive_path()` check stacks on top of zone classification — a path inside a trusted zone that matches a sensitive pattern (`.key`, `.env`, `secrets.*`, etc.) still triggers confirmation.
 
@@ -138,10 +149,13 @@ All `file_*` handlers receive `TrustedZoneChecker` via the existing `owner` / co
 
 ## Concurrency and sub-agent scoping
 
-Each agent instance (main agent and each sub-agent) receives its OWN `TrustedZoneChecker`
-instance. They share the same persisted `data/trusted_dirs.json` (loaded once at construction),
-but the in-memory request grant set is NOT shared. This prevents concurrent sub-agents from
-clearing each other's grants via `reset_request_grants()`.
+Each `BuiltinExecutor` instance owns its own `GrantTracker`. The persistent trust store
+(`_user_trusted`, `_default_trusted_dirs`) and the `TrustedZoneChecker` instance are shared
+between the main agent and sub-agents. The `GrantTracker` is per-executor, but since
+sub-agents currently reuse the main agent's executor, grant sets are effectively shared in
+practice. Full per-sub-agent `GrantTracker` isolation is tracked as a follow-up improvement.
+`reset_request_grants()` (called via `GrantTracker.reset()`) is called at each `react_loop()`
+entry; a sub-agent loop-entry reset clears the parent's in-flight grants (fail-safe behavior).
 
 Sub-agents are headless callers. The existing `_headless_confirm_bridge` remains active for
 UNRECOGNISED zone prompts from sub-agents — the operator is notified out of band and the
