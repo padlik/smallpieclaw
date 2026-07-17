@@ -298,6 +298,7 @@ def _run(
         paths_config=app_cfg.paths,
         data_dir=data_dir,
         agent_name=app_cfg.agent.agent_name,
+        vault_path=vault_file,
     )
     builtin.trusted_zone_checker = _trusted_zone_checker
     # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime

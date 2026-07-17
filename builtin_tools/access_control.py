@@ -90,6 +90,7 @@ class TrustedZoneChecker:
         paths_config: PathsConfig,
         data_dir: str,
         agent_name: str,
+        vault_path: str = "",
     ) -> None:
         """Construct checker from resolved config paths.
 
@@ -97,10 +98,16 @@ class TrustedZoneChecker:
             paths_config: Typed PathsConfig from AppConfig.
             data_dir: Absolute resolved data directory path.
             agent_name: Agent name used to derive log and vault XDG paths.
+            vault_path: Absolute path to the vault file; excluded from INTERNAL
+                auto-allow to prevent silent reads bypassing secret_get confirmation.
         """
         self._data_dir = os.path.realpath(data_dir)
         self._trusted_dirs_path = os.path.normcase(
             os.path.join(self._data_dir, "trusted_dirs.json")
+        )
+        self._vault_path: str = (
+            os.path.normcase(os.path.realpath(os.path.expanduser(vault_path)))
+            if vault_path else ""
         )
 
         # Internal dirs — auto-allow, resolved at construction time
@@ -169,8 +176,10 @@ class TrustedZoneChecker:
         """
         real = os.path.realpath(os.path.expanduser(path))
 
-        # INTERNAL: check first, but explicitly exclude trusted_dirs.json
+        # INTERNAL: check first, but explicitly exclude trusted_dirs.json and vault file
         if os.path.normcase(real) == self._trusted_dirs_path:
+            return ZoneClassification.UNRECOGNISED
+        if self._vault_path and os.path.normcase(real) == self._vault_path:
             return ZoneClassification.UNRECOGNISED
         for zone in self._internal_dirs:
             if _is_contained(real, zone):

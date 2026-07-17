@@ -73,6 +73,20 @@ class TestClassify:
             checker = _make_checker(tmp)
             assert checker.classify("/nonexistent/random/path/file.txt") == ZoneClassification.UNRECOGNISED
 
+    def test_vault_file_is_unrecognised(self):
+        """Vault file must not be auto-allowed even though it lives in an INTERNAL XDG dir."""
+        with tempfile.TemporaryDirectory() as tmp:
+            vault_file = os.path.join(tmp, "vault.toml")
+            checker = TrustedZoneChecker(
+                paths_config=_make_paths(tmp),
+                data_dir=os.path.join(tmp, "data"),
+                agent_name="test-agent",
+                vault_path=vault_file,
+            )
+            # Even if the vault dir happens to be inside an internal dir, the specific
+            # vault file must return UNRECOGNISED to force confirmation on reads.
+            assert checker.classify(vault_file) == ZoneClassification.UNRECOGNISED
+
     def test_user_added_trusted_is_trusted(self):
         with tempfile.TemporaryDirectory() as tmp:
             with tempfile.TemporaryDirectory() as some_dir:

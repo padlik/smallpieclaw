@@ -144,8 +144,8 @@ class FileTools:
     # ---- file_diff ----
 
     def _exec_file_diff(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
-        path_a = str(args.get("path_a", "")).strip()
-        path_b = str(args.get("path_b", "")).strip()
+        path_a = os.path.expanduser(str(args.get("path_a", "")).strip())
+        path_b = os.path.expanduser(str(args.get("path_b", "")).strip())
         if not path_a or not path_b:
             return {
                 "success": False, "output": "",
@@ -220,8 +220,8 @@ class FileTools:
 
     def _run_file_diff(self, args: dict, caller_tag: str = "") -> dict:
         """Execute file_diff after zone gate has passed."""
-        path_a = str(args.get("path_a", "")).strip()
-        path_b = str(args.get("path_b", "")).strip()
+        path_a = os.path.expanduser(str(args.get("path_a", "")).strip())
+        path_b = os.path.expanduser(str(args.get("path_b", "")).strip())
         try:
             context_lines = int(args.get("context_lines", 3))
         except (TypeError, ValueError):
