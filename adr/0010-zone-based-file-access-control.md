@@ -18,7 +18,7 @@ Prior to this change, `file_*` built-in tools had no path-based access boundary.
 
 A replacement model is needed that clearly separates the user's working areas (trusted zones) from the rest of the filesystem, and enforces that boundary at the `file_*` tool layer before any operation is performed.
 
-Agent-internal directories (data, tools, skills, prompts, XDG dirs) are deliberately excluded from the trusted set. The implementation detail of how internal data is stored must remain opaque to the LLM; dedicated built-in tools (`memory_read`, `secret_get`, `log_query`) are the intended access path for agent-internal data.
+Agent-internal directories (data, tools, skills, prompts, XDG dirs) are deliberately excluded from the trusted set. `file_*` access to internal paths is confirmation-gated, not silently accessible. Dedicated built-in tools (`memory_read`, `secret_get`, `log_query`) are the intended access path for agent-internal data; direct `file_*` access requires explicit user confirmation.
 
 ## Decision
 
@@ -36,7 +36,7 @@ The existing sensitive-pattern gate (`_is_sensitive_path()`) stacks on top of zo
 
 - Good, because routine writes to the user's workspace proceed without confirmation friction.
 - Good, because accidental agent access to arbitrary filesystem locations is gated at the tool layer before any effect.
-- Good, because agent-internal implementation details (memory files, vault, logs) are opaque to the LLM via `file_*` tools; the LLM uses dedicated built-ins for internal data access.
+- Good, because `file_*` access to agent-internal paths (memory, vault, logs) is confirmation-gated; the LLM is directed to dedicated built-ins for internal data access rather than raw file paths.
 - Good, because the trusted set is user-controlled and dynamically extensible without restarting the agent.
 - Good, because `realpath()` prevents zone bypass via symlink or `..` traversal.
 - Good, because trusted dirs can be marked read-only to allow inspection without write risk.
@@ -44,4 +44,4 @@ The existing sensitive-pattern gate (`_is_sensitive_path()`) stacks on top of zo
 - Bad, because the behavior change for `file_write`/`file_patch` (no longer always confirming inside trusted zones) is a UX inversion that may surprise operators upgrading from prior versions.
 - Neutral, because the shell tool is explicitly out of scope for this boundary and will be addressed in a future sandboxing change.
 - Bad, because the default `workspace_dir = ~/Documents` encompasses the agent's own source tree on typical developer machines (e.g. `~/Documents/develop/<repo>`), making the agent capable of silently modifying its own code without confirmation under the default configuration.
-- Neutral, because each agent instance (main + sub-agents) must receive its own `TrustedZoneChecker` instance to prevent concurrent request-grant interference; the persisted trust list (`data/trusted_dirs.json`) is shared read-only at construction time.
+- Neutral, because ONE `TrustedZoneChecker` instance is shared between the main agent and sub-agents (the persistent trust store is read-only after construction); request-grant isolation is provided by a per-`BuiltinExecutor` `GrantTracker`, not by separate checker instances.

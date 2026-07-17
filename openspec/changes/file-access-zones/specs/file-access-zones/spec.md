@@ -41,6 +41,28 @@ The system MUST resolve every path via `os.path.realpath()` and classify it into
 - **THEN** the resolved absolute real path is used for zone comparison
 - **AND** a symlink inside a trusted dir that resolves to a path outside all trusted zones is treated as unrecognised
 
+#### Scenario: Vault file path is UNRECOGNISED and confirmation-gated
+- **GIVEN** the vault file (`~/.local/share/<agent>/secrets.toml`) is an agent-internal path
+- **WHEN** `file_read` is invoked with the vault file path
+- **THEN** the path classifies as UNRECOGNISED and a confirmation prompt is sent
+- **AND** the `secret_get` built-in tool remains the intended interface for reading secrets
+
+### Requirement: file_diff zone-checks both paths independently
+
+`file_diff` MUST classify both `path_a` and `path_b` before executing. If either path is UNRECOGNISED, the entire operation is staged for confirmation.
+
+#### Scenario: file_diff with one unrecognised path stages confirmation
+- **GIVEN** `path_a` is inside `workspace_dir` (TRUSTED)
+- **AND** `path_b` is outside all trusted zones (UNRECOGNISED)
+- **WHEN** `file_diff` is invoked
+- **THEN** the operation is staged and a confirmation prompt is sent
+- **AND** neither path has been read at the time of the prompt
+
+#### Scenario: file_diff with both trusted paths proceeds without confirmation
+- **GIVEN** both `path_a` and `path_b` are inside `workspace_dir` (TRUSTED)
+- **WHEN** `file_diff` is invoked
+- **THEN** the diff executes immediately without any confirmation prompt
+
 ### Requirement: Trusted directories support read-only mode
 
 A user-added trusted directory entry MAY carry a `mode` field: `"r"` (read-only) or `"rw"` (read-write, default). The mode is checked at classify time based on the requested operation type passed by each `file_*` tool.

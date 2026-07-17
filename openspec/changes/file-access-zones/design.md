@@ -50,8 +50,8 @@ In-memory `set[str]` of absolute directory paths. Populated by **[Allow this req
 
 ```python
 class TrustedZoneChecker:
-    def classify(self, path: str, operation: str = "rw", request_grants: frozenset[str] = frozenset()) -> ZoneClassification: ...
-    # operation: "read" | "write" — used to downgrade "r"-mode trusted dirs for writes
+    def classify(self, path: str, operation: str = "write", request_grants: frozenset[str] = frozenset()) -> ZoneClassification: ...
+    # operation: "read" | "write" — defaults to "write" (fail-safe: omitting operation never silently allows writes to r-mode dirs)
     def add_trusted(self, path: str, mode: str = "rw") -> None: ...   # persists to data/trusted_dirs.json
     def remove_trusted(self, index: int) -> str: ...    # returns removed path
     def list_user_trusted(self) -> list[TrustedDir]: ...
@@ -94,7 +94,7 @@ Each tool passes `operation="read"` or `operation="write"` to `classify()`. The 
 
 Out-of-zone prompts gain two new inline buttons alongside the existing `[Approve]` / `[Deny]`:
 
-- **[Allow this request]** — calls `checker.grant_for_request(path)`; operation proceeds; future accesses to the same directory within this request are silent.
+- **[Allow this request]** — calls `grant_tracker.add(path)`; operation proceeds; future accesses to the same directory within this request are silent.
 - **[Add to trusted]** — calls `checker.add_trusted(os.path.dirname(realpath(path)))`; persists to `data/trusted_dirs.json`; operation proceeds; future accesses silent permanently.
 
 Both new buttons are handled in `telegram_callbacks.py`.
@@ -122,13 +122,16 @@ Default trusted dirs are intentionally excluded from the listing — they are fi
 
 ## ReactContext changes
 
-`ReactContext` dataclass (`react_loop.py`) gains:
+`ReactContext` dataclass (`react_loop.py`) gains two fields:
 
 ```python
 trusted_zone_checker: TrustedZoneChecker
+grant_tracker: Optional[GrantTracker]   # per-executor GrantTracker for request-grant isolation
 ```
 
-`react_loop()` calls `ctx.trusted_zone_checker.reset_request_grants()` once at loop entry, before tool dispatch begins.
+`react_loop()` calls `ctx.grant_tracker.reset()` once at loop entry, before tool dispatch begins. This clears all in-request directory grants from the previous cycle.
+
+`file_*` handlers call `classify(path, operation, request_grants=ctx.grant_tracker.snapshot())` to pass the current grant set without holding a lock across I/O. The `GrantTracker` lives on `BuiltinExecutor` (one per executor); `ReactContext` holds a reference to the same object for lifecycle management (`reset()`).
 
 All `file_*` handlers receive `TrustedZoneChecker` via the existing `owner` / context pattern (same as `_owner.max_output`, `_owner._requires_confirmation()`).
 
@@ -158,9 +161,11 @@ trusted_zone_checker = TrustedZoneChecker(
     agent_name=app_cfg.agent.agent_name,
 )
 builtin_executor.trusted_zone_checker = trusted_zone_checker  # files.py reads via self._owner.trusted_zone_checker.classify()
+# grant_tracker is owned by BuiltinExecutor; ReactContext holds a reference for lifecycle (reset at loop entry)
 react_context = ReactContext(
     ...,
-    trusted_zone_checker=trusted_zone_checker,  # used for reset_request_grants()
+    trusted_zone_checker=trusted_zone_checker,
+    grant_tracker=builtin_executor.grant_tracker,
 )
 ```
 

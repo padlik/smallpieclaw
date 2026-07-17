@@ -10,11 +10,12 @@ Define the operator interface for managing user-defined trusted directories: the
 
 The `/dir list` command MUST display only user-added trusted directories. Default protected directories (`workspace_dir`, `downloads_dir`, `tmp_dir`) MUST NOT appear in the listing.
 
-#### Scenario: /dir list shows user-added dirs with enumeration
-- **GIVEN** the user has added `/Users/paul/projects` and `/srv/data` to trusted dirs
+#### Scenario: /dir list shows user-added dirs with enumeration and mode
+- **GIVEN** the user has added `/Users/paul/projects` (rw) and `/srv/data` (r) to trusted dirs
 - **WHEN** the operator sends `/dir list`
 - **THEN** the response lists both directories with sequential numbers starting at 1
 - **AND** the listing is sorted by directory path name
+- **AND** each entry shows its mode annotation (`[rw]` or `[r]`)
 - **AND** default trusted directories are not shown
 
 #### Scenario: /dir list shows empty state message when no dirs added
@@ -52,7 +53,7 @@ Tapping **[Add to trusted]** on an out-of-zone confirmation prompt MUST persist 
 - **GIVEN** the agent requests access to `/Users/paul/projects/myapp/README.md`
 - **AND** the prompt is shown with `[Add to trusted]`
 - **WHEN** the operator taps `[Add to trusted]`
-- **THEN** `/Users/paul/projects/myapp` is added to the trusted directory list
+- **THEN** `/Users/paul/projects/myapp` is added to the trusted directory list with `mode: "rw"`
 - **AND** the file operation proceeds
 - **AND** future accesses to any path under `/Users/paul/projects/myapp/` are silent
 
