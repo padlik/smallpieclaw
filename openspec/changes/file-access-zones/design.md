@@ -182,3 +182,5 @@ Resolved via `os.path.expanduser()` at `TrustedZoneChecker` construction (then `
 ## New data file
 
 `data/trusted_dirs.json` — created on first **[Add to trusted]** action, absent until then. The `TrustedZoneChecker` handles missing file gracefully (starts with empty user-added list). Entries without a `mode` field are treated as `"rw"` for backward compatibility.
+
+**Defense-in-depth overrides:** `data/trusted_dirs.json` and the vault file (`~/.local/share/<agent>/secrets.toml`) are always classified as UNRECOGNISED by `classify()`, even if a parent directory (e.g. `data/` or `~/.local/share/<agent>/`) appears in the trusted set. This prevents a user-added trusted dir from accidentally making the trust store itself silently writable or the vault silently readable.
