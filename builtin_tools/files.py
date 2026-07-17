@@ -52,6 +52,7 @@ class FileTools:
         checker = self._checker
         if checker is not None:
             real_path = os.path.realpath(os.path.expanduser(path))
+            args["_resolved_path"] = real_path
             zone = checker.classify(path, operation="read", request_grants=self._request_grants())
             sensitive, reason = _is_sensitive_path(path)
             if zone == ZoneClassification.UNRECOGNISED:
@@ -84,7 +85,7 @@ class FileTools:
         return self._run_file_read(args, caller_tag=caller_tag)
 
     def _run_file_read(self, args: dict, caller_tag: str = "") -> dict:
-        path = str(args.get("path", "")).strip()
+        path = args.get("_resolved_path") or str(args.get("path", "")).strip()
         max_bytes = int(args.get("max_bytes", 50_000))
         offset = int(args.get("offset", 0))
         logger.info("Built-in file_read: %s (offset=%d, max=%d)", path, offset, max_bytes)
@@ -162,6 +163,8 @@ class FileTools:
         if checker is not None:
             real_path_a = os.path.realpath(os.path.expanduser(path_a))
             real_path_b = os.path.realpath(os.path.expanduser(path_b))
+            args["_resolved_path_a"] = real_path_a
+            args["_resolved_path_b"] = real_path_b
             grants = self._request_grants()
             zone_a = checker.classify(path_a, operation="read", request_grants=grants)
             zone_b = checker.classify(path_b, operation="read", request_grants=grants)
@@ -216,8 +219,8 @@ class FileTools:
 
     def _run_file_diff(self, args: dict, caller_tag: str = "") -> dict:
         """Execute file_diff after zone gate has passed."""
-        path_a = os.path.expanduser(str(args.get("path_a", "")).strip())
-        path_b = os.path.expanduser(str(args.get("path_b", "")).strip())
+        path_a = args.get("_resolved_path_a") or os.path.expanduser(str(args.get("path_a", "")).strip())
+        path_b = args.get("_resolved_path_b") or os.path.expanduser(str(args.get("path_b", "")).strip())
         try:
             context_lines = int(args.get("context_lines", 3))
         except (TypeError, ValueError):
@@ -268,6 +271,7 @@ class FileTools:
         checker = self._checker
         if checker is not None:
             real_path = os.path.realpath(os.path.expanduser(path))
+            args["_resolved_path"] = real_path
             if real_path != path:
                 desc += f"\n(→ <code>{real_path}</code>)"
             zone = checker.classify(path, operation="write", request_grants=self._request_grants())
@@ -292,7 +296,7 @@ class FileTools:
         return self._owner._requires_confirmation("file_write", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
     def _run_file_write(self, args: dict, caller_tag: str = "") -> dict:
-        path = str(args.get("path", "")).strip()
+        path = args.get("_resolved_path") or str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
         mode = str(args.get("mode", "w"))
         if mode not in ("w", "a"):
@@ -352,6 +356,7 @@ class FileTools:
 
         # FIX 2: realpath + zone classification BEFORE any file read (content oracle fix)
         real_path = os.path.realpath(os.path.expanduser(path))
+        args["_resolved_path"] = real_path
         checker = self._checker
         zone = None
         if checker is not None:
@@ -401,7 +406,7 @@ class FileTools:
         return self._owner._requires_confirmation("file_patch", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
     def _run_file_patch(self, args: dict, caller_tag: str = "") -> dict:
-        path = str(args.get("path", "")).strip()
+        path = args.get("_resolved_path") or str(args.get("path", "")).strip()
         old_str = str(args.get("old_str", ""))
         new_str = str(args.get("new_str", ""))
         try:
@@ -461,6 +466,7 @@ class FileTools:
 
         checker = self._checker
         real_path = os.path.realpath(path)
+        args["_resolved_path"] = real_path
         if checker is not None:
             zone = checker.classify(path, operation="read", request_grants=self._request_grants())
             sensitive, reason = _is_sensitive_path(path)
@@ -499,7 +505,7 @@ class FileTools:
 
     def _run_file_send(self, args: dict, caller_tag: str = "") -> dict:
         """Execute file_send after zone gate has passed."""
-        path = os.path.expanduser(str(args.get("path", "")).strip())
+        path = args.get("_resolved_path") or os.path.expanduser(str(args.get("path", "")).strip())
         caption = str(args.get("caption", "")).strip()
         if not os.path.exists(path):
             return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}

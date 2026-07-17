@@ -180,6 +180,22 @@ class TestClassify:
             checker.add_trusted(os.path.dirname(vault_file))
             assert checker.classify(vault_file) == ZoneClassification.UNRECOGNISED
 
+    def test_overlapping_trusted_most_restrictive_wins(self):
+        """When a path matches both rw and r trusted entries, r wins for writes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as parent:
+                child = os.path.join(parent, "secret")
+                os.makedirs(child)
+                checker = _make_checker(tmp)
+                checker.add_trusted(parent, mode="rw")
+                checker.add_trusted(child, mode="r")
+                # Read inside child: TRUSTED (both match, read allowed)
+                assert checker.classify(os.path.join(child, "f.txt"), operation="read") == ZoneClassification.TRUSTED
+                # Write inside child: UNRECOGNISED (r-mode match blocks write)
+                assert checker.classify(os.path.join(child, "f.txt"), operation="write") == ZoneClassification.UNRECOGNISED
+                # Write inside parent (not child): TRUSTED (only rw matches)
+                assert checker.classify(os.path.join(parent, "other.txt"), operation="write") == ZoneClassification.TRUSTED
+
     def test_trusted_parent_does_not_unlock_trust_store(self):
         """trusted_dirs.json remains UNRECOGNISED even when data/ is added to trusted."""
         with tempfile.TemporaryDirectory() as tmp:

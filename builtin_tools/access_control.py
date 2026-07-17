@@ -165,15 +165,23 @@ class TrustedZoneChecker:
             if _is_contained(real, zone):
                 return ZoneClassification.TRUSTED
 
-        # TRUSTED: user-added dirs — respect mode field
+        # TRUSTED: user-added dirs — most restrictive match wins
+        # (if any matching entry is r-mode and operation is write, block)
         with self._user_trusted_lock:
             user_trusted_snapshot = list(self._user_trusted)
+        has_r_match = False
+        has_rw_match = False
         for entry in user_trusted_snapshot:
             zone = os.path.realpath(os.path.expanduser(entry.path))
             if _is_contained(real, zone):
-                if entry.mode == "r" and operation == "write":
-                    return ZoneClassification.UNRECOGNISED
-                return ZoneClassification.TRUSTED
+                if entry.mode == "r":
+                    has_r_match = True
+                else:
+                    has_rw_match = True
+        if has_r_match or has_rw_match:
+            if has_r_match and operation == "write":
+                return ZoneClassification.UNRECOGNISED
+            return ZoneClassification.TRUSTED
 
         # REQUEST_GRANT: per-request directory grants
         for zone in request_grants:
