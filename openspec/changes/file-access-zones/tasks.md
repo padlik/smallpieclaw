@@ -58,4 +58,4 @@
 ## 8. Validation
 
 - [x] 8.1 Run `make check` (lint + tests) and confirm clean
-- [ ] 8.2 Run `openspec validate file-access-zones --type change --strict` and confirm no spec violations
+- [x] 8.2 Run `openspec validate file-access-zones --type change --strict` and confirm no spec violations
