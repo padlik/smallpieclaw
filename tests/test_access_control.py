@@ -67,7 +67,7 @@ class TestClassify:
             assert checker.classify("/nonexistent/random/path/file.txt") == ZoneClassification.UNRECOGNISED
 
     def test_vault_file_is_unrecognised(self):
-        """Vault file must not be auto-allowed even though it lives in an INTERNAL XDG dir."""
+        """Vault file must not be auto-allowed even though it lives in an agent-internal path."""
         with tempfile.TemporaryDirectory() as tmp:
             vault_file = os.path.join(tmp, "vault.toml")
             checker = TrustedZoneChecker(
@@ -460,3 +460,9 @@ class TestPersistence:
                 entries = checker2.list_user_trusted()
                 assert len(entries) == 1
                 assert entries[0].mode == "rw"
+
+    def test_add_trusted_invalid_mode_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = _make_checker(tmp)
+            with pytest.raises(ValueError):
+                checker.add_trusted("/some/path", mode="ro")

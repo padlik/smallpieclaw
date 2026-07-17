@@ -14,7 +14,6 @@ from builtin_tools.files import FileTools
 def _make_file_tools(zone: ZoneClassification) -> tuple[FileTools, MagicMock, MagicMock]:
     checker = MagicMock()
     checker.classify.return_value = zone
-    checker.is_write_protected_internal.return_value = False
 
     owner = MagicMock()
     owner.trusted_zone_checker = checker
@@ -30,7 +29,6 @@ def _make_file_tools_diff(
     """Factory for file_diff tests where path_a and path_b may have different zones."""
     checker = MagicMock()
     checker.classify.side_effect = [zone_a, zone_b]
-    checker.is_write_protected_internal.return_value = False
 
     owner = MagicMock()
     owner.trusted_zone_checker = checker
@@ -367,7 +365,6 @@ class TestConfirmRoundTrip:
         builtin = BuiltinExecutor()
         checker = MagicMock()
         checker.classify.return_value = ZoneClassification.UNRECOGNISED
-        checker.is_write_protected_internal.return_value = False
         builtin.trusted_zone_checker = checker  # type: ignore[assignment]  # type: ignore[assignment]
         builtin.grant_tracker = GrantTracker()
         return builtin

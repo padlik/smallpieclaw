@@ -184,6 +184,8 @@ class TrustedZoneChecker:
 
     def add_trusted(self, path: str, mode: str = "rw") -> None:
         """Persist a user-added trusted directory to data/trusted_dirs.json."""
+        if mode not in {"r", "rw"}:
+            raise ValueError(f"Invalid mode {mode!r}; must be 'r' or 'rw'")
         real = os.path.realpath(os.path.expanduser(path))
         with self._user_trusted_lock:
             existing = {os.path.realpath(os.path.expanduser(e.path)) for e in self._user_trusted}

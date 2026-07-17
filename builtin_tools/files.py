@@ -75,7 +75,7 @@ class FileTools:
                 )
             return self._run_file_read(args, caller_tag=caller_tag)
 
-        # Fallback: no checker wired — use legacy sensitive-only gate
+        # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
         logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_read")
         sensitive, reason = _is_sensitive_path(path)
         if sensitive:
@@ -196,6 +196,7 @@ class FileTools:
                     zone_path=unrecognised_path or "",
                 )
         else:
+            # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
             logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_diff")
             sensitive_a, reason_a = _is_sensitive_path(path_a)
             sensitive_b, reason_b = _is_sensitive_path(path_b)
@@ -483,6 +484,7 @@ class FileTools:
                     caller_depth=caller_depth, caller_tag=caller_tag,
                 )
         else:
+            # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
             logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_send")
             sensitive, reason = _is_sensitive_path(path)
             if sensitive:
