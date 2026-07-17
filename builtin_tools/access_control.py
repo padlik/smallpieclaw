@@ -1,13 +1,13 @@
 """Zone-based file access control for file_* built-in tools.
 
-TrustedZoneChecker classifies every path into one of four zones:
-  INTERNAL      - agent-owned dirs (data/, tools/, skills/, etc.) — auto-allow
+TrustedZoneChecker classifies every path into one of three zones:
   TRUSTED       - user workspace + downloads + tmp + user-added dirs — auto-allow
   REQUEST_GRANT - per-request directory grant (cleared each user message) — auto-allow
   UNRECOGNISED  - everything else — stage confirmation prompt
 
-data/trusted_dirs.json is excluded from INTERNAL auto-allow to prevent the LLM
-from silently modifying the trust store; writes to it go through _requires_confirmation.
+data/trusted_dirs.json and the vault file are always UNRECOGNISED even if a parent
+directory appears in the trusted set (defense-in-depth: prevents silent rewrite of
+the trust store or silent read of secrets).
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 class ZoneClassification(Enum):
     """Priority-ordered zone classification for file path access control."""
 
-    INTERNAL = "internal"
     TRUSTED = "trusted"
     REQUEST_GRANT = "request_grant"
     UNRECOGNISED = "unrecognised"
@@ -43,6 +42,7 @@ class TrustedDir:
 
     path: str
     added: str  # ISO8601 timestamp
+    mode: str = "rw"  # "rw" or "r"
 
 
 def _is_contained(path: str, zone_dir: str) -> bool:
@@ -97,9 +97,9 @@ class TrustedZoneChecker:
         Args:
             paths_config: Typed PathsConfig from AppConfig.
             data_dir: Absolute resolved data directory path.
-            agent_name: Agent name used to derive log and vault XDG paths.
-            vault_path: Absolute path to the vault file; excluded from INTERNAL
-                auto-allow to prevent silent reads bypassing secret_get confirmation.
+            agent_name: Agent name used to derive tmp dir fallback path.
+            vault_path: Absolute path to the vault file; always UNRECOGNISED
+                to prevent silent reads bypassing secret_get confirmation.
         """
         self._data_dir = os.path.realpath(data_dir)
         self._trusted_dirs_path = os.path.normcase(
@@ -110,25 +110,7 @@ class TrustedZoneChecker:
             if vault_path else ""
         )
 
-        # Internal dirs — auto-allow, resolved at construction time
-        internal_candidates = [
-            paths_config.tools_dir,
-            paths_config.generated_tools_dir,
-            data_dir,
-            paths_config.skills_dir,
-            paths_config.prompts_dir,
-            # XDG log dir: ~/.local/state/<agent>/logs/
-            os.path.expanduser(f"~/.local/state/{agent_name}/logs"),
-            # XDG vault dir: ~/.local/share/<agent>/
-            os.path.expanduser(f"~/.local/share/{agent_name}"),
-        ]
-        self._internal_dirs: list[str] = []
-        for d in internal_candidates:
-            resolved = os.path.realpath(os.path.expanduser(d))
-            if resolved and resolved not in self._internal_dirs:
-                self._internal_dirs.append(resolved)
-
-        # Default trusted dirs (protected, non-removable)
+        # Default trusted dirs (non-removable)
         trusted_candidates = [
             paths_config.workspace_dir,
             paths_config.downloads_dir,
@@ -142,22 +124,6 @@ class TrustedZoneChecker:
             if resolved and resolved not in self._default_trusted_dirs:
                 self._default_trusted_dirs.append(resolved)
 
-        # Write-protected internal subdirs — INTERNAL zone but writes require confirmation
-        # (ops that write/patch/send these dirs are downgraded to UNRECOGNISED)
-        _wp_candidates = [
-            paths_config.tools_dir,
-            paths_config.generated_tools_dir,
-            paths_config.prompts_dir,
-            paths_config.skills_dir,
-            # XDG dirs are INTERNAL but also write-protected — vault.toml and logs must not be
-            # silently overwritten by the LLM
-            os.path.expanduser(f"~/.local/state/{agent_name}/logs"),
-            os.path.expanduser(f"~/.local/share/{agent_name}"),
-        ]
-        self._write_protected_internal_dirs: list[str] = [
-            os.path.realpath(os.path.expanduser(d)) for d in _wp_candidates if d
-        ]
-
         # User-added trusted dirs — loaded from disk
         self._user_trusted: list[TrustedDir] = self._load_user_trusted()
         self._user_trusted_lock = threading.Lock()
@@ -166,51 +132,47 @@ class TrustedZoneChecker:
     # Public API
     # ------------------------------------------------------------------
 
-    def classify(self, path: str, request_grants: frozenset[str] = frozenset()) -> ZoneClassification:
+    def classify(self, path: str, operation: str = "write", request_grants: frozenset[str] = frozenset()) -> ZoneClassification:
         """Classify path into a zone. Always uses realpath for comparison.
 
         Args:
             path: File path to classify (expanded and realpath'd internally).
+            operation: "read" or "write" — used to enforce r-only user-added dirs.
             request_grants: Snapshot from GrantTracker.snapshot() for the current
                 request cycle. Pass frozenset() when no grants are active.
         """
         real = os.path.realpath(os.path.expanduser(path))
 
-        # INTERNAL: check first, but explicitly exclude trusted_dirs.json and vault file
+        # Defense-in-depth overrides: trust-store and vault are always UNRECOGNISED
+        # even if a parent directory is in the trusted set.
         if os.path.normcase(real) == self._trusted_dirs_path:
             return ZoneClassification.UNRECOGNISED
         if self._vault_path and os.path.normcase(real) == self._vault_path:
             return ZoneClassification.UNRECOGNISED
-        for zone in self._internal_dirs:
-            if _is_contained(real, zone):
-                return ZoneClassification.INTERNAL
 
-        # TRUSTED: default protected dirs + user-added
+        # TRUSTED: default protected dirs (always rw)
         for zone in self._default_trusted_dirs:
             if _is_contained(real, zone):
                 return ZoneClassification.TRUSTED
+
+        # TRUSTED: user-added dirs — respect mode field
         with self._user_trusted_lock:
             user_trusted_snapshot = list(self._user_trusted)
         for entry in user_trusted_snapshot:
             zone = os.path.realpath(os.path.expanduser(entry.path))
             if _is_contained(real, zone):
+                if entry.mode == "r" and operation == "write":
+                    return ZoneClassification.UNRECOGNISED
                 return ZoneClassification.TRUSTED
 
-        # REQUEST_GRANT: per-request directory grants (caller-supplied snapshot)
+        # REQUEST_GRANT: per-request directory grants
         for zone in request_grants:
             if _is_contained(real, zone):
                 return ZoneClassification.REQUEST_GRANT
 
         return ZoneClassification.UNRECOGNISED
 
-    def is_write_protected_internal(self, real_path: str) -> bool:
-        """Return True if real_path is inside an agent code directory (tools/prompts/skills)."""
-        for zone in self._write_protected_internal_dirs:
-            if _is_contained(real_path, zone):
-                return True
-        return False
-
-    def add_trusted(self, path: str) -> None:
+    def add_trusted(self, path: str, mode: str = "rw") -> None:
         """Persist a user-added trusted directory to data/trusted_dirs.json."""
         real = os.path.realpath(os.path.expanduser(path))
         with self._user_trusted_lock:
@@ -221,6 +183,7 @@ class TrustedZoneChecker:
             entry = TrustedDir(
                 path=real,
                 added=datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+                mode=mode,
             )
             self._user_trusted.append(entry)
             self._save_user_trusted()
@@ -258,14 +221,14 @@ class TrustedZoneChecker:
         try:
             with open(self._trusted_dirs_path) as f:
                 raw = json.load(f)
-            return [TrustedDir(path=e["path"], added=e.get("added", "")) for e in raw if "path" in e]
+            return [TrustedDir(path=e["path"], added=e.get("added", ""), mode=e.get("mode", "rw")) for e in raw if "path" in e]
         except Exception as exc:
             logger.warning("Zone: failed to load trusted_dirs.json: %s", exc)
             return []
 
     def _save_user_trusted(self) -> None:
         """Atomically persist user-added dirs to trusted_dirs.json."""
-        data = [{"path": e.path, "added": e.added} for e in self._user_trusted]
+        data = [{"path": e.path, "added": e.added, "mode": e.mode} for e in self._user_trusted]
         _atomic_save_json(self._trusted_dirs_path, data)
 
 

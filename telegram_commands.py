@@ -1001,7 +1001,7 @@ async def cmd_dir(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
         if not dirs:
             await msg.reply_text("No custom trusted directories added yet.")
             return
-        lines = [f"  {i}. {d.path}" for i, d in enumerate(dirs, 1)]
+        lines = [f"  {i}. {d.path} [{d.mode}]" for i, d in enumerate(dirs, 1)]
         await msg.reply_text("Trusted directories:\n" + "\n".join(lines))
 
     elif sub == "del":

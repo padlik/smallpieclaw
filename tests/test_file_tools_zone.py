@@ -82,37 +82,30 @@ class TestFileWriteZone:
             call_kwargs = owner._requires_confirmation.call_args.kwargs
             assert "zone_path" not in call_kwargs
 
-    def test_file_write_internal_zone_no_confirm(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "output.txt")
-            ft, owner, _ = _make_file_tools(ZoneClassification.INTERNAL)
-            ft._exec_file_write({"path": path, "content": "x"})
-            owner._requires_confirmation.assert_not_called()
-
-    def test_file_write_internal_write_protected_confirms(self):
-        """FIX 1: writes to write-protected internal dirs (tools/) require confirmation."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "tools", "my_tool.sh")
-            ft, owner, checker = _make_file_tools(ZoneClassification.INTERNAL)
-            checker.is_write_protected_internal.return_value = True
-            with patch("builtin_tools.files._is_sensitive_path", return_value=(False, "")):
-                result = ft._exec_file_write({"path": path, "content": "x"})
-            owner._requires_confirmation.assert_called_once()
+    def test_file_write_read_only_trusted_confirms(self):
+        """Write to a read-only trusted dir requires confirmation."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ft, owner, checker = _make_file_tools(ZoneClassification.TRUSTED)
+            # Override: make checker return UNRECOGNISED for write to r-mode dir
+            checker.classify.return_value = ZoneClassification.UNRECOGNISED
+            path = os.path.join(tmp_dir, "file.txt")
+            args = {"path": path, "content": "data"}
+            result = ft._exec_file_write(args)
             assert result.get("requires_confirmation") is True
-            call_kwargs = owner._requires_confirmation.call_args.kwargs
-            assert call_kwargs.get("zone_path") == os.path.realpath(path)
 
 
 class TestFileReadZone:
-    def test_file_read_internal_no_confirm(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "data.txt")
-            with open(path, "w") as f:
-                f.write("hello")
-            ft, owner, _ = _make_file_tools(ZoneClassification.INTERNAL)
-            result = ft._exec_file_read({"path": path})
-            owner._requires_confirmation.assert_not_called()
-            assert result["success"] is True
+    def test_file_read_agent_internal_path_confirms(self):
+        """Agent-internal paths (data/, tools/) are UNRECOGNISED in 3-zone model."""
+        ft, owner, _ = _make_file_tools(ZoneClassification.UNRECOGNISED)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            args = {"path": path}
+            result = ft._exec_file_read(args)
+            assert result.get("requires_confirmation") is True
+        finally:
+            os.unlink(path)
 
     def test_file_read_trusted_no_confirm(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,15 +178,6 @@ class TestFilePatchZone:
         with open(path, "w") as f:
             f.write(content)
         return path
-
-    def test_file_patch_internal_no_confirm(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_file(tmp)
-            ft, owner, _ = _make_file_tools(ZoneClassification.INTERNAL)
-            with patch("builtin_tools.files._is_sensitive_path", return_value=(False, "")):
-                result = ft._exec_file_patch({"path": path, "old_str": "hello", "new_str": "hi"})
-            owner._requires_confirmation.assert_not_called()
-            assert result["success"] is True
 
     def test_file_patch_unrecognised_confirms(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -367,20 +351,6 @@ class TestFileSendZone:
         owner._requires_confirmation.assert_called_once()
         assert result.get("requires_confirmation") is True
 
-    def test_file_send_internal_sensitive_confirms(self):
-        """FIX 1: INTERNAL zone no longer bypasses the sensitive path check."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_file(tmp)
-            ft, owner, checker = _make_file_tools(ZoneClassification.INTERNAL)
-            checker.is_write_protected_internal.return_value = False
-            with patch("builtin_tools.files._is_sensitive_path", return_value=(True, "sensitive file")):
-                result = ft._exec_file_send({"path": path})
-            owner._requires_confirmation.assert_called_once()
-            assert result.get("requires_confirmation") is True
-            # sensitive (non-UNRECOGNISED) confirm has no zone_path
-            call_kwargs = owner._requires_confirmation.call_args.kwargs
-            assert not call_kwargs.get("zone_path")
-
 
 class TestConfirmRoundTrip:
     """Integration: stage confirmation via execute(), then confirm(token) must use _run_table."""
@@ -398,7 +368,7 @@ class TestConfirmRoundTrip:
         checker = MagicMock()
         checker.classify.return_value = ZoneClassification.UNRECOGNISED
         checker.is_write_protected_internal.return_value = False
-        builtin.trusted_zone_checker = checker
+        builtin.trusted_zone_checker = checker  # type: ignore[assignment]  # type: ignore[assignment]
         builtin.grant_tracker = GrantTracker()
         return builtin
 

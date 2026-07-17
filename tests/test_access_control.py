@@ -47,13 +47,6 @@ def _make_checker(tmp: str, workspace: str | None = None) -> TrustedZoneChecker:
 
 
 class TestClassify:
-    def test_internal_path_is_internal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            checker = _make_checker(tmp)
-            paths = _make_paths(tmp)
-            path = os.path.join(paths.tools_dir, "my_tool.sh")
-            assert checker.classify(path) == ZoneClassification.INTERNAL
-
     def test_default_trusted_workspace_is_trusted(self):
         with tempfile.TemporaryDirectory() as tmp:
             checker = _make_checker(tmp)
@@ -130,6 +123,70 @@ class TestClassify:
         with tempfile.TemporaryDirectory() as tmp:
             checker = _make_checker(tmp)
             paths = _make_paths(tmp)
+            trusted_dirs_json = os.path.join(paths.data_dir, "trusted_dirs.json")
+            assert checker.classify(trusted_dirs_json) == ZoneClassification.UNRECOGNISED
+
+    def test_rw_trusted_dir_allows_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir, mode="rw")
+                path = os.path.join(some_dir, "file.txt")
+                assert checker.classify(path, operation="write") == ZoneClassification.TRUSTED
+
+    def test_read_only_trusted_dir_allows_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir, mode="r")
+                path = os.path.join(some_dir, "file.txt")
+                assert checker.classify(path, operation="read") == ZoneClassification.TRUSTED
+
+    def test_read_only_trusted_dir_blocks_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir, mode="r")
+                path = os.path.join(some_dir, "file.txt")
+                assert checker.classify(path, operation="write") == ZoneClassification.UNRECOGNISED
+
+    def test_operation_default_is_write(self):
+        """Default operation is 'write' (fail-safe)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir, mode="r")
+                path = os.path.join(some_dir, "file.txt")
+                # no operation kwarg — defaults to "write", read-only dir should block
+                assert checker.classify(path) == ZoneClassification.UNRECOGNISED
+
+    def test_trusted_parent_does_not_unlock_vault(self):
+        """Vault remains UNRECOGNISED even when its parent dir is added to trusted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            vault_file = os.path.join(tmp, "vault_dir", "secrets.toml")
+            os.makedirs(os.path.dirname(vault_file), exist_ok=True)
+            paths = _make_paths(tmp)
+            for d in [paths.tools_dir, paths.generated_tools_dir, paths.data_dir,
+                      paths.skills_dir, paths.prompts_dir, paths.downloads_dir,
+                      paths.workspace_dir, paths.tmp_dir]:
+                os.makedirs(d, exist_ok=True)
+            checker = TrustedZoneChecker(
+                paths_config=paths,
+                data_dir=paths.data_dir,
+                agent_name="test-agent",
+                vault_path=vault_file,
+            )
+            # Add the vault's parent dir to trusted — vault must still be UNRECOGNISED
+            checker.add_trusted(os.path.dirname(vault_file))
+            assert checker.classify(vault_file) == ZoneClassification.UNRECOGNISED
+
+    def test_trusted_parent_does_not_unlock_trust_store(self):
+        """trusted_dirs.json remains UNRECOGNISED even when data/ is added to trusted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = _make_checker(tmp)
+            paths = _make_paths(tmp)
+            # Add data/ dir to trusted
+            checker.add_trusted(paths.data_dir)
             trusted_dirs_json = os.path.join(paths.data_dir, "trusted_dirs.json")
             assert checker.classify(trusted_dirs_json) == ZoneClassification.UNRECOGNISED
 
@@ -245,49 +302,6 @@ class TestClassifyWithRequestGrants:
                 assert checker.classify(other_path, request_grants=gt.snapshot()) == ZoneClassification.UNRECOGNISED
 
 
-class TestWriteProtectedInternal:
-    def test_is_write_protected_internal_tools(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            checker = _make_checker(tmp)
-            paths = _make_paths(tmp)
-            path = os.path.join(paths.tools_dir, "my_tool.sh")
-            assert checker.is_write_protected_internal(os.path.realpath(path)) is True
-
-    def test_is_write_protected_internal_data(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            checker = _make_checker(tmp)
-            paths = _make_paths(tmp)
-            # data/ is INTERNAL but NOT in the write-protected set
-            path = os.path.join(paths.data_dir, "some_file.json")
-            assert checker.is_write_protected_internal(os.path.realpath(path)) is False
-
-    def test_is_write_protected_internal_prompts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            checker = _make_checker(tmp)
-            paths = _make_paths(tmp)
-            path = os.path.join(paths.prompts_dir, "system.md")
-            assert checker.is_write_protected_internal(os.path.realpath(path)) is True
-
-    def test_is_write_protected_internal_skills(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            checker = _make_checker(tmp)
-            paths = _make_paths(tmp)
-            path = os.path.join(paths.skills_dir, "myplugin", "SKILL.md")
-            assert checker.is_write_protected_internal(os.path.realpath(path)) is True
-
-
-class TestWriteProtectedIntegration:
-    def test_generated_tools_dir_is_internal_and_write_protected(self):
-        """Confirm the conjunction (INTERNAL and write-protected) can actually fire."""
-        with tempfile.TemporaryDirectory() as tmp:
-            checker = _make_checker(tmp)
-            paths = _make_paths(tmp)
-            tool_path = os.path.join(paths.generated_tools_dir, "gen_tool.py")
-            real_path = os.path.realpath(tool_path)
-            assert checker.classify(tool_path) == ZoneClassification.INTERNAL
-            assert checker.is_write_protected_internal(real_path) is True
-
-
 class TestIsContained:
     def test_child_is_contained(self):
         assert _is_contained("/tmp/myzone/file.txt", "/tmp/myzone") is True
@@ -386,3 +400,38 @@ class TestPersistence:
         with tempfile.TemporaryDirectory() as tmp:
             checker = _make_checker(tmp)
             assert checker.list_user_trusted() == []
+
+    def test_add_trusted_with_mode_r_persists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir, mode="r")
+                # Reload from disk and verify mode persisted
+                checker2 = _make_checker(tmp)
+                entries = checker2.list_user_trusted()
+                assert len(entries) == 1
+                assert entries[0].mode == "r"
+
+    def test_add_trusted_default_mode_is_rw(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir)
+                entries = checker.list_user_trusted()
+                assert entries[0].mode == "rw"
+
+    def test_load_backward_compat_missing_mode(self):
+        """Entries without 'mode' field in JSON default to 'rw'."""
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                # Write JSON without mode field (legacy format)
+                data_dir = _make_paths(tmp).data_dir
+                os.makedirs(data_dir, exist_ok=True)
+                legacy_data = [{"path": os.path.realpath(some_dir), "added": "2024-01-01T00:00:00+00:00"}]
+                with open(os.path.join(data_dir, "trusted_dirs.json"), "w") as f:
+                    json.dump(legacy_data, f)
+                checker2 = _make_checker(tmp)
+                entries = checker2.list_user_trusted()
+                assert len(entries) == 1
+                assert entries[0].mode == "rw"

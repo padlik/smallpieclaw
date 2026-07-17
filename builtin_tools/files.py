@@ -52,9 +52,7 @@ class FileTools:
         checker = self._checker
         if checker is not None:
             real_path = os.path.realpath(os.path.expanduser(path))
-            zone = checker.classify(path, request_grants=self._request_grants())
-            if zone == ZoneClassification.INTERNAL:
-                return self._run_file_read(args, caller_tag=caller_tag)
+            zone = checker.classify(path, operation="read", request_grants=self._request_grants())
             sensitive, reason = _is_sensitive_path(path)
             if zone == ZoneClassification.UNRECOGNISED:
                 desc = f"Read file: <code>{path}</code>"
@@ -165,8 +163,8 @@ class FileTools:
             real_path_a = os.path.realpath(os.path.expanduser(path_a))
             real_path_b = os.path.realpath(os.path.expanduser(path_b))
             grants = self._request_grants()
-            zone_a = checker.classify(path_a, request_grants=grants)
-            zone_b = checker.classify(path_b, request_grants=grants)
+            zone_a = checker.classify(path_a, operation="read", request_grants=grants)
+            zone_b = checker.classify(path_b, operation="read", request_grants=grants)
             sensitive_a, reason_a = _is_sensitive_path(path_a)
             sensitive_b, reason_b = _is_sensitive_path(path_b)
 
@@ -179,10 +177,7 @@ class FileTools:
 
             needs_confirm = unrecognised_path is not None
             needs_sensitive_confirm = (
-                not needs_confirm and (
-                    (sensitive_a and zone_a != ZoneClassification.INTERNAL) or
-                    (sensitive_b and zone_b != ZoneClassification.INTERNAL)
-                )
+                not needs_confirm and (sensitive_a or sensitive_b)
             )
 
             if needs_confirm or needs_sensitive_confirm:
@@ -191,9 +186,9 @@ class FileTools:
                     diff_desc += f"\n(→ <code>{real_path_a}</code>)"
                 if real_path_b != path_b:
                     diff_desc += f"\n(→ <code>{real_path_b}</code>)"
-                if sensitive_a and zone_a != ZoneClassification.INTERNAL:
+                if sensitive_a:
                     diff_desc += f"\n⚠️ {path_a}: {reason_a}"
-                if sensitive_b and zone_b != ZoneClassification.INTERNAL:
+                if sensitive_b:
                     diff_desc += f"\n⚠️ {path_b}: {reason_b}"
                 return self._owner._requires_confirmation(
                     "file_diff", args, diff_desc,
@@ -274,12 +269,7 @@ class FileTools:
             real_path = os.path.realpath(os.path.expanduser(path))
             if real_path != path:
                 desc += f"\n(→ <code>{real_path}</code>)"
-            zone = checker.classify(path, request_grants=self._request_grants())
-            # FIX 1: write-protected internal dirs require confirmation
-            if zone == ZoneClassification.INTERNAL and checker.is_write_protected_internal(real_path):
-                zone = ZoneClassification.UNRECOGNISED
-            if zone == ZoneClassification.INTERNAL:
-                return self._run_file_write(args, caller_tag=caller_tag)
+            zone = checker.classify(path, operation="write", request_grants=self._request_grants())
             sensitive, _ = _is_sensitive_path(path)
             if zone == ZoneClassification.UNRECOGNISED:
                 if sensitive:
@@ -364,10 +354,7 @@ class FileTools:
         checker = self._checker
         zone = None
         if checker is not None:
-            zone = checker.classify(path, request_grants=self._request_grants())
-            # FIX 1: write-protected internal dirs require confirmation
-            if zone == ZoneClassification.INTERNAL and checker.is_write_protected_internal(real_path):
-                zone = ZoneClassification.UNRECOGNISED
+            zone = checker.classify(path, operation="write", request_grants=self._request_grants())
 
         # Build confirmation description from args only — no file read before confirm
         old_lines = old_str.splitlines()
@@ -397,12 +384,12 @@ class FileTools:
                     caller_depth=caller_depth, caller_tag=caller_tag,
                     zone_path=real_path,
                 )
-            if zone != ZoneClassification.INTERNAL and sensitive:
+            if sensitive:
                 return self._owner._requires_confirmation(
                     "file_patch", args, desc,
                     caller_depth=caller_depth, caller_tag=caller_tag,
                 )
-            # Auto-allowed: INTERNAL (non-write-protected), TRUSTED, REQUEST_GRANT
+            # Auto-allowed: TRUSTED, REQUEST_GRANT
             if not os.path.exists(path):
                 return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
             return self._run_file_patch(args, caller_tag=caller_tag)
@@ -474,9 +461,7 @@ class FileTools:
         checker = self._checker
         real_path = os.path.realpath(path)
         if checker is not None:
-            zone = checker.classify(path, request_grants=self._request_grants())
-            if zone == ZoneClassification.INTERNAL and checker.is_write_protected_internal(real_path):
-                zone = ZoneClassification.UNRECOGNISED
+            zone = checker.classify(path, operation="read", request_grants=self._request_grants())
             sensitive, reason = _is_sensitive_path(path)
             if zone == ZoneClassification.UNRECOGNISED:
                 send_desc = f"Send file: <code>{path}</code>"

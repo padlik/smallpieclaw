@@ -70,14 +70,12 @@ from builtin_tools.access_control import (  # noqa: E402
     TrustedZoneChecker,
     GrantTracker,
 )
-ZoneClassification.INTERNAL
 ZoneClassification.TRUSTED
 ZoneClassification.REQUEST_GRANT
 ZoneClassification.UNRECOGNISED
 TrustedDir.path
 TrustedDir.added
 TrustedZoneChecker.classify
-TrustedZoneChecker.is_write_protected_internal
 TrustedZoneChecker.add_trusted
 TrustedZoneChecker.remove_trusted
 TrustedZoneChecker.list_user_trusted
