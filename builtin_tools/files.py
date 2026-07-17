@@ -78,6 +78,7 @@ class FileTools:
             return self._run_file_read(args, caller_tag=caller_tag)
 
         # Fallback: no checker wired — use legacy sensitive-only gate
+        logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_read")
         sensitive, reason = _is_sensitive_path(path)
         if sensitive:
             desc = f"Read file: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
@@ -157,72 +158,84 @@ class FileTools:
             return {"success": False, "output": "", "error": "file_diff: 'context_lines' must be an integer.", "exit_code": -1}
         if context_lines < 0:
             context_lines = 0
+        logger.info("Built-in file_diff: %s <-> %s (context=%d)", path_a, path_b, context_lines)
+
+        checker = self._checker
+        if checker is not None:
+            real_path_a = os.path.realpath(os.path.expanduser(path_a))
+            real_path_b = os.path.realpath(os.path.expanduser(path_b))
+            grants = self._request_grants()
+            zone_a = checker.classify(path_a, request_grants=grants)
+            zone_b = checker.classify(path_b, request_grants=grants)
+            sensitive_a, reason_a = _is_sensitive_path(path_a)
+            sensitive_b, reason_b = _is_sensitive_path(path_b)
+
+            # Prefer the actually-unrecognised path for zone_path so zone buttons grant the right dir
+            unrecognised_path = None
+            if zone_b == ZoneClassification.UNRECOGNISED:
+                unrecognised_path = real_path_b
+            elif zone_a == ZoneClassification.UNRECOGNISED:
+                unrecognised_path = real_path_a
+
+            needs_confirm = unrecognised_path is not None
+            needs_sensitive_confirm = (
+                not needs_confirm and (
+                    (sensitive_a and zone_a != ZoneClassification.INTERNAL) or
+                    (sensitive_b and zone_b != ZoneClassification.INTERNAL)
+                )
+            )
+
+            if needs_confirm or needs_sensitive_confirm:
+                diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
+                if real_path_a != path_a:
+                    diff_desc += f"\n(→ <code>{real_path_a}</code>)"
+                if real_path_b != path_b:
+                    diff_desc += f"\n(→ <code>{real_path_b}</code>)"
+                if sensitive_a and zone_a != ZoneClassification.INTERNAL:
+                    diff_desc += f"\n⚠️ {path_a}: {reason_a}"
+                if sensitive_b and zone_b != ZoneClassification.INTERNAL:
+                    diff_desc += f"\n⚠️ {path_b}: {reason_b}"
+                return self._owner._requires_confirmation(
+                    "file_diff", args, diff_desc,
+                    caller_depth=caller_depth, caller_tag=caller_tag,
+                    zone_path=unrecognised_path or "",
+                )
+        else:
+            logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_diff")
+            sensitive_a, reason_a = _is_sensitive_path(path_a)
+            sensitive_b, reason_b = _is_sensitive_path(path_b)
+            if sensitive_a or sensitive_b:
+                diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
+                if sensitive_a:
+                    diff_desc += f"\n⚠️ {path_a}: {reason_a}"
+                if sensitive_b:
+                    diff_desc += f"\n⚠️ {path_b}: {reason_b}"
+                return self._owner._requires_confirmation(
+                    "file_diff", args, diff_desc,
+                    caller_depth=caller_depth, caller_tag=caller_tag,
+                )
+
+        # Zone-gated: now safe to access filesystem
+        return self._run_file_diff(args, caller_tag=caller_tag)
+
+    def _run_file_diff(self, args: dict, caller_tag: str = "") -> dict:
+        """Execute file_diff after zone gate has passed."""
+        path_a = str(args.get("path_a", "")).strip()
+        path_b = str(args.get("path_b", "")).strip()
+        try:
+            context_lines = int(args.get("context_lines", 3))
+        except (TypeError, ValueError):
+            context_lines = 3
+        if context_lines < 0:
+            context_lines = 0
         try:
             max_bytes = int(args.get("max_bytes", 200_000))
         except (TypeError, ValueError):
-            return {"success": False, "output": "", "error": "file_diff: 'max_bytes' must be an integer.", "exit_code": -1}
-
-        logger.info("Built-in file_diff: %s <-> %s (context=%d)", path_a, path_b, context_lines)
-
+            max_bytes = 200_000
         try:
             for p in (path_a, path_b):
                 if not os.path.exists(p):
                     return {"success": False, "output": "", "error": f"File not found: {p}", "exit_code": 1}
-
-            checker = self._checker
-            if checker is not None:
-                real_path_a = os.path.realpath(os.path.expanduser(path_a))
-                real_path_b = os.path.realpath(os.path.expanduser(path_b))
-                grants = self._request_grants()
-                zone_a = checker.classify(path_a, request_grants=grants)
-                zone_b = checker.classify(path_b, request_grants=grants)
-                sensitive_a, reason_a = _is_sensitive_path(path_a)
-                sensitive_b, reason_b = _is_sensitive_path(path_b)
-
-                # FIX 4: trigger confirmation if EITHER path is unrecognised
-                unrecognised_path = None
-                if zone_a == ZoneClassification.UNRECOGNISED or zone_b == ZoneClassification.UNRECOGNISED:
-                    # Use path_a as zone_path for confirmation; if dirs differ a
-                    # second prompt fires on retry (fail-safe)
-                    unrecognised_path = real_path_a
-
-                needs_confirm = unrecognised_path is not None
-                needs_sensitive_confirm = (
-                    not needs_confirm and (
-                        (sensitive_a and zone_a != ZoneClassification.INTERNAL) or
-                        (sensitive_b and zone_b != ZoneClassification.INTERNAL)
-                    )
-                )
-
-                if needs_confirm or needs_sensitive_confirm:
-                    diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
-                    if real_path_a != path_a:
-                        diff_desc += f"\n(→ <code>{real_path_a}</code>)"
-                    if real_path_b != path_b:
-                        diff_desc += f"\n(→ <code>{real_path_b}</code>)"
-                    if sensitive_a and zone_a != ZoneClassification.INTERNAL:
-                        diff_desc += f"\n⚠️ {path_a}: {reason_a}"
-                    if sensitive_b and zone_b != ZoneClassification.INTERNAL:
-                        diff_desc += f"\n⚠️ {path_b}: {reason_b}"
-                    return self._owner._requires_confirmation(
-                        "file_diff", args, diff_desc,
-                        caller_depth=caller_depth, caller_tag=caller_tag,
-                        zone_path=unrecognised_path or "",
-                    )
-            else:
-                sensitive_a, reason_a = _is_sensitive_path(path_a)
-                sensitive_b, reason_b = _is_sensitive_path(path_b)
-                if sensitive_a or sensitive_b:
-                    diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
-                    if sensitive_a:
-                        diff_desc += f"\n⚠️ {path_a}: {reason_a}"
-                    if sensitive_b:
-                        diff_desc += f"\n⚠️ {path_b}: {reason_b}"
-                    return self._owner._requires_confirmation(
-                        "file_diff", args, diff_desc,
-                        caller_depth=caller_depth, caller_tag=caller_tag,
-                    )
-
             with open(path_a, "r", errors="replace") as f:
                 a_text = f.read(max_bytes)
             with open(path_b, "r", errors="replace") as f:
@@ -231,7 +244,6 @@ class FileTools:
             return {"success": False, "output": "", "error": f"Permission denied: {exc}", "exit_code": 1}
         except OSError as exc:
             return {"success": False, "output": "", "error": str(exc), "exit_code": 1}
-
         a_lines = a_text.splitlines(keepends=True)
         b_lines = b_text.splitlines(keepends=True)
         diff = list(difflib.unified_diff(
@@ -285,6 +297,7 @@ class FileTools:
             return self._run_file_write(args, caller_tag=caller_tag)
 
         # Fallback: no checker — always confirm
+        logger.error("Zone: trusted_zone_checker not wired — always confirming file_write")
         return self._owner._requires_confirmation("file_write", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
     def _run_file_write(self, args: dict, caller_tag: str = "") -> dict:
@@ -455,27 +468,15 @@ class FileTools:
 
     def _exec_file_send(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         path = os.path.expanduser(str(args.get("path", "")).strip())
-        caption = str(args.get("caption", "")).strip()
         if not path:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
-        if not os.path.exists(path):
-            return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
-        if not os.path.isfile(path):
-            return {"success": False, "output": "", "error": f"Not a file: {path}", "exit_code": 1}
-        size = os.path.getsize(path)
-        if size > self._MAX_FILE_SIZE:
-            return {
-                "success": False, "output": "",
-                "error": f"File too large ({size // 1024 // 1024} MB). Max 50 MB.", "exit_code": 1,
-            }
+
         checker = self._checker
+        real_path = os.path.realpath(path)
         if checker is not None:
-            real_path = os.path.realpath(path)
             zone = checker.classify(path, request_grants=self._request_grants())
-            # FIX 1: write-protected internal dirs require confirmation
             if zone == ZoneClassification.INTERNAL and checker.is_write_protected_internal(real_path):
                 zone = ZoneClassification.UNRECOGNISED
-            # FIX 1: always check sensitive — no INTERNAL bypass
             sensitive, reason = _is_sensitive_path(path)
             if zone == ZoneClassification.UNRECOGNISED:
                 send_desc = f"Send file: <code>{path}</code>"
@@ -497,6 +498,7 @@ class FileTools:
                     caller_depth=caller_depth, caller_tag=caller_tag,
                 )
         else:
+            logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_send")
             sensitive, reason = _is_sensitive_path(path)
             if sensitive:
                 send_desc = f"Send file: <code>{path}</code>\n⚠️ {reason}"
@@ -505,6 +507,23 @@ class FileTools:
                     caller_depth=caller_depth, caller_tag=caller_tag,
                 )
 
+        # Zone-gated: now safe to access filesystem
+        return self._run_file_send(args, caller_tag=caller_tag)
+
+    def _run_file_send(self, args: dict, caller_tag: str = "") -> dict:
+        """Execute file_send after zone gate has passed."""
+        path = os.path.expanduser(str(args.get("path", "")).strip())
+        caption = str(args.get("caption", "")).strip()
+        if not os.path.exists(path):
+            return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
+        if not os.path.isfile(path):
+            return {"success": False, "output": "", "error": f"Not a file: {path}", "exit_code": 1}
+        size = os.path.getsize(path)
+        if size > self._MAX_FILE_SIZE:
+            return {
+                "success": False, "output": "",
+                "error": f"File too large ({size // 1024 // 1024} MB). Max 50 MB.", "exit_code": 1,
+            }
         logger.info("Built-in file_send: %s (%d bytes)", path, size)
         return {
             "success": True,

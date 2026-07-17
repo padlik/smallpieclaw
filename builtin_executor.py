@@ -203,6 +203,8 @@ class BuiltinExecutor:
             "file_read": lambda a, ctx: self._files._run_file_read(a, caller_tag=ctx.caller_tag),
             "file_write": lambda a, ctx: self._files._run_file_write(a, caller_tag=ctx.caller_tag),
             "file_patch": lambda a, ctx: self._files._run_file_patch(a, caller_tag=ctx.caller_tag),
+            "file_diff": lambda a, ctx: self._files._run_file_diff(a, caller_tag=ctx.caller_tag),
+            "file_send": lambda a, ctx: self._files._run_file_send(a, caller_tag=ctx.caller_tag),
             "memory_graph_store": lambda a, ctx: self._memory_tools._run_memory_graph_store(a, caller_tag=ctx.caller_tag),
             "secret_get": lambda a, ctx: self._secrets._run_secret_get(a, caller_tag=ctx.caller_tag),
         }

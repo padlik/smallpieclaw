@@ -834,7 +834,7 @@ def react_loop(
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
 
-        if ctx.grant_tracker is not None:
+        if ctx.grant_tracker is not None and ctx.depth == 0:
             ctx.grant_tracker.reset()
 
         active_model = ctx.llm.llm_cfg.get("model", "?")

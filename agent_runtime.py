@@ -249,9 +249,8 @@ class AgentRuntime:
             plan_max_iterations=getattr(controller, "plan_max_iterations", 50),
             inactivity_warn_minutes=getattr(controller, "inactivity_warn_minutes", 15),
             confirmation=controller._confirmation,
-            trusted_zone_checker=(
-                getattr(controller, "trusted_zone_checker", None)
-                or getattr(getattr(controller, "builtin_executor", None), "trusted_zone_checker", None)
+            trusted_zone_checker=getattr(
+                getattr(controller, "builtin_executor", None), "trusted_zone_checker", None
             ),
             grant_tracker=getattr(getattr(controller, "builtin_executor", None), "grant_tracker", None),
         )

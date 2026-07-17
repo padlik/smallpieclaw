@@ -310,11 +310,15 @@ class TestPersistence:
                     checker.add_trusted(dir_a)
                     checker.add_trusted(dir_b)
 
+                    real_a = os.path.realpath(dir_a)
+                    real_b = os.path.realpath(dir_b)
+                    first_sorted, second_sorted = sorted([real_a, real_b])
+
                     removed = checker.remove_trusted(1)
-                    assert removed == os.path.realpath(dir_a)
+                    assert removed == first_sorted
                     remaining = [e.path for e in checker.list_user_trusted()]
-                    assert os.path.realpath(dir_a) not in remaining
-                    assert os.path.realpath(dir_b) in remaining
+                    assert first_sorted not in remaining
+                    assert second_sorted in remaining
 
     def test_remove_trusted_invalid_index_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -340,6 +344,29 @@ class TestPersistence:
             assert result_paths == sorted(result_paths)
             assert result_paths[0] == os.path.realpath(a_dir)
             assert result_paths[1] == os.path.realpath(z_dir)
+
+    def test_remove_trusted_uses_sorted_index_not_insertion_order(self):
+        """Regression: /dir del N must remove the N-th sorted entry, not N-th inserted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            z_dir = os.path.join(tmp, "zzz_dir")
+            a_dir = os.path.join(tmp, "aaa_dir")
+            os.makedirs(z_dir)
+            os.makedirs(a_dir)
+
+            checker = _make_checker(tmp)
+            # Insert zzz first, aaa second → insertion order [zzz, aaa]
+            checker.add_trusted(z_dir)
+            checker.add_trusted(a_dir)
+
+            # list_user_trusted() → sorted: #1=aaa, #2=zzz
+            # /dir del 1 must remove aaa (sorted index), not zzz (insertion index)
+            removed = checker.remove_trusted(1)
+            assert removed == os.path.realpath(a_dir), (
+                f"Expected aaa_dir removed (#1 sorted), got {removed}"
+            )
+            remaining = [e.path for e in checker.list_user_trusted()]
+            assert os.path.realpath(a_dir) not in remaining
+            assert os.path.realpath(z_dir) in remaining
 
     def test_missing_trusted_dirs_file_loads_empty(self):
         with tempfile.TemporaryDirectory() as tmp:

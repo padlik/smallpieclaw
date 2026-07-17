@@ -129,6 +129,8 @@ class TrustedZoneChecker:
         ]
         self._default_trusted_dirs: list[str] = []
         for d in trusted_candidates:
+            if not d:
+                continue
             resolved = os.path.realpath(os.path.expanduser(d))
             if resolved and resolved not in self._default_trusted_dirs:
                 self._default_trusted_dirs.append(resolved)
@@ -140,6 +142,10 @@ class TrustedZoneChecker:
             paths_config.generated_tools_dir,
             paths_config.prompts_dir,
             paths_config.skills_dir,
+            # XDG dirs are INTERNAL but also write-protected — vault.toml and logs must not be
+            # silently overwritten by the LLM
+            os.path.expanduser(f"~/.local/state/{agent_name}/logs"),
+            os.path.expanduser(f"~/.local/share/{agent_name}"),
         ]
         self._write_protected_internal_dirs: list[str] = [
             os.path.realpath(os.path.expanduser(d)) for d in _wp_candidates if d
@@ -212,18 +218,20 @@ class TrustedZoneChecker:
         logger.info("Zone: added trusted dir %s", real)
 
     def remove_trusted(self, index: int) -> str:
-        """Remove user-added trusted dir by 1-based index. Returns removed path.
+        """Remove user-added trusted dir by 1-based index (matches list_user_trusted order).
 
         Raises:
             IndexError: If index is out of range.
         """
         with self._user_trusted_lock:
-            if index < 1 or index > len(self._user_trusted):
+            sorted_dirs = sorted(self._user_trusted, key=lambda e: e.path)
+            if index < 1 or index > len(sorted_dirs):
                 raise IndexError(f"No trusted directory #{index}.")
-            removed = self._user_trusted.pop(index - 1)
+            target_path = sorted_dirs[index - 1].path
+            self._user_trusted = [e for e in self._user_trusted if e.path != target_path]
             self._save_user_trusted()
-        logger.info("Zone: removed trusted dir #%d (%s)", index, removed.path)
-        return removed.path
+        logger.info("Zone: removed trusted dir #%d (%s)", index, target_path)
+        return target_path
 
     def list_user_trusted(self) -> list[TrustedDir]:
         """Return user-added trusted dirs sorted by path."""
