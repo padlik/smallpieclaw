@@ -103,12 +103,13 @@ class TrustedZoneChecker:
         """
         self._data_dir = os.path.realpath(data_dir)
         self._trusted_dirs_path = os.path.normcase(
-            os.path.join(self._data_dir, "trusted_dirs.json")
+            os.path.realpath(os.path.join(self._data_dir, "trusted_dirs.json"))
         )
         self._vault_path: str = (
             os.path.normcase(os.path.realpath(os.path.expanduser(vault_path)))
             if vault_path else ""
         )
+        self._override_inodes: set[tuple[int, int]] = self._collect_override_inodes()
 
         # Default trusted dirs (non-removable)
         trusted_candidates = [
@@ -149,6 +150,15 @@ class TrustedZoneChecker:
             return ZoneClassification.UNRECOGNISED
         if self._vault_path and os.path.normcase(real) == self._vault_path:
             return ZoneClassification.UNRECOGNISED
+
+        # Hardlink alias: same inode as vault or trust-store — always UNRECOGNISED
+        if self._override_inodes:
+            try:
+                st = os.stat(real)
+                if (st.st_dev, st.st_ino) in self._override_inodes:
+                    return ZoneClassification.UNRECOGNISED
+            except OSError:
+                pass
 
         # TRUSTED: default protected dirs (always rw)
         for zone in self._default_trusted_dirs:
@@ -213,6 +223,19 @@ class TrustedZoneChecker:
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
+
+    def _collect_override_inodes(self) -> set[tuple[int, int]]:
+        """Stat override files at construction so hardlink aliases are caught in classify()."""
+        inodes: set[tuple[int, int]] = set()
+        for p in (self._trusted_dirs_path, self._vault_path):
+            if not p:
+                continue
+            try:
+                st = os.stat(p)
+                inodes.add((st.st_dev, st.st_ino))
+            except OSError:
+                pass
+        return inodes
 
     def _load_user_trusted(self) -> list[TrustedDir]:
         """Load user-added dirs from disk. Returns empty list if file missing."""

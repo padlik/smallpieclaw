@@ -190,6 +190,31 @@ class TestClassify:
             trusted_dirs_json = os.path.join(paths.data_dir, "trusted_dirs.json")
             assert checker.classify(trusted_dirs_json) == ZoneClassification.UNRECOGNISED
 
+    def test_hardlink_of_vault_in_trusted_dir_is_unrecognised(self, tmp_path):
+        """Hardlink alias of vault inside trusted dir must not classify as TRUSTED."""
+        tmp = str(tmp_path)
+        paths = _make_paths(tmp)
+        data_dir = paths.data_dir
+        workspace_dir = paths.workspace_dir
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(workspace_dir, exist_ok=True)
+
+        vault = os.path.join(data_dir, "secrets.toml")
+        with open(vault, "w") as f:
+            f.write("secret")
+
+        checker = TrustedZoneChecker(
+            paths_config=paths,
+            data_dir=data_dir,
+            agent_name="test",
+            vault_path=vault,
+        )
+        # workspace is default-trusted; hardlink of vault inside it must still be UNRECOGNISED
+        hardlink = os.path.join(workspace_dir, "alias.toml")
+        os.link(vault, hardlink)
+        result = checker.classify(hardlink, operation="read")
+        assert result == ZoneClassification.UNRECOGNISED
+
 
 class TestSiblingPrefixContainment:
     def test_sibling_with_shared_prefix_is_unrecognised(self):
