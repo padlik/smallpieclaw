@@ -47,6 +47,12 @@ The system MUST resolve every path via `os.path.realpath()` and classify it into
 - **THEN** the path classifies as UNRECOGNISED and a confirmation prompt is sent
 - **AND** the `secret_get` built-in tool remains the intended interface for reading secrets
 
+#### Scenario: Trust-store and vault remain UNRECOGNISED even when parent dir is trusted
+- **GIVEN** a user has added `data/` or `~/.local/share/<agent>/` to their trusted directories
+- **WHEN** `file_read` or `file_write` is invoked with the path of `data/trusted_dirs.json` or the vault file
+- **THEN** the path classifies as UNRECOGNISED and a confirmation prompt is sent
+- **AND** the parent-dir trust entry does not grant access to the trust store or the vault
+
 ### Requirement: file_diff zone-checks both paths independently
 
 `file_diff` MUST classify both `path_a` and `path_b` before executing. If either path is UNRECOGNISED, the entire operation is staged for confirmation.

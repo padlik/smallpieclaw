@@ -7,7 +7,7 @@
 ## 2. TrustedZoneChecker core
 
 - [ ] 2.1 Update `builtin_tools/access_control.py` with `ZoneClassification` enum (`TRUSTED`, `REQUEST_GRANT`, `UNRECOGNISED`) and `TrustedDir` dataclass (`path`, `added`, `mode`); derive allow/confirm action from zone: TRUSTED/REQUEST_GRANT → allow; UNRECOGNISED → confirm; remove `INTERNAL` zone entirely
-- [ ] 2.2 Update `TrustedZoneChecker.__init__`: resolve only default trusted dirs (`workspace_dir`, `downloads_dir`, `tmp_dir`) via `os.path.expanduser()` + `os.path.realpath()` from `PathsConfig`; load user-added dirs from `data/trusted_dirs.json` (handle missing file gracefully); no internal dirs, no vault_path; store the resolved real paths of `data/trusted_dirs.json` and the vault file (`~/.local/share/<agent>/secrets.toml`) as explicit UNRECOGNISED overrides (see 2.3)
+- [ ] 2.2 Update `TrustedZoneChecker.__init__`: resolve only default trusted dirs (`workspace_dir`, `downloads_dir`, `tmp_dir`) via `os.path.expanduser()` + `os.path.realpath()` from `PathsConfig`; load user-added dirs from `data/trusted_dirs.json` (handle missing file gracefully); no internal dirs; accept `vault_path: str` parameter and store the resolved real paths of `data/trusted_dirs.json` and the vault file (from `vault_path`, honoring `$SPC_VAULT_FILE`) as explicit UNRECOGNISED overrides (see 2.3)
 - [ ] 2.3 Update `TrustedZoneChecker.classify(path: str, operation: str = "write", request_grants: frozenset[str] = frozenset()) -> ZoneClassification`: default `"write"` is fail-safe; check UNRECOGNISED overrides first (trust-store path + vault file path are always UNRECOGNISED regardless of whether a parent is trusted); then check zones in priority order (trusted → request_grant → unrecognised); use `os.path.realpath()` for all comparisons; use separator-boundary containment; for `"r"`-mode trusted dirs, return UNRECOGNISED when `operation == "write"`
 - [x] 2.4 Implement `GrantTracker.add(path: str)`: store `os.path.dirname(realpath(path))` in in-memory set (grants parent dir of path)
 - [x] 2.5 Implement `GrantTracker.reset()`: clear in-memory grant set; `GrantTracker.snapshot() -> frozenset[str]` returns a thread-safe copy passed to `classify()`
@@ -31,7 +31,7 @@
 
 - [x] 4.1 `ReactContext` dataclass in `react_loop.py` has `trusted_zone_checker: TrustedZoneChecker` and `grant_tracker: Optional[GrantTracker]` fields; verify both present
 - [x] 4.2 Call `ctx.grant_tracker.reset()` at the start of `react_loop()`, before the tool dispatch loop
-- [ ] 4.3 Update `main.py`: construct ONE `TrustedZoneChecker(paths_config=app_cfg.paths, data_dir=..., agent_name=...)` without `vault_path`; inject same instance into `BuiltinExecutor.trusted_zone_checker` AND `ReactContext`; also inject `builtin_executor.grant_tracker` into `ReactContext.grant_tracker`
+- [ ] 4.3 Update `main.py`: construct ONE `TrustedZoneChecker(paths_config=app_cfg.paths, data_dir=..., vault_path=vault_path(cfg))` — pass the resolved vault path from `vault_path(cfg)` so `$SPC_VAULT_FILE` overrides are honoured; inject same instance into `BuiltinExecutor.trusted_zone_checker` AND `ReactContext`; also inject `builtin_executor.grant_tracker` into `ReactContext.grant_tracker`
 
 ## 5. Telegram: extended confirmation buttons
 
@@ -48,7 +48,7 @@
 
 ## 7. Tests
 
-- [ ] 7.1 Update unit tests for `TrustedZoneChecker.classify()`: default trusted (rw), user-added trusted (rw), user-added trusted (r) with write operation, request grant, unrecognised (including agent-internal paths), symlink outside trusted zone, `..` traversal attempt; remove any INTERNAL-zone test cases
+- [ ] 7.1 Update unit tests for `TrustedZoneChecker.classify()`: default trusted (rw), user-added trusted (rw), user-added trusted (r) with write operation, request grant, unrecognised (including agent-internal paths), symlink outside trusted zone, `..` traversal attempt; trust-store and vault remain UNRECOGNISED even when their parent dir is added to trusted; remove any INTERNAL-zone test cases
 - [x] 7.1b Write unit test for sibling-prefix containment: /srv/shared-evil is NOT contained in /srv/shared
 - [x] 7.2 Write unit tests for `GrantTracker.reset()`: grant active during request, cleared after reset
 - [ ] 7.3 Update unit tests for `add_trusted()` / `remove_trusted()` / `list_user_trusted()`: persistence round-trip with `mode` field, invalid index, missing file on load, backward-compat with entries missing `mode`
