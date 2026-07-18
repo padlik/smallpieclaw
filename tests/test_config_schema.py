@@ -78,9 +78,14 @@ class TestParseConfig:
 
     def test_raw_dict_preserved(self, minimal_config):
         cfg = parse_config(minimal_config)
-        # _raw holds the resolved (env-expanded) copy — equal to input when no
-        # placeholders are present, but not necessarily the same object.
-        assert cfg._raw == minimal_config
+        # _raw holds the resolved (env-expanded) copy, plus expanded defaults for
+        # path fields and agent_home. Compare non-path sections that exist.
+        assert cfg._raw["telegram"] == minimal_config["telegram"]
+        assert cfg._raw["models"] == minimal_config["models"]
+        if "embeddings" in minimal_config:
+            assert cfg._raw["embeddings"] == minimal_config["embeddings"]
+        if "scheduler" in minimal_config:
+            assert cfg._raw["scheduler"] == minimal_config["scheduler"]
 
     def test_frozen_immutability(self, minimal_config):
         cfg = parse_config(minimal_config)
@@ -652,7 +657,14 @@ class TestProviderCredentialInheritance:
     def test_legacy_config_raw_dict_remains_unchanged(self, minimal_config):
         cfg = parse_config(minimal_config)
 
-        assert cfg._raw == minimal_config
+        # Only non-path, non-agent_home sections remain identical because path
+        # fields and agent_home are normalized at parse time.
+        assert cfg._raw["telegram"] == minimal_config["telegram"]
+        assert cfg._raw["models"] == minimal_config["models"]
+        if "embeddings" in minimal_config:
+            assert cfg._raw["embeddings"] == minimal_config["embeddings"]
+        if "scheduler" in minimal_config:
+            assert cfg._raw["scheduler"] == minimal_config["scheduler"]
 
     def test_embeddings_inherit_provider_credentials_when_section_present(self, minimal_config):
         minimal_config["providers"] = {
@@ -826,3 +838,64 @@ class TestLoadVaultNonStringValues:
         vault_file.write_text("secret_num = 99\n")
         with pytest.raises(ConfigError, match="secret_num"):
             _load_vault(str(vault_file))
+
+
+# ---------------------------------------------------------------------------
+# Path tilde expansion
+# ---------------------------------------------------------------------------
+
+class TestPathsExpansion:
+    """Tilde references in path fields must be expanded at parse time."""
+
+    def test_skills_dir_tilde_expanded(self, minimal_config):
+        minimal_config["paths"]["skills_dir"] = "~/my-skills"
+        cfg = parse_config(minimal_config)
+        assert cfg.paths.skills_dir == os.path.expanduser("~/my-skills")
+
+    def test_workspace_dir_default_expanded(self, minimal_config):
+        cfg = parse_config(minimal_config)
+        assert cfg.paths.workspace_dir == os.path.expanduser("~/Documents")
+
+    def test_downloads_dir_tilde_expanded(self, minimal_config):
+        minimal_config["paths"]["downloads_dir"] = "~/Downloads"
+        cfg = parse_config(minimal_config)
+        assert cfg.paths.downloads_dir == os.path.expanduser("~/Downloads")
+
+    def test_tmp_dir_tilde_expanded(self, minimal_config):
+        minimal_config["paths"]["tmp_dir"] = "~/tmp"
+        cfg = parse_config(minimal_config)
+        assert cfg.paths.tmp_dir == os.path.expanduser("~/tmp")
+
+    def test_no_tilde_paths_unchanged(self, minimal_config):
+        minimal_config["paths"]["skills_dir"] = "skills"
+        minimal_config["paths"]["data_dir"] = "data"
+        cfg = parse_config(minimal_config)
+        assert cfg.paths.skills_dir == "skills"
+        assert cfg.paths.data_dir == "data"
+
+    def test_absolute_paths_unchanged(self, minimal_config):
+        minimal_config["paths"]["skills_dir"] = "/opt/skills"
+        cfg = parse_config(minimal_config)
+        assert cfg.paths.skills_dir == "/opt/skills"
+
+    def test_tilde_only_expanded(self, minimal_config):
+        minimal_config["paths"]["skills_dir"] = "~/x"
+        cfg = parse_config(minimal_config)
+        assert cfg.paths.skills_dir == os.path.expanduser("~/x")
+
+    def test_raw_paths_dict_also_expanded(self, minimal_config):
+        minimal_config["paths"]["skills_dir"] = "~/my-skills"
+        cfg = parse_config(minimal_config)
+        assert cfg._raw["paths"]["skills_dir"] == cfg.paths.skills_dir
+        assert cfg._raw["paths"]["workspace_dir"] == cfg.paths.workspace_dir
+
+    def test_agent_home_user_tilde_expanded(self, minimal_config):
+        minimal_config["agent"]["agent_home"] = "~/mybot"
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.agent_home == os.path.expanduser("~/mybot")
+        assert cfg._raw["agent"]["agent_home"] == os.path.expanduser("~/mybot")
+
+    def test_log_file_absolute_tilde_expanded(self, minimal_config):
+        minimal_config["paths"]["log_file"] = "~/.local/state/mybot/custom.log"
+        cfg = parse_config(minimal_config)
+        assert cfg.paths.log_file == os.path.expanduser("~/.local/state/mybot/custom.log")
