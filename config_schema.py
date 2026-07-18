@@ -259,6 +259,16 @@ def log_path(raw: dict) -> str:
     return os.path.join(log_dir(raw), filename or "agent.log")
 
 
+def _expand_path(value: str) -> str:
+    """Expand a leading ``~`` (or ``~user``) home-directory reference in *value*.
+
+    Wraps :func:`os.path.expanduser` so every config path field is normalized at
+    parse time. Idempotent on paths without a leading tilde. ``~user`` syntax
+    is supported via the ``pwd`` module (Unix only).
+    """
+    return os.path.expanduser(value)
+
+
 def _parse_bool(value: Any, field_path: str) -> bool:
     """Return *value* as bool, rejecting strings to prevent env refs or
     ``"false"`` from being silently coerced to ``True``."""
@@ -565,7 +575,10 @@ def _parse_agent(raw: dict) -> AgentConfig:
     agent_name = section.get("agent_name", "piclaw")
     # Derive agent_home from agent_name when not set or set to empty string.
     agent_home_raw = section.get("agent_home", "")
-    agent_home = agent_home_raw if agent_home_raw else os.path.expanduser(f"~/{agent_name}")
+    agent_home = _expand_path(agent_home_raw) if agent_home_raw else _expand_path(f"~/{agent_name}")
+    # Mirror expanded value back into raw so cfg["agent"] and AgentConfig agree.
+    if "agent" in raw:
+        raw["agent"]["agent_home"] = agent_home
     return AgentConfig(
         agent_name=agent_name,
         agent_home=agent_home,
@@ -601,24 +614,28 @@ def _parse_scheduler(raw: dict) -> SchedulerConfig:
 
 def _parse_paths(raw: dict) -> PathsConfig:
     section = raw.get("paths") or {}
-    return PathsConfig(
-        tools_dir=section.get("tools_dir", "tools"),
-        generated_tools_dir=section.get("generated_tools_dir", "tools_generated"),
-        data_dir=section.get("data_dir", "data"),
-        tool_index_file=section.get("tool_index_file", "data/tool_index.json"),
-        memory_file=section.get("memory_file", "data/memory.json"),
-        longterm_memory_file=section.get("longterm_memory_file", "data/longterm_memory.json"),
-        results_memory_file=section.get("results_memory_file", "data/results_memory.json"),
-        scheduler_config=section.get("scheduler_config", "scheduler.toml"),
-        skills_dir=section.get("skills_dir", "skills"),
-        downloads_dir=section.get("downloads_dir", "downloads"),
-        log_file=section.get("log_file", "agent.log"),
-        log_backup_count=_parse_int(section.get("log_backup_count"), 30, "paths.log_backup_count"),
-        pid_file=section.get("pid_file", "data/agent.pid"),
-        tmp_dir=section.get("tmp_dir", ""),
-        prompts_dir=section.get("prompts_dir", "prompts"),
-        workspace_dir=section.get("workspace_dir", "~/Documents"),
-    )
+    expanded = {
+        "tools_dir": _expand_path(section.get("tools_dir", "tools")),
+        "generated_tools_dir": _expand_path(section.get("generated_tools_dir", "tools_generated")),
+        "data_dir": _expand_path(section.get("data_dir", "data")),
+        "tool_index_file": _expand_path(section.get("tool_index_file", "data/tool_index.json")),
+        "memory_file": _expand_path(section.get("memory_file", "data/memory.json")),
+        "longterm_memory_file": _expand_path(section.get("longterm_memory_file", "data/longterm_memory.json")),
+        "results_memory_file": _expand_path(section.get("results_memory_file", "data/results_memory.json")),
+        "scheduler_config": _expand_path(section.get("scheduler_config", "scheduler.toml")),
+        "skills_dir": _expand_path(section.get("skills_dir", "skills")),
+        "downloads_dir": _expand_path(section.get("downloads_dir", "downloads")),
+        "log_file": _expand_path(section.get("log_file", "agent.log")),
+        "log_backup_count": _parse_int(section.get("log_backup_count"), 30, "paths.log_backup_count"),
+        "pid_file": _expand_path(section.get("pid_file", "data/agent.pid")),
+        "tmp_dir": _expand_path(section.get("tmp_dir", "")),
+        "prompts_dir": _expand_path(section.get("prompts_dir", "prompts")),
+        "workspace_dir": _expand_path(section.get("workspace_dir", "~/Documents")),
+    }
+    # Mirror expanded values back into raw so cfg["paths"] and PathsConfig agree.
+    if "paths" in raw:
+        raw["paths"].update(expanded)
+    return PathsConfig(**expanded)
 
 
 def _parse_graph_memory(raw: dict) -> GraphMemoryConfig:
