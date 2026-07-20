@@ -158,6 +158,7 @@ class AgentRuntime:
         data_dir: str = "data",
         tmp_dir: str = "/tmp/agent",
         downloads_dir: str = "downloads",
+        workspace_dir: str = "~/Documents",
         top_tools: int = 3,
         ctx_max_tokens: int = 90_000,
         scheduled_max_iterations: int = 100,
@@ -181,6 +182,7 @@ class AgentRuntime:
         self._data_dir = data_dir
         self._tmp_dir = tmp_dir
         self._downloads_dir = downloads_dir
+        self._workspace_dir = workspace_dir
         self._top_tools = top_tools
         self._ctx_max_tokens = ctx_max_tokens
         self._scheduled_max_iterations = scheduled_max_iterations
@@ -227,6 +229,7 @@ class AgentRuntime:
             ctx_max_tokens=controller.ctx_max_tokens,
             tmp_dir=controller.tmp_dir,
             downloads_dir=controller.downloads_dir,
+            workspace_dir=controller.workspace_dir,
             log_file=controller.log_file,
             log_backup_count=controller.log_backup_count,
             depth=controller._depth,
@@ -380,6 +383,7 @@ class AgentRuntime:
             ctx_max_tokens=self._ctx_max_tokens,
             tmp_dir=self._tmp_dir,
             downloads_dir=self._downloads_dir,
+            workspace_dir=self._workspace_dir,
             usage_registry=self._usage_registry,
             depth=1,
             fallback_models=options.fallback_models,

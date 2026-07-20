@@ -5,10 +5,14 @@ required: true
 mode: all
 variables:
   - tools
+  - file_storage
 ---
 
 AVAILABLE TOOLS:
 {{tools}}
+
+FILE STORAGE:
+{{file_storage}}
 
 You may also use these built-in tools directly without asking permission:
   shell         — execute any shell command on the host system

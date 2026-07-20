@@ -612,7 +612,7 @@ _RUNTIME_PROMPTS_DIR = os.path.join(
 )
 
 
-def _render_runtime_prompt(mode: str) -> str:
+def _render_runtime_prompt(mode: str, workspace_dir: str = "/tmp/agent") -> str:
     """Render the actual runtime system prompt for *mode* and return the text.
 
     Points ``build_system_prompt`` at the real ``prompts/`` directory so the
@@ -645,6 +645,7 @@ def _render_runtime_prompt(mode: str) -> str:
             llm=llm,
             tmp_dir="/tmp/agent",
             downloads_dir="downloads",
+            workspace_dir=workspace_dir,
             log_file="agent.log",
             log_backup_count=30,
             top_tools=3,
@@ -735,4 +736,18 @@ class TestRuntimePromptAdvertisedContent:
         )
         assert "secret_get" in sub_agent_prompt, (
             "`secret_get` missing from rendered sub-agent prompt."
+        )
+
+    def test_workspace_dir_appears_in_file_storage(self):
+        """``workspace_dir`` must appear in the FILE STORAGE section of both main and sub-agent prompts."""
+        test_workspace = "/test/workspace/path"
+
+        default_prompt = _render_runtime_prompt("default", workspace_dir=test_workspace)
+        assert test_workspace in default_prompt, (
+            "workspace_dir missing from main agent prompt"
+        )
+
+        sub_agent_prompt = _render_runtime_prompt("sub-agent", workspace_dir=test_workspace)
+        assert test_workspace in sub_agent_prompt, (
+            "workspace_dir missing from sub-agent prompt"
         )

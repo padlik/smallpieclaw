@@ -373,6 +373,7 @@ def build_system_prompt(
     llm,
     tmp_dir: str,
     downloads_dir: str,
+    workspace_dir: str = "~/Documents",
     log_file: str,
     log_backup_count: int,
     top_tools: int,
@@ -416,6 +417,7 @@ def build_system_prompt(
             llm=llm,
             tmp_dir=tmp_dir,
             downloads_dir=downloads_dir,
+            workspace_dir=workspace_dir,
             log_file=log_file,
             log_backup_count=log_backup_count,
             top_tools=top_tools,
@@ -459,12 +461,13 @@ def build_system_prompt(
     skills_section = format_skills(skill_registry)
     models_section = format_models(llm)
     file_storage = (
-        f"- Temporary files (downloads, intermediate outputs, anything only needed for this task):\n"
-        f"    {tmp_dir}  ← cleaned by OS on reboot\n"
+        f"- User workspace (prefer this for files you create or edit for the user):\n"
+        f"    {workspace_dir}  ← trusted zone (no confirmation for normal files)\n"
         f"- Permanent downloads (files the user wants to keep):\n"
         f"    {downloads_dir}\n"
-        f"- Use tmp for QR codes, generated images, fetched configs, etc.\n"
-        f"- Use downloads for files the operator explicitly wants to keep.\n"
+        f"- Temporary files (intermediate outputs, anything only needed for this task):\n"
+        f"    {tmp_dir}  ← cleaned by OS on reboot\n"
+        f"- Use workspace for work files, downloads for files the user keeps, tmp for temporary operations.\n"
         f"- Never write files to the agent script directory."
     )
     log_section = format_log_section(log_file, log_backup_count)
@@ -610,6 +613,7 @@ def _legacy_build_system_prompt(
     llm,
     tmp_dir: str,
     downloads_dir: str,
+    workspace_dir: str = "~/Documents",
     log_file: str,
     log_backup_count: int,
     top_tools: int,
@@ -642,12 +646,13 @@ def _legacy_build_system_prompt(
     skills_section = format_skills(skill_registry)
     models_section = format_models(llm)
     file_storage = (
-        f"- Temporary files (downloads, intermediate outputs, anything only needed for this task):\n"
-        f"    {tmp_dir}  ← cleaned by OS on reboot\n"
+        f"- User workspace (prefer this for files you create or edit for the user):\n"
+        f"    {workspace_dir}  ← trusted zone (no confirmation for normal files)\n"
         f"- Permanent downloads (files the user wants to keep):\n"
         f"    {downloads_dir}\n"
-        f"- Use tmp for QR codes, generated images, fetched configs, etc.\n"
-        f"- Use downloads for files the operator explicitly wants to keep.\n"
+        f"- Temporary files (intermediate outputs, anything only needed for this task):\n"
+        f"    {tmp_dir}  ← cleaned by OS on reboot\n"
+        f"- Use workspace for work files, downloads for files the user keeps, tmp for temporary operations.\n"
         f"- Never write files to the agent script directory."
     )
     log_section = format_log_section(log_file, log_backup_count)

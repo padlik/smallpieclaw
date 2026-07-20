@@ -174,6 +174,7 @@ def main():
     downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
     _agent_name   = os.path.basename(os.path.abspath("."))
     tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
+    workspace_dir = os.path.abspath(os.path.expanduser(paths.get("workspace_dir", "~/Documents")))
     log_file         = log_path(cfg)
     log_backup_count = int(paths.get("log_backup_count", 30))
     pid_file      = os.path.join(
@@ -192,6 +193,7 @@ def main():
             results_path=results_path,
             scheduler_config_path=scheduler_config_path, skills_dir=skills_dir,
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,
+            workspace_dir=workspace_dir,
             log_file=log_file, log_backup_count=log_backup_count,
         )
 
@@ -201,7 +203,7 @@ def _run(
     tools_dir, gen_tools_dir, data_dir,
     index_path, memory_path, results_path,
     scheduler_config_path, skills_dir,
-    downloads_dir, tmp_dir,
+    downloads_dir, tmp_dir, workspace_dir,
     log_file, log_backup_count,
 ):
     """Core startup after PID lock is acquired."""
@@ -326,6 +328,7 @@ def _run(
         mcp_manager=mcp_manager,
         tmp_dir=tmp_dir,
         downloads_dir=downloads_dir,
+        workspace_dir=workspace_dir,
         log_file=log_file,
         log_backup_count=log_backup_count,
         creativity_mode=creativity_mode,
@@ -397,6 +400,7 @@ def _run(
         data_dir=data_dir,
         tmp_dir=tmp_dir,
         downloads_dir=downloads_dir,
+        workspace_dir=workspace_dir,
         top_tools=top_tools,
         ctx_max_tokens=ctx_max_tokens,
         scheduled_max_iterations=scheduled_max_iter,

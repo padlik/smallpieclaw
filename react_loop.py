@@ -136,6 +136,7 @@ class ReactContext:
     ctx_max_tokens: int = 90_000
     tmp_dir: str = "/tmp/agent"
     downloads_dir: str = "downloads"
+    workspace_dir: str = "~/Documents"
     log_file: str = "agent.log"
     log_backup_count: int = 30
     depth: int = 0
@@ -611,6 +612,7 @@ def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
         llm=ctx.llm,
         tmp_dir=ctx.tmp_dir,
         downloads_dir=ctx.downloads_dir,
+        workspace_dir=ctx.workspace_dir,
         log_file=ctx.log_file,
         log_backup_count=ctx.log_backup_count,
         top_tools=ctx.top_tools,

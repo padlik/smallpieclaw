@@ -72,6 +72,7 @@ class AgentController:
         mcp_manager=None,      # Optional[MCPManager]
         tmp_dir: str = "/tmp/agent",
         downloads_dir: str = "downloads",
+        workspace_dir: str = "~/Documents",
         log_file: str = "agent.log",
         log_backup_count: int = 30,
         cancel_event: Optional[threading.Event] = None,
@@ -101,6 +102,7 @@ class AgentController:
         self.mcp_manager = mcp_manager
         self.tmp_dir = tmp_dir
         self.downloads_dir = downloads_dir
+        self.workspace_dir = workspace_dir
         self.log_file = log_file
         self.log_backup_count = log_backup_count
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
@@ -227,6 +229,7 @@ class AgentController:
             llm=self.llm,
             tmp_dir=self.tmp_dir,
             downloads_dir=self.downloads_dir,
+            workspace_dir=self.workspace_dir,
             log_file=self.log_file,
             log_backup_count=self.log_backup_count,
             top_tools=self.top_tools,
@@ -442,6 +445,7 @@ class SubAgentRunner:
         ctx_max_tokens: int = 90_000,
         tmp_dir: str = "/tmp/agent",
         downloads_dir: str = "downloads",
+        workspace_dir: str = "~/Documents",
         usage_registry=None,          # TokenUsageRegistry
         depth: int = 1,
         fallback_models: list[str] | None = None,  # None = inherit from parent config
@@ -503,6 +507,7 @@ class SubAgentRunner:
             mcp_manager=mcp_manager,
             tmp_dir=tmp_dir,
             downloads_dir=downloads_dir,
+            workspace_dir=workspace_dir,
             cancel_event=self._cancel_event,
             depth=depth,
             label=self.agent_id,
