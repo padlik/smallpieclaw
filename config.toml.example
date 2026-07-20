@@ -247,6 +247,7 @@ tool_index_file    = "data/tool_index.json"
 memory_file        = "data/memory.json"
 skills_dir         = "skills"
 downloads_dir      = "downloads"
+workspace_dir       = "~/Documents"  # primary user workspace; always a trusted file-access zone (file_* tools auto-allow here)
 log_file           = "agent.log"   # relative name → ~/.local/state/<agent_name>/logs/agent.log
                                     # (from agent_name, independent of agent_home); absolute path overrides.
                                     # Structured agent.jsonl is written alongside.

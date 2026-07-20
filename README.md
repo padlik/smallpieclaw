@@ -170,7 +170,8 @@ systemctl --user enable --now telegram-agent
 | `/skills` | List available agent skills |
 | `/models` | List LLM models and switch active one (👁 = vision-capable) |
 | `/jobs` | Scheduled jobs; sub-commands: `reload`, `pause <tag>`, `resume <tag>`, `remove <tag>` |
-| `/agents` | Active sub-agents; `/agents cancel <id>` to stop one |
+| `/agents` | Active sub-agents, scheduled jobs, and plan-step agents (with source category); `/agents cancel <id>` to stop one |
+| `/dir` | List and remove trusted directories: `list`, `del <n>` |
 | `/mcp` | Manage MCP servers: `list`, `on <name>`, `off <name>`, `info <name>` |
 | `/stop` | Cancel the current running task |
 | `/reset` | Save context to results memory and start fresh |
@@ -211,14 +212,32 @@ Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google G
 | Tool | Description | Confirmation required? |
 |------|-------------|----------------------|
 | `shell` | Execute shell commands | Yes — if destructive pattern |
-| `file_read` | Read a file; `offset: -5000` reads last 5 KB | Yes — if sensitive path |
-| `file_write` | Write content to a file | Always |
+| `file_read` | Read a file; `offset: -5000` reads last 5 KB | Yes — if outside trusted zones |
+| `file_write` | Write content to a file | Yes — if outside trusted zones |
 | `file_send` | Send a file or photo to Telegram chat | No |
 | `schedule` | Manage scheduled jobs and reminders | No |
 | `spawn_agent` | Spawn a background sub-agent | No |
 | `memory_write` | Read/write persistent key-value memory (`data/memory.json`) | No |
 | `memory_graph_search` | Search graph memory (requires graph memory enabled) | No |
 | `memory_graph_store` | Store a fact/episode in graph memory | No |
+
+### File access zones
+
+`file_*` tools use zone-based access control. Every path is classified as:
+
+- **Trusted** — inside `workspace_dir` (default `~/Documents`) or a user-added trusted directory. Reads and writes auto-allow with no confirmation.
+- **Request-granted** — a directory the user approved for the current request via the `[Allow this request]` button. Allowed for the rest of the current request.
+- **Unrecognised** — anything else, including agent-internal directories (`data/`, `tools/`, `skills/`, log dir, vault dir). Prompts the user.
+
+Out-of-zone prompts offer four options: **Approve** (once), **Deny**, **Allow this request** (grants the parent directory for the current request), and **Add to trusted** (persists to `data/trusted_dirs.json`).
+
+Trusted directory entries support an optional `mode` field — `"r"` (read-only) auto-allows reads but still prompts for writes; `"rw"` (default) auto-allows both.
+
+Agent-internal directories are always unrecognised even if a parent directory is trusted — the LLM must use dedicated built-ins (`memory_read`, `secret_get`, `log_query`) for agent-internal data.
+
+Use the `/dir` command to list and remove user-added trusted directories: `/dir list`, `/dir del <n>`.
+
+Per-request grants reset at the start of each new user message.
 
 When a dangerous operation is requested the bot sends an inline confirmation prompt. For recurring dangerous actions, **Approve All** suppresses further prompts for the same action type for the rest of the current task.
 
@@ -416,6 +435,7 @@ Ollama requires the official Python package: `pip install "ollama>=0.4.0"`.
 Switch models at runtime with `/models`. The agent does not auto-switch based on message content.
 
 Resilience behaviours:
+- **Native tool calling** — models that support it (Kimi, GLM, DeepSeek, Gemini, Ollama) use the provider's native tool-calling API directly, bypassing JSON parsing entirely; falls back to the text-based JSON path automatically when the provider doesn't support tools, on transient errors, or when the model returns text instead of tool calls
 - **Retries** — exponential backoff on timeout/connection errors; live status in Telegram
 - **Empty responses** — retried at HTTP level; enable `diagnose_empty_responses = true` in `[agent]` for full HTTP diagnostic logging when they persist
 - **Non-JSON prose** — coerced up to 2 times without consuming a step or polluting history
