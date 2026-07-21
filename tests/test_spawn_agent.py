@@ -365,7 +365,7 @@ class TestGetAgentResultCancelOnTimeout:
         mock_reg = MagicMock()
         mock_reg.get.return_value = record
 
-        with _patch("sub_agent_registry.get_registry", return_value=mock_reg):
+        with _patch("builtin_tools.agents._get_agent_registry", return_value=mock_reg):
             return exc._exec_get_agent_result(args)
 
     def test_cancel_event_set_by_default_on_timeout(self):

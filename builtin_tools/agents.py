@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Optional
 
 from sub_agent_supervisor import SubmissionRequest, SupervisionOptions
@@ -28,6 +29,8 @@ from builtin_tools import context_io
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
+
+from sub_agent_registry import SOURCE_ON_DEMAND, get_registry as _get_agent_registry
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,10 @@ class AgentTools:
         from sub_agent_registry import get_registry as get_agent_registry
 
         options = options or SupervisionOptions()
+        # Propagate the active prompt id (if any) onto the supervision options
+        # so the supervisor can bind it into the sub-agent's log context.
+        if options.prompt_id is None:
+            options.prompt_id = getattr(self._owner, "_current_prompt_id", None)
 
         task = args.get("task", "").strip()
         # Accept common LLM aliases for the 'task' parameter
@@ -241,7 +248,158 @@ class AgentTools:
         # Accepted run — the supervisor owns registration, background execution,
         # result signalling, context persistence, notification, scheduler
         # callbacks, and cleanup.
-        return self._owner._supervisor.submit(request, options)
+        result = self._owner._supervisor.submit(request, options)
+
+        # Record the spawned sub-agent against the active prompt, if any.
+        if result.get("success") and "agent_id" in result:
+            registry = getattr(self._owner, "_prompt_registry", None)
+            prompt_id = getattr(self._owner, "_current_prompt_id", None)
+            if registry is not None and prompt_id is not None:
+                registry.add_sub_agent(prompt_id, result["agent_id"])
+
+        return result
+
+    def _exec_wait_for_any_agent(self, args: dict, caller_tag: str = "") -> dict:
+        """Wait for the first of a set of sub-agents to finish and return its result.
+
+        Implements the council pattern: call repeatedly with the remaining agent IDs
+        to collect results in completion order. A 200ms poll loop checks each
+        candidate's completion event and terminal status. The timeout does not
+        cancel any sub-agents.
+        """
+        get_agent_registry = _get_agent_registry
+
+        agent_ids = args.get("agent_ids", [])
+        if not isinstance(agent_ids, list) or not agent_ids:
+            return {
+                "success": False,
+                "output": "",
+                "error": "wait_for_any_agent: 'agent_ids' must be a non-empty list.",
+                "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Provide a list of sub-agent IDs returned by spawn_agent.",
+            }
+
+        timeout = args.get("timeout", self._owner._subagent_result_timeout)
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            timeout = self._owner._subagent_result_timeout
+
+        records = []
+        for raw_id in agent_ids:
+            aid = str(raw_id).strip()
+            record = get_agent_registry().get(aid)
+            if record is None:
+                record = get_agent_registry().get_completed(aid)
+            if record is None:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": f"wait_for_any_agent: no active sub-agent with id '{aid}'.",
+                    "exit_code": -1,
+                    "status": "not_found",
+                    "error_type": "file_not_found",
+                    "recoverable": False,
+                    "suggestion": "Check /agents or recent notifications for valid IDs.",
+                }
+            records.append(record)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for record in records:
+                if record._result_event.is_set() and record.status in ("done", "failed", "cancelled"):
+                    return {
+                        "success": record.status == "done",
+                        "output": record.result or "",
+                        "error": record.result if record.status == "failed" else "",
+                        "exit_code": 0 if record.status == "done" else -1,
+                        "status": record.status,
+                        "agent_id": record.agent_id,
+                        "result": record.result,
+                        "result_type": record.result_type,
+                    }
+            time.sleep(0.2)
+
+        return {
+            "success": False,
+            "output": f"wait_for_any_agent: timed out after {timeout}s.",
+            "error": "",
+            "exit_code": 0,
+            "status": "timeout",
+            "agent_ids": [r.agent_id for r in records],
+        }
+
+    def _exec_cancel_agent(self, args: dict, caller_tag: str = "") -> dict:
+        """Cancel a specific sub-agent or all managed sub-agents.
+
+        Not confirmation-gated: the LLM can cancel its own workers directly.
+        The operator retains `/agents cancel` and `/stop` as overrides.
+        """
+        get_agent_registry = _get_agent_registry
+
+        agent_id = args.get("agent_id", "").strip()
+        if not agent_id:
+            return {
+                "success": False,
+                "output": "",
+                "error": "cancel_agent: 'agent_id' is required (or 'managed'/'all' to cancel all).",
+                "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Provide a sub-agent id, or use 'managed'/'all' to cancel all managed agents.",
+            }
+
+        if agent_id in ("managed", "all"):
+            # The model-facing cancel_agent tool cancels only sub-agents the LLM
+            # itself spawned (on-demand). Scheduled jobs are operator-owned and
+            # must be cancelled via /agents or /jobs commands, not by a sub-agent.
+            targets = [
+                r for r in get_agent_registry().list_active()
+                if r.source == SOURCE_ON_DEMAND
+            ]
+            for r in targets:
+                r.cancel()
+            n = len(targets)
+            return {
+                "success": True,
+                "output": f"Cancelled {n} managed sub-agent(s).",
+                "error": "",
+                "exit_code": 0,
+            }
+
+        record = get_agent_registry().get(agent_id)
+        if record is None:
+            return {
+                "success": False,
+                "output": "",
+                "error": f"cancel_agent: no active sub-agent with id '{agent_id}'.",
+                "exit_code": -1,
+                "error_type": "file_not_found",
+                "recoverable": False,
+                "suggestion": "The agent may have already finished; check /agents or recent notifications.",
+            }
+        if record.source != SOURCE_ON_DEMAND:
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"cancel_agent: sub-agent '{agent_id}' is a '{record.source}' agent "
+                    "and cannot be cancelled by the LLM. Use /agents cancel or /stop."
+                ),
+                "exit_code": -1,
+                "error_type": "fundamentally_wrong_approach",
+                "recoverable": False,
+                "suggestion": "Only on-demand sub-agents can be cancelled via cancel_agent.",
+            }
+        record.cancel()
+        return {
+            "success": True,
+            "output": f"Cancelled sub-agent '{agent_id}'.",
+            "error": "",
+            "exit_code": 0,
+        }
 
     def _exec_get_agent_result(self, args: dict, caller_tag: str = "") -> dict:
         """
@@ -249,7 +407,7 @@ class AgentTools:
 
         Blocks until the agent's _result_event is set or timeout expires.
         """
-        from sub_agent_registry import get_registry as get_agent_registry
+        get_agent_registry = _get_agent_registry
 
         agent_id = args.get("agent_id", "").strip()
         if not agent_id:

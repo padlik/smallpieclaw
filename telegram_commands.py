@@ -103,6 +103,7 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /mode    — set creativity mode (default / planner / explorer / resilient)\n"
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
         "  /jobs    — list scheduled jobs\n"
+        "  /prompts — list recent prompts and their status\n"
         "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
         "  /pair    — pairing token management\n"
         "  /myid    — show your Telegram user ID\n",
@@ -247,8 +248,9 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 async def cmd_stop(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if iface.agent:
         iface.agent.cancel()
+        _get_agent_registry().cancel_all_managed()
         await update.effective_message.reply_text(
-            "🛑 Stop signal sent — current task will end after the current step."
+            "🛑 Stop signal sent — main agent and all sub-agents cancelling."
         )
     else:
         await update.effective_message.reply_text("ℹ️ No active agent to stop.")
@@ -310,6 +312,56 @@ async def cmd_verbose(iface: "TelegramInterface", update: Update, ctx: ContextTy
     else:
         text = "🔇 <b>Verbose mode off</b>\n<i>Progress updates will edit a single status message.</i>"
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+_STATUS_ICONS = {
+    "running": "🔄",
+    "done": "✅",
+    "failed": "❌",
+    "cancelled": "🛑",
+}
+
+
+def _fmt_prompt_elapsed(started_at: float, ended_at: float | None = None) -> str:
+    """Format elapsed time as 'Xm Ys' or 'Ys'."""
+    end = ended_at if ended_at is not None else time.time()
+    elapsed = max(0, int(end - started_at))
+    mins, secs = divmod(elapsed, 60)
+    return f"{mins}m {secs}s" if mins else f"{secs}s"
+
+
+@_require_auth
+async def cmd_prompts(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List recent prompts with status, elapsed time, and sub-agent count."""
+    registry = getattr(iface, "_prompt_registry", None)
+    if registry is None:
+        await update.effective_message.reply_text(
+            "⚠️ Prompt registry not available.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    recent = registry.list_recent(20)
+    if not recent:
+        await update.effective_message.reply_text(
+            "ℹ️ No prompts recorded yet.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [f"📝 <b>Recent Prompts</b> ({len(recent)})\n"]
+    for rec in recent:
+        icon = _STATUS_ICONS.get(rec.status, "❓")
+        elapsed = _fmt_prompt_elapsed(rec.started_at, rec.ended_at)
+        sub_count = len(rec.sub_agent_ids)
+        sa_info = f" · {sub_count} sub-agent{'s' if sub_count != 1 else ''}" if sub_count else ""
+        lines.append(
+            f"<b>Prompt #{rec.prompt_id}</b> {icon} <code>{html.escape(rec.status)}</code>\n"
+            f"  Elapsed: {elapsed}{sa_info}"
+        )
+
+    for chunk in iface._split_message("\n".join(lines)):
+        await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
 _MODES = ("default", "planner", "explorer", "resilient")

@@ -107,6 +107,7 @@ from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
+from prompt_registry import PromptRegistry  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
 from strategy_memory import StrategyMemory  # noqa: E402
@@ -295,6 +296,10 @@ def _run(
     # implicit spawn_agent context summaries include recent tool results.
     builtin._working = working
     builtin._results = results_mem
+
+    # Prompt registry singleton: tracks monotonic "Prompt #N" runs.
+    prompt_registry = PromptRegistry(data_dir=data_dir)
+    builtin._prompt_registry = prompt_registry
     from builtin_tools.access_control import TrustedZoneChecker as _TrustedZoneChecker
     _trusted_zone_checker = _TrustedZoneChecker(
         paths_config=app_cfg.paths,
@@ -348,8 +353,9 @@ def _run(
     except Exception as exc:
         logger.warning("Tool index build failed (check embeddings API config): %s", exc)
 
-    def agent_handler(user_id, text, progress_cb, images=None):
-        return agent.run(text, progress_callback=progress_cb, images=images or None)
+    def agent_handler(user_id, text, progress_cb, images=None, *, prompt_id=None, trace_id=None):
+        return agent.run(text, progress_callback=progress_cb, images=images or None,
+                         prompt_id=prompt_id, trace_id=trace_id)
 
     # Build TelegramInterface first so notify() can reference it
     # (tg is created after scheduler/sub_agent_factory wiring, so we use nonlocal)
@@ -511,6 +517,7 @@ def _run(
     tg.agent = agent  # wire agent for confirm/resume and /models
     tg._graph_memory_store = graph_memory_store
     tg._graph_memory_writer = graph_memory_writer
+    tg._prompt_registry = prompt_registry  # wire prompt registry for /prompts and lifecycle
 
     # Wire the sub-agent Telegram confirmation bridge into the built-in executor.
     # Sub-agents running sensitive file operations will call this to ask the

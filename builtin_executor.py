@@ -33,7 +33,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import agent_logging
 from builtin_tools.access_control import GrantTracker
@@ -61,6 +61,10 @@ from builtin_tools.text_utils import (
     _truncate_output,  # noqa: F401  re-exported for tests
     _truncate_tail,  # noqa: F401  re-exported for tests
 )
+
+if TYPE_CHECKING:
+    from prompt_registry import PromptRegistry
+
 from sub_agent_supervisor import (
     SubAgentSupervisor,
     SupervisionOptions,
@@ -134,6 +138,13 @@ class BuiltinExecutor:
         self._supervisor = SubAgentSupervisor(max_subagents=max_subagents)
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
+        # Per-prompt approve-all set. Shared reference to the main agent's
+        # ConfirmationManager.auto_approve_tools set during a run; None outside
+        # of a run so sub-agents fail-closed after the prompt ends.
+        self._prompt_approval_set: Optional[set[str]] = None
+        # Active prompt ID and registry reference for sub-agent tracking.
+        self._current_prompt_id: Optional[int] = None
+        self._prompt_registry: Optional[PromptRegistry] = None
         # Headless (sub-agent) confirmation bridge
         # token -> threading.Event  (set when the operator responds)
         self._headless_confirm_events: dict[str, threading.Event] = {}
@@ -180,6 +191,8 @@ class BuiltinExecutor:
                 trace_id=ctx.trace_id,
             ),
             "get_agent_result": lambda a, ctx: self._exec_get_agent_result(a, caller_tag=ctx.caller_tag),
+            "wait_for_any_agent": lambda a, ctx: self._agents._exec_wait_for_any_agent(a, caller_tag=ctx.caller_tag),
+            "cancel_agent": lambda a, ctx: self._agents._exec_cancel_agent(a, caller_tag=ctx.caller_tag),
             "memory_write": lambda a, ctx: self._memory_tools._exec_memory_write(a, caller_tag=ctx.caller_tag),
             "file_patch": lambda a, ctx: self._files._exec_file_patch(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
@@ -196,6 +209,10 @@ class BuiltinExecutor:
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
             ),
         }
+        # Confirmation-capable execution table: tools whose execute() path may
+        # return ``requires_confirmation`` and therefore need a post-approval
+        # runner. The two new sub-agent control tools are intentionally absent
+        # because they are not confirmation-gated.
         self._run_table: dict[str, Callable[[dict, _CallContext], dict]] = {
             "shell": lambda a, ctx: self._shell._run_shell(
                 a, caller_tag=ctx.caller_tag, chunk_callback=ctx.chunk_callback,
@@ -456,6 +473,21 @@ class BuiltinExecutor:
 
         If the prompt callback is not wired (bot not ready) or times out, fails closed.
         """
+        if self._prompt_approval_set is not None and tool_name in self._prompt_approval_set:
+            caller_ok = True
+            if self._current_prompt_id is not None and caller_tag:
+                from sub_agent_registry import get_registry as _sar_get_registry
+                _rec = _sar_get_registry().get(caller_tag.split()[0])
+                if _rec is None or _rec.prompt_id != self._current_prompt_id:
+                    caller_ok = False
+            if caller_ok:
+                logger.info(
+                    "Headless sub-agent: auto-approving '%s' (prompt-scoped approve-all)", tool_name
+                )
+                token = secrets.token_hex(12)
+                self._pending[token] = (tool_name, args)
+                return self.confirm(token, _emit_lifecycle=False)
+
         if self._subagent_confirm_prompt_fn is None:
             logger.warning(
                 "Headless sub-agent: Telegram bridge not wired — blocking %s (fail-closed)",

@@ -124,7 +124,9 @@ class TestBuildLogging:
         with caplog.at_level(logging.INFO, logger="tool_index"):
             ti.build()
 
-        summary = next(r.message for r in caplog.records if "build complete" in r.message)
+        summaries = [r.message for r in caplog.records if "build complete" in r.message]
+        assert summaries, "No build summary found in logs"
+        summary = summaries[-1]
         # 1 stale removed
         assert "1" in summary, f"Expected stale count in summary: {summary}"
 

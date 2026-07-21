@@ -206,6 +206,8 @@ class LogQueryTools:
         event_type_arg = args.get("event_type") or ""
         tool_arg = args.get("tool") or ""
         since_arg = str(args.get("since") or "")
+        # prompt_id: exact match against the first-class prompt_id field.
+        prompt_id_arg = args.get("prompt_id")
         # text/query: Unicode-aware case-insensitive full-record substring search.
         # Accept "query" as an alias for "text"; "text" takes precedence.
         text_arg = str(args.get("text") or args.get("query") or "").strip()
@@ -236,9 +238,11 @@ class LogQueryTools:
             all_traces = trace in ("*", "")
 
         logger.info(
-            "log_query: trace=%s level=%s event_type=%s tool=%s since=%s text=%s limit=%d",
+            "log_query: trace=%s level=%s event_type=%s tool=%s since=%s text=%s "
+            "prompt_id=%s limit=%d",
             trace or "<all>", level_arg or "-", event_type_arg or "-",
-            tool_arg or "-", since_arg or "-", text_arg or "-", limit,
+            tool_arg or "-", since_arg or "-", text_arg or "-",
+            prompt_id_arg or "-", limit,
         )
 
         path = self._owner._log_jsonl_path
@@ -270,6 +274,13 @@ class LogQueryTools:
 
             if not all_traces and str(rec.get("trace", "")) != trace:
                 continue
+            if prompt_id_arg is not None:
+                # The logging context stores prompt_id as a string (see
+                # agent_logging.bind_run_context). Tool calls may supply either a
+                # string or an integer; compare both sides as strings.
+                rec_prompt_id = rec.get("prompt_id")
+                if str(rec_prompt_id) != str(prompt_id_arg):
+                    continue
             if since_arg and str(rec.get("ts", "")) < since_arg:
                 continue
             if tool_arg and rec.get("tool") != tool_arg:

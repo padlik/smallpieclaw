@@ -22,6 +22,8 @@ from typing import Callable, Optional
 
 import httpx
 
+from trace_context import new_trace_id
+
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -40,7 +42,7 @@ from telegram_formatter import (
 )
 from telegram_commands import (
     cmd_start, cmd_help, cmd_status, cmd_stop, cmd_reset, cmd_compress,
-    cmd_verbose, cmd_jobs, cmd_agents, cmd_tools, cmd_skills, cmd_mcp,
+    cmd_verbose, cmd_jobs, cmd_agents, cmd_prompts, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
     cmd_dir,
@@ -75,6 +77,11 @@ def _task_text_with_artifact(
         f"- path: {dest}\n"
         f"- size: {size_str}"
     )
+
+
+def _classify_final_status(result: str) -> str:
+    """Map a react_loop result string to a PromptRegistry status."""
+    return "cancelled" if result == "[Cancelled]" else "done"
 
 
 @dataclasses.dataclass
@@ -132,6 +139,7 @@ class TelegramInterface:
         self._usage_registry = usage_registry  # TokenUsageRegistry
         self.mcp_manager = mcp_manager
         self._downloads_dir = os.path.abspath(downloads_dir)
+        self._prompt_registry = None  # Optional[PromptRegistry] — wired by main.py
         self._start_time = time.time()
 
         # Pairing state: {token: user_id}
@@ -202,6 +210,7 @@ class TelegramInterface:
             BotCommand("mode", "Set creativity mode"),
             BotCommand("jobs", "List scheduled jobs"),
             BotCommand("agents", "List and manage active sub-agents"),
+            BotCommand("prompts", "List recent prompts and their status"),
             BotCommand("reset", "Save and clear current task context"),
             BotCommand("verbose", "Toggle live tool-call progress messages"),
             BotCommand("reindex", "Re-embed all tools in the semantic index"),
@@ -243,6 +252,7 @@ class TelegramInterface:
         app.add_handler(CommandHandler("unpair", partial(cmd_unpair, self)))
         app.add_handler(CommandHandler("myid", partial(cmd_myid, self)))
         app.add_handler(CommandHandler("agents", partial(cmd_agents, self)))
+        app.add_handler(CommandHandler("prompts", partial(cmd_prompts, self)))
         # Hidden diagnostic commands (not registered with BotFather)
         app.add_handler(CommandHandler("show_ctx", partial(cmd_show_ctx, self)))
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
@@ -594,21 +604,34 @@ class TelegramInterface:
             _steps.append((elapsed, _classify(msg)))
             _flush_panel()
 
+        trace_id = new_trace_id()
+        prompt_record = None
+        if self._prompt_registry is not None:
+            prompt_record = self._prompt_registry.start(trace_id, task_text)
+
+        final_status = "failed"
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda: self.agent_handler(user.id, task_text, progress, images=images),
+                lambda: self.agent_handler(
+                    user.id, task_text, progress, images=images,
+                    prompt_id=prompt_record.prompt_id if prompt_record is not None else None,
+                    trace_id=trace_id,
+                ),
             )
             await self._safe_edit_html(status_msg, _build_panel())
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
                 await self._send_safe(update.effective_message, chunk)
+            final_status = _classify_final_status(result)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
             await self._safe_edit_html(status_msg, _build_panel())
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
+            if self._prompt_registry is not None and prompt_record is not None:
+                self._prompt_registry.finish(prompt_record.prompt_id, final_status)
 
     async def _send_deferred_prompt(self, deferred: "_DeferredMessage") -> None:
         """After the active task finishes, ask the operator what to do with the deferred message."""
@@ -940,10 +963,21 @@ class TelegramInterface:
             f"{_md_to_html(description)}\n\n"
             "Approve or deny this action."
         )
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"subconfirm_yes:{token}"),
-            InlineKeyboardButton("❌ Deny", callback_data=f"subconfirm_no:{token}"),
-        ]])
+        rows = [
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"subconfirm_yes:{token}"),
+                InlineKeyboardButton("❌ Deny", callback_data=f"subconfirm_no:{token}"),
+            ]
+        ]
+        _FILE_TOOLS_WITH_APPROVE_ALL = {"file_read", "file_write", "file_patch"}
+        if tool_name in _FILE_TOOLS_WITH_APPROVE_ALL:
+            rows.append([
+                InlineKeyboardButton(
+                    f"✅✅ Approve all {tool_name}",
+                    callback_data=f"subconfirm_all:{token}:{tool_name}",
+                )
+            ])
+        keyboard = InlineKeyboardMarkup(rows)
 
         async def _send():
             bot = self._app.bot

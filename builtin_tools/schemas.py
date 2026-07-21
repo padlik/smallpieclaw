@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Built-in tool schemas (15 tools, matching BUILTIN_TOOLS in descriptors.py)
+# Built-in tool schemas (17 tools, matching BUILTIN_TOOLS in descriptors.py)
 # ---------------------------------------------------------------------------
 
 BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -230,6 +230,37 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["agent_id"],
         },
     },
+    "wait_for_any_agent": {
+        "description": "Wait for the first of a set of sub-agents to finish and return its result.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "agent_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of sub-agent IDs to wait on.",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default: configured subagent_result_timeout).",
+                },
+            },
+            "required": ["agent_ids"],
+        },
+    },
+    "cancel_agent": {
+        "description": "Cancel a spawned sub-agent or all managed sub-agents.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "Sub-agent id, 'managed', or 'all'.",
+                },
+            },
+            "required": ["agent_id"],
+        },
+    },
     "memory_write": {
         "description": "Read or write the agent's persistent memory (data/memory.json).",
         "parameters": {
@@ -375,6 +406,10 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "text": {
                     "type": "string",
                     "description": "Case-insensitive substring search against record JSON. Alias 'query' also accepted.",
+                },
+                "prompt_id": {
+                    "type": "string",
+                    "description": "Filter records by the operator-facing prompt ID.",
                 },
             },
             "required": [],
