@@ -114,7 +114,7 @@ In-force ADRs constraining this design: ADR-0005 (SubAgentSupervisor owns the su
 
 ### D3: Active-prompt context via `_current_prompt_id` on `BuiltinExecutor` + `_prompt_registry` wired in `main.py`
 
-**Choice:** Add `_current_prompt_id: Optional[int]` to `BuiltinExecutor`, set at `run()` start, cleared at `run()` end. Add `_prompt_registry: Optional[PromptRegistry]` to `BuiltinExecutor`, wired once in `main.py` (long-lived, not per-run). `SubAgentSupervisor.submit()` reads `owner._prompt_registry` and `owner._current_prompt_id` to call `add_sub_agent(prompt_id, agent_id)`.
+**Choice:** Add `_current_prompt_id: Optional[int]` to `BuiltinExecutor`, set at `run()` start, cleared at `run()` end. Add `_prompt_registry: Optional[PromptRegistry]` to `BuiltinExecutor`, wired once in `main.py` (long-lived, not per-run). `AgentTools._exec_spawn_agent` (`builtin_tools/agents.py`) reads `owner._prompt_registry` and `owner._current_prompt_id` and calls `add_sub_agent(prompt_id, agent_id)` immediately after spawning. Recording is intentionally scoped to the model-facing spawn path — plan-step and diagnostic agents launched via other paths during an active prompt are excluded by design.
 
 **Why:** Mirrors the `_prompt_approval_set` pattern (D2) for the per-run piece. Single shared instance, no thread-local, no new params on `spawn_agent`. The supervisor already has a back-reference to the executor (via the `AgentTools` owner chain), so it can read both fields at submit time. The registry reference is long-lived because the registry is a process singleton — wiring it per-run would be redundant.
 
@@ -130,7 +130,7 @@ In-force ADRs constraining this design: ADR-0005 (SubAgentSupervisor owns the su
 
 ### D5: `cancel_agent` not confirmation-gated
 
-**Choice:** `_exec_cancel_agent` wraps `registry.cancel(agent_id)` or `registry.cancel_all_managed()` directly. No operator prompt.
+**Choice:** `_exec_cancel_agent` wraps `registry.cancel(agent_id)` or filters on-demand agents by `agent_id in ("managed","all")` directly. No operator prompt. Narrowing: `cancel_all_managed()` covers scheduled agents too, but `_exec_cancel_agent` intentionally restricts to on-demand agents only — the LLM must not cancel operator-owned scheduled jobs.
 
 **Why:** The LLM cancelling its own spawned workers is analogous to the existing `get_agent_result` timeout-cancel (`builtin_tools/agents.py:291-294`), which is also not confirmed. The operator retains `/agents cancel` and `/stop` as overrides. Adding confirmation would defeat the "agent decides it has enough" autonomy that `wait_for_any_agent` enables.
 

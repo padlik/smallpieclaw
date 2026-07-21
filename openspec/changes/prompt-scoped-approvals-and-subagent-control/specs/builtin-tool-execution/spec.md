@@ -48,7 +48,7 @@ Rule: The shared set is the same `auto_approve_tools` object owned by the main a
 The built-in executor SHALL register `wait_for_any_agent` and `cancel_agent` as built-in tools, routed by name to their handlers in `builtin_tools/agents.py`. They are not confirmation-capable.
 
 Feature: Builtin tool execution
-Rule: The built-in set grows from 15 to 17 tools. The confirmation-capable set stays at 6 (shell, file_read, file_write, file_patch, memory_graph_store, secret_get) — the new tools are not confirmation-capable.
+Rule: The built-in set grows from 15 to 17 tools. The confirmation-capable set stays at 8 (shell, file_read, file_write, file_patch, file_diff, file_send, memory_graph_store, secret_get) — the new tools are not confirmation-capable.
 
 #### Scenario: wait_for_any_agent is enumerated as a built-in
 - **GIVEN** the built-in executor
@@ -63,14 +63,15 @@ Rule: The built-in set grows from 15 to 17 tools. The confirmation-capable set s
 #### Scenario: New tools are not confirmation-capable
 - **GIVEN** the built-in executor
 - **WHEN** the confirmation-capable built-ins are enumerated
-- **THEN** exactly six built-ins gate: `shell`, `file_read`, `file_write`, `file_patch`, `memory_graph_store`, and `secret_get`
+- **THEN** exactly eight built-ins gate: `shell`, `file_read`, `file_write`, `file_patch`, `file_diff`, `file_send`, `memory_graph_store`, and `secret_get`
 - **AND** `wait_for_any_agent` and `cancel_agent` are not in the confirmation-capable set
 
-#### Scenario: shell cannot enter the shared approval set
-- **GIVEN** the operator is offered approve-all buttons only for file tools (`file_read`, `file_write`, `file_patch`)
-- **WHEN** the operator grants an approve-all during a prompt
-- **THEN** `shell` is never added to `auto_approve_tools`
-- **AND** `shell` remains always-confirmed for the main agent and always-blocked for sub-agents, regardless of any approve-all grant
+#### Scenario: shell cannot enter the shared approval set via the sub-agent approve-all path
+- **GIVEN** the operator is offered approve-all buttons only for file tools (`file_read`, `file_write`, `file_patch`) in sub-agent confirmation prompts
+- **WHEN** the operator grants an approve-all during a sub-agent confirmation
+- **THEN** `shell` is never added to `auto_approve_tools` via this path
+- **AND** `shell` remains always-blocked for sub-agents regardless of any approve-all grant
+- **NOTE** Main-agent shell approve-all removal is deferred to the `shell-guard-v0` change; the per-prompt TTL already bounds any such grant to one prompt.
 
 ## MODIFIED Requirements
 

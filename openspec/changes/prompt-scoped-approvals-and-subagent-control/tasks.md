@@ -30,7 +30,7 @@
 
 ## 5. cancel_agent Tool
 
-- [x] 5.1 Implement `_exec_cancel_agent` in `builtin_tools/agents.py`: if `agent_id` in ("managed","all") call `get_registry().cancel_all_managed()`; else call `get_registry().cancel(agent_id)`; return `{success, output}`
+- [x] 5.1 Implement `_exec_cancel_agent` in `builtin_tools/agents.py`: if `agent_id` in ("managed","all") cancel on-demand agents only (not scheduled); else call `get_registry().cancel(agent_id)`; return `{success, output}` — intentional narrowing: LLM must not cancel operator-owned scheduled jobs
 - [x] 5.2 Add `cancel_agent` descriptor to `builtin_tools/descriptors.py` and schema to `builtin_tools/schemas.py`
 - [x] 5.3 Add routing entry to `builtin_executor.py` `_exec_table` and `_run_table`
 - [x] 5.4 Write tests: cancel specific agent, cancel all managed, not confirmation-gated, unknown agent_id handled
@@ -65,7 +65,7 @@
 
 - [x] 10.1 Add `_current_prompt_id: Optional[int]` and `_prompt_registry: Optional[PromptRegistry]` fields to `BuiltinExecutor` (the `_prompt_registry` wiring in `main.py` is owned by task 1.4)
 - [x] 10.2 Set `executor._current_prompt_id` at `AgentController.run()` start; clear in finally
-- [x] 10.3 In `SubAgentSupervisor.submit` (`sub_agent_supervisor.py:128`), after `register_run`, call `owner._prompt_registry.add_sub_agent(owner._current_prompt_id, runner.agent_id)` if both are non-None
+- [x] 10.3 In `AgentTools._exec_spawn_agent` (`builtin_tools/agents.py`), after spawning, call `owner._prompt_registry.add_sub_agent(owner._current_prompt_id, runner.agent_id)` if both are non-None; recording is scoped to the model-facing spawn path (plan-step/diagnostic agents via other paths intentionally excluded)
 - [x] 10.4 Write tests: spawned sub-agent recorded against active prompt, no recording when `_current_prompt_id` is None (e.g. scheduled runs without a prompt context)
 
 ## 11. Prompt Builder Guidance
@@ -78,7 +78,7 @@
 
 - [x] 12.1 Update the built-in tool count from 15 to 17 in `builtin_executor.py` and any tests that assert the count
 - [x] 12.2 Verify `is_builtin` and `all_tools` enumerate 17 tools including the two new ones
-- [x] 12.3 Verify the confirmation-capable set stays at 6 (the new tools are not in it)
+- [x] 12.3 Verify the confirmation-capable set stays at 8 (shell, file_read, file_write, file_patch, file_diff, file_send, memory_graph_store, secret_get — the two new tools are not added)
 
 ## 13. Validation and Lint
 
