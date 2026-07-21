@@ -17,6 +17,7 @@ import logging
 import threading
 from typing import Callable, Optional
 
+from agent_logging import bind_run_context
 from agent_runtime import AgentRuntime
 from confirmation import ConfirmationManager
 from llm_client import LLMClient
@@ -149,6 +150,9 @@ class AgentController:
         user_goal: str,
         progress_callback: Optional[Callable[[str], None]] = None,
         images: Optional[list[str]] = None,
+        *,
+        prompt_id: Optional[int] = None,
+        trace_id: Optional[str] = None,
     ) -> str:
         """
         Process a user goal and return the final answer string.
@@ -158,6 +162,14 @@ class AgentController:
 
         The primary model index is always restored on exit so transient
         fallbacks during one run never permanently demote subsequent requests.
+
+        ``trace_id`` may be supplied by the caller (e.g. TelegramInterface) to
+        correlate the run with an externally managed prompt record. When omitted,
+        a fresh child trace ID is minted.
+
+        ``prompt_id`` is the operator-facing "Prompt #N"; it is propagated into
+        the log context and onto the shared BuiltinExecutor for sub-agent
+        tracking.
         """
         # Save primary model index — mirrors the same pattern in SubAgentRunner.run().
         # chat_with_fallback() intentionally leaves _active_idx on the working model so
@@ -167,21 +179,35 @@ class AgentController:
 
         # Request-scoped trace ID: reuse a propagated parent trace when present,
         # otherwise mint a fresh one so each interactive run is correlatable.
-        trace_id = child_trace_id(self._trace_id)
+        run_trace_id = trace_id if trace_id else child_trace_id(self._trace_id)
         _prev_trace = getattr(self.llm, "_trace_id", "")
         if hasattr(self.llm, "set_trace_id"):
-            self.llm.set_trace_id(trace_id)
+            self.llm.set_trace_id(run_trace_id)
+
+        # Bind run identity into structlog context so every log line carries
+        # trace/agent/prompt_id.
+        bind_run_context(trace=run_trace_id, agent=self.label, prompt_id=str(prompt_id) if prompt_id is not None else "")
+
+        # Per-prompt shared approval set: sub-agents use the same set object as the
+        # main agent for one-prompt approve-all semantics.
+        if self.builtin_executor is not None and self._depth == 0:
+            self.builtin_executor._prompt_approval_set = self._confirmation.auto_approve_tools
+            self.builtin_executor._current_prompt_id = prompt_id
 
         # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
         # keeps only the per-run concerns: trace minting (above), model
         # _active_idx save/restore (below), and progress/image passthrough.
-        ctx = AgentRuntime.build_react_context(self, trace_id)
+        ctx = AgentRuntime.build_react_context(self, run_trace_id)
         try:
             return react_loop(ctx, user_goal, progress_callback, images)
         finally:
             self.llm._active_idx = _primary_idx
             if hasattr(self.llm, "set_trace_id"):
                 self.llm.set_trace_id(_prev_trace)
+            if self.builtin_executor is not None and self._depth == 0:
+                self.builtin_executor._prompt_approval_set = None
+                self.builtin_executor._current_prompt_id = None
+            self._confirmation.clear_auto_approve()
 
 
     def cancel(self) -> None:
@@ -540,7 +566,7 @@ class SubAgentRunner:
     def is_cancelled(self) -> bool:
         return self._cancel_event.is_set()
 
-    def run(self, task: str) -> str:
+    def run(self, task: str, prompt_id: Optional[int] = None) -> str:
         """
         Run the sub-agent synchronously in the calling thread.
         Returns the final result string (or an error/cancellation message).
@@ -556,7 +582,7 @@ class SubAgentRunner:
         # Save primary model index; restore after run() so next job starts fresh
         _primary_idx = self._llm._active_idx
         try:
-            result = self._agent.run(task)
+            result = self._agent.run(task, prompt_id=prompt_id)
             elapsed = time.time() - start
             self._log.info("Done in %.1fs | model: %s", elapsed, self._model_id)
             return result

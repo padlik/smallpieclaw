@@ -128,6 +128,26 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Example: {\"agent_id\": \"sa-abc123\"}"
         ),
     ),
+    "wait_for_any_agent": BuiltinTool(
+        name="wait_for_any_agent",
+        description=(
+            "Wait for the first of a set of sub-agents to finish and return its result. "
+            "Call repeatedly to collect results in completion order (council pattern). "
+            "Args: agent_ids (list[str], REQUIRED), timeout (int, optional — seconds to wait, "
+            "default: configured subagent_result_timeout). "
+            "Returns: {status: 'done'|'failed'|'cancelled'|'timeout', agent_id, result}. "
+            "Example: {\"agent_ids\": [\"sa-abc123\", \"sa-def456\"]}"
+        ),
+    ),
+    "cancel_agent": BuiltinTool(
+        name="cancel_agent",
+        description=(
+            "Cancel a spawned sub-agent or all managed sub-agents. Not confirmation-gated. "
+            "Args: agent_id (str, REQUIRED — sub-agent id, 'managed', or 'all'). "
+            "Returns: {success, output}. "
+            "Example: {\"agent_id\": \"sa-abc123\"} or {\"agent_id\": \"managed\"}"
+        ),
+    ),
     "memory_write": BuiltinTool(
         name="memory_write",
         description=(

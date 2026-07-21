@@ -472,3 +472,48 @@ def test_text_search_casefold_unicode(unicode_executor):
     # Lowercase variant also matches.
     payload_lower = _query(unicode_executor, trace="*", text="straße café")
     assert payload_lower["total_matched"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression: prompt_id type boundary between schema and log context
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def prompt_id_executor(tmp_path):
+    """Log with records whose prompt_id is stored as a string (matching the
+    structlog context) plus one record without a prompt_id."""
+    records = [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "tool": "shell", "prompt_id": "7"},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_END", "tool": "shell", "prompt_id": "7"},
+        {"ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "info",
+         "event_type": "LLM_CALL", "prompt_id": "42"},
+        {"ts": "2026-07-05T10:00:03", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "tool": "schedule"},
+    ]
+    path = tmp_path / "prompt_id.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return BuiltinExecutor(log_jsonl_path=str(path))
+
+
+def test_prompt_id_filter_string_matches_string(prompt_id_executor):
+    """prompt_id stored as string can be filtered by string argument."""
+    payload = _query(prompt_id_executor, trace="*", prompt_id="7")
+    assert payload["total_matched"] == 2
+    assert {r["tool"] for r in payload["records"]} == {"shell"}
+
+
+def test_prompt_id_filter_integer_matches_string(prompt_id_executor):
+    """prompt_id stored as string can be filtered by integer argument (LLMs
+    may emit JSON numbers) because the filter coerces both sides."""
+    payload = _query(prompt_id_executor, trace="*", prompt_id=7)
+    assert payload["total_matched"] == 2
+    assert {r["tool"] for r in payload["records"]} == {"shell"}
+
+
+def test_prompt_id_filter_no_match_when_different(prompt_id_executor):
+    payload = _query(prompt_id_executor, trace="*", prompt_id=99)
+    assert payload["total_matched"] == 0

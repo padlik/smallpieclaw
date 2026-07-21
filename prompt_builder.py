@@ -114,7 +114,9 @@ RELEVANT PAST RESULTS:
   schedule          — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
   spawn_agent       — spawn an isolated sub-agent in the background; accepts response_format ("text"|"json"|"file"), max_tokens, temperature, top_p; returns agent_id immediately
   get_agent_result  — wait for a sub-agent to finish and retrieve its typed result; args: agent_id (required), timeout (optional seconds), cancel_on_timeout (bool, default true — auto-cancels agent on timeout)
-  memory_write      — read/write the agent's persistent memory (actions: set, append, delete, get); value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string; do NOT store model or provider configuration here
+  wait_for_any_agent — wait for the first of a set of sub-agents to finish and return its result. Call repeatedly with remaining ids to collect results in completion order, then decide whether you have enough before calling finish.
+  cancel_agent      — cancel a spawned sub-agent you no longer need, or pass "managed"/"all" to stop all of them. Not confirmation-gated.
+  memory_write      — read/write the agent's persistent memory (data/memory.json). Actions: set, append, delete, get; value must be a native JSON value (object, array, number, string) — do NOT pre-serialize to a string; do NOT store model or provider configuration here
   vision_query      — ask the LLM to analyse an image file on disk. Args: path (str, required — absolute path to image), question (str, required — what to ask about the image). Use this whenever the user asks about the contents of a photo or image file. Do NOT use shell to base64-encode or manually analyse images.
   file_patch        — make a surgical search-and-replace edit to a file. Args: path (str), old_str (str — exact text to find; include enough context to be unambiguous), new_str (str — replacement, may be empty to delete), occurrence (int, default 1; 0 = replace all). Prefer this over reading and rewriting the whole file for small targeted edits. Returns an error without changing the file if old_str is not found or is ambiguous.
   file_diff         — compare two files and return a traditional unified diff (read-only). Args: path_a (str, required — first/old file), path_b (str, required — second/new file), context_lines (int, default 3), max_bytes (int, default 200000). Returns the unified diff text, or 'Files are identical.' when there are no differences. Prefer this over shelling out to the `diff` command.
@@ -140,7 +142,9 @@ Write every task as a fully standalone brief using this template:
 
 - Choose the model deliberately: fast/cheap for data extraction, smarter for analysis.
 - Spawn sub-agents concurrently when their tasks are independent of each other.
-- Always follow spawn_agent with get_agent_result to collect results before finishing.
+- Always follow spawn_agent with get_agent_result or wait_for_any_agent to collect results before finishing.
+- "Approve all" confirmation grants are per-prompt: they cover you and your sub-agents for the current task only, and expire when you present your final answer.
+
 
 AVAILABLE TOOLS:
 {tools}

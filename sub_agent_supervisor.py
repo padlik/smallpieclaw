@@ -18,13 +18,16 @@ and other internal supervision controls flow through :class:`SupervisionOptions`
 from __future__ import annotations
 
 import html as _html_mod
+import inspect
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from agent_logging import bind_run_context, clear_run_context
 from sub_agent_registry import SOURCE_ON_DEMAND
+from trace_context import child_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,7 @@ class SupervisionOptions:
     notify: bool = True                                 # deliver Telegram notification
     expandable: bool = True                             # wrap result in expandable blockquote
     source: str = SOURCE_ON_DEMAND                      # registry source category (internal only)
+    prompt_id: Optional[int] = None                     # parent prompt id for log correlation
 
 
 @dataclass
@@ -116,6 +120,7 @@ class SubAgentSupervisor:
             task_preview=request.task,
             result_type=request.response_format,
         )
+        record.prompt_id = options.prompt_id
 
         # Log spawn params for observability
         fallback_models = request.factory_kwargs.get("fallback_models")
@@ -195,7 +200,24 @@ class SubAgentSupervisor:
                 )
 
         try:
-            result = runner.run(task)
+            # Bind the parent's prompt_id into the pool thread's log context so
+            # every sub-agent log line correlates with the originating prompt.
+            parent_trace = getattr(runner._agent, "_trace_id", None)
+            run_trace_id = child_trace_id(parent_trace) if parent_trace else ""
+            bind_run_context(
+                trace=run_trace_id,
+                agent=runner.agent_id,
+                prompt_id=str(options.prompt_id) if options.prompt_id is not None else "",
+            )
+            # Real SubAgentRunner.run() accepts a prompt_id kwarg; test fakes may
+            # not, so fall back to the legacy signature. Use inspect.signature
+            # rather than a bare TypeError catch so real TypeErrors inside the
+            # runner do not silently restart execution.
+            run_signature = inspect.signature(runner.run)
+            if "prompt_id" in run_signature.parameters:
+                result = runner.run(task, prompt_id=options.prompt_id)
+            else:
+                result = runner.run(task)
             # P2 consolidation: sub-agent results are NOT auto-persisted into
             # semantic/graph memory. Auto-writing arbitrary sub-agent output
             # risks prompt poisoning. If a result should be remembered, the
@@ -306,6 +328,7 @@ class SubAgentSupervisor:
             _save_context_before_completion()
             deregister_run(runner.agent_id)
             runner.close()
+            clear_run_context()
             if options.finish_cb:
                 options.finish_cb(finish_tag)
 

@@ -53,6 +53,7 @@ class SubAgentRecord:
     _result_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _llm_client: object = field(default=None, repr=False)  # LLMClient — for immediate HTTP interrupt
     _timeout_cancelled: bool = field(default=False, repr=False)  # set by get_agent_result on timeout
+    prompt_id: Optional[int] = field(default=None, repr=False)
 
     def cancel(self) -> None:
         self._cancel_event.set()
@@ -90,9 +91,13 @@ class SubAgentRecord:
 
 
 class SubAgentRegistry:
+    _COMPLETED_TTL: float = 300.0
+
     def __init__(self):
         self._lock = threading.Lock()
         self._agents: dict[str, SubAgentRecord] = {}
+        self._completed: dict[str, SubAgentRecord] = {}
+        self._completed_at: dict[str, float] = {}
 
     def register(self, record: SubAgentRecord) -> None:
         with self._lock:
@@ -100,11 +105,33 @@ class SubAgentRegistry:
 
     def unregister(self, agent_id: str) -> None:
         with self._lock:
-            self._agents.pop(agent_id, None)
+            rec = self._agents.pop(agent_id, None)
+            if rec is not None and rec.status in ("done", "failed", "cancelled"):
+                now = time.time()
+                self._completed[agent_id] = rec
+                self._completed_at[agent_id] = now
+                cutoff = now - self._COMPLETED_TTL
+                stale = [k for k, t in self._completed_at.items() if t < cutoff]
+                for k in stale:
+                    self._completed.pop(k, None)
+                    self._completed_at.pop(k, None)
 
     def get(self, agent_id: str) -> Optional[SubAgentRecord]:
         with self._lock:
             return self._agents.get(agent_id)
+
+    def get_completed(self, agent_id: str) -> Optional[SubAgentRecord]:
+        """Return a recently-completed record from the TTL cache, or None."""
+        with self._lock:
+            rec = self._completed.get(agent_id)
+            if rec is None:
+                return None
+            age = time.time() - self._completed_at.get(agent_id, 0.0)
+            if age > self._COMPLETED_TTL:
+                self._completed.pop(agent_id, None)
+                self._completed_at.pop(agent_id, None)
+                return None
+            return rec
 
     def find_by_label(self, label: str) -> Optional[SubAgentRecord]:
         """Find a record by label (e.g. scheduler job tag)."""

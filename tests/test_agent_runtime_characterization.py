@@ -369,7 +369,7 @@ class TestSubAgentModelConfiguration:
         runner = _make_runner(config)
         assert runner._llm._active_idx == 0
 
-        def _fake_agent_run(_task):
+        def _fake_agent_run(_task, prompt_id=None):
             runner._llm._active_idx = 2  # simulate a mid-run fallback
             return "sub result"
 
@@ -382,7 +382,7 @@ class TestSubAgentModelConfiguration:
         config = _cfg()
         runner = _make_runner(config)
 
-        def _boom(_task):
+        def _boom(_task, prompt_id=None):
             runner._llm._active_idx = 1
             raise RuntimeError("crash")
 

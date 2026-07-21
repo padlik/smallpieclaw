@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ALLOWED_APPROVE_ALL_TOOLS: frozenset[str] = frozenset({"file_read", "file_write", "file_patch"})
+
 
 async def _ack_query(query) -> None:
     """Best-effort button-press acknowledgment (Telegram requires within ~10 s)."""
@@ -346,11 +348,12 @@ async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTy
 
 
 async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Approve/Deny buttons for headless sub-agent sensitive file operations.
+    """Handle Approve/Deny/Approve-all buttons for headless sub-agent sensitive file operations.
 
     Callback data format:
       subconfirm_yes:<token>
       subconfirm_no:<token>
+      subconfirm_all:<token>:<tool_name>
 
     Authorization and same-operator double-press safety mirror cb_deferred:
     - Unauthorized presses get a private alert and do not edit the prompt.
@@ -360,14 +363,17 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
     """
     query = update.callback_query
 
-    data = query.data  # "subconfirm_yes:<token>" or "subconfirm_no:<token>"
-    parts = data.split(":", 1)
-    if len(parts) != 2:
+    data = query.data  # "subconfirm_yes:<token>" | "subconfirm_no:<token>" | "subconfirm_all:<token>:<tool>"
+    parts = data.split(":", 2)
+    if len(parts) < 2:
         await _ack_query(query)
         return
 
-    action, token = parts
-    approved = action == "subconfirm_yes"
+    action = parts[0]
+    token = parts[1]
+    tool_name = parts[2] if len(parts) > 2 else ""
+    is_approve_all = action == "subconfirm_all"
+    approved = action == "subconfirm_yes" or is_approve_all
 
     caller = query.from_user
     caller_id = caller.id if caller else None
@@ -387,6 +393,23 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
             pass
         return
 
+    # Approve-all: enforce allowlist before adding to the shared per-prompt set.
+    if is_approve_all and tool_name:
+        if tool_name not in _ALLOWED_APPROVE_ALL_TOOLS:
+            builtin.signal_headless_confirm(token, False)
+            await _ack_query(query)
+            try:
+                await query.edit_message_text(
+                    f"❌ Approve-all is not permitted for <code>{html.escape(tool_name)}</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+        if iface.agent:
+            iface.agent._confirmation.auto_approve_tools.add(tool_name)
+        logger.info("Approve-all callback: tool=%s token=%s", tool_name, token[:8])
+
     # Atomically signal the executor (pops the event before any await).
     # Returns False if the token was already resolved or expired.
     signalled = builtin.signal_headless_confirm(token, approved)
@@ -403,10 +426,13 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
             pass
         return
 
-    action_label = "✅ Approved" if approved else "❌ Denied"
+    if is_approve_all and tool_name:
+        result_text = f"✅✅ All future <code>{html.escape(tool_name)}</code> operations in this prompt auto-approved."
+    else:
+        result_text = "✅ Approved — sub-agent sensitive file operation." if approved else "❌ Denied."
     try:
         await query.edit_message_text(
-            f"{action_label} — sub-agent sensitive file operation.",
+            f"🤖 <b>Sub-agent confirmation</b>\n\n{result_text}",
             parse_mode=ParseMode.HTML,
         )
     except Exception:

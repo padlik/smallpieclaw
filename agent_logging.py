@@ -288,12 +288,13 @@ def _reset_handlers(root: logging.Logger) -> None:
 # ---------------------------------------------------------------------------
 # Run identity + emit helpers
 # ---------------------------------------------------------------------------
-def bind_run_context(*, trace: str = "", agent: str = "") -> dict:
+def bind_run_context(*, trace: str = "", agent: str = "", prompt_id: str = "") -> dict:
     """Bind run-identity fields into the context-local logging state.
 
     Call at each run entry point (ReAct run start — the common chokepoint for
     main, sub-agent, and scheduled runs). ``agent`` is the run label (e.g.
-    ``main`` or ``sa-<id>``). Only non-empty values are bound.
+    ``main`` or ``sa-<id>``). ``prompt_id`` is the operator-facing prompt number.
+    Only non-empty values are bound.
 
     Returns the token mapping to pass to :func:`reset_run_context` on exit
     (empty dict if nothing was bound), so nested runs on one thread restore the
@@ -304,6 +305,8 @@ def bind_run_context(*, trace: str = "", agent: str = "") -> dict:
         data["trace"] = trace
     if agent:
         data["agent"] = agent
+    if prompt_id:
+        data["prompt_id"] = prompt_id
     if data:
         return dict(structlog.contextvars.bind_contextvars(**data))
     return {}
