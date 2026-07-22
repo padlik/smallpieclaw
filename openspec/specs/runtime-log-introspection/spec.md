@@ -11,12 +11,24 @@ Define the `log_query` built-in tool that lets the agent read and filter its own
 The application MUST provide a built-in `log_query` tool that lets the agent read and filter the active structured log during a run, returning structured operational facts.
 
 Feature: Runtime log introspection
-Rule: Queries read the active `agent.jsonl` only and default to the current run's trace, so mid-run self-analysis is cheap and scoped.
+Rule: Queries read the active `agent.jsonl` only and default to the current run's trace, so mid-run self-analysis is cheap and scoped. The `prompt_id` filter reads the first-class `prompt_id` field directly from each log line — no join on the registry is needed.
 
 #### Scenario: Query defaults to the current run
-- **GIVEN** an agent executing under trace id `r-9f3c`
-- **WHEN** the agent invokes `log_query` without specifying a trace
+- **GIVEN** an agent executing under trace id `r-9f3c` and prompt id 7
+- **WHEN** the agent invokes `log_query` without specifying a trace or prompt id
 - **THEN** only records with `trace = "r-9f3c"` are returned
+
+#### Scenario: Filter by prompt id
+- **GIVEN** the active log contains records for prompt id 7 and prompt id 8
+- **WHEN** the agent invokes `log_query` with `prompt_id=7`
+- **THEN** only records with `prompt_id = 7` are returned
+- **AND** records for prompt id 8 are excluded
+
+#### Scenario: Filter by prompt id
+- **GIVEN** the active log contains records for prompt id 7 and prompt id 8
+- **WHEN** the agent invokes `log_query` with `prompt_id=7`
+- **THEN** only records with `prompt_id = 7` are returned
+- **AND** records for prompt id 8 are excluded
 
 #### Scenario: Filter by level and event
 - **GIVEN** the active log contains mixed-level records for the current run
