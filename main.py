@@ -222,6 +222,9 @@ def _run(
     os.makedirs(skills_dir, exist_ok=True)
     os.makedirs(downloads_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
+    os.environ["TMPDIR"] = tmp_dir
+    os.environ["TMP"] = tmp_dir
+    os.environ["TEMP"] = tmp_dir
     logger.info("Downloads dir: %s | Tmp dir: %s", downloads_dir, tmp_dir)
 
     agent_cfg  = cfg.get("agent", {})
