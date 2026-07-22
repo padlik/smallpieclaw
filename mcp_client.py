@@ -18,6 +18,7 @@ Public API (unchanged from previous implementation):
 from __future__ import annotations
 
 import asyncio
+import os
 import concurrent.futures
 import logging
 import re
@@ -209,6 +210,9 @@ class _SdkClientWrapper:
         try:
             if transport == "stdio":
                 merged_env = {**get_default_environment(), **(cfg.get("env") or {})}
+                for _k in ("TMPDIR", "TMP", "TEMP"):
+                    if _k in os.environ:
+                        merged_env.setdefault(_k, os.environ[_k])
                 params = StdioServerParameters(
                     command=cfg["command"][0],
                     args=cfg["command"][1:],

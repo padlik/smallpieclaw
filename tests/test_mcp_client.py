@@ -293,11 +293,61 @@ class TestSdkClientWrapper:
         env = captured[0].env
         assert "MY_VAR" in env
         assert "PATH" in env
-        # Sensitive keys from os.environ must NOT appear (not in get_default_environment)
+        # Sensitive keys from os.environ must NOT appear (not in get_default_environment),
+        # except TMPDIR/TMP/TEMP which are intentionally forwarded.
         import os
-        secret_keys = [k for k in os.environ if k not in fake_default_env and k != "MY_VAR"]
+        _tmp_vars = {"TMPDIR", "TMP", "TEMP"}
+        secret_keys = [k for k in os.environ
+                       if k not in fake_default_env and k != "MY_VAR" and k not in _tmp_vars]
         for k in secret_keys[:5]:  # spot-check first 5
             assert k not in env
+
+    def test_connect_stdio_tmpdir_forwarded(self):
+        """TMPDIR/TMP/TEMP from os.environ are forwarded to stdio MCP subprocesses."""
+        captured: list = []
+        session = _make_mock_session()
+        stdio_cm, session_cm = _make_stdio_patches(session)
+
+        def _capture_params(params):
+            captured.append(params)
+            return stdio_cm
+
+        import os
+        fake_default_env = {"PATH": "/usr/bin"}
+        with patch("mcp_client.get_default_environment", return_value=fake_default_env):
+            with patch("mcp_client.os.environ", {**os.environ, "TMPDIR": "/configured/tmp"}):
+                with patch("mcp_client.stdio_client", side_effect=_capture_params):
+                    with patch("mcp_client.ClientSession", return_value=session_cm):
+                        cfg = {"name": "t", "command": ["echo"], "transport": "stdio", "timeout": 5}
+                        _SdkClientWrapper(cfg, self.loop).connect()
+
+        assert len(captured) == 1
+        assert captured[0].env.get("TMPDIR") == "/configured/tmp"
+
+    def test_connect_stdio_tmpdir_cfg_env_wins(self):
+        """Per-server cfg['env'] TMPDIR overrides the inherited os.environ value."""
+        captured: list = []
+        session = _make_mock_session()
+        stdio_cm, session_cm = _make_stdio_patches(session)
+
+        def _capture_params(params):
+            captured.append(params)
+            return stdio_cm
+
+        import os
+        fake_default_env = {"PATH": "/usr/bin"}
+        with patch("mcp_client.get_default_environment", return_value=fake_default_env):
+            with patch("mcp_client.os.environ", {**os.environ, "TMPDIR": "/process/tmp"}):
+                with patch("mcp_client.stdio_client", side_effect=_capture_params):
+                    with patch("mcp_client.ClientSession", return_value=session_cm):
+                        cfg = {
+                            "name": "t", "command": ["echo"], "transport": "stdio",
+                            "timeout": 5, "env": {"TMPDIR": "/server/tmp"},
+                        }
+                        _SdkClientWrapper(cfg, self.loop).connect()
+
+        assert len(captured) == 1
+        assert captured[0].env.get("TMPDIR") == "/server/tmp"
 
     def test_connect_failure(self):
         stdio_cm = MagicMock()
