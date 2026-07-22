@@ -230,6 +230,22 @@ class TrustedZoneChecker:
         with self._user_trusted_lock:
             return sorted(self._user_trusted, key=lambda e: e.path)
 
+    def reload_user_trusted(self) -> int:
+        """Reload user-added trusted dirs from disk, replacing the in-memory list.
+
+        Raises on malformed content so the caller can report the error and the
+        existing in-memory list is not silently wiped.
+
+        Returns:
+            Number of entries loaded from disk.
+        """
+        with self._user_trusted_lock:
+            fresh = self._read_trusted_from_disk()
+            self._user_trusted = fresh
+            n = len(fresh)
+        logger.info("Zone: reloaded trusted_dirs.json — %d entries", n)
+        return n
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
@@ -247,14 +263,35 @@ class TrustedZoneChecker:
                 pass
         return inodes
 
-    def _load_user_trusted(self) -> list[TrustedDir]:
-        """Load user-added dirs from disk. Returns empty list if file missing."""
+    def _read_trusted_from_disk(self) -> list[TrustedDir]:
+        """Parse trusted_dirs.json; raises on malformed content."""
         if not os.path.exists(self._trusted_dirs_path):
             return []
+        with open(self._trusted_dirs_path) as f:
+            raw = json.load(f)
+        if not isinstance(raw, list):
+            raise ValueError(
+                f"trusted_dirs.json must be a JSON array, got {type(raw).__name__}"
+            )
+        entries: list[TrustedDir] = []
+        for e in raw:
+            if not isinstance(e, dict) or not isinstance(e.get("path"), str):
+                raise ValueError(f"invalid entry in trusted_dirs.json: {e!r}")
+            added = e.get("added")
+            mode = e.get("mode", "rw")
+            if mode not in ("r", "rw"):
+                raise ValueError(f"invalid mode {mode!r} for {e['path']!r}")
+            entries.append(TrustedDir(
+                path=e["path"],
+                added=added if isinstance(added, str) else "",
+                mode=mode,
+            ))
+        return entries
+
+    def _load_user_trusted(self) -> list[TrustedDir]:
+        """Load user-added dirs from disk. Returns empty list if file missing or unreadable."""
         try:
-            with open(self._trusted_dirs_path) as f:
-                raw = json.load(f)
-            return [TrustedDir(path=e["path"], added=e.get("added", ""), mode=e.get("mode", "rw")) for e in raw if "path" in e]
+            return self._read_trusted_from_disk()
         except Exception as exc:
             logger.warning("Zone: failed to load trusted_dirs.json: %s", exc)
             return []

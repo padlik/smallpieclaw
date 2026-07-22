@@ -1032,6 +1032,7 @@ async def cmd_dir(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
     Usage:
       /dir list     -- show user-added trusted dirs
       /dir del N    -- remove entry N (1-based)
+      /dir reload   -- reload trusted dirs from disk
     """
     msg = update.effective_message
     if msg is None:
@@ -1054,7 +1055,7 @@ async def cmd_dir(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
         if not dirs:
             await msg.reply_text("No custom trusted directories added yet.")
             return
-        lines = [f"  {i}. {d.path} [{d.mode}]" for i, d in enumerate(dirs, 1)]
+        lines = [f"  {i}. {d.path} [{d.mode}]  added {d.added[:10]}" for i, d in enumerate(dirs, 1)]
         await msg.reply_text("Trusted directories:\n" + "\n".join(lines))
 
     elif sub == "del":
@@ -1072,5 +1073,12 @@ async def cmd_dir(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
         except IndexError:
             await msg.reply_text(f"No trusted directory #{n}.")
 
+    elif sub == "reload":
+        try:
+            n = checker.reload_user_trusted()
+            await msg.reply_text(f"Reloaded trusted directories from disk: {n} entries.")
+        except Exception as exc:
+            await msg.reply_text(f"⚠️ Reload failed, kept existing entries: {exc}")
+
     else:
-        await msg.reply_text("Usage: /dir list | /dir del N")
+        await msg.reply_text("Usage: /dir list | /dir del N | /dir reload")

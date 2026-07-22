@@ -482,3 +482,108 @@ class TestPersistence:
             checker = _make_checker(tmp)
             with pytest.raises(ValueError):
                 checker.add_trusted("/some/path", mode="ro")
+
+
+class TestReload:
+    def test_reload_picks_up_externally_written_entry(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                assert checker.list_user_trusted() == []
+
+                data_dir = _make_paths(tmp).data_dir
+                entry = {"path": os.path.realpath(some_dir), "added": "2024-01-01T00:00:00+00:00", "mode": "rw"}
+                with open(os.path.join(data_dir, "trusted_dirs.json"), "w") as f:
+                    json.dump([entry], f)
+
+                n = checker.reload_user_trusted()
+                assert n == 1
+                paths = [e.path for e in checker.list_user_trusted()]
+                assert os.path.realpath(some_dir) in paths
+
+    def test_reload_raises_on_malformed_json_and_keeps_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir)
+                original = checker.list_user_trusted()
+
+                data_dir = _make_paths(tmp).data_dir
+                with open(os.path.join(data_dir, "trusted_dirs.json"), "w") as f:
+                    f.write("not valid json{{{")
+
+                with pytest.raises(Exception):
+                    checker.reload_user_trusted()
+
+                assert checker.list_user_trusted() == original
+
+    def test_load_user_trusted_returns_empty_on_malformed_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = _make_paths(tmp).data_dir
+            os.makedirs(data_dir, exist_ok=True)
+            with open(os.path.join(data_dir, "trusted_dirs.json"), "w") as f:
+                f.write("not valid json{{{")
+            checker = _make_checker(tmp)
+            assert checker.list_user_trusted() == []
+
+    def test_null_added_field_loads_as_empty_string(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                data_dir = _make_paths(tmp).data_dir
+                os.makedirs(data_dir, exist_ok=True)
+                entry = {"path": os.path.realpath(some_dir), "added": None, "mode": "rw"}
+                with open(os.path.join(data_dir, "trusted_dirs.json"), "w") as f:
+                    json.dump([entry], f)
+                checker = _make_checker(tmp)
+                entries = checker.list_user_trusted()
+                assert len(entries) == 1
+                assert entries[0].added == ""
+
+    def test_reload_raises_on_wrong_json_type(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir)
+                original = checker.list_user_trusted()
+
+                data_dir = _make_paths(tmp).data_dir
+                with open(os.path.join(data_dir, "trusted_dirs.json"), "w") as f:
+                    json.dump("this is not a list", f)
+
+                with pytest.raises(ValueError, match="must be a JSON array"):
+                    checker.reload_user_trusted()
+
+                assert checker.list_user_trusted() == original
+
+    def test_integer_added_field_loads_as_empty_string(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                data_dir = _make_paths(tmp).data_dir
+                os.makedirs(data_dir, exist_ok=True)
+                entry = {"path": os.path.realpath(some_dir), "added": 20260722, "mode": "rw"}
+                with open(os.path.join(data_dir, "trusted_dirs.json"), "w") as f:
+                    json.dump([entry], f)
+                checker = _make_checker(tmp)
+                entries = checker.list_user_trusted()
+                assert len(entries) == 1
+                assert entries[0].added == ""
+                # Ensure slicing (as done in /dir list) does not crash
+                assert entries[0].added[:10] == ""
+
+    def test_reload_missing_file_resets_to_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory() as some_dir:
+                checker = _make_checker(tmp)
+                checker.add_trusted(some_dir)
+                assert len(checker.list_user_trusted()) == 1
+
+                data_dir = _make_paths(tmp).data_dir
+                os.remove(os.path.join(data_dir, "trusted_dirs.json"))
+
+                n = checker.reload_user_trusted()
+                assert n == 0
+                assert checker.list_user_trusted() == []
