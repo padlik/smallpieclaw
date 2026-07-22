@@ -15,6 +15,8 @@ For OpenSpec propose/apply/verify/archive workflows, use the local `openspec-git
 - Do **not** initiate a code review unless explicitly instructed by the user — either via direct command or written instructions.
 - When following **OpenSpec**, adhere strictly to the defined steps in order. Do not skip steps or advance to the next step without an explicit command from the user.
 - Do **not** merge or commit changes without explicit user approval or a direct command.
+- Do **not** install any tools, programs and scripts without user approval or direct command. 
+- Do **not** mount any filesystems without user approval.
 
 ## Dev Commands
 
