@@ -3,17 +3,46 @@ mcp_client.py
 -------------
 MCP server communication via the official mcp Python SDK.
 
-Two transport modes:
+Three transport modes:
   stdio — subprocess via SDK stdio_client
   http  — streamable HTTP via SDK streamablehttp_client
+  sse   — Server-Sent Events via SDK sse_client
 
-Public API (unchanged from previous implementation):
+Public API:
     manager = MCPManager(server_configs)
     manager.connect_all()
-    tools = manager.get_tools()
+    tools   = manager.get_tools()
     outcome = manager.call_tool(name, args)
+    found   = manager.has_tool(name)
+    ok      = manager.set_enabled(name, on)
+    servers = manager.list_servers()
+    info    = manager.get_server_info(name)
     manager.close_all()
 """
+
+# Server config dict schema (one entry in the list passed to MCPManager):
+#
+# Required keys (all transports):
+#   name        str   — unique server identifier
+#   transport   str   — "stdio" | "http" | "sse"  (default: "stdio")
+#
+# Required for stdio transport:
+#   command     list[str]  — executable + args, e.g. ["npx", "-y", "my-mcp-server"]
+#
+# Required for http/sse transports:
+#   url         str   — base URL, e.g. "http://localhost:8080"
+#
+# Optional (all transports):
+#   enabled     bool  — whether to connect on startup (default: True)
+#   timeout     int   — per-operation timeout in seconds (default: 30)
+#
+# Optional for http/sse transports:
+#   headers     dict[str, str]  — extra HTTP headers forwarded with each request
+#                                 (default: {})
+#
+# Optional for stdio transport:
+#   env         dict[str, str]  — extra env vars merged into the subprocess
+#                                 environment (default: {})
 
 from __future__ import annotations
 
@@ -300,7 +329,20 @@ class _SdkClientWrapper:
 class MCPManager:
     """
     Manages multiple MCP server connections.
-    Public API is identical to the previous implementation.
+
+    Threading model:
+      - A single daemon event loop runs in its own background thread (_loop_thread).
+      - Each configured server gets one _SdkClientWrapper, which schedules a
+        long-lived _session_runner coroutine on that shared loop.
+      - Tool calls are serialized per server via an asyncio.Queue; only one
+        outstanding call per server at a time.
+      - connect() / call_tool() bridge sync callers to the async loop via
+        loop.call_soon_threadsafe() to schedule work, plus a
+        concurrent.futures.Future on each _ToolRequest / _ready_future to
+        block the caller until the result is ready.
+      - asyncio.run_coroutine_threadsafe is used only in close_all() to drain
+        pending tasks before the loop stops.
+      - The loop starts lazily on first connect_all() and stops on close_all().
     """
 
     def __init__(self, server_configs: list[dict]) -> None:
@@ -507,7 +549,3 @@ class MCPManager:
             "last_error": wrapper.last_error if wrapper else "",
         }
 
-    def last_error(self, name: str) -> str:
-        with self._lock:
-            wrapper = self._wrappers.get(name)
-        return wrapper.last_error if wrapper else ""

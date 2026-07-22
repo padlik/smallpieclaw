@@ -134,6 +134,14 @@ class TestSdkResultToOutcome:
         out = _sdk_result_to_outcome(_make_result([unknown, _text_item("hello")]))
         assert out["output"] == "hello"
 
+    def test_resource_none_field(self):
+        item = MagicMock()
+        item.type = "resource"
+        item.resource = None
+        out = _sdk_result_to_outcome(_make_result([item]))
+        assert "[resource]" in out["output"]
+        assert out["success"] is True
+
 
 # ---------------------------------------------------------------------------
 # TestSdkToolsToRegistry
@@ -189,6 +197,11 @@ class TestSdkToolsToRegistry:
         tools = _sdk_tools_to_registry("srv", [t])
         assert "\x00" not in tools[0].description
         assert "HelloWorld" in tools[0].description
+
+    def test_description_truncated_at_max_len(self):
+        long_desc = "a" * 2049
+        tools = _sdk_tools_to_registry("srv", [_sdk_tool("my_tool", long_desc)])
+        assert len(tools[0].description) == 2048
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +654,67 @@ class TestSdkClientWrapper:
         # Second stop must be a no-op
         mgr._stop_loop()  # should not raise
 
+    def test_connect_initialize_failure(self):
+        session = _make_mock_session()
+        session.initialize = AsyncMock(side_effect=RuntimeError("init failed"))
+        stdio_cm, session_cm = _make_stdio_patches(session)
+
+        with patch("mcp_client.stdio_client", return_value=stdio_cm):
+            with patch("mcp_client.ClientSession", return_value=session_cm):
+                wrapper = self._make_wrapper()
+                tools = wrapper.connect()
+
+        assert wrapper.connected is False
+        assert tools == []
+        assert wrapper.last_error != ""
+
+    def test_connect_list_tools_failure_after_init(self):
+        session = _make_mock_session()
+        session.initialize = AsyncMock()
+        session.list_tools = AsyncMock(side_effect=RuntimeError("list_tools failed"))
+        stdio_cm, session_cm = _make_stdio_patches(session)
+
+        with patch("mcp_client.stdio_client", return_value=stdio_cm):
+            with patch("mcp_client.ClientSession", return_value=session_cm):
+                wrapper = self._make_wrapper()
+                tools = wrapper.connect()
+
+        assert wrapper.connected is False
+        assert tools == []
+        assert wrapper.last_error != ""
+
+    def test_pagination_page_limit(self):
+        # 9 tools/page × 51 pages = 459 total < _MAX_TOOLS (500), so _MAX_TOOL_PAGES fires first
+        pages = []
+        for i in range(51):
+            page = MagicMock()
+            page.tools = [_sdk_tool(f"t{i}_{j}") for j in range(9)]
+            page.nextCursor = f"cursor{i}" if i < 50 else None
+            pages.append(page)
+
+        session = MagicMock()
+        session.initialize = AsyncMock()
+        session.list_tools = AsyncMock(side_effect=pages)
+        stdio_cm, session_cm = _make_stdio_patches(session)
+
+        with patch("mcp_client.stdio_client", return_value=stdio_cm):
+            with patch("mcp_client.ClientSession", return_value=session_cm):
+                wrapper = self._make_wrapper()
+                tools = wrapper.connect()
+
+        assert wrapper.connected is False
+        assert tools == []
+        assert wrapper.last_error != ""
+
+    def test_connect_unknown_transport(self):
+        cfg = {"name": "test", "transport": "ws", "url": "ws://localhost", "timeout": 5}
+        wrapper = self._make_wrapper(cfg=cfg)
+        tools = wrapper.connect()
+
+        assert wrapper.connected is False
+        assert tools == []
+        assert "ws" in wrapper.last_error
+
 
 # ---------------------------------------------------------------------------
 # TestMCPManager
@@ -895,3 +969,73 @@ class TestMCPManager:
         result = mgr.call_tool("tool1", {})
         assert result["success"] is False
         assert "loop" in result["error"].lower()
+
+    def test_list_servers_transport_labels(self):
+        cfgs = [
+            {"name": "stdio_srv", "transport": "stdio", "command": ["x"]},
+            {"name": "http_srv", "transport": "http", "url": "http://x"},
+            {"name": "sse_srv", "transport": "sse", "url": "http://x/sse"},
+        ]
+        mgr = MCPManager(cfgs)
+        servers = mgr.list_servers()
+        by_name = {s["name"]: s for s in servers}
+        assert by_name["stdio_srv"]["transport"] == "stdio"
+        assert by_name["http_srv"]["transport"] == "web"
+        assert by_name["sse_srv"]["transport"] == "web"
+
+    def test_start_loop_idempotent(self):
+        import time
+        cfgs = [{"name": "srv", "transport": "stdio", "command": ["x"]}]
+        mgr = MCPManager(cfgs)
+        mgr._start_loop()
+        assert mgr._loop is not None
+        deadline = time.time() + 2
+        while not mgr._loop.is_running() and time.time() < deadline:
+            time.sleep(0.01)
+        assert mgr._loop.is_running()
+
+        first_loop = mgr._loop
+        first_thread = mgr._loop_thread
+
+        mgr._start_loop()  # second call — must be a no-op
+
+        try:
+            assert mgr._loop is first_loop
+            assert mgr._loop_thread is first_thread
+        finally:
+            mgr._stop_loop()
+
+    def test_get_server_info_disabled(self):
+        cfgs = [{"name": "srv", "transport": "stdio", "command": ["x"], "enabled": False}]
+        mgr = MCPManager(cfgs)
+        info = mgr.get_server_info("srv")
+        assert info is not None
+        assert info["status"] == "off"
+
+    def test_get_server_info_error_state(self):
+        cfgs = [{"name": "srv", "transport": "stdio", "command": ["x"], "enabled": True}]
+        mgr = MCPManager(cfgs)
+        error_wrapper = MagicMock()
+        error_wrapper.connected = False
+        error_wrapper.tools = []
+        error_wrapper.last_error = "connection refused"
+        mgr._wrappers["srv"] = error_wrapper
+
+        info = mgr.get_server_info("srv")
+        assert info is not None
+        assert info["status"] == "error"
+
+    def test_set_enabled_true_already_connected(self):
+        cfgs = [{"name": "srv", "transport": "stdio", "command": ["x"]}]
+        mgr = MCPManager(cfgs)
+        connected_wrapper = MagicMock()
+        connected_wrapper.connected = True
+        mgr._wrappers["srv"] = connected_wrapper
+
+        connect_calls: list = []
+        mgr._connect_server = lambda name, cfg: connect_calls.append(name)  # type: ignore[method-assign]
+
+        result = mgr.set_enabled("srv", True)
+
+        assert result is True
+        assert connect_calls == []
