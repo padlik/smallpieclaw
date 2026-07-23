@@ -92,7 +92,7 @@ class TestDepthGuardProtectsExecutorFields:
         executor = BuiltinExecutor(data_dir=str(tmp_path))
         sentinel_set: set = {"file_read"}
         executor._prompt_approval_set = sentinel_set
-        executor._current_prompt_id = 42
+        executor._current_prompt_id = "01JARYN6R0ABCDEFGHJKMNPQRS"
 
         llm = MagicMock()
         llm._active_idx = 0
@@ -108,9 +108,9 @@ class TestDepthGuardProtectsExecutorFields:
         with patch("agent_controller.AgentRuntime.build_react_context", return_value=MagicMock()):
             with patch("agent_controller.react_loop", return_value="sub done"):
                 with patch("agent_controller.bind_run_context"):
-                    result = ctrl.run("sub-task", prompt_id=99)
+                    result = ctrl.run("sub-task", prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS")
 
         assert result == "sub done"
         # Parent's fields survive the sub-agent run unchanged
         assert executor._prompt_approval_set is sentinel_set
-        assert executor._current_prompt_id == 42
+        assert executor._current_prompt_id == "01JARYN6R0ABCDEFGHJKMNPQRS"

@@ -355,9 +355,12 @@ async def cmd_prompts(iface: "TelegramInterface", update: Update, ctx: ContextTy
         elapsed = _fmt_prompt_elapsed(rec.started_at, rec.ended_at)
         sub_count = len(rec.sub_agent_ids)
         sa_info = f" · {sub_count} sub-agent{'s' if sub_count != 1 else ''}" if sub_count else ""
+        ts = _dt.fromtimestamp(rec.started_at).strftime("%Y-%m-%d %H:%M")
+        text_preview = _truncate_desc(rec.text, 80)
         lines.append(
-            f"<b>Prompt #{rec.prompt_id}</b> {icon} <code>{html.escape(rec.status)}</code>\n"
-            f"  Elapsed: {elapsed}{sa_info}"
+            f"<code>{html.escape(str(rec.prompt_id))}</code> {icon} <code>{html.escape(rec.status)}</code>\n"
+            f"  📅 {ts} · ⏱ {elapsed}{sa_info}\n"
+            f"  💬 {text_preview}"
         )
 
     for chunk in iface._split_message("\n".join(lines)):

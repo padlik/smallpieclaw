@@ -1,13 +1,20 @@
 """
 prompt_registry.py
 ------------------
-Process-singleton registry mapping a monotonic "Prompt #N" to a user-initiated
-agent run.
+Process-singleton registry mapping a globally-unique ULID prompt ID to a
+user-initiated agent run.
 
 The registry persists append-only JSONL records to ``data/prompts.jsonl`` so
 prompt IDs and their sub-agent associations survive process restarts. It is
 observed by the sub-agent supervisor (to record spawned agents against the active
 prompt) and queried by Telegram commands / log introspection tools.
+
+Prompt IDs are 26-char ULID strings (Crockford base32, 48-bit millisecond
+timestamp + 80-bit random), generated inline with no external dependency. They
+are globally unique and stable forever — across restarts, registry resets, and
+day boundaries. Legacy integer IDs from a prior version are normalized to
+``str`` on replay; callers must always pass ``str`` to ``get()``. Only new
+records receive ULIDs.
 
 Thread-safety: all shared state is protected by a single ``threading.Lock``.
 """
@@ -17,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,11 +33,39 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# ULID generator (inline, no external dependency)
+# ---------------------------------------------------------------------------
+
+# Crockford base32 alphabet (excludes I, L, O, U to avoid confusion).
+_CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _generate_ulid() -> str:
+    """Generate a 26-char ULID string (Crockford base32).
+
+    Layout: 6-byte (48-bit) millisecond timestamp + 10-byte (80-bit) random
+    from ``secrets.token_bytes`` = 16 bytes total, Crockford base32 encoded to
+    26 chars. Time-sortable lexicographically; 80 bits of entropy makes
+    collision effectively impossible.
+    """
+    ms_timestamp = int(time.time() * 1000)
+    randomness = secrets.token_bytes(10)
+    raw = ms_timestamp.to_bytes(6, "big") + randomness  # 16 bytes
+    # Crockford base32 encode (5 bits per char, 16 bytes -> 26 chars with 3-bit pad)
+    value = int.from_bytes(raw, "big")
+    chars = []
+    for _ in range(26):
+        chars.append(_CROCKFORD_ALPHABET[value & 0x1F])
+        value >>= 5
+    return "".join(reversed(chars))
+
+
 @dataclass
 class PromptRecord:
     """In-memory representation of one prompt/run."""
 
-    prompt_id: int
+    prompt_id: str
     trace_id: str
     text: str
     started_at: float
@@ -39,7 +75,7 @@ class PromptRecord:
 
 
 class PromptRegistry:
-    """Monotonic prompt-ID registry with append-only JSONL persistence."""
+    """Globally-unique ULID prompt-ID registry with append-only JSONL persistence."""
 
     def __init__(self, data_dir: str = "data") -> None:
         """Create the registry, ensuring the data directory exists and replaying
@@ -48,9 +84,8 @@ class PromptRegistry:
         self._data_dir = data_dir
         self._file_path = os.path.join(data_dir, "prompts.jsonl")
         os.makedirs(data_dir, exist_ok=True)
-        self._records: dict[int, PromptRecord] = {}
-        self._next_id = 1
-        self._trace_to_id: dict[str, int] = {}
+        self._records: dict[str, PromptRecord] = {}
+        self._trace_to_id: dict[str, str] = {}
         if os.path.exists(self._file_path):
             self._replay()
 
@@ -67,8 +102,11 @@ class PromptRegistry:
         """Replay the JSONL log to rebuild in-memory records.
 
         For each ``prompt_id`` the last line seen wins for mutable fields.
-        The next assigned ID will be ``max(prompt_id) + 1``."""
-        max_id = 0
+        Legacy integer IDs are normalized to ``str`` at the replay boundary;
+        callers must always pass ``str`` to ``get()``. Non-int/non-str values
+        (including ``bool``, ``float``, ``list``, ``dict``) are skipped. Only
+        new records receive ULIDs (no counter, no ``max_id`` logic).
+        """
         try:
             with open(self._file_path, "r", encoding="utf-8") as f:
                 for raw_line in f:
@@ -81,10 +119,9 @@ class PromptRegistry:
                         logger.warning("Skipping malformed prompts.jsonl line: %s", raw_line[:120])
                         continue
                     prompt_id = line.get("prompt_id")
-                    if prompt_id is None or not isinstance(prompt_id, int):
+                    if isinstance(prompt_id, bool) or not isinstance(prompt_id, (int, str)):
                         continue
-                    if prompt_id > max_id:
-                        max_id = prompt_id
+                    prompt_id = str(prompt_id)
 
                     # Start record
                     if "action" not in line:
@@ -116,7 +153,6 @@ class PromptRegistry:
                         record.sub_agent_ids = list(line.get("sub_agent_ids", record.sub_agent_ids))
         except OSError as exc:
             logger.warning("Could not replay %s: %s", self._file_path, exc)
-        self._next_id = max_id + 1 if max_id else 1
 
     # ------------------------------------------------------------------
     # Public API
@@ -129,8 +165,7 @@ class PromptRegistry:
         the JSONL log and returns the created ``PromptRecord``.
         """
         with self._lock:
-            prompt_id = self._next_id
-            self._next_id += 1
+            prompt_id = _generate_ulid()
             started_at = time.time()
             truncated = text[:200]
             record = PromptRecord(
@@ -149,10 +184,10 @@ class PromptRegistry:
                 "status": "running",
                 "sub_agent_ids": [],
             })
-            logger.info("Prompt %d started (trace=%s)", prompt_id, trace_id)
+            logger.info("Prompt %s started (trace=%s)", prompt_id, trace_id)
             return record
 
-    def finish(self, prompt_id: int, status: str) -> None:
+    def finish(self, prompt_id: str, status: str) -> None:
         """Finalize a prompt run.
 
         *status* should be one of ``"done"``, ``"failed"``, or ``"cancelled"``.
@@ -162,7 +197,7 @@ class PromptRegistry:
         with self._lock:
             record = self._records.get(prompt_id)
             if record is None:
-                logger.warning("finish called for unknown prompt_id %d", prompt_id)
+                logger.warning("finish called for unknown prompt_id %s", prompt_id)
                 return
             ended_at = time.time()
             record.ended_at = ended_at
@@ -174,14 +209,14 @@ class PromptRegistry:
                 "status": status,
                 "sub_agent_ids": list(record.sub_agent_ids),
             })
-            logger.info("Prompt %d finished (status=%s)", prompt_id, status)
+            logger.info("Prompt %s finished (status=%s)", prompt_id, status)
 
-    def add_sub_agent(self, prompt_id: int, agent_id: str) -> None:
+    def add_sub_agent(self, prompt_id: str, agent_id: str) -> None:
         """Record a spawned sub-agent against the originating prompt."""
         with self._lock:
             record = self._records.get(prompt_id)
             if record is None:
-                logger.warning("add_sub_agent called for unknown prompt_id %d", prompt_id)
+                logger.warning("add_sub_agent called for unknown prompt_id %s", prompt_id)
                 return
             if agent_id not in record.sub_agent_ids:
                 record.sub_agent_ids.append(agent_id)
@@ -190,9 +225,9 @@ class PromptRegistry:
                 "action": "add_sub_agent",
                 "agent_id": agent_id,
             })
-            logger.info("Prompt %d recorded sub-agent %s", prompt_id, agent_id)
+            logger.info("Prompt %s recorded sub-agent %s", prompt_id, agent_id)
 
-    def get(self, prompt_id: int) -> Optional[PromptRecord]:
+    def get(self, prompt_id: str) -> Optional[PromptRecord]:
         """Return the prompt record by ID, or ``None`` if unknown."""
         with self._lock:
             return self._records.get(prompt_id)
@@ -206,7 +241,11 @@ class PromptRegistry:
             return self._records.get(prompt_id)
 
     def list_recent(self, n: int = 20) -> list[PromptRecord]:
-        """Return the most recent *n* prompt records, most recent first."""
+        """Return the most recent *n* prompt records, most recent first.
+
+        Sorted by ``started_at`` descending (not by ``prompt_id`` keys) so mixed
+        legacy-int and ULID-string IDs never cause a ``TypeError``.
+        """
         with self._lock:
-            ids = sorted(self._records.keys(), reverse=True)
-            return [self._records[i] for i in ids[:n]]
+            records = sorted(self._records.values(), key=lambda r: r.started_at, reverse=True)
+            return records[:n]

@@ -409,7 +409,7 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "prompt_id": {
                     "type": "string",
-                    "description": "Filter records by the operator-facing prompt ID.",
+                    "description": "Filter records by the operator-facing prompt ID (globally-unique ULID string).",
                 },
             },
             "required": [],

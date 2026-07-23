@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re as _re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -57,14 +58,17 @@ class TestPromptsCommand:
         r1 = registry.start("r-aaaa", "first task")
         registry.add_sub_agent(r1.prompt_id, "sa-1")
         registry.finish(r1.prompt_id, "done")
-        registry.start("r-bbbb", "second task")
+        r2 = registry.start("r-bbbb", "second task")
 
         iface = _make_iface(registry)
         texts = _run_cmd(iface)
 
         full = "\n".join(texts)
-        assert "Prompt #2" in full
-        assert "Prompt #1" in full
+        assert r1.prompt_id in full
+        assert r2.prompt_id in full
+        assert "first task" in full
+        assert "second task" in full
+        assert _re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", full)
         assert "done" in full
         assert "running" in full
         assert "1 sub-agent" in full

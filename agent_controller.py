@@ -145,7 +145,7 @@ class AgentController:
         progress_callback: Optional[Callable[[str], None]] = None,
         images: Optional[list[str]] = None,
         *,
-        prompt_id: Optional[int] = None,
+        prompt_id: Optional[str] = None,
         trace_id: Optional[str] = None,
     ) -> str:
         """
@@ -548,7 +548,7 @@ class SubAgentRunner:
     def is_cancelled(self) -> bool:
         return self._cancel_event.is_set()
 
-    def run(self, task: str, prompt_id: Optional[int] = None) -> str:
+    def run(self, task: str, prompt_id: Optional[str] = None) -> str:
         """
         Run the sub-agent synchronously in the calling thread.
         Returns the final result string (or an error/cancellation message).
