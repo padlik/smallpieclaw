@@ -582,6 +582,7 @@ SYSTEM_BUILTIN_TOOLS = [
     "memory_graph_search",
     "memory_graph_store",
     "secret_get",
+    "log_query",
 ]
 
 # prompts/system/04-execution.md — RULES headings (mode="default").
@@ -599,10 +600,16 @@ SUB_AGENT_BUILTIN_TOOLS = [
     "file_diff",
     "vision_query",
     "secret_get",
+    "memory_write",
+    "memory_graph_search",
+    "memory_graph_store",
+    "schedule",
+    "log_query",
 ]
 
 # prompts/sub-agent/03-tools.md — RULES headings (mode="sub-agent").
 SUB_AGENT_RULES_HEADINGS = [
+    "GRAPH MEMORY RULES",
     "VAULT RULES",
 ]
 
@@ -699,6 +706,19 @@ class TestRuntimePromptAdvertisedContent:
                 f"prompts/system/03-capabilities.md is absent from the rendered "
                 f"default system prompt (no dedicated tool-entry line for it)."
             )
+        # Two-sided guard: every built-in tool entry in the rendered prompt must
+        # be in the roster. Catches the "added to markdown, forgot roster" case
+        # that the one-sided check above would miss. Scoped to known built-in
+        # tool names (from the BUILTIN_TOOLS registry) so incidental prose that
+        # happens to match the em-dash entry pattern (e.g. "tools — implement
+        # them...") is not flagged.
+        from builtin_tools.descriptors import BUILTIN_TOOLS
+        builtin_names = set(BUILTIN_TOOLS)
+        unexpected = (tool_entries & builtin_names) - set(SYSTEM_BUILTIN_TOOLS)
+        assert not unexpected, (
+            f"Built-in tools {sorted(unexpected)!r} appear in the rendered default "
+            f"system prompt but are not in SYSTEM_BUILTIN_TOOLS — update the roster."
+        )
         for heading in SYSTEM_RULES_HEADINGS:
             assert heading in prompt, (
                 f"{heading!r} block is absent from the rendered default system "
@@ -716,6 +736,18 @@ class TestRuntimePromptAdvertisedContent:
                 f"prompts/sub-agent/03-tools.md is absent from the rendered "
                 f"sub-agent prompt (no dedicated tool-entry line for it)."
             )
+        # Two-sided guard: every built-in tool entry in the rendered prompt must
+        # be in the roster. Catches the "added to markdown, forgot roster" case.
+        # Scoped to known built-in tool names (from the BUILTIN_TOOLS registry)
+        # so incidental prose that happens to match the em-dash entry pattern
+        # (e.g. "tools — implement them...") is not flagged.
+        from builtin_tools.descriptors import BUILTIN_TOOLS
+        builtin_names = set(BUILTIN_TOOLS)
+        unexpected = (tool_entries & builtin_names) - set(SUB_AGENT_BUILTIN_TOOLS)
+        assert not unexpected, (
+            f"Built-in tools {sorted(unexpected)!r} appear in the rendered sub-agent "
+            f"prompt but are not in SUB_AGENT_BUILTIN_TOOLS — update the roster."
+        )
         for heading in SUB_AGENT_RULES_HEADINGS:
             assert heading in prompt, (
                 f"{heading!r} block is absent from the rendered sub-agent prompt "

@@ -25,6 +25,7 @@ BUILT-IN TOOLS (always available — prefer these before creating new tools):
   memory_graph_search — search the knowledge graph for facts, people, preferences, or past events. Args: query (str). Only available when graph memory is enabled.
   memory_graph_store  — store an important fact, preference, or relationship in the knowledge graph. Args: content (str), entity_type (str, optional). Only available when graph memory is enabled.
   secret_get        — retrieve a value from the vault by key. Args: key (str, required). Requires user confirmation. Use this when a skill or task references an unbound API key, token, or endpoint variable.
+  log_query         — query the agent's own structured run log (the active JSONL sink) to inspect recent tool activity, errors, and events for the current or a specified run. Read-only and non-destructive; all arguments are optional. Prefer this over file_read for inspecting agent logs.
 
 AVAILABLE TOOLS:
 {{tools}}

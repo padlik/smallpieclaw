@@ -7,7 +7,7 @@ plain parameter rather than via an owner back-reference — no state to own.
 from __future__ import annotations
 
 
-def exec_schedule(scheduler, args: dict) -> dict:
+def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
     """Run the ``schedule`` built-in tool's ``action`` against *scheduler*.
 
     ``args["action"]`` selects the operation (default ``"list"``):
@@ -16,11 +16,37 @@ def exec_schedule(scheduler, args: dict) -> dict:
     (each requires ``tag``). Returns the standard built-in result dict; an
     unrecognized action or a missing ``scheduler`` both return
     ``success=False`` with a descriptive ``error``.
+
+    ``caller_depth`` is the depth of the invoking AgentController (0 = main
+    agent, 1 = sub-agent). Mutating actions (``add``/``remove``/``pause``/
+    ``resume``/``run_now``) are blocked at ``caller_depth >= 1`` so sub-agents
+    cannot create, delete, or alter scheduled jobs that persist beyond the
+    sub-agent's lifetime. The read-only ``list`` action remains available.
     """
     if not scheduler:
         return {"success": False, "output": "", "error": "Scheduler not available.", "exit_code": -1}
     action = str(args.get("action", "list")).lower()
     tag = str(args.get("tag", "")).strip()
+
+    # Depth guard — sub-agents cannot manipulate scheduled jobs. The read-only
+    # ``list`` action is allowed; all mutating actions are hard-blocked.
+    if caller_depth >= 1 and action != "list":
+        return {
+            "success": False,
+            "output": "",
+            "error": (
+                f"schedule: sub-agents cannot modify scheduled jobs "
+                f"(action '{action}' blocked at depth {caller_depth}). "
+                f"Only 'list' is available to sub-agents."
+            ),
+            "exit_code": -1,
+            "error_type": "fundamentally_wrong_approach",
+            "recoverable": False,
+            "suggestion": (
+                "Ask the parent agent to modify scheduled jobs; sub-agents may "
+                "only list them."
+            ),
+        }
 
     if action == "list":
         jobs = scheduler.list_jobs()

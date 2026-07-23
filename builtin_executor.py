@@ -185,7 +185,7 @@ class BuiltinExecutor:
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
             ),
             "file_send": lambda a, ctx: self._files._exec_file_send(a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag),
-            "schedule": lambda a, ctx: self._exec_schedule(a),
+            "schedule": lambda a, ctx: self._exec_schedule(a, caller_depth=ctx.caller_depth),
             "spawn_agent": lambda a, ctx: self._exec_spawn_agent(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
                 trace_id=ctx.trace_id,
@@ -574,8 +574,8 @@ class BuiltinExecutor:
 
     # ---- schedule ----
 
-    def _exec_schedule(self, args: dict) -> dict:
-        return exec_schedule(self.scheduler, args)
+    def _exec_schedule(self, args: dict, caller_depth: int = 0) -> dict:
+        return exec_schedule(self.scheduler, args, caller_depth=caller_depth)
 
     # ------------------------------------------------------------------
     # spawn_agent
