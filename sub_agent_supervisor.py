@@ -48,7 +48,7 @@ class SupervisionOptions:
     notify: bool = True                                 # deliver Telegram notification
     expandable: bool = True                             # wrap result in expandable blockquote
     source: str = SOURCE_ON_DEMAND                      # registry source category (internal only)
-    prompt_id: Optional[int] = None                     # parent prompt id for log correlation
+    prompt_id: Optional[str] = None                     # parent prompt id for log correlation
 
 
 @dataclass

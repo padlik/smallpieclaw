@@ -141,7 +141,7 @@ class BuiltinExecutor:
         # of a run so sub-agents fail-closed after the prompt ends.
         self._prompt_approval_set: Optional[set[str]] = None
         # Active prompt ID and registry reference for sub-agent tracking.
-        self._current_prompt_id: Optional[int] = None
+        self._current_prompt_id: Optional[str] = None
         self._prompt_registry: Optional[PromptRegistry] = None
         # Headless (sub-agent) confirmation bridge
         # token -> threading.Event  (set when the operator responds)

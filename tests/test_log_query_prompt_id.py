@@ -42,13 +42,13 @@ def _flush() -> None:
 class TestPromptIdFilter:
     def test_filter_by_prompt_id_returns_only_matches(self, executor, tmp_path):
         records = [
-            {"trace": "r-1", "prompt_id": 7, "level": "info", "event_type": "TOOL_START", "msg": "a"},
-            {"trace": "r-2", "prompt_id": 8, "level": "info", "event_type": "TOOL_START", "msg": "b"},
-            {"trace": "r-3", "prompt_id": 7, "level": "info", "event_type": "TOOL_START", "msg": "c"},
+            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "a"},
+            {"trace": "r-2", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
+            {"trace": "r-3", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "c"},
         ]
         _write_records(executor._log_jsonl_path, records)
 
-        result = executor._logquery._exec_log_query({"prompt_id": 7, "trace": "*"})
+        result = executor._logquery._exec_log_query({"prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "trace": "*"})
         assert result["success"] is True
         payload = json.loads(result["output"])
         assert payload["count"] == 2
@@ -56,13 +56,13 @@ class TestPromptIdFilter:
 
     def test_prompt_id_combines_with_trace_filter(self, executor, tmp_path):
         records = [
-            {"trace": "r-1", "prompt_id": 7, "level": "info", "event_type": "TOOL_START", "msg": "a"},
-            {"trace": "r-2", "prompt_id": 8, "level": "info", "event_type": "TOOL_START", "msg": "b"},
-            {"trace": "r-1", "prompt_id": 8, "level": "info", "event_type": "TOOL_START", "msg": "c"},
+            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "a"},
+            {"trace": "r-2", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
+            {"trace": "r-1", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "c"},
         ]
         _write_records(executor._log_jsonl_path, records)
 
-        result = executor._logquery._exec_log_query({"prompt_id": 8, "trace": "r-2"})
+        result = executor._logquery._exec_log_query({"prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "trace": "r-2"})
         assert result["success"] is True
         payload = json.loads(result["output"])
         assert payload["count"] == 1
@@ -70,14 +70,14 @@ class TestPromptIdFilter:
 
     def test_prompt_id_combines_with_level_and_event(self, executor, tmp_path):
         records = [
-            {"trace": "r-1", "prompt_id": 7, "level": "warning", "event_type": "TOOL_FAILED", "msg": "a"},
-            {"trace": "r-1", "prompt_id": 7, "level": "info", "event_type": "TOOL_START", "msg": "b"},
-            {"trace": "r-1", "prompt_id": 8, "level": "warning", "event_type": "TOOL_FAILED", "msg": "c"},
+            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "warning", "event_type": "TOOL_FAILED", "msg": "a"},
+            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
+            {"trace": "r-1", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "warning", "event_type": "TOOL_FAILED", "msg": "c"},
         ]
         _write_records(executor._log_jsonl_path, records)
 
         result = executor._logquery._exec_log_query(
-            {"prompt_id": 7, "level": "WARNING", "event_type": "TOOL_FAILED"},
+            {"prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "WARNING", "event_type": "TOOL_FAILED"},
         )
         assert result["success"] is True
         payload = json.loads(result["output"])
@@ -86,11 +86,11 @@ class TestPromptIdFilter:
 
     def test_empty_result_is_well_formed(self, executor, tmp_path):
         records = [
-            {"trace": "r-1", "prompt_id": 7, "level": "info", "msg": "a"},
+            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "msg": "a"},
         ]
         _write_records(executor._log_jsonl_path, records)
 
-        result = executor._logquery._exec_log_query({"prompt_id": 999})
+        result = executor._logquery._exec_log_query({"prompt_id": "01JNONEXISTENTULIDSTRING00000"})
         assert result["success"] is True
         payload = json.loads(result["output"])
         assert payload["records"] == []

@@ -71,7 +71,7 @@ class TestCallerTagSplitLookup:
         """Registry is queried with the bare agent_id, not the full 'sa-1 r-abc' string."""
         from unittest.mock import MagicMock
 
-        prompt_id = 5
+        prompt_id = "01JARYN6R0ABCDEFGHJKMNPQRS"
         executor._prompt_approval_set = {"file_read"}
         executor._current_prompt_id = prompt_id
         executor._subagent_confirm_prompt_fn = MagicMock()
@@ -97,11 +97,11 @@ class TestCallerTagSplitLookup:
         from unittest.mock import MagicMock
 
         executor._prompt_approval_set = {"file_read"}
-        executor._current_prompt_id = 10
+        executor._current_prompt_id = "01JARYZ3W2ABCDEFGHJKMNPQRS"
         executor._subagent_confirm_prompt_fn = MagicMock()
 
         mock_rec = MagicMock()
-        mock_rec.prompt_id = 9  # different prompt
+        mock_rec.prompt_id = "01JARYZ3W2DIFFERENTULIDSTR"  # different prompt
         mock_reg = MagicMock()
         mock_reg.get.return_value = mock_rec
 

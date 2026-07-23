@@ -72,11 +72,11 @@ class TestMainAgentPromptIdBinding:
 
         with patch("agent_controller.bind_run_context") as mock_bind, \
              patch("agent_controller.react_loop", return_value="done"):
-            controller.run("hello", prompt_id=42)
+            controller.run("hello", prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS")
 
         mock_bind.assert_called_once()
         _, kwargs = mock_bind.call_args
-        assert kwargs.get("prompt_id") == "42"
+        assert kwargs.get("prompt_id") == "01JARYN6R0ABCDEFGHJKMNPQRS"
         assert kwargs.get("agent") == "main"
         assert kwargs.get("trace", "").startswith("r-")
 
@@ -117,14 +117,14 @@ class TestSubAgentPromptIdBinding:
             res = exc._exec_spawn_agent(
                 {"task": "subtask"},
                 caller_depth=0,
-                options=SupervisionOptions(prompt_id=7, notify=False),
+                options=SupervisionOptions(prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS", notify=False),
             )
 
         assert res.get("success") is True
-        assert runner.prompt_id_seen == 7
+        assert runner.prompt_id_seen == "01JARYN6R0ABCDEFGHJKMNPQRS"
         mock_bind.assert_called_once()
         _, kwargs = mock_bind.call_args
-        assert kwargs.get("prompt_id") == "7"
+        assert kwargs.get("prompt_id") == "01JARYN6R0ABCDEFGHJKMNPQRS"
         assert kwargs.get("agent") == "sa-test"
 
     def test_supervisor_clears_run_context_after_run(self, tmp_path):
@@ -200,7 +200,7 @@ class TestSubAgentPromptIdBinding:
         with patch("sub_agent_supervisor.bind_run_context"):
             res = exc._exec_spawn_agent(
                 {"task": "subtask"},
-                options=SupervisionOptions(prompt_id=7, notify=False),
+                options=SupervisionOptions(prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS", notify=False),
             )
 
         assert res.get("success") is True
@@ -211,11 +211,11 @@ class TestBindRunContextField:
     """Directly verify bind_run_context emits prompt_id into JSONL records."""
 
     def test_prompt_id_appears_as_structured_field(self, tmp_path):
-        al.bind_run_context(trace="r-1234", agent="main", prompt_id="7")
+        al.bind_run_context(trace="r-1234", agent="main", prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS")
         logging.getLogger("test").info("hello")
         _flush()
         obj = _last_json(str(tmp_path / "agent.jsonl"))
-        assert obj.get("prompt_id") == "7"
+        assert obj.get("prompt_id") == "01JARYN6R0ABCDEFGHJKMNPQRS"
         assert obj.get("trace") == "r-1234"
         assert obj.get("agent") == "main"
 
