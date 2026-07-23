@@ -289,3 +289,68 @@ class TestBuiltinExecutorScheduleTool:
         call_kwargs = mock_scheduler.add_job.call_args[1]
         assert call_kwargs["fallback_models"] == fb
         assert call_kwargs["model"] == "primary-model"
+
+
+class TestScheduleDepthGuard:
+    """Sub-agents (caller_depth >= 1) cannot mutate scheduled jobs.
+
+    The read-only ``list`` action remains available; all mutating actions
+    (add/remove/pause/resume/run_now) are hard-blocked at depth >= 1.
+    """
+
+    def _executor(self):
+        from builtin_executor import BuiltinExecutor
+
+        mock_scheduler = MagicMock()
+        mock_scheduler.list_jobs.return_value = []
+        executor = BuiltinExecutor.__new__(BuiltinExecutor)
+        executor.scheduler = mock_scheduler
+        executor._config = {}
+        return executor
+
+    @pytest.mark.parametrize("action", ["add", "remove", "pause", "resume", "run_now"])
+    def test_mutating_actions_blocked_at_depth_1(self, action):
+        executor = self._executor()
+        args = {"action": action, "tag": "some_job", "task": "x"}
+        result = executor._exec_schedule(args, caller_depth=1)
+        assert result["success"] is False
+        assert "sub-agents cannot modify scheduled jobs" in result["error"]
+        assert result["error_type"] == "fundamentally_wrong_approach"
+        assert result["recoverable"] is False
+        # The scheduler must not have been touched.
+        executor.scheduler.add_job.assert_not_called()
+        executor.scheduler.remove_job.assert_not_called()
+        executor.scheduler.pause_job.assert_not_called()
+        executor.scheduler.resume_job.assert_not_called()
+        executor.scheduler.run_now.assert_not_called()
+
+    def test_list_allowed_at_depth_1(self):
+        executor = self._executor()
+        result = executor._exec_schedule({"action": "list"}, caller_depth=1)
+        assert result["success"] is True
+        executor.scheduler.list_jobs.assert_called_once()
+
+    def test_all_actions_allowed_at_depth_0(self):
+        executor = self._executor()
+        executor.scheduler.add_job.return_value = {"success": True}
+        executor.scheduler.remove_job.return_value = True
+        executor.scheduler.pause_job.return_value = True
+        executor.scheduler.resume_job.return_value = True
+        executor.scheduler.run_now.return_value = {"success": True}
+        for action in ["list", "add", "remove", "pause", "resume", "run_now"]:
+            args = {"action": action, "tag": "job", "task": "t"}
+            result = executor._exec_schedule(args, caller_depth=0)
+            assert result["success"] is True, f"action {action!r} failed at depth 0"
+
+    def test_dispatch_threads_caller_depth(self):
+        """The dispatch lambda passes caller_depth through to _exec_schedule."""
+        from builtin_executor import BuiltinExecutor
+
+        executor = BuiltinExecutor()
+        executor.scheduler = MagicMock()
+        executor.scheduler.list_jobs.return_value = []
+        # Execute via the public dispatch path with caller_depth=1.
+        result = executor.execute("schedule", {"action": "add", "tag": "j", "task": "t"},
+                                  caller_depth=1, caller_tag="[sa-test]")
+        assert result["success"] is False
+        assert "sub-agents cannot modify scheduled jobs" in result["error"]
