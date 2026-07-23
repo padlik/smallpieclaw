@@ -2,28 +2,42 @@
 
 ## Purpose
 
-Define the monotonic prompt registry that assigns a human-friendly "Prompt #N" ID to each user-initiated agent run, persists the mapping to `data/prompts.jsonl`, and provides the `/prompts` Telegram command for operator visibility.
+Define the prompt registry that assigns a globally-unique ULID string prompt ID to each user-initiated agent run, persists the mapping to `data/prompts.jsonl`, and provides the `/prompts` Telegram command for operator visibility.
 
 ## Requirements
 
-### Requirement: Prompt registry assigns monotonic prompt IDs
+### Requirement: Prompt registry assigns globally-unique prompt IDs
 
-The system SHALL assign a monotonic, human-friendly prompt ID ("Prompt #N") to each user-initiated agent run, persisted to `data/prompts.jsonl` so the ID is stable across process restarts.
+The system SHALL assign a globally-unique, time-sortable string prompt ID (ULID format: 26-char Crockford base32, 48-bit millisecond timestamp + 80-bit random) to each user-initiated agent run, persisted to `data/prompts.jsonl` so the ID is stable across process restarts, registry resets, and day boundaries. The ID is generated inline with no external dependency.
 
 Feature: Prompt tracking
-Rule: The prompt ID is the operator-facing handle for a run; the trace ID remains the high-cardinality join key for logs.
+Rule: The prompt ID is the single operator-facing handle for a run — globally unique and stable forever. The trace ID remains the high-cardinality join key for logs but is an implementation detail the operator does not need to know.
 
-#### Scenario: A new prompt gets the next sequential ID
-- **GIVEN** the last assigned prompt ID was 7 and the registry has reloaded from `data/prompts.jsonl` on startup
+#### Scenario: A new prompt gets a globally-unique ULID
+- **GIVEN** the registry is initialized
 - **WHEN** the operator sends a new message that starts an agent run
-- **THEN** the run is assigned prompt ID 8
-- **AND** a record with `prompt_id=8`, `trace_id`, `text` (first 200 chars), `started_at`, `status="running"`, and `sub_agent_ids=[]` is appended to `data/prompts.jsonl`
+- **THEN** the run is assigned a fresh 26-char ULID string prompt ID
+- **AND** a record with `prompt_id` (ULID string), `trace_id`, `text` (first 200 chars), `started_at`, `status="running"`, and `sub_agent_ids=[]` is appended to `data/prompts.jsonl`
 
 #### Scenario: Prompt ID is stable across restarts
-- **GIVEN** the process restarts after prompt ID 7 was assigned
-- **WHEN** the registry initializes on startup
-- **THEN** the next prompt ID assigned is 8 (max existing + 1)
-- **AND** the operator's "Prompt #7" reference still refers to the same run
+- **GIVEN** the process restarts after a prompt with ULID `01J...` was assigned
+- **WHEN** the registry initializes on startup and replays `data/prompts.jsonl`
+- **THEN** the existing ULID record is restored into memory
+- **AND** the operator's reference to that ULID still refers to the same run
+- **AND** the next prompt gets a new ULID (no sequential counter, no `max_id+1`)
+
+#### Scenario: Prompt ID survives registry reset
+- **GIVEN** `data/prompts.jsonl` is deleted and the process restarts
+- **WHEN** a new prompt is started
+- **THEN** the new prompt gets a fresh ULID that does not collide with any previously-assigned ID
+- **AND** old log records referencing the deleted prompts remain unambiguous
+
+#### Scenario: Legacy integer IDs are tolerated on replay
+- **GIVEN** `data/prompts.jsonl` contains records with integer `prompt_id` values from a prior version
+- **WHEN** the registry initializes and replays the file
+- **THEN** legacy integer-ID records are normalized to `str` at the replay boundary
+- **AND** new prompts receive ULID string IDs
+- **AND** no history rewrite occurs
 
 #### Scenario: Prompt record is finalized on run completion
 - **GIVEN** a prompt run is in progress with `status="running"`
@@ -39,13 +53,22 @@ Rule: The prompt ID is the operator-facing handle for a run; the trace ID remain
 
 ### Requirement: Operator can list recent prompts
 
-The system SHALL provide a `/prompts` Telegram command that lists recent prompts with their ID, status, elapsed time, and sub-agent count.
+The system SHALL provide a `/prompts` Telegram command that lists recent prompts with their ID, start timestamp, truncated prompt text, status, elapsed time, and sub-agent count. The list is sorted by start time descending (newest first), not by prompt ID, so mixed legacy-int and ULID-string IDs never cause a sort error.
 
 Feature: Prompt tracking
-Rule: The list is the operator's way to reference "Prompt #N" in conversation and log queries.
+Rule: The operator recognizes prompts by their text and timestamp, not by the ID alone. The full ULID is shown without truncation so the operator can copy-paste it for log queries.
 
-#### Scenario: /prompts lists recent prompts
-- **GIVEN** prompts 5, 6, 7 have completed and prompt 8 is running
+#### Scenario: /prompts lists recent prompts with text and timestamp
+- **GIVEN** prompts have been started with recognizable text
 - **WHEN** the operator runs `/prompts`
-- **THEN** the response lists the most recent N prompts (default 20)
-- **AND** each entry shows the prompt ID, status, elapsed time, and sub-agent count
+- **THEN** the response lists the most recent N prompts (default 20), sorted by start time descending
+- **AND** each entry shows the full prompt ID (ULID, no truncation)
+- **AND** each entry shows the start timestamp
+- **AND** each entry shows the truncated prompt text (first ~80 characters)
+- **AND** each entry shows the status, elapsed time, and sub-agent count
+
+#### Scenario: /prompts sorts by start time, not by prompt ID
+- **GIVEN** the registry contains a mix of legacy integer IDs and new ULID string IDs
+- **WHEN** the operator runs `/prompts`
+- **THEN** the list is ordered by `started_at` descending
+- **AND** no `TypeError` is raised from comparing mixed int/str IDs
