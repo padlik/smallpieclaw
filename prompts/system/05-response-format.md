@@ -23,10 +23,7 @@ Possible actions:
    WRONG:     {"action": "shell", "command": "df -h"}
    WRONG:     {"action": "tool", "tool": "shell", "args": ["df -h"]}
 
-2. Propose creating a new tool (requires operator approval — see rules):
-   {"action": "create_tool", "name": "<snake_case_name>", "language": "python", "code": "<code>", "description": "<one line>"}
-
-3. Execute a multi-step plan (DAG of tool calls run as parallel/sequential sub-agents):
+2. Execute a multi-step plan (DAG of tool calls run as parallel/sequential sub-agents):
    {"action": "plan", "plan": {"description": "<what the plan does>", "steps": [
      {"id": "<step_id>", "tool": "<tool_name>", "args": {}, "depends_on": [], "description": "<one line>"}
    ]}}
@@ -45,5 +42,5 @@ Possible actions:
      {"id": "report", "tool": "shell", "args": {"command": "echo {{cpu}} {{mem}}"}, "depends_on": ["cpu", "mem"]}
    ]}}{% endraw %}
 
-4. Finish and return an answer to the user:
+3. Finish and return an answer to the user:
    {"action": "finish", "result": "<your answer>"}

@@ -107,7 +107,7 @@ information is always injected fresh above and any memory entry about it will be
 RELEVANT PAST RESULTS:
 {past_results}
 
-{graph_context_section}BUILT-IN TOOLS (always available — prefer these before creating new tools):
+{graph_context_section}BUILT-IN TOOLS (always available):
   shell             — execute any shell command on the host system
   file_read         — read a file from the filesystem
   file_write        — write content to a file on the filesystem
@@ -169,24 +169,13 @@ Possible actions:
    WRONG:     {{"action": "shell", "command": "df -h"}}
    WRONG:     {{"action": "tool", "tool": "shell", "args": ["df -h"]}}
 
-2. Propose creating a new tool (requires operator approval — see rules):
-   {{"action": "create_tool", "name": "<snake_case_name>", "language": "python", "code": "<code>", "description": "<one line>"}}
-
-3. Finish and return an answer to the user:
+2. Finish and return an answer to the user:
    {{"action": "finish", "result": "<your answer>"}}
 
 Rules:
-- Always try shell / file_read / file_write before proposing a new tool.
 - If the user says "use skill <name>" or the task clearly matches a listed skill, read its SKILL.md first using file_read, then follow the instructions inside.
 - SKILL.md files describe *how* to accomplish tasks using shell commands and other means. Any "tools" or sub-commands mentioned inside a SKILL.md are descriptions of functionality — they are NOT registered tools you can call. Do not call them with {{"action": "tool", ...}}. Use shell or file_read to implement the instructions described in the skill.
 - When a SKILL.md references scripts, binaries, or files with relative paths (e.g. scripts/run.sh, ./process.py), resolve them against the skill's directory shown in AVAILABLE SKILLS. Use the absolute path directly or prefix the command with: cd <skill_dir> && <command>.
-- Use the shell tool for one-off or task-specific scripts — do NOT create a tool for single-use tasks.
-- Propose a new tool ONLY when it would be genuinely reusable across many different scenarios.
-- Tools must follow the UNIX paradigm: one tool, one task. Keep tools compact and composable.
-- Prefer Python for tools; use bash only for very simple one-liners.
-- Never hardcode paths, usernames, or task-specific values in tools — use parameters.
-- It is fine to propose multiple small tools instead of one large one.
-- All tool creation requires operator confirmation — the operator will review your code before approving.
 - Never include dangerous commands (rm -rf /, sudo, eval, reverse shells, etc.).
 - If a tool fails, try a different approach or explain the issue.
 - Always end with a "finish" action.

@@ -163,8 +163,6 @@ class TestAgentControllerResetTaskOutcomeEnqueue:
         ctrl = AgentController(
             llm=llm,
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             memory=MagicMock(),
             max_iterations=2,
         )
@@ -195,8 +193,6 @@ class TestAgentControllerResetTaskOutcomeEnqueue:
         ctrl = AgentController(
             llm=llm,
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             memory=MagicMock(),
             max_iterations=2,
         )

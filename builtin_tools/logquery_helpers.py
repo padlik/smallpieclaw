@@ -87,7 +87,7 @@ def _log_query_project(rec: dict) -> dict:
 
     Caps any single field at ``_LOG_QUERY_FIELD_MAXLEN`` chars so one verbose
     record (e.g. a large ``err`` or ``msg``) cannot dominate the log_query
-    output — the field-level analogue of ToolExecutor.max_output.
+    output — the field-level analogue of BuiltinExecutor.max_output.
     """
     projected: dict = {}
     for key, value in rec.items():

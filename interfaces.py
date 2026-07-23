@@ -196,7 +196,7 @@ class NotifyFn(Protocol):
 
 @runtime_checkable
 class ToolRegistryProtocol(Protocol):
-    """Contract for discovering and querying available tools."""
+    """Contract for querying available tools registered via MCP."""
 
     def list_tools(self) -> list[Any]:
         """Return all registered tools."""
@@ -204,10 +204,6 @@ class ToolRegistryProtocol(Protocol):
 
     def get_tool(self, name: str) -> Optional[Any]:
         """Get a specific tool by name, or None."""
-        ...
-
-    def refresh(self) -> None:
-        """Re-scan tool directories and update the registry."""
         ...
 
 

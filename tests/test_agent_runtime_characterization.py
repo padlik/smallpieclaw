@@ -45,8 +45,6 @@ def _make_controller(**overrides) -> AgentController:
     kwargs = dict(
         llm=MagicMock(),
         tool_index=MagicMock(),
-        executor=MagicMock(),
-        creator=MagicMock(),
         memory=MagicMock(),
         max_iterations=11,
         top_tools=4,
@@ -106,8 +104,6 @@ def _make_runner(config: dict, *, model_cfg=None, fallback_models=None,
         model_cfg=model_cfg,
         config=config,
         tool_index=MagicMock(),
-        executor=MagicMock(),
-        creator=MagicMock(),
         base_memory=MagicMock(),
         builtin_executor=MagicMock(),
         skill_registry=MagicMock(),
@@ -137,8 +133,6 @@ class TestAgentControllerReactContextAssembly:
         ctx, _ = _run_capture(ctrl)
         assert ctx.llm is ctrl.llm
         assert ctx.tool_index is ctrl.tool_index
-        assert ctx.executor is ctrl.executor
-        assert ctx.creator is ctrl.creator
         assert ctx.memory is ctrl.memory
         assert ctx.builtin_executor is ctrl.builtin_executor
         assert ctx.mcp_manager is ctrl.mcp_manager

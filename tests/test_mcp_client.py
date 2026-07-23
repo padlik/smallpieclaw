@@ -183,7 +183,6 @@ class TestSdkToolsToRegistry:
     def test_mcp_language_set(self):
         tools = _sdk_tools_to_registry("srv", [_sdk_tool("t")])
         assert tools[0].language == "mcp"
-        assert tools[0].path == ""
 
     def test_invalid_tool_name_skipped(self):
         invalid = _sdk_tool("bad name!")   # space and ! are invalid

@@ -8,7 +8,6 @@ A lightweight autonomous Telegram bot that controls and queries your server usin
 
 - **ReAct agent loop** — step-by-step reasoning, tool execution, repeat until done
 - **Semantic tool search** — embedding-based cosine similarity to pick the right tool
-- **Self-building tools** — LLM proposes `.py`/`.sh` tools; operator reviews via inline buttons (**Create**, **Run Once**, or **Cancel**)
 - **Built-in tools** — `shell`, `file_read`, `file_write`, `file_send`, `schedule` always available; dangerous ops require inline confirmation
 - **Secure Telegram bot** — allowlist or pairing-token access control
 - **4-tier memory** — short-term conversation, working task context, long-term vector index, and results history
@@ -122,7 +121,9 @@ source .venv/bin/activate
 python main.py
 ```
 
-On first run the agent creates `data/`, `tools_generated/`, and `downloads/`. Logs go to `~/.local/state/<agent_name>/logs/` — human-readable `agent.log` plus structured `agent.jsonl` (daily gzip rotation, 30 backups).
+On first run the agent creates `data/` and `downloads/`. Logs go to `~/.local/state/<agent_name>/logs/` — human-readable `agent.log` plus structured `agent.jsonl` (daily gzip rotation, 30 backups).
+
+> **Upgrading from a prior version?** The hand-written tool system (`tools/`, `tools_generated/`, `create_tool` action) has been removed. These directories are no longer scanned. You can safely delete them: `rm -rf tools/ tools_generated/`. Any `tools_dir` or `generated_tools_dir` keys in your `config.toml` are now silently ignored.
 
 ---
 
@@ -151,7 +152,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now telegram-agent
 ```
 
-> `WorkingDirectory` **must** point at the project root — `config.toml`, `tools/`, and `data/` are resolved relative to it.
+> `WorkingDirectory` **must** point at the project root — `config.toml` and `data/` are resolved relative to it.
 
 **Secrets in service:** use the vault (`sec:` prefix in `config.toml`), `EnvironmentFile=`, or a secrets manager (1Password, Doppler, Infisical). Note: `env:` values are inherited by tool/MCP subprocesses.
 
@@ -166,7 +167,7 @@ systemctl --user enable --now telegram-agent
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
 | `/status` | Uptime, model, tools, scheduler state, graph memory health, per-model token usage |
-| `/tools` | List all built-in, generated, and MCP tools |
+| `/tools` | List all built-in and MCP tools |
 | `/skills` | List available agent skills |
 | `/models` | List LLM models and switch active one (👁 = vision-capable) |
 | `/jobs` | Scheduled jobs; sub-commands: `reload`, `pause <tag>`, `resume <tag>`, `remove <tag>` |
@@ -191,7 +192,6 @@ Send any message to start a task:
 check disk usage
 is Docker running?
 show me the CPU temperature
-create a tool that lists all open ports
 remind me every day at 9am to check backup logs
 ```
 
@@ -227,7 +227,7 @@ Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google G
 
 - **Trusted** — inside `workspace_dir` (default `~/Documents`) or a user-added trusted directory. Reads and writes auto-allow with no confirmation.
 - **Request-granted** — a directory the user approved for the current request via the `[Allow this request]` button. Allowed for the rest of the current request.
-- **Unrecognised** — anything else, including agent-internal directories (`data/`, `tools/`, `skills/`, log dir, vault dir). Prompts the user.
+- **Unrecognised** — anything else, including agent-internal directories (`data/`, `skills/`, log dir, vault dir). Prompts the user.
 
 Out-of-zone prompts offer four options: **Approve** (once), **Deny**, **Allow this request** (grants the parent directory for the current request), and **Add to trusted** (persists to `data/trusted_dirs.json`).
 
@@ -246,27 +246,6 @@ When the agent hits the interactive step limit (`max_iterations`, default 8), in
 ---
 
 ## Extending the Agent
-
-### Custom tools
-
-Create `.py` or `.sh` files in `tools/`. Each file needs a `description:` comment in the first 15 lines (multi-line supported):
-
-```bash
-#!/bin/bash
-# description: check disk usage across all mount points
-#   and alert if any volume exceeds 90% capacity
-df -h
-```
-
-```python
-#!/usr/bin/env python3
-# description: list installed Python package versions
-import pkg_resources
-for pkg in sorted(pkg_resources.working_set, key=lambda p: p.project_name):
-    print(f"{pkg.project_name}=={pkg.version}")
-```
-
-Tools follow the UNIX paradigm — one tool, one reusable task. For one-off tasks the agent uses the `shell` built-in directly. LLM-proposed tools go to `tools_generated/` (Create) or run once and are discarded.
 
 ### Agent Skills
 
@@ -502,10 +481,8 @@ agent_controller.py      # Thin orchestrator — builds ReactContext, delegates 
 react_loop.py            # Canonical ReAct loop logic
 llm_client.py            # Multi-provider LLM + embeddings client (token tracking)
 builtin_executor.py      # Built-in tools (shell, file_read/write, schedule, spawn_agent, memory)
-tool_registry.py         # Discovers tools from tools/ and tools_generated/
+tool_registry.py         # MCP tool registry
 tool_index.py            # Semantic tool search via embedding cosine similarity
-tool_executor.py         # Runs tools in subprocess with timeout
-tool_creator.py          # LLM-proposed tool creation with operator approval
 memory_store.py          # Short-term, working, long-term, results memory
 graph_memory.py          # Optional LadybugDB graph store + background writer
 backfill_graph_memory.py # One-time CLI to seed graph from data/longterm_memory.json
@@ -519,8 +496,6 @@ exceptions.py            # Exception hierarchy (AgentError → LLMError, ToolErr
 prompt_builder.py        # System prompt assembly; re-exports estimate_tokens
 token_estimator.py       # Two-layer token counting (tiktoken + heuristic fallback)
 context_manager.py       # Auto-compaction at 85% of ctx_max_tokens
-tools/                   # Built-in tool scripts (.sh and .py)
-tools_generated/         # Tools created by the LLM at runtime
 skills/                  # Agent Skills — skills/<name>/SKILL.md
 data/                    # Runtime state: tool_index, memory, scheduler state, graph DB
 tests/                   # Test suite (pytest); execution harness in tests/execution_harness.py

@@ -2,7 +2,7 @@
 builtin_tools/schemas.py
 ------------------------
 OpenAI-format JSON Schema parameter definitions for all built-in tools,
-pseudo-tools (create_tool, plan), and a builder that merges them with
+pseudo-tools (plan), and a builder that merges them with
 MCP tool schemas into a single tool definitions array.
 
 Co-located with descriptors.py per ADR-0008. The arg descriptions in
@@ -440,35 +440,6 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 PSEUDO_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
-    "create_tool": {
-        "description": (
-            "Propose creating a new reusable tool. Requires operator approval. "
-            "Only use for genuinely reusable tools — prefer shell for one-off tasks."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Tool name in snake_case.",
-                },
-                "language": {
-                    "type": "string",
-                    "description": "Implementation language: 'python' or 'bash'.",
-                    "enum": ["python", "bash"],
-                },
-                "code": {
-                    "type": "string",
-                    "description": "Full source code of the tool.",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "One-line description of what the tool does.",
-                },
-            },
-            "required": ["name", "language", "code", "description"],
-        },
-    },
     "plan": {
         "description": (
             "Execute a multi-step plan as a DAG of tool calls run as parallel/sequential "

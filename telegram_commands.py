@@ -622,20 +622,10 @@ async def cmd_tools(iface: "TelegramInterface", update: Update, ctx: ContextType
         await update.effective_message.reply_text("No tools registered.")
         return
 
-    # Split into categories
-    local_tools = [t for t in tools if not t.is_generated and not t.is_mcp]
-    generated = [t for t in tools if t.is_generated and not t.is_mcp]
-    mcp_tools = [t for t in tools if t.is_mcp]
+    # All registered tools are MCP tools now (hand-written tools removed)
+    mcp_tools = list(tools)
 
     lines = [f"🔧 <b>Available Tools</b> ({len(tools)} total)\n"]
-    if local_tools:
-        lines.append("<b>Built-in:</b>")
-        for t in local_tools:
-            lines.append(_tool_entry(t))
-    if generated:
-        lines.append("\n<b>Generated:</b>")
-        for t in generated:
-            lines.append(_tool_entry(t))
     if mcp_tools:
         # Group by server
         servers: dict[str, list] = {}

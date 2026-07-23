@@ -115,7 +115,6 @@ def _sdk_tools_to_registry(server_name: str, sdk_tools: list) -> list[Tool]:
         input_schema: dict[str, Any] = getattr(t, "inputSchema", {}) or {}
         result.append(Tool(
             name=name,
-            path="",
             language="mcp",
             description=description,
             is_mcp=True,

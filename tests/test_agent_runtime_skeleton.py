@@ -69,8 +69,6 @@ def _runtime(config: dict, *, notify_fn=None, scheduled_max_iterations: int = 10
         all_models=config["models"],
         background_model_cfg=config["models"][0],
         tool_index=MagicMock(),
-        executor=MagicMock(),
-        creator=MagicMock(),
         base_memory=MagicMock(),
         builtin_executor=MagicMock(),
         skill_registry=MagicMock(),
@@ -241,20 +239,17 @@ class TestAgentRuntimeSkeleton:
 
     def test_holds_construction_dependencies(self):
         tool_index = object()
-        executor = object()
         base_memory = object()
         runtime = AgentRuntime(
             config={"models": []},
             all_models=[{"model": "model-a"}],
             background_model_cfg={"model": "model-a"},
             tool_index=tool_index,
-            executor=executor,
             base_memory=base_memory,
             top_tools=4,
             ctx_max_tokens=12345,
         )
         assert runtime._tool_index is tool_index
-        assert runtime._executor is executor
         assert runtime._base_memory is base_memory
         assert runtime._all_models == [{"model": "model-a"}]
         assert runtime._top_tools == 4
@@ -475,8 +470,6 @@ class TestAgentRuntimeCreateSubAgent:
             all_models=_cfg()["models"],
             background_model_cfg=_cfg()["models"][0],
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             base_memory=MagicMock(),
             builtin_executor=MagicMock(),
             skill_registry=MagicMock(),

@@ -100,8 +100,6 @@ class TestDepthGuardProtectsExecutorFields:
         ctrl = AgentController(
             llm=llm,
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             memory=MagicMock(),
             builtin_executor=executor,
             depth=1,  # sub-agent

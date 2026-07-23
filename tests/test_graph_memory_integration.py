@@ -26,8 +26,6 @@ class TestReactContextGraphMemoryDefaults:
         ctx = ReactContext(
             llm=MagicMock(),
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             memory=MagicMock(),
             builtin_executor=MagicMock(),
             mcp_manager=None,
@@ -43,8 +41,6 @@ class TestReactContextGraphMemoryDefaults:
         ctx = ReactContext(
             llm=MagicMock(),
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             memory=MagicMock(),
             builtin_executor=MagicMock(),
             mcp_manager=None,

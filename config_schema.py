@@ -457,8 +457,6 @@ class SchedulerConfig:
 
 @dataclass(frozen=True)
 class PathsConfig:
-    tools_dir: str = "tools"
-    generated_tools_dir: str = "tools_generated"
     data_dir: str = "data"
     tool_index_file: str = "data/tool_index.json"
     memory_file: str = "data/memory.json"
@@ -615,8 +613,6 @@ def _parse_scheduler(raw: dict) -> SchedulerConfig:
 def _parse_paths(raw: dict) -> PathsConfig:
     section = raw.get("paths") or {}
     expanded = {
-        "tools_dir": _expand_path(section.get("tools_dir", "tools")),
-        "generated_tools_dir": _expand_path(section.get("generated_tools_dir", "tools_generated")),
         "data_dir": _expand_path(section.get("data_dir", "data")),
         "tool_index_file": _expand_path(section.get("tool_index_file", "data/tool_index.json")),
         "memory_file": _expand_path(section.get("memory_file", "data/memory.json")),

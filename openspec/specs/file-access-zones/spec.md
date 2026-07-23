@@ -11,7 +11,7 @@ Define zone-based access control for all `file_*` built-in tool operations. A `T
 The system MUST resolve every path via `os.path.realpath()` and classify it into exactly one zone before executing any `file_*` tool operation.
 
 #### Scenario: Agent-internal path requires confirmation
-- **GIVEN** a `file_*` operation is invoked with a path inside an agent-internal directory (`data/`, `tools/`, `tools_generated/`, `skills/`, `prompts/`, log dir, vault dir)
+- **GIVEN** a `file_*` operation is invoked with a path inside an agent-internal directory (`data/`, `skills/`, `prompts/`, log dir, vault dir)
 - **WHEN** zone classification runs
 - **THEN** the operation is staged and a confirmation prompt is sent
 - **AND** the LLM should use dedicated built-in tools (`memory_read`, `secret_get`, `log_query`) for internal data access instead

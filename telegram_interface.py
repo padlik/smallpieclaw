@@ -48,7 +48,7 @@ from telegram_commands import (
     cmd_dir,
 )
 from telegram_callbacks import (
-    cb_confirm, cb_extend, cb_tool_create, cb_model_switch, cb_mode_switch,
+    cb_confirm, cb_extend, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
     cb_zone_allow, cb_zone_trusted,
 )
@@ -263,7 +263,6 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(partial(cb_mode_switch, self), pattern=r"^mode:"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
-        app.add_handler(CallbackQueryHandler(partial(cb_tool_create, self), pattern=r"^tool_create_"))
         app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
         app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
         app.add_handler(CallbackQueryHandler(partial(cb_zone_allow,   self), pattern=r"^zone_allow:"))
@@ -562,14 +561,7 @@ class TelegramInterface:
                     loop,
                 )
                 return
-            if msg.startswith("__TOOL_CREATE__:"):
-                token = msg.split(":", 1)[1]
-                asyncio.run_coroutine_threadsafe(
-                    self._send_tool_create_prompt(update.effective_message, token),
-                    loop,
-                )
-                return
-            if msg.startswith("__FILE__:"):
+            if msg.startswith("__FILE__"):
                 _, path_b64, caption_b64 = msg.split(":", 2)
                 try:
                     file_path = base64.b64decode(path_b64).decode()
@@ -738,33 +730,6 @@ class TelegramInterface:
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
-
-    async def _send_tool_create_prompt(self, message, token: str) -> None:
-        """Show tool code to operator with 3-way choice: Create / Run Once / Cancel."""
-        if not self.agent:
-            return
-        data = self.agent.get_pending_tool_create(token)
-        if not data:
-            return
-        name = html.escape(data.get("name", "?"))
-        lang = html.escape(data.get("language", "?"))
-        desc = html.escape(data.get("description", ""))
-        code = html.escape(data.get("code", ""))
-        # Truncate code display to avoid Telegram message size limit
-        code_display = code[:2000] + ("\n…(truncated)" if len(code) > 2000 else "")
-        text = (
-            f"🛠️ <b>Tool creation request</b>\n\n"
-            f"<b>Name:</b> <code>{name}</code>\n"
-            f"<b>Language:</b> {lang}\n"
-            f"<b>Description:</b> {desc}\n\n"
-            f"<b>Code:</b>\n<pre><code>{code_display}</code></pre>"
-        )
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Create Tool", callback_data=f"tool_create_yes:{token}"),
-            InlineKeyboardButton("⚡ Run Once",   callback_data=f"tool_create_run:{token}"),
-            InlineKeyboardButton("❌ Cancel",      callback_data=f"tool_create_no:{token}"),
-        ]])
-        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     async def _error_handler(self, update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Global PTB error handler — logs with full context and notifies users."""
@@ -1005,4 +970,4 @@ class TelegramInterface:
 
 # Progress message prefixes that represent agent "actions" (tool calls, results,
 # errors, model switches) — shown as new messages in verbose mode.
-_VERBOSE_EVENT_PREFIXES = ("🔧", "🖥️", "📄", "✏️", "🤖", "🧠", "🌐", "👁️", "✅ C", "❌", "🛠️", "⚡", "⚠️ ")
+_VERBOSE_EVENT_PREFIXES = ("🔧", "🖥️", "📄", "✏️", "🤖", "🧠", "🌐", "👁️", "✅ C", "❌", "⚡", "⚠️ ")

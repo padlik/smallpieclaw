@@ -113,8 +113,6 @@ from skill_registry import SkillRegistry  # noqa: E402
 from strategy_memory import StrategyMemory  # noqa: E402
 from telegram_interface import TelegramInterface  # noqa: E402
 from token_usage import get_registry as get_token_registry  # noqa: E402
-from tool_creator import ToolCreator  # noqa: E402
-from tool_executor import ToolExecutor  # noqa: E402
 from tool_index import ToolIndex  # noqa: E402
 from tool_registry import ToolRegistry  # noqa: E402
 
@@ -164,8 +162,6 @@ def main():
     cfg, app_cfg = load_config()
 
     paths = cfg.get("paths", {})
-    tools_dir     = paths.get("tools_dir", "tools")
-    gen_tools_dir = paths.get("generated_tools_dir", "tools_generated")
     data_dir      = paths.get("data_dir", "data")
     index_path    = paths.get("tool_index_file", "data/tool_index.json")
     memory_path   = paths.get("memory_file", "data/memory.json")
@@ -189,7 +185,7 @@ def main():
     with _PidFileLock(pid_file):
         _run(
             cfg=cfg, app_cfg=app_cfg, paths=paths,
-            tools_dir=tools_dir, gen_tools_dir=gen_tools_dir, data_dir=data_dir,
+            data_dir=data_dir,
             index_path=index_path, memory_path=memory_path,
             results_path=results_path,
             scheduler_config_path=scheduler_config_path, skills_dir=skills_dir,
@@ -201,7 +197,7 @@ def main():
 
 def _run(
     cfg, app_cfg, paths,
-    tools_dir, gen_tools_dir, data_dir,
+    data_dir,
     index_path, memory_path, results_path,
     scheduler_config_path, skills_dir,
     downloads_dir, tmp_dir, workspace_dir,
@@ -216,8 +212,6 @@ def _run(
         secret_values=_read_vault_secrets(vault_path(cfg)),
     )
 
-    os.makedirs(tools_dir, exist_ok=True)
-    os.makedirs(gen_tools_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(skills_dir, exist_ok=True)
     os.makedirs(downloads_dir, exist_ok=True)
@@ -258,7 +252,7 @@ def _run(
     _purged = memory.purge_matching("model", "llm")
     if _purged:
         logger.info("Startup: purged %d stale model/provider key(s) from memory store", _purged)
-    registry = ToolRegistry(tools_dirs=[tools_dir, gen_tools_dir])
+    registry = ToolRegistry()
     builtin  = BuiltinExecutor(
         default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,
         max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
@@ -266,8 +260,6 @@ def _run(
         shell_streaming=shell_streaming, vault_path=vault_file, log_jsonl_path=json_log_path,
     )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
-    executor = ToolExecutor(registry=registry, timeout=timeout, max_output=max_output)
-    creator  = ToolCreator(generated_dir=gen_tools_dir, registry=registry, index=index)
 
     # Initialise MCP servers (optional — skip if none configured)
     mcp_manager: MCPManager | None = None
@@ -322,8 +314,6 @@ def _run(
     agent = AgentController(
         llm=llm,
         tool_index=index,
-        executor=executor,
-        creator=creator,
         memory=memory,
         max_iterations=max_iter,
         top_tools=top_tools,
@@ -397,8 +387,6 @@ def _run(
         all_models=all_models,
         background_model_cfg=background_model_cfg,
         tool_index=index,
-        executor=executor,
-        creator=creator,
         base_memory=memory,
         builtin_executor=builtin,
         skill_registry=skills,

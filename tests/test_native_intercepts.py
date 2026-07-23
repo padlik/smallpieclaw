@@ -16,9 +16,8 @@ payload is nested under ``action_obj["plan"]``.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from confirmation import ConfirmationManager
 from interfaces import ChatResponse, ToolCall
 from tests.execution_harness import NativeScriptedLLM, RecordingExecutor, run_react
 
@@ -83,9 +82,9 @@ class TestNativePlanIntercept:
 
 
 class TestNativeCreateToolIntercept:
-    """A native ``create_tool`` call routes through the tool-creation flow."""
+    """A native ``create_tool`` call is now rejected because hand-written tools were removed."""
 
-    def test_native_create_tool_triggers_creator(self):
+    def test_native_create_tool_returns_error(self):
         llm = NativeScriptedLLM([
             ChatResponse(tool_calls=[ToolCall(
                 id="c1", name="create_tool",
@@ -100,35 +99,16 @@ class TestNativeCreateToolIntercept:
         ])
         ex = RecordingExecutor()
 
-        # Approve the creation so request_tool_create returns immediately rather
-        # than blocking on operator input (its default is a 300s event wait).
-        cm = ConfirmationManager()
-        cm.request_tool_create = lambda token, tool_info, progress_cb: "create"
-
-        creator = MagicMock()
-        creator.create.return_value = {
-            "success": True, "name": "greet", "path": "/tools_generated/greet.py",
-        }
-
-        with patch("react_loop._dispatch_tool") as mock_dispatch:
-            result, _calls, _progress = run_react(
-                llm, ex, "make a greeter", confirmation=cm, creator=creator,
-            )
+        result, _calls, _progress = run_react(llm, ex, "make a greeter")
 
         assert result == "done"
-        # create_tool has its own dispatch helper; it must not hit _dispatch_tool.
-        mock_dispatch.assert_not_called()
-
-        # The creator was invoked with the native argument values, in order.
-        creator.create.assert_called_once_with(
-            "greet", "python", "print('hi')", "greets the user",
-        )
-
-        # Success feedback is fed back to the model on the next turn.
+        # create_tool is no longer a supported native intercept; it falls through
+        # to the standard tool path and is rejected as an unknown tool.
+        assert ex.tool_order == []
         second = llm.tool_calls_seen[1]
         tool_msgs = [m for m in second if m.get("role") == "tool"]
         assert tool_msgs, "expected a tool-result message for create_tool"
-        assert "created successfully" in str(tool_msgs[0]["content"])
+        assert "not a built-in tool, MCP tool, or vision_query" in str(tool_msgs[0]["content"])
 
 
 class TestNativeVisionQueryIntercept:

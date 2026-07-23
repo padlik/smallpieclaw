@@ -222,6 +222,27 @@ class RecordingExecutor:
         return [c.tool for c in self.calls]
 
 
+class _StubBuiltinExecutor:
+    """Minimal builtin-executor stand-in for the test harness.
+
+    Wraps a RecordingExecutor so react_loop routes tool actions through it
+    after hand-written-tool removal, while still recording call order.
+    """
+
+    def __init__(self, executor: RecordingExecutor):
+        self._executor = executor
+
+    def is_builtin(self, tool_name: str) -> bool:
+        # Treat every tool as a builtin so react_loop routes here instead of
+        # returning "unknown tool" errors after hand-written-tool removal.
+        # create_tool is excluded so it falls through to the unknown-tool error
+        # path (the action was fully removed).
+        return tool_name != "create_tool"
+
+    def execute(self, tool_name: str, args: dict, **kwargs) -> dict:
+        return self._executor.execute(tool_name, args)
+
+
 # ---------------------------------------------------------------------------
 # Context builder + runner
 # ---------------------------------------------------------------------------
@@ -231,16 +252,14 @@ def build_context(llm, executor: RecordingExecutor, *, label: str = "main",
                   **overrides) -> ReactContext:
     """Build a ReactContext wired to *llm* and *executor* with safe defaults.
 
-    builtin_executor and mcp_manager are None so tool actions route through the
-    recording executor; graph memory and skills are disabled.
+    The executor is wrapped as a stub BuiltinExecutor so the ReAct loop routes
+    tool actions through it after hand-written tools were removed.
     """
     kwargs = dict(
         llm=llm,
         tool_index=_NullToolIndex(),
-        executor=executor,
-        creator=_NullCreator(),
         memory=_NullMemory(),
-        builtin_executor=None,
+        builtin_executor=_StubBuiltinExecutor(executor),
         mcp_manager=None,
         skill_registry=None,
         max_iterations=max_iterations,

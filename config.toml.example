@@ -240,8 +240,6 @@ type = "file"
 # max_context_entries   = 10           # max entities/facts injected into prompt
 
 [paths]
-tools_dir          = "tools"
-generated_tools_dir = "tools_generated"
 data_dir           = "data"
 tool_index_file    = "data/tool_index.json"
 memory_file        = "data/memory.json"
