@@ -65,8 +65,6 @@ class TestMainAgentPromptIdBinding:
         controller = AgentController(
             llm=mock_llm,
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             memory=MagicMock(),
         )
         controller.tool_index.search.return_value = []

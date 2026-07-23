@@ -57,12 +57,7 @@ The ReAct loop SHALL attempt native tool calling before falling back to the text
 
 ### Requirement: Special-case tool interception
 
-The ReAct loop SHALL intercept `create_tool`, `plan`, and `vision_query` native tool calls before `_dispatch_tool()` and route them to their existing special-case handlers.
-
-#### Scenario: create_tool intercepted
-- **GIVEN** the model returns a native tool call with name `create_tool`
-- **WHEN** the loop processes the tool call
-- **THEN** the loop SHALL route it to `_dispatch_create_tool()` instead of `_dispatch_tool()`
+The ReAct loop SHALL intercept `plan` and `vision_query` native tool calls before `_dispatch_tool()` and route them to their existing special-case handlers. `create_tool` is not a recognized tool and SHALL NOT be intercepted; it is handled as an unknown tool by `_dispatch_tool()`.
 
 #### Scenario: plan intercepted
 - **GIVEN** the model returns a native tool call with name `plan`
@@ -74,6 +69,12 @@ The ReAct loop SHALL intercept `create_tool`, `plan`, and `vision_query` native 
 - **WHEN** the loop processes the tool call
 - **THEN** the loop SHALL route it to `_exec_vision_query()` instead of `_dispatch_tool()`
 
+#### Scenario: create_tool is not intercepted
+- **GIVEN** the model returns a native tool call with name `create_tool`
+- **WHEN** the loop processes the tool call
+- **THEN** the loop SHALL NOT route it to any special-case handler
+- **AND** the loop SHALL return an error result with the message `Tool 'create_tool' is not a built-in tool, MCP tool, or vision_query.`
+
 ### Requirement: Tool definition assembly
 
 The system SHALL assemble OpenAI-format tool definitions from built-in schemas, pseudo-tool schemas, and MCP input schemas.
@@ -84,7 +85,7 @@ The system SHALL assemble OpenAI-format tool definitions from built-in schemas, 
 - **THEN** each built-in tool SHALL produce a `{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}` entry
 
 #### Scenario: Pseudo-tools included
-- **GIVEN** `PSEUDO_TOOL_SCHEMAS` contains schemas for `create_tool` and `plan`
+- **GIVEN** `PSEUDO_TOOL_SCHEMAS` contains schemas for `plan` only
 - **WHEN** `build_tool_definitions()` is called
 - **THEN** each pseudo-tool SHALL produce a `{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}` entry
 

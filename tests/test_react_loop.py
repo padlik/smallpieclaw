@@ -218,8 +218,6 @@ class TestOnToolTraceCallback:
         ctx = ReactContext(
             llm=MagicMock(),
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             memory=MagicMock(),
             builtin_executor=None,
             mcp_manager=None,
@@ -287,8 +285,6 @@ class TestCancelEventOwnership:
         return AgentController(
             llm=MagicMock(),
             tool_index=MagicMock(),
-            executor=MagicMock(),
-            creator=MagicMock(),
             memory=MagicMock(),
             cancel_event=cancel_event,
         )
@@ -298,8 +294,8 @@ class TestCancelEventOwnership:
         from unittest.mock import MagicMock
 
         ctx = ReactContext(
-            llm=MagicMock(), tool_index=MagicMock(), executor=MagicMock(),
-            creator=MagicMock(), memory=MagicMock(), builtin_executor=None,
+            llm=MagicMock(), tool_index=MagicMock(),
+            memory=MagicMock(), builtin_executor=None,
             mcp_manager=None, skill_registry=None,
         )
         assert ctx.owns_cancel_event is True
@@ -347,8 +343,8 @@ class TestCancelEventOwnership:
         ev = threading.Event()
         ev.set()
         ctx = ReactContext(
-            llm=MagicMock(), tool_index=MagicMock(), executor=MagicMock(),
-            creator=MagicMock(), memory=MagicMock(), builtin_executor=None,
+            llm=MagicMock(), tool_index=MagicMock(),
+            memory=MagicMock(), builtin_executor=None,
             mcp_manager=None, skill_registry=None,
             cancel_event=ev, owns_cancel_event=True,
         )

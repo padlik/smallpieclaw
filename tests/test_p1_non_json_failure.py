@@ -34,8 +34,6 @@ def _make_ctx(llm_responses: list[str]) -> tuple[ReactContext, list[str]]:
     ctx = ReactContext(
         llm=llm,
         tool_index=MagicMock(),
-        executor=MagicMock(),
-        creator=MagicMock(),
         memory=MagicMock(),
         builtin_executor=None,
         mcp_manager=None,

@@ -38,7 +38,6 @@ parse_mode = None
 parse_mode
 ToolRegistryProtocol.list_tools
 ToolRegistryProtocol.get_tool
-ToolRegistryProtocol.refresh
 MCPManagerProtocol.has_tool
 MCPManagerProtocol.call_tool
 MCPManagerProtocol.list_servers

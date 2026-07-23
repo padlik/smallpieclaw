@@ -59,10 +59,8 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `agent_runtime.py` | Construction-time policy via `RuntimeProfile` enum (MAIN, ON_DEMAND_SUBAGENT, SCHEDULED_AGENT, PLAN_STEP_AGENT, DIAGNOSTIC_AGENT); ADR-0007 scaffolding |
 | `sub_agent_supervisor.py` | Sub-agent lifecycle (admission, execution, cleanup, callbacks) via `SubAgentSupervisor`; `SupervisionOptions` + `SubmissionRequest` dataclasses |
 | `vector_utils.py` | Vector math utilities for embeddings; `cosine_similarity(a, b) → float` |
-| `tool_registry.py` | Discovers `.sh`/`.py` tools from `tools/` and `tools_generated/`; `Tool` dataclass |
+| `tool_registry.py` | MCP tool registry |
 | `tool_index.py` | Semantic tool search via embedding cosine similarity; persists to `data/tool_index.json` |
-| `tool_executor.py` | Runs tools in subprocess with timeout |
-| `tool_creator.py` | LLM-proposed tool creation with operator approval flow |
 | `memory_store.py` | `MemoryStore` (KV), `ShortTermMemory`, `WorkingMemory`, `ResultsMemory`, `LongTermMemory` |
 | `graph_memory.py` | Opt-in LadybugDB entity/relationship store; `GraphMemoryStore` + `GraphMemoryWriter` |
 | `backfill_graph_memory.py` | One-time CLI to seed graph from `data/longterm_memory.json` |
@@ -92,7 +90,7 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 - `mock_llm_response` — factory returning MagicMock LLM with scripted JSON responses
 - `finish_response` / `shell_response` — standard JSON action strings
 - `mock_subprocess` — patches `subprocess.run`
-- `tmp_agent_dir` — temp dir with `tools/`, `tools_generated/`, `data/`, `downloads/`
+- `tmp_agent_dir` — temp dir with `data/`, `downloads/`
 
 **Execution harness** (`tests/execution_harness.py`): `ScriptedLLM`, `RecordingExecutor`, `run_react()` for deterministic multi-step ReAct testing without network, Telegram, or graph DB.
 

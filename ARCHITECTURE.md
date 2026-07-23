@@ -82,8 +82,6 @@ main.py (composition root)
 ├── llm_client.py (LLM providers)
 ├── agent_controller.py (ReAct loop)
 │   ├── llm_client
-│   ├── tool_creator → tool_index, tool_registry
-│   ├── tool_executor → tool_registry
 │   ├── tool_index → tool_registry, llm_client
 │   ├── memory_store
 │   ├── mcp_client → tool_registry

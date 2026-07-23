@@ -44,8 +44,7 @@ class TestTraceContextHelpers:
 class TestReactContextPrefix:
     def _ctx(self, label="main", trace_id=""):
         return ReactContext(
-            llm=MagicMock(), tool_index=MagicMock(), executor=MagicMock(),
-            creator=MagicMock(), memory=MagicMock(), builtin_executor=None,
+            llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(), builtin_executor=None,
             mcp_manager=None, skill_registry=None, label=label, trace_id=trace_id,
         )
 
@@ -108,8 +107,7 @@ class TestAgentControllerTrace:
         applied = []
         llm.set_trace_id.side_effect = lambda t: applied.append(t)
         ctrl = agent_controller.AgentController(
-            llm=llm, tool_index=MagicMock(), executor=MagicMock(),
-            creator=MagicMock(), memory=MagicMock(), trace_id=trace_id,
+            llm=llm, tool_index=MagicMock(), memory=MagicMock(), trace_id=trace_id,
         )
         return ctrl, llm, applied
 
@@ -149,8 +147,7 @@ class TestReactLoopTraceLogging:
         llm.chat_with_tools_fallback.side_effect = NotImplementedError("native tools not mocked")
         llm.llm_cfg = {"model": "test-model"}
         ctx = ReactContext(
-            llm=llm, tool_index=MagicMock(), executor=MagicMock(), creator=MagicMock(),
-            memory=MagicMock(), builtin_executor=None, mcp_manager=None, skill_registry=None,
+            llm=llm, tool_index=MagicMock(), memory=MagicMock(), builtin_executor=None, mcp_manager=None, skill_registry=None,
             cancel_event=threading.Event(), label="main", trace_id="r-trace777",
         )
         # Run identity is bound into structlog contextvars at run entry now, not
@@ -220,8 +217,7 @@ class TestSubAgentTracePropagation:
         with patch.object(agent_controller.AgentController, "__init__", spy_init):
             runner = agent_controller.SubAgentRunner(
                 model_cfg=cfg["models"][0], config=cfg,
-                tool_index=MagicMock(), executor=MagicMock(), creator=MagicMock(),
-                base_memory=MagicMock(), builtin_executor=MagicMock(),
+                tool_index=MagicMock(), base_memory=MagicMock(), builtin_executor=MagicMock(),
                 trace_id="r-parent99",
             )
         assert captured["trace_id"] == "r-parent99"

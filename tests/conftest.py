@@ -46,8 +46,6 @@ def minimal_config() -> dict:
             }
         ],
         "paths": {
-            "tools_dir": "tools",
-            "generated_tools_dir": "tools_generated",
             "data_dir": "data",
         },
     }
@@ -111,8 +109,6 @@ def mock_subprocess():
 @pytest.fixture
 def tmp_agent_dir(tmp_path):
     """Create a temporary agent working directory with standard subdirs."""
-    (tmp_path / "tools").mkdir()
-    (tmp_path / "tools_generated").mkdir()
     (tmp_path / "data").mkdir()
     (tmp_path / "downloads").mkdir()
     return tmp_path

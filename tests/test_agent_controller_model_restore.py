@@ -21,8 +21,6 @@ def _make_controller(llm):
     return AgentController(
         llm=llm,
         tool_index=MagicMock(),
-        executor=MagicMock(),
-        creator=MagicMock(),
         memory=MagicMock(),
     )
 

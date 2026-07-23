@@ -39,8 +39,6 @@ def minimal_ctx():
     return ReactContext(
         llm=MagicMock(),
         tool_index=MagicMock(),
-        executor=MagicMock(),
-        creator=MagicMock(),
         memory=MagicMock(),
         builtin_executor=None,
         mcp_manager=None,

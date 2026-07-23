@@ -15,8 +15,6 @@ import logging
 import os
 import re
 import secrets
-import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -122,8 +120,6 @@ class ReactContext:
     # Core services
     llm: LLMClient
     tool_index: object          # ToolIndex
-    executor: object            # ToolExecutor
-    creator: object             # ToolCreator
     memory: object              # MemoryStore
     builtin_executor: object    # Optional BuiltinExecutor
     mcp_manager: object         # Optional MCPManager
@@ -458,7 +454,7 @@ def _append_native_tool_result(messages: list[dict], tc: ToolCall, content: str)
     Native multi-turn dispatch requires the OpenAI wire shape: an assistant
     message carrying the ``tool_calls`` entry, immediately followed by a ``tool``
     message keyed by the same ``tool_call_id``. Centralising this keeps every
-    intercept site (standard tool, create_tool, plan, vision_query) identical.
+    intercept site (standard tool, plan, vision_query) identical.
 
     Guards two provider-rejection cases: an empty ``tc.id`` (some models omit it)
     is replaced with a generated ``call_<hex>`` id so the assistant and tool
@@ -835,20 +831,6 @@ def _dispatch_action(
             state.operator_cancelled = True
         return None
 
-    if action == "create_tool":
-        _t0 = time.time()
-        feedback, cancelled = _dispatch_create_tool(ctx, action_obj, progress)
-        _emit_tool_trace(
-            ctx, "create_tool", {k: v for k, v in action_obj.items() if k != "action"},
-            success=not cancelled,
-            duration_ms=(time.time() - _t0) * 1000,
-            error="cancelled by operator" if cancelled else "",
-        )
-        sink(feedback)
-        if cancelled or ctx.cancel_event.is_set():
-            state.operator_cancelled = True
-        return None
-
     if action == "plan":
         plan_data = action_obj.get("plan", {})
         result_msg, new_max_steps, _ = _run_plan(ctx, plan_data, state.max_steps, progress)
@@ -860,7 +842,7 @@ def _dispatch_action(
         return None
 
     logger.warning("Unknown action '%s' from LLM", action)
-    sink(f'Unknown action "{action}". Use "tool", "create_tool", or "finish".')
+    sink(f'Unknown action "{action}". Use "tool", "plan", or "finish".')
     return None
 
 
@@ -956,15 +938,7 @@ def react_loop(
 
                 if turn.tool_calls:
                     tc = turn.tool_calls[0]
-                    if tc.name == "create_tool":
-                        action_obj: dict = {
-                            "action": "create_tool",
-                            "name": tc.arguments.get("name", "unnamed_tool"),
-                            "language": tc.arguments.get("language", "python"),
-                            "code": tc.arguments.get("code", ""),
-                            "description": tc.arguments.get("description", ""),
-                        }
-                    elif tc.name == "plan":
+                    if tc.name == "plan":
                         action_obj = {"action": "plan", "plan": tc.arguments}
                     elif tc.name == "finish":
                         action_obj = {"action": "finish", "result": (tc.arguments or {}).get("result", "Done.")}
@@ -1360,68 +1334,10 @@ def _dispatch_tool(
             )
         return outcome
 
-    # Registered tools
-    return ctx.executor.execute(tool_name, args)
-
-
-def _dispatch_create_tool(
-    ctx: ReactContext,
-    action_obj: dict,
-    _progress: Callable[[str], None],
-) -> tuple[str, bool]:
-    """Handle a create_tool action. Returns (feedback_message, operator_cancelled)."""
-    tool_name = action_obj.get("name", "unnamed_tool")
-    language = action_obj.get("language", "python")
-    code = action_obj.get("code", "")
-    description = action_obj.get("description", "")
-
-    token = secrets.token_hex(4)
-    tool_info = {"name": tool_name, "language": language, "code": code, "description": description}
-    tc_action = ctx.confirmation.request_tool_create(token, tool_info, _progress)
-
-    if tc_action == "create":
-        result = ctx.creator.create(tool_name, language, code, description)
-        if ctx.working:
-            ctx.working.add_step("create_tool", {"name": tool_name, "success": result["success"]})
-        if result["success"]:
-            feedback = (
-                f"Tool '{result['name']}' was created successfully at {result['path']}. "
-                "You can now use it with the 'tool' action."
-            )
-            _progress(f"🛠️ Tool Created: `{result['name']}`\n✅ {description}")
-        else:
-            feedback = f"Tool creation failed: {result['error']}"
-            _progress(f"🛠️ Tool Creation Failed: `{tool_name}`\n❌ {result['error']}")
-        logger.info("Tool creation '%s': %s", tool_name, result)
-        return feedback, False
-
-    elif tc_action == "run":
-        _progress(f"⚡ Running `{tool_name}` as one-off script…")
-        try:
-            if language == "python":
-                proc = subprocess.run(
-                    [sys.executable, "-c", code],
-                    capture_output=True, text=True, timeout=30
-                )
-            else:
-                proc = subprocess.run(
-                    ["bash", "-c", code],
-                    capture_output=True, text=True, timeout=30
-                )
-            output = (proc.stdout or "") + (proc.stderr or "")
-            output = output[:2000]
-            feedback = f"Script executed (exit {proc.returncode}):\n{output}" if output else f"Script executed (exit {proc.returncode}), no output."
-            _progress(f"⚡ Script result (exit {proc.returncode}):\n```\n{output[:400]}\n```" if output else "⚡ Script ran, no output.")
-        except Exception as exc:
-            feedback = f"Script execution failed: {exc}"
-            _progress(f"❌ Script failed: {exc}")
-        return feedback, False
-
-    else:  # cancel
-        feedback = (
-            "Tool creation was cancelled by the operator. "
-            "Do not attempt to create, write, or execute this code via shell, "
-            "file_write, or any other method. Respond with a finish action now."
-        )
-        _progress("❌ Tool creation cancelled by operator — stopping task.")
-        return feedback, True
+    # Unknown tool — no hand-written tools exist anymore
+    return {
+        "success": False,
+        "output": "",
+        "error": f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.",
+        "exit_code": -1,
+    }

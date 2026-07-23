@@ -19,8 +19,6 @@ from config_schema import PathsConfig
 
 def _make_paths(tmp: str, workspace: str | None = None) -> PathsConfig:
     return PathsConfig(
-        tools_dir=os.path.join(tmp, "tools"),
-        generated_tools_dir=os.path.join(tmp, "tools_generated"),
         data_dir=os.path.join(tmp, "data"),
         skills_dir=os.path.join(tmp, "skills"),
         prompts_dir=os.path.join(tmp, "prompts"),
@@ -33,8 +31,6 @@ def _make_paths(tmp: str, workspace: str | None = None) -> PathsConfig:
 def _make_checker(tmp: str, workspace: str | None = None) -> TrustedZoneChecker:
     paths = _make_paths(tmp, workspace)
     for d in [
-        paths.tools_dir,
-        paths.generated_tools_dir,
         paths.data_dir,
         paths.skills_dir,
         paths.prompts_dir,
@@ -166,9 +162,8 @@ class TestClassify:
             vault_file = os.path.join(tmp, "vault_dir", "secrets.toml")
             os.makedirs(os.path.dirname(vault_file), exist_ok=True)
             paths = _make_paths(tmp)
-            for d in [paths.tools_dir, paths.generated_tools_dir, paths.data_dir,
-                      paths.skills_dir, paths.prompts_dir, paths.downloads_dir,
-                      paths.workspace_dir, paths.tmp_dir]:
+            for d in [paths.data_dir, paths.skills_dir, paths.prompts_dir,
+                      paths.downloads_dir, paths.workspace_dir, paths.tmp_dir]:
                 os.makedirs(d, exist_ok=True)
             checker = TrustedZoneChecker(
                 paths_config=paths,

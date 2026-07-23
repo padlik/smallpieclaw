@@ -21,7 +21,7 @@ from tool_registry import Tool, ToolRegistry
 # ---------------------------------------------------------------------------
 
 def _make_tool(name: str, description: str = "") -> Tool:
-    return Tool(name=name, path="", language="python", description=description or f"{name} description")
+    return Tool(name=name, language="python", description=description or f"{name} description")
 
 
 def _make_registry(*tool_names: str) -> ToolRegistry:

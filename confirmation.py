@@ -15,20 +15,19 @@ from __future__ import annotations
 import logging
 import secrets
 import threading
-from typing import Callable, Optional
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
 # Marker prefixes sent to the progress callback for the Telegram UI
 CONFIRM_PREFIX = "__CONFIRM__"
 EXTEND_PREFIX = "__EXTEND__"
-TOOL_CREATE_PREFIX = "__TOOL_CREATE__"
 
 
 class ConfirmationManager:
     """Manages all pending operator confirmations for a single agent session.
 
-    Three confirmation flows are supported:
+    Two confirmation flows are supported:
 
     1. **Tool confirmation** — request_confirmation / signal_confirmation /
        signal_approve_all.  Used for shell / file_write (and any other builtin
@@ -36,9 +35,6 @@ class ConfirmationManager:
 
     2. **Step extension** — request_extension / signal_extension.  Prompted
        when the agent reaches its ``max_iterations`` limit.
-
-    3. **Tool creation** — request_tool_create / signal_tool_create.  Prompted
-       when the LLM emits a ``create_tool`` action.
     """
 
     def __init__(self) -> None:
@@ -50,11 +46,6 @@ class ConfirmationManager:
         # --- Extension ---
         self._extend_events: dict[str, threading.Event] = {}
         self._extend_results: dict[str, str] = {}
-
-        # --- Tool creation ---
-        self._tool_create_events: dict[str, threading.Event] = {}
-        self._tool_create_results: dict[str, str] = {}
-        self.tool_create_pending: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Tool confirmation
@@ -149,50 +140,6 @@ class ConfirmationManager:
             event.set()
         else:
             logger.warning("signal_extension: token=%s already resolved or timed out", token[:8])
-
-    # ------------------------------------------------------------------
-    # Tool creation
-    # ------------------------------------------------------------------
-
-    def request_tool_create(
-        self,
-        token: str,
-        tool_info: dict,
-        progress_cb: Callable[[str], None],
-    ) -> str:
-        """Register a pending tool-create request and block until the operator responds.
-
-        Sends ``TOOL_CREATE_PREFIX:token`` to *progress_cb* so the Telegram UI
-        can fetch and display the pending tool info via ``get_pending_tool_create``.
-
-        Returns ``'create'``, ``'run'``, or ``'cancel'``.
-        """
-        self.tool_create_pending[token] = tool_info
-        event = threading.Event()
-        self._tool_create_events[token] = event
-        self._tool_create_results[token] = "cancel"
-        progress_cb(f"{TOOL_CREATE_PREFIX}:{token}")
-        event.wait(timeout=300)
-        self._tool_create_events.pop(token, None)
-        action = self._tool_create_results.pop(token, "cancel")
-        self.tool_create_pending.pop(token, None)
-        return action
-
-    def get_pending_tool_create(self, token: str) -> Optional[dict]:
-        """Return pending tool-create data for display in the Telegram UI."""
-        return self.tool_create_pending.get(token)
-
-    def signal_tool_create(self, token: str, action: str) -> None:
-        """Called from an external thread with ``'create'``, ``'run'``, or ``'cancel'``.
-
-        Only acts if the request has not already timed out.
-        """
-        if event := self._tool_create_events.get(token):
-            logger.info("signal_tool_create: token=%s action=%s", token[:8], action)
-            self._tool_create_results[token] = action
-            event.set()
-        else:
-            logger.warning("signal_tool_create: token=%s already resolved or timed out", token[:8])
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -11,7 +11,7 @@ variables:
   - log_section
 ---
 
-BUILT-IN TOOLS (always available — prefer these before creating new tools):
+BUILT-IN TOOLS (always available):
   shell             — execute any shell command on the host system
   file_read         — read a file from the filesystem
   file_write        — write content to a file on the filesystem

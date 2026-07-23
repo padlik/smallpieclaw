@@ -310,7 +310,7 @@ class LogQueryTools:
 
         Records are projected (over-long field values truncated) and only the
         most recent records whose compact serialization fits within
-        ``owner.max_output`` are kept — mirroring ToolExecutor.max_output so a
+        ``owner.max_output`` are kept — mirroring BuiltinExecutor.max_output so a
         mid-loop call cannot blow the context budget. The metadata keys (count,
         truncated, total_matched) are preserved; ``truncated`` also reflects any
         size cap. The newest record is always kept even if it alone is large.

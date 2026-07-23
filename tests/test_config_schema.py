@@ -39,7 +39,7 @@ class TestParseConfig:
         assert cfg.agent.tool_timeout == 10
         assert cfg.agent.max_output_size == 4000
         assert cfg.agent.ctx_max_tokens == 90_000
-        assert cfg.paths.tools_dir == "tools"
+        assert cfg.paths.data_dir == "data"
         assert cfg.scheduler.enabled is True
 
     def test_multiple_models(self, minimal_config):

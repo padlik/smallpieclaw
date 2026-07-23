@@ -133,47 +133,6 @@ async def cb_extend(iface: "TelegramInterface", update: Update, ctx: ContextType
         logger.debug("Could not edit extend message: %s", exc)
 
 
-async def cb_tool_create(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Create Tool / Run Once / Cancel button presses."""
-    query = update.callback_query
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
-    data = query.data
-    if data.startswith("tool_create_yes:"):
-        action = "create"
-        token = data.split(":", 1)[1]
-        label = "✅ Creating tool…"
-    elif data.startswith("tool_create_run:"):
-        action = "run"
-        token = data.split(":", 1)[1]
-        label = "⚡ Running as one-off script…"
-    else:
-        action = "cancel"
-        token = data.split(":", 1)[1]
-        label = "❌ Cancelled."
-
-    if iface.agent:
-        iface.agent.resume_tool_create(token, action)
-    else:
-        logger.warning("_cb_tool_create: agent is None")
-
-    await _ack_query(query)
-
-    try:
-        await query.edit_message_text(
-            f"🛠️ <b>Tool creation</b>\n\n{label}",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as exc:
-        logger.debug("Could not edit tool_create message: %s", exc)
-
-
 async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle model switch button presses."""
     query = update.callback_query

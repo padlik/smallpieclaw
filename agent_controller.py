@@ -7,7 +7,7 @@ Workflow for each user request:
   1. Semantic search for relevant tools
   2. Send goal + tools + memory context to LLM
   3. Parse LLM JSON response
-  4. Dispatch action: tool | create_tool | finish
+  4. Dispatch action: tool | plan | finish
   5. Feed result back to LLM and repeat (max N iterations)
 """
 
@@ -38,8 +38,6 @@ from react_loop import (
     parse_json,
     react_loop,
 )
-from tool_creator import ToolCreator
-from tool_executor import ToolExecutor
 from tool_index import ToolIndex
 from trace_context import child_trace_id
 
@@ -59,8 +57,6 @@ class AgentController:
         self,
         llm: LLMClient,
         tool_index: ToolIndex,
-        executor: ToolExecutor,
-        creator: ToolCreator,
         memory: MemoryStore,
         max_iterations: int = 8,
         top_tools: int = 3,
@@ -89,8 +85,6 @@ class AgentController:
     ):
         self.llm = llm
         self.tool_index = tool_index
-        self.executor = executor
-        self.creator = creator
         self.memory = memory
         self.max_iterations = max_iterations
         self.top_tools = top_tools
@@ -233,14 +227,6 @@ class AgentController:
         automatic approval for the rest of this task.
         """
         self._confirmation.signal_approve_all(token, tool_name)
-
-    def get_pending_tool_create(self, token: str) -> Optional[dict]:
-        """Return pending tool-create data for display in Telegram UI."""
-        return self._confirmation.get_pending_tool_create(token)
-
-    def resume_tool_create(self, token: str, action: str) -> None:
-        """Called by TelegramInterface with 'create', 'run', or 'cancel'."""
-        self._confirmation.signal_tool_create(token, action)
 
     def build_system_prompt(self, user_goal: str = "(context snapshot)") -> tuple[str, int]:
         """Build the full system prompt as it would be sent to the LLM.
@@ -441,8 +427,8 @@ class SubAgentRunner:
     An isolated agent instance for background task execution.
 
     Each runner has its own LLMClient, ShortTermMemory, and WorkingMemory.
-    It shares ToolIndex, ToolExecutor, ToolCreator, BuiltinExecutor,
-    SkillRegistry, and ResultsMemory with the main agent.
+    It shares ToolIndex, BuiltinExecutor, SkillRegistry, and ResultsMemory
+    with the main agent.
 
     Results are delivered via notify_fn (Telegram). Sub-agent output is NOT
     auto-persisted into semantic memory (P2 consolidation); to remember a fact,
@@ -455,8 +441,6 @@ class SubAgentRunner:
         model_cfg: dict,              # single [[models]] entry dict
         config: dict,                 # full agent config (for LLMClient)
         tool_index,                   # ToolIndex (shared)
-        executor,                     # ToolExecutor (shared)
-        creator,                      # ToolCreator (shared)
         base_memory,                  # MemoryStore (shared long-term facts)
         builtin_executor,             # BuiltinExecutor (shared)
         skill_registry=None,          # SkillRegistry (shared)
@@ -519,8 +503,6 @@ class SubAgentRunner:
         self._agent = AgentController(
             llm=self._llm,
             tool_index=tool_index,
-            executor=executor,
-            creator=creator,
             memory=base_memory,
             max_iterations=max_iterations,
             top_tools=top_tools,

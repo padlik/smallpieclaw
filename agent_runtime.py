@@ -146,8 +146,6 @@ class AgentRuntime:
         all_models: Optional[list[dict]] = None,
         background_model_cfg: Optional[dict] = None,
         tool_index: object = None,
-        executor: object = None,
-        creator: object = None,
         base_memory: object = None,
         builtin_executor: object = None,
         skill_registry: object = None,
@@ -169,8 +167,6 @@ class AgentRuntime:
         self._background_model_cfg = background_model_cfg or {}
         # Shared tool + memory collaborators.
         self._tool_index = tool_index
-        self._executor = executor
-        self._creator = creator
         self._base_memory = base_memory
         self._builtin_executor = builtin_executor
         self._skill_registry = skill_registry
@@ -218,8 +214,6 @@ class AgentRuntime:
         ctx = ReactContext(
             llm=controller.llm,
             tool_index=controller.tool_index,
-            executor=controller.executor,
-            creator=controller.creator,
             memory=controller.memory,
             builtin_executor=controller.builtin_executor,
             mcp_manager=controller.mcp_manager,
@@ -367,8 +361,6 @@ class AgentRuntime:
             model_cfg=model_cfg,
             config=self._config,
             tool_index=self._tool_index,
-            executor=self._executor,
-            creator=self._creator,
             base_memory=self._base_memory,
             builtin_executor=self._builtin_executor,
             skill_registry=self._skill_registry,

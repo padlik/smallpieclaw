@@ -1,10 +1,8 @@
 """
 builtin_executor.py
 -------------------
-Always-available built-in tools, injected into every agent run regardless of
-what is in tools/ or tools_generated/. See BUILTIN_TOOLS in
-builtin_tools/descriptors.py for the full current list. The agent is
-instructed to prefer built-in tools before creating new ones.
+Always-available built-in tools, injected into every agent run. See BUILTIN_TOOLS in
+builtin_tools/descriptors.py for the full current list.
 
 Dangerous operations (destructive commands, sensitive file access, any write)
 require explicit user confirmation before execution. When confirmation is

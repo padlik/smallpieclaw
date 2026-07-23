@@ -1,43 +1,28 @@
 """
 tool_registry.py
 ----------------
-Discovers and registers executable tools (.sh, .py) from the tools directories.
-Each tool file must contain a "description:" comment on any line near the top.
-Multi-line descriptions are supported by continuing the comment on the next lines:
+MCP tool registry — registers and looks up tools provided by MCP servers.
 
-Example tool header (single-line):
-    #!/bin/bash
-    # description: check disk usage across all mount points
-
-Example tool header (multi-line):
-    #!/bin/bash
-    # description: check disk usage across all mount points
-    #   and report any volumes above 90% capacity
+The registry no longer scans local script directories. Tools are added only
+via register_mcp_tools() from an MCP client and removed via
+unregister_mcp_server(). All lookups share the same Tool dataclass used by
+the previous file-scanning implementation.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Regex to match the "description:" key line in tool file header
-_DESC_START_RE = re.compile(r"(?:#\s*)?description:\s*(.+)", re.IGNORECASE)
-# Regex to match a continuation comment line (e.g. "#   more text") — no new key
-_DESC_CONT_RE = re.compile(r"^#\s{2,}(.+)$")
-
 
 @dataclass
 class Tool:
-    name: str           # Unique identifier derived from filename (no extension)
-    path: str           # Absolute path to the script
-    language: str       # "bash", "python", or "builtin" / "mcp"
-    description: str    # Human-readable description extracted from file
-    is_generated: bool = False  # True if created by the LLM tool creator
+    name: str           # Unique tool identifier (MCP tool name)
+    language: str       # "mcp" for MCP-provided tools
+    description: str    # Human-readable description
     is_mcp: bool = False        # True for tools provided by an MCP server
     server_name: str = ""       # MCP server name (when is_mcp=True)
     input_schema: dict = field(default_factory=dict)  # MCP JSON Schema for args
@@ -45,39 +30,16 @@ class Tool:
 
 class ToolRegistry:
     """
-    Scans tool directories and maintains a registry of available tools.
+    Maintains a registry of tools provided by MCP servers.
     Only tools present in the registry are allowed to execute (safety).
     """
 
-    def __init__(self, tools_dirs: list[str]):
-        self.tools_dirs = tools_dirs
+    def __init__(self):
         self._registry: dict[str, Tool] = {}
-        self.refresh()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
-    def refresh(self) -> int:
-        """Rescan all directories and rebuild the registry. Returns tool count."""
-        self._registry.clear()
-        for directory in self.tools_dirs:
-            if not os.path.isdir(directory):
-                logger.debug("Tool directory not found, skipping: %s", directory)
-                continue
-            is_generated = "generated" in directory
-            for filename in os.listdir(directory):
-                if not filename.endswith((".sh", ".py")):
-                    continue
-                path = os.path.abspath(os.path.join(directory, filename))
-                tool = self._parse_tool(path, is_generated)
-                if tool:
-                    if tool.name in self._registry:
-                        logger.warning("Duplicate tool name '%s' — keeping first found", tool.name)
-                    else:
-                        self._registry[tool.name] = tool
-        logger.info("Tool registry refreshed: %d tools loaded", len(self._registry))
-        return len(self._registry)
 
     def get(self, name: str) -> Optional[Tool]:
         return self._registry.get(name)
@@ -87,11 +49,6 @@ class ToolRegistry:
 
     def exists(self, name: str) -> bool:
         return name in self._registry
-
-    def register(self, tool: Tool) -> None:
-        """Manually register a tool (used by ToolCreator after validation)."""
-        self._registry[tool.name] = tool
-        logger.info("Tool registered: %s (%s)", tool.name, tool.path)
 
     def register_mcp_tools(self, server_name: str, tools: list[Tool]) -> None:
         """Register MCP tools from the given server (replaces any prior tools for that server)."""
@@ -119,48 +76,3 @@ class ToolRegistry:
             return "No tools registered."
         lines = [f"  {t.name}: {t.description}" for t in self._registry.values()]
         return "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _parse_tool(path: str, is_generated: bool) -> Optional[Tool]:
-        """Extract tool metadata from a script file."""
-        try:
-            with open(path, "r", errors="replace") as f:
-                head = [next(f, "") for _ in range(15)]
-        except Exception as exc:
-            logger.warning("Could not read tool file %s: %s", path, exc)
-            return None
-
-        description = ""
-        for i, line in enumerate(head):
-            m = _DESC_START_RE.search(line)
-            if m:
-                parts = [m.group(1).strip()]
-                # Collect continuation comment lines immediately following
-                for cont in head[i + 1:]:
-                    cm = _DESC_CONT_RE.match(cont.rstrip())
-                    if cm:
-                        parts.append(cm.group(1).strip())
-                    else:
-                        break
-                description = " ".join(parts)
-                break
-
-        if not description:
-            logger.debug("No description found in %s — skipping", path)
-            return None
-
-        filename = os.path.basename(path)
-        name = os.path.splitext(filename)[0]
-        language = "bash" if path.endswith(".sh") else "python"
-
-        return Tool(
-            name=name,
-            path=path,
-            language=language,
-            description=description,
-            is_generated=is_generated,
-        )

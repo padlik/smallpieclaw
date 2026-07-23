@@ -38,7 +38,7 @@ _JSON_INDEX_LOAD_ERRORS = (OSError, json.JSONDecodeError)
 
 def _builtin_as_tool(name: str, description: str) -> Tool:
     """Wrap a built-in tool description as a Tool object for uniform handling."""
-    return Tool(name=name, path="", language="builtin", description=description)
+    return Tool(name=name, language="builtin", description=description)
 
 
 class ToolIndex:
@@ -130,7 +130,7 @@ class ToolIndex:
     def rebuild(self) -> dict:
         """
         Force re-embed ALL tools (registered + built-in), ignoring cached vectors.
-        Refreshes the registry first, then re-indexes everything from scratch.
+        Re-indexes everything from scratch.
         Returns a summary dict: {total, embedded, failed, removed}.
         """
         new_index: dict[str, dict] = {}
@@ -157,20 +157,6 @@ class ToolIndex:
         total = embedded + failed
         logger.info("Tool index rebuilt: %d embedded, %d failed", embedded, failed)
         return {"total": total, "embedded": embedded, "failed": failed, "removed": 0}
-
-    def add_tool(self, tool: Tool) -> None:
-        """Embed and index a single newly created tool."""
-        try:
-            vector = self.llm.embed(tool.description)
-            with self._lock:
-                self._index[tool.name] = {
-                    "description": tool.description,
-                    "vector": vector,
-                }
-            self._save()
-            logger.info("Tool '%s' added to semantic index", tool.name)
-        except _EMBEDDING_ERRORS as exc:
-            logger.error("Failed to index tool '%s': %s", tool.name, exc)
 
     def search(self, query: str, top_k: int = 3) -> list[Tool]:
         """
