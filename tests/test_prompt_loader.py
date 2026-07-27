@@ -583,6 +583,10 @@ SYSTEM_BUILTIN_TOOLS = [
     "memory_graph_store",
     "secret_get",
     "log_query",
+    "shell_env_set",
+    "shell_env_unset",
+    "shell_env_list",
+    "shell_env_get",
 ]
 
 # prompts/system/04-execution.md — RULES headings (mode="default").
@@ -605,6 +609,10 @@ SUB_AGENT_BUILTIN_TOOLS = [
     "memory_graph_store",
     "schedule",
     "log_query",
+    "shell_env_set",
+    "shell_env_unset",
+    "shell_env_list",
+    "shell_env_get",
 ]
 
 # prompts/sub-agent/03-tools.md — RULES headings (mode="sub-agent").
