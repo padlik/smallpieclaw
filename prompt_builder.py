@@ -123,6 +123,19 @@ RELEVANT PAST RESULTS:
   memory_graph_search — search the knowledge graph for facts, people, preferences, or past events. Args: query (str). Only available when graph memory is enabled.
   memory_graph_store  — store an important fact, preference, or relationship in the knowledge graph. Args: content (str), entity_type (str, optional). Only available when graph memory is enabled.
   secret_get        — retrieve a value from the vault by key. Args: key (str, required). Requires user confirmation. Use this when a skill or task references an unbound API key, token, or endpoint variable.
+  shell_env_set     — set a session-scoped environment variable for subsequent shell calls. Args: key (str, required), value (str, required). Replaces `export` (which does not persist across isolated shell calls).
+  shell_env_unset   — remove a session-scoped shell environment variable. Args: key (str, required).
+  shell_env_list    — list all session-scoped shell environment variables as a JSON object.
+  shell_env_get     — get the value of one session-scoped shell environment variable. Args: key (str, required). Returns empty string if not set.
+
+SHELL PERSISTENCE (nsjail backend):
+Each shell call runs in a separate jail — `export VAR=value` does NOT persist across calls.
+- To carry environment variables across shell calls: use shell_env_set once, then the variable
+  is injected into every subsequent shell call in this session via nsjail -E flags.
+- To carry files across shell calls: write them under /tmp (a per-session temp dir is
+  bind-mounted as /tmp in every jail). Files in /tmp survive across calls within the session
+  and are cleaned up at agent shutdown.
+- Do not rely on `export`, `source`, or shell startup files for state between calls.
 
 SUB-AGENT USAGE:
 Sub-agents run in complete isolation — they have NO access to your memory, conversation
