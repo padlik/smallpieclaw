@@ -432,6 +432,44 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["path", "question"],
         },
     },
+    "shell_env_set": {
+        "description": "Set a session-scoped environment variable for shell commands.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Environment variable name."},
+                "value": {"type": "string", "description": "Environment variable value."},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    "shell_env_unset": {
+        "description": "Remove a session-scoped environment variable.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Environment variable name to remove."},
+            },
+            "required": ["key"],
+        },
+    },
+    "shell_env_list": {
+        "description": "List all session-scoped shell environment variables.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    "shell_env_get": {
+        "description": "Get the value of a session-scoped shell environment variable.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Environment variable name."},
+            },
+            "required": ["key"],
+        },
+    },
 }
 
 

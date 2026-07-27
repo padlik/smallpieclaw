@@ -4,8 +4,8 @@ Change: split-builtin-executor-modules. These white-box tests guard the
 dispatch *framework* against table drift as tool bodies move into the
 ``builtin_tools`` package across later phases:
 
-  * the frozen 17-tool built-in set,
-  * the 16-entry ``_exec_table`` (every tool except ``vision_query``),
+  * the frozen 21-tool built-in set,
+  * the 20-entry ``_exec_table`` (every tool except ``vision_query``),
   * the confirmation-capable ``_run_table`` (shell/file/graph/secret),
   * the ``vision_query`` seam (declared built-in, no dispatch handler), and
   * total dispatch: an unknown tool name yields an error result, never raises.
@@ -33,6 +33,10 @@ _FROZEN_TOOLS = frozenset({
     "memory_graph_search",
     "memory_graph_store",
     "log_query",
+    "shell_env_set",
+    "shell_env_unset",
+    "shell_env_list",
+    "shell_env_get",
 })
 
 _CONFIRMATION_TOOLS = frozenset({
@@ -52,15 +56,15 @@ def _executor() -> BuiltinExecutor:
     return BuiltinExecutor()
 
 
-def test_builtin_set_is_frozen_seventeen():
-    assert len(_FROZEN_TOOLS) == 17
+def test_builtin_set_is_frozen_twenty_one():
+    assert len(_FROZEN_TOOLS) == 21
     assert set(BUILTIN_TOOLS) == set(_FROZEN_TOOLS)
 
 
 def test_exec_table_covers_every_non_vision_tool():
     ex = _executor()
     assert set(ex._exec_table) == set(_FROZEN_TOOLS) - {"vision_query"}
-    assert len(ex._exec_table) == 16
+    assert len(ex._exec_table) == 20
 
 
 def test_run_table_contains_only_confirmation_capable_tools():

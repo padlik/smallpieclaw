@@ -16,8 +16,10 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import shutil
 import signal
 import sys
+import tempfile
 
 import agent_logging
 
@@ -192,6 +194,7 @@ def main():
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,
             workspace_dir=workspace_dir,
             log_file=log_file, log_backup_count=log_backup_count,
+            agent_name=os.path.basename(os.path.abspath(".")),
         )
 
 
@@ -202,6 +205,7 @@ def _run(
     scheduler_config_path, skills_dir,
     downloads_dir, tmp_dir, workspace_dir,
     log_file, log_backup_count,
+    agent_name,
 ):
     """Core startup after PID lock is acquired."""
     # Re-initialise logging with the configured XDG path and structlog dual sink.
@@ -216,6 +220,19 @@ def _run(
     os.makedirs(skills_dir, exist_ok=True)
     os.makedirs(downloads_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
+    # XDG state dir for trusted_dirs.json — outside the nsjail-mounted project dir
+    # so a sandboxed shell command cannot overwrite the trust store.
+    xdg_state_home = os.environ.get(
+        "XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state")
+    )
+    nsjail_state_dir = os.path.join(xdg_state_home, agent_name)
+    os.makedirs(nsjail_state_dir, exist_ok=True)
+    trusted_dirs_path = os.path.join(nsjail_state_dir, "trusted_dirs.json")
+    # One-time migration from old location
+    old_trusted = os.path.join(data_dir, "trusted_dirs.json")
+    if os.path.exists(old_trusted) and not os.path.exists(trusted_dirs_path):
+        shutil.copy2(old_trusted, trusted_dirs_path)
+        logger.info("Migrated trusted_dirs.json to XDG state: %s", trusted_dirs_path)
     os.environ["TMPDIR"] = tmp_dir
     os.environ["TMP"] = tmp_dir
     os.environ["TEMP"] = tmp_dir
@@ -233,6 +250,11 @@ def _run(
     shell_pty_cols = int(agent_cfg.get("shell_pty_cols", 220))
     shell_pty_rows = int(agent_cfg.get("shell_pty_rows", 50))
     shell_streaming = bool(agent_cfg.get("shell_streaming", False))
+    shell_nsjail_confirm_mode = agent_cfg.get("shell_nsjail_confirm_mode", "always")
+    shell_nsjail_memory_mb = int(agent_cfg.get("shell_nsjail_memory_mb", 256))
+    shell_nsjail_pids_max = int(agent_cfg.get("shell_nsjail_pids_max", 64))
+    shell_nsjail_cpu_percent = int(agent_cfg.get("shell_nsjail_cpu_percent", 50))
+    shell_nsjail_network = agent_cfg.get("shell_nsjail_network", "none")
     creativity_mode = agent_cfg.get("creativity_mode", "default")
     plan_max_iterations = int(agent_cfg.get("plan_max_iterations", 50))
     inactivity_warn_minutes = int(agent_cfg.get("inactivity_warn_minutes", 15))
@@ -241,6 +263,11 @@ def _run(
     scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
 
     logger.info("Initialising components...")
+
+    # Per-session temp dir for nsjail /tmp bind mount — persists across nsjail
+    # invocations within a session, cleaned up at agent shutdown.
+    nsjail_session_tmpdir = tempfile.mkdtemp(prefix="nsjail-tmp-")
+    logger.info("nsjail session tmpdir: %s", nsjail_session_tmpdir)
 
     vault_file = vault_path(cfg)
 
@@ -258,6 +285,14 @@ def _run(
         max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
         shell_backend=shell_backend, shell_pty_cols=shell_pty_cols, shell_pty_rows=shell_pty_rows,
         shell_streaming=shell_streaming, vault_path=vault_file, log_jsonl_path=json_log_path,
+        shell_nsjail_confirm_mode=shell_nsjail_confirm_mode,
+        shell_nsjail_memory_mb=shell_nsjail_memory_mb,
+        shell_nsjail_pids_max=shell_nsjail_pids_max,
+        shell_nsjail_cpu_percent=shell_nsjail_cpu_percent,
+        shell_nsjail_network=shell_nsjail_network,
+        nsjail_session_tmpdir=nsjail_session_tmpdir,
+        nsjail_project_dir=_AGENT_DIR,
+        nsjail_trusted_dirs_path=trusted_dirs_path,
     )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
 
@@ -301,6 +336,7 @@ def _run(
         data_dir=data_dir,
         agent_name=app_cfg.agent.agent_name,
         vault_path=vault_file,
+        trusted_dirs_path=trusted_dirs_path,
     )
     builtin.trusted_zone_checker = _trusted_zone_checker
     # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime
@@ -523,6 +559,11 @@ def _run(
     finally:
         scheduler.stop()
         builtin.shutdown()
+        # Clean up per-session nsjail temp dir
+        try:
+            shutil.rmtree(nsjail_session_tmpdir, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
         if graph_memory_writer is not None:
             try:
                 graph_memory_writer.stop()

@@ -122,7 +122,7 @@ The existing architecture (ADR-0008: façade + handler-module package) means the
 | `network` | `curl\|sh`, `wget\|sh`, `/dev/tcp/`, `nc -e` | No | Config-dependent (network may be enabled) |
 | `resource` | fork bomb | Yes | Kernel-bounded by cgroup pids_max |
 | `project` | `rm -rf`, `chmod 777` | No | Can damage project inside jail |
-| `policy` | `sudo su`, `tools_generated/` | No | Policy decision, not safety |
+| `policy` | `sudo su` | No | Policy decision, not safety |
 
 **Rationale**: The confirmation flow should not blindly trust the jail config. Only skip confirmation for patterns where the kernel enforces a hard limit regardless of config (fork bomb → cgroup pids_max). Network patterns depend on `clone_newnet: true` being correct — if config is wrong, they're dangerous.
 
