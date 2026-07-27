@@ -108,7 +108,7 @@ class TestBuild:
         try:
             with open(cfg_path) as f:
                 content = f.read()
-            assert 'cwd: "/home/user/project"' in content
+            assert f'cwd: {json.dumps(builder.project_dir)}' in content
         finally:
             os.unlink(cfg_path)
 
@@ -123,8 +123,8 @@ class TestBuild:
         try:
             with open(cfg_path) as f:
                 content = f.read()
-            assert 'src: "/home/user/project"' in content
-            assert 'dst: "/home/user/project"' in content
+            assert f'src: {json.dumps(builder.project_dir)}' in content
+            assert f'dst: {json.dumps(builder.project_dir)}' in content
             assert "rw: true" in content
         finally:
             os.unlink(cfg_path)
@@ -140,7 +140,7 @@ class TestBuild:
         try:
             with open(cfg_path) as f:
                 content = f.read()
-            assert 'src: "/tmp/session"' in content
+            assert f'src: {json.dumps(builder.session_tmpdir)}' in content
             assert 'dst: "/tmp"' in content
         finally:
             os.unlink(cfg_path)
@@ -214,13 +214,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_network_none_creates_net_namespace(self) -> None:
-        """network='none' sets clone_newnet: true (network isolated)."""
+    def test_config_allow_net_false_creates_net_namespace(self) -> None:
+        """allow_net=False sets clone_newnet: true (network isolated)."""
         builder = NsjailConfigBuilder(
             project_dir="/home/user/project",
             session_tmpdir="/tmp/session",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
-            network="none",
+            allow_net=False,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -230,19 +230,157 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_network_host_shares_net_namespace(self) -> None:
-        """network='host' sets clone_newnet: false (host network)."""
+    def test_config_allow_net_true_shares_net_namespace(self) -> None:
+        """allow_net=True sets clone_newnet: false (host network)."""
         builder = NsjailConfigBuilder(
             project_dir="/home/user/project",
             session_tmpdir="/tmp/session",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
-            network="host",
+            allow_net=True,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
             with open(cfg_path) as f:
                 content = f.read()
             assert "clone_newnet: false" in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_config_skills_dir_mounted_when_exists(self) -> None:
+        """Existing skills_dir outside project_dir appears as a RO bind mount."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skills_dir = os.path.join(tmpdir, "skills")
+            os.makedirs(skills_dir)
+            builder = NsjailConfigBuilder(
+                project_dir="/home/user/project",
+                session_tmpdir="/tmp/session",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                skills_dir=skills_dir,
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert f'src: {json.dumps(builder.skills_dir)}' in content
+                assert f'dst: {json.dumps(builder.skills_dir)}' in content
+                assert "rw: false" in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_config_skills_dir_skipped_when_missing(self) -> None:
+        """A non-existent skills_dir path does not appear in the config."""
+        missing_dir = "/tmp/nonexistent-skills-dir-for-test"
+        builder = NsjailConfigBuilder(
+            project_dir="/home/user/project",
+            session_tmpdir="/tmp/session",
+            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            skills_dir=missing_dir,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert builder.skills_dir not in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_config_skills_dir_skipped_when_nested_under_project_dir(self) -> None:
+        """A skills_dir nested under project_dir is not mounted separately."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skills_dir = os.path.join(tmpdir, "skills")
+            os.makedirs(skills_dir)
+            builder = NsjailConfigBuilder(
+                project_dir=tmpdir,
+                session_tmpdir="/tmp/session",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                skills_dir=skills_dir,
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert builder.skills_dir not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_config_skills_dir_rejected_when_blocked_system_path(self) -> None:
+        """A skills_dir under a blocked system prefix is not mounted."""
+        with patch("os.path.isdir", return_value=True):
+            builder = NsjailConfigBuilder(
+                project_dir="/home/user/project",
+                session_tmpdir="/tmp/session",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                skills_dir="/etc",
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert 'src: "/etc"' not in content
+            assert 'dst: "/etc"' not in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_config_skills_dir_skipped_when_parent_of_project_dir(self) -> None:
+        """A skills_dir that is a parent of project_dir is not mounted separately."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = os.path.join(tmpdir, "project")
+            os.makedirs(project_dir)
+            builder = NsjailConfigBuilder(
+                project_dir=project_dir,
+                session_tmpdir="/tmp/session",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                skills_dir=tmpdir,
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert f'src: {json.dumps(builder.skills_dir)}' not in content
+                assert f'dst: {json.dumps(builder.skills_dir)}' not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_config_skills_dir_skipped_when_equal_to_project_dir(self) -> None:
+        """A skills_dir equal to project_dir is not mounted separately."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            builder = NsjailConfigBuilder(
+                project_dir=tmpdir,
+                session_tmpdir="/tmp/session",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                skills_dir=tmpdir,
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "# Skills directory mount (read-only)" not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_config_skills_dir_under_home_nested_in_project_not_blocked(self) -> None:
+        """Regression: skills_dir under /home but nested under project_dir must
+        be skipped via commonpath, NOT rejected by the /home blocklist prefix.
+
+        On Linux the default skills_dir resolves to /home/user/agent/skills which
+        is under /home — the blocklist must not fire before the commonpath check.
+        """
+        with patch("os.path.isdir", return_value=True), \
+             patch("os.path.realpath", side_effect=lambda p: p), \
+             patch("os.path.abspath", side_effect=lambda p: p):
+            builder = NsjailConfigBuilder(
+                project_dir="/home/user/myagent",
+                session_tmpdir="/tmp/session",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                skills_dir="/home/user/myagent/skills",
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            # The mount must be skipped (nested under project_dir), not rejected
+            assert "# Skills directory mount (read-only)" not in content
+            assert "/home/user/myagent/skills" not in content
         finally:
             os.unlink(cfg_path)
 

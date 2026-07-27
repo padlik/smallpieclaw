@@ -428,7 +428,7 @@ class AgentConfig:
     # nsjail shell backend — confirmation gate mode when nsjail sandboxing is active.
     # "always" (default): confirm all dangerous patterns (backward-compatible).
     # "adaptive": skip confirmation for "network" category patterns when nsjail
-    #   network isolation is active (shell_nsjail_network = "none"). All other
+    #   network isolation is active (allow_net = false). All other
     #   categories (including "resource") still require confirmation.
     # "never": skip confirmation for all dangerous patterns when nsjail is active.
     # Falls back to "always" when nsjail is not active (subprocess fallback).
@@ -437,8 +437,10 @@ class AgentConfig:
     shell_nsjail_memory_mb: int = 256
     shell_nsjail_pids_max: int = 64
     shell_nsjail_cpu_percent: int = 50
-    # nsjail network isolation — "none" (default, clone_newnet: true) or "host" (clone_newnet: false)
-    shell_nsjail_network: str = "none"
+    # nsjail network access — when false (default) the jail gets an empty network
+    # namespace (clone_newnet: true, no network access); when true the jail shares
+    # the host network namespace (clone_newnet: false, network access available).
+    allow_net: bool = False
     # Creativity mode for prompt assembly — default/planner/explorer/resilient
     creativity_mode: str = "default"
     # Maximum iterations for plan execution (higher than normal max_iterations
@@ -615,7 +617,7 @@ def _parse_agent(raw: dict) -> AgentConfig:
         shell_nsjail_memory_mb=_parse_int(section.get("shell_nsjail_memory_mb"), 256, "agent.shell_nsjail_memory_mb"),
         shell_nsjail_pids_max=_parse_int(section.get("shell_nsjail_pids_max"), 64, "agent.shell_nsjail_pids_max"),
         shell_nsjail_cpu_percent=_parse_int(section.get("shell_nsjail_cpu_percent"), 50, "agent.shell_nsjail_cpu_percent"),
-        shell_nsjail_network=str(section.get("shell_nsjail_network", "none")),
+        allow_net=_parse_bool(section.get("allow_net", False), "agent.allow_net"),
         creativity_mode=section.get("creativity_mode", "default"),
         plan_max_iterations=_parse_int(section.get("plan_max_iterations"), 50, "agent.plan_max_iterations"),
         inactivity_warn_minutes=_parse_int(section.get("inactivity_warn_minutes"), 15, "agent.inactivity_warn_minutes"),
@@ -874,6 +876,14 @@ def _reject_removed_fields(raw: dict) -> None:
             "[embeddings] 'api_key_file' has been removed."
             + _MIGRATION
             + " Example: api_key = \"sec:embeddings_api_key\""
+        )
+
+    agent = raw.get("agent") or {}
+    if "shell_nsjail_network" in agent:
+        raise ConfigError(
+            "[agent] 'shell_nsjail_network' has been removed. "
+            "Replace it with 'allow_net = true' (host network) or "
+            "'allow_net = false' (network isolated, the default)."
         )
 
 

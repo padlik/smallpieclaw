@@ -604,6 +604,25 @@ class TestAgentConfigFields:
         assert cfg.agent.agent_name == "myagent"
         assert cfg.agent.agent_home == "/tmp/agent"
 
+    def test_allow_net_defaults_false(self, minimal_config):
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.allow_net is False
+
+    def test_allow_net_true(self, minimal_config):
+        minimal_config["agent"]["allow_net"] = True
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.allow_net is True
+
+    def test_allow_net_rejects_string(self, minimal_config):
+        minimal_config["agent"]["allow_net"] = "true"
+        with pytest.raises(ConfigError, match=r"agent\.allow_net"):
+            parse_config(minimal_config)
+
+    def test_legacy_shell_nsjail_network_rejected(self, minimal_config):
+        minimal_config["agent"]["shell_nsjail_network"] = "none"
+        with pytest.raises(ConfigError, match=r"shell_nsjail_network.*has been removed"):
+            parse_config(minimal_config)
+
 
 # ---------------------------------------------------------------------------
 # Provider credential inheritance

@@ -56,7 +56,7 @@ class ShellTools:
         Uses ``shell_nsjail_confirm_mode`` and whether nsjail is active:
         - ``"always"`` (default): confirm all dangerous patterns regardless of category.
         - ``"adaptive"``: skip confirmation for ``network`` category patterns when
-          nsjail network isolation is active (``shell_nsjail_network = "none"``).
+          nsjail network isolation is active (``allow_net = false``).
           All other categories (including ``resource``) still confirm.
         - ``"never"``: skip confirmation for all dangerous patterns when nsjail is active.
 
@@ -71,7 +71,7 @@ class ShellTools:
         if mode == "adaptive":
             # Only skip network-category commands when the sandbox has network isolation.
             # resource (fork bomb) always confirms — rlimit_nproc is user-wide, not per-jail.
-            if category == "network" and self._owner._shell_nsjail_network == "none":
+            if category == "network" and not self._owner._allow_net:
                 return False
             return True
         return True  # "always"

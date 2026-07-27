@@ -44,7 +44,7 @@ nsjail is **Linux-only**. On macOS the agent falls back to the subprocess backen
    shell_nsjail_memory_mb = 256
    shell_nsjail_pids_max = 64
    shell_nsjail_cpu_percent = 50
-   shell_nsjail_network = "none"
+allow_net = false
    ```
 
 5. Verify cgroup v2 delegation is working:
@@ -131,12 +131,12 @@ The VM uses the VZ backend (Apple Virtualization.framework), Ubuntu 26.04 ARM64,
 | `shell_nsjail_memory_mb` | `256` | Memory limit in MB (cgroup) or `RLIMIT_AS` (rlimits fallback) |
 | `shell_nsjail_pids_max` | `64` | Max PIDs inside the jail (cgroup only) |
 | `shell_nsjail_cpu_percent` | `50` | CPU quota as a percentage of one core (cgroup only) |
-| `shell_nsjail_network` | `"none"` | `"none"` = isolated (no network), `"host"` = share host network |
+| `allow_net` | `false` | `false` = isolated (no network), `true` = share host network |
 
 ## Confirmation modes
 
 - `"always"` (default): Confirm all dangerous shell patterns. Backward-compatible with the subprocess backend.
-- `"adaptive"`: Skip confirmation for `network`-category patterns (`curl|sh`, `wget|sh`, `/dev/tcp`, `nc -e`) when network isolation is active (`shell_nsjail_network = "none"`). All other categories (`host_escape`, `project`, `resource`, `policy`) still require confirmation.
+- `"adaptive"`: Skip confirmation for `network`-category patterns (`curl|sh`, `wget|sh`, `/dev/tcp`, `nc -e`) when network isolation is active (`allow_net = false`). All other categories (`host_escape`, `project`, `resource`, `policy`) still require confirmation.
 - `"never"`: Skip all confirmation while nsjail is active. **Warning:** RW-mounted host directories such as the project directory and RW trusted dirs are **not** protected by the jail. A command like `rm -rf` on a project path will delete real host files. Use with caution.
 
 When nsjail is inactive (binary missing, non-Linux host), all modes fall back to `"always"`.
