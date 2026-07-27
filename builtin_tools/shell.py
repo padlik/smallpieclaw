@@ -50,14 +50,40 @@ class ShellTools:
     def __init__(self, owner: BuiltinExecutor) -> None:
         self._owner = owner
 
+    def _should_confirm(self, category: str) -> bool:
+        """Decide whether a dangerous shell pattern requires confirmation.
+
+        Uses ``shell_nsjail_confirm_mode`` and whether nsjail is active:
+        - ``"always"`` (default): confirm all dangerous patterns regardless of category.
+        - ``"adaptive"``: skip confirmation for ``network`` category patterns when
+          nsjail network isolation is active (``shell_nsjail_network = "none"``).
+          All other categories (including ``resource``) still confirm.
+        - ``"never"``: skip confirmation for all dangerous patterns when nsjail is active.
+
+        Falls back to ``"always"`` behaviour when nsjail is not active (subprocess
+        fallback) — the sandbox is not present, so all dangerous patterns must confirm.
+        """
+        if not self._owner._shell_nsjail_active:
+            return True
+        mode = self._owner._shell_nsjail_confirm_mode
+        if mode == "never":
+            return False
+        if mode == "adaptive":
+            # Only skip network-category commands when the sandbox has network isolation.
+            # resource (fork bomb) always confirms — rlimit_nproc is user-wide, not per-jail.
+            if category == "network" and self._owner._shell_nsjail_network == "none":
+                return False
+            return True
+        return True  # "always"
+
     def _exec_shell(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
                     chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         command = str(args.get("command", "")).strip()
         if not command:
             return {"success": False, "output": "", "error": "No command provided.", "exit_code": -1}
 
-        dangerous, reason = _is_dangerous_shell(command)
-        if dangerous:
+        dangerous, reason, category = _is_dangerous_shell(command)
+        if dangerous and self._should_confirm(category):
             desc = f"Run shell command: <code>{command}</code>\n⚠️ Reason for confirmation: {reason}"
             return self._owner._requires_confirmation("shell", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
 
@@ -65,7 +91,9 @@ class ShellTools:
 
     def _run_shell(self, args: dict, caller_tag: str = "",
                    chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
-        """Dispatch to the configured shell backend (subprocess or pty)."""
+        """Dispatch to the configured shell backend (subprocess, pty, or nsjail)."""
+        if self._owner._shell_backend == "nsjail" and self._owner._shell_nsjail_active:
+            return self._run_shell_nsjail(args, caller_tag=caller_tag)
         if self._owner._shell_backend == "pty" and sys.platform != "win32":
             return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         return self._run_shell_subprocess(args, caller_tag=caller_tag)
@@ -123,7 +151,46 @@ class ShellTools:
             pass
         return None
 
-    def _run_shell_subprocess(self, args: dict, caller_tag: str = "") -> dict:
+    def _run_shell_nsjail(self, args: dict, caller_tag: str = "") -> dict:
+        """Run a shell command inside an nsjail sandbox.
+
+        Builds the nsjail config + command list via ``NsjailConfigBuilder``,
+        then delegates to ``_run_shell_subprocess`` with the nsjail command
+        (reusing the same select() loop, output truncation, artifact logging,
+        and error classification). The config tempfile is cleaned up in a
+        ``finally`` block.
+
+        Falls back to ``_run_shell_subprocess`` if the nsjail binary is not
+        found at runtime (e.g. binary removed after startup).
+        """
+        import shutil as _shutil
+
+        if _shutil.which("nsjail") is None:
+            logger.warning("nsjail binary not found at runtime — falling back to subprocess")
+            self._owner._shell_nsjail_active = False
+            return self._run_shell_subprocess(args, caller_tag=caller_tag)
+
+        builder = self._owner._nsjail_builder
+        if builder is None:
+            logger.warning("nsjail builder not initialised — falling back to subprocess")
+            return self._run_shell_subprocess(args, caller_tag=caller_tag)
+
+        command = str(args.get("command", "")).strip()
+        timeout = int(args.get("timeout", self._owner.default_timeout))
+        with self._owner._shell_env_lock:
+            env_snapshot = dict(self._owner._shell_env)
+        cfg_path, nsjail_cmd = builder.build(command, timeout, shell_env=env_snapshot)
+
+        try:
+            return self._run_shell_subprocess(args, caller_tag=caller_tag, nsjail_cmd=nsjail_cmd)
+        finally:
+            try:
+                os.unlink(cfg_path)
+            except OSError:
+                pass
+
+    def _run_shell_subprocess(self, args: dict, caller_tag: str = "",
+                              nsjail_cmd: Optional[list[str]] = None) -> dict:
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self._owner.default_timeout))
         logger.info("Built-in shell (subprocess) executing: %s", command[:120])
@@ -148,13 +215,22 @@ class ShellTools:
             _popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
         try:
-            proc = subprocess.Popen(
-                command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                **_popen_kwargs,
-            )
+            if nsjail_cmd is not None:
+                proc = subprocess.Popen(
+                    nsjail_cmd,
+                    shell=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **_popen_kwargs,
+                )
+            else:
+                proc = subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **_popen_kwargs,
+                )
         except OSError as exc:
             if _log_fh:
                 _log_fh.close()
@@ -360,6 +436,24 @@ class ShellTools:
                 "recoverable": True,
                 "suggestion": "Try the command again with a longer timeout.",
             }
+        # Detect nsjail-own failures before classifying user-command errors.
+        # nsjail prefixes its own error lines with [E][ in its log output.
+        if nsjail_cmd is not None and returncode != 0 and "[E][" in error:
+            return {
+                "success": False,
+                "output": output,
+                "error": error,
+                "exit_code": returncode,
+                "elapsed_ms": round(elapsed_ms),
+                "full_log_path": full_log_path,
+                "error_type": "nsjail_error",
+                "recoverable": False,
+                "suggestion": (
+                    "The nsjail sandbox failed to set up. "
+                    "Check kernel namespace permissions, cgroup availability, or nsjail binary."
+                ),
+            }
+
         # Classify non-zero exit codes from the shell.
         error_type = ""
         recoverable = False

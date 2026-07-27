@@ -425,6 +425,20 @@ class AgentConfig:
     # When enabled, each chunk of output is forwarded to the UI as it arrives;
     # the panel shows a rolling tail. Requires shell_backend = "pty".
     shell_streaming: bool = False
+    # nsjail shell backend — confirmation gate mode when nsjail sandboxing is active.
+    # "always" (default): confirm all dangerous patterns (backward-compatible).
+    # "adaptive": skip confirmation for "network" category patterns when nsjail
+    #   network isolation is active (shell_nsjail_network = "none"). All other
+    #   categories (including "resource") still require confirmation.
+    # "never": skip confirmation for all dangerous patterns when nsjail is active.
+    # Falls back to "always" when nsjail is not active (subprocess fallback).
+    shell_nsjail_confirm_mode: str = "always"
+    # nsjail resource limits — memory cap in MB, max PIDs, CPU percent (1-100)
+    shell_nsjail_memory_mb: int = 256
+    shell_nsjail_pids_max: int = 64
+    shell_nsjail_cpu_percent: int = 50
+    # nsjail network isolation — "none" (default, clone_newnet: true) or "host" (clone_newnet: false)
+    shell_nsjail_network: str = "none"
     # Creativity mode for prompt assembly — default/planner/explorer/resilient
     creativity_mode: str = "default"
     # Maximum iterations for plan execution (higher than normal max_iterations
@@ -597,6 +611,11 @@ def _parse_agent(raw: dict) -> AgentConfig:
         shell_pty_cols=_parse_int(section.get("shell_pty_cols"), 220, "agent.shell_pty_cols"),
         shell_pty_rows=_parse_int(section.get("shell_pty_rows"), 50, "agent.shell_pty_rows"),
         shell_streaming=_parse_bool(section.get("shell_streaming", False), "agent.shell_streaming"),
+        shell_nsjail_confirm_mode=str(section.get("shell_nsjail_confirm_mode", "always")),
+        shell_nsjail_memory_mb=_parse_int(section.get("shell_nsjail_memory_mb"), 256, "agent.shell_nsjail_memory_mb"),
+        shell_nsjail_pids_max=_parse_int(section.get("shell_nsjail_pids_max"), 64, "agent.shell_nsjail_pids_max"),
+        shell_nsjail_cpu_percent=_parse_int(section.get("shell_nsjail_cpu_percent"), 50, "agent.shell_nsjail_cpu_percent"),
+        shell_nsjail_network=str(section.get("shell_nsjail_network", "none")),
         creativity_mode=section.get("creativity_mode", "default"),
         plan_max_iterations=_parse_int(section.get("plan_max_iterations"), 50, "agent.plan_max_iterations"),
         inactivity_warn_minutes=_parse_int(section.get("inactivity_warn_minutes"), 15, "agent.inactivity_warn_minutes"),

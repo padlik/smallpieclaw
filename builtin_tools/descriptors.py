@@ -263,4 +263,25 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "{\"text\": \"GraphMemoryStore\", \"limit\": 10}"
         ),
     ),
+    "shell_env_set": BuiltinTool(
+        name="shell_env_set",
+        description="Set a session-scoped environment variable for shell commands. "
+        "The variable is injected via nsjail -E flags on subsequent shell calls. "
+        "Args: key (str, REQUIRED), value (str, REQUIRED).",
+    ),
+    "shell_env_unset": BuiltinTool(
+        name="shell_env_unset",
+        description="Remove a session-scoped environment variable. "
+        "Args: key (str, REQUIRED).",
+    ),
+    "shell_env_list": BuiltinTool(
+        name="shell_env_list",
+        description="List all session-scoped shell environment variables. "
+        "Returns a JSON object with an 'env' field containing the variable dict.",
+    ),
+    "shell_env_get": BuiltinTool(
+        name="shell_env_get",
+        description="Get the value of a session-scoped shell environment variable. "
+        "Args: key (str, REQUIRED). Returns empty string if not set.",
+    ),
 }

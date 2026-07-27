@@ -91,6 +91,7 @@ class TrustedZoneChecker:
         data_dir: str,
         agent_name: str,
         vault_path: str = "",
+        trusted_dirs_path: str = "",
     ) -> None:
         """Construct checker from resolved config paths.
 
@@ -100,10 +101,13 @@ class TrustedZoneChecker:
             agent_name: Agent name used to derive tmp dir fallback path.
             vault_path: Absolute path to the vault file; always UNRECOGNISED
                 to prevent silent reads bypassing secret_get confirmation.
+            trusted_dirs_path: Absolute path to trusted_dirs.json. If empty,
+                falls back to ``data_dir/trusted_dirs.json``.
         """
         self._data_dir = os.path.realpath(data_dir)
         self._trusted_dirs_path = os.path.normcase(
-            os.path.realpath(os.path.join(self._data_dir, "trusted_dirs.json"))
+            os.path.realpath(trusted_dirs_path) if trusted_dirs_path
+            else os.path.realpath(os.path.join(self._data_dir, "trusted_dirs.json"))
         )
         self._vault_path: str = (
             os.path.normcase(os.path.realpath(os.path.expanduser(vault_path)))

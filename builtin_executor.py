@@ -27,7 +27,9 @@ Result dicts produced by built-in tools include the following recovery fields:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
+import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -55,6 +57,8 @@ from builtin_tools.patterns import (
 from builtin_tools.schedule import exec_schedule
 from builtin_tools.secrets_log import LogQueryTools, SecretsTools
 from builtin_tools.shell import ShellTools
+from builtin_tools.shell_env import ShellEnvTools
+from nsjail_config import NsjailConfigBuilder
 from builtin_tools.text_utils import (
     _truncate_output,  # noqa: F401  re-exported for tests
     _truncate_tail,  # noqa: F401  re-exported for tests
@@ -110,7 +114,15 @@ class BuiltinExecutor:
                  notify_html_fn=None, shell_backend: str = "subprocess",
                  shell_pty_cols: int = 220, shell_pty_rows: int = 50,
                  shell_streaming: bool = False, working=None, results=None,
-                 vault_path: str = "", log_jsonl_path: str = ""):
+                 vault_path: str = "", log_jsonl_path: str = "",
+                 shell_nsjail_confirm_mode: str = "always",
+                 shell_nsjail_memory_mb: int = 256,
+                 shell_nsjail_pids_max: int = 64,
+                 shell_nsjail_cpu_percent: int = 50,
+                 shell_nsjail_network: str = "none",
+                 nsjail_session_tmpdir: str = "",
+                 nsjail_project_dir: str = "",
+                 nsjail_trusted_dirs_path: str = ""):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -130,6 +142,18 @@ class BuiltinExecutor:
         self._shell_pty_cols = shell_pty_cols
         self._shell_pty_rows = shell_pty_rows
         self._shell_streaming = shell_streaming  # forward chunks to on_chunk callback (PTY only)
+        # nsjail shell backend state
+        self._shell_nsjail_confirm_mode = shell_nsjail_confirm_mode
+        self._shell_nsjail_memory_mb = shell_nsjail_memory_mb
+        self._shell_nsjail_pids_max = shell_nsjail_pids_max
+        self._shell_nsjail_cpu_percent = shell_nsjail_cpu_percent
+        self._shell_nsjail_network = shell_nsjail_network
+        self._shell_nsjail_session_tmpdir = nsjail_session_tmpdir
+        # Session-scoped env dict for nsjail -E flag injection
+        self._shell_env: dict[str, str] = {}
+        self._shell_env_lock = threading.Lock()
+        # Whether nsjail backend is actually active (binary found + backend selected)
+        self._shell_nsjail_active = False
         # Background sub-agent lifecycle is owned by the supervisor, which also
         # owns the thread pool. The model-facing _exec_spawn_agent shim and the
         # scheduler both delegate accepted runs to it.
@@ -160,7 +184,26 @@ class BuiltinExecutor:
         self._secrets = SecretsTools(self)
         self._logquery = LogQueryTools(self)
         self._shell = ShellTools(self)
+        self._shell_env_tools = ShellEnvTools(self)
         self._agents = AgentTools(self)
+        # nsjail config builder — only instantiated when nsjail backend is selected
+        self._nsjail_builder: Optional[NsjailConfigBuilder] = None
+        if shell_backend == "nsjail" and nsjail_session_tmpdir:
+            nsjail_binary = shutil.which("nsjail")
+            if nsjail_binary is not None:
+                self._shell_nsjail_active = True
+                self._nsjail_builder = NsjailConfigBuilder(
+                    project_dir=os.path.abspath(nsjail_project_dir) if nsjail_project_dir else os.path.abspath("."),
+                    session_tmpdir=nsjail_session_tmpdir,
+                    trusted_dirs_path=nsjail_trusted_dirs_path,
+                    memory_mb=shell_nsjail_memory_mb,
+                    pids_max=shell_nsjail_pids_max,
+                    cpu_percent=shell_nsjail_cpu_percent,
+                    network=shell_nsjail_network,
+                )
+                logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
+            else:
+                logger.warning("shell_backend='nsjail' but nsjail binary not found — falling back to subprocess")
         # Zone-based access control — set by main.py after construction
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
         # Per-executor ephemeral request grant tracker (isolated per agent/sub-agent)
@@ -206,6 +249,10 @@ class BuiltinExecutor:
             "log_query": lambda a, ctx: self._logquery._exec_log_query(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
             ),
+            "shell_env_set": lambda a, ctx: self._shell_env_tools.shell_env_set(a),
+            "shell_env_unset": lambda a, ctx: self._shell_env_tools.shell_env_unset(a),
+            "shell_env_list": lambda a, ctx: self._shell_env_tools.shell_env_list(a),
+            "shell_env_get": lambda a, ctx: self._shell_env_tools.shell_env_get(a),
         }
         # Confirmation-capable execution table: tools whose execute() path may
         # return ``requires_confirmation`` and therefore need a post-approval
