@@ -142,15 +142,15 @@ At agent startup, the system MUST detect the host filesystem layout and generate
 
 ### Requirement: Network is isolated by default
 
-The nsjail config MUST set `clone_newnet: true` by default, giving the jail an empty network namespace with no network access. The `shell_nsjail_network` config field controls whether the network namespace is created: when set to `"none"` (default), `clone_newnet` is `true` (network isolated, no access); when set to `"host"`, `clone_newnet` is `false` (jail shares the host network namespace, no network isolation). Future connectivity options (pasta userland NAT, loopback-only) are out of scope.
+The nsjail config MUST set `clone_newnet: true` by default, giving the jail an empty network namespace with no network access. The `allow_net` config field controls whether the network namespace is created: when set to `false` (default), `clone_newnet` is `true` (network isolated, no access); when set to `true`, `clone_newnet` is `false` (jail shares the host network namespace, no network isolation). Future connectivity options (pasta userland NAT, loopback-only) are out of scope.
 
 #### Scenario: Default config has no network
-- **GIVEN** `shell_nsjail_network` is not set (defaults to `"none"`)
+- **GIVEN** `allow_net` is not set (defaults to `false`)
 - **WHEN** the agent runs `shell("curl https://example.com")` inside the jail
 - **THEN** the command fails with a network error (empty network namespace, no interfaces)
 
 #### Scenario: Network isolation can be disabled via config
-- **GIVEN** `shell_nsjail_network` is set to `"host"`
+- **GIVEN** `allow_net` is set to `true`
 - **WHEN** the nsjail config is generated
 - **THEN** `clone_newnet` is set to `false`
 - **AND** the jail shares the host network namespace (network access is available, subject to host networking)
