@@ -170,6 +170,7 @@ def main():
     results_path  = paths.get("results_memory_file", "data/results_memory.json")
     scheduler_config_path = paths.get("scheduler_config", "scheduler.toml")
     skills_dir    = paths.get("skills_dir", "skills")
+    skills_dir_abs = os.path.join(_AGENT_DIR, skills_dir) if not os.path.isabs(skills_dir) else skills_dir
     downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
     _agent_name   = os.path.basename(os.path.abspath("."))
     tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
@@ -191,6 +192,7 @@ def main():
             index_path=index_path, memory_path=memory_path,
             results_path=results_path,
             scheduler_config_path=scheduler_config_path, skills_dir=skills_dir,
+            skills_dir_abs=skills_dir_abs,
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,
             workspace_dir=workspace_dir,
             log_file=log_file, log_backup_count=log_backup_count,
@@ -202,7 +204,7 @@ def _run(
     cfg, app_cfg, paths,
     data_dir,
     index_path, memory_path, results_path,
-    scheduler_config_path, skills_dir,
+    scheduler_config_path, skills_dir, skills_dir_abs,
     downloads_dir, tmp_dir, workspace_dir,
     log_file, log_backup_count,
     agent_name,
@@ -254,7 +256,7 @@ def _run(
     shell_nsjail_memory_mb = int(agent_cfg.get("shell_nsjail_memory_mb", 256))
     shell_nsjail_pids_max = int(agent_cfg.get("shell_nsjail_pids_max", 64))
     shell_nsjail_cpu_percent = int(agent_cfg.get("shell_nsjail_cpu_percent", 50))
-    shell_nsjail_network = agent_cfg.get("shell_nsjail_network", "none")
+    allow_net = app_cfg.agent.allow_net
     creativity_mode = agent_cfg.get("creativity_mode", "default")
     plan_max_iterations = int(agent_cfg.get("plan_max_iterations", 50))
     inactivity_warn_minutes = int(agent_cfg.get("inactivity_warn_minutes", 15))
@@ -289,8 +291,9 @@ def _run(
         shell_nsjail_memory_mb=shell_nsjail_memory_mb,
         shell_nsjail_pids_max=shell_nsjail_pids_max,
         shell_nsjail_cpu_percent=shell_nsjail_cpu_percent,
-        shell_nsjail_network=shell_nsjail_network,
+        allow_net=allow_net,
         nsjail_session_tmpdir=nsjail_session_tmpdir,
+        skills_dir=skills_dir_abs,
         nsjail_project_dir=_AGENT_DIR,
         nsjail_trusted_dirs_path=trusted_dirs_path,
     )

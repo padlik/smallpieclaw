@@ -146,6 +146,7 @@ class TestShouldConfirm:
         owner = MagicMock()
         owner._shell_nsjail_active = active
         owner._shell_nsjail_confirm_mode = mode
+        owner._allow_net = True
         return ShellTools(owner)
 
     def test_always_active_confirms_all(self):
@@ -165,7 +166,7 @@ class TestShouldConfirm:
         for cat in ("host_escape", "project", "policy"):
             assert shell._should_confirm(cat) is True
         # network skipped only when sandbox has network isolation
-        shell._owner._shell_nsjail_network = "none"
+        shell._owner._allow_net = False
         assert shell._should_confirm("network") is False
 
     def test_adaptive_inactive_confirms_all(self):

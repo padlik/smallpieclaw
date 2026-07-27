@@ -151,3 +151,83 @@ def test_session_tmp_persistence(nsjail_vm: NsjailVM) -> None:
     second = nsjail_vm.run_nsjail(cfg_path_second, timeout=15)
     assert second.returncode == 0, second.stderr
     assert second.stdout.strip() == "persisted"
+
+
+def test_skills_dir_mounted_read_only(nsjail_vm: NsjailVM) -> None:
+    """skills_dir is mounted read-only and writes inside the jail are blocked."""
+    host_dir = "/tmp/nsjail_skills_test"
+    nsjail_vm.run(f"rm -rf {host_dir} && mkdir -p {host_dir}")
+    nsjail_vm.run(
+        f"printf '%s\\n' '#!/bin/sh' 'echo skill-works' > {host_dir}/run.sh && "
+        f"chmod +x {host_dir}/run.sh"
+    )
+    config = _base_config(
+        "test-skills-ro",
+        f"echo hacked > {host_dir}/run.sh 2>&1 || echo WRITE_BLOCKED",
+        f'mount: {{ src: "{host_dir}" dst: "{host_dir}" '
+        'is_bind: true rw: false mandatory: true }',
+    )
+    cfg_path = "/tmp/test_skills_ro.cfg"
+    _write_config(nsjail_vm, cfg_path, config)
+    result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
+    assert "WRITE_BLOCKED" in result.stdout
+    host_check = nsjail_vm.run(f"cat {host_dir}/run.sh")
+    assert "skill-works" in host_check.stdout
+
+
+def test_skill_script_executable_inside_jail(nsjail_vm: NsjailVM) -> None:
+    """Executable scripts inside skills_dir can be run inside the jail."""
+    host_dir = "/tmp/nsjail_skills_exec_test"
+    nsjail_vm.run(f"rm -rf {host_dir} && mkdir -p {host_dir}")
+    nsjail_vm.run(
+        f"printf '%s\\n' '#!/bin/sh' 'echo skill-works' > {host_dir}/run.sh && "
+        f"chmod +x {host_dir}/run.sh"
+    )
+    config = _base_config(
+        "test-skills-exec",
+        f"{host_dir}/run.sh",
+        f'mount: {{ src: "{host_dir}" dst: "{host_dir}" '
+        'is_bind: true rw: false mandatory: true }',
+    )
+    cfg_path = "/tmp/test_skills_exec.cfg"
+    _write_config(nsjail_vm, cfg_path, config)
+    result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "skill-works" in result.stdout
+
+
+def test_skills_dir_write_fails(nsjail_vm: NsjailVM) -> None:
+    """Writing to a read-only skills_dir fails and host data remains unchanged."""
+    host_dir = "/tmp/nsjail_skills_write_test"
+    nsjail_vm.run(
+        f"rm -rf {host_dir} && mkdir -p {host_dir} && echo original > {host_dir}/data.txt"
+    )
+    config = _base_config(
+        "test-skills-write-fails",
+        f"echo overwritten > {host_dir}/data.txt 2>&1; test $? -ne 0 && echo WRITE_FAILED",
+        f'mount: {{ src: "{host_dir}" dst: "{host_dir}" '
+        'is_bind: true rw: false mandatory: true }',
+    )
+    cfg_path = "/tmp/test_skills_write_fails.cfg"
+    _write_config(nsjail_vm, cfg_path, config)
+    result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
+    assert "WRITE_FAILED" in result.stdout
+    host_check = nsjail_vm.run(f"cat {host_dir}/data.txt")
+    assert host_check.stdout.strip() == "original"
+
+
+def test_shell_logs_not_mounted(nsjail_vm: NsjailVM) -> None:
+    """shell_logs directory is not mounted inside the jail and is invisible."""
+    host_dir = "/tmp/nsjail_shell_logs_test"
+    nsjail_vm.run(
+        f"rm -rf {host_dir} && mkdir -p {host_dir} && echo secret-log-data > {host_dir}/artifact.log"
+    )
+    config = _base_config(
+        "test-shell-logs-not-mounted",
+        f"test -e {host_dir}/artifact.log && echo FOUND || echo MISSING",
+    )
+    cfg_path = "/tmp/test_shell_logs_not_mounted.cfg"
+    _write_config(nsjail_vm, cfg_path, config)
+    result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "MISSING" in result.stdout

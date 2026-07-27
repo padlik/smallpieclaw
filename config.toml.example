@@ -224,7 +224,7 @@ long_run_warn_minutes = 30
 #                          with the subprocess backend.
 #   "adaptive"           — skip confirmation for "network"-category patterns
 #                          (curl|sh, wget|sh, /dev/tcp, nc -e) when network
-#                          isolation is active (shell_nsjail_network = "none").
+#                          isolation is active (allow_net = false).
 #                          All other categories (host_escape, project, resource,
 #                          policy) still require confirmation.
 #   "never"              — skip confirmation for all dangerous patterns while
@@ -236,7 +236,7 @@ long_run_warn_minutes = 30
 # shell_nsjail_memory_mb    = 256   # memory cap in MB (cgroup, or RLIMIT_AS fallback)
 # shell_nsjail_pids_max     = 64    # max PIDs inside the jail (cgroup only)
 # shell_nsjail_cpu_percent  = 50    # CPU quota as % of one core (cgroup only)
-# shell_nsjail_network      = "none"  # "none" = isolated (no net), "host" = share host net
+# allow_net                 = false  # false = isolated (no network), true = share host network
 
 [scheduler]
 enabled = true

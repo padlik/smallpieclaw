@@ -119,10 +119,11 @@ class BuiltinExecutor:
                  shell_nsjail_memory_mb: int = 256,
                  shell_nsjail_pids_max: int = 64,
                  shell_nsjail_cpu_percent: int = 50,
-                 shell_nsjail_network: str = "none",
+                 allow_net: bool = False,
                  nsjail_session_tmpdir: str = "",
                  nsjail_project_dir: str = "",
-                 nsjail_trusted_dirs_path: str = ""):
+                 nsjail_trusted_dirs_path: str = "",
+                 skills_dir: str = ""):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -147,7 +148,7 @@ class BuiltinExecutor:
         self._shell_nsjail_memory_mb = shell_nsjail_memory_mb
         self._shell_nsjail_pids_max = shell_nsjail_pids_max
         self._shell_nsjail_cpu_percent = shell_nsjail_cpu_percent
-        self._shell_nsjail_network = shell_nsjail_network
+        self._allow_net = allow_net
         self._shell_nsjail_session_tmpdir = nsjail_session_tmpdir
         # Session-scoped env dict for nsjail -E flag injection
         self._shell_env: dict[str, str] = {}
@@ -199,7 +200,8 @@ class BuiltinExecutor:
                     memory_mb=shell_nsjail_memory_mb,
                     pids_max=shell_nsjail_pids_max,
                     cpu_percent=shell_nsjail_cpu_percent,
-                    network=shell_nsjail_network,
+                    allow_net=self._allow_net,
+                    skills_dir=skills_dir,
                 )
                 logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
             else:

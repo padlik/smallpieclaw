@@ -37,7 +37,8 @@ class NsjailConfigBuilder:
         memory_mb: int = 256,
         pids_max: int = 64,
         cpu_percent: int = 50,
-        network: str = "none",
+        allow_net: bool = False,
+        skills_dir: str = "",
     ) -> None:
         """Initialize the builder.
 
@@ -50,11 +51,13 @@ class NsjailConfigBuilder:
             memory_mb: Memory limit in megabytes.
             pids_max: Maximum number of PIDs allowed inside the sandbox.
             cpu_percent: Cgroup CPU limit as a percentage of one CPU.
-            network: Network mode; ``"none"`` isolates networking, ``"host"``
-                shares the host network namespace.
+            allow_net: When False (default) networking is isolated inside the
+                sandbox; when True the host network namespace is shared.
+            skills_dir: Absolute path to the skills directory; mounted read-only
+                when it exists and is not already reachable via the project dir.
         """
-        self.project_dir = os.path.abspath(project_dir)
-        self.session_tmpdir = os.path.abspath(session_tmpdir)
+        self.project_dir = os.path.realpath(os.path.abspath(project_dir))
+        self.session_tmpdir = os.path.realpath(os.path.abspath(session_tmpdir))
         self.trusted_dirs_path = os.path.abspath(trusted_dirs_path) if trusted_dirs_path else ""
         # Dynamic blocked prefixes: user-home paths that must never be trusted mounts.
         home = os.path.expanduser("~")
@@ -66,7 +69,8 @@ class NsjailConfigBuilder:
         self.memory_mb = memory_mb
         self.pids_max = pids_max
         self.cpu_percent = cpu_percent
-        self.network = network
+        self.allow_net = allow_net
+        self.skills_dir = os.path.realpath(os.path.abspath(skills_dir)) if skills_dir else ""
         self._cgroup_info = self._detect_cgroup_capability()
 
     def _detect_system_mounts(self) -> list[str]:
@@ -221,7 +225,7 @@ class NsjailConfigBuilder:
                 )
                 cgroup = {"available": False, "cgroupv2_mount": None}
 
-        clone_newnet = "true" if self.network == "none" else "false"
+        clone_newnet = "true" if not self.allow_net else "false"
         memory_bytes = self.memory_mb * 1024 * 1024
         cpu_ms_per_sec = self.cpu_percent * 10
 
@@ -266,6 +270,52 @@ class NsjailConfigBuilder:
             f'is_bind: true rw: true mandatory: true }}',
             "",
         ])
+
+        skills_mounts: list[str] = []
+        if self.skills_dir:
+            if not os.path.isdir(self.skills_dir):
+                logger.debug("nsjail: skills_dir does not exist, skipping mount: %s", self.skills_dir)
+            else:
+                # Containment checks first — these are the common cases and must
+                # run before the blocklist so that a skills_dir nested under
+                # project_dir (e.g. /home/user/agent/skills) is not spuriously
+                # rejected by the /home prefix in _BLOCKED_SYSTEM_PREFIXES.
+                try:
+                    common = os.path.commonpath([self.skills_dir, self.project_dir])
+                except ValueError:
+                    common = ""
+                if common == self.project_dir:
+                    logger.warning(
+                        "nsjail: skills_dir nested under project_dir, skipping mount "
+                        "(already accessible via project mount): %s",
+                        self.skills_dir,
+                    )
+                elif common == self.skills_dir:
+                    logger.warning(
+                        "nsjail: skills_dir is a parent of project_dir, skipping mount "
+                        "(would expose sibling directories read-only): %s",
+                        self.skills_dir,
+                    )
+                elif self.skills_dir == "/" or any(
+                    self.skills_dir == p or self.skills_dir.startswith(p + "/")
+                    for p in (_BLOCKED_SYSTEM_PREFIXES + self._blocked_user_prefixes)
+                ):
+                    # Defense-in-depth: reject blocked system paths (same check
+                    # as trusted_dirs). Only reached for paths that would actually
+                    # get mounted (not nested under or parent of project_dir).
+                    logger.warning(
+                        "nsjail: skills_dir rejected (restricted system path), skipping mount: %s",
+                        self.skills_dir,
+                    )
+                else:
+                    lines.append("# Skills directory mount (read-only)")
+                    skills_mounts.append(
+                        f'mount: {{ src: {json.dumps(self.skills_dir)} dst: {json.dumps(self.skills_dir)} '
+                        f'is_bind: true rw: false mandatory: true }}'
+                    )
+        if skills_mounts:
+            lines.extend(skills_mounts)
+            lines.append("")
 
         if cgroup["available"] and cgroup["cgroupv2_mount"]:
             lines.extend([
