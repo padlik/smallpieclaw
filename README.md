@@ -212,6 +212,12 @@ Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google G
 | Tool | Description | Confirmation required? |
 |------|-------------|----------------------|
 | `shell` | Execute shell commands | Yes — if destructive pattern |
+
+The `shell` tool has three backends, selected by `shell_backend` in `[agent]`:
+
+- **`subprocess`** (default) — cross-platform, fully buffered. Every dangerous pattern requires confirmation.
+- **`pty`** — POSIX only; gives commands a real TTY for line buffering, colour, and progress bars. Same confirmation rules as `subprocess`.
+- **`nsjail`** — Linux only; runs commands inside a kernel-level sandbox (mount/PID/net/user/IPC/UTS/cgroup namespaces + cgroup v2 limits). Confines blast radius to the project dir and explicitly trusted RW dirs. The confirmation gate becomes configurable via `shell_nsjail_confirm_mode` (`always` | `adaptive` | `never`); when nsjail is inactive (binary missing or non-Linux host) all modes fall back to `always`. See [`docs/nsjail-setup.md`](docs/nsjail-setup.md) for installation and prerequisites.
 | `file_read` | Read a file; `offset: -5000` reads last 5 KB | Yes — if outside trusted zones |
 | `file_write` | Write content to a file | Yes — if outside trusted zones |
 | `file_send` | Send a file or photo to Telegram chat | No |
@@ -229,7 +235,7 @@ Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google G
 - **Request-granted** — a directory the user approved for the current request via the `[Allow this request]` button. Allowed for the rest of the current request.
 - **Unrecognised** — anything else, including agent-internal directories (`data/`, `skills/`, log dir, vault dir). Prompts the user.
 
-Out-of-zone prompts offer four options: **Approve** (once), **Deny**, **Allow this request** (grants the parent directory for the current request), and **Add to trusted** (persists to `data/trusted_dirs.json`).
+Out-of-zone prompts offer four options: **Approve** (once), **Deny**, **Allow this request** (grants the parent directory for the current request), and **Add to trusted** (persists to `~/.local/state/<agent_name>/trusted_dirs.json` under `XDG_STATE_HOME`).
 
 Trusted directory entries support an optional `mode` field — `"r"` (read-only) auto-allows reads but still prompts for writes; `"rw"` (default) auto-allows both.
 

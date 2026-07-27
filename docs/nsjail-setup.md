@@ -136,10 +136,28 @@ The VM uses the VZ backend (Apple Virtualization.framework), Ubuntu 26.04 ARM64,
 ## Confirmation modes
 
 - `"always"` (default): Confirm all dangerous shell patterns. Backward-compatible with the subprocess backend.
-- `"adaptive"`: Skip confirmation for `resource`-category patterns (fork bombs are kernel-bounded by cgroup `pids_max`). All other categories still require confirmation.
+- `"adaptive"`: Skip confirmation for `network`-category patterns (`curl|sh`, `wget|sh`, `/dev/tcp`, `nc -e`) when network isolation is active (`shell_nsjail_network = "none"`). All other categories (`host_escape`, `project`, `resource`, `policy`) still require confirmation.
 - `"never"`: Skip all confirmation while nsjail is active. **Warning:** RW-mounted host directories such as the project directory and RW trusted dirs are **not** protected by the jail. A command like `rm -rf` on a project path will delete real host files. Use with caution.
 
 When nsjail is inactive (binary missing, non-Linux host), all modes fall back to `"always"`.
+
+## Trusted directories and XDG state location
+
+The trusted-directory store (`trusted_dirs.json`) doubles as the nsjail mount list: every user-added trusted directory is bind-mounted at its original host path inside the jail (RW entries read-write, `r` entries read-only). Because this file influences sandbox configuration, it **must reside outside the sandbox's write scope** — otherwise a jailed command could overwrite it and inject arbitrary host paths as trusted mounts on the next `build()` call (see ADR-0015).
+
+The store is kept under the XDG state directory, never inside the project dir:
+
+```
+~/.local/state/<agent_name>/trusted_dirs.json
+```
+
+Resolved at startup in `main.py` from `XDG_STATE_HOME` (defaulting to `~/.local/state`) joined with `agent_name`. The path is passed to both `TrustedZoneChecker` (file-access-zone enforcement) and `NsjailConfigBuilder` (mount generation); neither reads the environment directly.
+
+- A one-time migration copies `data/trusted_dirs.json` → the XDG location on first start if the new path does not yet exist.
+- The agent installation directory (`_AGENT_DIR`) and XDG state/data dirs are on the trusted-mount blocklist, so no `trusted_dirs.json` entry can re-expose them.
+- Managed at runtime via the `/dir` command: `/dir list`, `/dir del <n>`, `/dir reload`.
+
+Operators who override `XDG_STATE_HOME` (e.g. container deployments) get the new location automatically; there is no separate `nsjail_state_dir` config key.
 
 ## Troubleshooting
 
