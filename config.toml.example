@@ -198,6 +198,13 @@ long_run_warn_minutes = 30
 #                            live progress, git colours, npm spinners). Recommended
 #                            for sophisticated multi-step scripts.
 #                            Requires: ptyprocess>=0.7.0 (usually already installed).
+#   "nsjail"               — Linux only. Runs shell commands inside a kernel-level
+#                            sandbox (mount/PID/net/user/IPC/UTS/cgroup namespaces +
+#                            cgroup v2 resource limits). Confines blast radius to the
+#                            project directory and explicitly trusted RW directories.
+#                            See docs/nsjail-setup.md for installation and prerequisites.
+#                            Falls back to "subprocess" on macOS or if the nsjail
+#                            binary is missing.
 # shell_backend = "subprocess"
 # Terminal dimensions reported to child processes in PTY mode.
 # Wider columns prevent spurious line-wrapping in captured text.
@@ -207,6 +214,29 @@ long_run_warn_minutes = 30
 # Requires shell_backend = "pty".  Updates are debounced at the panel's
 # 1.5 s edit interval so Telegram rate limits are not hit.
 # shell_streaming = false
+#
+# nsjail shell backend — confirmation gate and resource limits.
+# Only take effect when shell_backend = "nsjail". When nsjail is inactive
+# (binary missing or non-Linux host), all modes fall back to "always".
+#
+# shell_nsjail_confirm_mode — confirmation gate for dangerous shell patterns:
+#   "always"   (default) — confirm all dangerous patterns. Backward-compatible
+#                          with the subprocess backend.
+#   "adaptive"           — skip confirmation for "network"-category patterns
+#                          (curl|sh, wget|sh, /dev/tcp, nc -e) when network
+#                          isolation is active (shell_nsjail_network = "none").
+#                          All other categories (host_escape, project, resource,
+#                          policy) still require confirmation.
+#   "never"              — skip confirmation for all dangerous patterns while
+#                          nsjail is active. WARNING: RW-mounted host dirs
+#                          (project dir, RW trusted dirs) are NOT protected by
+#                          the jail — `rm -rf` on a project path deletes real
+#                          host files. Use with caution.
+# shell_nsjail_confirm_mode = "always"
+# shell_nsjail_memory_mb    = 256   # memory cap in MB (cgroup, or RLIMIT_AS fallback)
+# shell_nsjail_pids_max     = 64    # max PIDs inside the jail (cgroup only)
+# shell_nsjail_cpu_percent  = 50    # CPU quota as % of one core (cgroup only)
+# shell_nsjail_network      = "none"  # "none" = isolated (no net), "host" = share host net
 
 [scheduler]
 enabled = true
@@ -253,6 +283,14 @@ log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups t
 pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate instances
 # tmp_dir defaults to /tmp/<working_dir_name> if not set
 # tmp_dir = "/tmp/agent"
+#
+# Trusted directories store (user-added file-access zones + nsjail mount list):
+#   ~/.local/state/<agent_name>/trusted_dirs.json
+# Resolved from XDG_STATE_HOME (or ~/.local/state) + agent_name. This path is
+# deliberately kept OUTSIDE the project dir so a sandboxed shell cannot rewrite
+# its own mount list. Managed at runtime via the /dir command (list/del/reload).
+# A one-time migration copies data/trusted_dirs.json to the XDG location on
+# first start; new installs start empty.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MCP Servers (Model Context Protocol)
