@@ -235,6 +235,19 @@ def _run(
     if os.path.exists(old_trusted) and not os.path.exists(trusted_dirs_path):
         shutil.copy2(old_trusted, trusted_dirs_path)
         logger.info("Migrated trusted_dirs.json to XDG state: %s", trusted_dirs_path)
+    # Vault migration: XDG_DATA_HOME → XDG_STATE_HOME consolidation
+    old_vault = os.path.join(os.path.expanduser("~"), ".local", "share", agent_name, "secrets.toml")
+    new_vault = os.path.join(xdg_state_home, agent_name, "secrets.toml")
+    if os.path.exists(old_vault) and not os.path.exists(new_vault):
+        os.makedirs(os.path.dirname(new_vault), exist_ok=True)
+        # Atomic copy: write to temp file, then rename so a crash mid-copy
+        # cannot leave a partial vault at the final path.
+        tmp_vault = new_vault + ".tmp"
+        shutil.copy2(old_vault, tmp_vault)
+        os.rename(tmp_vault, new_vault)
+        logger.info("Migrated vault to XDG state: %s", new_vault)
+    elif os.path.exists(old_vault) and os.path.exists(new_vault):
+        logger.warning("Vault exists at both old (%s) and new (%s) paths — using new path, old can be removed manually", old_vault, new_vault)
     os.environ["TMPDIR"] = tmp_dir
     os.environ["TMP"] = tmp_dir
     os.environ["TEMP"] = tmp_dir
@@ -294,8 +307,8 @@ def _run(
         allow_net=allow_net,
         nsjail_session_tmpdir=nsjail_session_tmpdir,
         skills_dir=skills_dir_abs,
-        nsjail_project_dir=_AGENT_DIR,
         nsjail_trusted_dirs_path=trusted_dirs_path,
+        nsjail_agent_dir=_AGENT_DIR,
     )
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
 

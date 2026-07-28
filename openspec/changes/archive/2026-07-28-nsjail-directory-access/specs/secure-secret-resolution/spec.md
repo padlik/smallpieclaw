@@ -1,10 +1,5 @@
-# Vault Secret Manager Specification
+## MODIFIED Requirements
 
-## Purpose
-
-Define a centralized, agent-scoped vault for storing arbitrary string values (API keys, tokens, URLs, bearer headers) in a single TOML file.
-
-## Requirements
 ### Requirement: File-backed vault storage
 
 The application MUST support a `[vault]` config section with a `type` field, and SHALL load key-value pairs from a TOML file at startup when `type = "file"`. The default vault path is `~/.local/state/<agent_name>/secrets.toml` (XDG_STATE_HOME), consolidated alongside other agent state files.
@@ -36,21 +31,3 @@ Rule: Agent-scoped secrets live in a single TOML file under XDG_STATE_HOME, refe
 - **WHEN** the application starts
 - **THEN** the vault is loaded from the path in `SPC_VAULT_FILE`
 - **AND** the default `~/.local/state/<agent_name>/secrets.toml` is ignored
-
-### Requirement: Vault supports arbitrary string values
-
-The vault SHALL store any string value, not just secrets. Values are opaque strings — the application does not inspect or validate them.
-
-Feature: Vault secret manager
-Rule: Vault values are plain strings; any key can hold a key, token, URL, or header.
-
-#### Scenario: Vault contains a base URL
-- **GIVEN** the vault contains `OLLAMA_HOST = "http://localhost:11434"`
-- **WHEN** a config field uses `sec:OLLAMA_HOST`
-- **THEN** the resolved value is `"http://localhost:11434"`
-
-#### Scenario: Vault contains a bearer header
-- **GIVEN** the vault contains `AUTH_HEADER = "Bearer sk-xyz"`
-- **WHEN** a config field uses `sec:AUTH_HEADER`
-- **THEN** the resolved value is `"Bearer sk-xyz"`
-

@@ -1,3 +1,5 @@
+## MODIFIED Requirements
+
 ### Requirement: skills_dir is mounted read-only inside the nsjail sandbox
 
 When the `skills_dir` directory exists on the host filesystem and is not a blocked sensitive path, the nsjail config builder MUST emit a read-only bind-mount entry for it inside the sandbox. This makes skill scripts and binaries referenced in the system prompt's AVAILABLE SKILLS section accessible to shell commands running inside the jail. The mount MUST be skipped silently (with a debug log) if the directory does not exist. The mount MUST be skipped with a warning log if the path is a blocked sensitive user path (`~/.ssh`, `~/.local`, `~/.config`, `~/.gnupg`).

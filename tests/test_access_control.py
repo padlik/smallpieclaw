@@ -122,6 +122,19 @@ class TestClassify:
             trusted_dirs_json = os.path.join(paths.data_dir, "trusted_dirs.json")
             assert checker.classify(trusted_dirs_json) == ZoneClassification.UNRECOGNISED
 
+    def test_vault_file_at_xdg_state_path_is_unrecognised(self):
+        """Vault under ~/.local/state/<agent>/secrets.toml must not be auto-allowed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = os.path.join(tmp, ".local", "state", "test-agent")
+            os.makedirs(state_dir, exist_ok=True)
+            vault_file = os.path.join(state_dir, "secrets.toml")
+            with open(vault_file, "w") as f:
+                f.write("secret")
+            checker = _make_checker(tmp)
+            # Even if state dir happens to be reachable, the specific vault file
+            # must be UNRECOGNISED to force confirmation on reads.
+            assert checker.classify(vault_file) == ZoneClassification.UNRECOGNISED
+
     def test_rw_trusted_dir_allows_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             with tempfile.TemporaryDirectory() as some_dir:

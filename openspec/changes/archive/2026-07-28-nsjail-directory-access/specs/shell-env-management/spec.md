@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: shell_env_set persists a session-scoped environment variable
 
@@ -34,6 +34,8 @@ Rule: Session env vars replace the non-persistent `export` pattern. Each nsjail 
 
 The `shell_env_unset` built-in tool MUST remove a key from the session-scoped `_shell_env` dict. Subsequent shell calls MUST NOT inject the variable via `-E` flags. If the variable exists in the base config `envar`, the config value becomes visible again as the fallback. The result dict MUST include `success` (bool), `output` (str), and `error` (str) keys.
 
+Feature: shell-env-management
+
 #### Scenario: shell_env_unset removes variable from subsequent calls
 - **GIVEN** the agent has called `shell_env_set(key="FOO", value="bar")`
 - **WHEN** the agent calls `shell_env_unset(key="FOO")`
@@ -52,6 +54,8 @@ The `shell_env_unset` built-in tool MUST remove a key from the session-scoped `_
 
 The `shell_env_list` built-in tool MUST return the complete `_shell_env` dict as a JSON object in the `output` field and as a dict in the `env` field. This includes only variables set via `shell_env_set`, not the base config `envar` entries or the agent process's `os.environ`. The result dict MUST include `success` (bool), `output` (str, JSON-encoded), `env` (dict), and `error` (str) keys.
 
+Feature: shell-env-management
+
 #### Scenario: shell_env_list shows session variables
 - **GIVEN** the agent has called `shell_env_set(key="PYTHONPATH", value="/lib")` and `shell_env_set(key="FOO", value="bar")`
 - **WHEN** the agent calls `shell_env_list()`
@@ -62,6 +66,8 @@ The `shell_env_list` built-in tool MUST return the complete `_shell_env` dict as
 ### Requirement: shell_env_get returns a single session-scoped environment variable
 
 The `shell_env_get` built-in tool MUST return the value of a single key from the `_shell_env` dict. If the key is not in the dict, it MUST return an empty string. The result dict MUST include `success` (bool), `output` (str, the value), `value` (str, the value), and `error` (str) keys.
+
+Feature: shell-env-management
 
 #### Scenario: shell_env_get returns value for existing key
 - **GIVEN** the agent has called `shell_env_set(key="FOO", value="bar")`
@@ -76,6 +82,8 @@ The `shell_env_get` built-in tool MUST return the value of a single key from the
 ### Requirement: shell_env tools are not confirmation-capable
 
 The `shell_env_set`, `shell_env_unset`, `shell_env_list`, and `shell_env_get` built-in tools MUST NOT gate through the confirmation flow. They modify an in-memory dict on the `BuiltinExecutor` — no filesystem, network, or subprocess operations are involved.
+
+Feature: shell-env-management
 
 #### Scenario: shell_env tools execute without confirmation
 - **GIVEN** the built-in executor with any `shell_nsjail_confirm_mode` setting

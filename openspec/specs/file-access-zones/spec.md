@@ -42,13 +42,13 @@ The system MUST resolve every path via `os.path.realpath()` and classify it into
 - **AND** a symlink inside a trusted dir that resolves to a path outside all trusted zones is treated as unrecognised
 
 #### Scenario: Vault file path is UNRECOGNISED and confirmation-gated
-- **GIVEN** the vault file (`~/.local/share/<agent>/secrets.toml`) is an agent-internal path
+- **GIVEN** the vault file (`~/.local/state/<agent>/secrets.toml`) is an agent-internal path
 - **WHEN** `file_read` is invoked with the vault file path
 - **THEN** the path classifies as UNRECOGNISED and a confirmation prompt is sent
 - **AND** the `secret_get` built-in tool remains the intended interface for reading secrets
 
 #### Scenario: Trust-store and vault remain UNRECOGNISED even when parent dir is trusted
-- **GIVEN** a user has added `data/` or `~/.local/share/<agent>/` to their trusted directories
+- **GIVEN** a user has added `data/` or `~/.local/state/<agent>/` to their trusted directories
 - **WHEN** `file_read` or `file_write` is invoked with the path of `data/trusted_dirs.json` or the vault file
 - **THEN** the path classifies as UNRECOGNISED and a confirmation prompt is sent
 - **AND** the parent-dir trust entry does not grant access to the trust store or the vault

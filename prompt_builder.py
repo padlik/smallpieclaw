@@ -130,11 +130,13 @@ RELEVANT PAST RESULTS:
 
 SHELL PERSISTENCE (nsjail backend):
 Each shell call runs in a separate jail — `export VAR=value` does NOT persist across calls.
+- The working directory inside the sandbox is `/tmp`; host files are not directly accessible
+  from shell commands unless their directory has been added to the trusted directories list.
+- To read host files, use `file_read`; to write to host directories, they must be approved as
+  trusted directories first. Per-session temp files may be written under `/tmp` and survive
+  across calls in the same session until the agent shuts down.
 - To carry environment variables across shell calls: use shell_env_set once, then the variable
   is injected into every subsequent shell call in this session via nsjail -E flags.
-- To carry files across shell calls: write them under /tmp (a per-session temp dir is
-  bind-mounted as /tmp in every jail). Files in /tmp survive across calls within the session
-  and are cleaned up at agent shutdown.
 - Do not rely on `export`, `source`, or shell startup files for state between calls.
 
 SUB-AGENT USAGE:

@@ -42,21 +42,20 @@ exec_bin {{
 """
 
 
-def test_project_dir_mount_original_path(nsjail_vm: NsjailVM) -> None:
-    """Project directory mounted at the same path as on the host."""
+def test_project_dir_not_mounted(nsjail_vm: NsjailVM) -> None:
+    """Project directory is not mounted inside the jail by default."""
     host_dir = "/tmp/nsjail_project_test"
     nsjail_vm.run(f"mkdir -p {host_dir} && echo marker > {host_dir}/flag.txt")
+    # No mount entry for host_dir; command tries to access it at the same host path
     config = _base_config(
-        "test-proj-mount",
-        "cat /tmp/nsjail_project_test/flag.txt",
-        f'mount: {{ src: "{host_dir}" dst: "{host_dir}" '
-        'is_bind: true rw: true mandatory: true }',
+        "test-proj-not-mounted",
+        "test -e /tmp/nsjail_project_test/flag.txt && echo FOUND || echo MISSING",
     )
-    cfg_path = "/tmp/test_proj_mount.cfg"
+    cfg_path = "/tmp/test_proj_not_mounted.cfg"
     _write_config(nsjail_vm, cfg_path, config)
     result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "marker"
+    assert "MISSING" in result.stdout
 
 
 def test_workspace_rw_bind_mount(nsjail_vm: NsjailVM) -> None:

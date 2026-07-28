@@ -9,6 +9,7 @@ are injected into subsequent ``shell`` invocations via nsjail ``-E`` flags.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import TYPE_CHECKING
@@ -47,17 +48,19 @@ class ShellEnvTools:
         if not _ENV_KEY_RE.match(key):
             return {
                 "success": False,
+                "output": "",
                 "error": f"Invalid env var key {key!r}: must match [A-Za-z_][A-Za-z0-9_]*",
             }
         if any(c in value for c in ("\x00", "\n", "\r")):
             return {
                 "success": False,
+                "output": "",
                 "error": "Null byte, newline, or carriage return in env var value is not allowed",
             }
         logger.info("Built-in shell_env_set: %s", key)
         with self._owner._shell_env_lock:
             self._owner._shell_env[key] = value
-        return {"success": True}
+        return {"success": True, "output": f"Set {key}={value}", "error": ""}
 
     def shell_env_unset(self, args: dict) -> dict:
         """Remove a session-scoped shell environment variable.
@@ -72,7 +75,7 @@ class ShellEnvTools:
         logger.info("Built-in shell_env_unset: %s", key)
         with self._owner._shell_env_lock:
             self._owner._shell_env.pop(key, None)
-        return {"success": True}
+        return {"success": True, "output": f"Unset {key}", "error": ""}
 
     def shell_env_list(self, args: dict) -> dict:
         """Return a snapshot of all session-scoped shell environment variables.
@@ -87,7 +90,7 @@ class ShellEnvTools:
         with self._owner._shell_env_lock:
             snapshot = dict(self._owner._shell_env)
         logger.info("Built-in shell_env_list: %d entries", len(snapshot))
-        return {"success": True, "env": snapshot}
+        return {"success": True, "output": json.dumps(snapshot, ensure_ascii=False), "env": snapshot, "error": ""}
 
     def shell_env_get(self, args: dict) -> dict:
         """Get the value of a session-scoped shell environment variable.
@@ -103,4 +106,4 @@ class ShellEnvTools:
         logger.info("Built-in shell_env_get: %s", key)
         with self._owner._shell_env_lock:
             value = self._owner._shell_env.get(key, "")
-        return {"success": True, "value": value}
+        return {"success": True, "output": value, "value": value, "error": ""}

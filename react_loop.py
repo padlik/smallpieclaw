@@ -327,7 +327,7 @@ def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
     log_note = ""
     if outcome.get("full_log_path"):
         log_note = f"\n📄 full log: `{outcome['full_log_path']}`"
-    if outcome["success"]:
+    if outcome.get("success", False):
         out = (outcome.get("output") or "").strip()
         # Include stderr even on success (warnings, compiler diagnostics, etc.)
         err = (outcome.get("error") or "").strip()
@@ -353,8 +353,8 @@ def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
 
 def format_tool_result(tool_name: str, outcome: dict) -> str:
     """Format a tool result as a message for the LLM."""
-    if outcome["success"]:
-        output = outcome["output"] or "(no output)"
+    if outcome.get("success", False):
+        output = outcome.get("output") or "(no output)"
         # Include stderr even for successful commands; warnings/diagnostics matter.
         stderr = (outcome.get("error") or "").strip()
         if stderr:
@@ -806,18 +806,18 @@ def _dispatch_action(
             outcome = _dispatch_tool(ctx, action_obj, progress)
         _duration_ms = (time.time() - _t0) * 1000
         _emit_tool_trace(
-            ctx, tool_name, args, success=outcome["success"],
+            ctx, tool_name, args, success=outcome.get("success", False),
             duration_ms=_duration_ms,
-            error=outcome.get("error", "") if not outcome["success"] else "",
+            error=outcome.get("error", "") if not outcome.get("success", False) else "",
         )
         if ctx.working:
-            ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome["success"]})
+            ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome.get("success", False)})
         if outcome.get("send_file"):
             path_b64 = base64.b64encode(outcome["send_file"].encode()).decode()
             caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
             progress(f"__FILE__:{path_b64}:{caption_b64}")
         tool_result = format_tool_result(tool_name, outcome)
-        if outcome["success"]:
+        if outcome.get("success", False):
             logger.info("Tool '%s' result: success=True", tool_name)
         else:
             logger.warning(

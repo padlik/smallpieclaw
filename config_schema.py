@@ -36,7 +36,7 @@ def parse_vault_content(
     The vault is a TOML file where every top-level key maps to a string
     secret, for example::
 
-        # ~/.local/share/<agent_name>/secrets.toml
+        # ~/.local/state/<agent_name>/secrets.toml
         openai_key = "sk-..."
         bot_token  = "123456:ABC"
 
@@ -222,13 +222,20 @@ def vault_path(raw: dict) -> str:
     """Return the vault file path for *raw*.
 
     Uses ``$SPC_VAULT_FILE`` when set, otherwise the default location under
-    ``~/.local/share/<agent_name>/secrets.toml``.
+    ``$XDG_STATE_HOME/<agent_name>/secrets.toml`` if ``XDG_STATE_HOME`` is set,
+    or ``~/.local/state/<agent_name>/secrets.toml`` as the fallback (XDG base
+    directory spec, consolidated alongside other agent state files).
     """
     env_path = os.environ.get("SPC_VAULT_FILE")
     if env_path:
         return env_path
     agent_name = (raw.get("agent") or {}).get("agent_name") or "piclaw"
-    return os.path.expanduser(f"~/.local/share/{agent_name}/secrets.toml")
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if xdg_state:
+        base = xdg_state
+    else:
+        base = os.path.expanduser("~/.local/state")
+    return os.path.join(base, agent_name, "secrets.toml")
 
 
 def log_dir(raw: dict) -> str:

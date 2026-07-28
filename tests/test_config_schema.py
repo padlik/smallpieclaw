@@ -389,17 +389,104 @@ class TestVaultLoading:
         monkeypatch.setenv("SPC_VAULT_FILE", "/custom/vault.toml")
         assert vault_path({}) == "/custom/vault.toml"
 
-    def test_vault_path_defaults_to_agent_name(self):
+    def test_vault_path_defaults_to_agent_name(self, monkeypatch):
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
         raw = {"agent": {"agent_name": "testbot"}}
-        assert vault_path(raw) == os.path.expanduser("~/.local/share/testbot/secrets.toml")
+        assert vault_path(raw) == os.path.expanduser("~/.local/state/testbot/secrets.toml")
 
-    def test_vault_path_default_agent_name(self):
-        assert vault_path({}) == os.path.expanduser("~/.local/share/piclaw/secrets.toml")
+    def test_vault_path_default_agent_name(self, monkeypatch):
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+        assert vault_path({}) == os.path.expanduser("~/.local/state/piclaw/secrets.toml")
 
-    # ------------------------------------------------------------------
-    # parse_vault_content public API
-    # ------------------------------------------------------------------
+    def test_vault_path_respects_xdg_state_home(self, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", "/custom/state")
+        raw = {"agent": {"agent_name": "testbot"}}
+        assert vault_path(raw) == "/custom/state/testbot/secrets.toml"
 
+    def test_vault_path_xdg_state_home_default_agent_name(self, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", "/custom/state")
+        assert vault_path({}) == "/custom/state/piclaw/secrets.toml"
+
+    def test_vault_path_various_agent_names(self):
+        assert vault_path({"agent": {"agent_name": "alpha"}}) == os.path.expanduser(
+            "~/.local/state/alpha/secrets.toml"
+        )
+        assert vault_path({"agent": {"agent_name": "my-agent_2"}}) == os.path.expanduser(
+            "~/.local/state/my-agent_2/secrets.toml"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Vault migration helpers
+# ---------------------------------------------------------------------------
+
+def _migrate_vault(old_vault: str, new_vault: str, logger: list[str]) -> None:
+    """Mimic the vault migration logic in main.py._run().
+
+    - If the old vault exists and the new one does not, copy old → new.
+    - If both exist, emit a warning and keep the new path.
+    - Otherwise do nothing.
+    """
+    import shutil
+
+    if os.path.exists(old_vault) and not os.path.exists(new_vault):
+        os.makedirs(os.path.dirname(new_vault), exist_ok=True)
+        shutil.copy2(old_vault, new_vault)
+        logger.append(f"migrated:{old_vault}->{new_vault}")
+    elif os.path.exists(old_vault) and os.path.exists(new_vault):
+        logger.append(f"warning:both_exist:{old_vault}:{new_vault}")
+
+
+class TestVaultMigration:
+    """Tests for the vault migration path consolidation in main.py."""
+
+    def test_migration_copies_when_old_exists_and_new_missing(self, tmp_path):
+        old = tmp_path / "old" / "secrets.toml"
+        new = tmp_path / "new" / "secrets.toml"
+        old.parent.mkdir(parents=True)
+        old.write_text('key = "value"\n')
+        logs: list[str] = []
+        _migrate_vault(str(old), str(new), logs)
+        assert new.exists()
+        assert new.read_text() == old.read_text()
+        assert "migrated" in logs[0]
+
+    def test_migration_prefers_new_when_both_exist(self, tmp_path, caplog):
+        old = tmp_path / "old" / "secrets.toml"
+        new = tmp_path / "new" / "secrets.toml"
+        old.parent.mkdir(parents=True)
+        new.parent.mkdir(parents=True)
+        old.write_text('key = "old"\n')
+        new.write_text('key = "new"\n')
+        logs: list[str] = []
+        _migrate_vault(str(old), str(new), logs)
+        assert new.read_text() == 'key = "new"\n'
+        assert any("both_exist" in entry for entry in logs)
+
+    def test_migration_skips_when_neither_exists(self, tmp_path):
+        old = tmp_path / "old" / "secrets.toml"
+        new = tmp_path / "new" / "secrets.toml"
+        logs: list[str] = []
+        _migrate_vault(str(old), str(new), logs)
+        assert not new.exists()
+        assert logs == []
+
+    def test_migration_skips_when_only_new_exists(self, tmp_path):
+        old = tmp_path / "old" / "secrets.toml"
+        new = tmp_path / "new" / "secrets.toml"
+        new.parent.mkdir(parents=True)
+        new.write_text('key = "value"\n')
+        logs: list[str] = []
+        _migrate_vault(str(old), str(new), logs)
+        assert new.read_text() == 'key = "value"\n'
+        assert logs == []
+
+
+# ---------------------------------------------------------------------------
+# parse_vault_content public API
+# ---------------------------------------------------------------------------
+
+class TestParseVaultContent:
     def test_parse_vault_content_toml(self):
         """parse_vault_content accepts a TOML string."""
         data = parse_vault_content('key = "value"\n', "/fake/path")
