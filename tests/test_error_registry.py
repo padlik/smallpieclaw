@@ -54,7 +54,7 @@ class TestErrorTypeRegistry:
         assert registry.get("not_a_real_error") is None
 
     def test_default_types_loaded(self):
-        """All 9 default error types are registered on construction."""
+        """All 10 default error types are registered on construction."""
         registry = ErrorTypeRegistry()
 
         expected = {
@@ -67,9 +67,10 @@ class TestErrorTypeRegistry:
             "wrong_model_for_task",
             "fundamentally_wrong_approach",
             "impossible_with_current_tools",
+            "nsjail_error",
         }
         assert set(registry._types.keys()) == expected
-        assert len(registry._types) == 9
+        assert len(registry._types) == 10
 
     def test_transient_types_are_recoverable(self):
         """Transient errors are marked recoverable."""
@@ -106,6 +107,7 @@ class TestErrorTypeRegistry:
             "wrong_model_for_task",
             "fundamentally_wrong_approach",
             "impossible_with_current_tools",
+            "nsjail_error",
         ):
             info = registry.get(error_type)
             assert info is not None
@@ -129,5 +131,6 @@ class TestErrorTypeRegistry:
             "wrong_model_for_task",
             "fundamentally_wrong_approach",
             "impossible_with_current_tools",
+            "nsjail_error",
         ):
             assert registry.get(error_type).max_retries == 0

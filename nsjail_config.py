@@ -271,12 +271,15 @@ class NsjailConfigBuilder:
         lines.extend(system_mounts)
 
         # Minimal /dev nodes for shell redirections (2>/dev/null, etc.)
+        # Paths must be quoted (json.dumps) — nsjail's config parser rejects bare paths.
         lines.append("# Minimal /dev nodes for shell redirections")
         lines.append(
-            'mount: { src: /dev/null dst: /dev/null is_bind: true rw: false mandatory: false }'
+            f'mount: {{ src: {json.dumps("/dev/null")} dst: {json.dumps("/dev/null")}'
+            f' is_bind: true rw: false mandatory: false }}'
         )
         lines.append(
-            'mount: { src: /dev/zero dst: /dev/zero is_bind: true rw: false mandatory: false }'
+            f'mount: {{ src: {json.dumps("/dev/zero")} dst: {json.dumps("/dev/zero")}'
+            f' is_bind: true rw: false mandatory: false }}'
         )
         lines.append("")
 

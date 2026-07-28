@@ -9,7 +9,8 @@ Error classification:
 
 * Transient (retryable): ``tool_timeout``, ``network_error``, ``syntax_error``.
 * Planning (no retry, needs alternative approach): ``wrong_model_for_task``,
-  ``fundamentally_wrong_approach``, ``impossible_with_current_tools``.
+  ``fundamentally_wrong_approach``, ``impossible_with_current_tools``,
+  ``nsjail_error``.
 * Fatal (no retry, environment/fix required): ``permission_denied``,
   ``file_not_found``, ``command_not_found``.
 """
@@ -67,3 +68,4 @@ class ErrorTypeRegistry:
         self.register(ErrorTypeInfo("wrong_model_for_task", False, 0, 0.0, True))
         self.register(ErrorTypeInfo("fundamentally_wrong_approach", False, 0, 0.0, True))
         self.register(ErrorTypeInfo("impossible_with_current_tools", False, 0, 0.0, True))
+        self.register(ErrorTypeInfo("nsjail_error", False, 0, 0.0, True))
