@@ -196,20 +196,20 @@ class TestShellEnv:
     def test_set(self):
         tools = self._make_tools()
         result = tools.shell_env_set({"key": "FOO", "value": "bar"})
-        assert result == {"success": True}
+        assert result == {"success": True, "output": "Set FOO=bar", "error": ""}
         assert tools._owner._shell_env["FOO"] == "bar"
 
     def test_unset(self):
         tools = self._make_tools()
         tools.shell_env_set({"key": "FOO", "value": "bar"})
         result = tools.shell_env_unset({"key": "FOO"})
-        assert result == {"success": True}
+        assert result == {"success": True, "output": "Unset FOO", "error": ""}
         assert "FOO" not in tools._owner._shell_env
 
     def test_unset_missing_key(self):
         tools = self._make_tools()
         result = tools.shell_env_unset({"key": "MISSING"})
-        assert result == {"success": True}
+        assert result == {"success": True, "output": "Unset MISSING", "error": ""}
 
     def test_list(self):
         tools = self._make_tools()
@@ -218,17 +218,19 @@ class TestShellEnv:
         result = tools.shell_env_list({})
         assert result["success"] is True
         assert result["env"] == {"A": "1", "B": "2"}
+        assert result["output"] == '{"A": "1", "B": "2"}'
+        assert result["error"] == ""
 
     def test_get_existing(self):
         tools = self._make_tools()
         tools.shell_env_set({"key": "FOO", "value": "bar"})
         result = tools.shell_env_get({"key": "FOO"})
-        assert result == {"success": True, "value": "bar"}
+        assert result == {"success": True, "output": "bar", "value": "bar", "error": ""}
 
     def test_get_missing(self):
         tools = self._make_tools()
         result = tools.shell_env_get({"key": "MISSING"})
-        assert result == {"success": True, "value": ""}
+        assert result == {"success": True, "output": "", "value": "", "error": ""}
 
     def test_no_side_effect_on_os_environ(self):
         tools = self._make_tools()

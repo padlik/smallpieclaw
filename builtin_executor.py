@@ -27,7 +27,6 @@ Result dicts produced by built-in tools include the following recovery fields:
 from __future__ import annotations
 
 import logging
-import os
 import secrets
 import shutil
 import threading
@@ -119,11 +118,11 @@ class BuiltinExecutor:
                  shell_nsjail_memory_mb: int = 256,
                  shell_nsjail_pids_max: int = 64,
                  shell_nsjail_cpu_percent: int = 50,
-                 allow_net: bool = False,
-                 nsjail_session_tmpdir: str = "",
-                 nsjail_project_dir: str = "",
-                 nsjail_trusted_dirs_path: str = "",
-                 skills_dir: str = ""):
+                  allow_net: bool = False,
+                  nsjail_session_tmpdir: str = "",
+                  nsjail_trusted_dirs_path: str = "",
+                  skills_dir: str = "",
+                  nsjail_agent_dir: str = ""):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -194,7 +193,6 @@ class BuiltinExecutor:
             if nsjail_binary is not None:
                 self._shell_nsjail_active = True
                 self._nsjail_builder = NsjailConfigBuilder(
-                    project_dir=os.path.abspath(nsjail_project_dir) if nsjail_project_dir else os.path.abspath("."),
                     session_tmpdir=nsjail_session_tmpdir,
                     trusted_dirs_path=nsjail_trusted_dirs_path,
                     memory_mb=shell_nsjail_memory_mb,
@@ -202,6 +200,7 @@ class BuiltinExecutor:
                     cpu_percent=shell_nsjail_cpu_percent,
                     allow_net=self._allow_net,
                     skills_dir=skills_dir,
+                    agent_dir=nsjail_agent_dir,
                 )
                 logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
             else:

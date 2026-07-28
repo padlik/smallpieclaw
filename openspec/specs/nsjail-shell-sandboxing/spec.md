@@ -32,31 +32,11 @@ Rule: The nsjail backend is opt-in via config. It is Linux-only. On macOS or whe
 - **THEN** the path is not found (No such file or directory)
 - **AND** the host filesystem outside mounted paths is inaccessible
 
-### Requirement: Project directory is mounted at its original host path
-
-The nsjail config MUST bind-mount the project directory at its original host path inside the jail with read-write access. This ensures file tools (which run in the agent process and see host paths) and shell tools (which run inside the jail) use identical paths — no path translation is needed.
-
-#### Scenario: Shell sees project at the same path as file tools
-- **GIVEN** the project directory is `/home/user/projects/myproject` on the host
-- **WHEN** the agent runs `shell("pwd")` with cwd set to the project directory
-- **THEN** the output is `/home/user/projects/myproject`
-- **AND** `shell("ls /home/user/projects/myproject/src/")` lists the same files as `file_read` would see
-
-#### Scenario: Files written in jail appear on host
-- **GIVEN** the nsjail backend is active and the project is mounted read-write
-- **WHEN** the agent runs `shell("echo data > /home/user/projects/myproject/output.txt")`
-- **THEN** the file `output.txt` appears on the host filesystem at the same path
-- **AND** `file_read("/home/user/projects/myproject/output.txt")` returns the content written by the shell command
-
-#### Scenario: Deep nested project paths work
-- **GIVEN** the project directory is at a deep nested path (e.g., `/home/user/projects/team/subteam/myproject`)
-- **WHEN** the nsjail config is generated
-- **THEN** nsjail auto-creates the parent directory scaffold inside the jail
-- **AND** the project is accessible at its original path inside the jail
-
 ### Requirement: Trusted directories are mounted at their original host paths
 
-Trusted directories from `data/trusted_dirs.json` (managed by `/dir` commands) MUST be bind-mounted at their original host paths inside the jail. Directories with `mode: "rw"` are mounted read-write; directories with `mode: "r"` are mounted read-only.
+Trusted directories from `trusted_dirs.json` (managed by `/dir` commands) MUST be bind-mounted at their original host paths inside the jail. Directories with `mode: "rw"` are mounted read-write; directories with `mode: "r"` are mounted read-only. Paths under `/home` are accepted — the blanket `/home` block has been removed. Sensitive subdirs (`~/.ssh`, `~/.local`, `~/.config`, `~/.gnupg`) remain blocked by the targeted user-prefix blocklist.
+
+Feature: nsjail-shell-sandboxing
 
 #### Scenario: RW trusted dir is writable inside jail
 - **GIVEN** `/home/user/.cache` is a trusted directory with `mode: "rw"`
@@ -74,6 +54,18 @@ Trusted directories from `data/trusted_dirs.json` (managed by `/dir` commands) M
 - **WHEN** the next shell call generates an nsjail config
 - **THEN** `/new/dir` appears as a mount entry in the config
 - **AND** the directory is accessible inside the jail at its original path
+
+#### Scenario: Trusted dir under /home is accepted
+- **GIVEN** `/home/user/projects/myproject` is a trusted directory with `mode: "rw"`
+- **WHEN** the nsjail config is generated
+- **THEN** the directory is mounted read-write inside the jail at its original path
+- **AND** no "restricted system path" warning is logged
+
+#### Scenario: Sensitive subdir under /home is rejected
+- **GIVEN** `~/.ssh` is listed in `trusted_dirs.json`
+- **WHEN** the nsjail config is generated
+- **THEN** the directory is NOT mounted inside the jail
+- **AND** a warning is logged that the path is a restricted user path
 
 ### Requirement: Per-session /tmp persists across nsjail invocations
 
@@ -93,7 +85,7 @@ A per-session temp directory (created at agent startup, cleaned up at agent shut
 
 ### Requirement: nsjail config is generated dynamically per shell call
 
-The nsjail config MUST be generated as a tempfile per shell call, combining static parts (namespaces, seccomp, system mounts, base envars) with dynamic parts (time_limit, cwd, project mount, trusted mounts, /tmp mount, command). The tempfile MUST be deleted after the command completes.
+The nsjail config MUST be generated as a tempfile per shell call, combining static parts (namespaces, seccomp, system mounts, base envars) with dynamic parts (time_limit, cwd, trusted mounts, /tmp mount, command). The config MUST set `cwd` to `/tmp` (the session tmpdir). The tempfile MUST be deleted after the command completes.
 
 #### Scenario: Config includes per-call timeout and command
 - **GIVEN** the nsjail backend is active
@@ -101,10 +93,34 @@ The nsjail config MUST be generated as a tempfile per shell call, combining stat
 - **THEN** the generated nsjail config contains `time_limit: 60`
 - **AND** the config contains the command as the exec target
 
+#### Scenario: Config sets cwd to /tmp
+- **GIVEN** the nsjail backend is active
+- **WHEN** the agent calls `shell("pwd")`
+- **THEN** the output is `/tmp`
+- **AND** the generated nsjail config contains `cwd: "/tmp"`
+
 #### Scenario: Config tempfile is cleaned up after execution
 - **GIVEN** the nsjail backend generates a config tempfile for a shell call
 - **WHEN** the shell command completes (success, failure, or timeout)
 - **THEN** the tempfile is deleted from the filesystem
+
+### Requirement: Minimal /dev nodes are mounted for shell redirections
+
+The nsjail config MUST bind-mount `/dev/null` and `/dev/zero` read-only inside the sandbox so that shell redirections like `2>/dev/null` and `dd if=/dev/zero` work correctly. The mounts MUST use `mandatory: false` so the jail still starts even if the host lacks these device nodes.
+
+Feature: nsjail-shell-sandboxing
+
+#### Scenario: Shell redirection to /dev/null works inside jail
+- **GIVEN** the nsjail backend is active
+- **WHEN** the agent runs `shell("ls /nonexistent 2>/dev/null")` inside the jail
+- **THEN** the command succeeds with empty stderr
+- **AND** no "cannot create /dev/null" error occurs
+
+#### Scenario: /dev/zero is accessible inside jail
+- **GIVEN** the nsjail backend is active
+- **WHEN** the agent runs `shell("dd if=/dev/zero of=/tmp/zero bs=1 count=1")` inside the jail
+- **THEN** the command succeeds
+- **AND** `/tmp/zero` contains a single null byte
 
 ### Requirement: Cgroup delegation uses systemd-run with rlimits fallback
 

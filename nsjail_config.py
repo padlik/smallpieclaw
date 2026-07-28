@@ -22,7 +22,7 @@ CGROUP2_SUPER_MAGIC: int = 0x63677270
 _BLOCKED_SYSTEM_PREFIXES: tuple[str, ...] = (
     "/etc", "/proc", "/sys", "/dev", "/boot",
     "/bin", "/sbin", "/lib", "/lib64", "/usr", "/root",
-    "/home", "/var", "/run",
+    "/var", "/run",
 )
 
 
@@ -31,7 +31,6 @@ class NsjailConfigBuilder:
 
     def __init__(
         self,
-        project_dir: str,
         session_tmpdir: str,
         trusted_dirs_path: str = "",
         memory_mb: int = 256,
@@ -39,12 +38,11 @@ class NsjailConfigBuilder:
         cpu_percent: int = 50,
         allow_net: bool = False,
         skills_dir: str = "",
+        agent_dir: str = "",
     ) -> None:
         """Initialize the builder.
 
         Args:
-            project_dir: Absolute path to the project directory; mounted RW at
-                the same path inside the sandbox.
             session_tmpdir: Per-session temporary directory; mounted as ``/tmp``
                 inside the sandbox.
             trusted_dirs_path: Absolute path to ``trusted_dirs.json``.
@@ -54,18 +52,29 @@ class NsjailConfigBuilder:
             allow_net: When False (default) networking is isolated inside the
                 sandbox; when True the host network namespace is shared.
             skills_dir: Absolute path to the skills directory; mounted read-only
-                when it exists and is not already reachable via the project dir.
+                when it exists and is not on a restricted path.
+            agent_dir: Absolute path to the agent's own installation directory;
+                blocked as a trusted mount to prevent the agent from mounting its
+                source code RW inside the sandbox.
         """
-        self.project_dir = os.path.realpath(os.path.abspath(project_dir))
         self.session_tmpdir = os.path.realpath(os.path.abspath(session_tmpdir))
         self.trusted_dirs_path = os.path.abspath(trusted_dirs_path) if trusted_dirs_path else ""
+        self._agent_dir = os.path.realpath(os.path.abspath(agent_dir)) if agent_dir else ""
         # Dynamic blocked prefixes: user-home paths that must never be trusted mounts.
         home = os.path.expanduser("~")
-        self._blocked_user_prefixes: tuple[str, ...] = (
+        blocked = [
             os.path.join(home, ".ssh"),
             os.path.join(home, ".local"),
             os.path.join(home, ".config"),
-        )
+            os.path.join(home, ".gnupg"),
+            os.path.join(home, ".aws"),
+            os.path.join(home, ".kube"),
+            os.path.join(home, ".docker"),
+            os.path.join(home, ".cache"),
+        ]
+        if self._agent_dir:
+            blocked.append(self._agent_dir)
+        self._blocked_user_prefixes: tuple[str, ...] = tuple(blocked)
         self.memory_mb = memory_mb
         self.pids_max = pids_max
         self.cpu_percent = cpu_percent
@@ -186,6 +195,11 @@ class NsjailConfigBuilder:
             if not os.path.exists(real):
                 logger.warning("Trusted directory does not exist: %s", real)
                 continue
+            # Skip trusted-dir entries that are under an already-mounted path
+            # (e.g., session_tmpdir is mounted as /tmp).
+            if real == self.session_tmpdir or real.startswith(self.session_tmpdir + os.sep):
+                logger.debug("Trusted directory under session_tmpdir, skipping (already mounted as /tmp): %s", real)
+                continue
             rw = "true" if mode == "rw" else "false"
             lines.append(
                 f'mount: {{ src: {json.dumps(real)} dst: {json.dumps(real)} is_bind: true '
@@ -256,6 +270,16 @@ class NsjailConfigBuilder:
         ]
         lines.extend(system_mounts)
 
+        # Minimal /dev nodes for shell redirections (2>/dev/null, etc.)
+        lines.append("# Minimal /dev nodes for shell redirections")
+        lines.append(
+            'mount: { src: /dev/null dst: /dev/null is_bind: true rw: false mandatory: false }'
+        )
+        lines.append(
+            'mount: { src: /dev/zero dst: /dev/zero is_bind: true rw: false mandatory: false }'
+        )
+        lines.append("")
+
         if trusted_mounts:
             lines.append("")
             lines.append("# Trusted mounts")
@@ -263,56 +287,28 @@ class NsjailConfigBuilder:
 
         lines.extend([
             "",
-            "# Project and session mounts",
-            f'mount: {{ src: {json.dumps(self.project_dir)} dst: {json.dumps(self.project_dir)} '
-            f'is_bind: true rw: true mandatory: true }}',
+            "# Session mounts",
             f'mount: {{ src: {json.dumps(self.session_tmpdir)} dst: "/tmp" '
             f'is_bind: true rw: true mandatory: true }}',
             "",
         ])
 
         skills_mounts: list[str] = []
-        if self.skills_dir:
-            if not os.path.isdir(self.skills_dir):
-                logger.debug("nsjail: skills_dir does not exist, skipping mount: %s", self.skills_dir)
+        if self.skills_dir and os.path.isdir(self.skills_dir):
+            if self.skills_dir == "/" or any(
+                self.skills_dir == p or self.skills_dir.startswith(p + "/")
+                for p in (_BLOCKED_SYSTEM_PREFIXES + self._blocked_user_prefixes)
+            ):
+                logger.warning(
+                    "nsjail: skills_dir rejected (restricted path), skipping mount: %s",
+                    self.skills_dir,
+                )
             else:
-                # Containment checks first — these are the common cases and must
-                # run before the blocklist so that a skills_dir nested under
-                # project_dir (e.g. /home/user/agent/skills) is not spuriously
-                # rejected by the /home prefix in _BLOCKED_SYSTEM_PREFIXES.
-                try:
-                    common = os.path.commonpath([self.skills_dir, self.project_dir])
-                except ValueError:
-                    common = ""
-                if common == self.project_dir:
-                    logger.warning(
-                        "nsjail: skills_dir nested under project_dir, skipping mount "
-                        "(already accessible via project mount): %s",
-                        self.skills_dir,
-                    )
-                elif common == self.skills_dir:
-                    logger.warning(
-                        "nsjail: skills_dir is a parent of project_dir, skipping mount "
-                        "(would expose sibling directories read-only): %s",
-                        self.skills_dir,
-                    )
-                elif self.skills_dir == "/" or any(
-                    self.skills_dir == p or self.skills_dir.startswith(p + "/")
-                    for p in (_BLOCKED_SYSTEM_PREFIXES + self._blocked_user_prefixes)
-                ):
-                    # Defense-in-depth: reject blocked system paths (same check
-                    # as trusted_dirs). Only reached for paths that would actually
-                    # get mounted (not nested under or parent of project_dir).
-                    logger.warning(
-                        "nsjail: skills_dir rejected (restricted system path), skipping mount: %s",
-                        self.skills_dir,
-                    )
-                else:
-                    lines.append("# Skills directory mount (read-only)")
-                    skills_mounts.append(
-                        f'mount: {{ src: {json.dumps(self.skills_dir)} dst: {json.dumps(self.skills_dir)} '
-                        f'is_bind: true rw: false mandatory: true }}'
-                    )
+                lines.append("# Skills directory mount (read-only)")
+                skills_mounts.append(
+                    f'mount: {{ src: {json.dumps(self.skills_dir)} dst: {json.dumps(self.skills_dir)} '
+                    f'is_bind: true rw: false mandatory: true }}'
+                )
         if skills_mounts:
             lines.extend(skills_mounts)
             lines.append("")
@@ -343,7 +339,7 @@ class NsjailConfigBuilder:
             "",
             f"time_limit: {timeout}",
             "",
-            f'cwd: {json.dumps(self.project_dir)}',
+            'cwd: "/tmp"',
             "",
             'exec_bin {',
             '  path: "/bin/sh"',
