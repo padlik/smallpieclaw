@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 from nsjail_config import NsjailConfigBuilder
 
@@ -686,3 +686,56 @@ class TestBuild:
             assert nsjail_cmd[0] == "nsjail"
         finally:
             os.unlink(cfg_path)
+
+
+class TestCgroup2Detection:
+    """Tests for _is_cgroup2_mounted() — statfs and /proc/filesystems fallback."""
+
+    def test_statfs_detects_cgroup2(self) -> None:
+        """When os.statfs is available and f_type matches, returns True."""
+        from nsjail_config import CGROUP2_SUPER_MAGIC
+
+        class FakeStatResult:
+            f_type = CGROUP2_SUPER_MAGIC
+
+        with patch("nsjail_config.os.statfs", return_value=FakeStatResult(), create=True):
+            assert NsjailConfigBuilder._is_cgroup2_mounted() is True
+
+    def test_statfs_rejects_non_cgroup2(self) -> None:
+        """When os.statfs returns a different magic number, returns False."""
+        class FakeStatResult:
+            f_type = 0x73717368  # squashfs magic, not cgroup2
+
+        with patch("nsjail_config.os.statfs", return_value=FakeStatResult(), create=True):
+            assert NsjailConfigBuilder._is_cgroup2_mounted() is False
+
+    def test_statfs_oserror_returns_false(self) -> None:
+        """When os.statfs raises OSError, returns False."""
+        with patch("nsjail_config.os.statfs", side_effect=OSError("nope"), create=True):
+            assert NsjailConfigBuilder._is_cgroup2_mounted() is False
+
+    def test_proc_filesystems_fallback_detects_cgroup2(self) -> None:
+        """When os.statfs is missing, /proc/filesystems fallback detects cgroup2."""
+        proc_content = (
+            "nodev\tdevtmpfs\n"
+            "nodev\tproc\n"
+            "nodev\tcgroup2\n"
+            "nodev\ttmpfs\n"
+        )
+        # Remove os.statfs to simulate a Python build without it
+        with patch("nsjail_config.os.statfs", None, create=True), \
+             patch("builtins.open", mock_open(read_data=proc_content)):
+            assert NsjailConfigBuilder._is_cgroup2_mounted() is True
+
+    def test_proc_filesystems_fallback_rejects_no_cgroup2(self) -> None:
+        """When /proc/filesystems has no cgroup2 entry, returns False."""
+        proc_content = "nodev\tdevtmpfs\nnodev\tproc\nnodev\ttmpfs\n"
+        with patch("nsjail_config.os.statfs", None, create=True), \
+             patch("builtins.open", mock_open(read_data=proc_content)):
+            assert NsjailConfigBuilder._is_cgroup2_mounted() is False
+
+    def test_proc_filesystems_fallback_oserror_returns_false(self) -> None:
+        """When /proc/filesystems can't be read, returns False."""
+        with patch("nsjail_config.os.statfs", None, create=True), \
+             patch("builtins.open", side_effect=OSError("nope")):
+            assert NsjailConfigBuilder._is_cgroup2_mounted() is False

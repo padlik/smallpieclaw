@@ -119,6 +119,10 @@ class NsjailConfigBuilder:
         ``/sys/fs/cgroup``.  When available, the user's cgroup path is derived from
         the current UID.
 
+        Detection of the cgroup2 filesystem type uses ``os.statfs`` when available
+        (Linux-only, checks the magic number), falling back to ``os.statvfs`` +
+        ``/proc/filesystems`` on Python builds where ``os.statfs`` is missing.
+
         Returns:
             Mapping with keys ``available`` (bool) and ``cgroupv2_mount`` (str or
             None).
@@ -130,16 +134,7 @@ class NsjailConfigBuilder:
         if not has_systemd_run:
             return {"available": False, "cgroupv2_mount": None}
 
-        _statfs = getattr(os, "statfs", None)
-        if _statfs is None:
-            return {"available": False, "cgroupv2_mount": None}
-
-        try:
-            cgroup_type = _statfs("/sys/fs/cgroup").f_type
-        except OSError:
-            return {"available": False, "cgroupv2_mount": None}
-
-        if cgroup_type != CGROUP2_SUPER_MAGIC:
+        if not self._is_cgroup2_mounted():
             return {"available": False, "cgroupv2_mount": None}
 
         uid = os.getuid()
@@ -149,6 +144,34 @@ class NsjailConfigBuilder:
             cgroupv2_mount = user_cgroup
 
         return {"available": available, "cgroupv2_mount": cgroupv2_mount}
+
+    @staticmethod
+    def _is_cgroup2_mounted() -> bool:
+        """Check whether ``/sys/fs/cgroup`` is a cgroup v2 mount.
+
+        Uses ``os.statfs`` (Linux-only, checks the magic number against
+        ``CGROUP2_SUPER_MAGIC``) when available.  Falls back to parsing
+        ``/proc/filesystems`` for a ``cgroup2`` entry when ``os.statfs`` is
+        missing from the Python build (some distributions ship Python without
+        the Linux-specific statfs binding).
+        """
+        _statfs = getattr(os, "statfs", None)
+        if _statfs is not None:
+            try:
+                return _statfs("/sys/fs/cgroup").f_type == CGROUP2_SUPER_MAGIC
+            except OSError:
+                return False
+
+        # Fallback: parse /proc/filesystems for a cgroup2 entry.
+        try:
+            with open("/proc/filesystems", encoding="utf-8") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[-1] == "cgroup2":
+                        return True
+            return False
+        except OSError:
+            return False
 
     def _load_trusted_mounts(self) -> list[str]:
         """Load trusted directory mounts from the configured trusted_dirs.json path.
