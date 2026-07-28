@@ -462,6 +462,142 @@ class TestShellTruncation:
         assert result["success"] is False
 
 
+class TestShellNsjailErrorDetection:
+    """Unit tests for the nsjail-error detection path in _run_shell_subprocess.
+
+    These tests mock subprocess.Popen so we can inject nsjail-style stderr
+    (``[E][`` prefix) and verify the error classification logic without a real
+    nsjail binary or Lima VM.
+    """
+
+    @staticmethod
+    def _make_executor() -> BuiltinExecutor:
+        """Create an executor with a minimal data dir."""
+        import tempfile
+        return BuiltinExecutor(
+            max_output=4000,
+            data_dir=tempfile.mkdtemp(),
+            shell_backend="subprocess",
+        )
+
+    def _run_with_mocked_popen(
+        self,
+        nsjail_cmd: list[str] | None,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> dict:
+        """Run _run_shell_subprocess with a mocked subprocess.Popen.
+
+        Args:
+            nsjail_cmd: Pass as the nsjail_cmd kwarg (None for plain subprocess).
+            stdout: Text the mock process writes to stdout.
+            stderr: Text the mock process writes to stderr.
+            returncode: Exit code of the mock process.
+        """
+        from unittest.mock import patch, MagicMock
+
+        executor = self._make_executor()
+        shell = executor._shell
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = None
+        mock_proc.stderr = None
+        mock_proc.returncode = returncode
+        mock_proc.poll.return_value = returncode
+        mock_proc.pid = 12345
+
+        # Build a fake Popen that returns our mock proc.
+        # The select loop in _run_shell_subprocess reads from proc.stdout/stderr
+        # via os.read. We need to simulate pipes that immediately yield the
+        # configured text and then EOF.
+        def _fake_popen(*args, **kwargs):
+            # Create real pipes so the select/os.read loop works.
+            import os as _os
+            r_out, w_out = _os.pipe()
+            r_err, w_err = _os.pipe()
+            _os.write(w_out, stdout.encode())
+            _os.write(w_err, stderr.encode())
+            _os.close(w_out)
+            _os.close(w_err)
+            mock_proc.stdout = _os.fdopen(r_out, "rb")
+            mock_proc.stderr = _os.fdopen(r_err, "rb")
+            mock_proc.poll.return_value = returncode
+            return mock_proc
+
+        with patch("subprocess.Popen", side_effect=_fake_popen):
+            return shell._run_shell_subprocess(
+                {"command": "echo test", "timeout": 5},
+                nsjail_cmd=nsjail_cmd,
+            )
+
+    def test_nsjail_error_detected_and_not_promoted(self):
+        """nsjail failure with [E][ in stderr is classified as nsjail_error.
+
+        The [E][ marker must stay in `error` (not promoted to `output`) so the
+        agent sees the nsjail failure reason.
+        """
+        nsjail_stderr = (
+            "[E][2026-07-28T21:05:58Z][1] buildMountTree():328 "
+            "Failed to mount mandatory point: '/tmp'\n"
+            "[F][2026-07-28T21:05:58Z][1] runChild():506 Launching child process failed\n"
+        )
+        result = self._run_with_mocked_popen(
+            nsjail_cmd=["nsjail", "--config", "/tmp/fake.cfg"],
+            stdout="",
+            stderr=nsjail_stderr,
+            returncode=255,
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "nsjail_error"
+        assert result["recoverable"] is False
+        # The [E][ marker must remain in error, not be promoted to output
+        assert "[E][" in result["error"]
+        assert "[E][" not in result["output"]
+
+    def test_nsjail_error_suggestion_present(self):
+        """nsjail_error result includes a helpful suggestion."""
+        result = self._run_with_mocked_popen(
+            nsjail_cmd=["nsjail", "--config", "/tmp/fake.cfg"],
+            stdout="",
+            stderr="[E][...] Failed to build mount tree\n",
+            returncode=255,
+        )
+        assert "nsjail sandbox failed" in result["suggestion"].lower()
+
+    def test_plain_subprocess_stderr_still_promoted(self):
+        """Non-nsjail failures still promote stderr→output when stdout is empty.
+
+        This verifies the fix didn't break the existing behavior for the
+        subprocess (non-nsjail) path.
+        """
+        result = self._run_with_mocked_popen(
+            nsjail_cmd=None,
+            stdout="",
+            stderr="ls: cannot access '/nonexistent': No such file or directory\n",
+            returncode=2,
+        )
+        assert result["success"] is False
+        assert result["error_type"] != "nsjail_error"
+        # stderr was promoted to output since stdout was empty
+        assert "No such file or directory" in result["output"]
+
+    def test_nsjail_error_with_stdout_does_not_promote(self):
+        """When nsjail fails but the command produced stdout, output is preserved.
+
+        The nsjail_error classification still fires; output is not overwritten.
+        """
+        result = self._run_with_mocked_popen(
+            nsjail_cmd=["nsjail", "--config", "/tmp/fake.cfg"],
+            stdout="some output\n",
+            stderr="[E][...] nsjail setup failed\n",
+            returncode=255,
+        )
+        assert result["error_type"] == "nsjail_error"
+        assert "some output" in result["output"]
+        assert "[E][" in result["error"]
+
+
 class TestShellPtyBackend:
     """Tests for the PTY shell backend (POSIX-only)."""
 

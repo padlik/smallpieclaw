@@ -140,7 +140,7 @@ class TestBuild:
             os.unlink(cfg_path)
 
     def test_config_contains_dev_null_and_dev_zero_mounts(self) -> None:
-        """Config contains bind mounts for /dev/null and /dev/zero."""
+        """Config contains bind mounts for /dev/null and /dev/zero (quoted paths)."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
@@ -149,10 +149,11 @@ class TestBuild:
         try:
             with open(cfg_path) as f:
                 content = f.read()
-            assert "src: /dev/null" in content
-            assert "dst: /dev/null" in content
-            assert "src: /dev/zero" in content
-            assert "dst: /dev/zero" in content
+            # Paths must be quoted — nsjail's config parser rejects bare paths.
+            assert 'src: "/dev/null"' in content
+            assert 'dst: "/dev/null"' in content
+            assert 'src: "/dev/zero"' in content
+            assert 'dst: "/dev/zero"' in content
             assert "is_bind: true" in content
             assert "rw: false" in content
         finally:

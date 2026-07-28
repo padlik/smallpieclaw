@@ -407,11 +407,25 @@ class ShellTools:
 
         returncode = proc.returncode if not timed_out else -1
 
+        # Detect nsjail-own failures before any stderr→output promotion.
+        # nsjail prefixes its own error lines with [E][ in its log output (stderr).
+        # This must run before the stderr promotion below, which would move the
+        # [E][ marker into `output` and empty `error`, hiding the nsjail failure.
+        is_nsjail_error = (
+            nsjail_cmd is not None
+            and not timed_out
+            and returncode != 0
+            and "[E][" in error
+        )
+
         if not timed_out and returncode != 0 and not output.strip() and error:
             # Some commands write only to stderr (e.g. systemctl status);
             # promote stderr → output so the LLM sees the failure reason.
-            output = error
-            error = ""
+            # Skip promotion for nsjail-own failures so the [E][ marker stays
+            # in `error` for the nsjail_error classification below.
+            if not is_nsjail_error:
+                output = error
+                error = ""
 
         if full_log_path:
             notice = f"\n[full output saved to: {full_log_path} — use file_read to view it]"
@@ -436,9 +450,7 @@ class ShellTools:
                 "recoverable": True,
                 "suggestion": "Try the command again with a longer timeout.",
             }
-        # Detect nsjail-own failures before classifying user-command errors.
-        # nsjail prefixes its own error lines with [E][ in its log output.
-        if nsjail_cmd is not None and returncode != 0 and "[E][" in error:
+        if is_nsjail_error:
             return {
                 "success": False,
                 "output": output,
