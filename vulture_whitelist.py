@@ -171,3 +171,33 @@ ProviderContext
 # config_schema.py — PathsConfig.workspace_dir field
 from config_schema import PathsConfig as _PathsConfig  # noqa: E402, F811
 _PathsConfig.workspace_dir
+
+# conversation_io.py — public helper API for conversation persistence
+from conversation_io import (  # noqa: E402
+    _load_or_create_conversation_id,
+    _save_conversation,
+)
+_load_or_create_conversation_id
+_save_conversation
+
+# main.py — public helper API used across modules and tests
+from main import (  # noqa: E402
+    _load_conversation,
+    _cleanup_old_session_logs,
+)
+_load_conversation
+_cleanup_old_session_logs
+
+# builtin_executor.py — public attributes set/wired externally
+from builtin_executor import BuiltinExecutor  # noqa: E402
+_builtin_executor_type = BuiltinExecutor
+_builtin_executor_type.conversation_id  # type: ignore[attr-defined]
+_builtin_executor_type._agent_name  # type: ignore[attr-defined]
+_builtin_executor_type._vault_secrets  # type: ignore[attr-defined]
+_builtin_executor_type._vault_secrets  # type: ignore[attr-defined]
+
+# config_schema.py — AgentConfig new retention field
+from config_schema import AgentConfig as _AgentConfig  # noqa: E402, F811
+_AgentConfig.session_logs_retention_days
+
+

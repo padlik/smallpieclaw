@@ -739,3 +739,185 @@ class TestCgroup2Detection:
         with patch("nsjail_config.os.statfs", None, create=True), \
              patch("builtins.open", side_effect=OSError("nope")):
             assert NsjailConfigBuilder._is_cgroup2_mounted() is False
+
+
+class TestSessionLogsMount:
+    """Tests for session_logs_dir kwarg in build()."""
+
+    def test_session_logs_dir_mounts_when_directory_exists(self) -> None:
+        """A real session_logs_dir produces a read-only bind mount with src==dst."""
+        with tempfile.TemporaryDirectory() as session_tmpdir, \
+             tempfile.TemporaryDirectory() as session_logs_dir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            )
+            cfg_path, _ = builder.build(
+                "ls", timeout=30, session_logs_dir=session_logs_dir,
+            )
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "# Session logs" in content
+                assert (
+                    f'mount: {{ src: {json.dumps(session_logs_dir)} '
+                    f'dst: {json.dumps(session_logs_dir)}'
+                ) in content
+                assert "is_bind: true" in content
+                assert "rw: false" in content
+                assert "mandatory: false" in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_session_logs_dir_empty_produces_no_mount(self) -> None:
+        """Default empty session_logs_dir does not produce a session logs mount."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "# Session logs" not in content
+            finally:
+                os.unlink(cfg_path)
+
+
+class TestCaCertDetection:
+    """Tests for CA certificate detection and env var injection."""
+
+    def test_allow_net_true_injects_mount_and_envars(self) -> None:
+        """allow_net=True with detected CA certs adds mount + SSL_CERT_* envars."""
+        with tempfile.TemporaryDirectory() as session_tmpdir, \
+             tempfile.TemporaryDirectory() as capath, \
+             tempfile.NamedTemporaryFile(suffix=".crt") as cafile_fh:
+            cafile = cafile_fh.name
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=True,
+            )
+            with patch.object(
+                builder, "_detect_ca_certs", return_value=(cafile, capath),
+            ):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "# TLS cert env vars (allow_net=true)" in content
+                assert f'envar: "SSL_CERT_FILE={cafile}"' in content
+                assert f'envar: "SSL_CERT_DIR={capath}"' in content
+                assert "# CA certificate store (read-only, allow_net=true)" in content
+                assert f'src: {json.dumps(capath)}' in content
+                assert f'dst: {json.dumps(capath)}' in content
+                assert "rw: false" in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_allow_net_false_skips_ca_certs(self) -> None:
+        """allow_net=False does not inject SSL_CERT_* envars or CA cert mount."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=False,
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "SSL_CERT_FILE" not in content
+                assert "SSL_CERT_DIR" not in content
+                assert "# CA certificate store" not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_allow_net_true_no_ca_certs_graceful(self) -> None:
+        """allow_net=True with no detected CA certs still generates valid config."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=True,
+            )
+            with patch.object(
+                builder, "_detect_ca_certs", return_value=(None, None),
+            ):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "SSL_CERT_FILE" not in content
+                assert "SSL_CERT_DIR" not in content
+                assert "# CA certificate store" not in content
+                assert "time_limit: 30" in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_detect_ca_certs_debian(self) -> None:
+        """Debian/Ubuntu layout returns ca-certificates.crt + certs dir."""
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+        )
+
+        def mock_isdir(path: str) -> bool:
+            return path in {"/etc/ssl/certs"}
+
+        def mock_isfile(path: str) -> bool:
+            return path == "/etc/ssl/certs/ca-certificates.crt"
+
+        with patch("os.path.isdir", side_effect=mock_isdir), \
+             patch("os.path.isfile", side_effect=mock_isfile):
+            cafile, capath = builder._detect_ca_certs()
+        assert cafile == "/etc/ssl/certs/ca-certificates.crt"
+        assert capath == "/etc/ssl/certs"
+
+    def test_detect_ca_certs_alpine(self) -> None:
+        """Alpine layout returns cert.pem file with no capath."""
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+        )
+
+        def mock_isfile(path: str) -> bool:
+            return path == "/etc/ssl/cert.pem"
+
+        with patch("os.path.isdir", return_value=False), \
+             patch("os.path.isfile", side_effect=mock_isfile):
+            cafile, capath = builder._detect_ca_certs()
+        assert cafile == "/etc/ssl/cert.pem"
+        assert capath is None
+
+    def test_detect_ca_certs_fedora(self) -> None:
+        """Fedora/RHEL layout returns ca-bundle.crt + certs dir."""
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+        )
+
+        def mock_isdir(path: str) -> bool:
+            return path in {"/etc/pki/tls/certs"}
+
+        def mock_isfile(path: str) -> bool:
+            return path == "/etc/pki/tls/certs/ca-bundle.crt"
+
+        with patch("os.path.isdir", side_effect=mock_isdir), \
+             patch("os.path.isfile", side_effect=mock_isfile):
+            cafile, capath = builder._detect_ca_certs()
+        assert cafile == "/etc/pki/tls/certs/ca-bundle.crt"
+        assert capath == "/etc/pki/tls/certs"
+
+    def test_detect_ca_certs_none_when_missing(self) -> None:
+        """When no known CA layout exists, returns (None, None)."""
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+        )
+        with patch("os.path.isdir", return_value=False), \
+             patch("os.path.isfile", return_value=False):
+            cafile, capath = builder._detect_ca_certs()
+        assert cafile is None
+        assert capath is None

@@ -20,7 +20,6 @@ import shutil
 import signal
 import sys
 import tempfile
-
 import agent_logging
 
 # Directory containing main.py — used as the agent's base directory
@@ -108,7 +107,7 @@ from config_schema import resolve_model_id, vault_path, log_path, parse_vault_co
 from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
-from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
+from memory_store import MemoryStore, WorkingMemory, ResultsMemory  # noqa: E402
 from prompt_registry import PromptRegistry  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
@@ -117,6 +116,7 @@ from telegram_interface import TelegramInterface  # noqa: E402
 from token_usage import get_registry as get_token_registry  # noqa: E402
 from tool_index import ToolIndex  # noqa: E402
 from tool_registry import ToolRegistry  # noqa: E402
+from conversation_io import _load_or_create_conversation_id, _save_conversation, _xdg_state_home  # noqa: E402
 
 
 def load_config(path="config.toml"):
@@ -141,6 +141,112 @@ def load_config(path="config.toml"):
         sys.exit(1)
 
     return app_cfg._raw, app_cfg
+
+
+def _load_conversation(path: str, max_turns: int = 20):
+    """Load ShortTermMemory from a conversation JSON file. Fresh on error."""
+    from memory_store import ShortTermMemory as _ShortTermMemory
+
+    if not os.path.exists(path):
+        return _ShortTermMemory(max_turns=max_turns)
+    try:
+        import json as _json
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return _ShortTermMemory.from_dict(data, max_turns=max_turns)
+    except OSError:
+        logger.warning(
+            "Conversation file corrupted at %s — starting fresh", path, exc_info=True
+        )
+        return _ShortTermMemory(max_turns=max_turns)
+    except ValueError:
+        logger.warning(
+            "Conversation file corrupted at %s — starting fresh", path, exc_info=True
+        )
+        return _ShortTermMemory(max_turns=max_turns)
+
+
+def _cleanup_old_session_logs(state_dir: str, active_conv_id: str, retention_days: int) -> None:
+    """Delete session_logs folders older than retention_days.
+
+    Also deletes the corresponding conversation JSON file. The active
+    conversation folder and its JSON file are always preserved.
+    """
+    import time as _time
+
+    session_logs_root = os.path.join(state_dir, "session_logs")
+    if not os.path.isdir(session_logs_root):
+        return
+    cutoff = _time.time() - (retention_days * 86400)
+    conversations_dir = os.path.join(state_dir, "conversations")
+    for entry in os.listdir(session_logs_root):
+        conv_dir = os.path.join(session_logs_root, entry)
+        if not os.path.isdir(conv_dir):
+            continue
+        if entry == active_conv_id:
+            continue
+        try:
+            files = os.listdir(conv_dir)
+            if not files:
+                newest = os.path.getmtime(conv_dir)
+            else:
+                newest = max(
+                    os.path.getmtime(os.path.join(conv_dir, f))
+                    for f in files
+                    if os.path.isfile(os.path.join(conv_dir, f))
+                )
+        except OSError:
+            continue
+        if newest < cutoff:
+            try:
+                shutil.rmtree(conv_dir, ignore_errors=True)
+            except OSError:
+                pass
+            conv_file = os.path.join(conversations_dir, entry + ".json")
+            if os.path.exists(conv_file):
+                try:
+                    _json_mtime = os.path.getmtime(conv_file)
+                except OSError:
+                    _json_mtime = 0
+                if _json_mtime < cutoff:
+                    try:
+                        os.unlink(conv_file)
+                    except OSError:
+                        pass
+            logger.info(
+                "Cleaned up old session_logs for conversation %s (older than %d days)",
+                entry,
+                retention_days,
+            )
+
+    # Second pass: clean up orphaned conversation JSON files
+    # (conversations that had no shell calls and thus no session_logs folder)
+    if os.path.isdir(conversations_dir):
+        for _jname in os.listdir(conversations_dir):
+            if not _jname.endswith('.json'):
+                continue
+            _conv_id = _jname[:-5]
+            if _conv_id == active_conv_id:
+                continue
+            # Skip if session_logs folder exists (already handled in first pass)
+            if os.path.isdir(os.path.join(session_logs_root, _conv_id)):
+                continue
+            _jpath = os.path.join(conversations_dir, _jname)
+            try:
+                _jmtime = os.path.getmtime(_jpath)
+            except OSError:
+                continue
+            if _jmtime < cutoff:
+                try:
+                    os.unlink(_jpath)
+                except OSError:
+                    pass
+                logger.info(
+                    "Cleaned up orphaned conversation JSON %s (older than %d days)",
+                    _conv_id,
+                    retention_days,
+                )
 
 
 def _read_vault_secrets(vault_file: str) -> list[str]:
@@ -224,11 +330,29 @@ def _run(
     os.makedirs(tmp_dir, exist_ok=True)
     # XDG state dir for trusted_dirs.json — outside the nsjail-mounted project dir
     # so a sandboxed shell command cannot overwrite the trust store.
-    xdg_state_home = os.environ.get(
-        "XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state")
-    )
+    xdg_state_home = _xdg_state_home()
+    # NOTE: agent_name here is os.path.basename(cwd) (set in main()), while
+    # app_cfg.agent.agent_name (default "piclaw") drives log paths and vault.
+    # When cwd basename != config name, XDG state splits across two directories.
     nsjail_state_dir = os.path.join(xdg_state_home, agent_name)
-    os.makedirs(nsjail_state_dir, exist_ok=True)
+    os.makedirs(nsjail_state_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(nsjail_state_dir, 0o700)
+    except OSError:
+        pass
+    conversation_id = _load_or_create_conversation_id(nsjail_state_dir)
+    conversations_dir = os.path.join(nsjail_state_dir, "conversations")
+    os.makedirs(conversations_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(conversations_dir, 0o700)
+    except OSError:
+        pass
+    try:
+        _cleanup_old_session_logs(
+            nsjail_state_dir, conversation_id, app_cfg.agent.session_logs_retention_days
+        )
+    except OSError:
+        logger.warning("session_logs retention cleanup failed", exc_info=True)
     trusted_dirs_path = os.path.join(nsjail_state_dir, "trusted_dirs.json")
     # One-time migration from old location
     old_trusted = os.path.join(data_dir, "trusted_dirs.json")
@@ -285,6 +409,7 @@ def _run(
     logger.info("nsjail session tmpdir: %s", nsjail_session_tmpdir)
 
     vault_file = vault_path(cfg)
+    vault_secrets = _read_vault_secrets(vault_file)
 
     llm      = LLMClient(cfg, usage_registry=get_token_registry(), caller_tag="main")
     memory   = MemoryStore(memory_path)
@@ -309,7 +434,10 @@ def _run(
         skills_dir=skills_dir_abs,
         nsjail_trusted_dirs_path=trusted_dirs_path,
         nsjail_agent_dir=_AGENT_DIR,
+        agent_name=agent_name,
+        vault_secrets=vault_secrets,
     )
+    builtin.conversation_id = conversation_id
     index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
 
     # Initialise MCP servers (optional — skip if none configured)
@@ -334,7 +462,9 @@ def _run(
         except Exception as exc:
             logger.warning("MCP connect_all failed (agent will start without MCP): %s", exc)
 
-    short_term    = ShortTermMemory(max_turns=20)
+    short_term    = _load_conversation(
+        os.path.join(conversations_dir, conversation_id + ".json")
+    )
     working       = WorkingMemory()
     results_mem   = ResultsMemory(path=results_path, llm=llm)
     strategy_mem  = StrategyMemory(data_dir=data_dir)
@@ -354,7 +484,7 @@ def _run(
         vault_path=vault_file,
         trusted_dirs_path=trusted_dirs_path,
     )
-    builtin.trusted_zone_checker = _trusted_zone_checker
+    builtin.trusted_zone_checker = _trusted_zone_checker  # type: ignore[attr-defined]
     # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime
     # agents (P2 consolidation). Runtime semantic recall is served by graph
     # memory; the legacy JSON store is migration/backfill-only via
@@ -391,6 +521,8 @@ def _run(
     # changing the AgentController signature today.
     agent.strategy_memory = strategy_mem  # type: ignore[attr-defined]
     agent.trusted_zone_checker = _trusted_zone_checker  # type: ignore[attr-defined]
+    # Let reset_task() save/rotate the conversation id.
+    agent._conversation_state_dir = nsjail_state_dir  # type: ignore[attr-defined]
 
     logger.info("Building semantic tool index...")
     try:
@@ -529,12 +661,12 @@ def _run(
             )
             if graph_memory_store is not None:
                 # Wire into agent (main react_loop context)
-                agent._graph_memory = graph_memory_store
-                agent._graph_memory_writer = graph_memory_writer
+                agent._graph_memory = graph_memory_store  # type: ignore[attr-defined]
+                agent._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
                 agent._graph_memory_max_entries = app_cfg.graph_memory.max_context_entries
                 # Wire into builtin executor for memory_graph_search/store tools
-                builtin._graph_memory = graph_memory_store
-                builtin._graph_memory_writer = graph_memory_writer
+                builtin._graph_memory = graph_memory_store  # type: ignore[attr-defined]
+                builtin._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
                 logger.info(
                     "Graph memory enabled (db=%s, extraction_model=%s)",
                     app_cfg.graph_memory.db_path,
@@ -557,10 +689,10 @@ def _run(
         downloads_dir=downloads_dir,
         mcp_manager=mcp_manager,
     )
-    tg.agent = agent  # wire agent for confirm/resume and /models
-    tg._graph_memory_store = graph_memory_store
-    tg._graph_memory_writer = graph_memory_writer
-    tg._prompt_registry = prompt_registry  # wire prompt registry for /prompts and lifecycle
+    tg.agent = agent  # type: ignore[attr-defined]  # wire agent for confirm/resume and /models
+    tg._graph_memory_store = graph_memory_store  # type: ignore[attr-defined]
+    tg._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
+    tg._prompt_registry = prompt_registry  # type: ignore[attr-defined]  # wire prompt registry for /prompts and lifecycle
 
     # Wire the sub-agent Telegram confirmation bridge into the built-in executor.
     # Sub-agents running sensitive file operations will call this to ask the
@@ -574,6 +706,17 @@ def _run(
         logger.info("Shutdown requested.")
     finally:
         scheduler.stop()
+        # Read the current conversation_id at shutdown — it may have been rotated
+        # by /reset during the session, so we cannot use the startup variable.
+        current_conv_id = getattr(builtin, "conversation_id", "") or conversation_id
+        if current_conv_id:
+            try:
+                _save_conversation(
+                    os.path.join(nsjail_state_dir, "conversations", current_conv_id + ".json"),
+                    agent.short_term,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to save conversation on shutdown", exc_info=True)
         builtin.shutdown()
         # Clean up per-session nsjail temp dir
         try:

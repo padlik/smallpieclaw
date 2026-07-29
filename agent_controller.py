@@ -14,12 +14,14 @@ Workflow for each user request:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Callable, Optional
 
 from agent_logging import bind_run_context
 from agent_runtime import AgentRuntime
 from confirmation import ConfirmationManager
+from conversation_io import _load_or_create_conversation_id, _save_conversation
 from llm_client import LLMClient
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
@@ -270,6 +272,25 @@ class AgentController:
                     tools_used=tools_used,
                 )
             msg = "✅ Task saved to results memory. Starting fresh context."
+        # Conversation persistence: save the current conversation and rotate to a
+        # new conversation id so the next task starts with a clean context file.
+        old_id = ""
+        if self.builtin_executor:
+            old_id = self.builtin_executor.conversation_id
+        state_dir = getattr(self, "_conversation_state_dir", "")
+        if save and old_id and state_dir:
+            try:
+                conv_path = os.path.join(state_dir, "conversations", old_id + ".json")
+                if self.short_term:
+                    _save_conversation(conv_path, self.short_term)
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to save conversation on reset", exc_info=True)
+        if state_dir and self.builtin_executor:
+            try:
+                new_id = _load_or_create_conversation_id(state_dir, force_new=True)
+                self.builtin_executor.conversation_id = new_id
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to rotate conversation_id", exc_info=True)
         if self.working:
             self.working.clear()
         if self.short_term:

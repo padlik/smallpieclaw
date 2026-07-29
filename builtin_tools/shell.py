@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from builtin_tools.patterns import _is_dangerous_shell
 from builtin_tools.text_utils import _truncate_tail
+from conversation_io import _xdg_state_home
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
@@ -98,7 +99,7 @@ class ShellTools:
             return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
         return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
-    def _open_shell_log(self, caller_tag: str = "") -> tuple[Optional[_SupportsWriteClose], Optional[str]]:
+    def _open_shell_log(self, caller_tag: str = "", conv_id: str = "") -> tuple[Optional[_SupportsWriteClose], Optional[str]]:
         """Open a run-specific artifact log file for incremental writing.
 
         Returns (file_handle, absolute_path) or (None, None) on failure.
@@ -109,7 +110,11 @@ class ShellTools:
         created owner-only (0700) and the file owner-only (0600).
         """
         try:
-            log_dir = os.path.join(self._owner._data_dir, "shell_logs")
+            xdg_state_home = _xdg_state_home()
+            conv_id = conv_id or self._owner.conversation_id or "default"
+            log_dir = os.path.join(
+                xdg_state_home, self._owner._agent_name, "session_logs", conv_id
+            )
             os.makedirs(log_dir, mode=0o700, exist_ok=True)
             # makedirs honours mode only when creating; tighten an existing dir.
             try:
@@ -144,6 +149,43 @@ class ShellTools:
         if total_chars > self._owner.max_output:
             logger.info("Built-in shell: full output (%d chars) saved to %s",
                         total_chars, path)
+            _secrets = getattr(self._owner, '_vault_secrets', [])
+            if _secrets:
+                _REDACT_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB
+                try:
+                    file_size = os.path.getsize(path)
+                except OSError:
+                    file_size = 0
+                if file_size > _REDACT_SIZE_LIMIT:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                    logger.warning(
+                        "session log at %s exceeded redaction size limit (%d bytes) — deleted",
+                        path,
+                        file_size,
+                    )
+                    return None
+                _tmp = path + '.tmp'
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='replace') as _f:
+                        _content = _f.read()
+                    for _s in _secrets:
+                        if _s:
+                            _content = _content.replace(_s, '[REDACTED]')
+                    with open(_tmp, 'w', encoding='utf-8') as _f:
+                        _f.write(_content)
+                    try:
+                        os.chmod(_tmp, 0o600)
+                    except OSError:
+                        pass
+                    os.replace(_tmp, path)
+                except OSError:
+                    try:
+                        os.unlink(_tmp)
+                    except OSError:
+                        pass
             return path
         try:
             os.unlink(path)
@@ -175,14 +217,28 @@ class ShellTools:
             logger.warning("nsjail builder not initialised — falling back to subprocess")
             return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
+        conv_id = self._owner.conversation_id or "default"
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self._owner.default_timeout))
         with self._owner._shell_env_lock:
             env_snapshot = dict(self._owner._shell_env)
-        cfg_path, nsjail_cmd = builder.build(command, timeout, shell_env=env_snapshot)
+        xdg_state_home = _xdg_state_home()
+        session_logs_dir = os.path.join(
+            xdg_state_home,
+            self._owner._agent_name,
+            "session_logs",
+            conv_id,
+        )
+        try:
+            os.makedirs(session_logs_dir, mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+        cfg_path, nsjail_cmd = builder.build(
+            command, timeout, shell_env=env_snapshot, session_logs_dir=session_logs_dir
+        )
 
         try:
-            return self._run_shell_subprocess(args, caller_tag=caller_tag, nsjail_cmd=nsjail_cmd)
+            return self._run_shell_subprocess(args, caller_tag=caller_tag, nsjail_cmd=nsjail_cmd, conv_id=conv_id)
         finally:
             try:
                 os.unlink(cfg_path)
@@ -190,14 +246,15 @@ class ShellTools:
                 pass
 
     def _run_shell_subprocess(self, args: dict, caller_tag: str = "",
-                              nsjail_cmd: Optional[list[str]] = None) -> dict:
+                              nsjail_cmd: Optional[list[str]] = None,
+                              conv_id: str = "") -> dict:
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self._owner.default_timeout))
         logger.info("Built-in shell (subprocess) executing: %s", command[:120])
         _start = time.monotonic()
 
         # Open artifact log for incremental writing; kept only if output is large.
-        _log_fh, _artifact_path = self._open_shell_log(caller_tag)
+        _log_fh, _artifact_path = self._open_shell_log(caller_tag, conv_id=conv_id)
         _tail_out = ""
         _tail_err = ""
         _total_out = 0
@@ -512,6 +569,7 @@ class ShellTools:
         When chunk_callback is provided and self._owner._shell_streaming is True, each
         decoded text chunk is forwarded to the callback as it arrives.
         """
+        conv_id = self._owner.conversation_id or "default"
         command = str(args.get("command", "")).strip()
         timeout = int(args.get("timeout", self._owner.default_timeout))
         logger.info("Built-in shell (pty) executing: %s", command[:120])
@@ -547,7 +605,7 @@ class ShellTools:
         _tail = ""
 
         # Open artifact log for incremental writing.
-        _log_fh, _artifact_path = self._open_shell_log(caller_tag)
+        _log_fh, _artifact_path = self._open_shell_log(caller_tag, conv_id=conv_id)
 
         try:
             while proc.isalive():

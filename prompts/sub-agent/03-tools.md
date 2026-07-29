@@ -40,6 +40,9 @@ Each shell call runs in a separate jail — `export VAR=value` does NOT persist 
   bind-mounted as /tmp in every jail). Files in /tmp survive across calls within the session
   and are cleaned up at agent shutdown.
 - Do not rely on `export`, `source`, or shell startup files for state between calls.
+- Large shell outputs are saved to a path readable by both file_read and shell.
+  The [full output saved to: <path>] notice in the tool result gives the path.
+  Sub-agents share the main conversation's session_logs folder.
 
 Rules:
 - Use shell for one-off or task-specific scripts.
