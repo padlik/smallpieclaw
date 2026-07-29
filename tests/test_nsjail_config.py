@@ -294,8 +294,8 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_skills_dir_rejected_on_blocked_user_prefix(self) -> None:
-        """skills_dir on a blocked user prefix (e.g. ~/.local/share/agent/skills) is rejected."""
+    def test_config_skills_dir_accepted_on_blocked_user_prefix(self) -> None:
+        """skills_dir on a blocked user prefix (e.g. ~/.local/share/agent/skills) is accepted because the mount is read-only and the user-prefix blocklist only applies to RW trusted-dir mounts."""
         home = os.path.expanduser("~")
         skills_dir = os.path.join(home, ".local", "share", "agent", "skills")
         with patch("os.path.isdir", return_value=True), \
@@ -310,8 +310,9 @@ class TestBuild:
         try:
             with open(cfg_path) as f:
                 content = f.read()
-            assert "# Skills directory mount (read-only)" not in content
-            assert builder.skills_dir not in content
+            assert "# Skills directory mount (read-only)" in content
+            assert skills_dir in content
+            assert "rw: false" in content
         finally:
             os.unlink(cfg_path)
 

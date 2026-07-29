@@ -1,6 +1,6 @@
 ### Requirement: skills_dir is mounted read-only inside the nsjail sandbox
 
-When the `skills_dir` directory exists on the host filesystem and is not a blocked sensitive path, the nsjail config builder MUST emit a read-only bind-mount entry for it inside the sandbox. This makes skill scripts and binaries referenced in the system prompt's AVAILABLE SKILLS section accessible to shell commands running inside the jail. The mount MUST be skipped silently (with a debug log) if the directory does not exist. The mount MUST be skipped with a warning log if the path is a blocked sensitive user path (`~/.ssh`, `~/.local`, `~/.config`, `~/.gnupg`).
+When the `skills_dir` directory exists on the host filesystem and is not a blocked sensitive **system** path, the nsjail config builder MUST emit a read-only bind-mount entry for it inside the sandbox. This makes skill scripts and binaries referenced in the system prompt's AVAILABLE SKILLS section accessible to shell commands running inside the jail. The mount MUST be skipped silently (with a debug log) if the directory does not exist. The mount MUST be skipped with a warning log if the path is a blocked sensitive **system** path (`/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/usr`, `/root`, `/var`, `/run`). The mount is **exempt** from the user-home prefix blocklist (`~/.ssh`, `~/.local`, `~/.config`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.cache`) because `skills_dir` is mounted read-only (`rw: false`) and the blocklist was designed to prevent sensitive read-write trusted-dir mounts. This allows `skills_dir` under common XDG-style paths (e.g. `~/.config/opencode/skills/`, `~/.local/share/agent/skills/`) to be mounted read-only inside the jail.
 
 Feature: skills-dir-sandbox-mount
 
@@ -37,8 +37,15 @@ Feature: skills-dir-sandbox-mount
 - **THEN** the directory is mounted read-only inside the jail
 - **AND** no "restricted system path" warning is logged
 
-#### Scenario: skills_dir on a blocked sensitive path is rejected
-- **GIVEN** `skills_dir` resolves to `~/.local/share/agent/skills` (under a blocked user prefix)
+#### Scenario: skills_dir on a blocked system path is rejected
+- **GIVEN** `skills_dir` resolves to `/etc/skills` (under a blocked system prefix)
 - **WHEN** the nsjail config is generated
 - **THEN** no mount entry for `skills_dir` is emitted
-- **AND** a warning is logged that the path is a restricted user path
+- **AND** a warning is logged that the path is a restricted system path
+
+#### Scenario: skills_dir under a blocked user-home prefix is accepted
+- **GIVEN** `skills_dir` resolves to `~/.local/share/agent/skills` (under a blocked user prefix)
+- **WHEN** the nsjail config is generated
+- **THEN** the directory is mounted read-only inside the jail
+- **AND** no "restricted path" warning is logged
+- **AND** the mount entry has `rw: false`

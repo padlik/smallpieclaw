@@ -414,12 +414,17 @@ class NsjailConfigBuilder:
 
         skills_mounts: list[str] = []
         if self.skills_dir and os.path.isdir(self.skills_dir):
+            # skills_dir is mounted read-only (rw: false), so the user-prefix
+            # blocklist — designed to prevent sensitive RW trusted-dir mounts —
+            # does not apply. Only system prefixes are checked. See
+            # openspec/changes/archive/2026-07-followups.md (2026-07-28-nsjail-
+            # directory-access) for the debt rationale.
             if self.skills_dir == "/" or any(
                 self.skills_dir == p or self.skills_dir.startswith(p + "/")
-                for p in (_BLOCKED_SYSTEM_PREFIXES + self._blocked_user_prefixes)
+                for p in _BLOCKED_SYSTEM_PREFIXES
             ):
                 logger.warning(
-                    "nsjail: skills_dir rejected (restricted path), skipping mount: %s",
+                    "nsjail: skills_dir rejected (restricted system path), skipping mount: %s",
                     self.skills_dir,
                 )
             else:
