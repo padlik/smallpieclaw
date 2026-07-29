@@ -87,6 +87,14 @@ Consolidated list of deferred items, future work, and out-of-scope items extract
 - **macOS case-insensitivity handling** (`realpath()` doesn't normalize case — noted as a decision) — *review-log.md* — security — low
 - **`add_trusted` dedup/normalization** against duplicate and trailing-slash variants — *review-log.md* — cleanup — low
 
+## 2026-07-28-nsjail-directory-access
+
+- **`_blocked_user_prefixes` is over-broad for read-only mounts** — The targeted user-prefix blocklist (`~/.ssh`, `~/.local`, `~/.config`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.cache`) was designed to prevent sensitive RW trusted-dir mounts. It is also applied to `skills_dir`, which is mounted **read-only** (`rw: false`). As a result, a `skills_dir` under `~/.local/...` or `~/.config/...` (e.g. the OpenCode default `~/.config/opencode/skills/`) is silently rejected and skills become unavailable inside the jail. **Resolved for `skills_dir`**: the skills_dir mount is now exempt from `_blocked_user_prefixes` (system prefixes still apply) because the RO constraint eliminates the exfiltration/tampering risk the blocklist was designed to prevent. **Remaining debt**: the agent's directory configuration as a whole needs review, refactor, and improvement — the blocklist is applied uniformly to all RO system-style mounts, the XDG path split (`~/.local/share` vs `~/.local/state`) fragments agent state, and the relationship between trusted-dir, skills_dir, session_logs, and vault path resolution is ad-hoc rather than governed by a unified directory model. A broader effort to consolidate directory configuration, narrow the blocklist to sensitive subdirs only (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`), and define a single coherent path-resolution policy is deferred — *design.md D2, nsjail_config.py, config_schema.py, main.py* — security/architecture — medium
+
+## 2026-07-29-add-session-logs-and-cert-mounts
+
+- No follow-ups found.
+
 ---
 
 ## Cross-cutting observations
