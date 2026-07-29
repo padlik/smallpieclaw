@@ -230,11 +230,29 @@ class NsjailConfigBuilder:
             )
         return lines
 
+    def _detect_ca_certs(self) -> tuple[Optional[str], Optional[str]]:
+        """Detect the system CA certificate store path (distro-aware).
+
+        Returns (cafile, capath) or (None, None) if none found.
+        Detection order: Debian -> Alpine -> Fedora/RHEL.
+        """
+        # Debian/Ubuntu: /etc/ssl/certs dir + /etc/ssl/certs/ca-certificates.crt file
+        if os.path.isdir("/etc/ssl/certs") and os.path.isfile("/etc/ssl/certs/ca-certificates.crt"):
+            return "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs"
+        # Alpine: /etc/ssl/cert.pem file, no dir
+        if os.path.isfile("/etc/ssl/cert.pem"):
+            return "/etc/ssl/cert.pem", None
+        # Fedora/RHEL: /etc/pki/tls/certs dir + /etc/pki/tls/certs/ca-bundle.crt file
+        if os.path.isdir("/etc/pki/tls/certs") and os.path.isfile("/etc/pki/tls/certs/ca-bundle.crt"):
+            return "/etc/pki/tls/certs/ca-bundle.crt", "/etc/pki/tls/certs"
+        return None, None
+
     def build(
         self,
         command: str,
         timeout: int,
         shell_env: Optional[dict] = None,
+        session_logs_dir: str = "",
     ) -> tuple[str, list[str]]:
         """Generate the nsjail config file and command list for a shell call.
 
@@ -243,6 +261,8 @@ class NsjailConfigBuilder:
             timeout: Maximum wall-clock execution time in seconds.
             shell_env: Optional environment variables passed as ``-E KEY=VALUE``
                 flags to nsjail.
+            session_logs_dir: Optional absolute path to session logs directory;
+                mounted read-only inside the jail when it exists.
 
         Returns:
             A tuple of ``(config_path, nsjail_cmd)``.  The config file is a
@@ -289,8 +309,23 @@ class NsjailConfigBuilder:
             'envar: "LANG=C.UTF-8"',
             'envar: "TERM=xterm-256color"',
             "",
-            "# System mounts",
         ]
+
+        cafile: Optional[str] = None
+        capath: Optional[str] = None
+        if self.allow_net:
+            cafile, capath = self._detect_ca_certs()
+            if cafile is not None or capath is not None:
+                lines.append("# TLS cert env vars (allow_net=true)")
+                if cafile and '"' not in cafile and '\\' not in cafile:
+                    lines.append(f'envar: "SSL_CERT_FILE={cafile}"')
+                if capath and '"' not in capath and '\\' not in capath:
+                    lines.append(f'envar: "SSL_CERT_DIR={capath}"')
+                lines.append("")
+
+        lines.extend([
+            "# System mounts",
+        ])
         lines.extend(system_mounts)
 
         # Minimal /dev nodes for shell redirections (2>/dev/null, etc.)
@@ -318,6 +353,28 @@ class NsjailConfigBuilder:
             f'is_bind: true rw: true mandatory: true }}',
             "",
         ])
+
+        if session_logs_dir and os.path.isdir(session_logs_dir):
+            lines.append("# Session logs (read-only mount — agent writes outside jail, shell reads inside)")
+            lines.append(
+                f'mount: {{ src: {json.dumps(session_logs_dir)} dst: {json.dumps(session_logs_dir)}'
+                f' is_bind: true rw: false mandatory: false }}'
+            )
+            lines.append("")
+
+        if self.allow_net and (cafile is not None or capath is not None):
+            lines.append("# CA certificate store (read-only, allow_net=true)")
+            if capath and os.path.isdir(capath):
+                lines.append(
+                    f'mount: {{ src: {json.dumps(capath)} dst: {json.dumps(capath)}'
+                    f' is_bind: true rw: false mandatory: false }}'
+                )
+            elif cafile and os.path.isfile(cafile):
+                lines.append(
+                    f'mount: {{ src: {json.dumps(cafile)} dst: {json.dumps(cafile)}'
+                    f' is_bind: true rw: false mandatory: false }}'
+                )
+            lines.append("")
 
         skills_mounts: list[str] = []
         if self.skills_dir and os.path.isdir(self.skills_dir):

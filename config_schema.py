@@ -448,6 +448,10 @@ class AgentConfig:
     # namespace (clone_newnet: true, no network access); when true the jail shares
     # the host network namespace (clone_newnet: false, network access available).
     allow_net: bool = False
+    # Days to retain per-conversation session_logs directories. Folders whose
+    # newest file is older than this are deleted at startup, along with the
+    # matching conversation JSON file. The active conversation is always kept.
+    session_logs_retention_days: int = 7
     # Creativity mode for prompt assembly — default/planner/explorer/resilient
     creativity_mode: str = "default"
     # Maximum iterations for plan execution (higher than normal max_iterations
@@ -625,6 +629,7 @@ def _parse_agent(raw: dict) -> AgentConfig:
         shell_nsjail_pids_max=_parse_int(section.get("shell_nsjail_pids_max"), 64, "agent.shell_nsjail_pids_max"),
         shell_nsjail_cpu_percent=_parse_int(section.get("shell_nsjail_cpu_percent"), 50, "agent.shell_nsjail_cpu_percent"),
         allow_net=_parse_bool(section.get("allow_net", False), "agent.allow_net"),
+        session_logs_retention_days=max(1, _parse_int(section.get("session_logs_retention_days"), 7, "agent.session_logs_retention_days")),
         creativity_mode=section.get("creativity_mode", "default"),
         plan_max_iterations=_parse_int(section.get("plan_max_iterations"), 50, "agent.plan_max_iterations"),
         inactivity_warn_minutes=_parse_int(section.get("inactivity_warn_minutes"), 15, "agent.inactivity_warn_minutes"),

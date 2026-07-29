@@ -5,7 +5,10 @@ Tests run inside a Lima VM and are skipped when Lima is not installed.
 
 from __future__ import annotations
 
+import os
 import uuid
+
+import pytest
 
 from tests.nsjail.conftest import NsjailVM
 
@@ -215,17 +218,87 @@ def test_skills_dir_write_fails(nsjail_vm: NsjailVM) -> None:
     assert host_check.stdout.strip() == "original"
 
 
-def test_shell_logs_not_mounted(nsjail_vm: NsjailVM) -> None:
-    """shell_logs directory is not mounted inside the jail and is invisible."""
-    host_dir = "/tmp/nsjail_shell_logs_test"
+def test_session_logs_mounted_readonly(nsjail_vm: NsjailVM) -> None:
+    """session_logs directory is mounted read-only at its host path when provided."""
+    host_dir = "/tmp/nsjail_session_logs_test"
     nsjail_vm.run(
         f"rm -rf {host_dir} && mkdir -p {host_dir} && echo secret-log-data > {host_dir}/artifact.log"
     )
-    config = _base_config(
-        "test-shell-logs-not-mounted",
-        f"test -e {host_dir}/artifact.log && echo FOUND || echo MISSING",
+    mount = (
+        f'mount: {{ src: "{host_dir}" dst: "{host_dir}" '
+        'is_bind: true rw: false mandatory: false }'
     )
-    cfg_path = "/tmp/test_shell_logs_not_mounted.cfg"
+    config = _base_config(
+        "test-session-logs-mounted",
+        f"cat {host_dir}/artifact.log || echo READ_FAILED",
+        mount,
+    )
+    cfg_path = "/tmp/test_session_logs_mounted.cfg"
+    _write_config(nsjail_vm, cfg_path, config)
+    result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "secret-log-data" in result.stdout
+    # Writing through the read-only mount should fail.
+    write_config = _base_config(
+        "test-session-logs-ro",
+        f"echo hacked > {host_dir}/artifact.log 2>&1 || echo WRITE_BLOCKED",
+        mount,
+    )
+    write_cfg_path = "/tmp/test_session_logs_ro.cfg"
+    _write_config(nsjail_vm, write_cfg_path, write_config)
+    write_result = nsjail_vm.run_nsjail(write_cfg_path, timeout=15)
+    assert "WRITE_BLOCKED" in write_result.stdout
+    host_check = nsjail_vm.run(f"cat {host_dir}/artifact.log")
+    assert host_check.stdout.strip() == "secret-log-data"
+
+
+def test_session_logs_mount_skipped_when_empty(nsjail_vm: NsjailVM) -> None:
+    """When session_logs_dir is empty, no session_logs mount is added."""
+    host_dir = "/tmp/nsjail_session_logs_missing"
+    nsjail_vm.run(
+        f"rm -rf {host_dir} && mkdir -p {host_dir} && echo data > {host_dir}/file.log"
+    )
+    # No mount entry for host_dir.
+    config = _base_config(
+        "test-session-logs-missing",
+        f"test -e {host_dir}/file.log && echo FOUND || echo MISSING",
+    )
+    cfg_path = "/tmp/test_session_logs_missing.cfg"
+    _write_config(nsjail_vm, cfg_path, config)
+    result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "MISSING" in result.stdout
+
+
+def test_ca_certs_mounted_readonly_when_allow_net(nsjail_vm: NsjailVM) -> None:
+    """When allow_net is true, /etc/ssl/certs is mounted read-only if present."""
+    if not os.path.isdir("/etc/ssl/certs"):
+        pytest.skip("Host /etc/ssl/certs does not exist")
+    mount = (
+        'mount: { src: "/etc/ssl/certs" dst: "/etc/ssl/certs" '
+        'is_bind: true rw: false mandatory: false }'
+    )
+    config = _base_config(
+        "test-ca-certs-mounted",
+        "test -r /etc/ssl/certs && echo READABLE || echo MISSING",
+        mount,
+    )
+    cfg_path = "/tmp/test_ca_certs_mounted.cfg"
+    _write_config(nsjail_vm, cfg_path, config)
+    result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "READABLE" in result.stdout
+
+
+def test_ca_certs_not_mounted_when_no_allow_net(nsjail_vm: NsjailVM) -> None:
+    """When allow_net is false, no CA certificate mount is added."""
+    if not os.path.isdir("/etc/ssl/certs"):
+        pytest.skip("Host /etc/ssl/certs does not exist")
+    config = _base_config(
+        "test-ca-certs-missing",
+        "test -e /etc/ssl/certs && echo FOUND || echo MISSING",
+    )
+    cfg_path = "/tmp/test_ca_certs_missing.cfg"
     _write_config(nsjail_vm, cfg_path, config)
     result = nsjail_vm.run_nsjail(cfg_path, timeout=15)
     assert result.returncode == 0, result.stderr

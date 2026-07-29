@@ -118,16 +118,23 @@ class BuiltinExecutor:
                  shell_nsjail_memory_mb: int = 256,
                  shell_nsjail_pids_max: int = 64,
                  shell_nsjail_cpu_percent: int = 50,
-                  allow_net: bool = False,
-                  nsjail_session_tmpdir: str = "",
-                  nsjail_trusted_dirs_path: str = "",
-                  skills_dir: str = "",
-                  nsjail_agent_dir: str = ""):
+                   allow_net: bool = False,
+                   nsjail_session_tmpdir: str = "",
+                   nsjail_trusted_dirs_path: str = "",
+                   skills_dir: str = "",
+                   nsjail_agent_dir: str = "",
+                   agent_name: str = "piclaw",
+                   vault_secrets: Optional[list[str]] = None):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
         self._sub_agent_factory = sub_agent_factory  # Callable[[model, context_key, label, notify_fn], SubAgentRunner]
         self._data_dir = data_dir
+        self._agent_name = agent_name
+        # Optional[str] — current conversation id; set by main.py on startup and
+        # rotated by AgentController.reset_task(). Used for per-conversation
+        # session_logs paths and persistence.
+        self.conversation_id: str = ""
         self._memory = memory  # Optional[MemoryStore] — for memory_write built-in
         self._working = working  # Optional[WorkingMemory] — for spawn_agent context summary
         self._results = results  # Optional[ResultsMemory] — for spawn_agent context summary
@@ -136,6 +143,7 @@ class BuiltinExecutor:
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
         self._vault_path = vault_path  # Path to TOML vault file for secret_get
         self._log_jsonl_path = log_jsonl_path  # Active JSONL log sink for the log_query built-in
+        self._vault_secrets: list[str] = list(vault_secrets or [])
         self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
         self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init
         self._shell_backend = shell_backend   # "subprocess" or "pty"

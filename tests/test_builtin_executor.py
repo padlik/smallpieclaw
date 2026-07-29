@@ -793,18 +793,22 @@ class TestShellStreaming:
 class TestShellLogArtifacts:
     """Tests for full-log artifact persistence when output is truncated."""
 
-    def test_no_artifact_when_within_limit(self, tmp_path):
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+    def test_no_artifact_when_within_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path), agent_name="testagent")
+        ex.conversation_id = "testconv"
         result = ex.execute("shell", {"command": "echo small"})
         assert result["success"] is True
         assert result.get("full_log_path") is None
-        # shell_logs dir may exist but must be empty (log file deleted after small run)
-        log_dir = tmp_path / "shell_logs"
+        # session_logs dir may exist but must be empty (log file deleted after small run)
+        log_dir = tmp_path / "testagent" / "session_logs" / "testconv"
         if log_dir.exists():
             assert list(log_dir.iterdir()) == []
 
-    def test_artifact_written_when_truncated(self, tmp_path):
-        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path))
+    def test_artifact_written_when_truncated(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path), agent_name="testagent")
+        ex.conversation_id = "testconv"
         # Produce > 50 chars of output
         result = ex.execute(
             "shell",
@@ -854,6 +858,50 @@ class TestShellLogArtifacts:
             full = fh.read()
         assert "line1" in full
         assert "line40" in full
+
+
+class TestShellLogRedaction:
+    """Tests for vault-secret redaction in session log artifacts."""
+
+    def test_secret_is_redacted_in_artifact(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        ex = BuiltinExecutor(
+            max_output=50,
+            data_dir=str(tmp_path),
+            agent_name="testagent",
+            vault_secrets=["supersecret"],
+        )
+        ex.conversation_id = "testconv"
+        result = ex.execute(
+            "shell",
+            {"command": "python3 -c \"print('supersecret ' * 20)\""},
+        )
+        assert result["success"] is True
+        path = result.get("full_log_path")
+        assert path is not None
+        assert os.path.exists(path)
+        assert oct(os.stat(path).st_mode & 0o777) == oct(0o600)
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+        assert "supersecret" not in content
+        assert "[REDACTED]" in content
+
+    def test_large_file_deleted_when_over_size_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        ex = BuiltinExecutor(
+            max_output=50,
+            data_dir=str(tmp_path),
+            agent_name="testagent",
+            vault_secrets=["secret"],
+        )
+        ex.conversation_id = "testconv"
+        monkeypatch.setattr("builtin_tools.shell.os.path.getsize", lambda _p: 11 * 1024 * 1024)
+        result = ex.execute(
+            "shell",
+            {"command": "for i in $(seq 1 40); do echo \"line$i\"; done"},
+        )
+        assert result["success"] is True
+        assert result.get("full_log_path") is None
 
 
 class TestShellStreamingThroughConfirm:
@@ -1143,8 +1191,8 @@ class TestSubprocessArtifactWriteFailure:
         # Inject a failing file handle so the first artifact write triggers OSError.
         original_open = ex._shell._open_shell_log
 
-        def _patched_open(caller_tag=""):
-            fh, path = original_open(caller_tag)
+        def _patched_open(caller_tag="", conv_id=""):
+            fh, path = original_open(caller_tag, conv_id=conv_id)
             if fh is not None:
                 fh.close()
             return _FailingWriter(), str(tmp_path / "fake_artifact.log")
