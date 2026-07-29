@@ -118,8 +118,9 @@ class BuiltinExecutor:
                  shell_nsjail_memory_mb: int = 256,
                  shell_nsjail_pids_max: int = 64,
                  shell_nsjail_cpu_percent: int = 50,
-                   allow_net: bool = False,
-                   nsjail_session_tmpdir: str = "",
+                    allow_net: bool = False,
+                    nsjail_dns_nameserver: str = "8.8.8.8",
+                    nsjail_session_tmpdir: str = "",
                    nsjail_trusted_dirs_path: str = "",
                    skills_dir: str = "",
                    nsjail_agent_dir: str = "",
@@ -156,6 +157,7 @@ class BuiltinExecutor:
         self._shell_nsjail_pids_max = shell_nsjail_pids_max
         self._shell_nsjail_cpu_percent = shell_nsjail_cpu_percent
         self._allow_net = allow_net
+        self._nsjail_dns_nameserver = nsjail_dns_nameserver
         self._shell_nsjail_session_tmpdir = nsjail_session_tmpdir
         # Session-scoped env dict for nsjail -E flag injection
         self._shell_env: dict[str, str] = {}
@@ -207,6 +209,7 @@ class BuiltinExecutor:
                     pids_max=shell_nsjail_pids_max,
                     cpu_percent=shell_nsjail_cpu_percent,
                     allow_net=self._allow_net,
+                    dns_nameserver=self._nsjail_dns_nameserver,
                     skills_dir=skills_dir,
                     agent_dir=nsjail_agent_dir,
                 )

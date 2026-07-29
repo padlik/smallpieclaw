@@ -241,6 +241,10 @@ long_run_warn_minutes = 30
 # When allow_net = true, the system CA certificate store is mounted read-only
 # inside the nsjail jail and SSL_CERT_FILE / SSL_CERT_DIR env vars are injected
 # so TLS-dependent tools (curl, git, Python ssl) can verify certificates.
+# dns_nameserver            = "8.8.8.8"  # nameserver written to /etc/resolv.conf
+#                          inside the jail when allow_net = true (the jail has
+#                          an isolated mount namespace, so the host's resolv.conf
+#                          is not visible). Defaults to Google public DNS.
 # session_logs_retention_days  = 7     # delete session_logs folders older than N days (default 7)
 
 [scheduler]

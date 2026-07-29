@@ -394,6 +394,7 @@ def _run(
     shell_nsjail_pids_max = int(agent_cfg.get("shell_nsjail_pids_max", 64))
     shell_nsjail_cpu_percent = int(agent_cfg.get("shell_nsjail_cpu_percent", 50))
     allow_net = app_cfg.agent.allow_net
+    dns_nameserver = app_cfg.agent.dns_nameserver
     creativity_mode = agent_cfg.get("creativity_mode", "default")
     plan_max_iterations = int(agent_cfg.get("plan_max_iterations", 50))
     inactivity_warn_minutes = int(agent_cfg.get("inactivity_warn_minutes", 15))
@@ -430,6 +431,7 @@ def _run(
         shell_nsjail_pids_max=shell_nsjail_pids_max,
         shell_nsjail_cpu_percent=shell_nsjail_cpu_percent,
         allow_net=allow_net,
+        nsjail_dns_nameserver=dns_nameserver,
         nsjail_session_tmpdir=nsjail_session_tmpdir,
         skills_dir=skills_dir_abs,
         nsjail_trusted_dirs_path=trusted_dirs_path,

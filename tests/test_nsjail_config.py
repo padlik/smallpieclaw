@@ -921,3 +921,138 @@ class TestCaCertDetection:
             cafile, capath = builder._detect_ca_certs()
         assert cafile is None
         assert capath is None
+
+
+class TestDnsResolvConf:
+    """Tests for /etc/resolv.conf injection when allow_net is true."""
+
+    def test_allow_net_true_injects_resolv_conf(self) -> None:
+        """allow_net=True injects a src_content mount for /etc/resolv.conf."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=True,
+            )
+            with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "# DNS resolution (allow_net=true)" in content
+                assert 'dst: "/etc/resolv.conf"' in content
+                assert "src_content:" in content
+                assert "nameserver 8.8.8.8" in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_allow_net_false_skips_resolv_conf(self) -> None:
+        """allow_net=False does not inject a resolv.conf mount."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=False,
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "/etc/resolv.conf" not in content
+                assert "src_content:" not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_custom_dns_nameserver_used(self) -> None:
+        """A custom dns_nameserver is written into the resolv.conf content."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=True,
+                dns_nameserver="1.1.1.1",
+            )
+            with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "nameserver 1.1.1.1" in content
+                assert "nameserver 8.8.8.8" not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_resolv_conf_src_content_has_real_newline(self) -> None:
+        """src_content value contains a real newline, not a literal backslash-n."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=True,
+            )
+            with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                # json.dumps("nameserver 8.8.8.8\n") => "nameserver 8.8.8.8\n"
+                # The \n is the two-character JSON escape (backslash + n),
+                # which nsjail's protobuf text parser interprets as a real
+                # newline. A double-escaped \\n (literal backslash + n) would
+                # be a bug.
+                assert '"nameserver 8.8.8.8\\n"' in content, (
+                    "src_content must contain the JSON newline escape (\\n), not a literal backslash-n (\\\\n)"
+                )
+                assert '"nameserver 8.8.8.8\\\\n"' not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_dns_and_ca_certs_both_present_when_allow_net(self) -> None:
+        """allow_net=True with detected CA certs produces both DNS and CA mounts."""
+        with tempfile.TemporaryDirectory() as session_tmpdir, \
+             tempfile.TemporaryDirectory() as capath, \
+             tempfile.NamedTemporaryFile(suffix=".crt") as cafile_fh:
+            cafile = cafile_fh.name
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=True,
+            )
+            with patch.object(
+                builder, "_detect_ca_certs", return_value=(cafile, capath),
+            ):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                # DNS mount
+                assert "# DNS resolution (allow_net=true)" in content
+                assert 'dst: "/etc/resolv.conf"' in content
+                # CA cert env vars + mount
+                assert f'envar: "SSL_CERT_FILE={cafile}"' in content
+                assert f'envar: "SSL_CERT_DIR={capath}"' in content
+                assert "# CA certificate store (read-only, allow_net=true)" in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_invalid_dns_nameserver_falls_back_to_default(self) -> None:
+        """An invalid dns_nameserver falls back to 8.8.8.8 with a warning."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=True,
+                dns_nameserver="not-an-ip",
+            )
+            assert builder.dns_nameserver == "8.8.8.8"
+
+    def test_empty_dns_nameserver_falls_back_to_default(self) -> None:
+        """An empty dns_nameserver falls back to 8.8.8.8."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                allow_net=True,
+                dns_nameserver="",
+            )
+            assert builder.dns_nameserver == "8.8.8.8"
