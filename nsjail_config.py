@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from typing import Any, Optional
@@ -25,6 +26,15 @@ _BLOCKED_SYSTEM_PREFIXES: tuple[str, ...] = (
     "/var", "/run",
 )
 
+# Minimal IPv4 address validator — rejects empty/garbage values that would
+# produce a non-functional /etc/resolv.conf inside the jail.
+_IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$")
+
+
+def _is_valid_ipv4(value: str) -> bool:
+    """Return True if *value* is a syntactically valid IPv4 address."""
+    return bool(_IPV4_RE.match(value))
+
 
 class NsjailConfigBuilder:
     """Build an nsjail config and command list for a single shell invocation."""
@@ -39,6 +49,7 @@ class NsjailConfigBuilder:
         allow_net: bool = False,
         skills_dir: str = "",
         agent_dir: str = "",
+        dns_nameserver: str = "8.8.8.8",
     ) -> None:
         """Initialize the builder.
 
@@ -56,6 +67,11 @@ class NsjailConfigBuilder:
             agent_dir: Absolute path to the agent's own installation directory;
                 blocked as a trusted mount to prevent the agent from mounting its
                 source code RW inside the sandbox.
+            dns_nameserver: Nameserver IP written to ``/etc/resolv.conf`` inside
+                the jail when ``allow_net`` is true.  The jail has an isolated
+                mount namespace (``clone_newns``), so the host's
+                ``/etc/resolv.conf`` is not visible and DNS resolution would
+                fail without this entry.  Defaults to ``8.8.8.8``.
         """
         self.session_tmpdir = os.path.realpath(os.path.abspath(session_tmpdir))
         self.trusted_dirs_path = os.path.abspath(trusted_dirs_path) if trusted_dirs_path else ""
@@ -79,6 +95,14 @@ class NsjailConfigBuilder:
         self.pids_max = pids_max
         self.cpu_percent = cpu_percent
         self.allow_net = allow_net
+        if not dns_nameserver or not _is_valid_ipv4(dns_nameserver):
+            logger.warning(
+                "nsjail: invalid dns_nameserver %r — falling back to 8.8.8.8",
+                dns_nameserver,
+            )
+            self.dns_nameserver = "8.8.8.8"
+        else:
+            self.dns_nameserver = dns_nameserver
         self.skills_dir = os.path.realpath(os.path.abspath(skills_dir)) if skills_dir else ""
         self._cgroup_info = self._detect_cgroup_capability()
 
@@ -314,6 +338,18 @@ class NsjailConfigBuilder:
         cafile: Optional[str] = None
         capath: Optional[str] = None
         if self.allow_net:
+            # DNS resolution: the jail has an isolated mount namespace
+            # (clone_newns), so the host's /etc/resolv.conf is not visible.
+            # Inject a minimal resolv.conf via src_content so tools like curl,
+            # git, and Python ssl can resolve hostnames.  See nsjail's
+            # configs/telegram.cfg for the canonical pattern.
+            resolv_content = f"nameserver {self.dns_nameserver}\n"
+            lines.append("# DNS resolution (allow_net=true)")
+            lines.append(
+                f'mount: {{ src_content: {json.dumps(resolv_content)}'
+                f' dst: {json.dumps("/etc/resolv.conf")} }}'
+            )
+            lines.append("")
             cafile, capath = self._detect_ca_certs()
             if cafile is not None or capath is not None:
                 lines.append("# TLS cert env vars (allow_net=true)")

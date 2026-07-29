@@ -448,6 +448,11 @@ class AgentConfig:
     # namespace (clone_newnet: true, no network access); when true the jail shares
     # the host network namespace (clone_newnet: false, network access available).
     allow_net: bool = False
+    # Nameserver IP written to /etc/resolv.conf inside the nsjail jail when
+    # allow_net is true. The jail has an isolated mount namespace, so the
+    # host's resolv.conf is not visible — DNS resolution would fail without
+    # this entry. Defaults to Google public DNS (8.8.8.8).
+    dns_nameserver: str = "8.8.8.8"
     # Days to retain per-conversation session_logs directories. Folders whose
     # newest file is older than this are deleted at startup, along with the
     # matching conversation JSON file. The active conversation is always kept.
@@ -629,6 +634,7 @@ def _parse_agent(raw: dict) -> AgentConfig:
         shell_nsjail_pids_max=_parse_int(section.get("shell_nsjail_pids_max"), 64, "agent.shell_nsjail_pids_max"),
         shell_nsjail_cpu_percent=_parse_int(section.get("shell_nsjail_cpu_percent"), 50, "agent.shell_nsjail_cpu_percent"),
         allow_net=_parse_bool(section.get("allow_net", False), "agent.allow_net"),
+        dns_nameserver=str(section.get("dns_nameserver", "8.8.8.8")),
         session_logs_retention_days=max(1, _parse_int(section.get("session_logs_retention_days"), 7, "agent.session_logs_retention_days")),
         creativity_mode=section.get("creativity_mode", "default"),
         plan_max_iterations=_parse_int(section.get("plan_max_iterations"), 50, "agent.plan_max_iterations"),

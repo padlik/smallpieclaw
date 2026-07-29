@@ -284,3 +284,25 @@ Feature: nsjail-shell-sandboxing
 - **GIVEN** `allow_net` is `true` and the CA cert store is mounted and env vars are set
 - **WHEN** the agent runs `shell("curl https://example.com")` inside the jail
 - **THEN** the command succeeds (TLS verification passes using the mounted CA bundle)
+
+### Requirement: DNS resolv.conf injected when networking is enabled
+
+When `allow_net` is `true`, the nsjail config MUST include a `src_content` mount that writes a `nameserver` line to `/etc/resolv.conf` inside the jail. The jail has an isolated mount namespace (`clone_newns: true`), so the host's `/etc/resolv.conf` is not visible and DNS resolution would fail without this entry. The nameserver IP is configurable via the `dns_nameserver` parameter (default `8.8.8.8`). When `allow_net` is `false` (default), no resolv.conf mount is added.
+
+Feature: nsjail-shell-sandboxing
+Rule: The resolv.conf mount is conditional on `allow_net=true`. When networking is isolated, DNS is irrelevant.
+
+#### Scenario: resolv.conf injected when allow_net=true
+- **GIVEN** `allow_net` is `true`
+- **WHEN** the nsjail config is generated
+- **THEN** the config contains a `mount` entry with `src_content` set to `"nameserver 8.8.8.8\n"` and `dst` set to `"/etc/resolv.conf"`
+
+#### Scenario: custom nameserver used when configured
+- **GIVEN** `allow_net` is `true` and `dns_nameserver` is set to `"1.1.1.1"`
+- **WHEN** the nsjail config is generated
+- **THEN** the config contains a `mount` entry with `src_content` set to `"nameserver 1.1.1.1\n"`
+
+#### Scenario: no resolv.conf mount when allow_net=false
+- **GIVEN** `allow_net` is `false` (default)
+- **WHEN** the nsjail config is generated
+- **THEN** no `src_content` mount for `/etc/resolv.conf` appears in the config
