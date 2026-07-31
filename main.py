@@ -278,8 +278,7 @@ def main():
     skills_dir    = paths.get("skills_dir", "skills")
     skills_dir_abs = os.path.join(_AGENT_DIR, skills_dir) if not os.path.isabs(skills_dir) else skills_dir
     downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
-    _agent_name   = os.path.basename(os.path.abspath("."))
-    tmp_dir       = os.path.abspath(paths.get("tmp_dir", f"/tmp/{_agent_name}"))
+    tmp_dir       = f"/tmp/{app_cfg.agent.agent_name}"
     workspace_dir = os.path.abspath(os.path.expanduser(paths.get("workspace_dir", "~/Documents")))
     log_file         = log_path(cfg)
     log_backup_count = int(paths.get("log_backup_count", 30))
@@ -302,7 +301,7 @@ def main():
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,
             workspace_dir=workspace_dir,
             log_file=log_file, log_backup_count=log_backup_count,
-            agent_name=os.path.basename(os.path.abspath(".")),
+            agent_name=app_cfg.agent.agent_name,
         )
 
 
@@ -331,9 +330,6 @@ def _run(
     # XDG state dir for trusted_dirs.json — outside the nsjail-mounted project dir
     # so a sandboxed shell command cannot overwrite the trust store.
     xdg_state_home = _xdg_state_home()
-    # NOTE: agent_name here is os.path.basename(cwd) (set in main()), while
-    # app_cfg.agent.agent_name (default "piclaw") drives log paths and vault.
-    # When cwd basename != config name, XDG state splits across two directories.
     nsjail_state_dir = os.path.join(xdg_state_home, agent_name)
     os.makedirs(nsjail_state_dir, mode=0o700, exist_ok=True)
     try:
@@ -437,6 +433,7 @@ def _run(
         nsjail_trusted_dirs_path=trusted_dirs_path,
         nsjail_agent_dir=_AGENT_DIR,
         agent_name=agent_name,
+        tmp_dir=tmp_dir,
         vault_secrets=vault_secrets,
     )
     builtin.conversation_id = conversation_id
@@ -482,7 +479,7 @@ def _run(
     _trusted_zone_checker = _TrustedZoneChecker(
         paths_config=app_cfg.paths,
         data_dir=data_dir,
-        agent_name=app_cfg.agent.agent_name,
+        agent_name=agent_name,
         vault_path=vault_file,
         trusted_dirs_path=trusted_dirs_path,
     )

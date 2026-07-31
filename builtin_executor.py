@@ -125,6 +125,7 @@ class BuiltinExecutor:
                    skills_dir: str = "",
                    nsjail_agent_dir: str = "",
                    agent_name: str = "piclaw",
+                   tmp_dir: str = "",
                    vault_secrets: Optional[list[str]] = None):
         self.default_timeout = default_timeout
         self.max_output = max_output
@@ -198,24 +199,32 @@ class BuiltinExecutor:
         self._agents = AgentTools(self)
         # nsjail config builder — only instantiated when nsjail backend is selected
         self._nsjail_builder: Optional[NsjailConfigBuilder] = None
-        if shell_backend == "nsjail" and nsjail_session_tmpdir:
-            nsjail_binary = shutil.which("nsjail")
-            if nsjail_binary is not None:
-                self._shell_nsjail_active = True
-                self._nsjail_builder = NsjailConfigBuilder(
-                    session_tmpdir=nsjail_session_tmpdir,
-                    trusted_dirs_path=nsjail_trusted_dirs_path,
-                    memory_mb=shell_nsjail_memory_mb,
-                    pids_max=shell_nsjail_pids_max,
-                    cpu_percent=shell_nsjail_cpu_percent,
-                    allow_net=self._allow_net,
-                    dns_nameserver=self._nsjail_dns_nameserver,
-                    skills_dir=skills_dir,
-                    agent_dir=nsjail_agent_dir,
+        if shell_backend == "nsjail":
+            if not (nsjail_session_tmpdir and tmp_dir):
+                logger.warning(
+                    "shell_backend='nsjail' but nsjail_session_tmpdir=%r/tmp_dir=%r not both "
+                    "set — falling back to subprocess",
+                    nsjail_session_tmpdir, tmp_dir,
                 )
-                logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
             else:
-                logger.warning("shell_backend='nsjail' but nsjail binary not found — falling back to subprocess")
+                nsjail_binary = shutil.which("nsjail")
+                if nsjail_binary is not None:
+                    self._shell_nsjail_active = True
+                    self._nsjail_builder = NsjailConfigBuilder(
+                        session_tmpdir=nsjail_session_tmpdir,
+                        tmp_dir=tmp_dir,
+                        trusted_dirs_path=nsjail_trusted_dirs_path,
+                        memory_mb=shell_nsjail_memory_mb,
+                        pids_max=shell_nsjail_pids_max,
+                        cpu_percent=shell_nsjail_cpu_percent,
+                        allow_net=self._allow_net,
+                        dns_nameserver=self._nsjail_dns_nameserver,
+                        skills_dir=skills_dir,
+                        agent_dir=nsjail_agent_dir,
+                    )
+                    logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
+                else:
+                    logger.warning("shell_backend='nsjail' but nsjail binary not found — falling back to subprocess")
         # Zone-based access control — set by main.py after construction
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
         # Per-executor ephemeral request grant tracker (isolated per agent/sub-agent)

@@ -20,6 +20,7 @@ class TestDetectSystemMounts:
     def _make_builder(self) -> NsjailConfigBuilder:
         return NsjailConfigBuilder(
             session_tmpdir="/tmp/test-session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/test-data/trusted_dirs.json",
             agent_dir="/tmp/test-agent",
         )
@@ -86,6 +87,7 @@ class TestBuild:
         """Config contains the correct time_limit from the timeout parameter."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("make test", timeout=60)
@@ -100,6 +102,7 @@ class TestBuild:
         """Config contains the cwd set to /tmp."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("ls", timeout=30)
@@ -114,6 +117,7 @@ class TestBuild:
         """Config does not contain a bind mount for the project directory."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("ls", timeout=30)
@@ -128,6 +132,7 @@ class TestBuild:
         """Config contains a RW bind mount for the session tmpdir as /tmp."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("ls", timeout=30)
@@ -139,10 +144,33 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
+    def test_config_contains_tmp_dir_mount_after_scratch_mount(self) -> None:
+        """tmp_dir is bind-mounted RW at its real path, immediately after the /tmp scratch mount."""
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
+            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            scratch_idx = content.index('dst: "/tmp"')
+            tmp_dir_idx = content.index(json.dumps(builder.tmp_dir))
+            assert scratch_idx < tmp_dir_idx
+            assert (
+                f'mount: {{ src: {json.dumps(builder.tmp_dir)} '
+                f'dst: {json.dumps(builder.tmp_dir)} '
+                f'is_bind: true rw: true mandatory: true }}'
+            ) in content
+        finally:
+            os.unlink(cfg_path)
+
     def test_config_contains_dev_null_and_dev_zero_mounts(self) -> None:
         """Config contains bind mounts for /dev/null and /dev/zero (quoted paths)."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("echo test", timeout=10)
@@ -163,6 +191,7 @@ class TestBuild:
         """Config contains base envar entries for PATH, HOME, LANG, TERM."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("ls", timeout=30)
@@ -176,10 +205,28 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
+    def test_config_contains_tmpdir_tmp_temp_envars_set_to_scratch_tmp(self) -> None:
+        """TMPDIR/TMP/TEMP are injected as base envars pointing at /tmp (scratch), not tmp_dir."""
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
+            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert 'envar: "TMPDIR=/tmp"' in content
+            assert 'envar: "TMP=/tmp"' in content
+            assert 'envar: "TEMP=/tmp"' in content
+        finally:
+            os.unlink(cfg_path)
+
     def test_config_contains_keep_env_false(self) -> None:
         """Config sets keep_env: false for environment isolation."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("ls", timeout=30)
@@ -194,6 +241,7 @@ class TestBuild:
         """Config contains all required namespace clone directives."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("ls", timeout=30)
@@ -213,6 +261,7 @@ class TestBuild:
         """Config contains the command as the exec target."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, _ = builder.build("make test", timeout=30)
@@ -228,6 +277,7 @@ class TestBuild:
         """allow_net=False sets clone_newnet: true (network isolated)."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
             allow_net=False,
         )
@@ -243,6 +293,7 @@ class TestBuild:
         """allow_net=True sets clone_newnet: false (host network)."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
             allow_net=True,
         )
@@ -261,6 +312,7 @@ class TestBuild:
             os.makedirs(skills_dir)
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 skills_dir=skills_dir,
             )
@@ -281,6 +333,7 @@ class TestBuild:
              patch("os.path.abspath", side_effect=lambda p: p):
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 skills_dir="/home/user/.agents/skills",
             )
@@ -303,6 +356,7 @@ class TestBuild:
              patch("os.path.abspath", side_effect=lambda p: p):
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 skills_dir=skills_dir,
             )
@@ -321,6 +375,7 @@ class TestBuild:
         missing_dir = "/tmp/nonexistent-skills-dir-for-test"
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
             skills_dir=missing_dir,
         )
@@ -337,6 +392,7 @@ class TestBuild:
         with patch("os.path.isdir", return_value=True):
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 skills_dir="/etc",
             )
@@ -353,6 +409,7 @@ class TestBuild:
         """Returned command list starts with nsjail --config."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, nsjail_cmd = builder.build("ls", timeout=30)
@@ -367,6 +424,7 @@ class TestBuild:
         """Returned command list includes -E KEY=VALUE flags from shell_env."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         cfg_path, nsjail_cmd = builder.build(
@@ -393,6 +451,7 @@ class TestBuild:
 
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=trusted_path,
             )
             with patch("os.path.exists", return_value=True), \
@@ -420,6 +479,7 @@ class TestBuild:
 
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
             )
             # Mock os.path.exists to return True for trusted dir paths
@@ -443,6 +503,7 @@ class TestBuild:
 
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
             )
             with patch("os.path.exists", return_value=True), \
@@ -468,6 +529,7 @@ class TestBuild:
 
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
                 agent_dir="/tmp/test-agent",
             )
@@ -494,6 +556,7 @@ class TestBuild:
 
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
                 agent_dir=agent_dir,
             )
@@ -520,6 +583,7 @@ class TestBuild:
 
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
                 agent_dir="/tmp/test-agent",
             )
@@ -546,6 +610,7 @@ class TestBuild:
 
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
                 agent_dir="/tmp/test-agent",
             )
@@ -579,6 +644,7 @@ class TestBuild:
 
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
             )
             # Mock os.path.exists and os.path.realpath to simulate Linux behavior
@@ -601,6 +667,7 @@ class TestBuild:
         with tempfile.TemporaryDirectory() as tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
             )
             # Should not raise
@@ -611,6 +678,7 @@ class TestBuild:
         """When cgroup delegation is unavailable, rlimits are used."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
             memory_mb=512,
         )
@@ -632,6 +700,7 @@ class TestBuild:
         """When cgroup delegation is available, cgroup limits are used."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
             memory_mb=256,
             pids_max=64,
@@ -659,6 +728,7 @@ class TestBuild:
         """When cgroup delegation is available, command is wrapped in systemd-run."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         builder._cgroup_info = {
@@ -679,6 +749,7 @@ class TestBuild:
         """When cgroup delegation is unavailable, command is raw nsjail."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         builder._cgroup_info = {"available": False, "cgroupv2_mount": None}
@@ -751,6 +822,7 @@ class TestSessionLogsMount:
              tempfile.TemporaryDirectory() as session_logs_dir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
             )
             cfg_path, _ = builder.build(
@@ -775,6 +847,7 @@ class TestSessionLogsMount:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
             )
             cfg_path, _ = builder.build("ls", timeout=30)
@@ -797,6 +870,7 @@ class TestCaCertDetection:
             cafile = cafile_fh.name
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=True,
             )
@@ -822,6 +896,7 @@ class TestCaCertDetection:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=False,
             )
@@ -840,6 +915,7 @@ class TestCaCertDetection:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=True,
             )
@@ -861,6 +937,7 @@ class TestCaCertDetection:
         """Debian/Ubuntu layout returns ca-certificates.crt + certs dir."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
 
@@ -880,6 +957,7 @@ class TestCaCertDetection:
         """Alpine layout returns cert.pem file with no capath."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
 
@@ -896,6 +974,7 @@ class TestCaCertDetection:
         """Fedora/RHEL layout returns ca-bundle.crt + certs dir."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
 
@@ -915,6 +994,7 @@ class TestCaCertDetection:
         """When no known CA layout exists, returns (None, None)."""
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
             trusted_dirs_path="/tmp/data/trusted_dirs.json",
         )
         with patch("os.path.isdir", return_value=False), \
@@ -932,6 +1012,7 @@ class TestDnsResolvConf:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=True,
             )
@@ -952,6 +1033,7 @@ class TestDnsResolvConf:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=False,
             )
@@ -969,6 +1051,7 @@ class TestDnsResolvConf:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=True,
                 dns_nameserver="1.1.1.1",
@@ -988,6 +1071,7 @@ class TestDnsResolvConf:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=True,
             )
@@ -1016,6 +1100,7 @@ class TestDnsResolvConf:
             cafile = cafile_fh.name
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=True,
             )
@@ -1041,6 +1126,7 @@ class TestDnsResolvConf:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=True,
                 dns_nameserver="not-an-ip",
@@ -1052,6 +1138,7 @@ class TestDnsResolvConf:
         with tempfile.TemporaryDirectory() as session_tmpdir:
             builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
                 trusted_dirs_path="/tmp/data/trusted_dirs.json",
                 allow_net=True,
                 dns_nameserver="",

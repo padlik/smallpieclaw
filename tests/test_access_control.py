@@ -24,7 +24,6 @@ def _make_paths(tmp: str, workspace: str | None = None) -> PathsConfig:
         prompts_dir=os.path.join(tmp, "prompts"),
         downloads_dir=os.path.join(tmp, "downloads"),
         workspace_dir=workspace or os.path.join(tmp, "workspace"),
-        tmp_dir=os.path.join(tmp, "tmp"),
     )
 
 
@@ -36,7 +35,6 @@ def _make_checker(tmp: str, workspace: str | None = None) -> TrustedZoneChecker:
         paths.prompts_dir,
         paths.downloads_dir,
         paths.workspace_dir,
-        paths.tmp_dir,
     ]:
         os.makedirs(d, exist_ok=True)
     return TrustedZoneChecker(paths_config=paths, data_dir=paths.data_dir, agent_name="test-agent")
@@ -176,7 +174,7 @@ class TestClassify:
             os.makedirs(os.path.dirname(vault_file), exist_ok=True)
             paths = _make_paths(tmp)
             for d in [paths.data_dir, paths.skills_dir, paths.prompts_dir,
-                      paths.downloads_dir, paths.workspace_dir, paths.tmp_dir]:
+                      paths.downloads_dir, paths.workspace_dir]:
                 os.makedirs(d, exist_ok=True)
             checker = TrustedZoneChecker(
                 paths_config=paths,

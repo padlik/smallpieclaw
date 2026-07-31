@@ -42,6 +42,7 @@ class NsjailConfigBuilder:
     def __init__(
         self,
         session_tmpdir: str,
+        tmp_dir: str,
         trusted_dirs_path: str = "",
         memory_mb: int = 256,
         pids_max: int = 64,
@@ -56,6 +57,10 @@ class NsjailConfigBuilder:
         Args:
             session_tmpdir: Per-session temporary directory; mounted as ``/tmp``
                 inside the sandbox.
+            tmp_dir: The agent's default trusted temp/handoff directory
+                (``f"/tmp/{agent_name}"``, already resolved and guaranteed to
+                exist by agent startup). Bind-mounted read-write at its real
+                host path, immediately after the ``/tmp`` scratch mount.
             trusted_dirs_path: Absolute path to ``trusted_dirs.json``.
             memory_mb: Memory limit in megabytes.
             pids_max: Maximum number of PIDs allowed inside the sandbox.
@@ -74,6 +79,7 @@ class NsjailConfigBuilder:
                 fail without this entry.  Defaults to ``8.8.8.8``.
         """
         self.session_tmpdir = os.path.realpath(os.path.abspath(session_tmpdir))
+        self.tmp_dir = os.path.realpath(os.path.abspath(tmp_dir)) if tmp_dir else ""
         self.trusted_dirs_path = os.path.abspath(trusted_dirs_path) if trusted_dirs_path else ""
         self._agent_dir = os.path.realpath(os.path.abspath(agent_dir)) if agent_dir else ""
         # Dynamic blocked prefixes: user-home paths that must never be trusted mounts.
@@ -243,9 +249,14 @@ class NsjailConfigBuilder:
                 logger.warning("Trusted directory does not exist: %s", real)
                 continue
             # Skip trusted-dir entries that are under an already-mounted path
-            # (e.g., session_tmpdir is mounted as /tmp).
+            # (e.g., session_tmpdir is mounted as /tmp, tmp_dir gets its own
+            # unconditional mount) — otherwise the same destination would get
+            # two mount stanzas in the generated config.
             if real == self.session_tmpdir or real.startswith(self.session_tmpdir + os.sep):
                 logger.debug("Trusted directory under session_tmpdir, skipping (already mounted as /tmp): %s", real)
+                continue
+            if self.tmp_dir and (real == self.tmp_dir or real.startswith(self.tmp_dir + os.sep)):
+                logger.debug("Trusted directory under tmp_dir, skipping (already mounted): %s", real)
                 continue
             rw = "true" if mode == "rw" else "false"
             lines.append(
@@ -332,6 +343,9 @@ class NsjailConfigBuilder:
             'envar: "HOME=/tmp"',
             'envar: "LANG=C.UTF-8"',
             'envar: "TERM=xterm-256color"',
+            'envar: "TMPDIR=/tmp"',
+            'envar: "TMP=/tmp"',
+            'envar: "TEMP=/tmp"',
             "",
         ]
 
@@ -386,6 +400,10 @@ class NsjailConfigBuilder:
             "",
             "# Session mounts",
             f'mount: {{ src: {json.dumps(self.session_tmpdir)} dst: "/tmp" '
+            f'is_bind: true rw: true mandatory: true }}',
+            "# Agent's default trusted temp/handoff directory — system mount,",
+            "# not subject to the trusted-dir blocklist, no operator approval needed.",
+            f'mount: {{ src: {json.dumps(self.tmp_dir)} dst: {json.dumps(self.tmp_dir)} '
             f'is_bind: true rw: true mandatory: true }}',
             "",
         ])

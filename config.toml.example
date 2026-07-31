@@ -290,8 +290,8 @@ log_file           = "agent.log"   # relative name → ~/.local/state/<agent_nam
                                     # Structured agent.jsonl is written alongside.
 log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups to keep
 pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate instances
-# tmp_dir defaults to /tmp/<working_dir_name> if not set
-# tmp_dir = "/tmp/agent"
+# Agent's temp/handoff directory is always /tmp/<agent_name> (agent.agent_name);
+# there is no config override for it.
 #
 # Trusted directories store (user-added file-access zones + nsjail mount list):
 #   ~/.local/state/<agent_name>/trusted_dirs.json

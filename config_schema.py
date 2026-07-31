@@ -500,7 +500,6 @@ class PathsConfig:
     log_file: str = "agent.log"
     log_backup_count: int = 30
     pid_file: str = "data/agent.pid"
-    tmp_dir: str = ""
     prompts_dir: str = "prompts"
     workspace_dir: str = "~/Documents"
 
@@ -663,7 +662,6 @@ def _parse_paths(raw: dict) -> PathsConfig:
         "log_file": _expand_path(section.get("log_file", "agent.log")),
         "log_backup_count": _parse_int(section.get("log_backup_count"), 30, "paths.log_backup_count"),
         "pid_file": _expand_path(section.get("pid_file", "data/agent.pid")),
-        "tmp_dir": _expand_path(section.get("tmp_dir", "")),
         "prompts_dir": _expand_path(section.get("prompts_dir", "prompts")),
         "workspace_dir": _expand_path(section.get("workspace_dir", "~/Documents")),
     }
