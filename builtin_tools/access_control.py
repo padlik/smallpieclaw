@@ -119,7 +119,7 @@ class TrustedZoneChecker:
         trusted_candidates = [
             paths_config.workspace_dir,
             paths_config.downloads_dir,
-            paths_config.tmp_dir if paths_config.tmp_dir else f"/tmp/{agent_name}",
+            f"/tmp/{agent_name}",
         ]
         self._default_trusted_dirs: list[str] = []
         for d in trusted_candidates:

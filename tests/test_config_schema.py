@@ -967,11 +967,6 @@ class TestPathsExpansion:
         cfg = parse_config(minimal_config)
         assert cfg.paths.downloads_dir == os.path.expanduser("~/Downloads")
 
-    def test_tmp_dir_tilde_expanded(self, minimal_config):
-        minimal_config["paths"]["tmp_dir"] = "~/tmp"
-        cfg = parse_config(minimal_config)
-        assert cfg.paths.tmp_dir == os.path.expanduser("~/tmp")
-
     def test_no_tilde_paths_unchanged(self, minimal_config):
         minimal_config["paths"]["skills_dir"] = "skills"
         minimal_config["paths"]["data_dir"] = "data"

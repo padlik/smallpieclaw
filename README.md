@@ -455,7 +455,7 @@ File storage defaults (override in `[paths]`):
 | Directory | Purpose |
 |-----------|---------|
 | `downloads/` | Files the user wants to keep |
-| System temp (e.g. `tmp_dir = "/tmp/myagent"`) | Temporary files; cleaned on reboot |
+| System temp (`/tmp/<agent_name>`, not configurable) | Temporary files; cleaned on reboot |
 
 ---
 
