@@ -190,7 +190,6 @@ Possible actions:
 Rules:
 - If the user says "use skill <name>" or the task clearly matches a listed skill, read its SKILL.md first using file_read, then follow the instructions inside.
 - SKILL.md files describe *how* to accomplish tasks using shell commands and other means. Any "tools" or sub-commands mentioned inside a SKILL.md are descriptions of functionality — they are NOT registered tools you can call. Do not call them with {{"action": "tool", ...}}. Use shell or file_read to implement the instructions described in the skill.
-- When a SKILL.md references scripts, binaries, or files with relative paths (e.g. scripts/run.sh, ./process.py), resolve them against the skill's directory shown in AVAILABLE SKILLS. Use the absolute path directly or prefix the command with: cd <skill_dir> && <command>.
 - Never include dangerous commands (rm -rf /, sudo, eval, reverse shells, etc.).
 - If a tool fails, try a different approach or explain the issue.
 - Always end with a "finish" action.

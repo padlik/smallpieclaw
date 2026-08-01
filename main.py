@@ -491,6 +491,7 @@ def _run(
 
     skills = SkillRegistry(skills_dir=skills_dir)
     logger.info("Loaded %d skill(s) from %s", skills.count(), skills_dir)
+    builtin.skill_registry = skills  # type: ignore[attr-defined]
 
     agent = AgentController(
         llm=llm,
