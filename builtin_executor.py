@@ -227,6 +227,8 @@ class BuiltinExecutor:
                     logger.warning("shell_backend='nsjail' but nsjail binary not found — falling back to subprocess")
         # Zone-based access control — set by main.py after construction
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
+        # Skill registry — set by main.py after construction (same pattern as trusted_zone_checker)
+        self.skill_registry = None  # Optional[SkillRegistry]
         # Per-executor ephemeral request grant tracker (isolated per agent/sub-agent)
         self.grant_tracker: GrantTracker = GrantTracker()
         # Per-confirmation zone_path store: token -> original path (for Telegram zone buttons)

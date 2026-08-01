@@ -489,8 +489,9 @@ def _run(
     # memory; the legacy JSON store is migration/backfill-only via
     # backfill_graph_memory.py.
 
-    skills = SkillRegistry(skills_dir=skills_dir)
-    logger.info("Loaded %d skill(s) from %s", skills.count(), skills_dir)
+    skills = SkillRegistry(skills_dir=skills_dir_abs)
+    logger.info("Loaded %d skill(s) from %s", skills.count(), skills_dir_abs)
+    builtin.skill_registry = skills  # type: ignore[attr-defined]
 
     agent = AgentController(
         llm=llm,

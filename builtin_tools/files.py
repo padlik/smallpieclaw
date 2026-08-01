@@ -12,6 +12,7 @@ from __future__ import annotations
 import difflib
 import logging
 import os
+import re
 from typing import TYPE_CHECKING
 
 from builtin_tools.access_control import ZoneClassification
@@ -21,6 +22,44 @@ if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
 
 logger = logging.getLogger(__name__)
+
+# Standard agentskills.io skill subdirectories for Tier 2 path substitution.
+_SKILL_SUBDIRS = ("scripts", "assets", "references", "tests")
+# Matches fenced code blocks (``` ... ```) and inline code spans (` ... `).
+_CODE_SPAN_RE = re.compile(r"(```[^\n]*\n.*?```|`[^`\n]+`)", re.DOTALL)
+# Matches any standard subdir at a path-component boundary, in a single pass.
+_SKILL_SUBDIR_RE = re.compile(
+    rf"(?<![/\w-])({'|'.join(re.escape(d) for d in _SKILL_SUBDIRS)})/"
+)
+
+
+def _subst_in_code_spans(text: str, pattern: re.Pattern, repl) -> str:
+    """Apply a compiled-pattern substitution only inside code fences and inline code spans."""
+    parts: list[str] = []
+    last_end = 0
+    for m in _CODE_SPAN_RE.finditer(text):
+        parts.append(text[last_end:m.start()])
+        parts.append(pattern.sub(repl, m.group(0)))
+        last_end = m.end()
+    parts.append(text[last_end:])
+    return "".join(parts)
+
+
+def _expand_skill_paths(content: str, skill_dir: str) -> str:
+    """Substitute relative path references in SKILL.md content with absolute paths.
+
+    Tier 1: ``./foo`` → ``<skill_dir>/foo`` globally (unambiguous in shell/path contexts).
+    Tier 2: standard subdirs (scripts/, assets/, references/, tests/) at a path-component
+    boundary, within fenced code blocks and inline code spans only.
+
+    Replacements are passed as callables (not plain strings) so that any backslashes
+    ``skill_dir`` contains are never interpreted as regex backreferences by ``re.sub``.
+    """
+    result = re.sub(r"(?<!\.)\./", lambda _m: skill_dir + "/", content)
+    result = _subst_in_code_spans(
+        result, _SKILL_SUBDIR_RE, lambda m: f"{skill_dir}/{m.group(1)}/"
+    )
+    return result
 
 
 class FileTools:
@@ -41,6 +80,21 @@ class FileTools:
         """Return a frozenset of current request grants, or empty frozenset."""
         gt = getattr(self._owner, "grant_tracker", None)
         return gt.snapshot() if gt is not None else frozenset()
+
+    def _resolve_skill_paths(self, content: str, path: str) -> str:
+        """Resolve relative paths in SKILL.md content using the skill registry."""
+        registry = getattr(self._owner, "skill_registry", None)
+        if registry is None:
+            skill_dir = os.path.dirname(path)
+        else:
+            skill = next(
+                (s for s in registry.all() if s.skill_md_path == path),
+                None,
+            )
+            if skill is None:
+                return content
+            skill_dir = skill.path  # skill DIRECTORY (not skill_md_path)
+        return _expand_skill_paths(content, skill_dir)
 
     # ---- file_read ----
 
@@ -110,6 +164,8 @@ class FileTools:
                 content = f.read(max_bytes)
             truncated = size > offset + max_bytes
             note = f"\n[Showing {len(content)} of {size} bytes from offset {offset}]" if truncated else ""
+            if os.path.basename(path) == "SKILL.md":
+                content = self._resolve_skill_paths(content, path)
             return {
                 "success": True,
                 "output": content + note,

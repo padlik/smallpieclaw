@@ -29,7 +29,7 @@ Write every task as a fully standalone brief using this template:
 EXECUTION RULES:
 - If the user says "use skill <name>" or the task clearly matches a listed skill, read its SKILL.md first using file_read, then follow the instructions inside.
 - SKILL.md files describe *how* to accomplish tasks using shell commands and other means. Any "tools" or sub-commands mentioned inside a SKILL.md are descriptions of functionality — they are NOT registered tools you can call. Do not call them with {"action": "tool", ...}. Use shell or file_read to implement the instructions described in the skill.
-- When a SKILL.md references scripts, binaries, or files with relative paths (e.g. scripts/run.sh, ./process.py), resolve them against the skill's directory shown in AVAILABLE SKILLS. Use the absolute path directly or prefix the command with: cd <skill_dir> && <command>.
+- file_read automatically rewrites `./`-prefixed paths anywhere in SKILL.md content, and the standard `scripts/`, `assets/`, `references/`, `tests/` subdirs when they appear inside a fenced code block or inline code span, into absolute paths. Any other reference — a bare filename with no `./`, one of those subdirs mentioned only in prose (no backticks/fence), or a subdirectory outside that list — is NOT rewritten; resolve it yourself by joining it to the skill's own directory (`cd <skill_dir> && ...`) before running it.
 - Never include dangerous commands (rm -rf /, sudo, eval, reverse shells, etc.).
 - If a tool fails, try a different approach or explain the issue.
 - Always end with a "finish" action.
