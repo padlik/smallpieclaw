@@ -193,8 +193,8 @@ class SkillRegistry:
         return Skill(
             name=name,
             description=description,
-            path=os.path.abspath(skill_dir),
-            skill_md_path=os.path.abspath(skill_md),
+            path=os.path.realpath(skill_dir),
+            skill_md_path=os.path.realpath(skill_md),
             license=fm.get("license", ""),
             compatibility=fm.get("compatibility", ""),
             metadata={k: v for k, v in fm.items()

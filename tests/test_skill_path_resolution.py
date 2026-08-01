@@ -93,6 +93,24 @@ class TestExpandSkillPaths:
         assert "/skill/references/c.md" in result
         assert "/skill/tests/d.py" in result
 
+    def test_tier1_parent_dir_reference_not_mangled(self):
+        content = "Run cd ../parent && ls"
+        result = _expand_skill_paths(content, "/skill")
+        assert "../parent" in result
+        assert "/skill/parent" not in result
+
+    def test_skill_dir_with_backslash_does_not_crash(self):
+        """A skill_dir containing a backslash must not be treated as a re.sub
+        backreference (e.g. \\1) in the replacement string."""
+        content = "Run ./scripts/run.sh"
+        result = _expand_skill_paths(content, r"/skills/foo\Users")
+        assert r"/skills/foo\Users/scripts/run.sh" in result
+
+    def test_tier2_fence_with_attributes_in_info_string(self):
+        content = "```python {.line-numbers}\nscripts/run.sh\n```"
+        result = _expand_skill_paths(content, "/skill")
+        assert "/skill/scripts/run.sh" in result
+
 
 # ---------------------------------------------------------------------------
 # Integration: _run_file_read SKILL.md intercept
@@ -142,3 +160,30 @@ class TestRunFileReadSkillMdIntercept:
             ft = _make_ft_with_registry(skill_dir, skill_md)
             result = ft._run_file_read({"_resolved_path": readme})
             assert "./scripts/run.sh" in result["output"]
+
+    def test_exec_file_read_through_symlinked_dir(self):
+        """End-to-end via _exec_file_read (the real production entrypoint): the
+        registry stores realpath'd paths, and _exec_file_read realpaths the
+        incoming path too, so a symlinked skills_dir must still match and get
+        substitution applied — instead of silently falling into the
+        'skill not found' branch (see skill_registry.py Skill.path/skill_md_path).
+        """
+        with tempfile.TemporaryDirectory() as real_dir:
+            skill_dir = os.path.join(real_dir, "actual-skill")
+            os.makedirs(skill_dir)
+            skill_md = os.path.join(skill_dir, "SKILL.md")
+            with open(skill_md, "w") as f:
+                f.write("Run ./scripts/fetch.py")
+
+            link_dir = os.path.join(real_dir, "linked-skill")
+            os.symlink(skill_dir, link_dir)
+            linked_skill_md = os.path.join(link_dir, "SKILL.md")
+
+            # Mirrors skill_registry.py's realpath-based construction.
+            ft = _make_ft_with_registry(
+                os.path.realpath(skill_dir), os.path.realpath(skill_md)
+            )
+            result = ft._exec_file_read({"path": linked_skill_md})
+            assert result["success"] is True
+            assert f"{os.path.realpath(skill_dir)}/scripts/fetch.py" in result["output"]
+            assert "./" not in result["output"]

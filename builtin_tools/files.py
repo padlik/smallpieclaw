@@ -26,16 +26,20 @@ logger = logging.getLogger(__name__)
 # Standard agentskills.io skill subdirectories for Tier 2 path substitution.
 _SKILL_SUBDIRS = ("scripts", "assets", "references", "tests")
 # Matches fenced code blocks (``` ... ```) and inline code spans (` ... `).
-_CODE_SPAN_RE = re.compile(r"(```[\w]*\n.*?```|`[^`\n]+`)", re.DOTALL)
+_CODE_SPAN_RE = re.compile(r"(```[^\n]*\n.*?```|`[^`\n]+`)", re.DOTALL)
+# Matches any standard subdir at a path-component boundary, in a single pass.
+_SKILL_SUBDIR_RE = re.compile(
+    rf"(?<![/\w-])({'|'.join(re.escape(d) for d in _SKILL_SUBDIRS)})/"
+)
 
 
-def _subst_in_code_spans(text: str, pattern: str, replacement: str) -> str:
-    """Apply regex substitution only inside code fences and inline code spans."""
+def _subst_in_code_spans(text: str, pattern: re.Pattern, repl) -> str:
+    """Apply a compiled-pattern substitution only inside code fences and inline code spans."""
     parts: list[str] = []
     last_end = 0
     for m in _CODE_SPAN_RE.finditer(text):
         parts.append(text[last_end:m.start()])
-        parts.append(re.sub(pattern, replacement, m.group(0)))
+        parts.append(pattern.sub(repl, m.group(0)))
         last_end = m.end()
     parts.append(text[last_end:])
     return "".join(parts)
@@ -47,12 +51,14 @@ def _expand_skill_paths(content: str, skill_dir: str) -> str:
     Tier 1: ``./foo`` → ``<skill_dir>/foo`` globally (unambiguous in shell/path contexts).
     Tier 2: standard subdirs (scripts/, assets/, references/, tests/) at a path-component
     boundary, within fenced code blocks and inline code spans only.
+
+    Replacements are passed as callables (not plain strings) so that any backslashes
+    ``skill_dir`` contains are never interpreted as regex backreferences by ``re.sub``.
     """
-    result = content.replace("./", skill_dir + "/")
-    for subdir in _SKILL_SUBDIRS:
-        pattern = rf"(?<![/\w-]){re.escape(subdir)}/"
-        replacement = f"{skill_dir}/{subdir}/"
-        result = _subst_in_code_spans(result, pattern, replacement)
+    result = re.sub(r"(?<!\.)\./", lambda _m: skill_dir + "/", content)
+    result = _subst_in_code_spans(
+        result, _SKILL_SUBDIR_RE, lambda m: f"{skill_dir}/{m.group(1)}/"
+    )
     return result
 
 
@@ -156,10 +162,10 @@ class FileTools:
                 if offset:
                     f.seek(offset)
                 content = f.read(max_bytes)
-            if path.endswith("SKILL.md"):
-                content = self._resolve_skill_paths(content, path)
             truncated = size > offset + max_bytes
             note = f"\n[Showing {len(content)} of {size} bytes from offset {offset}]" if truncated else ""
+            if os.path.basename(path) == "SKILL.md":
+                content = self._resolve_skill_paths(content, path)
             return {
                 "success": True,
                 "output": content + note,
