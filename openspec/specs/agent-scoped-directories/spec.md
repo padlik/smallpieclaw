@@ -2,92 +2,84 @@
 
 ## Purpose
 
-Define `agent_name` and `agent_home` configuration fields for shared agent state paths.
+Define `agent_name` as the sole agent identifier (resolved from `--agent-name` CLI); all storage paths derive from XDG Base Directories keyed by `agent_name`; `agent_home` is retired.
 
 ## Requirements
 
-### Requirement: Agent name and home directory configuration
+### Requirement: agent_name identifies the agent and its XDG storage namespace
 
-The application MUST support `agent_name` and `agent_home` fields in `[agent]` config, with sensible defaults. The vault path is independent of `agent_home` and lives under `XDG_STATE_HOME` alongside other agent state files.
+`agent_name` MUST be supplied via the `--agent-name` CLI argument. It is NOT read from `[agent].agent_name` config for path derivation. All XDG storage paths are prefixed with `agent_name` (see `xdg-path-resolution` spec). The `agent_home` concept is retired; no config field or env var provides it.
 
-Feature: Agent-scoped directories
-Rule: `agent_name` determines `agent_home`; vault lives in `~/.local/state/<agent_name>/secrets.toml` regardless of `agent_home`.
+Feature: Agent-scoped XDG directories
+Rule: `agent_name` from `--agent-name` CLI determines all storage paths; `agent_home` concept is retired.
 
-#### Scenario: Default agent name and home
-- **GIVEN** `[agent]` does not specify `agent_name` or `agent_home`
-- **WHEN** the application starts
-- **THEN** `agent_name` defaults to `"piclaw"`
-- **AND** `agent_home` resolves to `~/piclaw/`
-- **AND** the vault path defaults to `~/.local/state/piclaw/secrets.toml`
+#### Scenario: Agent named "piclaw" uses XDG paths under that name
+- **GIVEN** the agent is started with `--agent-name piclaw`
+- **WHEN** the application initialises
+- **THEN** all XDG paths are rooted under `piclaw`: `~/.local/state/piclaw/`, `~/.local/share/piclaw/`, `~/.config/piclaw/`, etc.
 
-#### Scenario: Custom agent name with default home
-- **GIVEN** `[agent]` has `agent_name = "mybot"`
-- **AND** `agent_home` is not set
-- **WHEN** the application starts
-- **THEN** `agent_home` resolves to `~/mybot/`
-- **AND** the vault path defaults to `~/.local/state/mybot/secrets.toml`
+#### Scenario: Different agent names produce distinct XDG namespaces
+- **GIVEN** two agents are started: one with `--agent-name piclaw` and one with `--agent-name mybot`
+- **WHEN** each agent initialises
+- **THEN** their state directories do not overlap: `~/.local/state/piclaw/` and `~/.local/state/mybot/` are distinct
+- **AND** no data written by one agent is readable from the other's XDG paths
 
-#### Scenario: Explicit agent home does NOT affect vault path
-- **GIVEN** `[agent]` has `agent_home = "/opt/smallpieclaw/data"`
-- **WHEN** the application starts
-- **THEN** `agent_home` is `/opt/smallpieclaw/data`
-- **AND** the vault path still defaults to `~/.local/state/piclaw/secrets.toml`
-- **AND** the vault path is unaffected by `agent_home`
+### Requirement: Vault is always at the XDG state path
 
-#### Scenario: Vault path overridden by environment variable
-- **GIVEN** `[agent]` has `agent_name = "mybot"`
-- **AND** `agent_home` defaults to `~/mybot/`
-- **AND** the environment variable `SPC_VAULT_FILE` is set to `/run/secrets/mybot.toml`
-- **WHEN** the application starts
-- **THEN** the vault is loaded from `/run/secrets/mybot.toml`
-- **AND** the default `~/.local/state/mybot/secrets.toml` is ignored
+The vault file MUST always reside at `$XDG_STATE_HOME/<agent_name>/secrets.toml` (`paths.secrets_file`). It is NOT configurable. The `SPC_VAULT_FILE` environment variable is retired. The `file_vault` config field is removed. No override mechanism exists.
 
-#### Scenario: Vault migrated from old XDG_DATA_HOME location
-- **GIVEN** a vault file exists at the old path `~/.local/share/<agent_name>/secrets.toml`
-- **AND** no vault file exists at the new path `~/.local/state/<agent_name>/secrets.toml`
-- **WHEN** the application starts
-- **THEN** the old vault file is copied to the new path
-- **AND** an info log records the migration
-- **AND** the old file remains on disk (non-destructive copy)
+Feature: Vault at XDG state path
+Rule: vault is always `~/.local/state/<agent_name>/secrets.toml`; no override exists.
 
-#### Scenario: Both old and new vault paths exist
-- **GIVEN** a vault file exists at the old path `~/.local/share/<agent_name>/secrets.toml`
-- **AND** a vault file also exists at the new path `~/.local/state/<agent_name>/secrets.toml`
-- **WHEN** the application starts
-- **THEN** the vault is loaded from the new path
-- **AND** a warning is logged that the old path is stale and can be removed manually
+#### Scenario: Vault path derives from agent_name only
+- **GIVEN** the agent is started with `--agent-name piclaw`
+- **WHEN** the application initialises
+- **THEN** the vault is loaded from `~/.local/state/piclaw/secrets.toml`
 
-### Requirement: Log files live in an XDG state directory
+#### Scenario: No env var or config field can override the vault path
+- **GIVEN** the agent is started with `--agent-name piclaw`
+- **AND** the environment variable `SPC_VAULT_FILE` is set to `/run/secrets/piclaw.toml`
+- **WHEN** the application initialises
+- **THEN** the vault is still loaded from `~/.local/state/piclaw/secrets.toml`
+- **AND** `SPC_VAULT_FILE` is ignored
 
-The application MUST write log files to an XDG state directory derived from `agent_name`, resolved independently of `agent_home`. This extends the existing rule that agent-scoped state paths derive from `agent_name`, using the XDG *state* directory for logs (parallel to the vault's use of the XDG *data* directory).
+### Requirement: Logs are always at the XDG state path
 
-Feature: Agent-scoped log directory
-Rule: Logs default to `~/.local/state/<agent_name>/logs/` regardless of `agent_home`; an explicit absolute `log_file` overrides.
+Log files MUST always be written to `$XDG_STATE_HOME/<agent_name>/logs/` (`paths.logs_dir`). The path is NOT configurable via `log_file` in `[paths]`. The `SPC_LOG_DIR` environment variable is retired. No per-agent override exists.
 
-#### Scenario: Default log location for default agent
-- **GIVEN** `[agent]` does not specify `agent_name` or `agent_home`
-- **AND** `[paths]` does not set an absolute `log_file`
+Feature: Logs at XDG state path
+Rule: logs are always `~/.local/state/<agent_name>/logs/`; no per-agent override exists.
+
+#### Scenario: Default agent logs at the XDG state path
+- **GIVEN** the agent is started with `--agent-name piclaw`
 - **WHEN** the application starts
 - **THEN** logs are written under `~/.local/state/piclaw/logs/`
 
 #### Scenario: Custom agent name derives log location
-- **GIVEN** `[agent]` has `agent_name = "mybot"`
+- **GIVEN** the agent is started with `--agent-name mybot`
 - **WHEN** the application starts
 - **THEN** logs are written under `~/.local/state/mybot/logs/`
 
-#### Scenario: Explicit agent home does NOT affect log location
-- **GIVEN** `[agent]` has `agent_home = "/opt/smallpieclaw/data"`
-- **WHEN** the application starts
-- **THEN** the log location still defaults under `~/.local/state/piclaw/logs/`
-- **AND** the log location is unaffected by `agent_home`
-
-#### Scenario: Explicit absolute log_file overrides the default
-- **GIVEN** `[paths]` sets `log_file = "/var/log/piclaw/agent.log"`
-- **WHEN** the application starts
-- **THEN** logs are written to `/var/log/piclaw/agent.log`
-- **AND** the XDG state default is ignored
-
-#### Scenario: Logs are no longer written into the source checkout
+#### Scenario: Logs are not written into the source checkout directory
 - **GIVEN** a default configuration
 - **WHEN** the application starts
 - **THEN** no `agent.log` is created inside the source checkout directory
+- **AND** logs are written to `~/.local/state/<agent_name>/logs/agent.log`
+
+### Requirement: Results memory and legacy long-term memory files are always under XDG data home
+
+`results_memory.json` MUST always reside at `$XDG_DATA_HOME/<agent_name>/results_memory.json`. The legacy, backfill-only `longterm_memory.json` (consumed only by `backfill_graph_memory.py`) MUST default to `$XDG_DATA_HOME/<agent_name>/longterm_memory.json`, overridable via `--longterm-path` for one-off manual runs against a different file. Neither path is configurable via `[paths]` in `config.toml`. The `results_memory_file` and `longterm_memory_file` config fields are removed.
+
+Feature: Generated memory files at XDG data home
+Rule: `results_memory.json` is always `paths.data_home / "results_memory.json"`; `longterm_memory.json` defaults to `paths.data_home / "longterm_memory.json"` and is overridable only via the `backfill_graph_memory.py --longterm-path` CLI flag, never via `config.toml`.
+
+#### Scenario: results_memory.json is not configurable
+- **GIVEN** `config.toml` sets `[paths] results_memory_file = "/custom/results.json"`
+- **WHEN** the application starts with `--agent-name piclaw`
+- **THEN** `results_memory.json` is still read from and written to `~/.local/share/piclaw/results_memory.json`
+- **AND** the `results_memory_file` config value is ignored
+
+#### Scenario: backfill_graph_memory.py defaults to the XDG data home for longterm_memory.json
+- **GIVEN** `backfill_graph_memory.py` is run with `--agent-name piclaw` and no `--longterm-path` override
+- **WHEN** the script resolves the source LongTermMemory file
+- **THEN** it reads from `~/.local/share/piclaw/longterm_memory.json`
