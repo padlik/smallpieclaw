@@ -9,24 +9,25 @@ from unittest.mock import MagicMock, patch
 
 
 
-def _make_scheduler() -> object:
+def _make_scheduler(tmp_xdg) -> object:
     """Return a minimal Scheduler whose _stop_event stops after two waits."""
     from scheduler import Scheduler
+    from xdg import xdg_paths
 
     cfg = {
         "telegram": {"bot_token": "x", "allowed_user_ids": []},
         "agent":    {"default_model": "test"},
     }
-    s = Scheduler(cfg, notify_fn=lambda _: None)
+    s = Scheduler(cfg, notify_fn=lambda _: None, paths=xdg_paths("test-agent"))
     return s
 
 
 class TestSchedulerLoopSurvival:
     """_run_loop must survive an unhandled exception in any iteration."""
 
-    def test_exception_in_process_pending_does_not_kill_loop(self):
+    def test_exception_in_process_pending_does_not_kill_loop(self, tmp_xdg):
         """If _process_pending_commands() raises, the loop runs another iteration."""
-        s = _make_scheduler()
+        s = _make_scheduler(tmp_xdg)
 
         call_count = [0]
         stop_after = 2
@@ -58,9 +59,9 @@ class TestSchedulerLoopSurvival:
         # Loop ran at least a second iteration despite the first failing
         assert len(iteration_results) >= 1
 
-    def test_exception_logged_not_swallowed(self):
+    def test_exception_logged_not_swallowed(self, tmp_xdg):
         """Logger.exception must be called when an exception occurs."""
-        s = _make_scheduler()
+        s = _make_scheduler(tmp_xdg)
 
         call_count = [0]
 
@@ -83,9 +84,9 @@ class TestSchedulerLoopSurvival:
 
         mock_logger.exception.assert_called()
 
-    def test_wait_still_runs_after_exception(self):
+    def test_wait_still_runs_after_exception(self, tmp_xdg):
         """_stop_event.wait() must be called even when the loop body raises."""
-        s = _make_scheduler()
+        s = _make_scheduler(tmp_xdg)
 
         wait_calls = [0]
 
@@ -108,9 +109,9 @@ class TestSchedulerLoopSurvival:
         # wait() called at least twice (once per iteration), verifying it's in finally-equivalent position
         assert wait_calls[0] >= 2
 
-    def test_exception_in_schedule_run_pending_survives(self):
+    def test_exception_in_schedule_run_pending_survives(self, tmp_xdg):
         """An exception from schedule.run_pending() is also caught."""
-        s = _make_scheduler()
+        s = _make_scheduler(tmp_xdg)
 
         call_count = [0]
 

@@ -14,10 +14,6 @@ class TestGraphMemoryConfigDefaults:
         cfg = parse_config(minimal_config)
         assert cfg.graph_memory.enabled is False
 
-    def test_default_db_path(self, minimal_config):
-        cfg = parse_config(minimal_config)
-        assert cfg.graph_memory.db_path == "data/graph_memory"
-
     def test_default_buffer_pool_mb(self, minimal_config):
         cfg = parse_config(minimal_config)
         assert cfg.graph_memory.buffer_pool_mb == 256
@@ -59,10 +55,6 @@ class TestGraphMemoryConfigEnabled:
     def test_enabled_false_explicit(self, minimal_config):
         cfg = self._with_gm(minimal_config, enabled=False)
         assert cfg.graph_memory.enabled is False
-
-    def test_custom_db_path(self, minimal_config):
-        cfg = self._with_gm(minimal_config, enabled=True, db_path="/data/mygraph")
-        assert cfg.graph_memory.db_path == "/data/mygraph"
 
     def test_custom_buffer_pool_mb(self, minimal_config):
         cfg = self._with_gm(minimal_config, enabled=True, buffer_pool_mb=128)

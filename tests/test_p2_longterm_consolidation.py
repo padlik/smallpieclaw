@@ -61,6 +61,7 @@ class TestSubAgentNoLongTermWrite:
 class TestSchedulerNoLongTermWrite:
     def _make_scheduler(self, tmp_path, ltm, agent_result="summary"):
         from scheduler import Scheduler
+        from xdg import xdg_paths
 
         cfg = {"agent": {"default_model": "test"}, "scheduler": {"enabled": True}}
         # NOTE: Scheduler no longer accepts a long_term_memory parameter (the
@@ -71,11 +72,11 @@ class TestSchedulerNoLongTermWrite:
             cfg,
             notify_fn=lambda _msg: None,
             agent_fn=lambda _task: agent_result,
-            data_dir=str(tmp_path),
+            paths=xdg_paths("test-agent"),
         )
         return s
 
-    def test_longterm_memory_update_job_does_not_write(self, tmp_path):
+    def test_longterm_memory_update_job_does_not_write(self, tmp_path, tmp_xdg):
         ltm = MagicMock()
         s = self._make_scheduler(tmp_path, ltm)
         # builtin_executor is None → legacy fallback path that previously wrote.

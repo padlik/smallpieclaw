@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
+from dataclasses import dataclass
 
 import pytest
 
@@ -14,11 +15,19 @@ from builtin_tools.access_control import (
     ZoneClassification,
     _is_contained,
 )
-from config_schema import PathsConfig
 
 
-def _make_paths(tmp: str, workspace: str | None = None) -> PathsConfig:
-    return PathsConfig(
+@dataclass
+class _FakePaths:
+    data_dir: str
+    skills_dir: str
+    prompts_dir: str
+    downloads_dir: str
+    workspace_dir: str
+
+
+def _make_paths(tmp: str, workspace: str | None = None) -> _FakePaths:
+    return _FakePaths(
         data_dir=os.path.join(tmp, "data"),
         skills_dir=os.path.join(tmp, "skills"),
         prompts_dir=os.path.join(tmp, "prompts"),
@@ -37,7 +46,12 @@ def _make_checker(tmp: str, workspace: str | None = None) -> TrustedZoneChecker:
         paths.workspace_dir,
     ]:
         os.makedirs(d, exist_ok=True)
-    return TrustedZoneChecker(paths_config=paths, data_dir=paths.data_dir, agent_name="test-agent")
+    return TrustedZoneChecker(
+        workspace_dir=paths.workspace_dir,
+        downloads_dir=paths.downloads_dir,
+        data_dir=paths.data_dir,
+        agent_name="test-agent",
+    )
 
 
 class TestClassify:
@@ -64,8 +78,10 @@ class TestClassify:
         """Vault file must not be auto-allowed even though it lives in an agent-internal path."""
         with tempfile.TemporaryDirectory() as tmp:
             vault_file = os.path.join(tmp, "vault.toml")
+            paths = _make_paths(tmp)
             checker = TrustedZoneChecker(
-                paths_config=_make_paths(tmp),
+                workspace_dir=paths.workspace_dir,
+                downloads_dir=paths.downloads_dir,
                 data_dir=os.path.join(tmp, "data"),
                 agent_name="test-agent",
                 vault_path=vault_file,
@@ -177,7 +193,8 @@ class TestClassify:
                       paths.downloads_dir, paths.workspace_dir]:
                 os.makedirs(d, exist_ok=True)
             checker = TrustedZoneChecker(
-                paths_config=paths,
+                workspace_dir=paths.workspace_dir,
+                downloads_dir=paths.downloads_dir,
                 data_dir=paths.data_dir,
                 agent_name="test-agent",
                 vault_path=vault_file,
@@ -226,7 +243,8 @@ class TestClassify:
             f.write("secret")
 
         checker = TrustedZoneChecker(
-            paths_config=paths,
+            workspace_dir=paths.workspace_dir,
+            downloads_dir=paths.downloads_dir,
             data_dir=data_dir,
             agent_name="test",
             vault_path=vault,

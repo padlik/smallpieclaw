@@ -4,15 +4,17 @@ main.py
 Entry point for the Telegram Home Server Agent.
 
 Boot sequence:
-  1. Load config
-  2. Initialise all components
-  3. Build the semantic tool index
-  4. Start the scheduler
-  5. Start the Telegram bot (blocking)
+  1. Parse --agent-name, resolve XDG paths, create XDG dirs, run migration check
+  2. Load config
+  3. Initialise all components
+  4. Build the semantic tool index
+  5. Start the scheduler
+  6. Start the Telegram bot (blocking)
 """
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import logging
 import os
@@ -20,11 +22,9 @@ import shutil
 import signal
 import sys
 import tempfile
+from pathlib import Path
+
 import agent_logging
-
-# Directory containing main.py — used as the agent's base directory
-_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 
 # Bootstrap logging to stdout until config (and the resolved XDG log path) load.
 agent_logging.setup_bootstrap()
@@ -103,7 +103,7 @@ except ImportError:
 from agent_controller import AgentController  # noqa: E402
 from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile  # noqa: E402
 from builtin_executor import BuiltinExecutor  # noqa: E402
-from config_schema import resolve_model_id, vault_path, log_path, parse_vault_content  # noqa: E402
+from config_schema import resolve_model_id, parse_vault_content  # noqa: E402
 from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
@@ -116,13 +116,56 @@ from telegram_interface import TelegramInterface  # noqa: E402
 from token_usage import get_registry as get_token_registry  # noqa: E402
 from tool_index import ToolIndex  # noqa: E402
 from tool_registry import ToolRegistry  # noqa: E402
-from conversation_io import _load_or_create_conversation_id, _save_conversation, _xdg_state_home  # noqa: E402
+from conversation_io import _load_or_create_conversation_id, _save_conversation  # noqa: E402
+import migrate  # noqa: E402
+from xdg import XDGPaths, xdg_paths  # noqa: E402
 
 
-def load_config(path="config.toml"):
-    if not os.path.exists(path):
+def _create_xdg_dirs(paths: XDGPaths) -> None:
+    """Create all XDG directories the agent needs. Idempotent."""
+    for d in (paths.config_home, paths.data_home, paths.state_home, paths.cache_home,
+              paths.logs_dir, paths.skills_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    paths.runtime_dir.mkdir(parents=False, exist_ok=True)
+    # state_home holds the vault, trust store, and conversation history — owner-only.
+    try:
+        os.chmod(paths.state_home, 0o700)
+    except OSError:
+        pass
+
+
+def _warn_relative_paths(cfg: dict) -> None:
+    """Warn on any string config value that looks like a relative path (starts with '.')."""
+    def _scan(value, path: str) -> None:
+        if isinstance(value, str):
+            if value.startswith("."):
+                logger.warning("Config value at %s looks like a relative path: %r", path, value)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                _scan(v, f"{path}.{k}" if path else k)
+        elif isinstance(value, list):
+            for i, item in enumerate(value):
+                _scan(item, f"{path}[{i}]")
+
+    _scan(cfg, "")
+
+
+def _check_migration(paths: XDGPaths, agent_name: str) -> None:
+    """Run the one-shot XDG migration if the old agent_home-relative layout is detected."""
+    if migrate.migration_sentinel_exists(paths):
+        return
+    source = Path(__file__).parent
+    if not (source / "config.toml").exists():
+        return
+    summary = migrate.main(agent_name, source)
+    for line in summary:
+        logger.info("migrate: %s", line)
+
+
+def load_config(path: Path, vault_file: str | None = None):
+    if not path.exists():
         logger.error("Config file not found: %s", path)
-        sys.exit(1)
+        sys.exit(f"No config found. Create: {path}")
     with open(path, "rb") as f:
         cfg = tomli.load(f)
     logger.info("Configuration loaded from %s", path)
@@ -135,7 +178,7 @@ def load_config(path="config.toml"):
     from config_schema import parse_config
     from exceptions import ConfigError
     try:
-        app_cfg = parse_config(cfg)
+        app_cfg = parse_config(cfg, vault_file=vault_file)
     except ConfigError as exc:
         logger.error("Configuration error: %s", exc)
         sys.exit(1)
@@ -266,76 +309,66 @@ def _read_vault_secrets(vault_file: str) -> list[str]:
         return []
 
 
-def main():
-    cfg, app_cfg = load_config()
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--agent-name", required=True,
+        help="Agent name (required; resolves all XDG paths)",
+    )
+    return parser.parse_args()
 
-    paths = cfg.get("paths", {})
-    data_dir      = paths.get("data_dir", "data")
-    index_path    = paths.get("tool_index_file", "data/tool_index.json")
-    memory_path   = paths.get("memory_file", "data/memory.json")
-    results_path  = paths.get("results_memory_file", "data/results_memory.json")
-    scheduler_config_path = paths.get("scheduler_config", "scheduler.toml")
-    skills_dir    = paths.get("skills_dir", "skills")
-    skills_dir_abs = os.path.join(_AGENT_DIR, skills_dir) if not os.path.isabs(skills_dir) else skills_dir
-    downloads_dir = os.path.abspath(paths.get("downloads_dir", "downloads"))
-    tmp_dir       = f"/tmp/{app_cfg.agent.agent_name}"
-    workspace_dir = os.path.abspath(os.path.expanduser(paths.get("workspace_dir", "~/Documents")))
-    log_file         = log_path(cfg)
-    log_backup_count = int(paths.get("log_backup_count", 30))
-    pid_file      = os.path.join(
-        _AGENT_DIR,
-        paths.get("pid_file", os.path.join(data_dir, "agent.pid")),
-    ) if not os.path.isabs(paths.get("pid_file", "")) else paths["pid_file"]
+
+def main():
+    args = _parse_args()
+    agent_name = args.agent_name
+    paths = xdg_paths(agent_name)
+    _check_migration(paths, agent_name)
+    _create_xdg_dirs(paths)
+
+    if not paths.config_file.exists():
+        sys.exit(f"No config found. Create: {paths.config_file}")
+
+    cfg, app_cfg = load_config(paths.config_file, vault_file=str(paths.secrets_file))
+    _warn_relative_paths(cfg)
+
+    workspace_dir = os.path.abspath(os.path.expanduser(
+        cfg.get("paths", {}).get("workspace_dir", "~/Documents")
+    ))
+    downloads_dir = os.path.join(workspace_dir, "downloads")
+    tmp_dir = f"/tmp/{agent_name}"
 
     # SIGTERM → clean exit so the finally: block always runs (e.g. systemctl stop)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-    with _PidFileLock(pid_file):
+    with _PidFileLock(str(paths.pid_file)):
         _run(
             cfg=cfg, app_cfg=app_cfg, paths=paths,
-            data_dir=data_dir,
-            index_path=index_path, memory_path=memory_path,
-            results_path=results_path,
-            scheduler_config_path=scheduler_config_path, skills_dir=skills_dir,
-            skills_dir_abs=skills_dir_abs,
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,
             workspace_dir=workspace_dir,
-            log_file=log_file, log_backup_count=log_backup_count,
-            agent_name=app_cfg.agent.agent_name,
+            agent_name=agent_name,
         )
 
 
 def _run(
-    cfg, app_cfg, paths,
-    data_dir,
-    index_path, memory_path, results_path,
-    scheduler_config_path, skills_dir, skills_dir_abs,
+    cfg, app_cfg, paths: XDGPaths,
     downloads_dir, tmp_dir, workspace_dir,
-    log_file, log_backup_count,
     agent_name,
 ):
     """Core startup after PID lock is acquired."""
-    # Re-initialise logging with the configured XDG path and structlog dual sink.
+    # Re-initialise logging with the resolved XDG log paths and structlog dual sink.
     # Vault secret values are passed so they are redacted from every log record.
     json_log_path = agent_logging.setup_logging(
-        log_file,
-        backup_count=log_backup_count,
-        secret_values=_read_vault_secrets(vault_path(cfg)),
+        str(paths.log_file),
+        json_file=str(paths.log_jsonl),
+        backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
+        secret_values=_read_vault_secrets(str(paths.secrets_file)),
     )
 
-    os.makedirs(data_dir, exist_ok=True)
-    os.makedirs(skills_dir, exist_ok=True)
     os.makedirs(downloads_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
-    # XDG state dir for trusted_dirs.json — outside the nsjail-mounted project dir
-    # so a sandboxed shell command cannot overwrite the trust store.
-    xdg_state_home = _xdg_state_home()
-    nsjail_state_dir = os.path.join(xdg_state_home, agent_name)
-    os.makedirs(nsjail_state_dir, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(nsjail_state_dir, 0o700)
-    except OSError:
-        pass
+    # nsjail_state_dir == paths.state_home — kept as a local alias since it's
+    # referenced heavily below (trusted_dirs.json, conversations, session_logs).
+    nsjail_state_dir = str(paths.state_home)
     conversation_id = _load_or_create_conversation_id(nsjail_state_dir)
     conversations_dir = os.path.join(nsjail_state_dir, "conversations")
     os.makedirs(conversations_dir, mode=0o700, exist_ok=True)
@@ -350,24 +383,6 @@ def _run(
     except OSError:
         logger.warning("session_logs retention cleanup failed", exc_info=True)
     trusted_dirs_path = os.path.join(nsjail_state_dir, "trusted_dirs.json")
-    # One-time migration from old location
-    old_trusted = os.path.join(data_dir, "trusted_dirs.json")
-    if os.path.exists(old_trusted) and not os.path.exists(trusted_dirs_path):
-        shutil.copy2(old_trusted, trusted_dirs_path)
-        logger.info("Migrated trusted_dirs.json to XDG state: %s", trusted_dirs_path)
-    # Vault migration: XDG_DATA_HOME → XDG_STATE_HOME consolidation
-    old_vault = os.path.join(os.path.expanduser("~"), ".local", "share", agent_name, "secrets.toml")
-    new_vault = os.path.join(xdg_state_home, agent_name, "secrets.toml")
-    if os.path.exists(old_vault) and not os.path.exists(new_vault):
-        os.makedirs(os.path.dirname(new_vault), exist_ok=True)
-        # Atomic copy: write to temp file, then rename so a crash mid-copy
-        # cannot leave a partial vault at the final path.
-        tmp_vault = new_vault + ".tmp"
-        shutil.copy2(old_vault, tmp_vault)
-        os.rename(tmp_vault, new_vault)
-        logger.info("Migrated vault to XDG state: %s", new_vault)
-    elif os.path.exists(old_vault) and os.path.exists(new_vault):
-        logger.warning("Vault exists at both old (%s) and new (%s) paths — using new path, old can be removed manually", old_vault, new_vault)
     os.environ["TMPDIR"] = tmp_dir
     os.environ["TMP"] = tmp_dir
     os.environ["TEMP"] = tmp_dir
@@ -405,11 +420,13 @@ def _run(
     nsjail_session_tmpdir = tempfile.mkdtemp(prefix="nsjail-tmp-")
     logger.info("nsjail session tmpdir: %s", nsjail_session_tmpdir)
 
-    vault_file = vault_path(cfg)
+    vault_file = str(paths.secrets_file)
     vault_secrets = _read_vault_secrets(vault_file)
+    data_dir = str(paths.data_home)
+    skills_dir_abs = str(paths.skills_dir)
 
     llm      = LLMClient(cfg, usage_registry=get_token_registry(), caller_tag="main")
-    memory   = MemoryStore(memory_path)
+    memory   = MemoryStore(str(paths.memory_file))
     # Purge any model/LLM facts the agent may have written in past sessions.
     # These are always stale — authoritative model info lives in config.toml and is
     # injected fresh into every system prompt via _format_models().
@@ -431,13 +448,14 @@ def _run(
         nsjail_session_tmpdir=nsjail_session_tmpdir,
         skills_dir=skills_dir_abs,
         nsjail_trusted_dirs_path=trusted_dirs_path,
-        nsjail_agent_dir=_AGENT_DIR,
+        nsjail_agent_dir=str(Path(__file__).parent.resolve()),
         agent_name=agent_name,
         tmp_dir=tmp_dir,
+        state_home=nsjail_state_dir,
         vault_secrets=vault_secrets,
     )
     builtin.conversation_id = conversation_id
-    index    = ToolIndex(registry=registry, llm=llm, index_path=index_path, builtin_executor=builtin)
+    index    = ToolIndex(registry=registry, llm=llm, index_path=str(paths.tool_index_file), builtin_executor=builtin)
 
     # Initialise MCP servers (optional — skip if none configured)
     mcp_manager: MCPManager | None = None
@@ -461,6 +479,7 @@ def _run(
         except Exception as exc:
             logger.warning("MCP connect_all failed (agent will start without MCP): %s", exc)
 
+    results_path  = str(paths.data_home / "results_memory.json")
     short_term    = _load_conversation(
         os.path.join(conversations_dir, conversation_id + ".json")
     )
@@ -477,7 +496,8 @@ def _run(
     builtin._prompt_registry = prompt_registry
     from builtin_tools.access_control import TrustedZoneChecker as _TrustedZoneChecker
     _trusted_zone_checker = _TrustedZoneChecker(
-        paths_config=app_cfg.paths,
+        workspace_dir=workspace_dir,
+        downloads_dir=downloads_dir,
         data_dir=data_dir,
         agent_name=agent_name,
         vault_path=vault_file,
@@ -509,8 +529,8 @@ def _run(
         tmp_dir=tmp_dir,
         downloads_dir=downloads_dir,
         workspace_dir=workspace_dir,
-        log_file=log_file,
-        log_backup_count=log_backup_count,
+        log_file=str(paths.log_file),
+        log_backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
         creativity_mode=creativity_mode,
         plan_max_iterations=plan_max_iterations,
         inactivity_warn_minutes=inactivity_warn_minutes,
@@ -633,8 +653,8 @@ def _run(
 
     scheduler = Scheduler(
         cfg, notify_fn=notify,
-        scheduler_config_path=scheduler_config_path,
-        data_dir=data_dir,
+        paths=paths,
+        scheduler_config_path=str(paths.scheduler_config),
         builtin_executor=builtin,
     )
     builtin.scheduler = scheduler  # wire scheduler into built-in tool
@@ -655,6 +675,7 @@ def _run(
 
             graph_memory_store, graph_memory_writer = create_graph_memory(
                 cfg=app_cfg,
+                db_path=str(paths.graph_memory_db),
                 embedder_fn=_embedder_fn,
                 llm_call_fn=_llm_call_fn,
                 embedding_dim=len(llm.embed("test")),
@@ -669,7 +690,7 @@ def _run(
                 builtin._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
                 logger.info(
                     "Graph memory enabled (db=%s, extraction_model=%s)",
-                    app_cfg.graph_memory.db_path,
+                    paths.graph_memory_db,
                     app_cfg.graph_memory.extraction_model or app_cfg.agent.default_model,
                 )
     except Exception as _gm_init_exc:

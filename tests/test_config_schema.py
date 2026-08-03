@@ -16,7 +16,6 @@ from config_schema import (
     parse_config,
     parse_vault_content,
     resolve_model_id,
-    vault_path,
 )
 
 
@@ -29,7 +28,6 @@ class TestParseConfig:
         assert cfg.telegram.bot_token == "123456:ABC-DEF"
         assert cfg.agent.max_iterations == 8
         assert cfg.agent.agent_name == "piclaw"
-        assert cfg.agent.agent_home == os.path.expanduser("~/piclaw")
         assert len(cfg.models) == 1
         assert cfg.models[0].provider == "openai"
         assert cfg.vault.type == "file"
@@ -39,7 +37,6 @@ class TestParseConfig:
         assert cfg.agent.tool_timeout == 10
         assert cfg.agent.max_output_size == 4000
         assert cfg.agent.ctx_max_tokens == 90_000
-        assert cfg.paths.data_dir == "data"
         assert cfg.scheduler.enabled is True
 
     def test_multiple_models(self, minimal_config):
@@ -385,102 +382,6 @@ class TestVaultLoading:
         assert not _has_sec_reference({"key": "plain"})
         assert not _has_sec_reference({"count": 5})
 
-    def test_vault_path_uses_env_variable(self, monkeypatch):
-        monkeypatch.setenv("SPC_VAULT_FILE", "/custom/vault.toml")
-        assert vault_path({}) == "/custom/vault.toml"
-
-    def test_vault_path_defaults_to_agent_name(self, monkeypatch):
-        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
-        raw = {"agent": {"agent_name": "testbot"}}
-        assert vault_path(raw) == os.path.expanduser("~/.local/state/testbot/secrets.toml")
-
-    def test_vault_path_default_agent_name(self, monkeypatch):
-        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
-        assert vault_path({}) == os.path.expanduser("~/.local/state/piclaw/secrets.toml")
-
-    def test_vault_path_respects_xdg_state_home(self, monkeypatch):
-        monkeypatch.setenv("XDG_STATE_HOME", "/custom/state")
-        raw = {"agent": {"agent_name": "testbot"}}
-        assert vault_path(raw) == "/custom/state/testbot/secrets.toml"
-
-    def test_vault_path_xdg_state_home_default_agent_name(self, monkeypatch):
-        monkeypatch.setenv("XDG_STATE_HOME", "/custom/state")
-        assert vault_path({}) == "/custom/state/piclaw/secrets.toml"
-
-    def test_vault_path_various_agent_names(self):
-        assert vault_path({"agent": {"agent_name": "alpha"}}) == os.path.expanduser(
-            "~/.local/state/alpha/secrets.toml"
-        )
-        assert vault_path({"agent": {"agent_name": "my-agent_2"}}) == os.path.expanduser(
-            "~/.local/state/my-agent_2/secrets.toml"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Vault migration helpers
-# ---------------------------------------------------------------------------
-
-def _migrate_vault(old_vault: str, new_vault: str, logger: list[str]) -> None:
-    """Mimic the vault migration logic in main.py._run().
-
-    - If the old vault exists and the new one does not, copy old → new.
-    - If both exist, emit a warning and keep the new path.
-    - Otherwise do nothing.
-    """
-    import shutil
-
-    if os.path.exists(old_vault) and not os.path.exists(new_vault):
-        os.makedirs(os.path.dirname(new_vault), exist_ok=True)
-        shutil.copy2(old_vault, new_vault)
-        logger.append(f"migrated:{old_vault}->{new_vault}")
-    elif os.path.exists(old_vault) and os.path.exists(new_vault):
-        logger.append(f"warning:both_exist:{old_vault}:{new_vault}")
-
-
-class TestVaultMigration:
-    """Tests for the vault migration path consolidation in main.py."""
-
-    def test_migration_copies_when_old_exists_and_new_missing(self, tmp_path):
-        old = tmp_path / "old" / "secrets.toml"
-        new = tmp_path / "new" / "secrets.toml"
-        old.parent.mkdir(parents=True)
-        old.write_text('key = "value"\n')
-        logs: list[str] = []
-        _migrate_vault(str(old), str(new), logs)
-        assert new.exists()
-        assert new.read_text() == old.read_text()
-        assert "migrated" in logs[0]
-
-    def test_migration_prefers_new_when_both_exist(self, tmp_path, caplog):
-        old = tmp_path / "old" / "secrets.toml"
-        new = tmp_path / "new" / "secrets.toml"
-        old.parent.mkdir(parents=True)
-        new.parent.mkdir(parents=True)
-        old.write_text('key = "old"\n')
-        new.write_text('key = "new"\n')
-        logs: list[str] = []
-        _migrate_vault(str(old), str(new), logs)
-        assert new.read_text() == 'key = "new"\n'
-        assert any("both_exist" in entry for entry in logs)
-
-    def test_migration_skips_when_neither_exists(self, tmp_path):
-        old = tmp_path / "old" / "secrets.toml"
-        new = tmp_path / "new" / "secrets.toml"
-        logs: list[str] = []
-        _migrate_vault(str(old), str(new), logs)
-        assert not new.exists()
-        assert logs == []
-
-    def test_migration_skips_when_only_new_exists(self, tmp_path):
-        old = tmp_path / "old" / "secrets.toml"
-        new = tmp_path / "new" / "secrets.toml"
-        new.parent.mkdir(parents=True)
-        new.write_text('key = "value"\n')
-        logs: list[str] = []
-        _migrate_vault(str(old), str(new), logs)
-        assert new.read_text() == 'key = "value"\n'
-        assert logs == []
-
 
 # ---------------------------------------------------------------------------
 # parse_vault_content public API
@@ -552,36 +453,38 @@ class TestParseConfigWithVault:
     Vault files use TOML format (``key = "value"`` at top level).
     """
 
-    def test_bot_token_from_vault(self, minimal_config, tmp_path, monkeypatch):
+    def test_bot_token_from_vault(self, minimal_config, tmp_path):
         vault_file = tmp_path / "secrets.toml"
         vault_file.write_text('bot_token = "99999:VAULT-TOKEN"\n')
-        monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
         minimal_config["telegram"]["bot_token"] = "sec:bot_token"
-        cfg = parse_config(minimal_config)
+        cfg = parse_config(minimal_config, vault_file=str(vault_file))
         assert cfg.telegram.bot_token == "99999:VAULT-TOKEN"
         assert cfg._raw["telegram"]["bot_token"] == "99999:VAULT-TOKEN"
 
-    def test_api_key_from_vault(self, minimal_config, tmp_path, monkeypatch):
+    def test_api_key_from_vault(self, minimal_config, tmp_path):
         vault_file = tmp_path / "secrets.toml"
         vault_file.write_text('openai_key = "sk-vault"\n')
-        monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
         minimal_config["models"][0]["api_key"] = "sec:openai_key"
-        cfg = parse_config(minimal_config)
+        cfg = parse_config(minimal_config, vault_file=str(vault_file))
         assert cfg.models[0].api_key == "sk-vault"
         assert cfg._raw["models"][0]["api_key"] == "sk-vault"
 
-    def test_missing_vault_key_fails_startup(self, minimal_config, tmp_path, monkeypatch):
+    def test_missing_vault_key_fails_startup(self, minimal_config, tmp_path):
         vault_file = tmp_path / "secrets.toml"
         vault_file.write_text('other_key = "value"\n')
-        monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
         minimal_config["telegram"]["bot_token"] = "sec:bot_token"
         with pytest.raises(ConfigError, match="bot_token"):
-            parse_config(minimal_config)
+            parse_config(minimal_config, vault_file=str(vault_file))
 
     def test_no_sec_reference_skips_vault_load(self, minimal_config):
-        # With no sec: references, a missing default vault path is fine.
+        # With no sec: references, a missing vault_file is fine.
         cfg = parse_config(minimal_config)
         assert cfg.telegram.bot_token == "123456:ABC-DEF"
+
+    def test_sec_reference_without_vault_file_raises(self, minimal_config):
+        minimal_config["telegram"]["bot_token"] = "sec:bot_token"
+        with pytest.raises(ConfigError, match="no vault file"):
+            parse_config(minimal_config)
 
     def test_vault_config_defaults_to_file(self, minimal_config):
         cfg = parse_config(minimal_config)
@@ -677,19 +580,16 @@ class TestParseConfigWithEnvVars:
 # ---------------------------------------------------------------------------
 
 class TestAgentConfigFields:
-    """Tests for agent_name and agent_home defaults and overrides."""
+    """Tests for agent_name defaults and overrides."""
 
     def test_defaults(self, minimal_config):
         cfg = parse_config(minimal_config)
         assert cfg.agent.agent_name == "piclaw"
-        assert cfg.agent.agent_home == os.path.expanduser("~/piclaw")
 
     def test_custom_values(self, minimal_config):
         minimal_config["agent"]["agent_name"] = "myagent"
-        minimal_config["agent"]["agent_home"] = "/tmp/agent"
         cfg = parse_config(minimal_config)
         assert cfg.agent.agent_name == "myagent"
-        assert cfg.agent.agent_home == "/tmp/agent"
 
     def test_allow_net_defaults_false(self, minimal_config):
         cfg = parse_config(minimal_config)
@@ -746,14 +646,13 @@ class TestProviderCredentialInheritance:
         assert cfg._raw["models"][0]["base_url"] == "https://provider.example/v1"
         assert cfg._raw["models"][0]["request_timeout"] == 180
 
-    def test_provider_sec_value_inherited_by_model(self, minimal_config, tmp_path, monkeypatch):
+    def test_provider_sec_value_inherited_by_model(self, minimal_config, tmp_path):
         vault_file = tmp_path / "secrets.toml"
         vault_file.write_text('openai_key = "provider-vault-key"\n')
-        monkeypatch.setenv("SPC_VAULT_FILE", str(vault_file))
         minimal_config["providers"] = {"openai": {"api_key": "sec:openai_key"}}
         del minimal_config["models"][0]["api_key"]
 
-        cfg = parse_config(minimal_config)
+        cfg = parse_config(minimal_config, vault_file=str(vault_file))
 
         assert cfg.providers["openai"].api_key == "provider-vault-key"
         assert cfg.models[0].api_key == "provider-vault-key"
@@ -763,8 +662,8 @@ class TestProviderCredentialInheritance:
     def test_legacy_config_raw_dict_remains_unchanged(self, minimal_config):
         cfg = parse_config(minimal_config)
 
-        # Only non-path, non-agent_home sections remain identical because path
-        # fields and agent_home are normalized at parse time.
+        # Only non-path sections remain identical because path fields are
+        # normalized at parse time.
         assert cfg._raw["telegram"] == minimal_config["telegram"]
         assert cfg._raw["models"] == minimal_config["models"]
         if "embeddings" in minimal_config:
@@ -859,38 +758,6 @@ class TestRemovedFileSecretFields:
 
 
 # ---------------------------------------------------------------------------
-# agent_home default resolution from agent_name
-# ---------------------------------------------------------------------------
-
-class TestAgentHomeDefault:
-    """agent_home default must resolve from agent_name when not set explicitly."""
-
-    def test_default_agent_name_gives_default_agent_home(self, minimal_config):
-        """Default agent_name 'piclaw' → agent_home '~/piclaw'."""
-        cfg = parse_config(minimal_config)
-        assert cfg.agent.agent_home == os.path.expanduser("~/piclaw")
-
-    def test_custom_agent_name_gives_derived_agent_home(self, minimal_config):
-        """Custom agent_name 'mybot' → agent_home '~/mybot'."""
-        minimal_config["agent"]["agent_name"] = "mybot"
-        cfg = parse_config(minimal_config)
-        assert cfg.agent.agent_home == os.path.expanduser("~/mybot")
-
-    def test_explicit_agent_home_overrides_derived_default(self, minimal_config):
-        """Explicit agent_home is not overridden by agent_name logic."""
-        minimal_config["agent"]["agent_name"] = "mybot"
-        minimal_config["agent"]["agent_home"] = "/opt/mybot"
-        cfg = parse_config(minimal_config)
-        assert cfg.agent.agent_home == "/opt/mybot"
-
-    def test_empty_agent_home_triggers_derived_default(self, minimal_config):
-        """Empty string agent_home in config triggers default derivation."""
-        minimal_config["agent"]["agent_home"] = ""
-        cfg = parse_config(minimal_config)
-        assert cfg.agent.agent_home == os.path.expanduser("~/piclaw")
-
-
-# ---------------------------------------------------------------------------
 # _load_vault rejects non-string values
 # ---------------------------------------------------------------------------
 
@@ -951,52 +818,28 @@ class TestLoadVaultNonStringValues:
 # ---------------------------------------------------------------------------
 
 class TestPathsExpansion:
-    """Tilde references in path fields must be expanded at parse time."""
-
-    def test_skills_dir_tilde_expanded(self, minimal_config):
-        minimal_config["paths"]["skills_dir"] = "~/my-skills"
-        cfg = parse_config(minimal_config)
-        assert cfg.paths.skills_dir == os.path.expanduser("~/my-skills")
+    """Tilde references in the surviving [paths] fields are expanded at parse time."""
 
     def test_workspace_dir_default_expanded(self, minimal_config):
         cfg = parse_config(minimal_config)
         assert cfg.paths.workspace_dir == os.path.expanduser("~/Documents")
 
-    def test_downloads_dir_tilde_expanded(self, minimal_config):
-        minimal_config["paths"]["downloads_dir"] = "~/Downloads"
+    def test_workspace_dir_tilde_expanded(self, minimal_config):
+        minimal_config["paths"]["workspace_dir"] = "~/my-workspace"
         cfg = parse_config(minimal_config)
-        assert cfg.paths.downloads_dir == os.path.expanduser("~/Downloads")
+        assert cfg.paths.workspace_dir == os.path.expanduser("~/my-workspace")
 
-    def test_no_tilde_paths_unchanged(self, minimal_config):
-        minimal_config["paths"]["skills_dir"] = "skills"
-        minimal_config["paths"]["data_dir"] = "data"
+    def test_prompts_dir_no_tilde_unchanged(self, minimal_config):
+        minimal_config["paths"]["prompts_dir"] = "prompts"
         cfg = parse_config(minimal_config)
-        assert cfg.paths.skills_dir == "skills"
-        assert cfg.paths.data_dir == "data"
+        assert cfg.paths.prompts_dir == "prompts"
 
     def test_absolute_paths_unchanged(self, minimal_config):
-        minimal_config["paths"]["skills_dir"] = "/opt/skills"
+        minimal_config["paths"]["workspace_dir"] = "/opt/workspace"
         cfg = parse_config(minimal_config)
-        assert cfg.paths.skills_dir == "/opt/skills"
-
-    def test_tilde_only_expanded(self, minimal_config):
-        minimal_config["paths"]["skills_dir"] = "~/x"
-        cfg = parse_config(minimal_config)
-        assert cfg.paths.skills_dir == os.path.expanduser("~/x")
+        assert cfg.paths.workspace_dir == "/opt/workspace"
 
     def test_raw_paths_dict_also_expanded(self, minimal_config):
-        minimal_config["paths"]["skills_dir"] = "~/my-skills"
+        minimal_config["paths"]["workspace_dir"] = "~/my-workspace"
         cfg = parse_config(minimal_config)
-        assert cfg._raw["paths"]["skills_dir"] == cfg.paths.skills_dir
         assert cfg._raw["paths"]["workspace_dir"] == cfg.paths.workspace_dir
-
-    def test_agent_home_user_tilde_expanded(self, minimal_config):
-        minimal_config["agent"]["agent_home"] = "~/mybot"
-        cfg = parse_config(minimal_config)
-        assert cfg.agent.agent_home == os.path.expanduser("~/mybot")
-        assert cfg._raw["agent"]["agent_home"] == os.path.expanduser("~/mybot")
-
-    def test_log_file_absolute_tilde_expanded(self, minimal_config):
-        minimal_config["paths"]["log_file"] = "~/.local/state/mybot/custom.log"
-        cfg = parse_config(minimal_config)
-        assert cfg.paths.log_file == os.path.expanduser("~/.local/state/mybot/custom.log")
