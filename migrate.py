@@ -43,7 +43,7 @@ def _copy_file(src: Path, dest: Path, *, dry_run: bool, summary: list[str]) -> N
 
 
 def _copy_tree(src: Path, dest: Path, *, dry_run: bool, summary: list[str]) -> None:
-    """Recursively copy *src* directory to *dest*. Skips if dest already exists."""
+    """Recursively copy *src* directory to *dest* via a temp dir + rename. Skips if dest already exists."""
     if not src.is_dir():
         return
     if dest.exists():
@@ -52,7 +52,11 @@ def _copy_tree(src: Path, dest: Path, *, dry_run: bool, summary: list[str]) -> N
     if dry_run:
         summary.append(f"would copy tree: {src} -> {dest}")
         return
-    shutil.copytree(src, dest)
+    tmp_dest = dest.with_name(dest.name + ".tmp")
+    if tmp_dest.exists():
+        shutil.rmtree(tmp_dest)
+    shutil.copytree(src, tmp_dest)
+    tmp_dest.rename(dest)
     summary.append(f"copied tree: {src} -> {dest}")
 
 
@@ -70,7 +74,7 @@ def _run_migration_steps(paths: XDGPaths, source: Path, *, dry_run: bool) -> lis
 
     _copy_file(source / "data" / "scheduler_state.json", paths.scheduler_state, dry_run=dry_run, summary=summary)
     _copy_file(source / "data" / "scheduler_commands.json", paths.scheduler_commands, dry_run=dry_run, summary=summary)
-    _copy_file(source / "data" / "scheduler_jobs.json", paths.scheduler_jobs, dry_run=dry_run, summary=summary)
+    _copy_file(source / "data" / "scheduled_jobs.json", paths.scheduler_jobs, dry_run=dry_run, summary=summary)
     _copy_file(source / "data" / "job_execution_log.jsonl", paths.job_execution_log, dry_run=dry_run, summary=summary)
     _copy_file(source / "data" / "results_memory.json", paths.data_home / "results_memory.json", dry_run=dry_run, summary=summary)
     _copy_file(source / "data" / "longterm_memory.json", paths.data_home / "longterm_memory.json", dry_run=dry_run, summary=summary)
@@ -79,6 +83,7 @@ def _run_migration_steps(paths: XDGPaths, source: Path, *, dry_run: bool) -> lis
         paths.data_home / "graph_memory_backfill_state.json",
         dry_run=dry_run, summary=summary,
     )
+    _copy_file(source / "data" / "trusted_dirs.json", paths.state_home / "trusted_dirs.json", dry_run=dry_run, summary=summary)
     _copy_tree(source / "skills", paths.skills_dir, dry_run=dry_run, summary=summary)
 
     tool_index = source / "data" / "tool_index.json"

@@ -14,8 +14,9 @@
 #   bot_token = "env:TELEGRAM_BOT_TOKEN"
 #   api_key   = "sec:OPENAI_API_KEY"
 #
-# Vault file location: ~/.local/share/<agent_name>/secrets.toml
-# Override via the SPC_VAULT_FILE environment variable.
+# Vault file location: ~/.local/state/<agent_name>/secrets.toml (XDG_STATE_HOME)
+# Not independently configurable — derived from XDG env vars, same as all other
+# agent storage paths.
 #
 # Vault format (TOML — plain key = "value" pairs):
 #   OPENAI_API_KEY = "sk-..."
@@ -259,8 +260,8 @@ enabled = true
 # ─────────────────────────────────────────────────────────────────────────────
 [vault]
 type = "file"
-# The vault path defaults to ~/.local/share/<agent_name>/secrets.toml.
-# Override via the SPC_VAULT_FILE environment variable.
+# The vault path is not configurable — always ~/.local/state/<agent_name>/secrets.toml
+# (XDG_STATE_HOME), derived the same way as every other agent storage path.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Graph-Based Memory (opt-in — disabled by default)
@@ -269,7 +270,7 @@ type = "file"
 # ─────────────────────────────────────────────────────────────────────────────
 # [graph_memory]
 # enabled               = false        # set to true to enable
-# db_path               = "data/graph_memory"   # LadybugDB database file (NOT a directory)
+# # db_path is not configurable — always <XDG_DATA_HOME>/<agent_name>/graph_memory
 # buffer_pool_mb        = 256          # RAM for DB buffer pool (lower on Pi 3/4)
 # # extraction_model: model to use for triplet extraction (LLM call per batch).
 # # Must match the 'model' field of a [[models]] entry. Falls back to default_model.
@@ -279,17 +280,12 @@ type = "file"
 # max_context_entries   = 10           # max entities/facts injected into prompt
 
 [paths]
-data_dir           = "data"
-tool_index_file    = "data/tool_index.json"
-memory_file        = "data/memory.json"
-skills_dir         = "skills"
-downloads_dir      = "downloads"
+# All agent storage (config, data, state, cache, logs, pid file, skills, vault,
+# scheduler files) is derived from XDG Base Directory env vars (XDG_CONFIG_HOME,
+# XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME, XDG_RUNTIME_DIR) scoped under
+# the agent's --agent-name. None of those paths are configurable here.
 workspace_dir       = "~/Documents"  # primary user workspace; always a trusted file-access zone (file_* tools auto-allow here)
-log_file           = "agent.log"   # relative name → ~/.local/state/<agent_name>/logs/agent.log
-                                    # (from agent_name, independent of agent_home); absolute path overrides.
-                                    # Structured agent.jsonl is written alongside.
 log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups to keep
-pid_file           = "data/agent.pid"  # PID lock file; prevents duplicate instances
 # Agent's temp/handoff directory is always /tmp/<agent_name> (agent.agent_name);
 # there is no config override for it.
 #

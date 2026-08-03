@@ -322,8 +322,8 @@ def main():
     args = _parse_args()
     agent_name = args.agent_name
     paths = xdg_paths(agent_name)
-    _create_xdg_dirs(paths)
     _check_migration(paths, agent_name)
+    _create_xdg_dirs(paths)
 
     if not paths.config_file.exists():
         sys.exit(f"No config found. Create: {paths.config_file}")

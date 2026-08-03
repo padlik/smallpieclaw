@@ -21,12 +21,13 @@ def _make_old_layout(source, with_data: bool = True) -> None:
         (data / "graph_memory.wal.checkpoint").write_text("ckpt")
         (data / "scheduler_state.json").write_text("{}")
         (data / "scheduler_commands.json").write_text("{}")
-        (data / "scheduler_jobs.json").write_text("[]")
+        (data / "scheduled_jobs.json").write_text("[]")
         (data / "job_execution_log.jsonl").write_text("")
         (data / "tool_index.json").write_text("{}")
         (data / "results_memory.json").write_text("{}")
         (data / "longterm_memory.json").write_text("{}")
         (data / "graph_memory_backfill_state.json").write_text("{}")
+        (data / "trusted_dirs.json").write_text("[]")
     skills = source / "skills"
     skills.mkdir()
     (skills / "hello" / "SKILL.md").parent.mkdir(parents=True)
@@ -122,6 +123,13 @@ class TestMigrationSteps:
         migrate.main("agent", source)
         paths = xdg_paths("agent")
         assert (paths.data_home / "graph_memory_backfill_state.json").exists()
+
+    def test_trusted_dirs_copied(self, tmp_xdg, tmp_path):
+        source = tmp_path / "old_agent"
+        _make_old_layout(source)
+        migrate.main("agent", source)
+        paths = xdg_paths("agent")
+        assert (paths.state_home / "trusted_dirs.json").exists()
 
     def test_skills_dir_copied_recursively(self, tmp_xdg, tmp_path):
         source = tmp_path / "old_agent"

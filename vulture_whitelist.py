@@ -57,10 +57,6 @@ SchedulerConfig
 PathsConfig
 MCPServerConfig
 
-# config_schema.py — PathsConfig new field
-from config_schema import PathsConfig as _PathsConfig2  # noqa: E402
-_PathsConfig2.workspace_dir
-
 # builtin_tools/access_control.py — public API
 from builtin_tools.access_control import (  # noqa: E402
     ZoneClassification,

@@ -439,7 +439,6 @@ class SchedulerConfig:
 
 @dataclass(frozen=True)
 class PathsConfig:
-    scheduler_config: str = "scheduler.toml"
     log_backup_count: int = 30
     prompts_dir: str = "prompts"
     workspace_dir: str = "~/Documents"
@@ -585,7 +584,6 @@ def _parse_scheduler(raw: dict) -> SchedulerConfig:
 def _parse_paths(raw: dict) -> PathsConfig:
     section = raw.get("paths") or {}
     expanded = {
-        "scheduler_config": _expand_path(section.get("scheduler_config", "scheduler.toml")),
         "log_backup_count": _parse_int(section.get("log_backup_count"), 30, "paths.log_backup_count"),
         "prompts_dir": _expand_path(section.get("prompts_dir", "prompts")),
         "workspace_dir": _expand_path(section.get("workspace_dir", "~/Documents")),
@@ -824,6 +822,26 @@ def _reject_removed_fields(raw: dict) -> None:
             "[agent] 'shell_nsjail_network' has been removed. "
             "Replace it with 'allow_net = true' (host network) or "
             "'allow_net = false' (network isolated, the default)."
+        )
+
+    paths = raw.get("paths") or {}
+    for removed_field in (
+        "data_dir", "tool_index_file", "memory_file", "pid_file",
+        "downloads_dir", "log_file", "file_vault", "skills_dir",
+    ):
+        if removed_field in paths:
+            raise ConfigError(
+                f"[paths] '{removed_field}' has been removed. "
+                "Storage paths are now derived from XDG Base Directory env vars "
+                "(XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME); "
+                "only 'workspace_dir' remains configurable in [paths]."
+            )
+
+    graph_memory = raw.get("graph_memory") or {}
+    if isinstance(graph_memory, dict) and "db_path" in graph_memory:
+        raise ConfigError(
+            "[graph_memory] 'db_path' has been removed. "
+            "The graph memory database path is now derived from XDG_DATA_HOME."
         )
 
 

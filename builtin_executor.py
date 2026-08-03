@@ -27,7 +27,6 @@ Result dicts produced by built-in tools include the following recovery fields:
 from __future__ import annotations
 
 import logging
-import os
 import secrets
 import shutil
 import threading
@@ -57,7 +56,7 @@ from builtin_tools.patterns import (
 from builtin_tools.schedule import exec_schedule
 from builtin_tools.secrets_log import LogQueryTools, SecretsTools
 from builtin_tools.shell import ShellTools
-from conversation_io import _xdg_state_home
+from xdg import xdg_paths
 from builtin_tools.shell_env import ShellEnvTools
 from nsjail_config import NsjailConfigBuilder
 from builtin_tools.text_utils import (
@@ -138,9 +137,9 @@ class BuiltinExecutor:
         self._agent_name = agent_name
         # XDGPaths.state_home (already agent_name-suffixed) as a str, passed down
         # explicitly so builtin_tools/shell.py doesn't re-derive it independently
-        # (single source of truth is xdg.py). Falls back to the pre-XDGPaths
-        # derivation when unset (tests, ad-hoc callers).
-        self._state_home = state_home or os.path.join(_xdg_state_home(), agent_name)
+        # (single source of truth is xdg.py). Falls back to xdg_paths() when unset
+        # (tests, ad-hoc callers).
+        self._state_home = state_home or str(xdg_paths(agent_name).state_home)
         # Optional[str] — current conversation id; set by main.py on startup and
         # rotated by AgentController.reset_task(). Used for per-conversation
         # session_logs paths and persistence.

@@ -163,8 +163,8 @@ def main() -> None:
         help="Override path to longterm_memory.json (default: XDGPaths.data_home for --agent-name)",
     )
     parser.add_argument(
-        "--agent-name", default="piclaw",
-        help="Agent name used to resolve default XDG paths (default: piclaw)",
+        "--agent-name", required=True,
+        help="Agent name used to resolve default XDG paths",
     )
     parser.add_argument(
         "--db-path", default="",
