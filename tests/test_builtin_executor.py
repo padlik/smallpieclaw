@@ -6,6 +6,8 @@ import os
 import sys
 from unittest.mock import MagicMock
 
+import pytest
+
 from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _is_sensitive_path, _truncate_output
 from builtin_tools.shell import ShellTools
 from builtin_tools.shell_env import ShellEnvTools
@@ -1441,3 +1443,107 @@ class TestSubprocessTimeoutBoundedKill:
         assert elapsed < 10.0, f"Took {elapsed:.1f}s — timeout kill may be looping"
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
+
+
+class TestNsjailDumpConfigOnError:
+    """Test ShellTools._dump_nsjail_config() and the dump-on-error flag."""
+
+    def test_dump_config_copies_file_to_session_logs(self, tmp_path):
+        cfg = tmp_path / "src.cfg"
+        cfg.write_text("name: \"agent-shell\"\nmode: ONCE\n")
+        session_logs = tmp_path / "session_logs"
+
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex._shell._dump_nsjail_config(str(cfg), str(session_logs))
+
+        dumped = list(session_logs.glob("nsjail-config-*.cfg"))
+        assert len(dumped) == 1
+        assert dumped[0].read_text() == cfg.read_text()
+
+    def test_dump_config_swallows_unwritable_session_logs_dir(self, tmp_path):
+        cfg = tmp_path / "src.cfg"
+        cfg.write_text("name: x\n")
+        # Make "blocker" a file so makedirs for a nested path under it fails.
+        (tmp_path / "blocker").write_text("")
+        bad_session_logs = str(tmp_path / "blocker" / "nested")
+
+        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        # Must not raise.
+        ex._shell._dump_nsjail_config(str(cfg), bad_session_logs)
+
+    def test_flag_defaults_to_false(self):
+        ex = BuiltinExecutor()
+        assert ex._shell_nsjail_dump_config_on_error is False
+
+    def test_dump_not_triggered_when_flag_off(self, tmp_path, monkeypatch):
+        """Gating: nsjail_error result + flag off → no dump, cfg still unlinked."""
+        cfg = tmp_path / "live.cfg"
+        cfg.write_text("name: x\n")
+        session_logs = tmp_path / "session_logs"
+        session_logs.mkdir()
+
+        shell = ShellTools(MagicMock())
+        shell._owner._shell_nsjail_dump_config_on_error = False
+        shell._owner._state_home = str(tmp_path)
+        shell._owner.conversation_id = "conv1"
+        shell._owner._nsjail_builder = MagicMock()
+        shell._owner._nsjail_builder.build.return_value = (str(cfg), ["nsjail", "--config", str(cfg)])
+        # Stub the subprocess call to return an nsjail_error result.
+        monkeypatch.setattr(
+            shell, "_run_shell_subprocess",
+            lambda args, caller_tag="", nsjail_cmd=None, conv_id="": {"error_type": "nsjail_error"},
+        )
+        monkeypatch.setattr(shell, "_dump_nsjail_config", lambda *_a, **_k: pytest.fail("must not dump"))
+        monkeypatch.setattr("shutil.which", lambda _b: "/usr/bin/nsjail")
+
+        shell._run_shell_nsjail({"command": "echo", "timeout": 1})
+        assert not list(session_logs.glob("nsjail-config-*.cfg"))
+        assert not cfg.exists()  # cfg unlinked even without dump
+
+    def test_dump_triggered_then_unlink_when_flag_on(self, tmp_path, monkeypatch):
+        """Gating: nsjail_error result + flag on → dump, then cfg unlinked."""
+        cfg = tmp_path / "live.cfg"
+        cfg.write_text("name: x\n")
+        session_logs = tmp_path / "session_logs"
+        session_logs.mkdir()
+
+        shell = ShellTools(MagicMock())
+        shell._owner._shell_nsjail_dump_config_on_error = True
+        shell._owner._state_home = str(tmp_path)
+        shell._owner.conversation_id = "conv1"
+        shell._owner._nsjail_builder = MagicMock()
+        shell._owner._nsjail_builder.build.return_value = (str(cfg), ["nsjail", "--config", str(cfg)])
+        monkeypatch.setattr(
+            shell, "_run_shell_subprocess",
+            lambda args, caller_tag="", nsjail_cmd=None, conv_id="": {"error_type": "nsjail_error"},
+        )
+        monkeypatch.setattr("shutil.which", lambda _b: "/usr/bin/nsjail")
+
+        shell._run_shell_nsjail({"command": "echo", "timeout": 1})
+        # _run_shell_nsjail computes session_logs_dir as <state_home>/session_logs/<conv_id>
+        dumped = list((tmp_path / "session_logs" / "conv1").glob("nsjail-config-*.cfg"))
+        assert len(dumped) == 1
+        assert not cfg.exists()  # cfg unlinked after dump
+
+    def test_cfg_unlinked_when_subprocess_raises(self, tmp_path, monkeypatch):
+        """Leak guard: if _run_shell_subprocess raises, cfg is still unlinked."""
+        cfg = tmp_path / "live.cfg"
+        cfg.write_text("name: x\n")
+        session_logs = tmp_path / "session_logs"
+        session_logs.mkdir()
+
+        shell = ShellTools(MagicMock())
+        shell._owner._shell_nsjail_dump_config_on_error = True
+        shell._owner._state_home = str(tmp_path)
+        shell._owner.conversation_id = "conv1"
+        shell._owner._nsjail_builder = MagicMock()
+        shell._owner._nsjail_builder.build.return_value = (str(cfg), ["nsjail", "--config", str(cfg)])
+
+        def _boom(*a, **k):
+            raise RuntimeError("subprocess exploded")
+        monkeypatch.setattr(shell, "_run_shell_subprocess", _boom)
+        monkeypatch.setattr("shutil.which", lambda _b: "/usr/bin/nsjail")
+
+        with pytest.raises(RuntimeError):
+            shell._run_shell_nsjail({"command": "echo", "timeout": 1})
+        assert not cfg.exists()  # finally cleaned up despite the raise

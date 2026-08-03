@@ -238,6 +238,10 @@ long_run_warn_minutes = 30
 # shell_nsjail_memory_mb    = 256   # memory cap in MB (cgroup, or RLIMIT_AS fallback)
 # shell_nsjail_pids_max     = 64    # max PIDs inside the jail (cgroup only)
 # shell_nsjail_cpu_percent  = 50    # CPU quota as % of one core (cgroup only)
+# shell_nsjail_dump_config_on_error = false  # when true, on an nsjail setup failure
+#                          the generated nsjail config file is copied into the
+#                          per-conversation session_logs directory for debugging.
+#                          Default: false.
 # allow_net                 = false  # false = isolated (no network), true = share host network
 # When allow_net = true, the system CA certificate store is mounted read-only
 # inside the nsjail jail and SSL_CERT_FILE / SSL_CERT_DIR env vars are injected
