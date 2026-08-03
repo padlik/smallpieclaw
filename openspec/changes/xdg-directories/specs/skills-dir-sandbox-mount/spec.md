@@ -4,7 +4,7 @@
 
 Define how `skills_dir` is mounted inside the nsjail sandbox. `skills_dir` is an XDG-derived path (`$XDG_STATE_HOME/<agent_name>/skills/`); it is not a user-configurable config field.
 
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: skills_dir is mounted read-only inside the nsjail sandbox
 

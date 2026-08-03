@@ -4,7 +4,7 @@
 
 Define the `XDGPaths` frozen dataclass and `xdg_paths(agent_name)` resolver in the new `xdg.py` module.
 
-## Requirements
+## ADDED Requirements
 
 ### Requirement: XDG Base Directory resolution
 

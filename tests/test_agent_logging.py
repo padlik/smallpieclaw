@@ -1,7 +1,7 @@
 """Tests for the structlog logging backbone (agent_logging) and XDG path resolution.
 
 Covers:
-- XDG log path resolution (independent of agent_home; absolute override).
+- XDG log path resolution via xdg_paths().
 - The shared processor chain: contextvars identity merge, secret redaction,
   and the JSONL render shape.
 - LogEvent taxonomy emission with structured fields.
@@ -13,13 +13,12 @@ rest of the suite.
 
 import json
 import logging
-import os
 
 import pytest
 import structlog
 
 import agent_logging as al
-import config_schema as cs
+from xdg import xdg_paths
 
 
 @pytest.fixture(autouse=True)
@@ -53,25 +52,18 @@ def _flush() -> None:
 
 
 class TestXdgPathResolution:
-    def test_default_agent(self):
-        p = cs.log_path({"agent": {"agent_name": "piclaw"}})
-        assert p == os.path.expanduser("~/.local/state/piclaw/logs/agent.log")
+    def test_default_agent(self, tmp_xdg):
+        p = xdg_paths("piclaw").log_file
+        assert p == tmp_xdg / "state" / "piclaw" / "logs" / "agent.log"
 
-    def test_custom_agent_name(self):
-        d = cs.log_dir({"agent": {"agent_name": "mybot"}})
-        assert d == os.path.expanduser("~/.local/state/mybot/logs")
+    def test_custom_agent_name(self, tmp_xdg):
+        d = xdg_paths("mybot").logs_dir
+        assert d == tmp_xdg / "state" / "mybot" / "logs"
 
-    def test_agent_home_does_not_affect_log_path(self):
-        p = cs.log_path({"agent": {"agent_name": "piclaw", "agent_home": "/opt/x"}})
-        assert "/.local/state/piclaw/logs/" in p
-        assert "/opt/x" not in p
-
-    def test_absolute_log_file_overrides(self):
-        assert cs.log_path({"paths": {"log_file": "/var/log/x/a.log"}}) == "/var/log/x/a.log"
-
-    def test_relative_log_file_lands_under_xdg(self):
-        p = cs.log_path({"agent": {"agent_name": "piclaw"}, "paths": {"log_file": "custom.log"}})
-        assert p == os.path.expanduser("~/.local/state/piclaw/logs/custom.log")
+    def test_logs_always_under_state_home(self, tmp_xdg):
+        p = xdg_paths("piclaw").log_file
+        assert "logs" in p.parts
+        assert "piclaw" in p.parts
 
 
 class TestProcessorChain:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,6 +18,32 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scheduler import Scheduler
+from xdg import XDGPaths
+
+
+def _paths_for(state_dir) -> XDGPaths:
+    """Build an XDGPaths rooted at *state_dir* without touching real XDG env vars."""
+    state_dir = Path(state_dir)
+    logs_dir = state_dir / "logs"
+    return XDGPaths(
+        config_home=state_dir, data_home=state_dir, state_home=state_dir,
+        cache_home=state_dir, runtime_dir=state_dir,
+        config_file=state_dir / "config.toml",
+        scheduler_config=state_dir / "scheduler.toml",
+        memory_file=state_dir / "memory.json",
+        graph_memory_db=state_dir / "graph_memory",
+        tool_index_file=state_dir / "tool_index.json",
+        pid_file=state_dir / "agent.pid",
+        secrets_file=state_dir / "secrets.toml",
+        logs_dir=logs_dir,
+        log_file=logs_dir / "agent.log",
+        log_jsonl=logs_dir / "agent.jsonl",
+        skills_dir=state_dir / "skills",
+        scheduler_state=state_dir / "scheduler_state.json",
+        scheduler_commands=state_dir / "scheduler_commands.json",
+        scheduler_jobs=state_dir / "scheduler_jobs.json",
+        job_execution_log=state_dir / "job_execution_log.jsonl",
+    )
 
 
 @pytest.fixture
@@ -35,7 +62,7 @@ def sched(tmp_path):
         notify_fn=MagicMock(),
         agent_fn=MagicMock(),
         scheduler_config_path=str(config_path),
-        data_dir=str(data_dir),
+        paths=_paths_for(data_dir),
     )
     return s
 
@@ -125,7 +152,7 @@ class TestTomlRoundTrip:
             config=config,
             notify_fn=MagicMock(),
             scheduler_config_path=str(toml_path),
-            data_dir=str(data_dir2),
+            paths=_paths_for(data_dir2),
         )
         assert s2._jobs_meta["roundtrip"]["fallback_models"] == fb
 
@@ -145,7 +172,7 @@ class TestTomlRoundTrip:
             config={"scheduler": {"enabled": False}, "agent": {}},
             notify_fn=MagicMock(),
             scheduler_config_path=str(toml_path),
-            data_dir=str(data_dir2),
+            paths=_paths_for(data_dir2),
         )
         assert s2._jobs_meta["no_fb_job"]["fallback_models"] == []
 
@@ -161,7 +188,7 @@ class TestTomlRoundTrip:
             config={"scheduler": {"enabled": False}, "agent": {}},
             notify_fn=MagicMock(),
             scheduler_config_path=str(toml_path),
-            data_dir=str(data_dir2),
+            paths=_paths_for(data_dir2),
         )
         assert s2._jobs_meta["plain"]["fallback_models"] is None
 

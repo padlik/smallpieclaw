@@ -5,8 +5,8 @@ Background task scheduler backed by scheduler.toml and dynamic JSON storage.
 Runs in a daemon thread so it does not block the Telegram bot.
 
 Job sources:
-  - scheduler.toml     static, config-managed jobs
-  - data/scheduled_jobs.json  dynamic, runtime-managed jobs
+  - scheduler.toml         static, config-managed jobs
+  - scheduler_jobs.json    dynamic, runtime-managed jobs (XDG state home)
 
 Scheduling uses cron expressions (5-field: minute hour day month weekday).
 Old-style config fields (schedule=daily/interval, time=, hours=, minutes=) are
@@ -29,13 +29,16 @@ import re
 import shutil
 import threading
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import schedule
 from croniter import croniter, CroniterBadCronError
 
 from sub_agent_registry import SOURCE_SCHEDULED
 from sub_agent_supervisor import SupervisionOptions
+
+if TYPE_CHECKING:
+    from xdg import XDGPaths
 
 logger = logging.getLogger(__name__)
 
@@ -255,9 +258,9 @@ class Scheduler:
         self,
         config: dict,
         notify_fn: Callable[[str], None],
+        paths: "XDGPaths",
         agent_fn: Optional[Callable[[str], str]] = None,
         scheduler_config_path: str = "scheduler.toml",
-        data_dir: str = "data",
         builtin_executor=None,
     ):
         sched_cfg = config.get("scheduler", {})
@@ -266,17 +269,16 @@ class Scheduler:
         self.notify = notify_fn
         self.agent = agent_fn
         self.builtin_executor = builtin_executor  # Optional[BuiltinExecutor]
-        self._data_dir = data_dir
         self._scheduler_config_path = scheduler_config_path
-        self._commands_file = os.path.join(data_dir, "scheduler_commands.json")
-        self._state_file = os.path.join(data_dir, "scheduler_state.json")
-        self._dynamic_jobs_file = os.path.join(data_dir, "scheduled_jobs.json")
+        self._commands_file = str(paths.scheduler_commands)
+        self._state_file = str(paths.scheduler_state)
+        self._dynamic_jobs_file = str(paths.scheduler_jobs)
 
         # Execution history log
         _log_max_age = int(sched_cfg.get("execution_log_max_age_hours", 48))
         _log_max_per = int(sched_cfg.get("execution_log_max_per_job", 10))
         self.execution_log = JobExecutionLog(
-            log_file=os.path.join(data_dir, "job_execution_log.jsonl"),
+            log_file=str(paths.job_execution_log),
             max_age_hours=_log_max_age,
             max_per_job=_log_max_per,
         )
@@ -297,7 +299,7 @@ class Scheduler:
         # preventing race conditions when two jobs finish simultaneously.
         self._save_lock = threading.Lock()
 
-        os.makedirs(data_dir, exist_ok=True)
+        paths.state_home.mkdir(parents=True, exist_ok=True)
         self._load_config_jobs(scheduler_config_path, sched_cfg)
         self._load_dynamic_jobs()   # migration: imports old JSON, deletes it, writes to TOML
         self._load_state()          # overlay last_run/last_error onto active jobs from history

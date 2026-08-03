@@ -27,6 +27,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scheduler import JobExecutionLog, Scheduler
+from xdg import xdg_paths
 
 
 # ---------------------------------------------------------------------------
@@ -44,22 +45,21 @@ def log(log_path):
     return JobExecutionLog(log_path, max_age_hours=48, max_per_job=10)
 
 
-def _sched(tmp_path, extra_config=None):
+def _sched(tmp_path, monkeypatch, extra_config=None):
     """Helper to create a minimal Scheduler for testing."""
     config_path = tmp_path / "scheduler.toml"
     config_path.write_text("")
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
     config = {
         "scheduler": {"enabled": False, **(extra_config or {})},
         "agent": {"scheduled_max_iterations": 10},
     }
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     return Scheduler(
         config=config,
         notify_fn=MagicMock(),
         agent_fn=MagicMock(),
         scheduler_config_path=str(config_path),
-        data_dir=str(data_dir),
+        paths=xdg_paths("test-agent"),
     )
 
 
@@ -225,14 +225,14 @@ def test_format_for_prompt_shows_success_marker(log):
 # ---------------------------------------------------------------------------
 
 
-def test_scheduler_has_execution_log(tmp_path):
-    s = _sched(tmp_path)
+def test_scheduler_has_execution_log(tmp_path, monkeypatch):
+    s = _sched(tmp_path, monkeypatch)
     assert hasattr(s, "execution_log")
     assert isinstance(s.execution_log, JobExecutionLog)
 
 
-def test_scheduler_uses_config_for_log_params(tmp_path):
-    s = _sched(tmp_path, extra_config={
+def test_scheduler_uses_config_for_log_params(tmp_path, monkeypatch):
+    s = _sched(tmp_path, monkeypatch, extra_config={
         "execution_log_max_age_hours": 12,
         "execution_log_max_per_job": 5,
     })
@@ -240,8 +240,8 @@ def test_scheduler_uses_config_for_log_params(tmp_path):
     assert s.execution_log._max_per_job == 5
 
 
-def test_scheduler_legacy_path_records_success(tmp_path):
-    s = _sched(tmp_path)
+def test_scheduler_legacy_path_records_success(tmp_path, monkeypatch):
+    s = _sched(tmp_path, monkeypatch)
     s._jobs_meta["test_job"] = {"task": "do something", "enabled": True, "notify": False}
     s.agent = MagicMock(return_value="all done")
 
@@ -255,8 +255,8 @@ def test_scheduler_legacy_path_records_success(tmp_path):
     assert kwargs["result"] == "all done"
 
 
-def test_scheduler_legacy_path_records_failure(tmp_path):
-    s = _sched(tmp_path)
+def test_scheduler_legacy_path_records_failure(tmp_path, monkeypatch):
+    s = _sched(tmp_path, monkeypatch)
     s._jobs_meta["bad_job"] = {"task": "do something", "enabled": True, "notify": False}
     s.agent = MagicMock(return_value="❌ something went wrong")
 
@@ -268,14 +268,14 @@ def test_scheduler_legacy_path_records_failure(tmp_path):
     assert kwargs["success"] is False
 
 
-def test_scheduler_spawn_path_passes_result_log_cb(tmp_path):
+def test_scheduler_spawn_path_passes_result_log_cb(tmp_path, monkeypatch):
     """Scheduler delivers result_log_cb via supervision options, not spawn_args.
 
     Migrated from asserting an ``_result_log_cb`` key inside the model-facing
     spawn_args dict: scheduler/internal controls now flow through the
     per-submission ``SupervisionOptions`` channel.
     """
-    s = _sched(tmp_path)
+    s = _sched(tmp_path, monkeypatch)
     s._jobs_meta["spawn_job"] = {"task": "do spawn task", "enabled": True, "notify": False}
     mock_executor = MagicMock()
     mock_executor._exec_spawn_agent = MagicMock(return_value={"success": True})

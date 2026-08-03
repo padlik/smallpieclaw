@@ -27,6 +27,7 @@ Result dicts produced by built-in tools include the following recovery fields:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import shutil
 import threading
@@ -56,6 +57,7 @@ from builtin_tools.patterns import (
 from builtin_tools.schedule import exec_schedule
 from builtin_tools.secrets_log import LogQueryTools, SecretsTools
 from builtin_tools.shell import ShellTools
+from conversation_io import _xdg_state_home
 from builtin_tools.shell_env import ShellEnvTools
 from nsjail_config import NsjailConfigBuilder
 from builtin_tools.text_utils import (
@@ -126,6 +128,7 @@ class BuiltinExecutor:
                    nsjail_agent_dir: str = "",
                    agent_name: str = "piclaw",
                    tmp_dir: str = "",
+                   state_home: str = "",
                    vault_secrets: Optional[list[str]] = None):
         self.default_timeout = default_timeout
         self.max_output = max_output
@@ -133,6 +136,11 @@ class BuiltinExecutor:
         self._sub_agent_factory = sub_agent_factory  # Callable[[model, context_key, label, notify_fn], SubAgentRunner]
         self._data_dir = data_dir
         self._agent_name = agent_name
+        # XDGPaths.state_home (already agent_name-suffixed) as a str, passed down
+        # explicitly so builtin_tools/shell.py doesn't re-derive it independently
+        # (single source of truth is xdg.py). Falls back to the pre-XDGPaths
+        # derivation when unset (tests, ad-hoc callers).
+        self._state_home = state_home or os.path.join(_xdg_state_home(), agent_name)
         # Optional[str] — current conversation id; set by main.py on startup and
         # rotated by AgentController.reset_task(). Used for per-conversation
         # session_logs paths and persistence.

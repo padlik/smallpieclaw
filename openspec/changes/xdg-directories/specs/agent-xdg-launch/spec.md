@@ -4,7 +4,7 @@
 
 Define `--agent-name` as the required CLI argument for agent launch and the XDG startup flow in `main.py`.
 
-## Requirements
+## ADDED Requirements
 
 ### Requirement: --agent-name is a required CLI argument
 
@@ -86,7 +86,7 @@ Rule: String config values starting with `.` trigger a startup warning; values s
 
 ### Requirement: downloads_dir derived from workspace_dir at startup
 
-`downloads_dir` is no longer a `[paths]` config field. It is derived at startup as `Path(cfg["paths"].get("workspace_dir", "~/Documents")).expanduser() / "downloads"`. `workspace_dir` is the one remaining user-configurable path in `[paths]`; all other path derivation is handled by `xdg.py`.
+`downloads_dir` MUST NOT be a `[paths]` config field. It MUST be derived at startup as `Path(cfg["paths"].get("workspace_dir", "~/Documents")).expanduser() / "downloads"`. `workspace_dir` is the one remaining user-configurable path in `[paths]`; all other path derivation is handled by `xdg.py`.
 
 Feature: downloads_dir derivation
 Rule: `downloads_dir` is always `<workspace_dir>/downloads/`; it is not configurable directly and does not appear as a `[paths]` field.

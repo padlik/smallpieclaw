@@ -4,7 +4,7 @@
 
 Define `agent_name` as the sole agent identifier (resolved from `--agent-name` CLI); all storage paths derive from XDG Base Directories keyed by `agent_name`; `agent_home` is retired.
 
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: agent_name identifies the agent and its XDG storage namespace
 
@@ -65,3 +65,21 @@ Rule: logs are always `~/.local/state/<agent_name>/logs/`; no per-agent override
 - **WHEN** the application starts
 - **THEN** no `agent.log` is created inside the source checkout directory
 - **AND** logs are written to `~/.local/state/<agent_name>/logs/agent.log`
+
+### Requirement: Results memory and legacy long-term memory files are always under XDG data home
+
+`results_memory.json` MUST always reside at `$XDG_DATA_HOME/<agent_name>/results_memory.json`. The legacy, backfill-only `longterm_memory.json` (consumed only by `backfill_graph_memory.py`) MUST default to `$XDG_DATA_HOME/<agent_name>/longterm_memory.json`, overridable via `--longterm-path` for one-off manual runs against a different file. Neither path is configurable via `[paths]` in `config.toml`. The `results_memory_file` and `longterm_memory_file` config fields are removed.
+
+Feature: Generated memory files at XDG data home
+Rule: `results_memory.json` is always `paths.data_home / "results_memory.json"`; `longterm_memory.json` defaults to `paths.data_home / "longterm_memory.json"` and is overridable only via the `backfill_graph_memory.py --longterm-path` CLI flag, never via `config.toml`.
+
+#### Scenario: results_memory.json is not configurable
+- **GIVEN** `config.toml` sets `[paths] results_memory_file = "/custom/results.json"`
+- **WHEN** the application starts with `--agent-name piclaw`
+- **THEN** `results_memory.json` is still read from and written to `~/.local/share/piclaw/results_memory.json`
+- **AND** the `results_memory_file` config value is ignored
+
+#### Scenario: backfill_graph_memory.py defaults to the XDG data home for longterm_memory.json
+- **GIVEN** `backfill_graph_memory.py` is run with `--agent-name piclaw` and no `--longterm-path` override
+- **WHEN** the script resolves the source LongTermMemory file
+- **THEN** it reads from `~/.local/share/piclaw/longterm_memory.json`

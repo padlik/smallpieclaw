@@ -13,6 +13,9 @@ Agent configuration, data, and runtime state are currently stored relative to th
 - **BREAKING** Remove `file_vault` config parameter — always `$XDG_STATE_HOME/<agent_name>/secrets.toml` (no change for existing installs; already XDG)
 - **BREAKING** Remove `graph_memory.db_path` config parameter — always `$XDG_DATA_HOME/<agent_name>/graph_memory`
 - **BREAKING** Remove `skills_dir` config parameter — always `$XDG_STATE_HOME/<agent_name>/skills/`; skills are user-created only, not bundled with code
+- **BREAKING** Remove `results_memory_file` config parameter — always `$XDG_DATA_HOME/<agent_name>/results_memory.json`
+- **BREAKING** Remove `longterm_memory_file` config parameter — legacy/backfill-only file defaults to `$XDG_DATA_HOME/<agent_name>/longterm_memory.json`; overridable only via `backfill_graph_memory.py --longterm-path` for one-off manual runs, never via `config.toml`
+- `backfill_graph_memory.py --state-file` default (`graph_memory_backfill_state.json`) moves from alongside `--longterm-path` to `$XDG_DATA_HOME/<agent_name>/graph_memory_backfill_state.json`; `--agent-name` flag added (default `piclaw`) to resolve XDG defaults
 - **BREAKING** Move `config.toml` from `agent_home/` to `$XDG_CONFIG_HOME/<agent_name>/config.toml`
 - **BREAKING** Move `scheduler.toml` from `agent_home/` to `$XDG_CONFIG_HOME/<agent_name>/scheduler.toml`
 - **BREAKING** Move scheduler runtime state files from `data/` to `$XDG_STATE_HOME/<agent_name>/`: `scheduler_state.json`, `scheduler_commands.json`, `scheduler_jobs.json`, `job_execution_log.jsonl`
@@ -34,21 +37,22 @@ Agent configuration, data, and runtime state are currently stored relative to th
 
 - `xdg-path-resolution`: All agent storage paths derived from XDG env vars and `--agent-name`; no per-path config parameters; `XDGPaths` dataclass passed to all consumers
 - `agent-xdg-launch`: Agent launched with `--agent-name <name>` flag from any working directory; config resolved from `$XDG_CONFIG_HOME/<name>/config.toml`; XDG dirs created at startup; missing config produces actionable error
-- `xdg-data-migration`: `migrate.py --agent-name <name> [--source <agent_home_dir>]` detects old `agent_home`-relative layout and copies files to correct XDG locations; writes migration sentinel to prevent re-runs; skips and removes regeneratable files (`tool_index.json`)
+- `xdg-data-migration`: `migrate.py --agent-name <name> [--source <agent_home_dir>]` detects old `agent_home`-relative layout and copies files to correct XDG locations (including `results_memory.json`, `longterm_memory.json`, `graph_memory_backfill_state.json`); writes migration sentinel to prevent re-runs; skips and removes regeneratable files (`tool_index.json`)
 
 ### Modified Capabilities
 
 - `skill-path-resolution`: Skills directory changes from project-relative (`agent_home/skills/`) to user-global XDG state (`$XDG_STATE_HOME/<name>/skills/`); skills are user-created only, no bundled skills shipped with code
 - `skills-dir-sandbox-mount`: nsjail read-only whitelist for skills dir updated from project-relative path to `$XDG_STATE_HOME/<name>/skills/`; `skills_dir` config parameter in `[paths]` removed; path is always XDG-derived
-- `agent-scoped-directories`: `agent_home` no longer serves as a storage root — it is the code directory only (WorkingDirectory in systemd); `AgentConfig.agent_home` field removed; all storage paths derive from XDG + `agent_name`; `log_file` override scenario removed (parameter no longer exists)
+- `agent-scoped-directories`: `agent_home` no longer serves as a storage root — it is the code directory only (WorkingDirectory in systemd); `AgentConfig.agent_home` field removed; all storage paths derive from XDG + `agent_name`; `log_file` override scenario removed (parameter no longer exists); `results_memory.json` and legacy `longterm_memory.json` also derive from `$XDG_DATA_HOME/<agent_name>/` with no `[paths]` override
 
 ## Impact
 
 - `main.py` — major refactor: `_AGENT_DIR` retired, new startup flow, XDG dir creation, auto-migration check, `--agent-name` CLI arg
 - `xdg.py` — new module
 - `migrate.py` — new script
-- `config_schema.py` — remove 8 `PathsConfig` fields (`data_dir`, `tool_index_file`, `memory_file`, `pid_file`, `downloads_dir`, `log_file`, `file_vault`, `skills_dir`), remove `GraphMemoryConfig.db_path`, remove `AgentConfig.agent_home`; XDG path helpers updated
+- `config_schema.py` — remove 10 `PathsConfig` fields (`data_dir`, `tool_index_file`, `memory_file`, `pid_file`, `downloads_dir`, `log_file`, `file_vault`, `skills_dir`, `results_memory_file`, `longterm_memory_file`), remove `GraphMemoryConfig.db_path`, remove `AgentConfig.agent_home`; XDG path helpers updated
 - `scheduler.py` — state/commands/jobs/log paths derived from `XDGPaths`
 - `nsjail_config.py` — skills path whitelist updated
+- `backfill_graph_memory.py` — `--agent-name` flag added; `longterm_path`/`state_file` defaults resolve from `xdg_paths(agent_name).data_home` instead of `[paths]` config
 - `tests/conftest.py` — `tmp_agent_dir` fixture replaced by `tmp_xdg` (overrides all `XDG_*` env vars to temp dirs)
 - Systemd user service units: add `--agent-name <name>` to `ExecStart`; `$XDG_RUNTIME_DIR` already set by systemd-logind

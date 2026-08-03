@@ -44,11 +44,10 @@ MCPManagerProtocol.list_servers
 MCPManagerProtocol.get_tools
 
 # config_schema.py — public API classes and functions
-from config_schema import parse_config, vault_path, AppConfig, TelegramConfig, AgentConfig  # noqa: E402
+from config_schema import parse_config, AppConfig, TelegramConfig, AgentConfig  # noqa: E402
 from config_schema import ModelConfig, EmbeddingsConfig, SchedulerConfig  # noqa: E402
 from config_schema import PathsConfig, MCPServerConfig  # noqa: E402
 parse_config
-vault_path
 AppConfig
 TelegramConfig
 AgentConfig
@@ -82,11 +81,6 @@ GrantTracker
 GrantTracker.add
 GrantTracker.reset
 GrantTracker.snapshot
-
-# config_schema.py — XDG log path helpers
-from config_schema import log_dir, log_path  # noqa: E402
-log_dir
-log_path
 
 # agent_logging.py — structlog logging backbone public API
 from agent_logging import (  # noqa: E402

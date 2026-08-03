@@ -2,26 +2,26 @@
 backfill_graph_memory.py
 ------------------------
 One-time CLI tool to seed the LadybugDB graph store from existing
-LongTermMemory entries (data/longterm_memory.json).
+LongTermMemory entries. Defaults to ``$XDG_DATA_HOME/<agent_name>/longterm_memory.json``.
 
 Usage examples
 --------------
 # Dry-run: count what would be imported without touching anything
-python backfill_graph_memory.py --config config.toml --dry-run
+python backfill_graph_memory.py --config config.toml --agent-name piclaw --dry-run
 
 # Import up to 20 entries (incremental)
-python backfill_graph_memory.py --config config.toml --limit 20
+python backfill_graph_memory.py --config config.toml --agent-name piclaw --limit 20
 
 # Import everything, skipping already-imported entries
-python backfill_graph_memory.py --config config.toml
+python backfill_graph_memory.py --config config.toml --agent-name piclaw
 
 # Re-import all entries regardless of prior state
-python backfill_graph_memory.py --config config.toml --force
+python backfill_graph_memory.py --config config.toml --agent-name piclaw --force
 
-# Custom paths
-python backfill_graph_memory.py --config config.toml \\
-    --longterm-path data/longterm_memory.json \\
-    --state-file data/graph_memory_backfill_state.json
+# Override paths explicitly (e.g. importing from a different agent's export)
+python backfill_graph_memory.py --config config.toml --agent-name piclaw \\
+    --longterm-path /path/to/longterm_memory.json \\
+    --state-file /path/to/graph_memory_backfill_state.json
 
 Prerequisites
 -------------
@@ -160,11 +160,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--longterm-path", default="",
-        help="Override path to longterm_memory.json",
+        help="Override path to longterm_memory.json (default: XDGPaths.data_home for --agent-name)",
+    )
+    parser.add_argument(
+        "--agent-name", default="piclaw",
+        help="Agent name used to resolve default XDG paths (default: piclaw)",
+    )
+    parser.add_argument(
+        "--db-path", default="",
+        help="Override the graph DB path (default: XDGPaths.graph_memory_db for --agent-name)",
     )
     parser.add_argument(
         "--state-file", default="",
-        help="Override path to backfill state file (default: data/graph_memory_backfill_state.json)",
+        help="Override path to backfill state file (default: XDGPaths.data_home/graph_memory_backfill_state.json)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -195,8 +203,11 @@ def main() -> None:
 
     from config_schema import parse_config
     from exceptions import ConfigError
+    from xdg import xdg_paths
+
+    xdg = xdg_paths(args.agent_name)
     try:
-        app_cfg = parse_config(raw_cfg)
+        app_cfg = parse_config(raw_cfg, vault_file=str(xdg.secrets_file))
     except ConfigError as exc:
         logger.error("Config error: %s", exc)
         sys.exit(1)
@@ -227,15 +238,9 @@ def main() -> None:
     # Resolve paths
     # ------------------------------------------------------------------
     gm_cfg = app_cfg.graph_memory
-    paths = raw_cfg.get("paths", {})
-    longterm_path = (
-        args.longterm_path
-        or paths.get("longterm_memory_file", "data/longterm_memory.json")
-    )
-    state_file = (
-        args.state_file
-        or os.path.join(os.path.dirname(longterm_path), "graph_memory_backfill_state.json")
-    )
+    db_path = args.db_path or str(xdg.graph_memory_db)
+    longterm_path = args.longterm_path or str(xdg.data_home / "longterm_memory.json")
+    state_file = args.state_file or str(xdg.data_home / "graph_memory_backfill_state.json")
 
     if not os.path.exists(longterm_path):
         logger.warning("LongTermMemory file not found: %s — nothing to import.", longterm_path)
@@ -319,7 +324,7 @@ def main() -> None:
         backfill_longterm_to_graph,
     )
 
-    logger.info("Opening graph store at %s", gm_cfg.db_path)
+    logger.info("Opening graph store at %s", db_path)
     try:
         embedding_dim = len(llm.embed("test"))
     except Exception as exc:  # noqa: BLE001
@@ -329,7 +334,7 @@ def main() -> None:
 
     try:
         store = GraphMemoryStore(
-            db_path=gm_cfg.db_path,
+            db_path=db_path,
             embedder_fn=lambda text: llm.embed(text),
             embedding_dim=embedding_dim,
             buffer_pool_mb=gm_cfg.buffer_pool_mb,

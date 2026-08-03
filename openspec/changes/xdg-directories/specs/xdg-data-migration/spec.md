@@ -4,7 +4,7 @@
 
 Define `migrate.py` one-shot migration from the old agent-home-relative layout to XDG Base Directory paths, and the `_check_migration()` auto-trigger in `main.py`.
 
-## Requirements
+## ADDED Requirements
 
 ### Requirement: One-shot file migration from old layout to XDG paths
 
@@ -14,18 +14,21 @@ Feature: XDG data migration
 Rule: `python migrate.py --agent-name <name>` resolves all XDG target paths and copies each listed source file to its XDG destination using `shutil.copy2` via an atomic write-to-tmp-then-rename; existing destinations are not overwritten; `data/tool_index.json` is deleted from source and not copied.
 
 #### Scenario: Full migration copies all listed files to XDG locations
-- **GIVEN** an old agent home directory at `/home/user/piclaw/` containing `config.toml`, `scheduler.toml`, `data/memory.json`, `data/graph_memory` (plus `.wal` and `.wal.checkpoint` siblings), `data/scheduler_state.json`, `data/scheduler_commands.json`, `data/scheduler_jobs.json`, `data/job_execution_log.jsonl`, `skills/` (directory with contents), and `data/tool_index.json`
+- **GIVEN** an old agent home directory at `/home/user/piclaw/` containing `config.toml`, `scheduler.toml`, `data/memory.json`, `data/graph_memory` (plus `.wal` and `.wal.checkpoint` siblings), `data/scheduler_state.json`, `data/scheduler_commands.json`, `data/scheduler_jobs.json`, `data/job_execution_log.jsonl`, `data/results_memory.json`, `data/longterm_memory.json`, `data/graph_memory_backfill_state.json`, `skills/` (directory with contents), and `data/tool_index.json`
 - **AND** no migration sentinel exists in `~/.local/state/piclaw/`
 - **AND** none of the XDG destination files exist
 - **WHEN** `python migrate.py --agent-name piclaw --source /home/user/piclaw` is run
 - **THEN** `config.toml` is copied to `~/.config/piclaw/config.toml`
 - **AND** `scheduler.toml` is copied to `~/.config/piclaw/scheduler.toml`
 - **AND** `data/memory.json` is copied to `~/.local/share/piclaw/memory.json`
-- **AND** each `data/graph_memory*` file is copied to `~/.local/share/piclaw/<filename>`
+- **AND** each of `data/graph_memory`, `data/graph_memory.wal`, and `data/graph_memory.wal.checkpoint` is copied to `~/.local/share/piclaw/<filename>`
 - **AND** `data/scheduler_state.json` is copied to `~/.local/state/piclaw/scheduler_state.json`
 - **AND** `data/scheduler_commands.json` is copied to `~/.local/state/piclaw/scheduler_commands.json`
 - **AND** `data/scheduler_jobs.json` is copied to `~/.local/state/piclaw/scheduler_jobs.json`
 - **AND** `data/job_execution_log.jsonl` is copied to `~/.local/state/piclaw/job_execution_log.jsonl`
+- **AND** `data/results_memory.json` is copied to `~/.local/share/piclaw/results_memory.json`
+- **AND** `data/longterm_memory.json` is copied to `~/.local/share/piclaw/longterm_memory.json`
+- **AND** `data/graph_memory_backfill_state.json` is copied to `~/.local/share/piclaw/graph_memory_backfill_state.json`
 - **AND** the `skills/` directory is recursively copied to `~/.local/state/piclaw/skills/`
 - **AND** all source files except `data/tool_index.json` remain in the source directory
 - **AND** a `migrated_from_<timestamp>.sentinel` file is written to `~/.local/state/piclaw/`
@@ -72,7 +75,7 @@ Rule: Under `--dry-run`, all planned copy and delete operations are printed to s
 
 ### Requirement: Migration sentinel ensures idempotency
 
-After a successful migration, `write_migration_sentinel(paths)` writes a timestamped `migrated_from_<timestamp>.sentinel` file to `paths.state_home`. On any subsequent invocation, `migration_sentinel_exists(paths)` returning `True` causes the script to exit immediately without re-processing any files.
+After a successful migration, `write_migration_sentinel(paths)` MUST write a timestamped `migrated_from_<timestamp>.sentinel` file to `paths.state_home`. On any subsequent invocation, `migration_sentinel_exists(paths)` returning `True` MUST cause the script to exit immediately without re-processing any files.
 
 Feature: Migration sentinel
 Rule: A `migrated_from_*.sentinel` file in `state_home` is the canonical marker that migration has already run; its presence causes any further invocation to exit without copying or deleting files; the sentinel is never written under `--dry-run`.

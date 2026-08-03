@@ -674,10 +674,11 @@ class TestCreateGraphMemory:
             graph_memory=gm,
         )
 
-    def test_disabled_returns_nones(self):
+    def test_disabled_returns_nones(self, tmp_path):
         cfg = self._make_cfg(enabled=False)
         store, writer = create_graph_memory(
             cfg=cfg,
+            db_path=str(tmp_path / "gm"),
             embedder_fn=lambda t: [0.1],
             llm_call_fn=lambda p: "",
             embedding_dim=1,
@@ -685,11 +686,12 @@ class TestCreateGraphMemory:
         assert store is None
         assert writer is None
 
-    def test_missing_ladybug_returns_nones(self, monkeypatch):
+    def test_missing_ladybug_returns_nones(self, monkeypatch, tmp_path):
         monkeypatch.setattr("graph_memory._LADYBUG_AVAILABLE", False)
         cfg = self._make_cfg(enabled=True)
         store, writer = create_graph_memory(
             cfg=cfg,
+            db_path=str(tmp_path / "gm"),
             embedder_fn=lambda t: [0.1],
             llm_call_fn=lambda p: "",
             embedding_dim=1,
@@ -698,9 +700,10 @@ class TestCreateGraphMemory:
         assert writer is None
 
     def test_enabled_creates_store_and_writer(self, mock_ladybug, tmp_path):
-        cfg = self._make_cfg(enabled=True, db_path=str(tmp_path / "gm"))
+        cfg = self._make_cfg(enabled=True)
         store, writer = create_graph_memory(
             cfg=cfg,
+            db_path=str(tmp_path / "gm"),
             embedder_fn=lambda t: [0.1] * 4,
             llm_call_fn=lambda p: "",
             embedding_dim=4,

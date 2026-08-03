@@ -97,23 +97,23 @@ def _clean_registry():
 class TestSchedulerSynchronousRejection:
     """A synchronous rejection from the spawn path must clean up scheduler state."""
 
-    def _sched(self, tmp_path):
+    def _sched(self, tmp_path, monkeypatch):
         from scheduler import Scheduler
+        from xdg import xdg_paths
 
         config_path = tmp_path / "scheduler.toml"
         config_path.write_text("")
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
         return Scheduler(
             config={"scheduler": {"enabled": False}, "agent": {"scheduled_max_iterations": 10}},
             notify_fn=MagicMock(),
             agent_fn=MagicMock(),
             scheduler_config_path=str(config_path),
-            data_dir=str(data_dir),
+            paths=xdg_paths("test-agent"),
         )
 
-    def test_cap_rejection_sets_last_error_notifies_and_clears_running(self, tmp_path):
-        s = self._sched(tmp_path)
+    def test_cap_rejection_sets_last_error_notifies_and_clears_running(self, tmp_path, monkeypatch):
+        s = self._sched(tmp_path, monkeypatch)
         s._jobs_meta["capped_job"] = {"task": "do work", "enabled": True, "notify": True}
 
         mock_executor = MagicMock()

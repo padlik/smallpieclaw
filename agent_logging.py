@@ -210,6 +210,7 @@ def setup_bootstrap() -> None:
 def setup_logging(
     log_file: str,
     *,
+    json_file: str | None = None,
     backup_count: int = 30,
     secret_values: Iterable[str] = (),
     stream=None,
@@ -217,18 +218,21 @@ def setup_logging(
     """Configure structlog dual-sink logging and return the JSONL path.
 
     Args:
-        log_file: Resolved absolute prose log path (see ``config_schema.log_path``).
+        log_file: Resolved absolute prose log path (``XDGPaths.log_file``).
+        json_file: Resolved absolute JSONL log path (``XDGPaths.log_jsonl``).
+            Defaults to ``<log_file stem>.jsonl`` when omitted.
         backup_count: Number of daily rotated backups to retain per sink.
         secret_values: Known secret strings to redact from every field.
         stream: Console stream for the prose sink (defaults to ``sys.stdout``).
 
     Returns:
-        The path to the primary JSONL sink (``<log_file stem>.jsonl``).
+        The path to the primary JSONL sink.
     """
     if stream is None:
         stream = sys.stdout
     os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
-    json_file = f"{os.path.splitext(log_file)[0]}.jsonl"
+    if json_file is None:
+        json_file = f"{os.path.splitext(log_file)[0]}.jsonl"
     secrets = frozenset(s for s in secret_values if isinstance(s, str) and s)
 
     shared = _shared_processors(secrets)

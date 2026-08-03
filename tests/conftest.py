@@ -46,7 +46,7 @@ def minimal_config() -> dict:
             }
         ],
         "paths": {
-            "data_dir": "data",
+            "workspace_dir": "~/Documents",
         },
     }
 
@@ -107,8 +107,17 @@ def mock_subprocess():
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def tmp_agent_dir(tmp_path):
-    """Create a temporary agent working directory with standard subdirs."""
-    (tmp_path / "data").mkdir()
-    (tmp_path / "downloads").mkdir()
+def tmp_xdg(tmp_path, monkeypatch):
+    """Override all XDG env vars to tmp_path subdirs. Tests never touch real home.
+
+    XDG_RUNTIME_DIR itself is pre-created, mirroring systemd-logind's real-world
+    guarantee — only the agent-scoped subdirectory under it is created lazily.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
     return tmp_path

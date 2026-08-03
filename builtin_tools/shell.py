@@ -2,7 +2,8 @@
 
 Handler module: ``ShellTools`` holds a back-reference to the ``BuiltinExecutor``
 façade (``owner``) and reads constructor-time settings (``default_timeout``,
-``max_output``, ``_data_dir``, ``_shell_*``) via it at call time. Confirmation is
+``max_output``, ``_data_dir``, ``_state_home``, ``_shell_*``) via it at call
+time. Confirmation is
 staged only through ``owner._requires_confirmation`` (Decision 8 seam
 constraint); no lifecycle logging happens here. The PTY fallback,
 process-group kill, and incremental UTF-8 decode behaviour are preserved
@@ -24,7 +25,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from builtin_tools.patterns import _is_dangerous_shell
 from builtin_tools.text_utils import _truncate_tail
-from conversation_io import _xdg_state_home
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
@@ -110,10 +110,9 @@ class ShellTools:
         created owner-only (0700) and the file owner-only (0600).
         """
         try:
-            xdg_state_home = _xdg_state_home()
             conv_id = conv_id or self._owner.conversation_id or "default"
             log_dir = os.path.join(
-                xdg_state_home, self._owner._agent_name, "session_logs", conv_id
+                self._owner._state_home, "session_logs", conv_id
             )
             os.makedirs(log_dir, mode=0o700, exist_ok=True)
             # makedirs honours mode only when creating; tighten an existing dir.
@@ -222,10 +221,8 @@ class ShellTools:
         timeout = int(args.get("timeout", self._owner.default_timeout))
         with self._owner._shell_env_lock:
             env_snapshot = dict(self._owner._shell_env)
-        xdg_state_home = _xdg_state_home()
         session_logs_dir = os.path.join(
-            xdg_state_home,
-            self._owner._agent_name,
+            self._owner._state_home,
             "session_logs",
             conv_id,
         )

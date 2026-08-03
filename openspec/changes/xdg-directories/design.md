@@ -130,8 +130,12 @@ downloads_dir = Path(cfg["paths"].get("workspace_dir", "~/Documents")).expanduse
 | `log_file` | `str = "agent.log"` | derived: `paths.log_file` / `paths.log_jsonl` |
 | `file_vault` | `str` | derived: `paths.secrets_file` |
 | `skills_dir` | `str = "skills"` | derived: `paths.skills_dir` |
+| `results_memory_file` | `str = "data/results_memory.json"` | derived: `paths.data_home / "results_memory.json"` |
+| `longterm_memory_file` | `str = "data/longterm_memory.json"` | derived: `paths.data_home / "longterm_memory.json"` (legacy/backfill-only; overridable only via `backfill_graph_memory.py --longterm-path`) |
 
 `workspace_dir` field **stays** — it is the one user-configurable path (default: `~/Documents`).
+
+Note: `results_memory.json` and `longterm_memory.json` have no dedicated `XDGPaths` field — like `job_contexts/`, `prompts.jsonl`, and `strategies.json`, they are resolved ad hoc as `paths.data_home / "<filename>"` at the call site (`main.py`, `backfill_graph_memory.py`) rather than added to the frozen 20-field `XDGPaths` dataclass.
 
 ### `GraphMemoryConfig` — removed field
 
@@ -185,17 +189,26 @@ Old layout is present if `<source>/config.toml` exists AND `migration_sentinel_e
 | `<source>/config.toml` | `paths.config_file` | skip if dest exists |
 | `<source>/scheduler.toml` | `paths.scheduler_config` | skip if dest exists |
 | `<source>/data/memory.json` | `paths.memory_file` | skip if dest exists |
-| `<source>/data/graph_memory*` | `paths.data_home / <filename>` | glob: base + .wal + .wal.checkpoint; each file copied to `paths.data_home / src_file.name` |
+| `<source>/data/graph_memory`, `.wal`, `.wal.checkpoint` | `paths.data_home / <filename>` | explicit 3-item list (not a glob — see note below); each file copied to `paths.data_home / <filename>` |
 | `<source>/data/scheduler_state.json` | `paths.scheduler_state` | skip if dest exists |
 | `<source>/data/scheduler_commands.json` | `paths.scheduler_commands` | skip if dest exists |
 | `<source>/data/scheduler_jobs.json` | `paths.scheduler_jobs` | skip if dest exists |
 | `<source>/data/job_execution_log.jsonl` | `paths.job_execution_log` | skip if dest exists |
+| `<source>/data/results_memory.json` | `paths.data_home / "results_memory.json"` | skip if dest exists |
+| `<source>/data/longterm_memory.json` | `paths.data_home / "longterm_memory.json"` | skip if dest exists; legacy/backfill-only file |
+| `<source>/data/graph_memory_backfill_state.json` | `paths.data_home / "graph_memory_backfill_state.json"` | skip if dest exists |
 | `<source>/skills/` | `paths.skills_dir` | recursive copy; skip if dest exists |
 | `<source>/data/tool_index.json` | *(deleted from source)* | regeneratable; **not copied**; source file removed after all other steps succeed |
 
 All copy operations are non-destructive (source files preserved), except `tool_index.json` which is deleted from source but not copied (it regenerates on next run). Copy uses `shutil.copy2`. Writes to `<dest>.tmp` then renames.
 
+The `data/graph_memory*` step uses an explicit three-item list (`graph_memory`, `graph_memory.wal`, `graph_memory.wal.checkpoint`), not a glob — a glob would also incorrectly match `graph_memory_backfill_state.json` by prefix, double-copying it via the wrong step.
+
 Note: `secrets.toml` (vault file) is **not** in the migration table. It was already stored at `$XDG_STATE_HOME/<name>/secrets.toml` in the old layout — no migration step is needed.
+
+### `backfill_graph_memory.py` changes
+
+`--agent-name <name>` is added (default `"piclaw"`, for backward-compatible manual invocation). Defaults for `--longterm-path` and `--state-file` change from `[paths]`-config-derived / sibling-of-longterm-path to `xdg_paths(agent_name).data_home / "longterm_memory.json"` and `xdg_paths(agent_name).data_home / "graph_memory_backfill_state.json"` respectively. `--db-path` (already added) defaults to `xdg_paths(agent_name).graph_memory_db`. All three remain CLI-overridable for one-off manual runs against a different location; none are read from `config.toml`.
 
 ### Sentinel
 
@@ -326,4 +339,7 @@ Replacement: both scenarios should describe the XDG-derived path `$XDG_STATE_HOM
 | `scheduler_commands.json` | `$XDG_STATE_HOME` | `~/.local/state/<name>/scheduler_commands.json` | `scheduler_commands` |
 | `scheduler_jobs.json` | `$XDG_STATE_HOME` | `~/.local/state/<name>/scheduler_jobs.json` | `scheduler_jobs` |
 | `job_execution_log.jsonl` | `$XDG_STATE_HOME` | `~/.local/state/<name>/job_execution_log.jsonl` | `job_execution_log` |
+| `results_memory.json` | `$XDG_DATA_HOME` | `~/.local/share/<name>/results_memory.json` | *(no field; `data_home`-joined)* |
+| `longterm_memory.json` | `$XDG_DATA_HOME` | `~/.local/share/<name>/longterm_memory.json` | *(no field; `data_home`-joined; legacy/backfill-only)* |
+| `graph_memory_backfill_state.json` | `$XDG_DATA_HOME` | `~/.local/share/<name>/graph_memory_backfill_state.json` | *(no field; `data_home`-joined)* |
 | `downloads/` | workspace | `<workspace_dir>/downloads/` | *(derived from config)* |

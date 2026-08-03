@@ -218,54 +218,6 @@ def _has_sec_reference(value: Any) -> bool:
     return False
 
 
-def vault_path(raw: dict) -> str:
-    """Return the vault file path for *raw*.
-
-    Uses ``$SPC_VAULT_FILE`` when set, otherwise the default location under
-    ``$XDG_STATE_HOME/<agent_name>/secrets.toml`` if ``XDG_STATE_HOME`` is set,
-    or ``~/.local/state/<agent_name>/secrets.toml`` as the fallback (XDG base
-    directory spec, consolidated alongside other agent state files).
-    """
-    env_path = os.environ.get("SPC_VAULT_FILE")
-    if env_path:
-        return env_path
-    agent_name = (raw.get("agent") or {}).get("agent_name") or "piclaw"
-    xdg_state = os.environ.get("XDG_STATE_HOME")
-    if xdg_state:
-        base = xdg_state
-    else:
-        base = os.path.expanduser("~/.local/state")
-    return os.path.join(base, agent_name, "secrets.toml")
-
-
-def log_dir(raw: dict) -> str:
-    """Return the XDG state log directory for *raw*.
-
-    Uses ``$SPC_LOG_DIR`` when set, otherwise the default location under
-    ``~/.local/state/<agent_name>/logs``. Resolved from ``agent_name`` only and
-    is therefore independent of ``agent_home`` (mirrors :func:`vault_path`).
-    """
-    env_dir = os.environ.get("SPC_LOG_DIR")
-    if env_dir:
-        return os.path.expanduser(env_dir)
-    agent_name = (raw.get("agent") or {}).get("agent_name") or "piclaw"
-    return os.path.expanduser(f"~/.local/state/{agent_name}/logs")
-
-
-def log_path(raw: dict) -> str:
-    """Resolve the active log file path for *raw*.
-
-    An absolute ``[paths] log_file`` overrides and is returned as-is. Otherwise
-    the configured filename (default ``agent.log``) is placed under
-    :func:`log_dir`, so logs never land inside the source checkout.
-    """
-    configured = (raw.get("paths") or {}).get("log_file", "agent.log")
-    if configured and os.path.isabs(configured):
-        return configured
-    filename = os.path.basename(configured) if configured else "agent.log"
-    return os.path.join(log_dir(raw), filename or "agent.log")
-
-
 def _expand_path(value: str) -> str:
     """Expand a leading ``~`` (or ``~user``) home-directory reference in *value*.
 
@@ -408,7 +360,6 @@ class ProviderConfig:
 @dataclass(frozen=True)
 class AgentConfig:
     agent_name: str = "piclaw"
-    agent_home: str = ""
     max_iterations: int = 8
     scheduled_max_iterations: int = 100
     tool_timeout: int = 10
@@ -469,7 +420,6 @@ class AgentConfig:
 @dataclass(frozen=True)
 class GraphMemoryConfig:
     enabled: bool = False
-    db_path: str = "data/graph_memory"
     buffer_pool_mb: int = 256
     extraction_model: str = ""
     extract_every_n_turns: int = 3
@@ -489,17 +439,8 @@ class SchedulerConfig:
 
 @dataclass(frozen=True)
 class PathsConfig:
-    data_dir: str = "data"
-    tool_index_file: str = "data/tool_index.json"
-    memory_file: str = "data/memory.json"
-    longterm_memory_file: str = "data/longterm_memory.json"
-    results_memory_file: str = "data/results_memory.json"
     scheduler_config: str = "scheduler.toml"
-    skills_dir: str = "skills"
-    downloads_dir: str = "downloads"
-    log_file: str = "agent.log"
     log_backup_count: int = 30
-    pid_file: str = "data/agent.pid"
     prompts_dir: str = "prompts"
     workspace_dir: str = "~/Documents"
 
@@ -602,15 +543,8 @@ def _parse_embeddings(raw: dict) -> EmbeddingsConfig:
 def _parse_agent(raw: dict) -> AgentConfig:
     section = raw.get("agent") or {}
     agent_name = section.get("agent_name", "piclaw")
-    # Derive agent_home from agent_name when not set or set to empty string.
-    agent_home_raw = section.get("agent_home", "")
-    agent_home = _expand_path(agent_home_raw) if agent_home_raw else _expand_path(f"~/{agent_name}")
-    # Mirror expanded value back into raw so cfg["agent"] and AgentConfig agree.
-    if "agent" in raw:
-        raw["agent"]["agent_home"] = agent_home
     return AgentConfig(
         agent_name=agent_name,
-        agent_home=agent_home,
         max_iterations=_parse_int(section.get("max_iterations"), 8, "agent.max_iterations"),
         scheduled_max_iterations=_parse_int(section.get("scheduled_max_iterations"), 100, "agent.scheduled_max_iterations"),
         tool_timeout=_parse_int(section.get("tool_timeout"), 10, "agent.tool_timeout"),
@@ -651,17 +585,8 @@ def _parse_scheduler(raw: dict) -> SchedulerConfig:
 def _parse_paths(raw: dict) -> PathsConfig:
     section = raw.get("paths") or {}
     expanded = {
-        "data_dir": _expand_path(section.get("data_dir", "data")),
-        "tool_index_file": _expand_path(section.get("tool_index_file", "data/tool_index.json")),
-        "memory_file": _expand_path(section.get("memory_file", "data/memory.json")),
-        "longterm_memory_file": _expand_path(section.get("longterm_memory_file", "data/longterm_memory.json")),
-        "results_memory_file": _expand_path(section.get("results_memory_file", "data/results_memory.json")),
         "scheduler_config": _expand_path(section.get("scheduler_config", "scheduler.toml")),
-        "skills_dir": _expand_path(section.get("skills_dir", "skills")),
-        "downloads_dir": _expand_path(section.get("downloads_dir", "downloads")),
-        "log_file": _expand_path(section.get("log_file", "agent.log")),
         "log_backup_count": _parse_int(section.get("log_backup_count"), 30, "paths.log_backup_count"),
-        "pid_file": _expand_path(section.get("pid_file", "data/agent.pid")),
         "prompts_dir": _expand_path(section.get("prompts_dir", "prompts")),
         "workspace_dir": _expand_path(section.get("workspace_dir", "~/Documents")),
     }
@@ -675,7 +600,6 @@ def _parse_graph_memory(raw: dict) -> GraphMemoryConfig:
     section = raw.get("graph_memory") or {}
     return GraphMemoryConfig(
         enabled=_parse_bool(section.get("enabled", False), "graph_memory.enabled"),
-        db_path=section.get("db_path", "data/graph_memory"),
         buffer_pool_mb=_parse_int(section.get("buffer_pool_mb"), 256, "graph_memory.buffer_pool_mb"),
         extraction_model=section.get("extraction_model", ""),
         extract_every_n_turns=_parse_int(section.get("extract_every_n_turns"), 3, "graph_memory.extract_every_n_turns"),
@@ -903,12 +827,17 @@ def _reject_removed_fields(raw: dict) -> None:
         )
 
 
-def parse_config(raw: dict) -> AppConfig:
+def parse_config(raw: dict, vault_file: str | None = None) -> AppConfig:
     """Parse and validate a raw TOML config dict into a typed AppConfig.
 
     Environment-variable placeholders (``${VAR}`` and ``${VAR:-default}``) in
     string values are expanded before validation — this is the single place in
     the codebase where config values are resolved against the OS environment.
+
+    *vault_file* is the resolved vault path (``XDGPaths.secrets_file``); it is
+    only read when *raw* contains a ``sec:`` reference. Callers resolve it via
+    :func:`xdg.xdg_paths` since the vault location is no longer derived from
+    config content.
 
     Raises ConfigError on missing required fields, invalid values, or
     unset required environment variables.
@@ -917,7 +846,11 @@ def parse_config(raw: dict) -> AppConfig:
 
     vault: dict | None = None
     if _has_sec_reference(raw):
-        vault = _load_vault(vault_path(raw))
+        if not vault_file:
+            raise ConfigError(
+                "Config contains a 'sec:' reference but no vault file was provided."
+            )
+        vault = _load_vault(vault_file)
 
     # Expand ${VAR} / ${VAR:-default} placeholders and sec: secrets before any other processing.
     raw = expand_env(raw, vault=vault)

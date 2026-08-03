@@ -257,3 +257,27 @@ None.
 ### ⚖️ Verdict
 
 **Tasks frozen. All artifacts complete. Ready to proceed to `/opsx-apply`.**
+
+## Post-implementation follow-up Round 1 — 2026-08-03
+
+**Batch:** post-implementation follow-up (proposal.md, design.md, specs/agent-scoped-directories, specs/xdg-data-migration, tasks.md §12)
+**Trigger:** user-directed audit found `results_memory.json`, `longterm_memory.json`, and `graph_memory_backfill_state.json` still resolving relative to `agent_home`/cwd — missed by original review because these files were never itemized in the original design/tasks (a gap in the frozen artifacts' scope, not a code bug against the frozen spec).
+**Frozen artifacts:** all prior artifacts remain frozen except the specific sections amended by this follow-up (unfrozen and re-reviewed per decision-level-change rule).
+
+### 🔴 Fixed
+
+- **`design.md` migration-steps table self-contradiction**: the `graph_memory*` row still described a glob ("base + .wal + .wal.checkpoint") while the new explanatory note directly below it said the step is now an explicit 3-item list (the glob was accidentally also matching `graph_memory_backfill_state.json` by prefix — the exact bug this follow-up fixes). Table row rewritten to match the code and the note.
+
+### 🟡 Fixed
+
+- **`graph_memory.py:1307` stale relative default**: `backfill_longterm_to_graph(state_path: str = "data/graph_memory_backfill_state.json")` still defaulted to a pre-XDG relative path, even though the only production caller always passed it explicitly. Made `state_path` a required parameter (no default) to remove the landmine.
+- **`backfill_graph_memory.py` docstring examples stale**: usage examples still showed relative `--longterm-path data/longterm_memory.json` / `--state-file data/...` as if they were the defaults. Updated to show `--agent-name` and reframed the override example as "importing from a different agent's export."
+
+### ✅ Confirmed
+
+- `config_schema.py`, `main.py`, `backfill_graph_memory.py`, `migrate.py` all match the amended specs exactly (verified by independent reviewer pass against actual code, not just the artifacts)
+- Broader repo sweep found no other agent_home/cwd-relative generated-content writes in `scheduler.py`, `builtin_executor.py`, `builtin_tools/*.py`, `strategy_memory.py`, `prompt_registry.py` — all `data_dir: str = "data"`-style defaults are always overridden with `paths.data_home` at `main.py`'s call sites
+
+### ⚖️ Verdict
+
+**Follow-up fixes applied and verified. `make check` (1506 tests) and `openspec validate --strict` both pass. Artifacts re-frozen.**

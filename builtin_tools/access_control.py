@@ -20,11 +20,6 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from config_schema import PathsConfig
-
 logger = logging.getLogger(__name__)
 
 
@@ -87,16 +82,18 @@ class TrustedZoneChecker:
 
     def __init__(
         self,
-        paths_config: PathsConfig,
+        workspace_dir: str,
+        downloads_dir: str,
         data_dir: str,
         agent_name: str,
         vault_path: str = "",
         trusted_dirs_path: str = "",
     ) -> None:
-        """Construct checker from resolved config paths.
+        """Construct checker from resolved runtime paths.
 
         Args:
-            paths_config: Typed PathsConfig from AppConfig.
+            workspace_dir: Absolute resolved workspace directory path.
+            downloads_dir: Absolute resolved downloads directory path.
             data_dir: Absolute resolved data directory path.
             agent_name: Agent name used to derive tmp dir fallback path.
             vault_path: Absolute path to the vault file; always UNRECOGNISED
@@ -117,8 +114,8 @@ class TrustedZoneChecker:
 
         # Default trusted dirs (non-removable)
         trusted_candidates = [
-            paths_config.workspace_dir,
-            paths_config.downloads_dir,
+            workspace_dir,
+            downloads_dir,
             f"/tmp/{agent_name}",
         ]
         self._default_trusted_dirs: list[str] = []

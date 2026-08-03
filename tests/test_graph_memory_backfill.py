@@ -790,3 +790,49 @@ class TestBackfillProgress:
             notify_fn=None,
         )
         assert result.imported == 1
+
+
+# ---------------------------------------------------------------------------
+# backfill_graph_memory.main() — vault_file wiring regression
+# ---------------------------------------------------------------------------
+
+class TestMainResolvesVaultFile:
+    """main() must pass vault_file to parse_config so sec: refs resolve.
+
+    Regression: parse_config() requires an explicit vault_file whenever the
+    config contains a sec: reference (config_schema.py). main() must resolve
+    it via xdg_paths(args.agent_name).secrets_file before the config with a
+    sec:-referenced field (e.g. bot_token) can be parsed at all.
+    """
+
+    def test_sec_reference_resolves_via_agent_vault(self, tmp_xdg, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import backfill_graph_memory
+        from xdg import xdg_paths
+
+        agent_name = "test-agent"
+        paths = xdg_paths(agent_name)
+        paths.state_home.mkdir(parents=True)
+        paths.secrets_file.write_text('bot_token = "sec-resolved-token"\n')
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[telegram]\nbot_token = "sec:bot_token"\nallowed_user_ids = []\n'
+            '[agent]\ndefault_model = "test"\n'
+            '[[models]]\nname = "m"\nprovider = "openai"\nmodel = "gpt-4o-mini"\n'
+            "[graph_memory]\nenabled = false\n"
+        )
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["backfill_graph_memory.py", "--config", str(config_path), "--agent-name", agent_name],
+        )
+        # graph_memory.enabled = false → main() exits(1) right after parse_config
+        # succeeds. A ConfigError from a missing vault_file would also exit(1),
+        # so assert on the log message to prove we got past config parsing.
+        with caplog.at_level(logging.ERROR, logger="backfill_graph_memory"):
+            with pytest.raises(SystemExit):
+                backfill_graph_memory.main()
+        assert any("not enabled" in r.message for r in caplog.records)
+        assert not any("vault file" in r.message for r in caplog.records)

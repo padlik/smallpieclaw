@@ -1116,6 +1116,7 @@ class GraphMemoryWriter:
 
 def create_graph_memory(
     cfg,  # AppConfig
+    db_path: str,
     embedder_fn: Callable[[str], list[float]],
     llm_call_fn: Callable[[str], str],
     embedding_dim: int = 1536,
@@ -1129,6 +1130,7 @@ def create_graph_memory(
     Parameters
     ----------
     cfg           : AppConfig instance
+    db_path       : Resolved database base path (``XDGPaths.graph_memory_db``)
     embedder_fn   : callable(text) -> embedding vector (list of floats)
     llm_call_fn   : callable(prompt) -> response text (extraction LLM)
     embedding_dim : dimension of vectors returned by embedder_fn
@@ -1147,7 +1149,7 @@ def create_graph_memory(
 
     try:
         store = GraphMemoryStore(
-            db_path=gm_cfg.db_path,
+            db_path=db_path,
             embedder_fn=embedder_fn,
             embedding_dim=embedding_dim,
             buffer_pool_mb=gm_cfg.buffer_pool_mb,
@@ -1302,7 +1304,7 @@ def backfill_longterm_to_graph(
     long_term_entries: list[tuple[str, dict]],
     store: GraphMemoryStore,
     llm_call_fn: Callable[[str], str],
-    state_path: str = "data/graph_memory_backfill_state.json",
+    state_path: str,
     dry_run: bool = False,
     limit: Optional[int] = None,
     force: bool = False,
