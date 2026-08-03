@@ -404,6 +404,7 @@ def _run(
     shell_nsjail_memory_mb = int(agent_cfg.get("shell_nsjail_memory_mb", 256))
     shell_nsjail_pids_max = int(agent_cfg.get("shell_nsjail_pids_max", 64))
     shell_nsjail_cpu_percent = int(agent_cfg.get("shell_nsjail_cpu_percent", 50))
+    shell_nsjail_dump_config_on_error = bool(agent_cfg.get("shell_nsjail_dump_config_on_error", False))
     allow_net = app_cfg.agent.allow_net
     dns_nameserver = app_cfg.agent.dns_nameserver
     creativity_mode = agent_cfg.get("creativity_mode", "default")
@@ -443,6 +444,7 @@ def _run(
         shell_nsjail_memory_mb=shell_nsjail_memory_mb,
         shell_nsjail_pids_max=shell_nsjail_pids_max,
         shell_nsjail_cpu_percent=shell_nsjail_cpu_percent,
+        shell_nsjail_dump_config_on_error=shell_nsjail_dump_config_on_error,
         allow_net=allow_net,
         nsjail_dns_nameserver=dns_nameserver,
         nsjail_session_tmpdir=nsjail_session_tmpdir,

@@ -395,6 +395,10 @@ class AgentConfig:
     shell_nsjail_memory_mb: int = 256
     shell_nsjail_pids_max: int = 64
     shell_nsjail_cpu_percent: int = 50
+    # When true, on an nsjail setup failure the generated nsjail config file is
+    # copied into the per-conversation session_logs directory for debugging.
+    # Off by default to avoid leaving config snapshots on every transient error.
+    shell_nsjail_dump_config_on_error: bool = False
     # nsjail network access — when false (default) the jail gets an empty network
     # namespace (clone_newnet: true, no network access); when true the jail shares
     # the host network namespace (clone_newnet: false, network access available).
@@ -565,6 +569,7 @@ def _parse_agent(raw: dict) -> AgentConfig:
         shell_nsjail_memory_mb=_parse_int(section.get("shell_nsjail_memory_mb"), 256, "agent.shell_nsjail_memory_mb"),
         shell_nsjail_pids_max=_parse_int(section.get("shell_nsjail_pids_max"), 64, "agent.shell_nsjail_pids_max"),
         shell_nsjail_cpu_percent=_parse_int(section.get("shell_nsjail_cpu_percent"), 50, "agent.shell_nsjail_cpu_percent"),
+        shell_nsjail_dump_config_on_error=_parse_bool(section.get("shell_nsjail_dump_config_on_error", False), "agent.shell_nsjail_dump_config_on_error"),
         allow_net=_parse_bool(section.get("allow_net", False), "agent.allow_net"),
         dns_nameserver=str(section.get("dns_nameserver", "8.8.8.8")),
         session_logs_retention_days=max(1, _parse_int(section.get("session_logs_retention_days"), 7, "agent.session_logs_retention_days")),

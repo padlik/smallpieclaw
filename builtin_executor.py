@@ -128,7 +128,8 @@ class BuiltinExecutor:
                    agent_name: str = "piclaw",
                    tmp_dir: str = "",
                    state_home: str = "",
-                   vault_secrets: Optional[list[str]] = None):
+                   vault_secrets: Optional[list[str]] = None,
+                   shell_nsjail_dump_config_on_error: bool = False):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -167,6 +168,7 @@ class BuiltinExecutor:
         self._allow_net = allow_net
         self._nsjail_dns_nameserver = nsjail_dns_nameserver
         self._shell_nsjail_session_tmpdir = nsjail_session_tmpdir
+        self._shell_nsjail_dump_config_on_error = shell_nsjail_dump_config_on_error
         # Session-scoped env dict for nsjail -E flag injection
         self._shell_env: dict[str, str] = {}
         self._shell_env_lock = threading.Lock()

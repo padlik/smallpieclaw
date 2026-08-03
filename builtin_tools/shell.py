@@ -198,8 +198,10 @@ class ShellTools:
         Builds the nsjail config + command list via ``NsjailConfigBuilder``,
         then delegates to ``_run_shell_subprocess`` with the nsjail command
         (reusing the same select() loop, output truncation, artifact logging,
-        and error classification). The config tempfile is cleaned up in a
-        ``finally`` block.
+        and error classification). On an nsjail setup failure, when
+        ``shell_nsjail_dump_config_on_error`` is enabled, the generated config
+        is copied into the per-conversation session_logs directory before the
+        tempfile is cleaned up in a ``finally`` block.
 
         Falls back to ``_run_shell_subprocess`` if the nsjail binary is not
         found at runtime (e.g. binary removed after startup).
@@ -235,12 +237,45 @@ class ShellTools:
         )
 
         try:
-            return self._run_shell_subprocess(args, caller_tag=caller_tag, nsjail_cmd=nsjail_cmd, conv_id=conv_id)
+            result = self._run_shell_subprocess(args, caller_tag=caller_tag, nsjail_cmd=nsjail_cmd, conv_id=conv_id)
+            # On nsjail setup failure, optionally snapshot the generated config
+            # into the per-conversation session_logs directory for post-mortem
+            # debugging. The dump runs inside the try block so it only fires on
+            # a real result; the finally below always cleans up the tempfile.
+            if (
+                result.get("error_type") == "nsjail_error"
+                and self._owner._shell_nsjail_dump_config_on_error
+            ):
+                self._dump_nsjail_config(cfg_path, session_logs_dir)
+            return result
         finally:
             try:
                 os.unlink(cfg_path)
             except OSError:
                 pass
+
+    def _dump_nsjail_config(self, cfg_path: str, session_logs_dir: str) -> None:
+        """Best-effort copy of a generated nsjail config into session_logs.
+
+        Used for post-mortem debugging when ``shell_nsjail_dump_config_on_error``
+        is enabled and an nsjail setup failure occurred. Copy errors are logged
+        at warning level and swallowed — the config dump must never mask the
+        original shell failure.
+        """
+        import shutil as _shutil
+        import threading as _threading
+        from datetime import datetime as _datetime
+        try:
+            os.makedirs(session_logs_dir, mode=0o700, exist_ok=True)
+            # Microseconds + thread id guard against same-second collisions when
+            # parallel shell calls (plan steps / sub-agents run as threads in
+            # this process) both hit nsjail_error within one wall-clock second.
+            stamp = _datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+            dest = os.path.join(session_logs_dir, f"nsjail-config-{stamp}-{_threading.get_ident()}.cfg")
+            _shutil.copy2(cfg_path, dest)
+            logger.info("nsjail: dumped failed config to %s", dest)
+        except OSError as exc:
+            logger.warning("nsjail: failed to dump config to %s: %s", session_logs_dir, exc)
 
     def _run_shell_subprocess(self, args: dict, caller_tag: str = "",
                               nsjail_cmd: Optional[list[str]] = None,
