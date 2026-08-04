@@ -7,6 +7,7 @@ import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+import mcp_client
 from mcp_client import (
     MCPManager,
     _SdkClientWrapper,
@@ -90,7 +91,9 @@ class TestSdkResultToOutcome:
         assert out == {"success": True, "output": "hello", "error": "", "exit_code": 0}
 
     def test_is_error_true(self):
-        out = _sdk_result_to_outcome(_make_result([_text_item("failed")], is_error=True))
+        out = _sdk_result_to_outcome(
+            _make_result([_text_item("failed")], is_error=True)
+        )
         assert out["success"] is False
         assert out["error"] == "failed"
         assert out["exit_code"] == 1
@@ -109,15 +112,21 @@ class TestSdkResultToOutcome:
         assert "[audio: audio/mp3]" in out["output"]
 
     def test_resource_link_content(self):
-        out = _sdk_result_to_outcome(_make_result([_resource_link_item("https://example.com")]))
+        out = _sdk_result_to_outcome(
+            _make_result([_resource_link_item("https://example.com")])
+        )
         assert "[resource_link: https://example.com]" in out["output"]
 
     def test_mixed_content(self):
-        out = _sdk_result_to_outcome(_make_result([
-            _text_item("result text"),
-            _image_item("image/jpeg"),
-            _resource_item("file:///bar.txt"),
-        ]))
+        out = _sdk_result_to_outcome(
+            _make_result(
+                [
+                    _text_item("result text"),
+                    _image_item("image/jpeg"),
+                    _resource_item("file:///bar.txt"),
+                ]
+            )
+        )
         assert "result text" in out["output"]
         assert "[image: image/jpeg]" in out["output"]
         assert "[resource: file:///bar.txt]" in out["output"]
@@ -148,7 +157,9 @@ class TestSdkResultToOutcome:
 # ---------------------------------------------------------------------------
 
 
-def _sdk_tool(name: str, description: str = "", input_schema: dict | None = None) -> MagicMock:
+def _sdk_tool(
+    name: str, description: str = "", input_schema: dict | None = None
+) -> MagicMock:
     t = MagicMock()
     t.name = name
     t.description = description
@@ -158,7 +169,9 @@ def _sdk_tool(name: str, description: str = "", input_schema: dict | None = None
 
 class TestSdkToolsToRegistry:
     def test_basic_conversion(self):
-        tools = _sdk_tools_to_registry("srv", [_sdk_tool("read_file", "Read a file", {"type": "object"})])
+        tools = _sdk_tools_to_registry(
+            "srv", [_sdk_tool("read_file", "Read a file", {"type": "object"})]
+        )
         assert len(tools) == 1
         assert tools[0].name == "read_file"
         assert tools[0].is_mcp is True
@@ -185,7 +198,7 @@ class TestSdkToolsToRegistry:
         assert tools[0].language == "mcp"
 
     def test_invalid_tool_name_skipped(self):
-        invalid = _sdk_tool("bad name!")   # space and ! are invalid
+        invalid = _sdk_tool("bad name!")  # space and ! are invalid
         valid = _sdk_tool("good_tool")
         tools = _sdk_tools_to_registry("srv", [invalid, valid])
         assert len(tools) == 1
@@ -220,7 +233,9 @@ def _stop_test_loop(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -
     thread.join(timeout=2)
 
 
-def _make_mock_session(tools: list | None = None, next_cursor: str | None = None) -> MagicMock:
+def _make_mock_session(
+    tools: list | None = None, next_cursor: str | None = None
+) -> MagicMock:
     """Build a mock ClientSession with optional tool list."""
     session = MagicMock()
     session.initialize = AsyncMock()
@@ -254,14 +269,34 @@ def _make_stdio_patches(session: MagicMock) -> tuple:
 class TestSdkClientWrapper:
     def setup_method(self):
         self.loop, self.thread = _start_test_loop()
+        self._wrappers: list[_SdkClientWrapper] = []
 
     def teardown_method(self):
+        # Cancel and await each wrapper's session-runner task (if any) on the
+        # loop before stopping it — otherwise asyncio warns "Task was
+        # destroyed but it is pending!" whenever the garbage collector
+        # happens to run during a later test.
+        tasks = [w._task for w in self._wrappers if w._task is not None]
+        if tasks and self.loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    mcp_client._cancel_and_wait(tasks), self.loop
+                ).result(timeout=2)
+            except Exception:
+                pass
         _stop_test_loop(self.loop, self.thread)
 
     def _make_wrapper(self, cfg: dict | None = None) -> _SdkClientWrapper:
         if cfg is None:
-            cfg = {"name": "test", "command": ["echo", "hello"], "transport": "stdio", "timeout": 5}
-        return _SdkClientWrapper(cfg, self.loop)
+            cfg = {
+                "name": "test",
+                "command": ["echo", "hello"],
+                "transport": "stdio",
+                "timeout": 5,
+            }
+        wrapper = _SdkClientWrapper(cfg, self.loop)
+        self._wrappers.append(wrapper)
+        return wrapper
 
     def test_connect_stdio_success(self):
         sdk_tool = _sdk_tool("tool1", "Tool 1")
@@ -308,9 +343,13 @@ class TestSdkClientWrapper:
         # Sensitive keys from os.environ must NOT appear (not in get_default_environment),
         # except TMPDIR/TMP/TEMP which are intentionally forwarded.
         import os
+
         _tmp_vars = {"TMPDIR", "TMP", "TEMP"}
-        secret_keys = [k for k in os.environ
-                       if k not in fake_default_env and k != "MY_VAR" and k not in _tmp_vars]
+        secret_keys = [
+            k
+            for k in os.environ
+            if k not in fake_default_env and k != "MY_VAR" and k not in _tmp_vars
+        ]
         for k in secret_keys[:5]:  # spot-check first 5
             assert k not in env
 
@@ -325,12 +364,20 @@ class TestSdkClientWrapper:
             return stdio_cm
 
         import os
+
         fake_default_env = {"PATH": "/usr/bin"}
         with patch("mcp_client.get_default_environment", return_value=fake_default_env):
-            with patch("mcp_client.os.environ", {**os.environ, "TMPDIR": "/configured/tmp"}):
+            with patch(
+                "mcp_client.os.environ", {**os.environ, "TMPDIR": "/configured/tmp"}
+            ):
                 with patch("mcp_client.stdio_client", side_effect=_capture_params):
                     with patch("mcp_client.ClientSession", return_value=session_cm):
-                        cfg = {"name": "t", "command": ["echo"], "transport": "stdio", "timeout": 5}
+                        cfg = {
+                            "name": "t",
+                            "command": ["echo"],
+                            "transport": "stdio",
+                            "timeout": 5,
+                        }
                         _SdkClientWrapper(cfg, self.loop).connect()
 
         assert len(captured) == 1
@@ -347,14 +394,20 @@ class TestSdkClientWrapper:
             return stdio_cm
 
         import os
+
         fake_default_env = {"PATH": "/usr/bin"}
         with patch("mcp_client.get_default_environment", return_value=fake_default_env):
-            with patch("mcp_client.os.environ", {**os.environ, "TMPDIR": "/process/tmp"}):
+            with patch(
+                "mcp_client.os.environ", {**os.environ, "TMPDIR": "/process/tmp"}
+            ):
                 with patch("mcp_client.stdio_client", side_effect=_capture_params):
                     with patch("mcp_client.ClientSession", return_value=session_cm):
                         cfg = {
-                            "name": "t", "command": ["echo"], "transport": "stdio",
-                            "timeout": 5, "env": {"TMPDIR": "/server/tmp"},
+                            "name": "t",
+                            "command": ["echo"],
+                            "transport": "stdio",
+                            "timeout": 5,
+                            "env": {"TMPDIR": "/server/tmp"},
                         }
                         _SdkClientWrapper(cfg, self.loop).connect()
 
@@ -376,6 +429,7 @@ class TestSdkClientWrapper:
 
     def test_connect_timeout(self):
         """If session runner never sets ready, connect returns empty after timeout."""
+
         # Never-completing stdio client
         async def _never_return(params):  # noqa: ARG001
             await asyncio.sleep(999)
@@ -499,6 +553,7 @@ class TestSdkClientWrapper:
     def test_pagination_tool_limit(self):
         """Exceeding _MAX_TOOLS must fail connect gracefully."""
         from mcp_client import _MAX_TOOLS
+
         many_tools = [_sdk_tool(f"t{i}") for i in range(_MAX_TOOLS + 1)]
 
         page1 = MagicMock()
@@ -525,6 +580,7 @@ class TestSdkClientWrapper:
     def test_pagination_tool_limit_single_page(self):
         """_MAX_TOOLS guard must fire even on a single page with no nextCursor."""
         from mcp_client import _MAX_TOOLS
+
         many_tools = [_sdk_tool(f"t{i}") for i in range(_MAX_TOOLS + 1)]
 
         page1 = MagicMock()
@@ -567,7 +623,12 @@ class TestSdkClientWrapper:
         session_cm.__aenter__ = AsyncMock(return_value=session)
         session_cm.__aexit__ = AsyncMock(return_value=None)
 
-        cfg = {"name": "http_srv", "transport": "http", "url": "http://localhost:8080", "timeout": 5}
+        cfg = {
+            "name": "http_srv",
+            "transport": "http",
+            "url": "http://localhost:8080",
+            "timeout": 5,
+        }
         with patch("mcp_client.streamablehttp_client", return_value=http_cm):
             with patch("mcp_client.ClientSession", return_value=session_cm):
                 wrapper = _SdkClientWrapper(cfg, self.loop)
@@ -587,7 +648,12 @@ class TestSdkClientWrapper:
         session_cm.__aenter__ = AsyncMock(return_value=session)
         session_cm.__aexit__ = AsyncMock(return_value=None)
 
-        cfg = {"name": "sse_srv", "transport": "sse", "url": "http://localhost:9090/sse", "timeout": 5}
+        cfg = {
+            "name": "sse_srv",
+            "transport": "sse",
+            "url": "http://localhost:9090/sse",
+            "timeout": 5,
+        }
         with patch("mcp_client.sse_client", return_value=sse_cm):
             with patch("mcp_client.ClientSession", return_value=session_cm):
                 wrapper = _SdkClientWrapper(cfg, self.loop)
@@ -723,8 +789,18 @@ class TestSdkClientWrapper:
 class TestMCPManager:
     def test_connect_disabled_servers_skipped(self):
         cfgs = [
-            {"name": "active", "transport": "stdio", "command": ["echo"], "enabled": True},
-            {"name": "off", "transport": "stdio", "command": ["echo"], "enabled": False},
+            {
+                "name": "active",
+                "transport": "stdio",
+                "command": ["echo"],
+                "enabled": True,
+            },
+            {
+                "name": "off",
+                "transport": "stdio",
+                "command": ["echo"],
+                "enabled": False,
+            },
         ]
         mgr = MCPManager(cfgs)
         connected: list = []
@@ -761,7 +837,9 @@ class TestMCPManager:
         mgr = MCPManager([{"name": "srv", "transport": "stdio", "command": ["x"]}])
         mgr._start_loop()
         mock_wrapper = MagicMock()
-        mock_wrapper.call_tool.return_value = _tool_outcome(output="result", success=True)
+        mock_wrapper.call_tool.return_value = _tool_outcome(
+            output="result", success=True
+        )
         mgr._wrappers["srv"] = mock_wrapper
         mgr._tool_to_server["tool1"] = "srv"
 
@@ -774,7 +852,9 @@ class TestMCPManager:
     def test_get_tools(self):
         mgr = MCPManager([{"name": "a", "transport": "stdio", "command": ["x"]}])
         mock_wrapper = MagicMock()
-        mock_wrapper.tools = _sdk_tools_to_registry("a", [_sdk_tool("t1"), _sdk_tool("t2")])
+        mock_wrapper.tools = _sdk_tools_to_registry(
+            "a", [_sdk_tool("t1"), _sdk_tool("t2")]
+        )
         mgr._wrappers["a"] = mock_wrapper
 
         tools = mgr.get_tools()
@@ -782,7 +862,9 @@ class TestMCPManager:
         assert tools[0].name == "t1"
 
     def test_set_enabled_false(self):
-        cfgs = [{"name": "srv", "transport": "stdio", "command": ["x"], "enabled": True}]
+        cfgs = [
+            {"name": "srv", "transport": "stdio", "command": ["x"], "enabled": True}
+        ]
         mgr = MCPManager(cfgs)
         result = mgr.set_enabled("srv", False)
         assert result is True
@@ -861,19 +943,36 @@ class TestMCPManager:
 
     def test_list_servers_mixed_states(self):
         cfgs = [
-            {"name": "active_srv", "transport": "stdio", "command": ["x"], "enabled": True},
-            {"name": "off_srv", "transport": "http", "url": "http://x", "enabled": False},
-            {"name": "error_srv", "transport": "stdio", "command": ["x"], "enabled": True},
+            {
+                "name": "active_srv",
+                "transport": "stdio",
+                "command": ["x"],
+                "enabled": True,
+            },
+            {
+                "name": "off_srv",
+                "transport": "http",
+                "url": "http://x",
+                "enabled": False,
+            },
+            {
+                "name": "error_srv",
+                "transport": "stdio",
+                "command": ["x"],
+                "enabled": True,
+            },
         ]
         mgr = MCPManager(cfgs)
         active_wrapper = MagicMock()
         active_wrapper.connected = True
+        active_wrapper.needs_auth = False
         active_wrapper.tools = []
         active_wrapper.last_error = ""
         mgr._wrappers["active_srv"] = active_wrapper
 
         error_wrapper = MagicMock()
         error_wrapper.connected = False
+        error_wrapper.needs_auth = False
         error_wrapper.tools = []
         error_wrapper.last_error = "failed"
         mgr._wrappers["error_srv"] = error_wrapper
@@ -889,6 +988,7 @@ class TestMCPManager:
         mgr = MCPManager(cfgs)
         mock_wrapper = MagicMock()
         mock_wrapper.connected = True
+        mock_wrapper.needs_auth = False
         mock_wrapper.tools = []
         mock_wrapper.last_error = ""
         mgr._wrappers["srv"] = mock_wrapper
@@ -915,6 +1015,7 @@ class TestMCPManager:
 
         def _fake_connect(name, cfg):  # noqa: ARG001
             import time
+
             time.sleep(0.05)  # simulate slow connect
             connected_calls.append(name)
             with mgr._lock:
@@ -922,13 +1023,18 @@ class TestMCPManager:
 
         mgr._connect_server = _fake_connect  # type: ignore[method-assign]
 
-        threads = [threading.Thread(target=mgr.set_enabled, args=("srv", True)) for _ in range(5)]
+        threads = [
+            threading.Thread(target=mgr.set_enabled, args=("srv", True))
+            for _ in range(5)
+        ]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
-        assert len(connected_calls) == 1, f"Expected 1 connect, got {len(connected_calls)}"
+        assert len(connected_calls) == 1, (
+            f"Expected 1 connect, got {len(connected_calls)}"
+        )
         mgr._stop_loop()
 
     def test_set_enabled_true_reconnects_failed_wrapper(self):
@@ -984,6 +1090,7 @@ class TestMCPManager:
 
     def test_start_loop_idempotent(self):
         import time
+
         cfgs = [{"name": "srv", "transport": "stdio", "command": ["x"]}]
         mgr = MCPManager(cfgs)
         mgr._start_loop()
@@ -1005,17 +1112,22 @@ class TestMCPManager:
             mgr._stop_loop()
 
     def test_get_server_info_disabled(self):
-        cfgs = [{"name": "srv", "transport": "stdio", "command": ["x"], "enabled": False}]
+        cfgs = [
+            {"name": "srv", "transport": "stdio", "command": ["x"], "enabled": False}
+        ]
         mgr = MCPManager(cfgs)
         info = mgr.get_server_info("srv")
         assert info is not None
         assert info["status"] == "off"
 
     def test_get_server_info_error_state(self):
-        cfgs = [{"name": "srv", "transport": "stdio", "command": ["x"], "enabled": True}]
+        cfgs = [
+            {"name": "srv", "transport": "stdio", "command": ["x"], "enabled": True}
+        ]
         mgr = MCPManager(cfgs)
         error_wrapper = MagicMock()
         error_wrapper.connected = False
+        error_wrapper.needs_auth = False
         error_wrapper.tools = []
         error_wrapper.last_error = "connection refused"
         mgr._wrappers["srv"] = error_wrapper
@@ -1038,3 +1150,243 @@ class TestMCPManager:
 
         assert result is True
         assert connect_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Test MCP OAuth integration
+# ---------------------------------------------------------------------------
+
+
+class TestMCPOAuthIntegration:
+    def setup_method(self):
+        self.loop, self.thread = _start_test_loop()
+
+    def teardown_method(self):
+        _stop_test_loop(self.loop, self.thread)
+
+    def _oauth_cfg(self, tmp_path):
+        cert_path = tmp_path / "cert.pem"
+        key_path = tmp_path / "key.pem"
+        cert_path.write_text("cert")
+        key_path.write_text("key")
+        return {
+            "client_id": "client1",
+            "client_secret": "secret1",
+            "redirect_uri": "https://localhost/cb",
+            "scope": "tools",
+            "callback_port": 8123,
+            "callback_bind": "127.0.0.1",
+            "cert_path": str(cert_path),
+            "key_path": str(key_path),
+        }
+
+    def test_oauth_server_without_token_needs_auth(self, tmp_path):
+        """An HTTP server configured for OAuth but lacking tokens stays in needs_auth."""
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        oauth = self._oauth_cfg(tmp_path)
+        cfgs = [
+            {
+                "name": "oauth_srv",
+                "transport": "http",
+                "url": "http://localhost:8080",
+                "oauth": oauth,
+            },
+        ]
+        mgr = MCPManager(cfgs, mcp_tokens_dir=mcp_tokens_dir)
+        mgr._start_loop()
+
+        with patch("mcp_client.streamablehttp_client") as mock_http:
+            mock_http.return_value.__aenter__ = AsyncMock()
+            mock_http.return_value.__aexit__ = AsyncMock()
+            mgr.connect_all()
+
+        servers = mgr.list_servers()
+        by_name = {s["name"]: s for s in servers}
+        assert by_name["oauth_srv"]["status"] == "needs_auth"
+        mock_http.return_value.__aenter__.assert_not_awaited()
+        mgr.close_all()
+
+    def test_oauth_server_with_valid_token_connects(self, tmp_path):
+        """A valid stored token lets the HTTP OAuth server connect normally."""
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        (mcp_tokens_dir / "oauth_srv.json").write_text(
+            '{"access_token": "tok", "token_type": "Bearer"}'
+        )
+        oauth = self._oauth_cfg(tmp_path)
+        cfgs = [
+            {
+                "name": "oauth_srv",
+                "transport": "http",
+                "url": "http://localhost:8080",
+                "timeout": 5,
+                "oauth": oauth,
+            },
+        ]
+
+        session = _make_mock_session(tools=[_sdk_tool("oauth_tool")])
+        read, write = AsyncMock(), AsyncMock()
+        http_cm = MagicMock()
+        http_cm.__aenter__ = AsyncMock(return_value=(read, write, None))
+        http_cm.__aexit__ = AsyncMock(return_value=None)
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mgr = MCPManager(cfgs, mcp_tokens_dir=mcp_tokens_dir)
+        mgr._start_loop()
+
+        with patch.object(
+            mcp_client, "streamablehttp_client", return_value=http_cm
+        ) as mock_http:
+            with patch("mcp_client.ClientSession", return_value=session_cm):
+                mgr.connect_all()
+
+        servers = mgr.list_servers()
+        by_name = {s["name"]: s for s in servers}
+        assert by_name["oauth_srv"]["status"] == "active"
+        assert by_name["oauth_srv"]["tool_count"] == 1
+        # provider passed as auth= keyword
+        _, kwargs = mock_http.call_args
+        assert kwargs.get("auth") is not None
+        mgr.close_all()
+
+    def test_concurrent_oauth_flow_rejected(self, tmp_path):
+        """Only one interactive OAuth flow may run at a time."""
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        oauth = self._oauth_cfg(tmp_path)
+        cfgs = [
+            {"name": "server1", "transport": "http", "url": "http://x", "oauth": oauth},
+            {"name": "server2", "transport": "http", "url": "http://y", "oauth": oauth},
+        ]
+
+        mgr = MCPManager(cfgs, mcp_tokens_dir=mcp_tokens_dir)
+        mgr._start_loop()
+
+        self._oauth_flow_started = threading.Event()
+        self._oauth_flow_release = threading.Event()
+
+        async def _slow_flow(*args, **kwargs):  # noqa: ARG001
+            self._oauth_flow_started.set()
+            # Block until the test signals release, so the first flow stays
+            # "in progress" while we assert the second is rejected.
+            for _ in range(100):
+                if self._oauth_flow_release.is_set():
+                    break
+                await asyncio.sleep(0.05)
+            return {"success": True}
+
+        with patch.object(mgr, "_run_oauth_flow", side_effect=_slow_flow):
+            first_thread = threading.Thread(
+                target=mgr.start_oauth_flow, args=("server1", None), daemon=True
+            )
+            first_thread.start()
+            assert self._oauth_flow_started.wait(timeout=2)
+
+            result = mgr.start_oauth_flow("server2", None)
+            assert result["success"] is False
+            assert "already in progress" in result["error"].lower()
+
+            # Release the first flow so it can complete and free the lock.
+            self._oauth_flow_release.set()
+            first_thread.join(timeout=2)
+
+        mgr.close_all()
+
+    def test_needs_auth_in_list_servers(self, tmp_path):
+        """list_servers returns the needs_auth status for OAuth servers."""
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        oauth = self._oauth_cfg(tmp_path)
+        cfgs = [
+            {
+                "name": "oauth_srv",
+                "transport": "http",
+                "url": "http://localhost:8080",
+                "oauth": oauth,
+            },
+        ]
+        mgr = MCPManager(cfgs, mcp_tokens_dir=mcp_tokens_dir)
+        mgr._start_loop()
+
+        with patch("mcp_client.streamablehttp_client") as mock_http:
+            mock_http.return_value.__aenter__ = AsyncMock()
+            mock_http.return_value.__aexit__ = AsyncMock()
+            mgr.connect_all()
+
+        servers = mgr.list_servers()
+        assert any(s["status"] == "needs_auth" for s in servers)
+        mgr.close_all()
+
+    def test_oauth_flow_success_keeps_session_alive(self, tmp_path):
+        """A successful start_oauth_flow keeps the session runner alive and callable."""
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        (mcp_tokens_dir / "oauth_srv.json").write_text(
+            '{"access_token": "tok", "token_type": "Bearer"}'
+        )
+        oauth = self._oauth_cfg(tmp_path)
+        cfgs = [
+            {
+                "name": "oauth_srv",
+                "transport": "http",
+                "url": "http://localhost:8080",
+                "timeout": 5,
+                "oauth": oauth,
+            },
+        ]
+
+        session = _make_mock_session(tools=[_sdk_tool("oauth_tool")])
+        session.call_tool = AsyncMock(
+            return_value=_make_result([_text_item("oauth result")])
+        )
+        read, write = AsyncMock(), AsyncMock()
+        http_cm = MagicMock()
+        http_cm.__aenter__ = AsyncMock(return_value=(read, write, None))
+        http_cm.__aexit__ = AsyncMock(return_value=None)
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mgr = MCPManager(cfgs, mcp_tokens_dir=mcp_tokens_dir)
+        mgr._start_loop()
+
+        mock_provider = MagicMock()
+        with patch.object(
+            mcp_client, "streamablehttp_client", return_value=http_cm
+        ) as mock_http:
+            with patch("mcp_client.ClientSession", return_value=session_cm):
+                with patch(
+                    "mcp_oauth.CallbackServer.start", new_callable=AsyncMock
+                ):
+                    with patch(
+                        "mcp_oauth.CallbackServer.stop", new_callable=AsyncMock
+                    ):
+                        with patch(
+                            "mcp_oauth.OAuthProviderFactory.build",
+                            return_value=mock_provider,
+                        ):
+                            result = mgr.start_oauth_flow("oauth_srv", None)
+
+        assert result["success"] is True
+
+        wrapper = mgr._wrappers.get("oauth_srv")
+        assert wrapper is not None
+        assert wrapper.connected is True
+        assert wrapper._task is not None
+        assert not wrapper._task.done(), "Session runner must still be alive after flow"
+        assert len(wrapper.tools) == 1
+        assert wrapper.tools[0].name == "oauth_tool"
+
+        # provider passed as auth= keyword
+        _, kwargs = mock_http.call_args
+        assert kwargs.get("auth") is mock_provider
+
+        # The live session must still be able to serve tool calls.
+        tool_result = mgr.call_tool("oauth_tool", {})
+        assert tool_result["success"] is True
+        assert "oauth result" in tool_result["output"]
+
+        mgr.close_all()

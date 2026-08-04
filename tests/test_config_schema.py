@@ -137,6 +137,93 @@ class TestValidation:
         with pytest.raises(ConfigError, match="url"):
             parse_config(minimal_config)
 
+    def test_mcp_oauth_all_fields(self, minimal_config):
+        minimal_config["mcp_servers"] = [{
+            "name": "gmail",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "oauth": {
+                "client_id": "id",
+                "client_secret": "secret",
+                "redirect_uri": "https://ddns.example.com/callback",
+                "scope": "https://mail.google.com/",
+                "cert_path": "/etc/letsencrypt/live/ddns/fullchain.pem",
+                "key_path": "/etc/letsencrypt/live/ddns/privkey.pem",
+            },
+        }]
+        cfg = parse_config(minimal_config)
+        oauth = cfg.mcp_servers[0].oauth
+        assert oauth is not None
+        assert oauth.client_id == "id"
+        assert oauth.client_secret == "secret"
+        assert oauth.redirect_uri == "https://ddns.example.com/callback"
+        assert oauth.scope == "https://mail.google.com/"
+        assert oauth.cert_path == "/etc/letsencrypt/live/ddns/fullchain.pem"
+        assert oauth.key_path == "/etc/letsencrypt/live/ddns/privkey.pem"
+        assert oauth.callback_port == 8000
+        assert oauth.callback_bind == "0.0.0.0"
+
+    def test_mcp_oauth_optional(self, minimal_config):
+        minimal_config["mcp_servers"] = [{
+            "name": "gmail",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+        }]
+        cfg = parse_config(minimal_config)
+        assert cfg.mcp_servers[0].oauth is None
+
+    def test_mcp_oauth_missing_client_id(self, minimal_config):
+        minimal_config["mcp_servers"] = [{
+            "name": "gmail",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "oauth": {
+                "client_secret": "secret",
+                "redirect_uri": "https://ddns.example.com/callback",
+                "scope": "https://mail.google.com/",
+                "cert_path": "/etc/letsencrypt/live/ddns/fullchain.pem",
+                "key_path": "/etc/letsencrypt/live/ddns/privkey.pem",
+            },
+        }]
+        with pytest.raises(ConfigError, match="client_id"):
+            parse_config(minimal_config)
+
+    def test_mcp_oauth_missing_client_secret(self, minimal_config):
+        minimal_config["mcp_servers"] = [{
+            "name": "gmail",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "oauth": {
+                "client_id": "id",
+                "redirect_uri": "https://ddns.example.com/callback",
+                "scope": "https://mail.google.com/",
+                "cert_path": "/etc/letsencrypt/live/ddns/fullchain.pem",
+                "key_path": "/etc/letsencrypt/live/ddns/privkey.pem",
+            },
+        }]
+        with pytest.raises(ConfigError, match="client_secret"):
+            parse_config(minimal_config)
+
+    def test_mcp_oauth_defaults(self, minimal_config):
+        minimal_config["mcp_servers"] = [{
+            "name": "gmail",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "oauth": {
+                "client_id": "id",
+                "client_secret": "secret",
+                "redirect_uri": "https://ddns.example.com/callback",
+                "scope": "https://mail.google.com/",
+                "cert_path": "/etc/letsencrypt/live/ddns/fullchain.pem",
+                "key_path": "/etc/letsencrypt/live/ddns/privkey.pem",
+            },
+        }]
+        cfg = parse_config(minimal_config)
+        oauth = cfg.mcp_servers[0].oauth
+        assert oauth is not None
+        assert oauth.callback_port == 8000
+        assert oauth.callback_bind == "0.0.0.0"
+
     def test_mcp_missing_name(self, minimal_config):
         minimal_config["mcp_servers"] = [{
             "transport": "http",

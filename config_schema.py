@@ -449,6 +449,18 @@ class PathsConfig:
 
 
 @dataclass(frozen=True)
+class OAuthConfig:
+    client_id: str
+    client_secret: str
+    redirect_uri: str
+    scope: str
+    cert_path: str
+    key_path: str
+    callback_port: int = 8000
+    callback_bind: str = "0.0.0.0"
+
+
+@dataclass(frozen=True)
 class MCPServerConfig:
     name: str
     transport: str  # "stdio" | "http"
@@ -458,6 +470,7 @@ class MCPServerConfig:
     timeout: int = 30
     env: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
+    oauth: OAuthConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -611,6 +624,35 @@ def _parse_graph_memory(raw: dict) -> GraphMemoryConfig:
     )
 
 
+def _parse_oauth(entry: dict, server_name: str) -> OAuthConfig | None:
+    """Parse the optional ``oauth`` subsection of an MCP server entry.
+
+    Returns ``None`` when the subsection is absent or empty.  When present,
+    ``client_id`` and ``client_secret`` are required.
+    """
+    oauth = entry.get("oauth")
+    if not oauth:
+        return None
+    if not isinstance(oauth, dict):
+        raise ConfigError(
+            f"mcp_servers.{server_name}.oauth must be a table, got {type(oauth).__name__}"
+        )
+
+    section = f"mcp_servers.{server_name}.oauth"
+    return OAuthConfig(
+        client_id=_require(oauth, "client_id", section),
+        client_secret=_require(oauth, "client_secret", section),
+        redirect_uri=_require(oauth, "redirect_uri", section),
+        scope=_require(oauth, "scope", section),
+        cert_path=_require(oauth, "cert_path", section),
+        key_path=_require(oauth, "key_path", section),
+        callback_port=_parse_int(
+            oauth.get("callback_port"), 8000, f"{section}.callback_port"
+        ),
+        callback_bind=oauth.get("callback_bind", "0.0.0.0"),
+    )
+
+
 def _parse_mcp_server(entry: dict, index: int) -> MCPServerConfig:
     name = entry.get("name", "")
     if not name:
@@ -624,6 +666,7 @@ def _parse_mcp_server(entry: dict, index: int) -> MCPServerConfig:
         raise ConfigError(f"[[mcp_servers]] '{name}': stdio transport requires 'command' list")
     if transport == "http" and not entry.get("url"):
         raise ConfigError(f"[[mcp_servers]] '{name}': http transport requires 'url'")
+    oauth = _parse_oauth(entry, name)
     return MCPServerConfig(
         name=name,
         transport=transport,
@@ -633,6 +676,7 @@ def _parse_mcp_server(entry: dict, index: int) -> MCPServerConfig:
         timeout=_parse_int(entry.get("timeout"), 30, f"mcp_servers.{name}.timeout"),
         env=dict(entry.get("env") or {}),
         headers=dict(entry.get("headers") or {}),
+        oauth=oauth,
     )
 
 

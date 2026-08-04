@@ -52,15 +52,22 @@ import concurrent.futures
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
+from mcp.client.stdio import (
+    StdioServerParameters,
+    get_default_environment,
+    stdio_client,
+)
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.sse import sse_client
 from mcp.types import CallToolResult
 
+import mcp_oauth
 from tool_registry import Tool
 
 logger = logging.getLogger(__name__)
@@ -68,16 +75,23 @@ logger = logging.getLogger(__name__)
 _MAX_TOOL_PAGES = 50
 _MAX_TOOLS = 500
 
-_VALID_TOOL_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
+_VALID_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 _MAX_DESCRIPTION_LEN = 2048
-_CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _tool_outcome(output: str = "", error: str = "", success: bool = True) -> dict:
-    return {"success": success, "output": output, "error": error, "exit_code": 0 if success else 1}
+    return {
+        "success": success,
+        "output": output,
+        "error": error,
+        "exit_code": 0 if success else 1,
+    }
+
 
 def _sdk_result_to_outcome(result: CallToolResult) -> dict:
     """Flatten SDK CallToolResult into our standard outcome dict."""
@@ -100,6 +114,7 @@ def _sdk_result_to_outcome(result: CallToolResult) -> dict:
         return _tool_outcome(error=text, success=False)
     return _tool_outcome(output=text)
 
+
 def _sdk_tools_to_registry(server_name: str, sdk_tools: list) -> list[Tool]:
     """Convert SDK Tool objects to our Tool dataclass list."""
     result: list[Tool] = []
@@ -108,20 +123,27 @@ def _sdk_tools_to_registry(server_name: str, sdk_tools: list) -> list[Tool]:
         if not name:
             continue
         if not _VALID_TOOL_NAME_RE.match(name):
-            logger.warning("MCP [%s] skipping tool with invalid name: %r", server_name, name)
+            logger.warning(
+                "MCP [%s] skipping tool with invalid name: %r", server_name, name
+            )
             continue
-        raw_desc: str = getattr(t, "description", None) or f"MCP tool '{name}' from {server_name}"
+        raw_desc: str = (
+            getattr(t, "description", None) or f"MCP tool '{name}' from {server_name}"
+        )
         description = _CONTROL_CHARS_RE.sub("", raw_desc)[:_MAX_DESCRIPTION_LEN]
         input_schema: dict[str, Any] = getattr(t, "inputSchema", {}) or {}
-        result.append(Tool(
-            name=name,
-            language="mcp",
-            description=description,
-            is_mcp=True,
-            server_name=server_name,
-            input_schema=input_schema,
-        ))
+        result.append(
+            Tool(
+                name=name,
+                language="mcp",
+                description=description,
+                is_mcp=True,
+                server_name=server_name,
+                input_schema=input_schema,
+            )
+        )
     return result
+
 
 async def _cancel_and_wait(tasks: list) -> None:
     """Cancel asyncio tasks and await their completion so context managers finalize."""
@@ -129,15 +151,18 @@ async def _cancel_and_wait(tasks: list) -> None:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
+
 # ---------------------------------------------------------------------------
 # Per-server SDK wrapper
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class _ToolRequest:
     name: str
     args: dict
     future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
+
 
 class _SdkClientWrapper:
     """
@@ -159,8 +184,13 @@ class _SdkClientWrapper:
         self._task: Optional[asyncio.Task] = None
         self._queue: Optional[asyncio.Queue] = None
         self.connected: bool = False
+        self.needs_auth: bool = False
         self.last_error: str = ""
         self._tools: list[Tool] = []
+        self._oauth_provider: Any = None
+        self._mcp_tokens_dir: Path | None = None
+        self._interactive: bool = False
+        self._tg_iface: object | None = None
 
     @property
     def tools(self) -> list[Tool]:
@@ -168,12 +198,15 @@ class _SdkClientWrapper:
 
     def connect(self) -> list[Tool]:
         """Schedule the session runner on the event loop; block until ready."""
+
         def _create_task() -> None:
             self._task = self._loop.create_task(self._session_runner())
 
         self._loop.call_soon_threadsafe(_create_task)
         try:
             self._ready_future.result(timeout=self._timeout)
+            if self.needs_auth:
+                return []
             self.connected = True
             logger.info("MCP [%s] connected: %d tool(s)", self.name, len(self._tools))
             return self._tools
@@ -201,7 +234,9 @@ class _SdkClientWrapper:
         try:
             self._loop.call_soon_threadsafe(self._queue.put_nowait, req)
         except RuntimeError:
-            return _tool_outcome(error=f"MCP server '{self.name}' is closing", success=False)
+            return _tool_outcome(
+                error=f"MCP server '{self.name}' is closing", success=False
+            )
         try:
             return req.future.result(timeout=self._timeout)
         except concurrent.futures.TimeoutError:
@@ -236,6 +271,16 @@ class _SdkClientWrapper:
         cfg = self._cfg
         transport = cfg.get("transport", "stdio").lower()
         try:
+            oauth_cfg = cfg.get("oauth")
+            if oauth_cfg and transport in ("http", "sse"):
+                if not self._interactive:
+                    await self._prepare_oauth_provider(oauth_cfg)
+                    if self.needs_auth:
+                        self._ready_future.set_result([])
+                        return
+                # For interactive flows, _oauth_provider is already set by _run_oauth_flow
+                # and we proceed directly to connection so the SDK's async_auth_flow fires.
+
             if transport == "stdio":
                 merged_env = {**get_default_environment(), **(cfg.get("env") or {})}
                 for _k in ("TMPDIR", "TMP", "TEMP"):
@@ -250,12 +295,16 @@ class _SdkClientWrapper:
                     await self._run_session(read, write)
             elif transport == "http":
                 async with streamablehttp_client(
-                    cfg["url"], headers=cfg.get("headers") or {}
+                    cfg["url"],
+                    headers=cfg.get("headers") or {},
+                    auth=self._oauth_provider,
                 ) as (read, write, _):
                     await self._run_session(read, write)
             elif transport == "sse":
                 async with sse_client(
-                    cfg["url"], headers=cfg.get("headers") or {}
+                    cfg["url"],
+                    headers=cfg.get("headers") or {},
+                    auth=self._oauth_provider,
                 ) as (read, write):
                     await self._run_session(read, write)
             else:
@@ -268,6 +317,45 @@ class _SdkClientWrapper:
                 self.last_error = str(exc)
                 logger.error("MCP [%s] session error: %s", self.name, exc)
 
+    async def _prepare_oauth_provider(self, oauth_cfg: dict) -> None:
+        """Resolve OAuth provider and detect whether an interactive flow is needed.
+
+        If ``mcp_tokens_dir`` is configured but no stored token exists, mark the
+        server as needing authentication and skip the transport connection. The
+        manager can later trigger ``start_oauth_flow`` to acquire a token.
+        """
+        if self._mcp_tokens_dir is None:
+            return
+        # Create an unstarted callback server. If an interactive flow is later
+        # triggered via ``start_oauth_flow`` it is started up front; otherwise
+        # the redirect handler starts it lazily if a fallback full-redirect
+        # flow is triggered (e.g. an invalid stored refresh token).
+        cb_server = mcp_oauth.CallbackServer(
+            port=oauth_cfg.get("callback_port", 8000),
+            bind=oauth_cfg.get("callback_bind", "0.0.0.0"),
+            cert_path=oauth_cfg["cert_path"],
+            key_path=oauth_cfg["key_path"],
+            loop=asyncio.get_running_loop(),
+        )
+        self._oauth_provider = mcp_oauth.OAuthProviderFactory.build(
+            self._cfg,
+            self._mcp_tokens_dir,
+            cb_server=cb_server,
+            tg_iface=self._tg_iface,
+        )
+        storage = mcp_oauth.FileTokenStorage(
+            server_name=self.name,
+            mcp_tokens_dir=self._mcp_tokens_dir,
+            client_id=oauth_cfg["client_id"],
+            client_secret=oauth_cfg["client_secret"],
+        )
+        existing = await storage.get_tokens()
+        if existing is None:
+            self.needs_auth = True
+            self.connected = False
+        else:
+            self.needs_auth = False
+
     async def _run_session(self, read: Any, write: Any) -> None:
         """Enter ClientSession, discover tools, then process requests."""
         async with ClientSession(read, write) as session:
@@ -277,7 +365,11 @@ class _SdkClientWrapper:
             seen_cursors: set[str] = set()
             page_count = 0
             while True:
-                page = await session.list_tools(cursor=cursor) if cursor else await session.list_tools()
+                page = (
+                    await session.list_tools(cursor=cursor)
+                    if cursor
+                    else await session.list_tools()
+                )
                 all_tools.extend(page.tools)
                 page_count += 1
                 if len(all_tools) > _MAX_TOOLS:
@@ -309,21 +401,28 @@ class _SdkClientWrapper:
                             req.future.set_result(_sdk_result_to_outcome(result))
                     except asyncio.CancelledError:
                         if not req.future.done():
-                            req.future.set_result(_tool_outcome(
-                                error=f"MCP server '{self.name}' closing", success=False
-                            ))
+                            req.future.set_result(
+                                _tool_outcome(
+                                    error=f"MCP server '{self.name}' closing",
+                                    success=False,
+                                )
+                            )
                         raise
                     except Exception as exc:
                         self.connected = False
                         self.last_error = str(exc)
                         if not req.future.done():
-                            req.future.set_result(_tool_outcome(error=str(exc), success=False))
+                            req.future.set_result(
+                                _tool_outcome(error=str(exc), success=False)
+                            )
             finally:
                 self._drain_queue(f"MCP server '{self.name}' session ended")
+
 
 # ---------------------------------------------------------------------------
 # MCPManager
 # ---------------------------------------------------------------------------
+
 
 class MCPManager:
     """
@@ -344,18 +443,176 @@ class MCPManager:
       - The loop starts lazily on first connect_all() and stops on close_all().
     """
 
-    def __init__(self, server_configs: list[dict]) -> None:
-        self._cfgs: dict[str, dict] = {cfg["name"]: cfg for cfg in server_configs if "name" in cfg}
+    def __init__(
+        self,
+        server_configs: list[dict],
+        mcp_tokens_dir: Path | None = None,
+        tg_iface: object | None = None,
+    ) -> None:
+        self._cfgs: dict[str, dict] = {
+            cfg["name"]: cfg for cfg in server_configs if "name" in cfg
+        }
         self._wrappers: dict[str, _SdkClientWrapper] = {}
         self._tool_to_server: dict[str, str] = {}
         self._enabled: dict[str, bool] = {
-            name: bool(cfg.get("enabled", True))
-            for name, cfg in self._cfgs.items()
+            name: bool(cfg.get("enabled", True)) for name, cfg in self._cfgs.items()
         }
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._connecting: set[str] = set()
+        self._mcp_tokens_dir: Path | None = mcp_tokens_dir
+        self._tg_iface: object | None = tg_iface
+        self._oauth_flow_in_progress: bool = False
+        self._oauth_cancel_requested: bool = False
+        self._oauth_chat_id: int | None = None
+
+    def set_tg_iface(self, tg_iface: object) -> None:
+        """Set the Telegram interface used for OAuth redirect URL delivery.
+
+        Called once from the composition root after both ``MCPManager`` and
+        ``TelegramInterface`` are constructed.  This is the only supported way
+        to wire the Telegram dependency post-construction; direct attribute
+        writes are not part of the public API.
+
+        Args:
+            tg_iface: Telegram interface instance whose ``app.bot`` can send
+                messages during interactive OAuth flows.
+        """
+        self._tg_iface = tg_iface
+
+    def server_name_for_tool(self, tool_name: str) -> str:
+        """Return the server name owning a tool, or empty string (thread-safe)."""
+        with self._lock:
+            return self._tool_to_server.get(tool_name, "")
+
+    def server_has_oauth(self, server_name: str) -> bool:
+        """Return True if the server has OAuth configured (thread-safe)."""
+        with self._lock:
+            cfg = self._cfgs.get(server_name, {})
+        return bool(cfg.get("oauth"))
+
+    def get_token_info(self, server_name: str) -> dict[str, Any] | None:
+        """Return token info for a server for status display (thread-safe).
+
+        Reads the persisted token file directly without touching the event
+        loop, so this method is safe to call from synchronous code.
+
+        Returns:
+            A dict with keys ``has_token`` (bool), ``expires_in`` (int|None, remaining seconds until expiry),
+            ``has_refresh`` (bool), and ``scope`` (str|None). Returns ``None``
+            if the server is not found or has no OAuth configuration.
+        """
+        if not self.server_has_oauth(server_name):
+            return None
+
+        cfg = self._cfgs.get(server_name, {})
+        oauth_cfg = cfg.get("oauth") or {}
+        if self._mcp_tokens_dir is None:
+            return {
+                "has_token": False,
+                "expires_in": None,
+                "has_refresh": False,
+                "scope": oauth_cfg.get("scope"),
+            }
+
+        storage = mcp_oauth.FileTokenStorage(
+            server_name=server_name,
+            mcp_tokens_dir=self._mcp_tokens_dir,
+            client_id=oauth_cfg["client_id"],
+            client_secret=oauth_cfg["client_secret"],
+        )
+        data = storage._read_file()
+        if data is None:
+            return {
+                "has_token": False,
+                "expires_in": None,
+                "has_refresh": False,
+                "scope": oauth_cfg.get("scope"),
+            }
+
+        token_data = data.get("token") or data
+        access_token = token_data.get("access_token")
+        _expires_in = token_data.get("expires_in")
+        _issued_at = token_data.get("issued_at")
+        if _expires_in is not None and _issued_at is not None:
+            expires_display: int | None = max(0, int(_issued_at + _expires_in - time.time()))
+        else:
+            expires_display = _expires_in
+        return {
+            "has_token": bool(access_token),
+            "expires_in": expires_display,
+            "has_refresh": bool(token_data.get("refresh_token")),
+            "scope": token_data.get("scope") or oauth_cfg.get("scope"),
+        }
+
+    def mark_needs_auth(self, server_name: str) -> None:
+        """Mark a server as needing authentication (thread-safe).
+
+        Sets ``needs_auth=True`` and ``connected=False`` on the server's wrapper
+        under the class lock. Safe to call from any thread.
+
+        Args:
+            server_name: Name of the configured MCP server.
+        """
+        with self._lock:
+            wrapper = self._wrappers.get(server_name)
+            if wrapper is not None:
+                wrapper.needs_auth = True
+                wrapper.connected = False
+
+    def revoke_server(self, server_name: str) -> bool:
+        """Revoke stored OAuth tokens and unregister tools for a server.
+
+        Deletes the token file, closes the wrapper, and removes the server's
+        tools from the registry — all under the class lock. The wrapper is
+        left in place marked ``needs_auth`` (rather than removed) so status
+        queries report "needs_auth" instead of falling back to "error".
+        Returns False if the server name is not configured or has no OAuth.
+
+        Safe to call from any thread.
+
+        Args:
+            server_name: Name of the configured MCP server.
+
+        Returns:
+            True if the server existed and had OAuth configured; False otherwise.
+        """
+        cfg = self._cfgs.get(server_name)
+        if cfg is None:
+            return False
+        if not cfg.get("oauth"):
+            return False
+        # Delete token file
+        if self._mcp_tokens_dir is not None:
+            token_file = self._mcp_tokens_dir / f"{server_name}.json"
+            try:
+                token_file.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("MCP revoke: could not delete token file for %s: %s", server_name, exc)
+        with self._lock:
+            wrapper = self._wrappers.get(server_name)
+            for tool_name in [k for k, v in self._tool_to_server.items() if v == server_name]:
+                del self._tool_to_server[tool_name]
+        if wrapper is not None:
+            try:
+                wrapper.close()
+            except Exception as exc:
+                logger.warning("MCP revoke close error for %s: %s", server_name, exc)
+            wrapper.needs_auth = True
+            wrapper._tools = []
+        return True
+
+    def cancel_oauth_flow(self) -> dict:
+        """Request cancellation of the currently running OAuth flow.
+
+        The next time the running flow polls the cancel flag, it aborts. If no
+        flow is in progress, this returns an error.
+        """
+        if not self._oauth_flow_in_progress:
+            return {"success": False, "error": "No OAuth flow in progress"}
+        self._oauth_cancel_requested = True
+        return {"success": True}
 
     def _start_loop(self) -> None:
         if self._loop is not None and self._loop.is_running():
@@ -394,6 +651,8 @@ class MCPManager:
         if self._loop is None:
             self._start_loop()
         wrapper = _SdkClientWrapper(cfg, self._loop)
+        wrapper._mcp_tokens_dir = self._mcp_tokens_dir
+        wrapper._tg_iface = self._tg_iface
         tools = wrapper.connect()
         with self._lock:
             self._wrappers[name] = wrapper
@@ -401,7 +660,9 @@ class MCPManager:
                 if tool.name in self._tool_to_server:
                     logger.warning(
                         "MCP tool name conflict: '%s' claimed by both '%s' and '%s' — keeping first",
-                        tool.name, self._tool_to_server[tool.name], name,
+                        tool.name,
+                        self._tool_to_server[tool.name],
+                        name,
                     )
                 else:
                     self._tool_to_server[tool.name] = name
@@ -440,10 +701,14 @@ class MCPManager:
         with self._lock:
             server_name = self._tool_to_server.get(tool_name)
             if not server_name:
-                return _tool_outcome(error=f"MCP tool '{tool_name}' not found", success=False)
+                return _tool_outcome(
+                    error=f"MCP tool '{tool_name}' not found", success=False
+                )
             wrapper = self._wrappers.get(server_name)
         if not wrapper:
-            return _tool_outcome(error=f"MCP server '{server_name}' not connected", success=False)
+            return _tool_outcome(
+                error=f"MCP server '{server_name}' not connected", success=False
+            )
         return wrapper.call_tool(tool_name, args)
 
     def get_tools(self) -> list[Tool]:
@@ -464,7 +729,9 @@ class MCPManager:
             with self._lock:
                 existing = self._wrappers.get(name)
                 # Allow reconnect if wrapper is present but not connected
-                if (existing is not None and existing.connected) or name in self._connecting:
+                if (
+                    existing is not None and existing.connected
+                ) or name in self._connecting:
                     return True
                 self._connecting.add(name)
             try:
@@ -475,7 +742,9 @@ class MCPManager:
                     # If disabled during the connect window, close the just-registered wrapper
                     if not self._enabled.get(name, True):
                         wrapper = self._wrappers.pop(name, None)
-                        for tool_name in [k for k, v in self._tool_to_server.items() if v == name]:
+                        for tool_name in [
+                            k for k, v in self._tool_to_server.items() if v == name
+                        ]:
                             del self._tool_to_server[tool_name]
                         if wrapper:
                             try:
@@ -485,7 +754,9 @@ class MCPManager:
         else:
             with self._lock:
                 wrapper = self._wrappers.pop(name, None)
-                for tool_name in [k for k, v in self._tool_to_server.items() if v == name]:
+                for tool_name in [
+                    k for k, v in self._tool_to_server.items() if v == name
+                ]:
                     del self._tool_to_server[tool_name]
             if wrapper:
                 try:
@@ -509,15 +780,19 @@ class MCPManager:
                 status = "off"
             elif wrapper and wrapper.connected:
                 status = "active"
+            elif wrapper and wrapper.needs_auth:
+                status = "needs_auth"
             else:
                 status = "error"
-            result.append({
-                "name": name,
-                "transport": "web" if transport in ("http", "sse") else "stdio",
-                "status": status,
-                "tool_count": len(wrapper.tools) if wrapper else 0,
-                "last_error": wrapper.last_error if wrapper else "",
-            })
+            result.append(
+                {
+                    "name": name,
+                    "transport": "web" if transport in ("http", "sse") else "stdio",
+                    "status": status,
+                    "tool_count": len(wrapper.tools) if wrapper else 0,
+                    "last_error": wrapper.last_error if wrapper else "",
+                }
+            )
         return result
 
     def get_server_info(self, name: str) -> Optional[dict]:
@@ -533,6 +808,8 @@ class MCPManager:
             status = "off"
         elif wrapper and wrapper.connected:
             status = "active"
+        elif wrapper and wrapper.needs_auth:
+            status = "needs_auth"
         else:
             status = "error"
         return {
@@ -548,3 +825,177 @@ class MCPManager:
             "last_error": wrapper.last_error if wrapper else "",
         }
 
+    def start_oauth_flow(self, name: str, chat_id: int | None = None) -> dict:
+        """Start an interactive OAuth flow for the named server.
+
+        Called from a sync context; the actual async flow runs on the MCP event
+        loop while the caller blocks until completion or timeout.
+
+        Args:
+            name: Name of the configured MCP server to authorize.
+            chat_id: Telegram chat ID to send the authorization prompt to.
+
+        Returns:
+            A dict with ``success`` and optional ``error`` keys.
+        """
+        with self._lock:
+            if self._oauth_flow_in_progress:
+                return {"success": False, "error": "OAuth flow already in progress"}
+            self._oauth_flow_in_progress = True
+            self._oauth_chat_id = chat_id
+            # Reset any stale cancel flag from a racy cancel that arrived
+            # after the previous flow's _run_oauth_flow finished but before
+            # this method's finally block ran.  Without this, a stale True
+            # would cause the next flow to abort immediately.
+            self._oauth_cancel_requested = False
+
+        try:
+            cfg = self._cfgs.get(name)
+            if cfg is None:
+                return {"success": False, "error": f"Server '{name}' not found"}
+
+            oauth_cfg = cfg.get("oauth")
+            if oauth_cfg is None:
+                return {
+                    "success": False,
+                    "error": f"Server '{name}' has no OAuth configuration",
+                }
+
+            if self._mcp_tokens_dir is None:
+                return {
+                    "success": False,
+                    "error": "OAuth token directory not configured",
+                }
+
+            timeout = oauth_cfg.get("timeout", 300)
+            future = asyncio.run_coroutine_threadsafe(
+                self._run_oauth_flow(name, cfg, oauth_cfg),
+                self._loop,
+            )
+            return future.result(timeout=timeout + 10)
+        except concurrent.futures.TimeoutError:
+            return {"success": False, "error": "OAuth flow timed out"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        finally:
+            with self._lock:
+                self._oauth_flow_in_progress = False
+                self._oauth_chat_id = None
+
+    async def _watch_cancel(self) -> None:
+        """Coroutine that completes once an operator cancel is requested."""
+        while not self._oauth_cancel_requested:
+            await asyncio.sleep(0.5)
+
+    async def _run_oauth_flow(self, name: str, cfg: dict, oauth_cfg: dict) -> dict:
+        """Run the interactive OAuth flow by connecting a real session with auth=provider.
+
+        The SDK's ``async_auth_flow`` generator drives the full handshake
+        (discovery → redirect_handler → callback_handler → token exchange →
+        set_tokens → retry) as a side effect of the HTTP request hitting a 401.
+        """
+        cb_server = mcp_oauth.CallbackServer(
+            port=oauth_cfg.get("callback_port", 8000),
+            bind=oauth_cfg.get("callback_bind", "0.0.0.0"),
+            cert_path=oauth_cfg["cert_path"],
+            key_path=oauth_cfg["key_path"],
+            loop=asyncio.get_running_loop(),
+        )
+        session_task: asyncio.Task | None = None
+        try:
+            await cb_server.start()
+
+            provider = mcp_oauth.OAuthProviderFactory.build(
+                cfg,
+                self._mcp_tokens_dir,
+                cb_server=cb_server,
+                tg_iface=self._tg_iface,
+                chat_id=self._oauth_chat_id,
+            )
+
+            # Create a wrapper that will connect with the OAuth provider.
+            # The SDK's async_auth_flow fires when session.initialize() hits a 401,
+            # driving the full handshake: redirect → callback → token exchange →
+            # set_tokens → retry with Bearer token.
+            wrapper = _SdkClientWrapper(cfg, self._loop)
+            wrapper._mcp_tokens_dir = self._mcp_tokens_dir
+            wrapper._oauth_provider = provider
+            wrapper._interactive = True
+
+            session_task = asyncio.create_task(wrapper._session_runner())
+            cancel_task = asyncio.create_task(self._watch_cancel())
+
+            # Wait for either the session to become ready or a cancel request.
+            # asyncio.create_task() only accepts coroutines, while
+            # asyncio.ensure_future() also accepts an awaitable Future produced by
+            # asyncio.wrap_future(); this keeps the code compatible with Python 3.10.
+            ready_task = asyncio.ensure_future(
+                asyncio.wrap_future(wrapper._ready_future)
+            )
+
+            done, pending = await asyncio.wait(
+                {ready_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel anything still running.
+            for t in pending:
+                t.cancel()
+            # Gather cancelled tasks to avoid "Task was destroyed but pending" warnings.
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            if cancel_task in done and self._oauth_cancel_requested:
+                return {"success": False, "error": "Cancelled by operator"}
+
+            if ready_task in done:
+                exc = ready_task.exception()
+                if exc is not None:
+                    return {"success": False, "error": str(exc)}
+
+                # Session is ready — the SDK has completed the OAuth flow and
+                # persisted tokens via storage.set_tokens().
+                if wrapper.needs_auth:
+                    return {
+                        "success": False,
+                        "error": "Server still needs auth after flow",
+                    }
+
+                wrapper.connected = True
+                # Hand off the session task to the wrapper so it owns its
+                # lifecycle (close_all, close, set_enabled).  Null out the
+                # local so the ``finally`` block does NOT cancel the live
+                # session runner — it must keep running to serve tool calls.
+                wrapper._task = session_task
+                session_task = None
+                with self._lock:
+                    old = self._wrappers.get(name)
+                    if old is not None:
+                        old.close()
+                    self._wrappers[name] = wrapper
+                    for tool in wrapper.tools:
+                        if tool.name in self._tool_to_server:
+                            logger.warning(
+                                "MCP tool name conflict: '%s' claimed by both '%s' and '%s' — keeping first",
+                                tool.name,
+                                self._tool_to_server[tool.name],
+                                name,
+                            )
+                        else:
+                            self._tool_to_server[tool.name] = name
+                return {"success": True}
+
+            # Should not reach here, but handle defensively.
+            return {"success": False, "error": "Unexpected state in OAuth flow"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        finally:
+            self._oauth_cancel_requested = False
+            # Always cancel and await the session runner so its context
+            # managers (transport, ClientSession) finalize cleanly.
+            if session_task is not None and not session_task.done():
+                session_task.cancel()
+                await asyncio.gather(session_task, return_exceptions=True)
+            try:
+                await cb_server.stop()
+            except Exception as exc:
+                logger.warning("MCP [%s] callback server stop error: %s", name, exc)

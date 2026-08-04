@@ -51,6 +51,7 @@ from telegram_callbacks import (
     cb_confirm, cb_extend, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
     cb_zone_allow, cb_zone_trusted,
+    cb_oauth_cancel,
 )
 
 logger = logging.getLogger(__name__)
@@ -267,6 +268,7 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
         app.add_handler(CallbackQueryHandler(partial(cb_zone_allow,   self), pattern=r"^zone_allow:"))
         app.add_handler(CallbackQueryHandler(partial(cb_zone_trusted, self), pattern=r"^zone_trusted:"))
+        app.add_handler(CallbackQueryHandler(partial(cb_oauth_cancel, self), pattern=r"^oauth_cancel:"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
         app.add_handler(MessageHandler(filters.PHOTO, self._on_file))

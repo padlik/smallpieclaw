@@ -478,3 +478,51 @@ async def cb_zone_trusted(iface: "TelegramInterface", update: Update, ctx: Conte
         )
     except Exception as exc:
         logger.debug("Could not edit zone_trusted message: %s", exc)
+
+
+async def cb_oauth_cancel(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the Cancel button on an in-flight OAuth authorization prompt.
+
+    The button always sends the constant ``oauth_cancel:`` (no state appended).
+    Any trailing field after ``:`` is extracted only for logging; the MCP manager
+    is always signalled unconditionally because only one interactive OAuth flow
+    may run at a time.
+    """
+    query = update.callback_query
+    caller = query.from_user
+    caller_id = caller.id if caller else None
+    if caller_id is None or not iface._is_authorized(caller_id):
+        try:
+            await query.answer("⛔ Not authorized.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    data = query.data or ""
+    parts = data.split(":", 1)
+    state = parts[1] if len(parts) > 1 else ""
+    logger.info("OAuth cancel callback: state=%s", state[:8])
+
+    result = None
+    if getattr(iface, "mcp_manager", None):
+        result = iface.mcp_manager.cancel_oauth_flow()
+
+    if result and not result.get("success"):
+        try:
+            await query.answer(
+                html.escape(result.get("error", "Unable to cancel OAuth flow.")),
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer("OAuth flow cancelled.", show_alert=True)
+    except Exception:
+        pass
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as exc:
+        logger.debug("Could not remove OAuth cancel reply markup: %s", exc)

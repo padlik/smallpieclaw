@@ -164,6 +164,195 @@ class TestBotCommandDiscovery:
 
 
 # ---------------------------------------------------------------------------
+# Tests: /mcp auth commands
+# ---------------------------------------------------------------------------
+
+class TestMcpAuthCommands:
+    """Telegram surface for MCP OAuth flows."""
+
+    def test_mcp_auth_unknown_server(self):
+        """/mcp auth <name> surfaces errors from start_oauth_flow."""
+        from telegram_commands import cmd_mcp
+
+        iface = _make_iface()
+        iface.mcp_manager = MagicMock()
+        iface.mcp_manager.server_has_oauth = MagicMock(return_value=False)
+        iface.mcp_manager.start_oauth_flow = MagicMock(
+            return_value={"success": False, "error": "Server 'unknown' not found"}
+        )
+
+        sent_texts: list[str] = []
+
+        async def _run():
+            mock_message = MagicMock()
+            mock_message.reply_text = AsyncMock(side_effect=lambda text, **kw: sent_texts.append(text))
+
+            mock_user = MagicMock()
+            mock_user.id = 42
+
+            mock_update = MagicMock()
+            mock_update.effective_user = mock_user
+            mock_update.effective_message = mock_message
+            mock_update.effective_chat = MagicMock()
+            mock_update.effective_chat.id = 123
+
+            mock_ctx = MagicMock()
+            mock_ctx.args = ["auth", "unknown"]
+
+            await cmd_mcp(iface, mock_update, mock_ctx)
+
+        asyncio.run(_run())
+        assert any("unknown" in t and "not found" in t for t in sent_texts), sent_texts
+
+    def test_mcp_auth_no_oauth(self):
+        """/mcp auth <name> reports missing OAuth configuration."""
+        from telegram_commands import cmd_mcp
+
+        iface = _make_iface()
+        iface.mcp_manager = MagicMock()
+        iface.mcp_manager.server_has_oauth = MagicMock(return_value=True)
+        iface.mcp_manager.start_oauth_flow = MagicMock(
+            return_value={"success": False, "error": "Server 'local' has no OAuth configuration"}
+        )
+
+        sent_texts: list[str] = []
+
+        async def _run():
+            mock_message = MagicMock()
+            mock_message.reply_text = AsyncMock(side_effect=lambda text, **kw: sent_texts.append(text))
+
+            mock_user = MagicMock()
+            mock_user.id = 42
+
+            mock_update = MagicMock()
+            mock_update.effective_user = mock_user
+            mock_update.effective_message = mock_message
+            mock_update.effective_chat = MagicMock()
+            mock_update.effective_chat.id = 123
+
+            mock_ctx = MagicMock()
+            mock_ctx.args = ["auth", "local"]
+
+            await cmd_mcp(iface, mock_update, mock_ctx)
+
+        asyncio.run(_run())
+        assert any("no OAuth configuration" in t for t in sent_texts), sent_texts
+
+    def test_mcp_auth_status_format(self):
+        """/mcp auth status lists servers with OAuth details."""
+        from telegram_commands import cmd_mcp
+
+        iface = _make_iface()
+        iface.mcp_manager = MagicMock()
+        iface.mcp_manager.server_has_oauth = MagicMock(side_effect=lambda name: name == "gmail")
+        iface.mcp_manager.list_servers = MagicMock(
+            return_value=[
+                {"name": "gmail", "status": "needs_auth"},
+                {"name": "stdio_srv", "status": "active"},
+            ]
+        )
+
+        sent_texts: list[str] = []
+
+        async def _run():
+            mock_message = MagicMock()
+            mock_message.reply_text = AsyncMock(side_effect=lambda text, **kw: sent_texts.append(text))
+
+            mock_user = MagicMock()
+            mock_user.id = 42
+
+            mock_update = MagicMock()
+            mock_update.effective_user = mock_user
+            mock_update.effective_message = mock_message
+
+            mock_ctx = MagicMock()
+            mock_ctx.args = ["auth", "status"]
+
+            await cmd_mcp(iface, mock_update, mock_ctx)
+
+        asyncio.run(_run())
+        text = "\n".join(sent_texts)
+        assert "gmail" in text
+        assert "stdio_srv" in text
+        assert "needs_auth" in text
+        assert "active" in text
+        assert "no OAuth" in text or "needs authentication" in text
+
+    def test_mcp_auth_status_shows_expiry_and_refresh(self):
+        """/mcp auth status shows token expiry and refresh-token availability."""
+        from telegram_commands import cmd_mcp
+
+        iface = _make_iface()
+        iface.mcp_manager = MagicMock()
+        iface.mcp_manager.server_has_oauth = MagicMock(return_value=True)
+        iface.mcp_manager.list_servers = MagicMock(
+            return_value=[{"name": "gmail", "status": "active"}]
+        )
+        iface.mcp_manager.get_token_info = MagicMock(
+            return_value={
+                "has_token": True,
+                "expires_in": 3600,
+                "has_refresh": True,
+                "scope": "read_mail",
+            }
+        )
+
+        sent_texts: list[str] = []
+
+        async def _run():
+            mock_message = MagicMock()
+            mock_message.reply_text = AsyncMock(side_effect=lambda text, **kw: sent_texts.append(text))
+
+            mock_user = MagicMock()
+            mock_user.id = 42
+
+            mock_update = MagicMock()
+            mock_update.effective_user = mock_user
+            mock_update.effective_message = mock_message
+
+            mock_ctx = MagicMock()
+            mock_ctx.args = ["auth", "status"]
+
+            await cmd_mcp(iface, mock_update, mock_ctx)
+
+        asyncio.run(_run())
+        text = "\n".join(sent_texts)
+        assert "gmail" in text
+        assert "expires in 3600s" in text
+        assert "refresh: available" in text
+
+    def test_mcp_auth_revoke_deletes_token(self):
+        """/mcp auth revoke <name> delegates to revoke_server and reports success."""
+        from telegram_commands import cmd_mcp
+
+        iface = _make_iface()
+        iface.mcp_manager = MagicMock()
+        iface.mcp_manager.revoke_server = MagicMock(return_value=True)
+
+        sent_texts: list[str] = []
+
+        async def _run():
+            mock_message = MagicMock()
+            mock_message.reply_text = AsyncMock(side_effect=lambda text, **kw: sent_texts.append(text))
+
+            mock_user = MagicMock()
+            mock_user.id = 42
+
+            mock_update = MagicMock()
+            mock_update.effective_user = mock_user
+            mock_update.effective_message = mock_message
+
+            mock_ctx = MagicMock()
+            mock_ctx.args = ["auth", "revoke", "gmail"]
+
+            await cmd_mcp(iface, mock_update, mock_ctx)
+
+        asyncio.run(_run())
+        iface.mcp_manager.revoke_server.assert_called_once_with("gmail")
+        assert any("Token revoked" in t and "gmail" in t for t in sent_texts), sent_texts
+
+
+# ---------------------------------------------------------------------------
 # Tests: Handler registration
 # ---------------------------------------------------------------------------
 
