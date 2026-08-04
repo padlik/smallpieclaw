@@ -124,7 +124,7 @@ from xdg import XDGPaths, xdg_paths  # noqa: E402
 def _create_xdg_dirs(paths: XDGPaths) -> None:
     """Create all XDG directories the agent needs. Idempotent."""
     for d in (paths.config_home, paths.data_home, paths.state_home, paths.cache_home,
-              paths.logs_dir, paths.skills_dir):
+              paths.logs_dir, paths.skills_dir, paths.mcp_tokens_dir):
         d.mkdir(parents=True, exist_ok=True)
     paths.runtime_dir.mkdir(parents=False, exist_ok=True)
     # state_home holds the vault, trust store, and conversation history — owner-only.
@@ -464,7 +464,7 @@ def _run(
     mcp_server_cfgs = cfg.get("mcp_servers", [])
     if mcp_server_cfgs:
         logger.info("Initialising %d MCP server(s)...", len(mcp_server_cfgs))
-        mcp_manager = MCPManager(mcp_server_cfgs)
+        mcp_manager = MCPManager(mcp_server_cfgs, mcp_tokens_dir=paths.mcp_tokens_dir)
         try:
             mcp_manager.connect_all()
             mcp_tools = mcp_manager.get_tools()
@@ -716,6 +716,11 @@ def _run(
     tg._graph_memory_store = graph_memory_store  # type: ignore[attr-defined]
     tg._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
     tg._prompt_registry = prompt_registry  # type: ignore[attr-defined]  # wire prompt registry for /prompts and lifecycle
+
+    # Wire the Telegram interface into the MCP manager so OAuth redirect URLs
+    # can be posted to the operator as inline buttons during the auth flow.
+    if mcp_manager is not None:
+        mcp_manager.set_tg_iface(tg)
 
     # Wire the sub-agent Telegram confirmation bridge into the built-in executor.
     # Sub-agents running sensitive file operations will call this to ask the

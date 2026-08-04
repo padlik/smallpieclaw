@@ -36,6 +36,7 @@ class XDGPaths:
     tool_index_file: Path
     pid_file: Path
     secrets_file: Path
+    mcp_tokens_dir: Path
     logs_dir: Path
     log_file: Path
     log_jsonl: Path
@@ -81,6 +82,7 @@ def xdg_paths(agent_name: str) -> XDGPaths:
         tool_index_file=cache_home / "tool_index.json",
         pid_file=runtime_dir / "agent.pid",
         secrets_file=state_home / "secrets.toml",
+        mcp_tokens_dir=state_home / "mcp_tokens",
         logs_dir=logs_dir,
         log_file=logs_dir / "agent.log",
         log_jsonl=logs_dir / "agent.jsonl",

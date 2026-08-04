@@ -55,6 +55,45 @@ def _tool_icon(name: str) -> str:
     return _TOOL_ICONS.get(name, _DEFAULT_TOOL_ICON)
 
 
+def _is_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -> bool:
+    """Detect clear MCP authentication/authorization failures in tool outcome.
+
+    Only triggers for servers that have OAuth configured — a non-OAuth server
+    returning '401' in its error text is a normal tool error, not an auth failure.
+    """
+    if not isinstance(outcome, dict) or outcome.get("success") is not False:
+        return False
+    # Only check for auth failures on OAuth-configured servers
+    if ctx.mcp_manager is None:
+        return False
+    server_name = ctx.mcp_manager.server_name_for_tool(tool_name)
+    if not server_name:
+        return False
+    if not ctx.mcp_manager.server_has_oauth(server_name):
+        return False
+    error = (outcome.get("error", "") or "").lower()
+    indicators = ("401", "unauthorized", "token expired", "refresh failed", "invalid token", "access denied")
+    return any(ind in error for ind in indicators)
+
+
+def _handle_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -> dict:
+    """Transition the owning MCP server to needs_auth and return a helpful error."""
+    server_name = ""
+    if ctx.mcp_manager is not None:
+        server_name = ctx.mcp_manager.server_name_for_tool(tool_name)
+        ctx.mcp_manager.mark_needs_auth(server_name)
+    display_name = server_name or "unknown"
+    return {
+        "success": False,
+        "output": "",
+        "error": (
+            f"MCP token expired for server '{display_name}'. "
+            f"Run `/mcp auth {display_name}` to re-authenticate."
+        ),
+        "exit_code": -1,
+    }
+
+
 def _format_parent_context(ctx: ReactContext) -> str:
     """Format a PARENT CONTEXT section for sub-agents from stored payload.
 
@@ -1311,6 +1350,8 @@ def _dispatch_tool(
             )
             raise
         dur_ms = int((time.perf_counter() - _mcp_start) * 1000)
+        if _is_mcp_auth_failure(ctx, tool_name, outcome):
+            outcome = _handle_mcp_auth_failure(ctx, tool_name, outcome)
         if isinstance(outcome, dict) and outcome.get("success"):
             agent_logging.log_event(
                 agent_logging.LogEvent.TOOL_END,

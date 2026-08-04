@@ -43,6 +43,7 @@ def _paths_for(state_dir) -> XDGPaths:
         scheduler_commands=state_dir / "scheduler_commands.json",
         scheduler_jobs=state_dir / "scheduler_jobs.json",
         job_execution_log=state_dir / "job_execution_log.jsonl",
+        mcp_tokens_dir=state_dir / "mcp_tokens",
     )
 
 

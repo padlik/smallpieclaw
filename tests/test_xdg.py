@@ -28,6 +28,7 @@ class TestXdgPathsDefaults:
         assert paths.tool_index_file == paths.cache_home / "tool_index.json"
         assert paths.pid_file == paths.runtime_dir / "agent.pid"
         assert paths.secrets_file == paths.state_home / "secrets.toml"
+        assert paths.mcp_tokens_dir == paths.state_home / "mcp_tokens"
         assert paths.logs_dir == paths.state_home / "logs"
         assert paths.log_file == paths.logs_dir / "agent.log"
         assert paths.log_jsonl == paths.logs_dir / "agent.jsonl"

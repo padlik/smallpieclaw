@@ -46,7 +46,7 @@ MCPManagerProtocol.get_tools
 # config_schema.py — public API classes and functions
 from config_schema import parse_config, AppConfig, TelegramConfig, AgentConfig  # noqa: E402
 from config_schema import ModelConfig, EmbeddingsConfig, SchedulerConfig  # noqa: E402
-from config_schema import PathsConfig, MCPServerConfig  # noqa: E402
+from config_schema import PathsConfig, MCPServerConfig, OAuthConfig  # noqa: E402
 parse_config
 AppConfig
 TelegramConfig
@@ -56,6 +56,7 @@ EmbeddingsConfig
 SchedulerConfig
 PathsConfig
 MCPServerConfig
+OAuthConfig
 
 # builtin_tools/access_control.py — public API
 from builtin_tools.access_control import (  # noqa: E402
@@ -77,6 +78,17 @@ GrantTracker
 GrantTracker.add
 GrantTracker.reset
 GrantTracker.snapshot
+
+# mcp_oauth.py — public API for MCP OAuth 2.0 support
+from mcp_oauth import FileTokenStorage, CallbackServer, OAuthProviderFactory  # noqa: E402
+FileTokenStorage
+CallbackServer
+OAuthProviderFactory
+
+# xdg.py — XDGPaths field exposed for MCP token storage
+from xdg import XDGPaths  # noqa: E402
+XDGPaths
+XDGPaths.mcp_tokens_dir
 
 # agent_logging.py — structlog logging backbone public API
 from agent_logging import (  # noqa: E402
@@ -177,6 +189,11 @@ from main import (  # noqa: E402
 )
 _load_conversation
 _cleanup_old_session_logs
+
+# mcp_client.py — public API for MCP token status display
+from mcp_client import MCPManager  # noqa: E402
+_mcp_manager_type = MCPManager
+_mcp_manager_type.get_token_info  # type: ignore[attr-defined]
 
 # builtin_executor.py — public attributes set/wired externally
 from builtin_executor import BuiltinExecutor  # noqa: E402

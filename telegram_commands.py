@@ -10,7 +10,7 @@ import re as _re
 import secrets
 import time
 from datetime import datetime as _dt
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -663,9 +663,98 @@ async def cmd_skills(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
+def _fmt_mcp_token_info(token_info: dict[str, Any] | None) -> str:
+    """Format token expiry and refresh availability for display.
+
+    Args:
+        token_info: Result of ``MCPManager.get_token_info()``, or ``None``.
+
+    Returns:
+        A compact HTML-safe parenthetical string like
+        ``"authenticated, expires in 3600s, refresh: available"``.
+    """
+    if token_info is None:
+        return "no OAuth"
+    if not token_info["has_token"]:
+        return "needs authentication — run /mcp auth &lt;name&gt;"
+
+    parts = ["authenticated"]
+    if token_info["expires_in"] is not None:
+        parts.append(f"expires in {token_info['expires_in']}s")
+    else:
+        parts.append("expiry unknown")
+    if token_info["has_refresh"]:
+        parts.append("refresh: available")
+    else:
+        parts.append("refresh: none")
+    return ", ".join(parts)
+
+
+async def _mcp_auth_status(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Render /mcp auth status output."""
+    assert iface.mcp_manager is not None
+    servers = iface.mcp_manager.list_servers()
+    if not servers:
+        await update.effective_message.reply_text("🔌 No MCP servers configured.")
+        return
+    lines = ["🔐 <b>MCP OAuth Status</b>\n"]
+    for s in servers:
+        name = s["name"]
+        status = s["status"]
+        has_oauth = iface.mcp_manager.server_has_oauth(name)
+        if not has_oauth:
+            auth_state = "no OAuth"
+        elif status == "needs_auth":
+            auth_state = "needs authentication — run /mcp auth &lt;name&gt;"
+        elif status == "active":
+            token_info = iface.mcp_manager.get_token_info(name)
+            auth_state = _fmt_mcp_token_info(token_info)
+        else:
+            auth_state = "OAuth configured"
+        lines.append(
+            f"• <b>{html.escape(name)}</b> — {html.escape(status)} ({auth_state})"
+        )
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _mcp_auth_revoke(
+    iface: "TelegramInterface",
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    name: str,
+) -> None:
+    """Revoke stored OAuth tokens for a server and mark it as needing auth."""
+    assert iface.mcp_manager is not None
+    revoked = iface.mcp_manager.revoke_server(name)
+    if not revoked:
+        # Determine whether the server exists but lacks OAuth for a precise message.
+        servers = {s["name"] for s in iface.mcp_manager.list_servers()}
+        if name not in servers:
+            await update.effective_message.reply_text(
+                f"❌ Server <code>{html.escape(name)}</code> not found.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.effective_message.reply_text(
+                f"❌ Server <code>{html.escape(name)}</code> has no OAuth configuration.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    await update.effective_message.reply_text(
+        f"🔒 Token revoked for <code>{html.escape(name)}</code>.\n"
+        f"Server status: needs_auth.\n"
+        f"Run <code>/mcp auth {html.escape(name)}</code> to re-authenticate.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @_require_auth
 async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /mcp [list|on|off|info] [name]"""
+    """Handle /mcp [list|on|off|info|auth] [name]"""
     if not iface.mcp_manager:
         await update.effective_message.reply_text(
             "🔌 No MCP servers configured.\n"
@@ -677,6 +766,48 @@ async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
     args = ctx.args or []
     sub = args[0].lower() if args else "list"
     name = args[1] if len(args) > 1 else ""
+
+    # /mcp auth [name|status|revoke]
+    if sub == "auth":
+        if not name:
+            await update.effective_message.reply_text(
+                "Usage: <code>/mcp auth &lt;name&gt;</code> | "
+                "<code>/mcp auth status</code> | "
+                "<code>/mcp auth revoke &lt;name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if name.lower() == "status":
+            await _mcp_auth_status(iface, update, ctx)
+            return
+        if name.lower() == "revoke":
+            revoke_name = args[2] if len(args) > 2 else ""
+            if not revoke_name:
+                await update.effective_message.reply_text(
+                    "Usage: <code>/mcp auth revoke &lt;name&gt;</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await _mcp_auth_revoke(iface, update, ctx, revoke_name)
+            return
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, iface.mcp_manager.start_oauth_flow, name, update.effective_chat.id
+        )
+        if result.get("success"):
+            await update.effective_message.reply_text(
+                f"✅ OAuth flow completed for <code>{html.escape(name)}</code>. "
+                f"Server is now active.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            error = result.get("error", "OAuth flow failed")
+            await update.effective_message.reply_text(
+                f"❌ {html.escape(error)}",
+                parse_mode=ParseMode.HTML,
+            )
+        return
 
     # /mcp on <name>
     if sub == "on":
