@@ -14,3 +14,7 @@
 - You are reading files under `openspec/changes/<name>/`
 
 Failure to load `openspec-workflow` will result in missing critical workflow context.
+
+@AGENTS.md
+
+
