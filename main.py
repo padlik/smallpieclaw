@@ -504,6 +504,7 @@ def _run(
         agent_name=agent_name,
         vault_path=vault_file,
         trusted_dirs_path=trusted_dirs_path,
+        skills_dir=skills_dir_abs,
     )
     builtin.trusted_zone_checker = _trusted_zone_checker  # type: ignore[attr-defined]
     # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime
