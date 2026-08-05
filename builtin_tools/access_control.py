@@ -102,7 +102,8 @@ class TrustedZoneChecker:
             trusted_dirs_path: Absolute path to trusted_dirs.json. If empty,
                 falls back to ``data_dir/trusted_dirs.json``.
             skills_dir: Absolute path to the skills directory; auto-trusted
-                so SKILL.md reads do not trigger confirmation dialogs.
+                with read/write access (same level as workspace/downloads) so
+                SKILL.md reads do not trigger confirmation dialogs.
         """
         self._data_dir = os.path.realpath(data_dir)
         self._trusted_dirs_path = os.path.normcase(

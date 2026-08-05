@@ -255,6 +255,22 @@ class TestClassify:
         result = checker.classify(hardlink, operation="read")
         assert result == ZoneClassification.UNRECOGNISED
 
+    def test_skills_dir_is_trusted(self):
+        """Paths inside skills_dir must classify as TRUSTED so SKILL.md reads need no confirmation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _make_paths(tmp)
+            for d in [paths.data_dir, paths.skills_dir, paths.downloads_dir, paths.workspace_dir]:
+                os.makedirs(d, exist_ok=True)
+            checker = TrustedZoneChecker(
+                workspace_dir=paths.workspace_dir,
+                downloads_dir=paths.downloads_dir,
+                data_dir=paths.data_dir,
+                agent_name="test-agent",
+                skills_dir=paths.skills_dir,
+            )
+            skill_md = os.path.join(paths.skills_dir, "someskill", "SKILL.md")
+            assert checker.classify(skill_md, operation="read") == ZoneClassification.TRUSTED
+
 
 class TestSiblingPrefixContainment:
     def test_sibling_with_shared_prefix_is_unrecognised(self):
