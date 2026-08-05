@@ -88,6 +88,7 @@ class TrustedZoneChecker:
         agent_name: str,
         vault_path: str = "",
         trusted_dirs_path: str = "",
+        skills_dir: str = "",
     ) -> None:
         """Construct checker from resolved runtime paths.
 
@@ -100,6 +101,8 @@ class TrustedZoneChecker:
                 to prevent silent reads bypassing secret_get confirmation.
             trusted_dirs_path: Absolute path to trusted_dirs.json. If empty,
                 falls back to ``data_dir/trusted_dirs.json``.
+            skills_dir: Absolute path to the skills directory; auto-trusted
+                so SKILL.md reads do not trigger confirmation dialogs.
         """
         self._data_dir = os.path.realpath(data_dir)
         self._trusted_dirs_path = os.path.normcase(
@@ -117,6 +120,7 @@ class TrustedZoneChecker:
             workspace_dir,
             downloads_dir,
             f"/tmp/{agent_name}",
+            skills_dir,
         ]
         self._default_trusted_dirs: list[str] = []
         for d in trusted_candidates:
