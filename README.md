@@ -181,6 +181,9 @@ systemctl --user enable --now telegram-agent
 | `/reindex` | Force re-embed all tools |
 | `/pair` / `/unpair <id>` | Pairing-mode access management |
 | `/myid` | Show your Telegram user ID |
+| `/mcp auth <name>` | Initiate OAuth 2.0 authorization flow for an MCP server |
+| `/mcp auth status` | Show OAuth token status (expiry, refresh token availability) for all servers |
+| `/mcp auth revoke <name>` | Delete stored OAuth tokens and disconnect the server |
 
 Hidden diagnostic commands (not in menu, available to authorised users): `/show_ctx`, `/show_env`, `/memory`, `/compress`.
 
@@ -286,7 +289,7 @@ timeout   = 30
 [mcp_servers.env]
 MY_ENV_VAR = "value"
 
-# Remote HTTP
+# Remote HTTP with static headers
 [[mcp_servers]]
 name      = "my-api"
 transport = "http"
@@ -299,9 +302,103 @@ Authorization = "env:MY_AUTH_HEADER"    # set MY_AUTH_HEADER="Bearer ..." in env
 
 `enabled = false` loads the definition without connecting. Manage live with `/mcp on <name>` / `/mcp off <name>`.
 
+#### OAuth 2.0 (Authorization-Code + PKCE) for HTTP Servers
+
+HTTP-transport MCP servers like Google's Gmail MCP require OAuth 2.0 authentication. The agent supports the full authorization-code + PKCE flow with an ephemeral callback server:
+
+```toml
+[[mcp_servers]]
+name      = "gmail"
+transport = "http"
+url       = "https://gmailmcp.googleapis.com/mcp/v1"
+enabled   = true
+timeout   = 30
+
+[mcp_servers.oauth]
+# OAuth client credentials (register your app with the provider)
+client_id     = "sec:GMAIL_CLIENT_ID"
+client_secret = "sec:GMAIL_CLIENT_SECRET"
+# Redirect URI must match exactly what you registered with the provider
+redirect_uri  = "https://<your-hostname>:8000/oauth/callback"
+# Scopes required by the API (space-separated or URL-encoded)
+scope         = "https://www.googleapis.com/auth/gmail.readonly"
+# Ephemeral callback server (listens only during auth flow)
+callback_port = 8000
+callback_bind = "0.0.0.0"          # or "127.0.0.1" for local-only
+# TLS certificate for HTTPS callback (self-signed or Let's Encrypt)
+cert_path     = "/path/to/cert.pem"
+key_path      = "/path/to/key.pem"
+```
+
+**Setup steps:**
+
+1. **Register OAuth app** with the provider (e.g., Google Cloud Console) and obtain `client_id` and `client_secret`
+2. **Generate TLS certificate** for your hostname:
+   ```bash
+   openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+   ```
+3. **Register redirect URI** in your OAuth app settings: `https://<your-hostname>:<callback_port>/oauth/callback`
+4. **Port-forward** the callback port through your router to this machine
+5. **Store secrets** in the vault (`~/.local/state/<agent_name>/secrets.toml`):
+   ```toml
+   GMAIL_CLIENT_ID = "your-client-id"
+   GMAIL_CLIENT_SECRET = "your-client-secret"
+   ```
+
+**Authorization flow:**
+
+- Run `/mcp auth gmail` in Telegram
+- Tap the authorization URL button (opens provider's login page)
+- Authenticate and grant permissions
+- Agent receives the callback, exchanges the code for tokens, and stores them in `~/.local/state/<agent_name>/mcp_tokens/gmail.json` (mode `0600`)
+- Server connects with Bearer token; tools become available
+
+**Token management:**
+
+- **Automatic refresh:** When a tool call returns 401, the agent automatically refreshes the token using the stored refresh token (outbound only, no callback needed)
+- **Manual re-auth:** Run `/mcp auth gmail` again to revoke and re-authenticate
+- **Token status:** Run `/mcp auth status` to see expiry times and refresh token availability
+- **Revoke tokens:** Run `/mcp auth revoke gmail` to delete stored tokens and disconnect the server
+
 ---
 
 ## Advanced Topics
+
+### MCP OAuth 2.0 (Security & Troubleshooting)
+
+**Callback server:**
+- Opens **only during auth flow** (~30 seconds), then closes automatically
+- Protected by **state parameter** (CSRF token) + **PKCE** (code interception)
+- Requires **HTTPS** (TLS cert must be valid; self-signed is acceptable)
+- Binds to `callback_bind` (default `0.0.0.0`; restrict to `127.0.0.1` for local-only flows)
+- Port must be accessible from the OAuth provider's servers (router port-forward required)
+
+**Token storage:**
+- Stored as `~/.local/state/<agent_name>/mcp_tokens/<server>.json` with `0600` permissions
+- Contains `access_token`, `refresh_token`, `expires_at`, `scope`, and `client_info`
+- Vault integration deferred — store client secrets in `secrets.toml` with `sec:` prefix, not plaintext
+
+**Troubleshooting:**
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| "Certificate validation failed" | TLS cert missing, unreadable, or expired | Regenerate cert; ensure `cert_path` and `key_path` are readable |
+| "Callback server failed to start" | Port already in use or permission denied | Change `callback_port` or stop the process using the port |
+| "Connection timed out" | Router port-forward not configured or hostname wrong | Verify port-forward; test with `curl https://<hostname>:<port>` |
+| "OAuth flow timed out" | Callback URL not reached within 300s | Check hostname resolution; verify port-forward; ensure HTTPS is working |
+| "401 Unauthorized" after auth | Tokens expired and refresh token invalid | Run `/mcp auth <name>` to re-authenticate |
+| "Token refresh failed" | Refresh token revoked or expired | Run `/mcp auth <name>` to re-authenticate; check scope permissions |
+
+**Security best practices:**
+
+- Use a **hostname** (not IP address) for the redirect URI to survive network changes
+- Use **Let's Encrypt** for production (self-signed is fine for testing)
+- Store `client_secret` in the **vault** (not config.toml)
+- Restrict `callback_bind` to **`127.0.0.1`** if the agent is local-only
+- Regularly run `/mcp auth status` to monitor **token expiry**
+- Use `/mcp auth revoke <name>` to **disconnect** servers you no longer need
+
+---
 
 ### Scheduler
 

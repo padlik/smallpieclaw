@@ -327,3 +327,45 @@ log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups t
 # timeout   = 30
 # [mcp_servers.headers]
 # Authorization = "env:MY_AUTH_HEADER"    # set MY_AUTH_HEADER="Bearer sk-..." in env
+
+# Example: HTTP MCP server with OAuth 2.0 (authorization-code + PKCE flow)
+# This example uses Google's Gmail MCP (https://gmailmcp.googleapis.com/mcp/v1).
+#
+# Prerequisites:
+#   1. Create an OAuth app in Google Cloud Console (https://console.cloud.google.com)
+#   2. Generate OAuth 2.0 credentials (type: Web Application)
+#   3. Add your callback URI to the app's authorized redirect URIs:
+#      https://<your-dynamic-dns-hostname>:<callback_port>/oauth/callback
+#   4. Generate a self-signed HTTPS certificate or use Let's Encrypt for the hostname:
+#      openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+#   5. Store the certificate and key files securely; reference them in config below
+#   6. Ensure your router forwards the callback port to this machine
+#
+# To authorize:
+#   - Run `/mcp auth gmail` in Telegram
+#   - Tap the authorization URL button
+#   - Complete the OAuth flow with Google
+#   - The agent stores tokens at $XDG_STATE_HOME/<agent_name>/mcp_tokens/gmail.json
+#   - The agent automatically refreshes expired tokens on next tool call (or use /mcp auth gmail to re-auth)
+#
+# [[mcp_servers]]
+# name      = "gmail"
+# transport = "http"
+# url       = "https://gmailmcp.googleapis.com/mcp/v1"
+# enabled   = true
+# timeout   = 30
+#
+# [mcp_servers.oauth]
+# # From Google Cloud Console OAuth 2.0 credentials
+# client_id           = "sec:GMAIL_MCP_CLIENT_ID"
+# client_secret       = "sec:GMAIL_MCP_CLIENT_SECRET"
+# # Must match the redirect URI registered in Google Cloud Console
+# redirect_uri        = "https://<your-dynamic-dns-hostname>:8000/oauth/callback"
+# # Scopes for Gmail API — adjust based on OAuth app permissions
+# scope               = "https://www.googleapis.com/auth/gmail.readonly"
+# # Callback server settings (ephemeral HTTPS server that listens only during auth flow)
+# callback_port       = 8000
+# callback_bind       = "0.0.0.0"    # bind to all interfaces; set to "127.0.0.1" for local only
+# # Path to TLS certificate and private key (see prerequisites above)
+# cert_path           = "/path/to/cert.pem"
+# key_path            = "/path/to/key.pem"
