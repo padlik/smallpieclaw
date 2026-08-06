@@ -237,10 +237,18 @@ class _SdkClientWrapper:
             return _tool_outcome(
                 error=f"MCP server '{self.name}' is closing", success=False
             )
+        logger.debug("MCP [%s] calling tool '%s'", self.name, tool_name)
         try:
             return req.future.result(timeout=self._timeout)
         except concurrent.futures.TimeoutError:
             self.last_error = f"MCP [{self.name}] tool '{tool_name}' timeout"
+            logger.error(
+                "MCP [%s] tool '%s' timed out after %ds (connected=%s)",
+                self.name,
+                tool_name,
+                self._timeout,
+                self.connected,
+            )
             return _tool_outcome(error=self.last_error, success=False)
 
     def close(self) -> None:
@@ -353,13 +361,19 @@ class _SdkClientWrapper:
         if existing is None:
             self.needs_auth = True
             self.connected = False
+            logger.info("MCP [%s] no stored token; marking needs_auth", self.name)
         else:
             self.needs_auth = False
+            logger.info(
+                "MCP [%s] stored token found; connecting with existing token", self.name
+            )
 
     async def _run_session(self, read: Any, write: Any) -> None:
         """Enter ClientSession, discover tools, then process requests."""
         async with ClientSession(read, write) as session:
+            logger.debug("MCP [%s] session.initialize() start", self.name)
             await session.initialize()
+            logger.debug("MCP [%s] session.initialize() done", self.name)
             all_tools: list = []
             cursor: Optional[str] = None
             seen_cursors: set[str] = set()
@@ -389,6 +403,9 @@ class _SdkClientWrapper:
                     )
                 seen_cursors.add(cursor)
             self._tools = _sdk_tools_to_registry(self.name, all_tools)
+            logger.debug(
+                "MCP [%s] list_tools: %d tools discovered", self.name, len(all_tools)
+            )
             self._ready_future.set_result(True)
             try:
                 while True:
@@ -894,6 +911,7 @@ class MCPManager:
         (discovery → redirect_handler → callback_handler → token exchange →
         set_tokens → retry) as a side effect of the HTTP request hitting a 401.
         """
+        logger.info("MCP [%s] interactive OAuth flow starting", name)
         cb_server = mcp_oauth.CallbackServer(
             port=oauth_cfg.get("callback_port", 8000),
             bind=oauth_cfg.get("callback_bind", "0.0.0.0"),
@@ -954,11 +972,20 @@ class MCPManager:
 
                 # Session is ready — the SDK has completed the OAuth flow and
                 # persisted tokens via storage.set_tokens().
+                logger.info("MCP [%s] session ready; verifying token storage", name)
                 if wrapper.needs_auth:
                     return {
                         "success": False,
                         "error": "Server still needs auth after flow",
                     }
+
+                token_file = self._mcp_tokens_dir / f"{name}.json"
+                if not token_file.exists():
+                    logger.warning(
+                        "MCP [%s] OAuth flow returned success but no token file found — "
+                        "redirect_handler may not have fired (server may allow unauthenticated discovery)",
+                        name,
+                    )
 
                 wrapper.connected = True
                 # Hand off the session task to the wrapper so it owns its

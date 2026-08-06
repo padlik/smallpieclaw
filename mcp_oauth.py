@@ -87,10 +87,11 @@ class FileTokenStorage:
         """Read stored OAuth tokens, or ``None`` if no file exists."""
         data = self._read_file()
         if data is None:
+            logger.debug("MCP [%s] token: no file on disk", self.server_name)
             return None
         token_data = data.get("token") or data
         try:
-            return OAuthToken(
+            token = OAuthToken(
                 access_token=token_data["access_token"],
                 token_type=token_data.get("token_type", "Bearer"),
                 expires_in=token_data.get("expires_in"),
@@ -105,6 +106,26 @@ class FileTokenStorage:
             )
             return None
 
+        has_refresh = token.refresh_token is not None
+        scope = token.scope or "unknown"
+        remaining: int | str = "unknown"
+        issued_at = token_data.get("issued_at")
+        if token.expires_in is not None and issued_at is not None:
+            try:
+                remaining = int(issued_at + token.expires_in - time.time())
+            except (TypeError, ValueError, OverflowError):
+                # Diagnostic only — a corrupt ``issued_at`` (wrong type, inf, nan)
+                # must never prevent an otherwise valid token from loading.
+                remaining = "unknown"
+        logger.debug(
+            "MCP [%s] token: found (scope=%s, has_refresh=%s, remaining=%s)",
+            self.server_name,
+            scope,
+            has_refresh,
+            remaining,
+        )
+        return token
+
     async def set_tokens(self, tokens: OAuthToken) -> None:
         """Persist ``tokens`` to disk, preserving any existing ``client_info``."""
         existing = self._read_file() or {}
@@ -116,6 +137,14 @@ class FileTokenStorage:
         if "client_info" in existing:
             payload["client_info"] = existing["client_info"]
         self._atomic_write(payload)
+        has_refresh = tokens.refresh_token is not None
+        scope = tokens.scope or "unknown"
+        logger.info(
+            "MCP [%s] tokens written to disk (scope=%s, has_refresh=%s)",
+            self.server_name,
+            scope,
+            has_refresh,
+        )
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         """Return OAuth client information.
@@ -139,12 +168,14 @@ class FileTokenStorage:
                 )
             else:
                 if cached.client_secret == self.client_secret:
+                    logger.debug("MCP [%s] client_info: using cached", self.server_name)
                     return cached
                 logger.info(
                     "MCP client_secret for %s changed in config; "
                     "ignoring cached client_info",
                     self.server_name,
                 )
+        logger.debug("MCP [%s] client_info: using pre-seeded credentials", self.server_name)
         return OAuthClientInformationFull(
             client_id=self.client_id,
             client_secret=self.client_secret,
@@ -216,6 +247,7 @@ class CallbackServer:
                 port=self.port,
                 ssl=ssl_context,
             )
+            logger.info("MCP OAuth callback server started on %s:%d", self.bind, self.port)
         except OSError as exc:
             raise OSError(
                 f"Cannot start OAuth callback server on {self.bind}:{self.port}: {exc}"
@@ -237,6 +269,7 @@ class CallbackServer:
 
             parts = request_line.decode("utf-8", errors="replace").split()
             if len(parts) < 2 or "?" not in parts[1]:
+                logger.debug("OAuth callback handler error: malformed request")
                 writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nMalformed request")
                 await writer.drain()
                 return
@@ -249,6 +282,7 @@ class CallbackServer:
             state = params.get("state", [None])[0]
 
             if code is None:
+                logger.debug("OAuth callback handler error: missing code")
                 writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nMissing code")
                 await writer.drain()
                 return
@@ -257,8 +291,10 @@ class CallbackServer:
             # internally via ``secrets.compare_digest``; this early-reject avoids
             # resolving the future with a bad code.  When ``expected_state`` is
             # set, the incoming state MUST match — a missing state is rejected.
-            if self.expected_state is not None:
+            validated_state = self.expected_state is not None
+            if validated_state:
                 if state is None or not secrets.compare_digest(self.expected_state, state):
+                    logger.debug("OAuth callback handler error: state mismatch")
                     writer.write(
                         b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nState mismatch"
                     )
@@ -267,6 +303,12 @@ class CallbackServer:
 
             if not self._future.done():
                 self._future.set_result((code, state))
+            # A mismatch returns above, so reaching here means state either
+            # matched or was never validated — there is no "no" case to report.
+            logger.info(
+                "MCP OAuth callback received (code=yes, state_match=%s)",
+                "yes" if validated_state else "n/a",
+            )
 
             body = "Auth complete, close this tab"
             response = (
@@ -343,7 +385,10 @@ class OAuthProviderFactory:
             client_secret=oauth_cfg["client_secret"],
         )
 
-        redirect_handler = make_redirect_handler(tg_iface, name, cb_server, chat_id=chat_id)
+        trace = oauth_cfg.get("trace", False)
+        redirect_handler = make_redirect_handler(
+            tg_iface, name, cb_server, chat_id=chat_id, trace=trace
+        )
         callback_handler = make_callback_handler(cb_server)
 
         return OAuthClientProvider(
@@ -361,6 +406,7 @@ def make_redirect_handler(
     server_name: str,
     cb_server: CallbackServer,
     chat_id: int | None = None,
+    trace: bool = False,
 ) -> Callable[[str], Awaitable[None]]:
     """Return an async handler that forwards the auth URL to Telegram.
 
@@ -373,6 +419,8 @@ def make_redirect_handler(
         cb_server: Callback server that will receive the OAuth redirect.
         chat_id: Chat ID to send the authorization prompt to. Required when
             ``tg_iface`` is provided for interactive flows.
+        trace: When ``True``, log the full authorization URL at INFO. The
+            URL contains ``client_id`` and ``scope`` — diagnostic-only.
     """
     async def _handler(auth_url: str) -> None:
         # Lazily start the callback server here so a fallback full-redirect
@@ -388,6 +436,14 @@ def make_redirect_handler(
         state = params.get("state", [""])[0]
         if state:
             cb_server.set_expected_state(state)
+
+        logger.info(
+            "MCP [%s] redirect_handler called (state=%s...)",
+            server_name,
+            state[:8] if state else "",
+        )
+        if trace:
+            logger.info("MCP [%s] auth URL: %s", server_name, auth_url)
 
         if tg_iface is None or chat_id is None:
             logger.warning(
@@ -416,6 +472,11 @@ def make_redirect_handler(
                     chat_id=chat_id,
                     text=f"Authorize MCP server '{server_name}':",
                     reply_markup=markup,
+                )
+                logger.info(
+                    "MCP [%s] auth URL sent via Telegram (chat=%s)",
+                    server_name,
+                    chat_id,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to send OAuth redirect via Telegram: %s", exc)

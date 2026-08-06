@@ -458,6 +458,11 @@ class OAuthConfig:
     key_path: str
     callback_port: int = 8000
     callback_bind: str = "0.0.0.0"
+    # Diagnostic flag: when true, the full authorization URL (containing
+    # client_id, scope, state, code_challenge) is logged at INFO. Not for
+    # production use. Read at runtime from the raw ``oauth`` dict by
+    # ``OAuthProviderFactory.build``; this typed field is for validation only.
+    trace: bool = False
 
 
 @dataclass(frozen=True)
@@ -650,6 +655,7 @@ def _parse_oauth(entry: dict, server_name: str) -> OAuthConfig | None:
             oauth.get("callback_port"), 8000, f"{section}.callback_port"
         ),
         callback_bind=oauth.get("callback_bind", "0.0.0.0"),
+        trace=_parse_bool(oauth.get("trace", False), f"{section}.trace"),
     )
 
 
