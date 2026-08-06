@@ -369,3 +369,7 @@ log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups t
 # # Path to TLS certificate and private key (see prerequisites above)
 # cert_path           = "/path/to/cert.pem"
 # key_path            = "/path/to/key.pem"
+# # Diagnostic flag: when true, the full authorization URL (containing client_id,
+# # scope, state, code_challenge) is logged at INFO during the auth flow.
+# # Not for production use — enable only when diagnosing OAuth issues.
+# trace               = false

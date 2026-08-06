@@ -328,6 +328,9 @@ callback_bind = "0.0.0.0"          # or "127.0.0.1" for local-only
 # TLS certificate for HTTPS callback (self-signed or Let's Encrypt)
 cert_path     = "/path/to/cert.pem"
 key_path      = "/path/to/key.pem"
+# Diagnostic flag: logs the full authorization URL at INFO when true.
+# Not for production use — enable only when diagnosing OAuth issues.
+trace         = false
 ```
 
 **Setup steps:**
@@ -388,6 +391,7 @@ key_path      = "/path/to/key.pem"
 | "OAuth flow timed out" | Callback URL not reached within 300s | Check hostname resolution; verify port-forward; ensure HTTPS is working |
 | "401 Unauthorized" after auth | Tokens expired and refresh token invalid | Run `/mcp auth <name>` to re-authenticate |
 | "Token refresh failed" | Refresh token revoked or expired | Run `/mcp auth <name>` to re-authenticate; check scope permissions |
+| Auth reports success but tools stall | Server allows unauthenticated discovery; no token stored | Set `trace = true` in the `[mcp_servers.oauth]` block and re-run `/mcp auth <name>`; check logs for the "no token file found" warning |
 
 **Security best practices:**
 
