@@ -665,18 +665,16 @@ class TestProbePostRetry:
             "probe triggered OAuth handshake" in rec.message for rec in caplog.records
         )
 
-    def test_get_200_no_post_issued(
+    def test_get_200_post_200_no_oauth(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """GET 200 should short-circuit; no POST retry must be issued."""
+        """GET 200 → POST 200 should confirm the server did not require OAuth."""
         manager = MCPManager([], mcp_tokens_dir=tmp_path)
         requests_made: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests_made.append(request.method)
-            if request.method == "GET":
-                return httpx.Response(200, text="ok")
-            raise AssertionError("POST should not be issued when GET returns 200")
+            return httpx.Response(200, text="ok")
 
         self._fake_client(monkeypatch, handler)
         caplog.set_level(logging.INFO, logger="mcp_client")
@@ -690,7 +688,10 @@ class TestProbePostRetry:
         assert saw is False
         assert status == 200
         assert error is None
-        assert requests_made == ["GET"]
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "server did not require OAuth" in rec.message for rec in caplog.records
+        )
 
     def test_get_401_no_post_issued(
         self, tmp_path: Path, monkeypatch, caplog
@@ -718,6 +719,131 @@ class TestProbePostRetry:
         assert status == 401
         assert error is None
         assert requests_made == ["GET"]
+
+    def test_get_401_auth_retry_200_no_post_issued(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 401 → auth flow retries GET with token → 200: no POST should be issued.
+
+        The ``not probe_saw_auth_challenge`` guard prevents a spurious POST when
+        the GET already triggered the OAuth handshake and the SDK retried with a
+        Bearer token (final_status=200, flag=True).  Without this guard, the probe
+        would send an unnecessary POST after the OAuth flow already fired.
+        """
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        class _RetryAuthProvider(httpx.Auth):
+            """Simulates the SDK's async_auth_flow: on 401, add a Bearer token and retry."""
+
+            async def async_auth_flow(self, request):
+                response = yield request
+                if response.status_code == 401:
+                    request.headers["Authorization"] = "Bearer fake_token"
+                    yield request
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                if "Authorization" in request.headers:
+                    return httpx.Response(200, text="ok")
+                return httpx.Response(401, text="unauthorized")
+            raise AssertionError("POST should not be issued after GET auth retry")
+
+        original_async_client = httpx.AsyncClient
+
+        def _fake_client(**kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            # Use our retry auth provider instead of the passed-in mock
+            kwargs["auth"] = _RetryAuthProvider()
+            return original_async_client(**kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", _RetryAuthProvider(), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 200
+        assert error is None
+        # Only GET requests — no POST despite final_status=200
+        assert all(r == "GET" for r in requests_made)
+        assert len(requests_made) == 2  # original GET (401) + retry GET (200)
+
+    def test_get_200_post_401_triggers_oauth(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → POST 401 should fire the event hook and trigger OAuth.
+
+        This is the Gmail scenario: the server allows unauthenticated GET but
+        returns 401 on unauthenticated tools/call.
+        """
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            # Verify the POST body matches design D2 (JSON-RPC tools/call).
+            body = json.loads(request.content)
+            assert body["jsonrpc"] == "2.0"
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "_oauth_probe"
+            assert body["params"]["arguments"] == {}
+            assert "id" in body
+            # Verify the POST headers match design D3 (MCP streamable-http transport).
+            assert request.headers["Accept"] == "application/json, text/event-stream"
+            assert request.headers["Content-Type"] == "application/json"
+            assert request.headers["MCP-Protocol-Version"] == "2025-11-25"
+            return httpx.Response(401, text="unauthorized")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+        assert any(
+            "probe triggered OAuth handshake (status=401)" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_get_200_post_raises_no_stale_status(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → POST raises should report final_status=None, not the stale GET 200."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            raise httpx.ConnectError("post failed")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status is None
+        assert error is not None
+        assert "post failed" in error
+        assert any(
+            "OAuth probe failed" in rec.message for rec in caplog.records
+        )
 
     def test_get_405_post_raises_no_stale_status(
         self, tmp_path: Path, monkeypatch, caplog
@@ -816,3 +942,20 @@ class TestProbePostRetryFlow:
         assert any(
             "unexpected status 405" in rec.message for rec in caplog.records
         )
+
+    def test_get_200_post_401_oauth_fires_token_created(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """GET 200 → POST 401 should trigger OAuth and create the token file."""
+        _patch_callback_server(monkeypatch)
+        _patch_provider_factory(monkeypatch)
+        _patch_probe(monkeypatch, saw_challenge=True, final_status=401)
+        _patch_session_runner(monkeypatch, tmp_path, needs_auth=False, write_token=True)
+
+        cfg, oauth_cfg = _base_cfg(tmp_path)
+        manager = MCPManager([cfg], mcp_tokens_dir=tmp_path)
+
+        result = _run_flow(manager, cfg, oauth_cfg)
+
+        assert result == {"success": True}
+        assert (tmp_path / "srv.json").exists()
