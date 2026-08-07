@@ -4,6 +4,8 @@ The system SHALL support OAuth 2.0 authorization-code + PKCE authentication for 
 
 The system SHALL proactively trigger the SDK's authorization handshake by making a standalone HTTP probe request to the server URL with `auth=provider` before connecting the MCP session. This ensures the `redirect_handler` fires even for servers that allow unauthenticated MCP discovery (return 200 on `initialize`/`tools/list` without challenging with 401).
 
+The probe SHALL send an HTTP GET request first. If the server returns 405 Method Not Allowed on the GET probe, the system SHALL retry with an HTTP POST request containing a JSON-RPC 2.0 `tools/call` body to a dummy tool name, carrying the same `MCP-Protocol-Version` header plus `Accept` and `Content-Type` headers matching the MCP streamable-http transport. This ensures the OAuth handshake fires for MCP servers that only accept POST on their streamable-http endpoint (e.g. Gmail's MCP server).
+
 #### Scenario: Successful OAuth flow for a new server
 
 - **GIVEN** an HTTP-transport MCP server is configured with an `oauth` section (client_id, client_secret, redirect_uri, scope, cert_path, key_path) and has no stored token
@@ -35,6 +37,33 @@ The system SHALL proactively trigger the SDK's authorization handshake by making
 - **THEN** the SDK's `async_auth_flow` does not enter the OAuth branch, `redirect_handler` is not called, and no authorization URL is sent to Telegram
 - **AND** the agent connects the MCP session normally without a token, the session becomes ready, and the agent logs at INFO that the server did not require OAuth on the probe
 - **AND** no "no token file found" warning is emitted, since the probe confirmed the server did not challenge
+
+#### Scenario: GET probe returns 405 — POST retry triggers OAuth for POST-only server
+
+- **GIVEN** an HTTP-transport MCP server is configured with an `oauth` section, has no stored token, and only accepts POST on its streamable-http endpoint (returns 405 Method Not Allowed on GET)
+- **WHEN** the operator runs `/mcp auth <name>` in Telegram
+- **THEN** the agent makes a proactive HTTP GET probe to the server URL with `auth=provider` and the `MCP-Protocol-Version` header
+- **AND** the server returns 405 on the GET probe
+- **AND** the agent retries with an HTTP POST request to the server URL containing a JSON-RPC 2.0 body with `method: "tools/call"`, `params: {"name": "_oauth_probe", "arguments": {}}`, a random UUID `id`, and `jsonrpc: "2.0"`, carrying `Accept: application/json, text/event-stream`, `Content-Type: application/json`, and `MCP-Protocol-Version` headers
+- **AND** the server's auth middleware returns 401 on the unauthenticated POST, triggering the SDK's `async_auth_flow`
+- **AND** the SDK calls `redirect_handler`, which posts the authorization URL to Telegram as an inline button
+- **AND** the operator completes browser authorization, the callback is received, the token is exchanged and stored, and the MCP session connects with the Bearer token
+- **AND** the probe logs reflect the final POST status, not the intermediate GET 405
+
+#### Scenario: GET probe returns 405, POST probe returns 200 — server does not require OAuth
+
+- **GIVEN** an HTTP-transport MCP server is configured with an `oauth` section, returns 405 on GET, and returns 200 on unauthenticated POST `tools/call` (allows unauthenticated tool calls)
+- **WHEN** the agent makes the GET probe and retries with the POST probe
+- **THEN** the SDK's `async_auth_flow` does not enter the OAuth branch on the POST response, `redirect_handler` is not called, and no authorization URL is sent to Telegram
+- **AND** the agent connects the MCP session normally without a token, the session becomes ready, and the agent logs at INFO that the server did not require OAuth on the probe
+- **AND** no "no token file found" warning is emitted
+
+#### Scenario: GET probe returns 405, POST probe returns 405 — session fallback
+
+- **GIVEN** an HTTP-transport MCP server returns 405 on both GET and POST on its MCP endpoint
+- **WHEN** the agent makes the GET probe, retries with the POST probe, and the POST also returns 405
+- **THEN** the agent logs a WARNING for the unexpected POST status and proceeds to session connection as a fallback
+- **AND** the session's `initialize` may still trigger a 401 that the SDK's auth flow handles as a last resort
 
 #### Scenario: OAuth flow fired but did not complete
 

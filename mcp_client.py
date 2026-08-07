@@ -53,6 +53,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -80,6 +81,20 @@ _MAX_TOOLS = 500
 # The SDK reads this to decide whether to include the RFC 8707 resource param.
 # Update this single value when the SDK bumps the protocol version.
 _PROBE_MCP_PROTOCOL_VERSION = "2025-11-25"
+
+# POST probe constants (design D2/D3): when the GET probe returns 405, retry
+# with a JSON-RPC tools/call body to a dummy tool name.  The headers match the
+# SDK's streamable_http transport so the server routes the request through its
+# auth middleware.
+_PROBE_TOOL_NAME = "_oauth_probe"
+_PROBE_GET_HEADERS = {
+    "MCP-Protocol-Version": _PROBE_MCP_PROTOCOL_VERSION,
+}
+_PROBE_POST_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+    "MCP-Protocol-Version": _PROBE_MCP_PROTOCOL_VERSION,
+}
 
 _VALID_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 _MAX_DESCRIPTION_LEN = 2048
@@ -922,6 +937,13 @@ class MCPManager:
         response event hook records whether any 401/403 was observed, since the
         returned response is the post-retry result and its status is not 401.
 
+        If the GET probe returns 405 Method Not Allowed (POST-only servers
+        like Gmail), a POST retry is issued with a JSON-RPC ``tools/call`` body
+        to a dummy tool name, carrying MCP streamable-http transport headers.
+        The POST uses the same client (auth + event hooks) so a 401 on the POST
+        fires the OAuth handshake the same way.  ``final_status`` is updated
+        to the POST response status before the logging block runs.
+
         Exceptions are caught internally so that ``probe_saw_auth_challenge``
         survives even when the OAuth flow fires (event hook sees 401) but then
         fails (e.g. callback timeout, discovery error).  The caller uses the
@@ -959,12 +981,31 @@ class MCPManager:
                 auth=provider,
                 timeout=timeout,
                 event_hooks={"response": [_on_response]},
+                follow_redirects=False,
             ) as client:
                 response = await client.get(
                     server_url,
-                    headers={"MCP-Protocol-Version": _PROBE_MCP_PROTOCOL_VERSION},
+                    headers=_PROBE_GET_HEADERS,
                 )
                 final_status = response.status_code
+                # GET→405→POST retry (design D1): POST-only MCP servers (e.g.
+                # Gmail) return 405 on GET.  Retry with a JSON-RPC tools/call
+                # body so the server's auth middleware returns 401, firing the
+                # SDK's async_auth_flow via the event hook.
+                if final_status == 405:
+                    final_status = None
+                    post_body = {
+                        "jsonrpc": "2.0",
+                        "id": str(uuid.uuid4()),
+                        "method": "tools/call",
+                        "params": {"name": _PROBE_TOOL_NAME, "arguments": {}},
+                    }
+                    post_response = await client.post(
+                        server_url,
+                        json=post_body,
+                        headers=_PROBE_POST_HEADERS,
+                    )
+                    final_status = post_response.status_code
         except Exception as exc:
             error = str(exc)
             if probe_saw_auth_challenge:
@@ -986,11 +1027,13 @@ class MCPManager:
             logger.info(
                 "MCP [%s] probe triggered OAuth handshake (status=%s)", name, final_status
             )
+        elif final_status == 200:
+            logger.info(
+                "MCP [%s] probe returned 200 — server did not require OAuth", name
+            )
         else:
             logger.info(
-                "MCP [%s] probe returned %s — server did not require OAuth",
-                name,
-                final_status,
+                "MCP [%s] probe returned %s", name, final_status
             )
         return probe_saw_auth_challenge, final_status, error
 
