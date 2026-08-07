@@ -74,7 +74,11 @@ class TestPostFlowTokenVerification:
     def test_run_oauth_flow_warns_when_no_token_file(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """`_run_oauth_flow` must warn if it reports success but wrote no token file."""
+        """`_run_oauth_flow` must warn if it reports success but wrote no token file.
+
+        The probe saw an auth challenge (401) so the warning is appropriate —
+        the OAuth flow was attempted but no token was stored.
+        """
 
         async def fake_start(self) -> None:
             return None
@@ -87,6 +91,11 @@ class TestPostFlowTokenVerification:
         monkeypatch.setattr(
             mcp_oauth.OAuthProviderFactory, "build", lambda *a, **k: object()
         )
+
+        async def fake_probe(self, name, server_url, provider, oauth_cfg):  # noqa: ARG001
+            return (True, 401, None)
+
+        monkeypatch.setattr(MCPManager, "_probe_oauth_challenge", fake_probe)
 
         async def fake_session_runner(self) -> None:
             self.needs_auth = False
@@ -134,6 +143,11 @@ class TestPostFlowTokenVerification:
             mcp_oauth.OAuthProviderFactory, "build", lambda *a, **k: object()
         )
 
+        async def fake_probe(self, name, server_url, provider, oauth_cfg):  # noqa: ARG001
+            return (True, 401, None)
+
+        monkeypatch.setattr(MCPManager, "_probe_oauth_challenge", fake_probe)
+
         async def fake_session_runner(self) -> None:
             self.needs_auth = False
             self._tools = []
@@ -161,6 +175,66 @@ class TestPostFlowTokenVerification:
         assert result == {"success": True}
         assert not any(
             "no token file found" in rec.message for rec in caplog.records
+        )
+
+    def test_run_oauth_flow_no_warning_when_probe_saw_no_auth_challenge(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """No WARNING should fire when the probe returned 200 (no auth challenge).
+
+        The server did not require OAuth on the probe, so no token file is
+        expected.  An INFO log should be emitted instead of a WARNING.
+        """
+
+        async def fake_start(self) -> None:
+            return None
+
+        async def fake_stop(self) -> None:
+            return None
+
+        monkeypatch.setattr(CallbackServer, "start", fake_start)
+        monkeypatch.setattr(CallbackServer, "stop", fake_stop)
+        monkeypatch.setattr(
+            mcp_oauth.OAuthProviderFactory, "build", lambda *a, **k: object()
+        )
+
+        async def fake_probe(self, name, server_url, provider, oauth_cfg):  # noqa: ARG001
+            return (False, 200, None)
+
+        monkeypatch.setattr(MCPManager, "_probe_oauth_challenge", fake_probe)
+
+        async def fake_session_runner(self) -> None:
+            self.needs_auth = False
+            self._tools = []
+            self._ready_future.set_result(True)
+
+        monkeypatch.setattr(_SdkClientWrapper, "_session_runner", fake_session_runner)
+
+        cfg = {"name": "srv", "transport": "http", "url": "https://example.com"}
+        oauth_cfg = {
+            "callback_port": 0,
+            "callback_bind": "127.0.0.1",
+            "cert_path": "unused",
+            "key_path": "unused",
+        }
+        manager = MCPManager([cfg], mcp_tokens_dir=tmp_path)
+
+        async def _run() -> dict:
+            manager._loop = asyncio.get_running_loop()
+            return await manager._run_oauth_flow("srv", cfg, oauth_cfg)
+
+        caplog.set_level(logging.INFO, logger="mcp_client")
+        result = asyncio.run(_run())
+
+        assert result == {"success": True}
+        assert not (tmp_path / "srv.json").exists()
+        # No WARNING about "no token file found"
+        assert not any(
+            "no token file found" in rec.message for rec in caplog.records
+        )
+        # INFO log about server not requiring OAuth
+        assert any(
+            "did not require OAuth" in rec.message for rec in caplog.records
         )
 
 
