@@ -68,12 +68,18 @@ from mcp.client.sse import sse_client
 from mcp.types import CallToolResult
 
 import mcp_oauth
+import httpx
 from tool_registry import Tool
 
 logger = logging.getLogger(__name__)
 
 _MAX_TOOL_PAGES = 50
 _MAX_TOOLS = 500
+
+# MCP protocol version sent on the proactive OAuth probe (design D3).
+# The SDK reads this to decide whether to include the RFC 8707 resource param.
+# Update this single value when the SDK bumps the protocol version.
+_PROBE_MCP_PROTOCOL_VERSION = "2025-11-25"
 
 _VALID_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 _MAX_DESCRIPTION_LEN = 2048
@@ -904,6 +910,200 @@ class MCPManager:
         while not self._oauth_cancel_requested:
             await asyncio.sleep(0.5)
 
+    async def _probe_oauth_challenge(
+        self, name: str, server_url: str, provider: httpx.Auth, oauth_cfg: dict
+    ) -> tuple[bool, int | None, str | None]:
+        """Proactively trigger the SDK's OAuth handshake via a standalone HTTP probe.
+
+        Makes a GET request to ``server_url`` with ``auth=provider``.  If the
+        server returns 401 or 403, the SDK's ``async_auth_flow`` fires the full
+        handshake (discovery → registration → redirect_handler →
+        callback_handler → token exchange → set_tokens → retry).  An httpx
+        response event hook records whether any 401/403 was observed, since the
+        returned response is the post-retry result and its status is not 401.
+
+        Exceptions are caught internally so that ``probe_saw_auth_challenge``
+        survives even when the OAuth flow fires (event hook sees 401) but then
+        fails (e.g. callback timeout, discovery error).  The caller uses the
+        flag to decide whether to suppress the session-connection fallback.
+
+        Args:
+            name: Server name (for logging).
+            server_url: MCP server URL to probe.
+            provider: The ``OAuthClientProvider`` (an ``httpx.Auth`` subclass).
+            oauth_cfg: OAuth config dict (for the timeout).
+
+        Returns:
+            A tuple ``(probe_saw_auth_challenge, final_status, error)`` where
+            ``probe_saw_auth_challenge`` is True if a 401 or 403 was observed by
+            the event hook (even if the flow subsequently failed),
+            ``final_status`` is the HTTP status code of the final response (or
+            None if the request failed before a response), and ``error`` is a
+            string describing the failure (or None on success).
+        """
+        probe_saw_auth_challenge = False
+        final_status: int | None = None
+        error: str | None = None
+
+        async def _on_response(response: httpx.Response) -> None:
+            nonlocal probe_saw_auth_challenge
+            if response.status_code in (401, 403):
+                probe_saw_auth_challenge = True
+
+        timeout = oauth_cfg.get("timeout", 300)
+        logger.info(
+            "MCP [%s] proactive OAuth probe starting (url=%s)", name, server_url
+        )
+        try:
+            async with httpx.AsyncClient(
+                auth=provider,
+                timeout=timeout,
+                event_hooks={"response": [_on_response]},
+            ) as client:
+                response = await client.get(
+                    server_url,
+                    headers={"MCP-Protocol-Version": _PROBE_MCP_PROTOCOL_VERSION},
+                )
+                final_status = response.status_code
+        except Exception as exc:
+            error = str(exc)
+            if probe_saw_auth_challenge:
+                logger.warning(
+                    "MCP [%s] OAuth probe failed after auth challenge: %s",
+                    name,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "MCP [%s] OAuth probe failed: %s — proceeding to session "
+                    "connection as fallback",
+                    name,
+                    exc,
+                )
+            return probe_saw_auth_challenge, final_status, error
+
+        if probe_saw_auth_challenge:
+            logger.info(
+                "MCP [%s] probe triggered OAuth handshake (status=%s)", name, final_status
+            )
+        else:
+            logger.info(
+                "MCP [%s] probe returned %s — server did not require OAuth",
+                name,
+                final_status,
+            )
+        return probe_saw_auth_challenge, final_status, error
+
+    async def _run_probe_step(
+        self, name: str, cfg: dict, provider: httpx.Auth, oauth_cfg: dict
+    ) -> tuple[bool, bool, dict | None]:
+        """Run the proactive OAuth probe, racing it against operator cancel.
+
+        Creates the probe task and the cancel watcher, then races them with
+        ``asyncio.wait(FIRST_COMPLETED)``.  Handles all probe outcomes:
+
+        - Cancel wins → returns ``(True, False, cancel_result)``.
+        - Probe saw auth challenge but failed → returns
+          ``(False, True, error_result)`` — caller should NOT fall back to
+          session connection (Rec 2: double auth-link prevention).
+        - Probe failed without auth challenge → logs WARNING, returns
+          ``(False, False, None)`` — caller should fall back to session.
+        - Probe succeeded with unexpected non-200 status → logs WARNING,
+          returns ``(False, saw_challenge, None)`` — caller falls back.
+        - Probe succeeded normally → returns ``(False, saw_challenge, None)``.
+
+        Args:
+            name: Server name (for logging).
+            cfg: Server config dict (must contain ``url``).
+            provider: The ``OAuthClientProvider`` (an ``httpx.Auth`` subclass).
+            oauth_cfg: OAuth config dict.
+
+        Returns:
+            ``(cancelled, probe_saw_auth_challenge, error_result)`` where
+            ``error_result`` is a failure dict the caller should return
+            directly, or None to proceed to session connection.
+        """
+        probe_task = asyncio.create_task(
+            self._probe_oauth_challenge(name, cfg["url"], provider, oauth_cfg)
+        )
+        cancel_task = asyncio.create_task(self._watch_cancel())
+
+        done, pending = await asyncio.wait(
+            {probe_task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if cancel_task in done and self._oauth_cancel_requested:
+            probe_task.cancel()
+            await asyncio.gather(probe_task, return_exceptions=True)
+            return True, False, {"success": False, "error": "Cancelled by operator"}
+
+        probe_saw_auth_challenge = False
+
+        if probe_task in done:
+            exc = probe_task.exception()
+            if exc is not None:
+                logger.warning(
+                    "MCP [%s] OAuth probe task error: %s — proceeding to "
+                    "session connection as fallback",
+                    name,
+                    exc,
+                )
+            else:
+                probe_saw_auth_challenge, final_status, probe_error = (
+                    probe_task.result()
+                )
+                if probe_error is not None:
+                    if probe_saw_auth_challenge:
+                        logger.warning(
+                            "MCP [%s] OAuth probe failed after auth "
+                            "challenge: %s",
+                            name,
+                            probe_error,
+                        )
+                        for t in pending:
+                            t.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        return (
+                            False,
+                            True,
+                            {
+                                "success": False,
+                                "error": f"OAuth probe failed after auth challenge: {probe_error}",
+                            },
+                        )
+                    logger.warning(
+                        "MCP [%s] OAuth probe failed: %s — proceeding to "
+                        "session connection as fallback",
+                        name,
+                        probe_error,
+                    )
+                    if final_status is not None and final_status != 200:
+                        logger.warning(
+                            "MCP [%s] probe returned unexpected status %s — "
+                            "proceeding to session connection as fallback",
+                            name,
+                            final_status,
+                        )
+                else:
+                    if (
+                        not probe_saw_auth_challenge
+                        and final_status is not None
+                        and final_status != 200
+                    ):
+                        logger.warning(
+                            "MCP [%s] probe returned unexpected status %s — "
+                            "proceeding to session connection as fallback",
+                            name,
+                            final_status,
+                        )
+
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        return False, probe_saw_auth_challenge, None
+
     async def _run_oauth_flow(self, name: str, cfg: dict, oauth_cfg: dict) -> dict:
         """Run the interactive OAuth flow by connecting a real session with auth=provider.
 
@@ -931,6 +1131,20 @@ class MCPManager:
                 chat_id=self._oauth_chat_id,
             )
 
+            # --- Proactive OAuth probe (D1) ---
+            # Race the probe against operator cancel.  The helper handles all
+            # probe outcomes (cancel, auth-challenge failure, unexpected status,
+            # success) and returns (cancelled, saw_challenge, error_result).
+            cancelled, probe_saw_auth_challenge, error_result = (
+                await self._run_probe_step(name, cfg, provider, oauth_cfg)
+            )
+            if cancelled or error_result is not None:
+                return error_result or {
+                    "success": False,
+                    "error": "Cancelled by operator",
+                }
+
+            # --- Session connection ---
             # Create a wrapper that will connect with the OAuth provider.
             # The SDK's async_auth_flow fires when session.initialize() hits a 401,
             # driving the full handshake: redirect → callback → token exchange →
@@ -981,11 +1195,26 @@ class MCPManager:
 
                 token_file = self._mcp_tokens_dir / f"{name}.json"
                 if not token_file.exists():
-                    logger.warning(
-                        "MCP [%s] OAuth flow returned success but no token file found — "
-                        "redirect_handler may not have fired (server may allow unauthenticated discovery)",
-                        name,
-                    )
+                    if probe_saw_auth_challenge:
+                        # Probe saw a 401/403 (OAuth flow was attempted) but no
+                        # token file was created — redirect_handler failed or
+                        # callback timed out.  This is a genuine error.
+                        logger.warning(
+                            "MCP [%s] OAuth flow returned success but no token file found — "
+                            "redirect_handler may not have fired. "
+                            "Retry `/mcp auth %s`.",
+                            name,
+                            name,
+                        )
+                    else:
+                        # Probe did not see an auth challenge — the server did
+                        # not require OAuth on the probe.  No token file is
+                        # expected; the session connects without a token.
+                        logger.info(
+                            "MCP [%s] server did not require OAuth on probe; "
+                            "connecting without token",
+                            name,
+                        )
 
                 wrapper.connected = True
                 # Hand off the session task to the wrapper so it owns its
