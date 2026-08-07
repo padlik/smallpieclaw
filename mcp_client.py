@@ -988,11 +988,13 @@ class MCPManager:
                     headers=_PROBE_GET_HEADERS,
                 )
                 final_status = response.status_code
-                # GET→405→POST retry (design D1): POST-only MCP servers (e.g.
-                # Gmail) return 405 on GET.  Retry with a JSON-RPC tools/call
-                # body so the server's auth middleware returns 401, firing the
-                # SDK's async_auth_flow via the event hook.
-                if final_status == 405:
+                # POST probe retry: when the GET probe returns 200 or 405
+                # without an auth challenge, retry with a JSON-RPC tools/call
+                # body.  Some MCP servers (e.g. Gmail) return 200 on
+                # unauthenticated GET but 401 on unauthenticated tools/call —
+                # the POST probe triggers the 401 that fires the SDK's
+                # async_auth_flow via the event hook.
+                if not probe_saw_auth_challenge and final_status in (200, 405):
                     final_status = None
                     post_body = {
                         "jsonrpc": "2.0",

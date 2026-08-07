@@ -4,7 +4,7 @@ The system SHALL support OAuth 2.0 authorization-code + PKCE authentication for 
 
 The system SHALL proactively trigger the SDK's authorization handshake by making a standalone HTTP probe request to the server URL with `auth=provider` before connecting the MCP session. This ensures the `redirect_handler` fires even for servers that allow unauthenticated MCP discovery (return 200 on `initialize`/`tools/list` without challenging with 401).
 
-The probe SHALL send an HTTP GET request first. If the server returns 405 Method Not Allowed on the GET probe, the system SHALL retry with an HTTP POST request containing a JSON-RPC 2.0 `tools/call` body to a dummy tool name, carrying the same `MCP-Protocol-Version` header plus `Accept` and `Content-Type` headers matching the MCP streamable-http transport. This ensures the OAuth handshake fires for MCP servers that only accept POST on their streamable-http endpoint (e.g. Gmail's MCP server).
+The probe SHALL send an HTTP GET request first. If the server returns 200 or 405 on the GET probe without an auth challenge (401/403), the system SHALL retry with an HTTP POST request containing a JSON-RPC 2.0 `tools/call` body to a dummy tool name, carrying the same `MCP-Protocol-Version` header plus `Accept` and `Content-Type` headers matching the MCP streamable-http transport. This ensures the OAuth handshake fires for MCP servers that allow unauthenticated GET (e.g. Gmail, which returns 200 on GET but 401 on unauthenticated `tools/call`) or only accept POST on their streamable-http endpoint (return 405 on GET).
 
 #### Scenario: Successful OAuth flow for a new server
 
@@ -30,13 +30,25 @@ The probe SHALL send an HTTP GET request first. If the server returns 405 Method
 - **AND** the SDK calls `redirect_handler`, which posts the authorization URL to Telegram as an inline button
 - **AND** the operator completes browser authorization, the callback is received, the token is exchanged and stored, and the MCP session connects with the Bearer token
 
-#### Scenario: Proactive probe returns 200 — server does not require OAuth
+#### Scenario: Proactive probe returns 200 on both GET and POST — server does not require OAuth
 
-- **GIVEN** an HTTP-transport MCP server is configured with an `oauth` section but the server returns 200 on the unauthenticated probe (does not challenge with 401 or 403)
+- **GIVEN** an HTTP-transport MCP server is configured with an `oauth` section but the server returns 200 on both the unauthenticated GET probe and the unauthenticated POST `tools/call` probe (does not challenge with 401 or 403)
 - **WHEN** the agent makes the proactive HTTP probe
 - **THEN** the SDK's `async_auth_flow` does not enter the OAuth branch, `redirect_handler` is not called, and no authorization URL is sent to Telegram
 - **AND** the agent connects the MCP session normally without a token, the session becomes ready, and the agent logs at INFO that the server did not require OAuth on the probe
 - **AND** no "no token file found" warning is emitted, since the probe confirmed the server did not challenge
+
+#### Scenario: GET probe returns 200, POST probe returns 401 — server requires OAuth for tool calls
+
+- **GIVEN** an HTTP-transport MCP server is configured with an `oauth` section, has no stored token, and returns 200 on unauthenticated GET but 401 on unauthenticated POST `tools/call` (e.g. Gmail's MCP server)
+- **WHEN** the operator runs `/mcp auth <name>` in Telegram
+- **THEN** the agent makes a proactive HTTP GET probe to the server URL with `auth=provider` and the `MCP-Protocol-Version` header
+- **AND** the server returns 200 on the GET probe
+- **AND** the agent retries with an HTTP POST request to the server URL containing a JSON-RPC 2.0 body with `method: "tools/call"`, `params: {"name": "_oauth_probe", "arguments": {}}`, a random UUID `id`, and `jsonrpc: "2.0"`, carrying `Accept: application/json, text/event-stream`, `Content-Type: application/json`, and `MCP-Protocol-Version` headers
+- **AND** the server's auth middleware returns 401 on the unauthenticated POST, triggering the SDK's `async_auth_flow`
+- **AND** the SDK calls `redirect_handler`, which posts the authorization URL to Telegram as an inline button
+- **AND** the operator completes browser authorization, the callback is received, the token is exchanged and stored, and the MCP session connects with the Bearer token
+- **AND** the probe logs reflect the final POST status, not the intermediate GET 200
 
 #### Scenario: GET probe returns 405 — POST retry triggers OAuth for POST-only server
 
