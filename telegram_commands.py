@@ -773,12 +773,27 @@ async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
             await update.effective_message.reply_text(
                 "Usage: <code>/mcp auth &lt;name&gt;</code> | "
                 "<code>/mcp auth status</code> | "
+                "<code>/mcp auth cancel</code> | "
                 "<code>/mcp auth revoke &lt;name&gt;</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
         if name.lower() == "status":
             await _mcp_auth_status(iface, update, ctx)
+            return
+        if name.lower() == "cancel":
+            result = iface.mcp_manager.cancel_oauth_flow()
+            if result.get("success"):
+                await update.effective_message.reply_text(
+                    "🛑 OAuth flow cancellation requested. "
+                    "The flow will abort shortly.",
+                )
+            else:
+                error = result.get("error", "Unable to cancel")
+                await update.effective_message.reply_text(
+                    f"❌ {html.escape(error)}",
+                    parse_mode=ParseMode.HTML,
+                )
             return
         if name.lower() == "revoke":
             revoke_name = args[2] if len(args) > 2 else ""
@@ -789,6 +804,14 @@ async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
                 )
                 return
             await _mcp_auth_revoke(iface, update, ctx, revoke_name)
+            return
+
+        # Quick validation before promising the user anything.
+        if not iface.mcp_manager.server_has_oauth(name):
+            await update.effective_message.reply_text(
+                f"❌ Server <code>{html.escape(name)}</code> not found or has no OAuth configuration.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         timeout = iface.mcp_manager.get_oauth_timeout(name)

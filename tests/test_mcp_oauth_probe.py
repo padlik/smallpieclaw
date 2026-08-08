@@ -17,6 +17,7 @@ Covers the scenarios from the ``proactive-oauth-401-probe`` change:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 from pathlib import Path
@@ -309,7 +310,14 @@ class TestProbeAuthChallengeButNoToken:
         caplog.set_level(logging.WARNING, logger="mcp_client")
         result = _run_flow(manager, cfg, oauth_cfg)
 
-        assert result == {"success": True}
+        assert result == {
+            "success": False,
+            "error": (
+                "OAuth flow completed but no token was stored — "
+                "the authorization link may not have been delivered. "
+                "Retry /mcp auth srv."
+            ),
+        }
         assert not (tmp_path / "srv.json").exists()
         # WARNING about "no token file found" — probe saw auth challenge
         assert any(
@@ -486,7 +494,11 @@ class TestProbeAuthUrlSentViaTelegram:
 
         class _TgIface:
             def __init__(self):
-                self.send_oauth_prompt = MagicMock()
+                # send_oauth_prompt must return a concurrent.futures.Future
+                # because the redirect handler now awaits it.
+                future = concurrent.futures.Future()
+                future.set_result(None)
+                self.send_oauth_prompt = MagicMock(return_value=future)
 
         tg_iface = _TgIface()
 

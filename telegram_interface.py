@@ -18,6 +18,7 @@ import re
 import secrets
 import time
 from functools import partial
+from concurrent.futures import Future
 from typing import Callable, Optional
 
 import httpx
@@ -189,7 +190,7 @@ class TelegramInterface:
 
     def send_oauth_prompt(
         self, chat_id: int, server_name: str, auth_url: str, timeout: int = 300
-    ) -> None:
+    ) -> Optional[Future]:
         """Send an OAuth authorize/cancel prompt to the operator.
 
         Thread-safe — marshals onto the Telegram event loop via
@@ -201,6 +202,11 @@ class TelegramInterface:
             server_name: Human-readable MCP server name for the prompt text.
             auth_url: Full OAuth authorization URL for the Authorize button.
             timeout: OAuth flow timeout in seconds, surfaced in the prompt text.
+
+        Returns:
+            A ``concurrent.futures.Future`` representing the in-flight
+            send_message call, or ``None`` if the prompt could not be
+            scheduled (app not built or loop not running).
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -211,7 +217,7 @@ class TelegramInterface:
                 server_name,
                 auth_url,
             )
-            return
+            return None
 
         timeout_str = f"{timeout // 60} min" if timeout >= 60 else f"{timeout} sec"
 
@@ -246,10 +252,11 @@ class TelegramInterface:
                     chat_id,
                     exc,
                 )
+                raise
 
         loop = self._loop
         if loop and loop.is_running():
-            asyncio.run_coroutine_threadsafe(_send(), loop)
+            return asyncio.run_coroutine_threadsafe(_send(), loop)
         else:
             logger.warning(
                 "send_oauth_prompt: Telegram loop not running; cannot send "
@@ -257,6 +264,7 @@ class TelegramInterface:
                 server_name,
                 auth_url,
             )
+            return None
 
     def run(self) -> None:
         """Start polling (blocking)."""
