@@ -47,6 +47,7 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import concurrent.futures
 import logging
@@ -82,11 +83,46 @@ _MAX_TOOLS = 500
 # Update this single value when the SDK bumps the protocol version.
 _PROBE_MCP_PROTOCOL_VERSION = "2025-11-25"
 
-# POST probe constants (design D2/D3): when the GET probe returns 405, retry
-# with a JSON-RPC tools/call body to a dummy tool name.  The headers match the
-# SDK's streamable_http transport so the server routes the request through its
+# Maximum response body size for the probe's tools/list request.  A
+# tools/list response is typically a few KB; cap at 1 MB as
+# defense-in-depth against a malicious or compromised server returning
+# a huge body to exhaust memory.
+_PROBE_MAX_RESPONSE_BYTES = 1_048_576
+
+# Tool name prefixes that suggest a mutating/side-effecting operation.
+# The probe prefers non-mutating tools to minimize risk if a server
+# executes before checking auth (defense-in-depth beyond the design's
+# accepted risk in design.md).
+_PROBE_MUTATING_TOOL_PREFIXES = (
+    "send_",
+    "delete_",
+    "write_",
+    "update_",
+    "create_",
+    "remove_",
+    "set_",
+    "put_",
+    "post_",
+    "add_",
+    "insert_",
+    "modify_",
+    "edit_",
+    "move_",
+    "rename_",
+    "clear_",
+    "reset_",
+    "upload_",
+    "submit_",
+    "execute_",
+    "run_",
+)
+
+# POST probe constants (design D2/D3): when the GET probe returns 200 or 405
+# without an auth challenge, issue a two-step discovery probe: POST
+# tools/list to discover real tool names, then POST tools/call with the
+# first real tool name and empty arguments.  The headers match the SDK's
+# streamable_http transport so the server routes the request through its
 # auth middleware.
-_PROBE_TOOL_NAME = "_oauth_probe"
 _PROBE_GET_HEADERS = {
     "MCP-Protocol-Version": _PROBE_MCP_PROTOCOL_VERSION,
 }
@@ -925,6 +961,88 @@ class MCPManager:
         while not self._oauth_cancel_requested:
             await asyncio.sleep(0.5)
 
+    @staticmethod
+    def _extract_first_tool_name(
+        list_response: httpx.Response,
+    ) -> str | None:
+        """Extract a safe tool name from a ``tools/list`` JSON-RPC response.
+
+        Handles both ``application/json`` (bare JSON-RPC body) and
+        ``text/event-stream`` (SSE-framed JSON-RPC) response framings.
+        Prefers the first non-mutating tool name (skips verbs like
+        ``send_``, ``delete_``, ``write_``) to minimize risk if a server
+        executes before checking auth.  Returns ``None`` if the response
+        is malformed, the tool list is empty, or all tools are mutating.
+
+        Args:
+            list_response: The HTTP response from the POST ``tools/list``.
+
+        Returns:
+            A non-mutating tool name, or ``None`` if no safe tool is found.
+        """
+        content_type = list_response.headers.get("content-type", "")
+        try:
+            if "text/event-stream" in content_type:
+                # SSE framing: split into events (blank-line delimited),
+                # parse each event's data: lines joined with \n per the
+                # SSE spec.  Return the first well-formed JSON-RPC frame.
+                text = list_response.text
+                if len(text) > _PROBE_MAX_RESPONSE_BYTES:
+                    return None
+                parsed: dict | None = None
+                for event_block in text.split("\n\n"):
+                    parts: list[str] = []
+                    for line in event_block.splitlines():
+                        if line.startswith("data:"):
+                            parts.append(line.removeprefix("data:").lstrip())
+                    if not parts:
+                        continue
+                    event_data = "\n".join(parts)
+                    try:
+                        candidate = json.loads(event_data)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    # Skip events without a result.tools list (e.g.
+                    # heartbeat/ping frames) — keep scanning for the
+                    # JSON-RPC frame that carries the tool list.
+                    if (
+                        isinstance(candidate, dict)
+                        and isinstance(candidate.get("result"), dict)
+                        and isinstance(
+                            candidate["result"].get("tools"), list
+                        )
+                    ):
+                        parsed = candidate
+                        break
+                if parsed is None:
+                    return None
+            else:
+                parsed = list_response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.debug("MCP probe tools/list parse error: %s", exc)
+            return None
+
+        if not isinstance(parsed, dict):
+            return None
+        result = parsed.get("result")
+        if not isinstance(result, dict):
+            return None
+        tools = result.get("tools")
+        if not isinstance(tools, list) or not tools:
+            return None
+        # Prefer the first non-mutating tool name (defense-in-depth
+        # against servers that execute before checking auth).
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if not name.startswith(_PROBE_MUTATING_TOOL_PREFIXES):
+                return name
+        # All tools are mutating or unnamed — skip tools/call
+        return None
+
     async def _probe_oauth_challenge(
         self, name: str, server_url: str, provider: httpx.Auth, oauth_cfg: dict
     ) -> tuple[bool, int | None, str | None]:
@@ -937,12 +1055,16 @@ class MCPManager:
         response event hook records whether any 401/403 was observed, since the
         returned response is the post-retry result and its status is not 401.
 
-        If the GET probe returns 405 Method Not Allowed (POST-only servers
-        like Gmail), a POST retry is issued with a JSON-RPC ``tools/call`` body
-        to a dummy tool name, carrying MCP streamable-http transport headers.
-        The POST uses the same client (auth + event hooks) so a 401 on the POST
-        fires the OAuth handshake the same way.  ``final_status`` is updated
-        to the POST response status before the logging block runs.
+        If the GET probe returns 200 OK or 405 Method Not Allowed (POST-only
+        servers like Gmail) without an auth challenge, a two-step discovery
+        probe is issued: a POST ``tools/list`` to discover real tool names,
+        followed by a POST ``tools/call`` with the first real tool name and
+        empty arguments, carrying MCP streamable-http transport headers.  Both
+        POSTs use the same client (auth + event hooks) so a 401 on either POST
+        fires the OAuth handshake the same way.  ``_extract_first_tool_name``
+        parses the ``tools/list`` response (JSON or SSE framing) and returns
+        ``None`` for malformed or empty responses.  ``final_status`` is updated
+        to the last POST response status before the logging block runs.
 
         Exceptions are caught internally so that ``probe_saw_auth_challenge``
         survives even when the OAuth flow fires (event hook sees 401) but then
@@ -988,26 +1110,86 @@ class MCPManager:
                     headers=_PROBE_GET_HEADERS,
                 )
                 final_status = response.status_code
-                # POST probe retry: when the GET probe returns 200 or 405
-                # without an auth challenge, retry with a JSON-RPC tools/call
-                # body.  Some MCP servers (e.g. Gmail) return 200 on
-                # unauthenticated GET but 401 on unauthenticated tools/call —
-                # the POST probe triggers the 401 that fires the SDK's
+                # Two-step discovery probe (design D1): when the GET probe
+                # returns 200 or 405 without an auth challenge, POST
+                # tools/list to discover real tool names, then POST tools/call
+                # with the first real tool name and empty arguments.  Some
+                # MCP servers (e.g. Gmail) enforce auth at the tool execution
+                # layer — a dummy tool name returns 200 (tool not found)
+                # instead of 401.  The tools/call 401 fires the SDK's
                 # async_auth_flow via the event hook.
                 if not probe_saw_auth_challenge and final_status in (200, 405):
                     final_status = None
-                    post_body = {
+                    list_body = {
                         "jsonrpc": "2.0",
                         "id": str(uuid.uuid4()),
-                        "method": "tools/call",
-                        "params": {"name": _PROBE_TOOL_NAME, "arguments": {}},
+                        "method": "tools/list",
+                        "params": {},
                     }
-                    post_response = await client.post(
+                    list_response = await client.post(
                         server_url,
-                        json=post_body,
+                        json=list_body,
                         headers=_PROBE_POST_HEADERS,
                     )
-                    final_status = post_response.status_code
+                    final_status = list_response.status_code
+
+                    # If tools/list returned 401, the event hook already set
+                    # probe_saw_auth_challenge=True — OAuth fired on tools/list.
+                    # Do not send tools/call.
+                    # If tools/list returned a non-200 status (e.g. 405, 500),
+                    # skip parsing and tools/call — fall through to the logging
+                    # block with the tools/list status as final_status.
+                    if not probe_saw_auth_challenge and final_status == 200:
+                        # Defense-in-depth: reject oversized responses
+                        # before parsing to avoid memory exhaustion.
+                        content_length = list_response.headers.get(
+                            "content-length"
+                        )
+                        if (
+                            content_length is not None
+                            and int(content_length) > _PROBE_MAX_RESPONSE_BYTES
+                        ):
+                            logger.warning(
+                                "MCP [%s] probe tools/list response too "
+                                "large (%s bytes) — skipping tools/call",
+                                name,
+                                content_length,
+                            )
+                        elif len(list_response.content) > _PROBE_MAX_RESPONSE_BYTES:
+                            logger.warning(
+                                "MCP [%s] probe tools/list response too "
+                                "large (%d bytes) — skipping tools/call",
+                                name,
+                                len(list_response.content),
+                            )
+                        else:
+                            first_tool_name = self._extract_first_tool_name(
+                                list_response
+                            )
+                            if first_tool_name is None:
+                                logger.warning(
+                                    "MCP [%s] probe tools/list returned no "
+                                    "usable tool name — skipping tools/call, "
+                                    "proceeding to session connection",
+                                    name,
+                                )
+                            else:
+                                final_status = None
+                                call_body = {
+                                    "jsonrpc": "2.0",
+                                    "id": str(uuid.uuid4()),
+                                    "method": "tools/call",
+                                    "params": {
+                                        "name": first_tool_name,
+                                        "arguments": {},
+                                    },
+                                }
+                                call_response = await client.post(
+                                    server_url,
+                                    json=call_body,
+                                    headers=_PROBE_POST_HEADERS,
+                                )
+                                final_status = call_response.status_code
         except Exception as exc:
             error = str(exc)
             if probe_saw_auth_challenge:
