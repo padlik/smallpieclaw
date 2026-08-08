@@ -187,6 +187,77 @@ class TelegramInterface:
         )
         return self._app
 
+    def send_oauth_prompt(
+        self, chat_id: int, server_name: str, auth_url: str, timeout: int = 300
+    ) -> None:
+        """Send an OAuth authorize/cancel prompt to the operator.
+
+        Thread-safe — marshals onto the Telegram event loop via
+        ``run_coroutine_threadsafe``.  Safe to call from the MCP event loop
+        thread or any other thread.
+
+        Args:
+            chat_id: Telegram chat ID to send the prompt to.
+            server_name: Human-readable MCP server name for the prompt text.
+            auth_url: Full OAuth authorization URL for the Authorize button.
+            timeout: OAuth flow timeout in seconds, surfaced in the prompt text.
+        """
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        if not self._app:
+            logger.warning(
+                "send_oauth_prompt: Telegram app not built; cannot send "
+                "auth URL for MCP [%s]: %s",
+                server_name,
+                auth_url,
+            )
+            return
+
+        timeout_str = f"{timeout // 60} min" if timeout >= 60 else f"{timeout} sec"
+
+        markup = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Authorize", url=auth_url)],
+                [InlineKeyboardButton("Cancel", callback_data="oauth_cancel:")],
+            ]
+        )
+
+        async def _send() -> None:
+            try:
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🔐 MCP server '{html.escape(server_name)}' requires "
+                        f"authorization.\n"
+                        f"Tap <b>Authorize</b> below — waiting up to {timeout_str}:"
+                    ),
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                logger.info(
+                    "OAuth prompt delivered to chat %s (MCP [%s])",
+                    chat_id,
+                    server_name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to send OAuth prompt for MCP [%s] to chat %s: %s",
+                    server_name,
+                    chat_id,
+                    exc,
+                )
+
+        loop = self._loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        else:
+            logger.warning(
+                "send_oauth_prompt: Telegram loop not running; cannot send "
+                "auth URL for MCP [%s]: %s",
+                server_name,
+                auth_url,
+            )
+
     def run(self) -> None:
         """Start polling (blocking)."""
         app = self.build()

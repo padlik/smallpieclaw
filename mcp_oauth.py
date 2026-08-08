@@ -386,10 +386,11 @@ class OAuthProviderFactory:
         )
 
         trace = oauth_cfg.get("trace", False)
+        timeout = int(oauth_cfg.get("timeout", 300))
         redirect_handler = make_redirect_handler(
-            tg_iface, name, cb_server, chat_id=chat_id, trace=trace
+            tg_iface, name, cb_server, chat_id=chat_id, trace=trace, timeout=timeout
         )
-        callback_handler = make_callback_handler(cb_server)
+        callback_handler = make_callback_handler(cb_server, timeout=timeout)
 
         return OAuthClientProvider(
             server_url=server_url,
@@ -397,7 +398,7 @@ class OAuthProviderFactory:
             storage=storage,
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
-            timeout=300.0,
+            timeout=float(timeout),
         )
 
 
@@ -407,6 +408,7 @@ def make_redirect_handler(
     cb_server: CallbackServer,
     chat_id: int | None = None,
     trace: bool = False,
+    timeout: int = 300,
 ) -> Callable[[str], Awaitable[None]]:
     """Return an async handler that forwards the auth URL to Telegram.
 
@@ -421,6 +423,7 @@ def make_redirect_handler(
             ``tg_iface`` is provided for interactive flows.
         trace: When ``True``, log the full authorization URL at INFO. The
             URL contains ``client_id`` and ``scope`` — diagnostic-only.
+        timeout: OAuth flow timeout in seconds, surfaced in the prompt text.
     """
     async def _handler(auth_url: str) -> None:
         # Lazily start the callback server here so a fallback full-redirect
@@ -454,41 +457,39 @@ def make_redirect_handler(
             )
             return
 
+        send_fn = getattr(tg_iface, "send_oauth_prompt", None)
+        if send_fn is None:
+            logger.warning(
+                "MCP [%s] Telegram interface has no send_oauth_prompt; "
+                "cannot send auth URL to chat. URL: %s",
+                server_name,
+                auth_url,
+            )
+            return
         try:
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-            buttons = [
-                [InlineKeyboardButton("Authorize", url=auth_url)],
-                # Use a constant callback_data — cancel is global (single-flow),
-                # and Telegram caps callback_data at 64 bytes.
-                [InlineKeyboardButton("Cancel", callback_data="oauth_cancel:")],
-            ]
-            markup = InlineKeyboardMarkup(buttons)
-            bot = getattr(tg_iface, "app", None)
-            if bot is not None:
-                bot = getattr(bot, "bot", None)
-            if bot is not None:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"Authorize MCP server '{server_name}':",
-                    reply_markup=markup,
-                )
-                logger.info(
-                    "MCP [%s] auth URL sent via Telegram (chat=%s)",
-                    server_name,
-                    chat_id,
-                )
+            send_fn(chat_id, server_name, auth_url, timeout)
+            logger.debug(
+                "MCP [%s] auth URL scheduled for Telegram delivery (chat=%s)",
+                server_name,
+                chat_id,
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to send OAuth redirect via Telegram: %s", exc)
+            logger.warning("Failed to schedule OAuth redirect via Telegram: %s", exc)
 
     return _handler
 
 
 def make_callback_handler(
     cb_server: CallbackServer,
+    timeout: float = 300.0,
 ) -> Callable[[], Awaitable[tuple[str, str | None]]]:
-    """Return an async handler that awaits the callback server result."""
+    """Return an async handler that awaits the callback server result.
+
+    Args:
+        cb_server: Callback server that will receive the OAuth redirect.
+        timeout: Maximum seconds to wait for the OAuth callback.
+    """
     async def _handler() -> tuple[str, str | None]:
-        return await cb_server.wait_for_callback()
+        return await cb_server.wait_for_callback(timeout=timeout)
 
     return _handler

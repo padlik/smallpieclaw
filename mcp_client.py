@@ -566,6 +566,26 @@ class MCPManager:
             cfg = self._cfgs.get(server_name, {})
         return bool(cfg.get("oauth"))
 
+    def get_oauth_timeout(self, name: str) -> int:
+        """Return the configured OAuth timeout for a server (default 300s).
+
+        Thread-safe.
+
+        Args:
+            name: Server name.
+
+        Returns:
+            Timeout in seconds, or 300 if not configured / not found.
+        """
+        with self._lock:
+            cfg = self._cfgs.get(name)
+        if cfg is None:
+            return 300
+        oauth_cfg = cfg.get("oauth")
+        if oauth_cfg is None:
+            return 300
+        return int(oauth_cfg.get("timeout", 300))
+
     def get_token_info(self, server_name: str) -> dict[str, Any] | None:
         """Return token info for a server for status display (thread-safe).
 
