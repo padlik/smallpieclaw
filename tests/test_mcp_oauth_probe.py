@@ -137,6 +137,20 @@ class TestProbeInternalLogging:
         manager = MCPManager([], mcp_tokens_dir=tmp_path)
 
         def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {"tools": [{"name": "noop"}]},
+                    },
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "noop"
+            assert body["params"]["arguments"] == {}
             return httpx.Response(200, text="ok")
 
         original_async_client = httpx.AsyncClient
@@ -573,20 +587,31 @@ class TestProbePostRetry:
     def test_get_405_post_401_triggers_oauth(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """GET 405 → POST 401 should fire the event hook and trigger OAuth."""
+        """GET 405 -> POST tools/list 200 -> POST tools/call 401 triggers OAuth."""
         manager = MCPManager([], mcp_tokens_dir=tmp_path)
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET":
                 return httpx.Response(405, text="method not allowed")
-            # Verify the POST body matches design D2 (JSON-RPC tools/call).
             body = json.loads(request.content)
-            assert body["jsonrpc"] == "2.0"
+            if body["method"] == "tools/list":
+                assert body["jsonrpc"] == "2.0"
+                assert "id" in body
+                assert request.headers["Accept"] == "application/json, text/event-stream"
+                assert request.headers["Content-Type"] == "application/json"
+                assert request.headers["MCP-Protocol-Version"] == "2025-11-25"
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {"tools": [{"name": "list_labels"}]},
+                    },
+                )
             assert body["method"] == "tools/call"
-            assert body["params"]["name"] == "_oauth_probe"
-            assert body["params"]["arguments"] == {}
+            assert body["jsonrpc"] == "2.0"
             assert "id" in body
-            # Verify the POST headers match design D3 (MCP streamable-http transport).
+            assert body["params"]["name"] == "list_labels"
+            assert body["params"]["arguments"] == {}
             assert request.headers["Accept"] == "application/json, text/event-stream"
             assert request.headers["Content-Type"] == "application/json"
             assert request.headers["MCP-Protocol-Version"] == "2025-11-25"
@@ -612,12 +637,24 @@ class TestProbePostRetry:
     def test_get_405_post_200_no_oauth(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """GET 405 → POST 200 should report that the server did not require OAuth."""
+        """GET 405 -> POST tools/list 200 -> POST tools/call 200: no OAuth."""
         manager = MCPManager([], mcp_tokens_dir=tmp_path)
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET":
                 return httpx.Response(405, text="method not allowed")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {"tools": [{"name": "list_labels"}]},
+                    },
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "list_labels"
+            assert body["params"]["arguments"] == {}
             return httpx.Response(200, text="ok")
 
         self._fake_client(monkeypatch, handler)
@@ -640,10 +677,14 @@ class TestProbePostRetry:
     def test_get_405_post_405_no_oauth_warning(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """GET 405 → POST 405 should not log the OAuth-success or 200 messages."""
+        """GET 405 -> POST tools/list 405: no OAuth, no tools/call."""
         manager = MCPManager([], mcp_tokens_dir=tmp_path)
 
         def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(405, text="method not allowed")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
             return httpx.Response(405, text="method not allowed")
 
         self._fake_client(monkeypatch, handler)
@@ -668,12 +709,26 @@ class TestProbePostRetry:
     def test_get_200_post_200_no_oauth(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """GET 200 → POST 200 should confirm the server did not require OAuth."""
+        """GET 200 → POST tools/list 200 → POST tools/call 200: no OAuth."""
         manager = MCPManager([], mcp_tokens_dir=tmp_path)
         requests_made: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {"tools": [{"name": "list_labels"}]},
+                    },
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "list_labels"
+            assert body["params"]["arguments"] == {}
             return httpx.Response(200, text="ok")
 
         self._fake_client(monkeypatch, handler)
@@ -688,7 +743,7 @@ class TestProbePostRetry:
         assert saw is False
         assert status == 200
         assert error is None
-        assert requests_made == ["GET", "POST"]
+        assert requests_made == ["GET", "POST", "POST"]
         assert any(
             "server did not require OAuth" in rec.message for rec in caplog.records
         )
@@ -777,7 +832,7 @@ class TestProbePostRetry:
     def test_get_200_post_401_triggers_oauth(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """GET 200 → POST 401 should fire the event hook and trigger OAuth.
+        """GET 200 → POST tools/list 200 → POST tools/call 401 triggers OAuth.
 
         This is the Gmail scenario: the server allows unauthenticated GET but
         returns 401 on unauthenticated tools/call.
@@ -787,14 +842,20 @@ class TestProbePostRetry:
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET":
                 return httpx.Response(200, text="ok")
-            # Verify the POST body matches design D2 (JSON-RPC tools/call).
             body = json.loads(request.content)
-            assert body["jsonrpc"] == "2.0"
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {"tools": [{"name": "list_labels"}]},
+                    },
+                )
             assert body["method"] == "tools/call"
-            assert body["params"]["name"] == "_oauth_probe"
-            assert body["params"]["arguments"] == {}
+            assert body["jsonrpc"] == "2.0"
             assert "id" in body
-            # Verify the POST headers match design D3 (MCP streamable-http transport).
+            assert body["params"]["name"] == "list_labels"
+            assert body["params"]["arguments"] == {}
             assert request.headers["Accept"] == "application/json, text/event-stream"
             assert request.headers["Content-Type"] == "application/json"
             assert request.headers["MCP-Protocol-Version"] == "2025-11-25"
@@ -820,12 +881,14 @@ class TestProbePostRetry:
     def test_get_200_post_raises_no_stale_status(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """GET 200 → POST raises should report final_status=None, not the stale GET 200."""
+        """GET 200 -> POST tools/list raises: final_status=None, not the stale GET 200."""
         manager = MCPManager([], mcp_tokens_dir=tmp_path)
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET":
                 return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
             raise httpx.ConnectError("post failed")
 
         self._fake_client(monkeypatch, handler)
@@ -848,7 +911,7 @@ class TestProbePostRetry:
     def test_get_405_post_raises_no_stale_status(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        """GET 405 → POST raises should report final_status=None, not the stale GET 405.
+        """GET 405 -> POST tools/list raises: final_status=None, not the stale GET 405.
 
         The POST retry resets ``final_status`` to None before issuing the request,
         so if the POST raises (network error, timeout), the returned status is None
@@ -859,6 +922,8 @@ class TestProbePostRetry:
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET":
                 return httpx.Response(405, text="method not allowed")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
             raise httpx.ConnectError("post failed")
 
         self._fake_client(monkeypatch, handler)
@@ -959,3 +1024,1053 @@ class TestProbePostRetryFlow:
 
         assert result == {"success": True}
         assert (tmp_path / "srv.json").exists()
+
+
+class TestProbeTwoStepDiscovery:
+    """MockTransport tests driving the real ``_probe_oauth_challenge`` two-step discovery.
+
+    Verifies GET → POST tools/list → POST tools/call flow: auth-challenge detection,
+    tool-name extraction, empty tool list handling, SSE parsing, and error cases.
+    """
+
+    def _fake_client(self, monkeypatch, handler) -> None:
+        """Patch ``httpx.AsyncClient`` to use the supplied MockTransport handler."""
+        original_async_client = httpx.AsyncClient
+
+        def _wrapper(**kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            kwargs.pop("auth", None)
+            return original_async_client(**kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _wrapper)
+
+    def test_get_200_tools_list_200_tools_call_401_triggers_oauth(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → tools/list 200 → tools/call 401 triggers OAuth handshake."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "tools": [
+                                {"name": "list_labels"},
+                                {"name": "send_email"},
+                            ]
+                        },
+                    },
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "list_labels"
+            assert body["params"]["arguments"] == {}
+            return httpx.Response(401, text="unauthorized")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+        assert requests_made == ["GET", "POST", "POST"]
+        assert any(
+            "probe triggered OAuth handshake (status=401)" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_get_200_tools_list_200_tools_call_200_no_oauth(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → tools/list 200 → tools/call 200: server did not require OAuth."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {"tools": [{"name": "list_labels"}]},
+                    },
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "list_labels"
+            assert body["params"]["arguments"] == {}
+            return httpx.Response(200, text="ok")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert any(
+            "probe returned 200 — server did not require OAuth" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_get_200_tools_list_200_empty_no_tools_call(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → tools/list 200 with empty tools: no tools/call issued."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "result": {"tools": []}},
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "no usable tool name" in rec.message for rec in caplog.records
+        )
+
+    def test_get_200_tools_list_401_no_tools_call(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → tools/list 401: auth challenge detected, no tools/call issued."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(401, text="unauthorized")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "probe triggered OAuth handshake" in rec.message for rec in caplog.records
+        )
+
+    def test_get_401_no_post(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 401 short-circuits; no POST tools/list or tools/call issued."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(401, text="unauthorized")
+            raise AssertionError("POST should not be issued when GET returns 401")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+        assert requests_made == ["GET"]
+
+    def test_get_405_tools_list_200_tools_call_401_triggers_oauth(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 405 → tools/list 200 → tools/call 401; final status reflects tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(405, text="method not allowed")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {"tools": [{"name": "list_labels"}]},
+                    },
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "list_labels"
+            assert body["params"]["arguments"] == {}
+            return httpx.Response(401, text="unauthorized")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+        assert any(
+            "probe triggered OAuth handshake (status=401)" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_get_200_tools_list_sse_parsed(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → tools/list returns SSE frames; first tool extracted correctly."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                content = b'data: {"jsonrpc": "2.0", "result": {"tools": [{"name": "search"}]}}\n\n'
+                return httpx.Response(
+                    200,
+                    content=content,
+                    headers={"content-type": "text/event-stream"},
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "search"
+            assert body["params"]["arguments"] == {}
+            return httpx.Response(401, text="unauthorized")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+
+    def test_get_200_tools_list_500_no_tools_call(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → tools/list 500: no tools/call, final status 500, warning logged."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(500, text="internal server error")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 500
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        # The probe logs the non-200/non-challenge status at INFO; the
+        # "unexpected status" WARNING is emitted by _run_probe_step, not
+        # _probe_oauth_challenge (which this test calls directly).
+        assert any(
+            "probe returned 500" in rec.message for rec in caplog.records
+        )
+
+    def test_get_200_tools_list_connect_error(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → tools/list raises ConnectError; final_status=None, warning logged."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            raise httpx.ConnectError("tools/list failed")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status is None
+        assert error is not None
+        assert "tools/list failed" in error
+        assert any(
+            "OAuth probe failed" in rec.message for rec in caplog.records
+        )
+
+    def test_get_200_tools_list_200_tools_call_connect_error(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """GET 200 → tools/list 200 → tools/call raises ConnectError; status=None."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {"tools": [{"name": "list_labels"}]},
+                    },
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "list_labels"
+            assert body["params"]["arguments"] == {}
+            raise httpx.ConnectError("tools/call failed")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status is None
+        assert error is not None
+        assert "tools/call failed" in error
+        assert requests_made == ["GET", "POST", "POST"]
+        assert any(
+            "OAuth probe failed" in rec.message for rec in caplog.records
+        )
+
+
+class TestProbeMalformedResponses:
+    """MockTransport tests for malformed tools/list responses and edge cases.
+
+    Verifies that the probe extracts the first tool name safely, logs a WARNING
+    when extraction fails, and skips the tools/call POST in those cases.
+    """
+
+    def _fake_client(self, monkeypatch, handler) -> None:
+        """Patch ``httpx.AsyncClient`` to use the supplied MockTransport handler."""
+        original_async_client = httpx.AsyncClient
+
+        def _wrapper(**kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            kwargs.pop("auth", None)
+            return original_async_client(**kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _wrapper)
+
+    def test_tools_list_200_missing_name_field(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list returns a tool with no 'name' field -> no tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "result": {"tools": [{"description": "no name here"}]},
+                },
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "no usable tool name" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_200_result_not_dict(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list returns 'result' as a string -> no tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "result": "not_a_dict"},
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "no usable tool name" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_200_tools_not_list(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list returns 'tools' as a string -> no tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "result": {"tools": "not_a_list"}},
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "no usable tool name" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_200_malformed_json(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list returns malformed JSON -> no tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(
+                200,
+                content=b"not valid json",
+                headers={"content-type": "application/json"},
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "no usable tool name" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_sse_no_space_prefix(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """SSE data: without space prefix is parsed correctly."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                content = b'data:{"jsonrpc": "2.0", "result": {"tools": [{"name": "search"}]}}\n\n'
+                return httpx.Response(
+                    200,
+                    content=content,
+                    headers={"content-type": "text/event-stream"},
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "search"
+            assert body["params"]["arguments"] == {}
+            return httpx.Response(401, text="unauthorized")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+        assert requests_made == ["GET", "POST", "POST"]
+        assert any(
+            "probe triggered OAuth handshake" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_sse_malformed(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """SSE frame contains malformed JSON -> no tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            content = b'data: not json\n\n'
+            return httpx.Response(
+                200,
+                content=content,
+                headers={"content-type": "text/event-stream"},
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "no usable tool name" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_sse_empty(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """SSE body has no data frames -> no tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(
+                200,
+                content=b"\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "no usable tool name" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_403_triggers_oauth(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list returns 403 -> auth challenge, no tools/call issued."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(403, text="forbidden")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 403
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "probe triggered OAuth handshake" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_response_too_large_content_length(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list with Content-Length > 1MB -> WARNING, no tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            return httpx.Response(
+                200,
+                content=b'{"jsonrpc": "2.0", "result": {"tools": [{"name": "list"}]}}',
+                headers={"content-length": str(2_000_000)},
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any("too large" in rec.message for rec in caplog.records)
+
+    def test_tools_list_response_too_large_body(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list with body > 1MB -> WARNING, no tools/call."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            big = b'{"jsonrpc":"2.0","result":{"tools":[{"name":"list"}]}}' + b"x" * 1_100_000
+            return httpx.Response(200, content=big)
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any("too large" in rec.message for rec in caplog.records)
+
+    def test_tools_list_all_mutating_tools_no_tools_call(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list returns only mutating tools -> no tools/call, WARNING."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            assert body["method"] == "tools/list"
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "tools": [
+                            {"name": "send_email"},
+                            {"name": "delete_message"},
+                        ]
+                    },
+                },
+            )
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is False
+        assert status == 200
+        assert error is None
+        assert requests_made == ["GET", "POST"]
+        assert any(
+            "no usable tool name" in rec.message for rec in caplog.records
+        )
+
+    def test_tools_list_prefers_non_mutating_tool(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """tools/list returns mutating + non-mutating -> probe uses non-mutating."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "tools": [
+                                {"name": "send_email"},
+                                {"name": "list_labels"},
+                            ]
+                        },
+                    },
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "list_labels"
+            return httpx.Response(401, text="unauthorized")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+        assert requests_made == ["GET", "POST", "POST"]
+
+    def test_sse_multi_event_skips_heartbeat(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """SSE stream with heartbeat before tools event -> parser skips heartbeat."""
+        manager = MCPManager([], mcp_tokens_dir=tmp_path)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, text="ok")
+            body = json.loads(request.content)
+            if body["method"] == "tools/list":
+                sse_body = (
+                    b'data: {"type": "ping"}\n\n'
+                    b'data: {"jsonrpc": "2.0", "result": {"tools": [{"name": "search"}]}}\n\n'
+                )
+                return httpx.Response(
+                    200,
+                    content=sse_body,
+                    headers={"content-type": "text/event-stream"},
+                )
+            assert body["method"] == "tools/call"
+            assert body["params"]["name"] == "search"
+            return httpx.Response(401, text="unauthorized")
+
+        self._fake_client(monkeypatch, handler)
+        caplog.set_level(logging.INFO, logger="mcp_client")
+
+        saw, status, error = asyncio.run(
+            manager._probe_oauth_challenge(
+                "srv", "https://example.com", MagicMock(spec=httpx.Auth), {"timeout": 30}
+            )
+        )
+
+        assert saw is True
+        assert status == 401
+        assert error is None
+        assert requests_made == ["GET", "POST", "POST"]
+
+
+class TestExtractFirstToolName:
+    """Unit tests for the ``_extract_first_tool_name`` helper."""
+
+    def test_json_with_tools(self) -> None:
+        resp = httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "result": {"tools": [{"name": "list_labels"}, {"name": "send"}]},
+            },
+        )
+        assert MCPManager._extract_first_tool_name(resp) == "list_labels"
+
+    def test_json_empty_tools(self) -> None:
+        resp = httpx.Response(
+            200, json={"jsonrpc": "2.0", "result": {"tools": []}}
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_json_missing_result(self) -> None:
+        resp = httpx.Response(200, json={"jsonrpc": "2.0"})
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_json_result_not_dict(self) -> None:
+        resp = httpx.Response(
+            200, json={"jsonrpc": "2.0", "result": "bad"}
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_json_tools_not_list(self) -> None:
+        resp = httpx.Response(
+            200, json={"jsonrpc": "2.0", "result": {"tools": "bad"}}
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_json_tool_missing_name(self) -> None:
+        resp = httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "result": {"tools": [{"desc": "no name"}]},
+            },
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_json_malformed_body(self) -> None:
+        resp = httpx.Response(
+            200,
+            content=b"not json",
+            headers={"content-type": "application/json"},
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_sse_with_space(self) -> None:
+        body = b'data: {"jsonrpc": "2.0", "result": {"tools": [{"name": "search"}]}}\n\n'
+        resp = httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert MCPManager._extract_first_tool_name(resp) == "search"
+
+    def test_sse_without_space(self) -> None:
+        body = b'data:{"jsonrpc": "2.0", "result": {"tools": [{"name": "search"}]}}\n\n'
+        resp = httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert MCPManager._extract_first_tool_name(resp) == "search"
+
+    def test_sse_malformed(self) -> None:
+        body = b'data: not json\n\n'
+        resp = httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_sse_empty(self) -> None:
+        body = b"\n\n"
+        resp = httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_sse_tool_missing_name(self) -> None:
+        body = b'data: {"jsonrpc": "2.0", "result": {"tools": [{"desc": "no name"}]}}\n\n'
+        resp = httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_prefers_non_mutating_tool(self) -> None:
+        resp = httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "result": {
+                    "tools": [{"name": "send_email"}, {"name": "list_labels"}]
+                },
+            },
+        )
+        assert MCPManager._extract_first_tool_name(resp) == "list_labels"
+
+    def test_all_mutating_tools_returns_none(self) -> None:
+        resp = httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "result": {
+                    "tools": [
+                        {"name": "send_email"},
+                        {"name": "delete_message"},
+                        {"name": "write_file"},
+                    ]
+                },
+            },
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None
+
+    def test_first_non_mutating_selected_even_if_later(self) -> None:
+        resp = httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "result": {
+                    "tools": [
+                        {"name": "delete_item"},
+                        {"name": "update_record"},
+                        {"name": "get_status"},
+                        {"name": "list_all"},
+                    ]
+                },
+            },
+        )
+        assert MCPManager._extract_first_tool_name(resp) == "get_status"
+
+    def test_sse_multi_event_skips_heartbeat(self) -> None:
+        """SSE stream with heartbeat before tools event -> skip heartbeat."""
+        body = (
+            b'data: {"type": "ping"}\n\n'
+            b'data: {"jsonrpc": "2.0", "result": {"tools": [{"name": "search"}]}}\n\n'
+        )
+        resp = httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert MCPManager._extract_first_tool_name(resp) == "search"
+
+    def test_sse_response_too_large(self) -> None:
+        """SSE response exceeding the size cap returns None."""
+        large_body = (
+            b'data: {"jsonrpc": "2.0", "result": {"tools": [{"name": "x"}]}}\n\n'
+        )
+        large_body += b"x" * 1_100_000
+        resp = httpx.Response(
+            200,
+            content=large_body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert MCPManager._extract_first_tool_name(resp) is None

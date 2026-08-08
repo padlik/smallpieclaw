@@ -94,6 +94,18 @@ flowchart TD
 
 **Rationale:** The probe and SDK transport share the same `OAuthClientProvider` object and `FileTokenStorage`. The probe's `async_auth_flow` fires on the 401, calls `redirect_handler` (posts auth URL to Telegram), calls `callback_handler` (waits for operator), stores the token via `storage.set_tokens()`. The SDK transport's `async_auth_flow` reads the token via `storage.get_tokens()` on its first request. Refactoring to share a single `httpx.AsyncClient` would be a larger change with regression risk — file-based persistence is sufficient.
 
+### D6: Response-size cap on tools/list (defense-in-depth)
+
+**Decision:** The probe rejects `tools/list` responses exceeding `_PROBE_MAX_RESPONSE_BYTES` (1 MB) before parsing. Oversized responses log a WARNING and skip `tools/call`, falling through to session connection.
+
+**Rationale:** httpx buffers the full response body before parsing. A malicious or compromised MCP server could return a multi-GB body within the 300-second timeout window and exhaust memory. A `tools/list` response is typically a few KB; 1 MB is a generous cap. The check inspects both the `Content-Length` header and the actual `len(response.content)` to handle servers that misreport or omit the header. This is defense-in-depth beyond the operator-initiated trusted-server threat model.
+
+### D7: Prefer non-mutating tool names (defense-in-depth)
+
+**Decision:** `_extract_first_tool_name` iterates through the tool list and returns the first tool whose name does NOT start with a known mutating prefix (`send_`, `delete_`, `write_`, `update_`, `create_`, `remove_`, `set_`, `put_`, `post_`, `add_`, `insert_`, `modify_`, `edit_`, `move_`, `rename_`, `clear_`, `reset_`, `upload_`, `submit_`, `execute_`, `run_`). If all tools are mutating, the probe skips `tools/call` and falls back to session connection.
+
+**Rationale:** D2's safety argument ("auth fires before tool execution") is confirmed for Gmail but generalized to all servers. A server that executes before checking auth could run an arbitrary, unreviewed tool. Preferring non-mutating tools minimizes the risk of destructive side effects if a server executes before checking auth. If no safe tool is found, skipping `tools/call` is safer than calling a potentially destructive tool. This is defense-in-depth beyond the accepted risk documented in the Risks section.
+
 ## Risks / Trade-offs
 
 - **[Server validates arguments before checking auth]** → The probe would get a 200 JSON-RPC argument error instead of 401. Mitigation: confirmed via curl that Gmail checks auth before args. If a server validates args first, the probe falls back to session connection (the `tools/call` returns 200, `probe_saw_auth_challenge` stays False, WARNING + fallback).
@@ -102,9 +114,9 @@ flowchart TD
 
 - **[Extra HTTP round-trips for tools/list]** → The probe adds one extra round-trip (tools/list) before the tools/call. Mitigation: acceptable for an interactive flow that already takes seconds. The tools/list response is fast (no body processing beyond JSON parsing).
 
-- **[tools/list returns a large list]** → Parsing a large tools/list response to extract the first tool name. Mitigation: we only need the first tool name — parse the JSON response and extract `result.tools[0].name`. No need to process the full list.
+- **[tools/list returns a large list]** → Parsing a large tools/list response to extract the first tool name. Mitigation: the probe caps the response at `_PROBE_MAX_RESPONSE_BYTES` (1 MB) before parsing (D6). Responses exceeding the cap are rejected with a WARNING and the probe falls back to session connection. For responses within the cap, the probe only needs the first non-mutating tool name — it iterates the list but does not process the full list beyond the name field.
 
-- **[First tool has side effects even with empty args]** → Extremely unlikely since auth fires before tool execution. Mitigation: the 401 prevents the tool from ever running. If auth is somehow bypassed, empty args minimize impact.
+- **[First tool has side effects even with empty args]** → Extremely unlikely since auth fires before tool execution. Mitigation: the 401 prevents the tool from ever running. If auth is somehow bypassed, empty args minimize impact. Additionally, the probe prefers non-mutating tool names (D7) — if the first tool is `send_*`/`delete_*`/`write_*` etc., the probe skips it and uses the first non-mutating tool instead. If all tools are mutating, the probe skips `tools/call` entirely.
 
 ## Migration Plan
 
