@@ -703,9 +703,10 @@ class MCPManager:
         The next time the running flow polls the cancel flag, it aborts. If no
         flow is in progress, this returns an error.
         """
-        if not self._oauth_flow_in_progress:
-            return {"success": False, "error": "No OAuth flow in progress"}
-        self._oauth_cancel_requested = True
+        with self._lock:
+            if not self._oauth_flow_in_progress:
+                return {"success": False, "error": "No OAuth flow in progress"}
+            self._oauth_cancel_requested = True
         return {"success": True}
 
     def _start_loop(self) -> None:
@@ -968,8 +969,15 @@ class MCPManager:
             )
             return future.result(timeout=timeout + 10)
         except concurrent.futures.TimeoutError:
+            logger.warning("MCP [%s] OAuth flow timed out after %ss", name, timeout)
             return {"success": False, "error": "OAuth flow timed out"}
         except Exception as exc:
+            logger.warning(
+                "MCP [%s] OAuth flow error: %s",
+                name,
+                exc,
+                exc_info=True,
+            )
             return {"success": False, "error": str(exc)}
         finally:
             with self._lock:
@@ -1429,12 +1437,22 @@ class MCPManager:
             if ready_task in done:
                 exc = ready_task.exception()
                 if exc is not None:
+                    logger.warning(
+                        "MCP [%s] OAuth session failed: %s",
+                        name,
+                        exc,
+                        exc_info=True,
+                    )
                     return {"success": False, "error": str(exc)}
 
                 # Session is ready — the SDK has completed the OAuth flow and
                 # persisted tokens via storage.set_tokens().
                 logger.info("MCP [%s] session ready; verifying token storage", name)
                 if wrapper.needs_auth:
+                    logger.warning(
+                        "MCP [%s] server still needs auth after OAuth flow",
+                        name,
+                    )
                     return {
                         "success": False,
                         "error": "Server still needs auth after flow",
@@ -1453,6 +1471,14 @@ class MCPManager:
                             name,
                             name,
                         )
+                        return {
+                            "success": False,
+                            "error": (
+                                "OAuth flow completed but no token was stored — "
+                                "the authorization link may not have been delivered. "
+                                f"Retry /mcp auth {name}."
+                            ),
+                        }
                     else:
                         # Probe did not see an auth challenge — the server did
                         # not require OAuth on the probe.  No token file is
@@ -1488,8 +1514,15 @@ class MCPManager:
                 return {"success": True}
 
             # Should not reach here, but handle defensively.
+            logger.warning("MCP [%s] unexpected state in OAuth flow", name)
             return {"success": False, "error": "Unexpected state in OAuth flow"}
         except Exception as exc:
+            logger.warning(
+                "MCP [%s] OAuth flow failed: %s",
+                name,
+                exc,
+                exc_info=True,
+            )
             return {"success": False, "error": str(exc)}
         finally:
             self._oauth_cancel_requested = False

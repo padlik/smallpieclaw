@@ -76,7 +76,13 @@ class FileTokenStorage:
                 json.dump(payload, fh, indent=2)
             os.chmod(tmp_path, 0o600)
             os.replace(tmp_path, self._token_file)
-        except BaseException:  # broad catch intentional: ensure tmp cleanup on KeyboardInterrupt/SystemExit
+        except BaseException as exc:  # broad catch intentional: ensure tmp cleanup on KeyboardInterrupt/SystemExit
+            logger.warning(
+                "MCP [%s] failed to write token file %s: %s",
+                self.server_name,
+                self._token_file,
+                exc,
+            )
             try:
                 os.unlink(tmp_path)
             except OSError:
@@ -294,7 +300,12 @@ class CallbackServer:
             validated_state = self.expected_state is not None
             if validated_state:
                 if state is None or not secrets.compare_digest(self.expected_state, state):
-                    logger.debug("OAuth callback handler error: state mismatch")
+                    logger.warning(
+                        "MCP OAuth callback state mismatch: expected=%s... got=%s... — "
+                        "possible CSRF or misdirected redirect",
+                        self.expected_state[:8] if self.expected_state else "",
+                        state[:8] if state else "",
+                    )
                     writer.write(
                         b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nState mismatch"
                     )
@@ -449,6 +460,12 @@ def make_redirect_handler(
             logger.info("MCP [%s] auth URL: %s", server_name, auth_url)
 
         if tg_iface is None or chat_id is None:
+            # Degraded path: no Telegram chat in context (e.g. non-interactive
+            # reconnect with a stored refresh token that turned out invalid).
+            # This is a legitimate manual-authorize fallback — the operator
+            # can visit the URL from the logs.  Do NOT raise here; raising
+            # would abort the SDK flow, which is wrong for this path since
+            # the operator may still complete authorization manually.
             logger.warning(
                 "MCP [%s] needs re-authorization but no Telegram chat is in "
                 "context for this flow; visit this URL to authorize: %s",
@@ -465,16 +482,34 @@ def make_redirect_handler(
                 server_name,
                 auth_url,
             )
-            return
+            raise RuntimeError(
+                f"Telegram interface has no send_oauth_prompt; cannot deliver "
+                f"auth URL for MCP [{server_name}]"
+            )
         try:
-            send_fn(chat_id, server_name, auth_url, timeout)
-            logger.debug(
-                "MCP [%s] auth URL scheduled for Telegram delivery (chat=%s)",
+            future = send_fn(chat_id, server_name, auth_url, timeout)
+            if future is None:
+                raise RuntimeError(
+                    f"Could not schedule OAuth prompt delivery for MCP "
+                    f"[{server_name}] — Telegram app not built or loop not running"
+                )
+            # Await the delivery result on the MCP loop via wrap_future.
+            # If send_message fails on the Telegram loop, this re-raises
+            # here, aborting the SDK's auth flow so the operator isn't
+            # stranded waiting for a callback that will never come.
+            await asyncio.wrap_future(future)
+            logger.info(
+                "MCP [%s] auth URL delivered to Telegram (chat=%s)",
                 server_name,
                 chat_id,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to schedule OAuth redirect via Telegram: %s", exc)
+            logger.debug(
+                "MCP [%s] failed to deliver auth URL via Telegram: %s",
+                server_name,
+                exc,
+            )
+            raise
 
     return _handler
 

@@ -9,6 +9,7 @@ Covers the two new observable behaviors introduced by this change:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -120,7 +121,14 @@ class TestPostFlowTokenVerification:
         caplog.set_level(logging.WARNING, logger="mcp_client")
         result = asyncio.run(_run())
 
-        assert result == {"success": True}
+        assert result == {
+            "success": False,
+            "error": (
+                "OAuth flow completed but no token was stored — "
+                "the authorization link may not have been delivered. "
+                "Retry /mcp auth srv."
+            ),
+        }
         assert not (tmp_path / "srv.json").exists()
         assert any(
             "no token file found" in rec.message for rec in caplog.records
@@ -272,8 +280,15 @@ class TestTraceGatedAuthUrlLogging:
             return None
 
         monkeypatch.setattr(CallbackServer, "start", fake_start)
+
+        tg_iface = self._make_tg_iface()
+        # The handler now awaits the future returned by send_oauth_prompt,
+        # so stub it with a real completed future.
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        future.set_result(None)
+        tg_iface.send_oauth_prompt = MagicMock(return_value=future)
         handler = make_redirect_handler(
-            self._make_tg_iface(), "srv", cb_server, chat_id=123, trace=trace
+            tg_iface, "srv", cb_server, chat_id=123, trace=trace
         )
         asyncio.run(handler(url))
 
@@ -323,7 +338,8 @@ class TestTraceGatedAuthUrlLogging:
             _BareTgIface(), "srv", cb_server, chat_id=123, trace=False
         )
         caplog.set_level(logging.WARNING, logger="mcp_oauth")
-        asyncio.run(handler(auth_url))
+        with pytest.raises(RuntimeError):
+            asyncio.run(handler(auth_url))
 
         assert any(
             "no send_oauth_prompt" in rec.message and auth_url in rec.message

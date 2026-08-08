@@ -357,7 +357,77 @@ class TestMcpAuthCommands:
         iface.mcp_manager.revoke_server.assert_called_once_with("gmail")
         assert any("Token revoked" in t and "gmail" in t for t in sent_texts), sent_texts
 
+    def test_mcp_auth_cancel_success(self):
+        """/mcp auth cancel requests cancellation of in-progress flow."""
+        from telegram_commands import cmd_mcp
 
+        iface = _make_iface()
+        iface.mcp_manager = MagicMock()
+        iface.mcp_manager.cancel_oauth_flow = MagicMock(
+            return_value={"success": True}
+        )
+
+        sent_texts: list[str] = []
+
+        async def _run():
+            mock_message = MagicMock()
+            mock_message.reply_text = AsyncMock(
+                side_effect=lambda text, **kw: sent_texts.append(text)
+            )
+
+            mock_user = MagicMock()
+            mock_user.id = 42
+
+            mock_update = MagicMock()
+            mock_update.effective_user = mock_user
+            mock_update.effective_message = mock_message
+
+            mock_ctx = MagicMock()
+            mock_ctx.args = ["auth", "cancel"]
+
+            await cmd_mcp(iface, mock_update, mock_ctx)
+
+        asyncio.run(_run())
+        iface.mcp_manager.cancel_oauth_flow.assert_called_once()
+        assert any("cancellation requested" in t.lower() for t in sent_texts)
+
+    def test_mcp_auth_cancel_no_flow(self):
+        """/mcp auth cancel when no flow is in progress reports error."""
+        from telegram_commands import cmd_mcp
+
+        iface = _make_iface()
+        iface.mcp_manager = MagicMock()
+        iface.mcp_manager.cancel_oauth_flow = MagicMock(
+            return_value={"success": False, "error": "No OAuth flow in progress"}
+        )
+
+        sent_texts: list[str] = []
+
+        async def _run():
+            mock_message = MagicMock()
+            mock_message.reply_text = AsyncMock(
+                side_effect=lambda text, **kw: sent_texts.append(text)
+            )
+
+            mock_user = MagicMock()
+            mock_user.id = 42
+
+            mock_update = MagicMock()
+            mock_update.effective_user = mock_user
+            mock_update.effective_message = mock_message
+
+            mock_ctx = MagicMock()
+            mock_ctx.args = ["auth", "cancel"]
+
+            await cmd_mcp(iface, mock_update, mock_ctx)
+
+        asyncio.run(_run())
+        iface.mcp_manager.cancel_oauth_flow.assert_called_once()
+        assert any("No OAuth flow in progress" in t for t in sent_texts)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Handler registration
 # ---------------------------------------------------------------------------
 # Tests: send_oauth_prompt
 # ---------------------------------------------------------------------------
@@ -441,7 +511,7 @@ class TestSendOauthPrompt:
         assert any("loop not running" in rec.message for rec in caplog.records)
 
     def test_send_message_failure_logs_warning(self, caplog):
-        """An exception from bot.send_message is caught and logged."""
+        """An exception from bot.send_message is caught, logged, and re-raised."""
         iface = self._make_iface_with_app()
         iface._app.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
         caplog.set_level(logging.WARNING, logger="telegram_interface")
@@ -450,7 +520,9 @@ class TestSendOauthPrompt:
 
         assert len(self._captured) == 1
         coro, _loop = self._captured[0]
-        asyncio.run(coro)
+        # The coroutine must re-raise so the redirect handler can abort the flow.
+        with pytest.raises(RuntimeError, match="boom"):
+            asyncio.run(coro)
         assert any(
             "Failed to send OAuth prompt for MCP [gmail] to chat 123" in rec.message
             for rec in caplog.records
