@@ -9,9 +9,13 @@ Spec assertions:
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import os
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 # Ensure project root is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -177,6 +181,7 @@ class TestMcpAuthCommands:
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
         iface.mcp_manager.server_has_oauth = MagicMock(return_value=False)
+        iface.mcp_manager.get_oauth_timeout = MagicMock(return_value=300)
         iface.mcp_manager.start_oauth_flow = MagicMock(
             return_value={"success": False, "error": "Server 'unknown' not found"}
         )
@@ -211,6 +216,7 @@ class TestMcpAuthCommands:
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
         iface.mcp_manager.server_has_oauth = MagicMock(return_value=True)
+        iface.mcp_manager.get_oauth_timeout = MagicMock(return_value=300)
         iface.mcp_manager.start_oauth_flow = MagicMock(
             return_value={"success": False, "error": "Server 'local' has no OAuth configuration"}
         )
@@ -350,6 +356,105 @@ class TestMcpAuthCommands:
         asyncio.run(_run())
         iface.mcp_manager.revoke_server.assert_called_once_with("gmail")
         assert any("Token revoked" in t and "gmail" in t for t in sent_texts), sent_texts
+
+
+# ---------------------------------------------------------------------------
+# Tests: send_oauth_prompt
+# ---------------------------------------------------------------------------
+
+class TestSendOauthPrompt:
+    """Direct tests for TelegramInterface.send_oauth_prompt."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_run_coroutine_threadsafe(self, monkeypatch):
+        """Capture coroutines submitted via run_coroutine_threadsafe so tests can run them."""
+        self._captured: list[tuple[Any, asyncio.AbstractEventLoop]] = []
+
+        def _fake_run_coroutine_threadsafe(coro, loop):
+            self._captured.append((coro, loop))
+            return MagicMock()
+
+        monkeypatch.setattr(
+            asyncio, "run_coroutine_threadsafe", _fake_run_coroutine_threadsafe
+        )
+
+    def _make_iface_with_app(self):
+        from telegram_interface import TelegramInterface
+
+        iface = TelegramInterface.__new__(TelegramInterface)
+        iface._app = MagicMock()
+        iface._app.bot.send_message = AsyncMock()
+        iface._loop = MagicMock()
+        iface._loop.is_running.return_value = True
+        return iface
+
+    def test_successful_delivery(self, caplog):
+        """A running loop schedules send_message with the expected payload."""
+        from telegram.constants import ParseMode
+
+        iface = self._make_iface_with_app()
+        caplog.set_level(logging.INFO, logger="telegram_interface")
+
+        iface.send_oauth_prompt(123, "gmail", "https://auth.example.com", timeout=300)
+
+        assert len(self._captured) == 1
+        coro, loop = self._captured[0]
+        asyncio.run(coro)
+        loop.is_running.assert_called_once()
+
+        call_kwargs = iface._app.bot.send_message.call_args.kwargs
+        assert call_kwargs["chat_id"] == 123
+        assert "gmail" in call_kwargs["text"]
+        assert "5 min" in call_kwargs["text"]
+        assert "<b>Authorize</b>" in call_kwargs["text"]
+        assert call_kwargs["parse_mode"] == ParseMode.HTML
+        assert call_kwargs["reply_markup"] is not None
+        assert any(
+            "OAuth prompt delivered to chat 123 (MCP [gmail])" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_app_not_built_logs_warning(self, caplog):
+        """Without _app, the prompt is not sent and a warning is logged."""
+        from telegram_interface import TelegramInterface
+
+        iface = TelegramInterface.__new__(TelegramInterface)
+        iface._app = None
+        iface._loop = MagicMock()
+        caplog.set_level(logging.WARNING, logger="telegram_interface")
+
+        iface.send_oauth_prompt(123, "gmail", "https://auth.example.com")
+
+        assert len(self._captured) == 0
+        assert any("app not built" in rec.message for rec in caplog.records)
+
+    def test_loop_not_running_logs_warning(self, caplog):
+        """Without a running loop, the prompt is not sent and a warning is logged."""
+        iface = self._make_iface_with_app()
+        iface._loop.is_running.return_value = False
+        caplog.set_level(logging.WARNING, logger="telegram_interface")
+
+        iface.send_oauth_prompt(123, "gmail", "https://auth.example.com")
+
+        assert len(self._captured) == 0
+        iface._app.bot.send_message.assert_not_called()
+        assert any("loop not running" in rec.message for rec in caplog.records)
+
+    def test_send_message_failure_logs_warning(self, caplog):
+        """An exception from bot.send_message is caught and logged."""
+        iface = self._make_iface_with_app()
+        iface._app.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        caplog.set_level(logging.WARNING, logger="telegram_interface")
+
+        iface.send_oauth_prompt(123, "gmail", "https://auth.example.com")
+
+        assert len(self._captured) == 1
+        coro, _loop = self._captured[0]
+        asyncio.run(coro)
+        assert any(
+            "Failed to send OAuth prompt for MCP [gmail] to chat 123" in rec.message
+            for rec in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------

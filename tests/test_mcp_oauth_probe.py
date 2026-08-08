@@ -484,12 +484,15 @@ class TestProbeAuthUrlSentViaTelegram:
         monkeypatch.setattr(CallbackServer, "start", AsyncMock(return_value=None))
         monkeypatch.setattr(CallbackServer, "stop", AsyncMock(return_value=None))
 
-        tg_iface = MagicMock()
-        tg_iface.app.bot.send_message = AsyncMock()
+        class _TgIface:
+            def __init__(self):
+                self.send_oauth_prompt = MagicMock()
+
+        tg_iface = _TgIface()
 
         # Build the redirect handler that sends the auth URL to Telegram
         redirect_handler = mcp_oauth.make_redirect_handler(
-            tg_iface, "srv", cb_server, chat_id=123, trace=False
+            tg_iface, "srv", cb_server, chat_id=123, trace=False, timeout=300
         )
 
         # Custom httpx.Auth that simulates the SDK's async_auth_flow:
@@ -553,15 +556,12 @@ class TestProbeAuthUrlSentViaTelegram:
         assert status == 200
         assert error is None
         # The auth URL should have been sent via Telegram
-        tg_iface.app.bot.send_message.assert_awaited_once()
-        call_kwargs = tg_iface.app.bot.send_message.call_args.kwargs
-        assert call_kwargs["chat_id"] == 123
-        # The auth URL should be in the InlineKeyboardButton
-        reply_markup = call_kwargs["reply_markup"]
-        # InlineKeyboardMarkup has inline_keyboard attribute
-        keyboard = reply_markup.inline_keyboard
-        authorize_button = keyboard[0][0]
-        assert authorize_button.url == auth_url_sent
+        tg_iface.send_oauth_prompt.assert_called_once()
+        call_args = tg_iface.send_oauth_prompt.call_args.args
+        assert call_args[0] == 123  # chat_id
+        assert call_args[1] == "srv"  # server_name
+        assert call_args[2] == auth_url_sent  # auth_url
+        assert call_args[3] == 300  # timeout
 
 
 class TestProbePostRetry:

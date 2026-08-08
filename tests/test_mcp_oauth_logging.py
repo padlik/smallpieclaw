@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -258,10 +258,12 @@ class TestTraceGatedAuthUrlLogging:
             loop=loop,
         )
 
-    def _make_tg_iface(self) -> MagicMock:
-        tg_iface = MagicMock()
-        tg_iface.app.bot.send_message = AsyncMock()
-        return tg_iface
+    def _make_tg_iface(self):
+        class _TgIface:
+            def __init__(self):
+                self.send_oauth_prompt = MagicMock()
+
+        return _TgIface()
 
     def _run_handler(self, tmp_path: Path, monkeypatch, *, trace: bool, url: str) -> None:
         cb_server = self._make_cb_server(tmp_path)
@@ -300,3 +302,30 @@ class TestTraceGatedAuthUrlLogging:
         # Handler ran far enough to emit its INFO events, so absence is meaningful.
         assert any("redirect_handler called" in rec.message for rec in caplog.records)
         assert not any(auth_url in rec.message for rec in caplog.records)
+
+    def test_no_send_oauth_prompt_logs_warning_with_url(
+        self, tmp_path: Path, caplog, monkeypatch
+    ) -> None:
+        """When tg_iface has no send_oauth_prompt, the URL is logged as a warning."""
+        auth_url = "https://auth.example.com/authorize?client_id=abc&state=s3"
+        cb_server = self._make_cb_server(tmp_path)
+
+        async def fake_start(self) -> None:
+            return None
+
+        monkeypatch.setattr(CallbackServer, "start", fake_start)
+
+        # tg_iface without send_oauth_prompt
+        class _BareTgIface:
+            pass
+
+        handler = make_redirect_handler(
+            _BareTgIface(), "srv", cb_server, chat_id=123, trace=False
+        )
+        caplog.set_level(logging.WARNING, logger="mcp_oauth")
+        asyncio.run(handler(auth_url))
+
+        assert any(
+            "no send_oauth_prompt" in rec.message and auth_url in rec.message
+            for rec in caplog.records
+        )

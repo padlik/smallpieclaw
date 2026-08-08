@@ -791,6 +791,15 @@ async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
             await _mcp_auth_revoke(iface, update, ctx, revoke_name)
             return
 
+        timeout = iface.mcp_manager.get_oauth_timeout(name)
+        timeout_str = f"{timeout // 60} min" if timeout >= 60 else f"{timeout} sec"
+        await update.effective_message.reply_text(
+            f"🔐 Starting OAuth flow for <code>{html.escape(name)}</code>…\n"
+            f"An authorization link will appear here shortly "
+            f"(timeout: {timeout_str}).",
+            parse_mode=ParseMode.HTML,
+        )
+
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None, iface.mcp_manager.start_oauth_flow, name, update.effective_chat.id
@@ -862,7 +871,7 @@ async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
                 f"❌ MCP server <code>{html.escape(name)}</code> not found.",
                 parse_mode=ParseMode.HTML)
             return
-        status_icon = {"active": "●", "off": "○", "error": "⚠️"}.get(info["status"], "?")
+        status_icon = {"active": "●", "off": "○", "error": "⚠️", "needs_auth": "🔐"}.get(info["status"], "?")
         lines = [
             f"🔌 <b>MCP Server: {html.escape(name)}</b>",
             f"  Status:    {status_icon} {info['status']}",
@@ -895,15 +904,20 @@ async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
         return
     lines = ["🔌 <b>MCP Servers</b>\n"]
     for s in servers:
-        icon = "●" if s["status"] == "active" else ("○" if s["status"] == "off" else "⚠️")
+        icon = {"active": "●", "off": "○", "needs_auth": "🔐"}.get(s["status"], "⚠️")
         tools_str = f"  — {s['tool_count']} tool(s)" if s["tool_count"] else ""
         err_str = "  ⚠️ error" if s["last_error"] else ""
+        if s["status"] == "needs_auth":
+            auth_hint = " — auth required, use /mcp auth &lt;name&gt;"
+        else:
+            auth_hint = ""
         lines.append(
             f"{icon} <b>{html.escape(s['name'])}</b>"
-            f"  [{s['transport']}]  {s['status']}{tools_str}{err_str}"
+            f"  [{s['transport']}]  {s['status']}{auth_hint}{tools_str}{err_str}"
         )
     lines.append(
-        "\n<i>Tip: /mcp on &lt;name&gt; · /mcp off &lt;name&gt; · /mcp info &lt;name&gt;</i>"
+        "\n<i>Tip: /mcp on &lt;name&gt; · /mcp off &lt;name&gt; · /mcp info &lt;name&gt;"
+        " · /mcp auth &lt;name&gt; · /mcp auth status</i>"
     )
     for chunk in iface._split_message("\n".join(lines)):
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
