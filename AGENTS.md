@@ -94,7 +94,9 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 
 **Execution harness** (`tests/execution_harness.py`): `ScriptedLLM`, `RecordingExecutor`, `run_react()` for deterministic multi-step ReAct testing without network, Telegram, or graph DB.
 
-**Graph memory tests:** `test_graph_memory_e2e.py` uses `pytest.importorskip("ladybug")` — entire module skips when ladybug not installed. `test_graph_memory_integration.py` tests wiring without real DB.
+**Graph memory tests:** `test_graph_memory_e2e.py` uses `pytest.importorskip("ladybug")` — entire module skips when ladybug not installed. `test_graph_memory_integration.py` tests wiring without real DB. **Ladybug IS installed** in the project venv (`.venv/`, Python 3.14, ladybug 0.18.3) — the e2e tests run and pass (6/6). They do NOT skip in this environment.
+
+**Full suite baseline:** `make check` (lint + test) yields **1627 passed, 1 skipped**. The single skip is `test_access_control.py::TestIsContained::test_normcase_case_insensitive` — a platform-specific test that skips on macOS because `os.path.normcase` is a no-op on case-insensitive filesystems. It is unrelated to any dependency or code change. No tests skip due to missing packages.
 
 **Mocking:** Tests use `unittest.mock` (MagicMock, patch). No external mocking frameworks.
 
