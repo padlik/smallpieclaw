@@ -13,4 +13,6 @@ ADR review completed for this change.
 
 ## New Durable ADRs Created
 
-- None — no major durable architectural decisions were introduced. This change fixes a bug (missing `token_endpoint_auth_method` in the pre-seeded `OAuthClientInformationFull`) via tactical implementation choices (defaulted constructor param, fill-if-None on cached path, sourcing from `client_metadata`). These are scoped to `FileTokenStorage` and do not establish a new pattern, boundary, or cross-cutting commitment.
+- None — no major durable architectural decisions were introduced. This change fixes a bug (missing `token_endpoint_auth_method` in the pre-seeded `OAuthClientInformationFull`) via two tactical implementation choices: a defaulted constructor param on `FileTokenStorage`, and including the value in the pre-seed. These are scoped to `FileTokenStorage` and do not establish a new pattern, boundary, or cross-cutting commitment.
+
+  Note: an earlier draft of this change also sourced the value from `client_metadata` in `build()` and repaired the cached return path via fill-if-None. Both were removed after a post-implementation code review proved them inert — see `review-log.md`. Neither reached the shipped implementation, so neither bears on this ADR review.
