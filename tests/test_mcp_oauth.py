@@ -37,6 +37,27 @@ def _run_async(loop: asyncio.AbstractEventLoop, coro):
     return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
 
+def _insecure_ssl_context() -> ssl.SSLContext:
+    """Client context that accepts the tests' self-signed cert."""
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _port_is_listening(host: str, port: int) -> bool:
+    """Return True if a TCP connect to ``host:port`` is accepted.
+
+    Used to assert the OAuth callback listener is really gone, not just that the
+    server object's handle was cleared.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        return sock.connect_ex((host, port)) == 0
+
+
 def _make_self_signed_cert(tmp_path: Path) -> tuple[str, str]:
     cert_path = tmp_path / "cert.pem"
     key_path = tmp_path / "key.pem"
@@ -319,6 +340,149 @@ class TestCallbackServer:
             assert state == "teststate"
         finally:
             _run_async(self.loop, server.stop())
+
+    def test_callback_handler_closes_listener_on_success(self, tmp_path: Path):
+        """The port must close the moment the code arrives, not when the flow ends."""
+        from mcp_oauth import make_callback_handler
+
+        server = self._make_server(tmp_path)
+        _run_async(self.loop, server.start())
+        host, port = server._server.sockets[0].getsockname()[:2]
+        handler = make_callback_handler(server, timeout=5.0)
+
+        async def _drive() -> tuple[str, str | None]:
+            waiting = asyncio.ensure_future(handler())
+            await asyncio.sleep(0)
+            reader, writer = await asyncio.open_connection(
+                host, port, ssl=_insecure_ssl_context()
+            )
+            writer.write(b"GET /?code=c1&state=s1 HTTP/1.1\r\n\r\n")
+            await writer.drain()
+            _ = await reader.read(4096)
+            writer.close()
+            await writer.wait_closed()
+            return await waiting
+
+        code, state = _run_async(self.loop, _drive())
+        assert (code, state) == ("c1", "s1"), "the result must survive the early close"
+        assert server._server is None, "listener must be closed once the code arrives"
+        assert not _port_is_listening(host, port), f"port {port} still accepting"
+
+    def test_bind_all_interfaces_delivers_success_page_before_close(self, tmp_path: Path):
+        """A remote browser must still get the full success page despite the early close.
+
+        The approval sequence can run on a different host, so ``callback_bind``
+        defaults to ``0.0.0.0`` and must keep working. ``_handle`` resolves the
+        future (mcp_oauth.py:323) *before* writing the success page, so the
+        handler's close races the response flush. That is safe because
+        ``Server.close()`` closes only listening sockets and leaves accepted
+        connections to finish — this test pins that guarantee.
+        """
+        from mcp_oauth import make_callback_handler
+
+        cert_path, key_path = _make_self_signed_cert(tmp_path)
+        server = CallbackServer(
+            port=0,
+            bind="0.0.0.0",
+            cert_path=cert_path,
+            key_path=key_path,
+            loop=self.loop,
+        )
+        _run_async(self.loop, server.start())
+        bound = [sk.getsockname() for sk in server._server.sockets]
+        assert any(addr == "0.0.0.0" for addr, *_ in bound), (
+            f"must bind all interfaces for off-box approval, got {bound}"
+        )
+        port = bound[0][1]
+        server.set_expected_state("st8")
+        handler = make_callback_handler(server, timeout=5.0)
+
+        async def _drive() -> tuple[bytes, tuple[str, str | None]]:
+            waiting = asyncio.ensure_future(handler())
+            await asyncio.sleep(0)
+            # 0.0.0.0 covers loopback, so this exercises the all-interfaces bind
+            # without depending on a routable LAN address being present.
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", port, ssl=_insecure_ssl_context()
+            )
+            writer.write(b"GET /?code=remote1&state=st8 HTTP/1.1\r\nHost: x\r\n\r\n")
+            await writer.drain()
+            payload = await reader.read(8192)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+            return payload, await waiting
+
+        payload, (code, state) = _run_async(self.loop, _drive())
+
+        assert b"200 OK" in payload
+        assert b"Auth complete, close this tab" in payload, (
+            "early close truncated the response to the remote browser"
+        )
+        assert (code, state) == ("remote1", "st8")
+        assert server._server is None
+        assert not _port_is_listening("127.0.0.1", port)
+
+    def test_callback_handler_closes_listener_on_timeout(self, tmp_path: Path):
+        """A flow that never receives a callback must not leak the port either."""
+        from mcp_oauth import make_callback_handler
+
+        server = self._make_server(tmp_path)
+        _run_async(self.loop, server.start())
+        host, port = server._server.sockets[0].getsockname()[:2]
+        handler = make_callback_handler(server, timeout=0.05)
+
+        with pytest.raises(asyncio.TimeoutError):
+            _run_async(self.loop, handler())
+
+        assert server._server is None
+        assert not _port_is_listening(host, port), f"port {port} leaked after timeout"
+
+    def test_callback_server_is_restartable_after_stop(self, tmp_path: Path):
+        """stop() must leave the instance reusable, not silently dead.
+
+        Closing early is only safe if a second flow on the same instance really
+        rebinds: start() previously no-opped because stop() left ``_server`` set,
+        and the once-created future stayed cancelled.
+        """
+        server = self._make_server(tmp_path)
+        _run_async(self.loop, server.start())
+        assert server._server is not None
+        _run_async(self.loop, server.stop())
+        assert server._server is None
+
+        _run_async(self.loop, server.start())
+        assert server._server is not None, "start() after stop() must rebind"
+        assert not server._future.done(), "a reused instance needs a fresh future"
+
+        host, port = server._server.sockets[0].getsockname()[:2]
+
+        async def _send() -> None:
+            reader, writer = await asyncio.open_connection(
+                host, port, ssl=_insecure_ssl_context()
+            )
+            writer.write(b"GET /?code=second&state=s2 HTTP/1.1\r\n\r\n")
+            await writer.drain()
+            _ = await reader.read(4096)
+            writer.close()
+            await writer.wait_closed()
+
+        try:
+            _run_async(self.loop, _send())
+            code, _ = _run_async(self.loop, server.wait_for_callback(timeout=5.0))
+            assert code == "second", "the second flow must resolve its own callback"
+        finally:
+            _run_async(self.loop, server.stop())
+
+    def test_stop_is_idempotent(self, tmp_path: Path):
+        """The owning flow's finally-block stop() must stay a harmless backstop."""
+        server = self._make_server(tmp_path)
+        _run_async(self.loop, server.start())
+        _run_async(self.loop, server.stop())
+        _run_async(self.loop, server.stop())
+        assert server._server is None
 
     def test_callback_server_accepts_non_root_redirect_path(self, tmp_path: Path):
         """Callback server must accept redirect_uris with a real path (e.g. /callback)."""
