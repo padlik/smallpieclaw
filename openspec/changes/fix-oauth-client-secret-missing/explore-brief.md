@@ -49,3 +49,34 @@ MCP SDK (oauth2.py):
 ## Open Questions
 
 - None blocking. Future enhancement: make `token_endpoint_auth_method` configurable via `OAuthConfig` for `client_secret_post`-only providers. Not in scope for this fix.
+
+## Addendum — 2026-08-09 (post-implementation code review)
+
+A high-effort code review invalidated the premise on which **Option A was rejected**,
+and with it steps 2 and 3 of the Final Approach. Recorded here so the artifacts do
+not read as contradicting the brief.
+
+**Option A's rejection is void.** It was rejected because hardcoding in the pre-seed
+alone "leaves the cached-client_info return path latent-broken." That path is not
+latent-broken — it is **unreachable**. `get_client_info()` never returns `None` (it
+always falls back to the pre-seed), and both of the SDK's `set_client_info` calls sit
+behind `if not self.context.client_info:` (mcp/client/auth/oauth2.py:572), which a
+truthy pre-seed makes permanently false. No production run can write a `client_info`
+block, so no production run can read a stale one. A repo-wide grep confirms no other
+caller. The scenario the rejection guarded against cannot occur.
+
+**Step 2 (source from `client_metadata`) does not do what it claims.** `build()`
+hardcodes `token_endpoint_auth_method="client_secret_basic"` on `client_metadata` and
+`oauth_cfg` has no key for it, so reading the value back to pass into
+`FileTokenStorage` — whose default is the same string — is a tautology. Verified by
+mutation: deleting the kwarg left the entire test suite green. It cannot prevent
+drift, because there is no second source to drift from.
+
+**Step 3 (fill-if-None on the cached path)** repairs a state that cannot be reached,
+per the above.
+
+**Adopted approach:** effectively Option A — the defaulted constructor param (step 1)
+plus the pre-seed normalization only. Steps 2 and 3 are dropped as no-ops rather than
+kept as inert code. The `OAuthConfig` knob remains out of scope and is deferred to its
+own proposal; the consequence is that `client_secret_basic` is asserted for every
+OAuth MCP server, which is an accepted trade-off recorded in `design.md`.

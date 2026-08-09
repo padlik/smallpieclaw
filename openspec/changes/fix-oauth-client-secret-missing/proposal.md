@@ -4,11 +4,16 @@ OAuth token exchange with Google (Gmail MCP server) fails with `400 client_secre
 
 ## What Changes
 
-- Add a defaulted constructor parameter `token_endpoint_auth_method: str = "client_secret_basic"` to `FileTokenStorage.__init__`, sourced from `client_metadata.token_endpoint_auth_method` in `OAuthProviderFactory.build()` so storage and metadata can never drift.
-- Normalize **both** return paths in `get_client_info()`:
-  - Pre-seed path: include `token_endpoint_auth_method` in the constructed `OAuthClientInformationFull`.
-  - Cached path: fill-if-None via `model_copy(update={...})` so a stale cached block (persisted with `exclude_none=True`, reloading the field as `None`) is repaired without clobbering a legitimate DCR-provided method for non-Google providers.
-- Add regression tests covering both return paths.
+- Add a defaulted constructor parameter `token_endpoint_auth_method: str = "client_secret_basic"` to `FileTokenStorage.__init__`. The default is the sole source of the value; it is also the seam a future config knob plugs into.
+- Include `token_endpoint_auth_method` in the pre-seeded `OAuthClientInformationFull` returned by `get_client_info()`. This is the entire behavioral fix.
+- Add regression tests for the pre-seed path, the constructor default, and the pre-existing malformed-`client_info` fallback.
+
+**Deliberately not changed** (both were in an earlier draft of this proposal and were
+removed after a code review proved them inert — see `review-log.md` and the
+`explore-brief.md` addendum):
+
+- `OAuthProviderFactory.build()` does **not** pass the value into `FileTokenStorage`. `build()` hardcodes `token_endpoint_auth_method="client_secret_basic"` on `client_metadata` and `oauth_cfg` has no key for it, so reading it back to pass into storage — whose default is the same string — is a tautology that cannot prevent drift. Verified by mutation: deleting the kwarg left the whole suite green.
+- The cached return path of `get_client_info()` is **not** normalized. It is unreachable: `get_client_info()` never returns `None`, so both of the SDK's `set_client_info` calls (each guarded by `if not self.context.client_info:`) never run and no `client_info` block is ever written.
 
 ## Capabilities
 
@@ -18,11 +23,12 @@ OAuth token exchange with Google (Gmail MCP server) fails with `400 client_secre
 
 ### Modified Capabilities
 
-- `mcp-oauth-flow`: The pre-seeded client info returned by `FileTokenStorage.get_client_info()` SHALL include `token_endpoint_auth_method` so the SDK's `prepare_token_auth()` sends `client_secret` in the token exchange. Both the pre-seed and cached return paths are normalized.
+- `mcp-oauth-flow`: The pre-seeded client info returned by `FileTokenStorage.get_client_info()` SHALL include `token_endpoint_auth_method` so the SDK's `prepare_token_auth()` sends `client_secret` in the token exchange. Only the pre-seed return path is normalized; the cached path is left unchanged.
 
 ## Impact
 
-- **`mcp_oauth.py`**: `FileTokenStorage.__init__` gains a defaulted param; `get_client_info()` normalizes both return paths; `OAuthProviderFactory.build()` passes the method through from `client_metadata`.
-- **`mcp_client.py`**: Two non-test `FileTokenStorage` construction sites (`_prepare_oauth_provider` line 411, `get_token_info` line 613) are unaffected: the new param defaults to `client_secret_basic`, matching `build()`'s value, so they compile and behave unchanged.
-- **Tests**: New regression tests in `tests/test_mcp_oauth.py` asserting `token_endpoint_auth_method` is set for both pre-seed and cached paths. Existing test constructions of `FileTokenStorage` compile unchanged due to the defaulted param.
-- **No config schema changes**: The auth method is sourced from `client_metadata` (already set to `"client_secret_basic"` in `build()`), not from a new config field.
+- **`mcp_oauth.py`**: three added lines — `FileTokenStorage.__init__` gains a defaulted param and stores it; the `get_client_info()` pre-seed passes it to `OAuthClientInformationFull`. `OAuthProviderFactory.build()` and the cached return path are untouched.
+- **`mcp_client.py`**: Two non-test `FileTokenStorage` construction sites (`_prepare_oauth_provider` and `get_token_info`) are unaffected — the new param is defaulted, so they compile and behave unchanged.
+- **Tests**: Regression tests in `tests/test_mcp_oauth.py` for the pre-seed value, the constructor default, and the pre-existing malformed-block fallback, plus a `build()`-level assertion that the value reaches the provider's storage. Also repairs `test_token_storage_preserves_client_info`, which asserted only facts that were equally true of the pre-seed fallback and so never exercised the cached path it names. Existing constructions compile unchanged due to the defaulted param.
+- **No config schema changes.** The value is hardcoded via the constructor default.
+- **Accepted trade-off**: `client_secret_basic` is now asserted for *every* OAuth-protected MCP server, not just Google. A provider whose client is registered as public/PKCE-only could regress from working (no client authentication sent) to `401 invalid_client`. No such provider is configured or exercised today. Making the method configurable via `OAuthConfig` is deferred to its own proposal.

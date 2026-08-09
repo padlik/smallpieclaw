@@ -4,11 +4,11 @@
 
 The system SHALL store OAuth tokens per-server in JSON files resolved via `xdg_paths(agent_name).mcp_tokens_dir` (the `$XDG_STATE_HOME/<agent_name>/mcp_tokens/` directory), with `0600` file permissions. The storage SHALL implement the MCP SDK's `TokenStorage` protocol.
 
-The `FileTokenStorage` SHALL accept a `token_endpoint_auth_method` parameter (defaulting to `"client_secret_basic"`) so the pre-seeded `OAuthClientInformationFull` carries the auth method the SDK's `prepare_token_auth()` expects. The `OAuthProviderFactory.build()` SHALL source this parameter from `client_metadata.token_endpoint_auth_method` to prevent drift between the two objects.
+The `FileTokenStorage` SHALL accept a `token_endpoint_auth_method` parameter (defaulting to `"client_secret_basic"`) so the pre-seeded `OAuthClientInformationFull` carries the auth method the SDK's `prepare_token_auth()` expects.
 
-The `get_client_info()` method SHALL normalize `token_endpoint_auth_method` on both return paths:
-- **Pre-seed path**: the constructed `OAuthClientInformationFull` SHALL include `token_endpoint_auth_method` set to the storage's configured value.
-- **Cached path**: when a cached `client_info` block exists and the configured `client_secret` matches, if the cached block's `token_endpoint_auth_method` is `None`, it SHALL be filled with the storage's configured value. A non-`None` cached value SHALL be preserved (e.g. a method set by a real Dynamic Client Registration response for a non-Google provider).
+The `get_client_info()` method SHALL set `token_endpoint_auth_method` on its pre-seed return path: the constructed `OAuthClientInformationFull` SHALL include `token_endpoint_auth_method` set to the storage's configured value. When `get_client_info()` returns a persisted block — which it does only when that block's `client_secret` matches the configured one — it SHALL return it unmodified; on a `client_secret` mismatch the configured credentials take precedence and the pre-seed is returned instead, so a secret rotation takes effect.
+
+When a persisted `client_info` block cannot be parsed, `get_client_info()` SHALL log a warning and fall back to the pre-seed rather than raising, so a corrupt or schema-drifted block does not prevent connecting to the server.
 
 #### Scenario: Token storage path resolution
 - **GIVEN** the agent is running with `--agent-name <name>`
@@ -18,7 +18,8 @@ The `get_client_info()` method SHALL normalize `token_endpoint_auth_method` on b
 #### Scenario: Token file created with restrictive permissions
 - **GIVEN** an OAuth flow completes successfully for server `gmail`
 - **WHEN** the tokens are stored
-- **THEN** a file `$XDG_STATE_HOME/<name>/mcp_tokens/gmail.json` is created with `0600` permissions containing `access_token`, `refresh_token`, `expires_at`, `scope`, and `client_info`
+- **THEN** a file `$XDG_STATE_HOME/<name>/mcp_tokens/gmail.json` is created with `0600` permissions containing a `token` object carrying the fields the provider returned (`access_token` and `token_type`, plus `refresh_token`, `scope`, and `expires_in` when granted) and an `issued_at` stamp
+- **AND** a `client_info` block is present only if one was already persisted, since a normal flow never writes one
 
 #### Scenario: Token storage directory creation
 - **GIVEN** the `mcp_tokens_dir` does not exist on first boot
@@ -32,19 +33,12 @@ The `get_client_info()` method SHALL normalize `token_endpoint_auth_method` on b
 - **AND** the SDK skips Dynamic Client Registration
 - **AND** the SDK's `prepare_token_auth()` sends `client_secret` via HTTP Basic auth header in the token exchange request
 
-#### Scenario: Cached client info with missing token_endpoint_auth_method is repaired
-- **GIVEN** an MCP server has a stored token file with a cached `client_info` block whose `token_endpoint_auth_method` is `None` (e.g. persisted with `exclude_none=True`)
-- **AND** the cached `client_secret` matches the currently configured `client_secret`
+#### Scenario: Malformed cached client info falls back to the pre-seed
+- **GIVEN** an MCP server has a stored token file whose `client_info` block cannot be parsed into an `OAuthClientInformationFull` (e.g. hand-edited, or written by an older schema, so a required field such as `redirect_uris` is absent)
 - **WHEN** `FileTokenStorage.get_client_info()` is called
-- **THEN** the returned `OAuthClientInformationFull` has `token_endpoint_auth_method` filled with the storage's configured value
-- **AND** the SDK's `prepare_token_auth()` sends `client_secret` in the token exchange request
-
-#### Scenario: Cached client info with DCR-provided auth method is preserved
-- **GIVEN** an MCP server has a stored token file with a cached `client_info` block whose `token_endpoint_auth_method` is `"client_secret_post"` (set by a real Dynamic Client Registration response for a non-Google provider)
-- **AND** the cached `client_secret` matches the currently configured `client_secret`
-- **WHEN** `FileTokenStorage.get_client_info()` is called
-- **THEN** the returned `OAuthClientInformationFull` retains `token_endpoint_auth_method="client_secret_post"` unchanged
-- **AND** the SDK's `prepare_token_auth()` sends `client_secret` in the request body
+- **THEN** a warning naming the server is logged and no exception propagates
+- **AND** the returned `OAuthClientInformationFull` is the pre-seed built from config, carrying `token_endpoint_auth_method`
+- **AND** the connection attempt proceeds instead of failing
 
 #### Scenario: Token revocation
 - **GIVEN** a server `gmail` has stored tokens
