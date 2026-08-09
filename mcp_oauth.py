@@ -248,6 +248,11 @@ class CallbackServer:
         """
         if self._server is not None:
             return
+        if self._future.done():
+            # A previous flow resolved or cancelled the future. Replace it so
+            # this flow waits on its own callback instead of instantly reusing
+            # the old result (or raising the old CancelledError).
+            self._future = self.loop.create_future()
         ssl_context = self._build_ssl_context()
         try:
             self._server = await asyncio.start_server(
@@ -345,10 +350,22 @@ class CallbackServer:
         return await asyncio.wait_for(self._future, timeout=timeout)
 
     async def stop(self) -> None:
-        """Close the server socket and cancel the pending future."""
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+        """Close the server socket and cancel any still-pending future.
+
+        Idempotent, and leaves the instance restartable: ``_server`` is reset to
+        ``None`` so a later :meth:`start` binds a fresh socket rather than
+        silently no-opping. Safe to call while a callback result is already
+        resolved — a completed future is left intact so a caller that has not yet
+        read it still can.
+        """
+        server, self._server = self._server, None
+        if server is not None:
+            # close() is synchronous and stops accepting immediately; clear the
+            # handle first so a CancelledError during wait_closed() cannot leave
+            # the instance believing it is still listening.
+            server.close()
+            logger.info("MCP OAuth callback server stopped on %s:%d", self.bind, self.port)
+            await server.wait_closed()
         if not self._future.done():
             self._future.cancel()
 
@@ -370,9 +387,12 @@ class OAuthProviderFactory:
             server_cfg: Raw MCP server dict. Must contain ``name``, ``url``,
                 and an ``oauth`` subsection with the OAuth fields.
             mcp_tokens_dir: Directory for persisting tokens.
-            cb_server: An already-started ``CallbackServer`` that will receive
-                the OAuth redirect.  The caller is responsible for starting
-                and stopping it.
+            cb_server: A ``CallbackServer`` that will receive the OAuth redirect.
+                May be unstarted — the redirect handler starts it lazily, and the
+                callback handler stops it as soon as the code arrives, so the
+                caller need not stop it. A caller that starts it up front should
+                still stop it in a ``finally`` as a backstop, for flows that abort
+                before the redirect ever fires.
             tg_iface: Optional Telegram interface used to forward the auth URL.
             chat_id: Chat ID to send the authorization prompt to. Required when
                 ``tg_iface`` is provided for interactive flows.
@@ -523,11 +543,21 @@ def make_callback_handler(
 ) -> Callable[[], Awaitable[tuple[str, str | None]]]:
     """Return an async handler that awaits the callback server result.
 
+    The listener is closed as soon as the callback resolves — before token
+    exchange and session initialization — so the port is exposed only for the
+    window it is actually needed. Closing here also covers the lazily-started
+    fallback flow, whose callback server has no other owner to stop it.
+
     Args:
         cb_server: Callback server that will receive the OAuth redirect.
         timeout: Maximum seconds to wait for the OAuth callback.
     """
     async def _handler() -> tuple[str, str | None]:
-        return await cb_server.wait_for_callback(timeout=timeout)
+        try:
+            return await cb_server.wait_for_callback(timeout=timeout)
+        finally:
+            # Also runs on timeout and cancellation. stop() is idempotent, so the
+            # owning flow's own finally-block stop() remains a harmless backstop.
+            await cb_server.stop()
 
     return _handler
