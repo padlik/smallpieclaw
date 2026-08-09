@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import ssl
 import threading
 from pathlib import Path
@@ -106,6 +108,40 @@ class TestFileTokenStorage:
         mode = (tmp_path / "srv.json").stat().st_mode & 0o777
         assert mode == 0o600
 
+    def test_token_file_payload_shape(self, tmp_path: Path):
+        """The written file nests the grant under ``token`` and stamps ``issued_at``.
+
+        Asserted on the raw JSON rather than through ``get_tokens()``, which reads
+        ``data.get("token") or data`` and so accepts a flat layout too — a read-back
+        test cannot tell the two shapes apart.
+        """
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        asyncio.run(
+            storage.set_tokens(
+                OAuthToken(
+                    access_token="a",
+                    refresh_token="r",
+                    scope="read",
+                    expires_in=3600,
+                )
+            )
+        )
+
+        payload = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert set(payload) == {"token"}, "a normal flow writes no client_info block"
+        token = payload["token"]
+        assert token["access_token"] == "a"
+        assert token["token_type"] == "Bearer"
+        assert token["refresh_token"] == "r"
+        assert token["scope"] == "read"
+        assert token["expires_in"] == 3600
+        assert isinstance(token["issued_at"], float)
+
     def test_token_storage_pre_seeded_client_info(self, tmp_path: Path):
         storage = FileTokenStorage(
             server_name="srv",
@@ -142,6 +178,14 @@ class TestFileTokenStorage:
         assert loaded.access_token == "second"
 
     def test_token_storage_preserves_client_info(self, tmp_path: Path):
+        """A persisted client_info block survives a later token write and is reused.
+
+        The cached ``client_id`` deliberately differs from the storage's configured
+        one (as a real DCR response would), so the assertions cannot pass via the
+        pre-seed fallback. ``redirect_uris`` must be non-None: ``set_client_info``
+        persists with ``exclude_none=True``, and a dropped ``redirect_uris`` makes
+        the block unparseable on reload, silently falling through to the pre-seed.
+        """
         storage = FileTokenStorage(
             server_name="srv",
             mcp_tokens_dir=tmp_path,
@@ -149,15 +193,77 @@ class TestFileTokenStorage:
             client_secret="csec",
         )
         info = OAuthClientInformationFull(
-            client_id="cid",
+            client_id="dcr-cid",
             client_secret="csec",
-            redirect_uris=None,
+            redirect_uris=["https://localhost:8765/callback"],
         )
         asyncio.run(storage.set_client_info(info))
         asyncio.run(storage.set_tokens(OAuthToken(access_token="a")))
         reloaded = asyncio.run(storage.get_client_info())
         assert reloaded is not None
-        assert reloaded.client_id == "cid"
+        assert reloaded.client_id == "dcr-cid", "expected the cached path, not pre-seed"
+        assert reloaded.client_secret == "csec"
+
+    def test_pre_seed_includes_token_endpoint_auth_method(self, tmp_path: Path):
+        """Pre-seed path carries the auth method so prepare_token_auth() sends the secret.
+
+        Configures ``client_secret_post`` — deliberately *not* the constructor
+        default — so the assertion fails if the parameter is ignored and the
+        default is emitted instead. ``test_token_endpoint_auth_method_defaults_to_basic``
+        covers the default separately.
+        """
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+            token_endpoint_auth_method="client_secret_post",
+        )
+        info = asyncio.run(storage.get_client_info())
+        assert info is not None
+        assert info.token_endpoint_auth_method == "client_secret_post"
+
+    def test_malformed_cached_client_info_falls_back_to_pre_seed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """An unparseable client_info block degrades to the pre-seed, not an exception.
+
+        The bad block is written straight to the file rather than round-tripped
+        through ``set_client_info``, so this covers the ``except (TypeError,
+        ValueError)`` handler independently of how client_info is persisted.
+        """
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        # redirect_uris is required by the SDK model, so omitting it fails validation.
+        (tmp_path / "srv.json").write_text(
+            json.dumps({"client_info": {"client_id": "dcr-cid", "client_secret": "csec"}}),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="mcp_oauth"):
+            info = asyncio.run(storage.get_client_info())
+
+        assert info is not None, "malformed client_info must not abort the OAuth flow"
+        assert info.client_id == "cid", "expected the pre-seed, not the malformed block"
+        assert info.token_endpoint_auth_method == "client_secret_basic"
+        assert "malformed" in caplog.text
+
+    def test_token_endpoint_auth_method_defaults_to_basic(self, tmp_path: Path):
+        """Existing construction sites that omit the param keep working."""
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        assert storage.token_endpoint_auth_method == "client_secret_basic"
+        info = asyncio.run(storage.get_client_info())
+        assert info is not None
+        assert info.token_endpoint_auth_method == "client_secret_basic"
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +440,7 @@ class TestOAuthProviderFactory:
             loop.close()
 
         assert provider is not None
+        assert provider.context.storage.token_endpoint_auth_method == "client_secret_basic"
 
     def test_redirect_handler_no_telegram_is_noop(self, tmp_path: Path):
         from mcp_oauth import CallbackServer, make_redirect_handler

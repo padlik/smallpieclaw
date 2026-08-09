@@ -42,11 +42,13 @@ class FileTokenStorage:
         mcp_tokens_dir: Path,
         client_id: str,
         client_secret: str,
+        token_endpoint_auth_method: str = "client_secret_basic",
     ) -> None:
         self.server_name = server_name
         self.mcp_tokens_dir = mcp_tokens_dir
         self.client_id = client_id
         self.client_secret = client_secret
+        self.token_endpoint_auth_method = token_endpoint_auth_method
         self._token_file = mcp_tokens_dir / f"{server_name}.json"
 
     def _read_file(self) -> dict[str, Any] | None:
@@ -186,6 +188,7 @@ class FileTokenStorage:
             client_id=self.client_id,
             client_secret=self.client_secret,
             redirect_uris=None,
+            token_endpoint_auth_method=self.token_endpoint_auth_method,
         )
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
