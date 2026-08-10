@@ -223,6 +223,68 @@ class TestValidation:
         assert oauth is not None
         assert oauth.callback_port == 8000
         assert oauth.callback_bind == "0.0.0.0"
+        assert oauth.extra_auth_params == {}
+
+    def test_mcp_oauth_extra_auth_params_table(self, minimal_config):
+        """A TOML table round-trips and coerces keys/values to str."""
+        minimal_config["mcp_servers"] = [{
+            "name": "gmail",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "oauth": {
+                "client_id": "id",
+                "client_secret": "secret",
+                "redirect_uri": "https://ddns.example.com/callback",
+                "scope": "https://mail.google.com/",
+                "cert_path": "/etc/letsencrypt/live/ddns/fullchain.pem",
+                "key_path": "/etc/letsencrypt/live/ddns/privkey.pem",
+                "extra_auth_params": {"access_type": "offline", "prompt": "consent"},
+            },
+        }]
+        cfg = parse_config(minimal_config)
+        oauth = cfg.mcp_servers[0].oauth
+        assert oauth is not None
+        assert oauth.extra_auth_params == {"access_type": "offline", "prompt": "consent"}
+
+    def test_mcp_oauth_extra_auth_params_coerces_non_string(self, minimal_config):
+        """Non-string values in the table are coerced to str."""
+        minimal_config["mcp_servers"] = [{
+            "name": "gmail",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "oauth": {
+                "client_id": "id",
+                "client_secret": "secret",
+                "redirect_uri": "https://ddns.example.com/callback",
+                "scope": "https://mail.google.com/",
+                "cert_path": "/etc/letsencrypt/live/ddns/fullchain.pem",
+                "key_path": "/etc/letsencrypt/live/ddns/privkey.pem",
+                "extra_auth_params": {"flag": True},
+            },
+        }]
+        cfg = parse_config(minimal_config)
+        oauth = cfg.mcp_servers[0].oauth
+        assert oauth is not None
+        assert oauth.extra_auth_params == {"flag": "True"}
+
+    def test_mcp_oauth_extra_auth_params_non_table_raises(self, minimal_config):
+        """A non-table value for extra_auth_params raises ConfigError."""
+        minimal_config["mcp_servers"] = [{
+            "name": "gmail",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "oauth": {
+                "client_id": "id",
+                "client_secret": "secret",
+                "redirect_uri": "https://ddns.example.com/callback",
+                "scope": "https://mail.google.com/",
+                "cert_path": "/etc/letsencrypt/live/ddns/fullchain.pem",
+                "key_path": "/etc/letsencrypt/live/ddns/privkey.pem",
+                "extra_auth_params": "not-a-table",
+            },
+        }]
+        with pytest.raises(ConfigError, match="extra_auth_params must be a table"):
+            parse_config(minimal_config)
 
     def test_mcp_missing_name(self, minimal_config):
         minimal_config["mcp_servers"] = [{

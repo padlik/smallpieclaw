@@ -463,6 +463,12 @@ class OAuthConfig:
     # production use. Read at runtime from the raw ``oauth`` dict by
     # ``OAuthProviderFactory.build``; this typed field is for validation only.
     trace: bool = False
+    # Provider-specific authorization parameters injected into the auth URL
+    # via the SDK's redirect_handler hook.  Used for extensions the MCP SDK
+    # does not send itself — e.g. Google requires ``access_type=offline`` and
+    # ``prompt=consent`` to return a refresh_token.  Keys are param names,
+    # values are param values.  Default: empty dict (no injection).
+    extra_auth_params: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -644,6 +650,18 @@ def _parse_oauth(entry: dict, server_name: str) -> OAuthConfig | None:
         )
 
     section = f"mcp_servers.{server_name}.oauth"
+
+    # Parse extra_auth_params: a TOML table of string→string mappings.
+    raw_extra = oauth.get("extra_auth_params")
+    if raw_extra is None:
+        extra_auth_params: dict[str, str] = {}
+    elif isinstance(raw_extra, dict):
+        extra_auth_params = {str(k): str(v) for k, v in raw_extra.items()}
+    else:
+        raise ConfigError(
+            f"{section}.extra_auth_params must be a table, got {type(raw_extra).__name__}"
+        )
+
     return OAuthConfig(
         client_id=_require(oauth, "client_id", section),
         client_secret=_require(oauth, "client_secret", section),
@@ -656,6 +674,7 @@ def _parse_oauth(entry: dict, server_name: str) -> OAuthConfig | None:
         ),
         callback_bind=oauth.get("callback_bind", "0.0.0.0"),
         trace=_parse_bool(oauth.get("trace", False), f"{section}.trace"),
+        extra_auth_params=extra_auth_params,
     )
 
 

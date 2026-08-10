@@ -331,6 +331,18 @@ key_path      = "/path/to/key.pem"
 # Diagnostic flag: logs the full authorization URL at INFO when true.
 # Not for production use — enable only when diagnosing OAuth issues.
 trace         = false
+
+# Provider-specific authorization parameters (optional).
+# The MCP SDK sends only spec-standard params (response_type, client_id,
+# redirect_uri, state, code_challenge, code_challenge_method). Some providers
+# need extra params — e.g. Google requires access_type=offline and
+# prompt=consent to return a refresh_token. Without a refresh_token the
+# access_token expires in ~1 hour and re-auth via browser is needed.
+# Keys are param names, values are param values. Default: empty (no injection).
+# Note: prompt=consent is a standard OIDC param — non-Google OIDC servers
+# (Okta, Auth0, Microsoft) will honor it and force the consent screen.
+# Only set this for providers that need it.
+extra_auth_params = { access_type = "offline", prompt = "consent" }
 ```
 
 **Setup steps:**
@@ -358,7 +370,7 @@ trace         = false
 
 **Token management:**
 
-- **Automatic refresh:** When a tool call returns 401, the agent automatically refreshes the token using the stored refresh token (outbound only, no callback needed)
+- **Automatic refresh:** When a tool call returns 401, the agent automatically refreshes the token using the stored refresh token (outbound only, no callback needed). This requires Google servers to have returned a refresh token — make sure `extra_auth_params` includes `access_type = "offline"` for Google flows.
 - **Manual re-auth:** Run `/mcp auth gmail` again to revoke and re-authenticate
 - **Token status:** Run `/mcp auth status` to see expiry times and refresh token availability
 - **Revoke tokens:** Run `/mcp auth revoke gmail` to delete stored tokens and disconnect the server

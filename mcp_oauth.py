@@ -19,7 +19,7 @@ import ssl
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
@@ -188,7 +188,7 @@ class FileTokenStorage:
             client_id=self.client_id,
             client_secret=self.client_secret,
             redirect_uris=None,
-            token_endpoint_auth_method=self.token_endpoint_auth_method,
+            token_endpoint_auth_method=self.token_endpoint_auth_method,  # type: ignore[arg-type]
         )
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
@@ -307,7 +307,7 @@ class CallbackServer:
             # set, the incoming state MUST match — a missing state is rejected.
             validated_state = self.expected_state is not None
             if validated_state:
-                if state is None or not secrets.compare_digest(self.expected_state, state):
+                if state is None or not secrets.compare_digest(self.expected_state or "", state or ""):
                     logger.warning(
                         "MCP OAuth callback state mismatch: expected=%s... got=%s... — "
                         "possible CSRF or misdirected redirect",
@@ -422,7 +422,8 @@ class OAuthProviderFactory:
         trace = oauth_cfg.get("trace", False)
         timeout = int(oauth_cfg.get("timeout", 300))
         redirect_handler = make_redirect_handler(
-            tg_iface, name, cb_server, chat_id=chat_id, trace=trace, timeout=timeout
+            tg_iface, name, cb_server, chat_id=chat_id, trace=trace, timeout=timeout,
+            extra_auth_params=oauth_cfg.get("extra_auth_params", {}),
         )
         callback_handler = make_callback_handler(cb_server, timeout=timeout)
 
@@ -443,6 +444,7 @@ def make_redirect_handler(
     chat_id: int | None = None,
     trace: bool = False,
     timeout: int = 300,
+    extra_auth_params: dict[str, str] | None = None,
 ) -> Callable[[str], Awaitable[None]]:
     """Return an async handler that forwards the auth URL to Telegram.
 
@@ -458,7 +460,19 @@ def make_redirect_handler(
         trace: When ``True``, log the full authorization URL at INFO. The
             URL contains ``client_id`` and ``scope`` — diagnostic-only.
         timeout: OAuth flow timeout in seconds, surfaced in the prompt text.
+        extra_auth_params: Additional query parameters to append to the
+            authorization URL before forwarding it to the user.  Used for
+            provider-specific extensions the MCP SDK does not send itself.
+            Default is an empty dict (no injection).  Google flows that
+            need a ``refresh_token`` should pass
+            ``{"access_type": "offline", "prompt": "consent"}``; other
+            providers generally should leave this empty because
+            ``prompt=consent`` is a standard OIDC parameter that forces a
+            consent screen on every re-auth.  Parameters already present
+            in the URL are never overwritten.
     """
+    _extra = extra_auth_params or {}
+
     async def _handler(auth_url: str) -> None:
         # Lazily start the callback server here so a fallback full-redirect
         # flow (e.g. a stored refresh token turning out to be invalid during
@@ -469,10 +483,25 @@ def make_redirect_handler(
         # Extract state from the auth URL and wire it into the callback server
         # for defense-in-depth CSRF validation (the SDK also validates state).
         parsed = urlparse(auth_url)
-        params = parse_qs(parsed.query)
+        params = parse_qs(parsed.query, keep_blank_values=True)
         state = params.get("state", [""])[0]
         if state:
             cb_server.set_expected_state(state)
+
+        # Append provider-specific params (e.g. access_type=offline for
+        # Google) that the SDK does not send.  Never overwrite params the
+        # authorization server or SDK already set — only add missing ones.
+        if _extra:
+            existing = set(params.keys())
+            filtered = {k: v for k, v in _extra.items() if k not in existing}
+            if filtered:
+                sep = "&" if parsed.query else "?"
+                auth_url = f"{auth_url}{sep}{urlencode(filtered)}"
+                logger.debug(
+                    "MCP [%s] appended extra auth params: %s",
+                    server_name,
+                    ", ".join(filtered.keys()),
+                )
 
         logger.info(
             "MCP [%s] redirect_handler called (state=%s...)",
