@@ -373,3 +373,11 @@ log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups t
 # # scope, state, code_challenge) is logged at INFO during the auth flow.
 # # Not for production use — enable only when diagnosing OAuth issues.
 # trace               = false
+# # Provider-specific authorization parameters (optional, default: empty).
+# # Google requires access_type=offline and prompt=consent to return a
+# # refresh_token — without it the access_token expires in ~1 hour and
+# # re-auth via browser is needed every time.  prompt=consent forces the
+# # consent screen on every auth (ensures refresh_token on re-auth).
+# # Only set this for Google; prompt=consent is a standard OIDC param that
+# # non-Google servers (Okta, Auth0, Microsoft) will honor.
+# extra_auth_params   = { access_type = "offline", prompt = "consent" }

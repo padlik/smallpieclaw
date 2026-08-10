@@ -13,7 +13,7 @@ import pytest
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-from mcp_oauth import CallbackServer, FileTokenStorage, OAuthProviderFactory
+from mcp_oauth import CallbackServer, FileTokenStorage, OAuthProviderFactory, make_redirect_handler
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ class TestFileTokenStorage:
         """The written file nests the grant under ``token`` and stamps ``issued_at``.
 
         Asserted on the raw JSON rather than through ``get_tokens()``, which reads
-        ``data.get("token") or data`` and so accepts a flat layout too — a read-back
+        ``data.get("token") or data`` and accepts a flat layout too — a read-back
         test cannot tell the two shapes apart.
         """
         storage = FileTokenStorage(
@@ -650,3 +650,274 @@ class TestOAuthProviderFactory:
         finally:
             loop.run_until_complete(server.stop())
             loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Extra auth params
+# ---------------------------------------------------------------------------
+
+
+class _FakeTgIface:
+    """Minimal Telegram interface that captures the auth URL it receives."""
+
+    def __init__(self) -> None:
+        self.captured_url: str | None = None
+
+    def send_oauth_prompt(
+        self,
+        chat_id: int,
+        server_name: str,
+        auth_url: str,
+        timeout: int,
+    ) -> asyncio.Future[None]:
+        """Capture ``auth_url`` and return an immediately resolved future."""
+        self.captured_url = auth_url
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        future.set_result(None)
+        return future
+
+
+class TestExtraAuthParams:
+    """Tests for the ``extra_auth_params`` hook in ``make_redirect_handler``."""
+
+    def setup_method(self):
+        self.loop, self.thread = _start_test_loop()
+
+    def teardown_method(self):
+        _stop_test_loop(self.loop, self.thread)
+
+    def _make_server(self, tmp_path: Path) -> CallbackServer:
+        cert_path, key_path = _make_self_signed_cert(tmp_path)
+        return CallbackServer(
+            port=0,
+            bind="127.0.0.1",
+            cert_path=cert_path,
+            key_path=key_path,
+            loop=self.loop,
+        )
+
+    def test_extra_auth_params_appended_to_url(self, tmp_path: Path) -> None:
+        """Configured Google params are appended to a standard SDK auth URL."""
+        cb_server = self._make_server(tmp_path)
+        tg_iface = _FakeTgIface()
+        handler = make_redirect_handler(
+            tg_iface,
+            "srv",
+            cb_server,
+            chat_id=123,
+            extra_auth_params={"access_type": "offline", "prompt": "consent"},
+        )
+
+        async def _run() -> None:
+            await handler(
+                "https://accounts.google.com/o/oauth2/auth?response_type=code"
+                "&client_id=cid&redirect_uri=https://localhost/callback"
+                "&state=st123&code_challenge=ch&code_challenge_method=S256&scope=openid"
+            )
+
+        _run_async(self.loop, _run())
+        url = tg_iface.captured_url
+        assert url is not None
+        assert "access_type=offline" in url
+        assert "prompt=consent" in url
+        assert "state=st123" in url
+        assert "client_id=cid" in url
+        assert "response_type=code" in url
+
+    def test_existing_params_not_overwritten(self, tmp_path: Path) -> None:
+        """Params already present in the URL are preserved, not overwritten."""
+        cb_server = self._make_server(tmp_path)
+        tg_iface = _FakeTgIface()
+        handler = make_redirect_handler(
+            tg_iface,
+            "srv",
+            cb_server,
+            chat_id=123,
+            extra_auth_params={"access_type": "offline", "prompt": "consent"},
+        )
+
+        async def _run() -> None:
+            await handler(
+                "https://accounts.google.com/o/oauth2/auth?access_type=online&state=s"
+            )
+
+        _run_async(self.loop, _run())
+        url = tg_iface.captured_url
+        assert url is not None
+        assert "access_type=online" in url
+        assert "access_type=offline" not in url
+        assert "prompt=consent" in url
+
+    def test_custom_extra_auth_params(self, tmp_path: Path) -> None:
+        """Explicit ``extra_auth_params`` replace the default (empty) injection set."""
+        cb_server = self._make_server(tmp_path)
+        tg_iface = _FakeTgIface()
+        handler = make_redirect_handler(
+            tg_iface, "srv", cb_server, chat_id=123, extra_auth_params={"foo": "bar"}
+        )
+
+        async def _run() -> None:
+            await handler("https://example.com/auth?state=s")
+
+        _run_async(self.loop, _run())
+        url = tg_iface.captured_url
+        assert url is not None
+        assert "foo=bar" in url
+        assert "access_type=offline" not in url
+        assert "prompt=consent" not in url
+
+    def test_no_query_string_uses_question_mark(self, tmp_path: Path) -> None:
+        """URLs without an existing query string receive a ``?`` separator."""
+        cb_server = self._make_server(tmp_path)
+        tg_iface = _FakeTgIface()
+        handler = make_redirect_handler(
+            tg_iface,
+            "srv",
+            cb_server,
+            chat_id=123,
+            extra_auth_params={"foo": "bar"},
+        )
+
+        async def _run() -> None:
+            await handler("https://example.com/auth")
+
+        _run_async(self.loop, _run())
+        url = tg_iface.captured_url
+        assert url is not None
+        assert "?foo=bar" in url
+
+    def test_empty_extra_auth_params_disables_injection(self, tmp_path: Path) -> None:
+        """An empty dict disables injection entirely."""
+        cb_server = self._make_server(tmp_path)
+        tg_iface = _FakeTgIface()
+        handler = make_redirect_handler(
+            tg_iface, "srv", cb_server, chat_id=123, extra_auth_params={}
+        )
+
+        async def _run() -> None:
+            await handler("https://example.com/auth?state=s")
+
+        _run_async(self.loop, _run())
+        url = tg_iface.captured_url
+        assert url is not None
+        assert "access_type" not in url
+        assert "prompt" not in url
+
+    def test_none_extra_auth_params_is_no_injection(self, tmp_path: Path) -> None:
+        """``None`` (the function default) behaves the same as an empty dict."""
+        cb_server = self._make_server(tmp_path)
+        tg_iface = _FakeTgIface()
+        handler = make_redirect_handler(
+            tg_iface, "srv", cb_server, chat_id=123, extra_auth_params=None
+        )
+
+        async def _run() -> None:
+            await handler("https://example.com/auth?state=s")
+
+        _run_async(self.loop, _run())
+        url = tg_iface.captured_url
+        assert url is not None
+        assert "access_type" not in url
+        assert "prompt" not in url
+
+    def test_state_still_extracted_with_extra_params(self, tmp_path: Path) -> None:
+        """State extraction continues to work alongside param injection."""
+        cb_server = self._make_server(tmp_path)
+        tg_iface = _FakeTgIface()
+        handler = make_redirect_handler(
+            tg_iface,
+            "srv",
+            cb_server,
+            chat_id=123,
+            extra_auth_params={"access_type": "offline", "prompt": "consent"},
+        )
+
+        async def _run() -> None:
+            await handler("https://example.com/auth?state=expected-state-xyz")
+
+        _run_async(self.loop, _run())
+        assert cb_server.expected_state == "expected-state-xyz"
+
+    def test_default_is_no_injection(self, tmp_path: Path) -> None:
+        """Default ``make_redirect_handler`` call does not inject any params."""
+        cb_server = self._make_server(tmp_path)
+        tg_iface = _FakeTgIface()
+        handler = make_redirect_handler(tg_iface, "srv", cb_server, chat_id=123)
+
+        async def _run() -> None:
+            await handler("https://example.com/auth?state=s")
+
+        _run_async(self.loop, _run())
+        url = tg_iface.captured_url
+        assert url is not None
+        assert url == "https://example.com/auth?state=s"
+        assert "access_type" not in url
+        assert "prompt" not in url
+
+    def test_factory_wires_extra_auth_params(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``OAuthProviderFactory.build`` passes extra_auth_params from config.
+
+        The degraded path (tg_iface=None) logs the full auth_url at WARNING
+        (mcp_oauth.py:521–526).  We capture that log line and assert the
+        injected params are present — proving the factory wired the config
+        through to the handler.  Without the wiring, the URL would contain
+        only the original ``state=st`` and no ``access_type``.
+        """
+        import logging
+
+        mcp_tokens_dir = tmp_path / "tokens"
+        cert_path, key_path = _make_self_signed_cert(tmp_path)
+        server_cfg = {
+            "name": "myserver",
+            "url": "https://mcp.example.com/sse",
+            "oauth": {
+                "client_id": "cid",
+                "client_secret": "csec",
+                "redirect_uri": "https://localhost/callback",
+                "scope": "read",
+                "cert_path": cert_path,
+                "key_path": key_path,
+                "callback_port": 8123,
+                "callback_bind": "127.0.0.1",
+                "extra_auth_params": {"access_type": "offline", "prompt": "consent"},
+            },
+        }
+
+        cb_server = CallbackServer(
+            port=server_cfg["oauth"]["callback_port"],
+            bind=server_cfg["oauth"]["callback_bind"],
+            cert_path=cert_path,
+            key_path=key_path,
+            loop=self.loop,
+        )
+
+        async def _build() -> OAuthClientProvider:
+            return OAuthProviderFactory.build(server_cfg, mcp_tokens_dir, cb_server)
+
+        provider = _run_async(self.loop, _build())
+        assert provider is not None
+        redirect_handler = provider.context.redirect_handler
+        assert redirect_handler is not None
+
+        # Provider's handler has tg_iface=None/chat_id=None, so it logs the
+        # full (mutated) auth_url at WARNING in the degraded path.  Capture
+        # that log line and assert the injected params are present.
+        with caplog.at_level(logging.WARNING, logger="mcp_oauth"):
+            _run_async(
+                self.loop,
+                redirect_handler(
+                    "https://example.com/auth?response_type=code&state=st"
+                ),
+            )
+        assert cb_server.expected_state == "st"
+        # The WARNING log line contains the full URL with injected params.
+        joined = " ".join(r.message for r in caplog.records)
+        assert "access_type=offline" in joined, (
+            "factory must wire extra_auth_params — URL should contain access_type=offline"
+        )
+        assert "prompt=consent" in joined, (
+            "factory must wire extra_auth_params — URL should contain prompt=consent"
+        )

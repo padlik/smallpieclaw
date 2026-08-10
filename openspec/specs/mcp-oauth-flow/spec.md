@@ -1,3 +1,9 @@
+## Purpose
+
+Defines the OAuth 2.0 authorization-code + PKCE flow for HTTP-transport MCP servers, including the proactive 401-probe mechanism, ephemeral HTTPS callback server, file-backed token storage, automatic token refresh, provider-specific authorization parameter injection, and operator-facing Telegram commands.
+
+## Requirements
+
 ### Requirement: OAuth authorization flow for MCP servers
 
 The system SHALL support OAuth 2.0 authorization-code + PKCE authentication for HTTP-transport MCP servers, using the MCP SDK's `OAuthClientProvider`. The operator SHALL initiate the flow via `/mcp auth <name>` in Telegram, and the authorization URL SHALL be delivered as an inline button.
@@ -242,12 +248,12 @@ The system SHALL report OAuth-related status for MCP servers, including token va
 
 ### Requirement: OAuth configuration schema
 
-The system SHALL support an optional `oauth` section in MCP server configuration with client credentials, redirect URI, scope, callback server settings, and TLS cert paths.
+The system SHALL support an optional `oauth` section in MCP server configuration with client credentials, redirect URI, scope, callback server settings, TLS cert paths, and provider-specific authorization parameters.
 
 #### Scenario: OAuth config parsed from TOML
 - **GIVEN** a `config.toml` with a `[[mcp_servers]]` entry containing an `[mcp_servers.oauth]` subsection
 - **WHEN** the config is parsed
-- **THEN** the `MCPServerConfig` includes an `OAuthConfig` with `client_id`, `client_secret`, `redirect_uri`, `scope`, `callback_port` (default 8000), `callback_bind` (default `0.0.0.0`), `cert_path`, and `key_path`
+- **THEN** the `MCPServerConfig` includes an `OAuthConfig` with `client_id`, `client_secret`, `redirect_uri`, `scope`, `callback_port` (default 8000), `callback_bind` (default `0.0.0.0`), `cert_path`, `key_path`, `trace` (default `false`), and `extra_auth_params` (default empty dict)
 
 #### Scenario: OAuth config is optional
 - **GIVEN** a `[[mcp_servers]]` entry without an `oauth` subsection
@@ -263,3 +269,58 @@ The system SHALL support an optional `oauth` section in MCP server configuration
 - **GIVEN** a `[[mcp_servers]]` entry with an `oauth` subsection missing `client_secret`
 - **WHEN** the config is parsed
 - **THEN** a `ConfigError` is raised indicating `oauth.client_secret` is required
+
+#### Scenario: extra_auth_params parsed as a TOML table
+- **GIVEN** a `[[mcp_servers]]` entry with an `oauth` subsection containing `extra_auth_params = { access_type = "offline", prompt = "consent" }`
+- **WHEN** the config is parsed
+- **THEN** the `OAuthConfig.extra_auth_params` field is `{"access_type": "offline", "prompt": "consent"}` with all keys and values coerced to `str`
+
+#### Scenario: extra_auth_params defaults to empty dict
+- **GIVEN** a `[[mcp_servers]]` entry with an `oauth` subsection that does not contain `extra_auth_params`
+- **WHEN** the config is parsed
+- **THEN** the `OAuthConfig.extra_auth_params` field is an empty dict and no params are injected into the authorization URL
+
+#### Scenario: extra_auth_params non-table raises ConfigError
+- **GIVEN** a `[[mcp_servers]]` entry with an `oauth` subsection where `extra_auth_params` is a string or scalar (not a TOML table)
+- **WHEN** the config is parsed
+- **THEN** a `ConfigError` is raised indicating `extra_auth_params must be a table`
+
+### Requirement: Provider-specific authorization parameters
+
+The system SHALL support injecting provider-specific query parameters into the OAuth authorization URL via the MCP SDK's `redirect_handler` hook. The MCP SDK builds authorization URLs with only spec-standard parameters (`response_type`, `client_id`, `redirect_uri`, `state`, `code_challenge`, `code_challenge_method`); some providers require additional parameters (e.g. Google requires `access_type=offline` and `prompt=consent` to return a `refresh_token`).
+
+The injection SHALL occur inside the `redirect_handler` callback — the SDK calls this handler with the authorization URL after building it but before the browser opens it. The handler appends configured parameters to the URL query string. This approach uses the SDK's documented extensibility point and does not modify or monkey-patch the SDK.
+
+Parameters already present in the authorization URL SHALL NOT be overwritten — only missing parameters are appended. This protects the SDK-owned parameters (`state`, `code_challenge`, etc.) from being clobbered.
+
+The default SHALL be an empty dict (no injection), so non-Google OAuth servers are unaffected. The `prompt=consent` parameter is a standard OpenID Connect parameter (OIDC Core §3.1.2.1) that forces the consent screen on every re-auth; it is not Google-specific and will be honored by any OIDC-compliant server (Okta, Auth0, Microsoft Entra). Operators SHOULD only configure `extra_auth_params` for providers that need it.
+
+The `OAuthProviderFactory.build` SHALL read `extra_auth_params` from the raw OAuth config dict and pass it to `make_redirect_handler`, consistent with how `trace` and `timeout` are read from the raw dict (the typed `OAuthConfig` field is for validation only, per the incremental config migration pattern).
+
+#### Scenario: Google extra_auth_params injected into authorization URL
+- **GIVEN** an MCP server is configured with `extra_auth_params = { access_type = "offline", prompt = "consent" }` and the operator runs `/mcp auth <name>`
+- **WHEN** the SDK's `redirect_handler` is called with the authorization URL
+- **THEN** `access_type=offline` and `prompt=consent` are appended to the URL query string before it is posted to Telegram
+- **AND** the original SDK parameters (`response_type`, `client_id`, `redirect_uri`, `state`, `code_challenge`, `code_challenge_method`, `scope`) are preserved unchanged
+
+#### Scenario: Existing parameters not overwritten
+- **GIVEN** an MCP server is configured with `extra_auth_params = { access_type = "offline" }` and the authorization URL already contains `access_type=online`
+- **WHEN** the `redirect_handler` is called
+- **THEN** the URL retains `access_type=online` (the existing value is not overwritten) and no `access_type=offline` is appended
+
+#### Scenario: Default empty dict — no injection for non-Google servers
+- **GIVEN** an MCP server is configured without `extra_auth_params` (or with `extra_auth_params = {}`)
+- **WHEN** the `redirect_handler` is called with the authorization URL
+- **THEN** the URL is forwarded to Telegram unchanged — no extra parameters are appended
+
+#### Scenario: State extraction still works with extra_auth_params
+- **GIVEN** an MCP server is configured with `extra_auth_params` and the authorization URL contains a `state` parameter
+- **WHEN** the `redirect_handler` is called
+- **THEN** the `state` is extracted from the URL and wired into the callback server for CSRF validation before any extra params are appended
+- **AND** the extra params do not interfere with the state validation or the PKCE flow
+
+#### Scenario: Factory wires extra_auth_params from config
+- **GIVEN** an MCP server config dict contains `oauth.extra_auth_params = {"access_type": "offline", "prompt": "consent"}`
+- **WHEN** `OAuthProviderFactory.build` constructs the `OAuthClientProvider`
+- **THEN** the provider's `redirect_handler` injects `access_type=offline` and `prompt=consent` into the authorization URL
+- **AND** the injected params are observable in the handler's output (e.g. via the degraded-path WARNING log when `tg_iface` is None)
