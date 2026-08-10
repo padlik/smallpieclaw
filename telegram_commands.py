@@ -939,8 +939,8 @@ async def cmd_mcp(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
             f"  [{s['transport']}]  {s['status']}{auth_hint}{tools_str}{err_str}"
         )
     lines.append(
-        "\n<i>Tip: /mcp on &lt;name&gt; · /mcp off &lt;name&gt; · /mcp info &lt;name&gt;"
-        " · /mcp auth &lt;name&gt; · /mcp auth status</i>"
+        "\n<i>Commands: /mcp list · /mcp on &lt;name&gt; · /mcp off &lt;name&gt; · /mcp info &lt;name&gt; "
+        "· /mcp auth &lt;name&gt; · /mcp auth status · /mcp auth cancel · /mcp auth revoke &lt;name&gt;</i>"
     )
     for chunk in iface._split_message("\n".join(lines)):
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
