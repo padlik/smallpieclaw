@@ -898,78 +898,78 @@ class PlanExecutor:
             pool, futures = self._run_batch(
                 ready_steps, ctx, factory, cancel_event, deadline,
             )
+            try:
+                done_futures, pending_futures = self._drain_pending(
+                    set(futures.keys()), cancel_event, deadline, errors, plan.timeout,
+                )
 
-            done_futures, pending_futures = self._drain_pending(
-                set(futures.keys()), cancel_event, deadline, errors, plan.timeout,
-            )
+                if pending_futures:
+                    cancel_event.set()
+                    # Request cooperative cancellation on still-running runners,
+                    # then allow a brief grace period to take effect.
+                    with self._active_lock:
+                        active_snapshot = {
+                            sid: runner
+                            for sid in list(futures.values())
+                            if (runner := self._active_runners.get(sid)) is not None
+                        }
+                    for sid, runner in active_snapshot.items():
+                        if hasattr(runner, "cancel"):
+                            try:
+                                runner.cancel()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    done2, pending_futures = wait(
+                        pending_futures, timeout=_CANCELLATION_GRACE_SECONDS,
+                    )
 
-            if pending_futures:
-                cancel_event.set()
-                # Request cooperative cancellation on still-running runners,
-                # then allow a brief grace period to take effect.
+                    for future in done2:
+                        sid = futures[future]
+                        with self._active_lock:
+                            self._active_runners.pop(sid, None)
+                        outcome, error_line = self._classify_incomplete(
+                            sid, cancelled_by_parent=cancelled_by_parent, completed_in_grace=True,
+                        )
+                        results[sid] = outcome
+                        errors.append(error_line)
+
+                    for future in pending_futures:
+                        sid = futures[future]
+                        with self._active_lock:
+                            self._active_runners.pop(sid, None)
+                        outcome, error_line = self._classify_incomplete(
+                            sid, cancelled_by_parent=cancelled_by_parent, completed_in_grace=False,
+                        )
+                        results[sid] = outcome
+                        errors.append(error_line)
+
+                for future in done_futures:
+                    sid = futures[future]
+                    try:
+                        outcome = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("Step '%s' future raised", sid)
+                        outcome = fail_outcome(f"Execution error: {exc}")
+                    results[sid] = outcome
+                    self._record_step_outcome(sid, outcome, errors, _progress)
+            finally:
+                # Cancel any runners that did not complete and shut down the
+                # pool without waiting indefinitely. Pending futures that
+                # ignore cancellation will be forcibly discarded.
                 with self._active_lock:
-                    active_snapshot = {
-                        sid: runner
-                        for sid in list(futures.values())
-                        if (runner := self._active_runners.get(sid)) is not None
-                    }
-                for sid, runner in active_snapshot.items():
+                    final_active = list(self._active_runners.items())
+                for sid, runner in final_active:
                     if hasattr(runner, "cancel"):
                         try:
                             runner.cancel()
                         except Exception:  # noqa: BLE001
                             pass
-                done2, pending_futures = wait(
-                    pending_futures, timeout=_CANCELLATION_GRACE_SECONDS,
-                )
-
-                for future in done2:
-                    sid = futures[future]
-                    with self._active_lock:
-                        self._active_runners.pop(sid, None)
-                    outcome, error_line = self._classify_incomplete(
-                        sid, cancelled_by_parent=cancelled_by_parent, completed_in_grace=True,
-                    )
-                    results[sid] = outcome
-                    errors.append(error_line)
-
-                for future in pending_futures:
-                    sid = futures[future]
-                    with self._active_lock:
-                        self._active_runners.pop(sid, None)
-                    outcome, error_line = self._classify_incomplete(
-                        sid, cancelled_by_parent=cancelled_by_parent, completed_in_grace=False,
-                    )
-                    results[sid] = outcome
-                    errors.append(error_line)
-
-            for future in done_futures:
-                sid = futures[future]
-                try:
-                    outcome = future.result()
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Step '%s' future raised", sid)
-                    outcome = fail_outcome(f"Execution error: {exc}")
-                results[sid] = outcome
-                self._record_step_outcome(sid, outcome, errors, _progress)
-
-            # Cancel any runners that did not complete and shut down the
-            # pool without waiting indefinitely. Pending futures that
-            # ignore cancellation will be forcibly discarded.
-            with self._active_lock:
-                final_active = list(self._active_runners.items())
-            for sid, runner in final_active:
-                if hasattr(runner, "cancel"):
-                    try:
-                        runner.cancel()
-                    except Exception:  # noqa: BLE001
-                        pass
-            with self._active_lock:
-                self._active_runners.clear()
-            for future in list(futures.keys()):
-                if not future.done():
-                    future.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
+                with self._active_lock:
+                    self._active_runners.clear()
+                for future in list(futures.keys()):
+                    if not future.done():
+                        future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
 
             if cancel_event.is_set():
                 break

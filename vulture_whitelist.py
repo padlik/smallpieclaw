@@ -202,6 +202,7 @@ _builtin_executor_type.conversation_id  # type: ignore[attr-defined]
 _builtin_executor_type._agent_name  # type: ignore[attr-defined]
 _builtin_executor_type._vault_secrets  # type: ignore[attr-defined]
 _builtin_executor_type._vault_secrets  # type: ignore[attr-defined]
+_builtin_executor_type.use_grant_tracker  # type: ignore[attr-defined]
 
 # config_schema.py — AgentConfig new retention field
 from config_schema import AgentConfig as _AgentConfig  # noqa: E402, F811

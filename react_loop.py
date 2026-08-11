@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
-    from builtin_tools.access_control import GrantTracker, TrustedZoneChecker
+    from builtin_tools.access_control import TrustedZoneChecker
 
 import agent_logging
 from builtin_tools.schemas import build_tool_definitions
@@ -67,10 +67,10 @@ def _is_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -> bo
     # Only check for auth failures on OAuth-configured servers
     if ctx.mcp_manager is None:
         return False
-    server_name = ctx.mcp_manager.server_name_for_tool(tool_name)
+    server_name = ctx.mcp_manager.server_name_for_tool(tool_name)  # type: ignore[attr-defined]
     if not server_name:
         return False
-    if not ctx.mcp_manager.server_has_oauth(server_name):
+    if not ctx.mcp_manager.server_has_oauth(server_name):  # type: ignore[attr-defined]
         return False
     error = (outcome.get("error", "") or "").lower()
     indicators = ("401", "unauthorized", "token expired", "refresh failed", "invalid token", "access denied")
@@ -81,8 +81,8 @@ def _handle_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -
     """Transition the owning MCP server to needs_auth and return a helpful error."""
     server_name = ""
     if ctx.mcp_manager is not None:
-        server_name = ctx.mcp_manager.server_name_for_tool(tool_name)
-        ctx.mcp_manager.mark_needs_auth(server_name)
+        server_name = ctx.mcp_manager.server_name_for_tool(tool_name)  # type: ignore[attr-defined]
+        ctx.mcp_manager.mark_needs_auth(server_name)  # type: ignore[attr-defined]
     display_name = server_name or "unknown"
     return {
         "success": False,
@@ -222,8 +222,6 @@ class ReactContext:
     # ReactContext without wiring; production paths always inject this from main.py.
     trusted_zone_checker: Optional["TrustedZoneChecker"] = None
 
-    # Per-agent request grant tracker — isolated from other sub-agents; reset each run
-    grant_tracker: Optional["GrantTracker"] = None
 
     # Creativity mode for prompt assembly — passed through to prompt_loader
     creativity_mode: str = "default"
@@ -430,9 +428,15 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     real_path = os.path.realpath(os.path.expanduser(path))
     checker = getattr(ctx, "trusted_zone_checker", None)
     if checker is not None:
+        builtin = getattr(ctx, "builtin_executor", None)
+        request_grants = (
+            builtin.grant_tracker.snapshot()
+            if builtin is not None and builtin.grant_tracker is not None
+            else frozenset()
+        )
         zone = checker.classify(
             path, operation="read",
-            request_grants=ctx.grant_tracker.snapshot() if ctx.grant_tracker else frozenset(),
+            request_grants=request_grants,
         )
         sensitive, reason = _is_sensitive_path(real_path)
         if zone == ZoneClassification.UNRECOGNISED or sensitive:
@@ -909,9 +913,6 @@ def react_loop(
         ctx._tool_defs = None
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
-
-        if ctx.grant_tracker is not None and ctx.depth == 0:
-            ctx.grant_tracker.reset()
 
         active_model = ctx.llm.llm_cfg.get("model", "?")
         logger.info("%sstart | model: %s | goal: %s", pfx, active_model, user_goal[:80])

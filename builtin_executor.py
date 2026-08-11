@@ -26,13 +26,15 @@ Result dicts produced by built-in tools include the following recovery fields:
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import secrets
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import agent_logging
 from builtin_tools.access_control import GrantTracker
@@ -56,6 +58,7 @@ from builtin_tools.patterns import (
 from builtin_tools.schedule import exec_schedule
 from builtin_tools.secrets_log import LogQueryTools, SecretsTools
 from builtin_tools.shell import ShellTools
+
 from xdg import xdg_paths
 from builtin_tools.shell_env import ShellEnvTools
 from nsjail_config import NsjailConfigBuilder
@@ -75,6 +78,13 @@ from sub_agent_supervisor import (
 slog = agent_logging.get_logger(__name__)
 
 logger = logging.getLogger(__name__)
+
+# Module-level ContextVar holding the active per-run GrantTracker.
+# None means no run context is active; the BuiltinExecutor property will fall
+# back to the executor-wide default tracker for backward compatibility.
+_grant_tracker_var: contextvars.ContextVar[Optional[GrantTracker]] = contextvars.ContextVar(
+    "grant_tracker", default=None
+)
 
 
 @dataclass
@@ -238,11 +248,10 @@ class BuiltinExecutor:
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
         # Skill registry — set by main.py after construction (same pattern as trusted_zone_checker)
         self.skill_registry = None  # Optional[SkillRegistry]
-        # Per-executor ephemeral request grant tracker (isolated per agent/sub-agent).
-        # Uses a stack so concurrent sub-agent runs each get their own tracker.
-        # `grant_tracker` property returns the top of stack, or the default if empty.
+        # Per-executor fallback GrantTracker used outside of an active run context.
+        # Runs use a context-scoped ContextVar (set via use_grant_tracker) so
+        # concurrent sub-agents are isolated automatically without push/pop bookkeeping.
         self._default_grant_tracker: GrantTracker = GrantTracker()
-        self._grant_tracker_stack: list[GrantTracker] = []
         # Per-confirmation zone_path store: token -> original path (for Telegram zone buttons)
         self._zone_paths: dict[str, str] = {}
         # Name-keyed dispatch registries (replace the former if/elif chains).
@@ -312,25 +321,28 @@ class BuiltinExecutor:
 
     @property
     def grant_tracker(self) -> GrantTracker:
-        """Return the active GrantTracker for the current run.
+        """Return the active GrantTracker for the current run context.
 
-        Returns the top of the per-run stack when a run is active, otherwise
-        the default (shared) tracker. This preserves backward compatibility for
-        callers that access ``grant_tracker`` outside of a run context while
-        isolating concurrent sub-agent runs via push/pop.
+        Uses a module-level ContextVar so each concurrent run (main or sub-agent)
+        gets its own isolated tracker automatically. Falls back to the executor-wide
+        default tracker when called outside of an active ``use_grant_tracker`` block.
         """
-        if self._grant_tracker_stack:
-            return self._grant_tracker_stack[-1]
-        return self._default_grant_tracker
+        active = _grant_tracker_var.get()
+        return active if active is not None else self._default_grant_tracker
 
-    def push_grant_tracker(self, gt: GrantTracker) -> None:
-        """Push a per-run GrantTracker onto the stack (called by AgentController.run)."""
-        self._grant_tracker_stack.append(gt)
+    @contextmanager
+    def use_grant_tracker(self, gt: GrantTracker) -> Iterator[None]:
+        """Set *gt* as the active GrantTracker for the current context.
 
-    def pop_grant_tracker(self) -> None:
-        """Pop the per-run GrantTracker (called in AgentController.run finally block)."""
-        if self._grant_tracker_stack:
-            self._grant_tracker_stack.pop()
+        Thread- and asyncio-safe: the tracker is bound to the current thread/task
+        context via a ContextVar, so concurrent sub-agent runs cannot see each
+        other's grants. The previous value is restored on exit.
+        """
+        token = _grant_tracker_var.set(gt)
+        try:
+            yield
+        finally:
+            _grant_tracker_var.reset(token)
 
     def shutdown(self, graceful_timeout: float = 10.0) -> None:
         """Shut down the sub-agent thread pool.

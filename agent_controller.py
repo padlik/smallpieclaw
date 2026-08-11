@@ -191,18 +191,15 @@ class AgentController:
         if self.builtin_executor is not None and self._depth == 0:
             self.builtin_executor._prompt_approval_set = self._confirmation.auto_approve_tools
             self.builtin_executor._current_prompt_id = prompt_id
-        # Push a fresh GrantTracker for EVERY run (main + sub-agent) so each
-        # run's per-request grants are isolated from concurrent runs sharing
-        # the same executor. Popped in the finally block below.
-        if self.builtin_executor is not None:
-            from builtin_tools.access_control import GrantTracker  # noqa: PLC0415
-            self.builtin_executor.push_grant_tracker(GrantTracker())
-
         # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
         # keeps only the per-run concerns: trace minting (above), model
         # _active_idx save/restore (below), and progress/image passthrough.
         ctx = AgentRuntime.build_react_context(self, run_trace_id)
         try:
+            if self.builtin_executor is not None:
+                from builtin_tools.access_control import GrantTracker  # noqa: PLC0415
+                with self.builtin_executor.use_grant_tracker(GrantTracker()):
+                    return react_loop(ctx, user_goal, progress_callback, images)
             return react_loop(ctx, user_goal, progress_callback, images)
         finally:
             self.llm._active_idx = _primary_idx
@@ -211,8 +208,6 @@ class AgentController:
             if self.builtin_executor is not None and self._depth == 0:
                 self.builtin_executor._prompt_approval_set = None
                 self.builtin_executor._current_prompt_id = None
-            if self.builtin_executor is not None:
-                self.builtin_executor.pop_grant_tracker()
             self._confirmation.clear_auto_approve()
 
 

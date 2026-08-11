@@ -364,12 +364,10 @@ class TestConfirmRoundTrip:
 
     def _make_executor(self) -> BuiltinExecutor:
         """Real BuiltinExecutor with a checker that classifies all paths as UNRECOGNISED."""
-        from builtin_tools.access_control import GrantTracker
         builtin = BuiltinExecutor()
         checker = MagicMock()
         checker.classify.return_value = ZoneClassification.UNRECOGNISED
         builtin.trusted_zone_checker = checker  # type: ignore[assignment]  # type: ignore[assignment]
-        builtin.push_grant_tracker(GrantTracker())
         return builtin
 
     def test_file_diff_confirm_executes(self):
