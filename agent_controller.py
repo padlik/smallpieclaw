@@ -114,6 +114,8 @@ class AgentController:
         # Sub-agent context sharing (set by SubAgentRunner only for sub-agents)
         self._context_payload: dict | None = None
         self._prompt_variant: str | None = None
+        # Strategy memory (optional — set by main.py after init when enabled)
+        self.strategy_memory: Optional[object] = None  # Set post-construction by main.py
         # Graph memory (optional — set by main.py after init when enabled)
         self._graph_memory = None          # Optional[GraphMemoryStore]
         self._graph_memory_writer = None   # Optional[GraphMemoryWriter]
@@ -520,6 +522,7 @@ class SubAgentRunner:
         self._short_term = short_term if short_term is not None else ShortTermMemory()
         self._working = WorkingMemory()
 
+        # Note: strategy_memory is intentionally not forwarded to sub-agents (short-lived runs).
         # Build the isolated AgentController — headless (no confirm callbacks)
         self._agent = AgentController(
             llm=self._llm,

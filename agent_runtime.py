@@ -240,7 +240,7 @@ class AgentRuntime:
             graph_memory=controller._graph_memory,
             graph_memory_writer=controller._graph_memory_writer,
             graph_memory_max_entries=controller._graph_memory_max_entries,
-            strategy_memory=getattr(controller, "strategy_memory", None),
+            strategy_memory=controller.strategy_memory,
             max_subagents=getattr(controller.builtin_executor, "_max_subagents", 6),
             creativity_mode=getattr(controller, "creativity_mode", "default"),
             plan_max_iterations=getattr(controller, "plan_max_iterations", 50),

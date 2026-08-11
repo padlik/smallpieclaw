@@ -458,6 +458,9 @@ class OAuthConfig:
     key_path: str
     callback_port: int = 8000
     callback_bind: str = "0.0.0.0"
+    # OAuth flow timeout in seconds (consumed by mcp_client.py and
+    # mcp_oauth.py via raw dict).
+    timeout: int = 300
     # Diagnostic flag: when true, the full authorization URL (containing
     # client_id, scope, state, code_challenge) is logged at INFO. Not for
     # production use. Read at runtime from the raw ``oauth`` dict by

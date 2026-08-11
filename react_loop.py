@@ -629,7 +629,7 @@ def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
             logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
 
     strategies_section = ""
-    if getattr(ctx, "strategy_memory", None) is not None:
+    if ctx.strategy_memory is not None:
         from strategy_memory import classify_task_type, format_strategies_for_prompt
         task_type = classify_task_type(user_goal)
         strategies = ctx.strategy_memory.get_top_k(task_type, k=2)
@@ -1212,7 +1212,7 @@ def _finish_run(
             tools_used=tools_used,
         )
     # Fire-and-forget strategy extraction on background thread
-    if getattr(ctx, "strategy_memory", None) is not None:
+    if ctx.strategy_memory is not None:
         try:
             from strategy_memory import extract_strategy  # noqa: PLC0415
 
