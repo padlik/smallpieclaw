@@ -26,13 +26,15 @@ Result dicts produced by built-in tools include the following recovery fields:
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import secrets
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import agent_logging
 from builtin_tools.access_control import GrantTracker
@@ -56,6 +58,7 @@ from builtin_tools.patterns import (
 from builtin_tools.schedule import exec_schedule
 from builtin_tools.secrets_log import LogQueryTools, SecretsTools
 from builtin_tools.shell import ShellTools
+
 from xdg import xdg_paths
 from builtin_tools.shell_env import ShellEnvTools
 from nsjail_config import NsjailConfigBuilder
@@ -75,6 +78,13 @@ from sub_agent_supervisor import (
 slog = agent_logging.get_logger(__name__)
 
 logger = logging.getLogger(__name__)
+
+# Module-level ContextVar holding the active per-run GrantTracker.
+# None means no run context is active; the BuiltinExecutor property will fall
+# back to the executor-wide default tracker for backward compatibility.
+_grant_tracker_var: contextvars.ContextVar[Optional[GrantTracker]] = contextvars.ContextVar(
+    "grant_tracker", default=None
+)
 
 
 @dataclass
@@ -238,10 +248,15 @@ class BuiltinExecutor:
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
         # Skill registry — set by main.py after construction (same pattern as trusted_zone_checker)
         self.skill_registry = None  # Optional[SkillRegistry]
-        # Per-executor ephemeral request grant tracker (isolated per agent/sub-agent)
-        self.grant_tracker: GrantTracker = GrantTracker()
+        # Per-executor fallback GrantTracker used outside of an active run context.
+        # Runs use a context-scoped ContextVar (set via use_grant_tracker) so
+        # concurrent sub-agents are isolated automatically without push/pop bookkeeping.
+        self._default_grant_tracker: GrantTracker = GrantTracker()
         # Per-confirmation zone_path store: token -> original path (for Telegram zone buttons)
         self._zone_paths: dict[str, str] = {}
+        # Per-confirmation tracker capture: token -> GrantTracker (so the Telegram
+        # callback thread can write to the run-scoped tracker, not the default).
+        self._zone_trackers: dict[str, "GrantTracker"] = {}
         # Name-keyed dispatch registries (replace the former if/elif chains).
         # Each value is a per-tool adapter that forwards exactly the kwargs that
         # tool accepts today (Decision 3); vision_query has no entry — it is
@@ -306,6 +321,31 @@ class BuiltinExecutor:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def grant_tracker(self) -> GrantTracker:
+        """Return the active GrantTracker for the current run context.
+
+        Uses a module-level ContextVar so each concurrent run (main or sub-agent)
+        gets its own isolated tracker automatically. Falls back to the executor-wide
+        default tracker when called outside of an active ``use_grant_tracker`` block.
+        """
+        active = _grant_tracker_var.get()
+        return active if active is not None else self._default_grant_tracker
+
+    @contextmanager
+    def use_grant_tracker(self, gt: GrantTracker) -> Iterator[None]:
+        """Set *gt* as the active GrantTracker for the current context.
+
+        Thread- and asyncio-safe: the tracker is bound to the current thread/task
+        context via a ContextVar, so concurrent sub-agent runs cannot see each
+        other's grants. The previous value is restored on exit.
+        """
+        token = _grant_tracker_var.set(gt)
+        try:
+            yield
+        finally:
+            _grant_tracker_var.reset(token)
 
     def shutdown(self, graceful_timeout: float = 10.0) -> None:
         """Shut down the sub-agent thread pool.
@@ -452,6 +492,7 @@ class BuiltinExecutor:
         """
         entry = self._pending.pop(token, None)
         self._zone_paths.pop(token, None)
+        self._zone_trackers.pop(token, None)
         if entry is None:
             return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
         tool_name, args = entry
@@ -478,6 +519,7 @@ class BuiltinExecutor:
         """
         entry = self._pending.pop(token, None)
         self._zone_paths.pop(token, None)
+        self._zone_trackers.pop(token, None)
         if entry is None:
             return
         tool_name = entry[0]
@@ -537,6 +579,7 @@ class BuiltinExecutor:
         self._pending[token] = (tool_name, args)
         if zone_path:
             self._zone_paths[token] = zone_path
+            self._zone_trackers[token] = self.grant_tracker
         logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
         return {
             "requires_confirmation": True,

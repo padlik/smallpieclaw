@@ -114,6 +114,8 @@ class AgentController:
         # Sub-agent context sharing (set by SubAgentRunner only for sub-agents)
         self._context_payload: dict | None = None
         self._prompt_variant: str | None = None
+        # Strategy memory (optional — set by main.py after init when enabled)
+        self.strategy_memory: Optional[object] = None  # Set post-construction by main.py
         # Graph memory (optional — set by main.py after init when enabled)
         self._graph_memory = None          # Optional[GraphMemoryStore]
         self._graph_memory_writer = None   # Optional[GraphMemoryWriter]
@@ -189,12 +191,19 @@ class AgentController:
         if self.builtin_executor is not None and self._depth == 0:
             self.builtin_executor._prompt_approval_set = self._confirmation.auto_approve_tools
             self.builtin_executor._current_prompt_id = prompt_id
-
+            # Reset the default tracker so stale grants from a prior run (or
+            # from a Telegram callback that fell back to the default) don't
+            # accumulate across runs.
+            self.builtin_executor._default_grant_tracker.reset()
         # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
         # keeps only the per-run concerns: trace minting (above), model
         # _active_idx save/restore (below), and progress/image passthrough.
         ctx = AgentRuntime.build_react_context(self, run_trace_id)
         try:
+            if self.builtin_executor is not None:
+                from builtin_tools.access_control import GrantTracker  # noqa: PLC0415
+                with self.builtin_executor.use_grant_tracker(GrantTracker()):
+                    return react_loop(ctx, user_goal, progress_callback, images)
             return react_loop(ctx, user_goal, progress_callback, images)
         finally:
             self.llm._active_idx = _primary_idx
@@ -520,6 +529,7 @@ class SubAgentRunner:
         self._short_term = short_term if short_term is not None else ShortTermMemory()
         self._working = WorkingMemory()
 
+        # Note: strategy_memory is intentionally not forwarded to sub-agents (short-lived runs).
         # Build the isolated AgentController — headless (no confirm callbacks)
         self._agent = AgentController(
             llm=self._llm,

@@ -567,7 +567,7 @@ class ShellTools:
                 error_type = "permission_denied"
                 recoverable = False
                 suggestion = "Check file permissions or use sudo."
-            elif "command not found" in combined or "not found" in error_lower and "file" not in error_lower:
+            elif "command not found" in combined or ("not found" in error_lower and "file" not in error_lower):
                 error_type = "command_not_found"
                 recoverable = False
                 suggestion = "Check the command name or install the missing executable."

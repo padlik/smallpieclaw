@@ -542,7 +542,7 @@ def _run(
     # Wire strategy memory into the agent so the ReAct loop can query learned
     # approaches in a later iteration. Assigned post-construction to avoid
     # changing the AgentController signature today.
-    agent.strategy_memory = strategy_mem  # type: ignore[attr-defined]
+    agent.strategy_memory = strategy_mem
     agent.trusted_zone_checker = _trusted_zone_checker  # type: ignore[attr-defined]
     # Let reset_task() save/rotate the conversation id.
     agent._conversation_state_dir = nsjail_state_dir  # type: ignore[attr-defined]

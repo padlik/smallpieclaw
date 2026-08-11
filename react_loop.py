@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
-    from builtin_tools.access_control import GrantTracker, TrustedZoneChecker
+    from builtin_tools.access_control import TrustedZoneChecker
 
 import agent_logging
 from builtin_tools.schemas import build_tool_definitions
@@ -30,6 +30,7 @@ from context_manager import maybe_compact
 from interfaces import ToolCall
 from llm_client import LLMClient, LLMCancelledError, LLMError, LLMPermanentError, _encode_images
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
+from outcome_utils import fail_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -66,10 +67,10 @@ def _is_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -> bo
     # Only check for auth failures on OAuth-configured servers
     if ctx.mcp_manager is None:
         return False
-    server_name = ctx.mcp_manager.server_name_for_tool(tool_name)
+    server_name = ctx.mcp_manager.server_name_for_tool(tool_name)  # type: ignore[attr-defined]
     if not server_name:
         return False
-    if not ctx.mcp_manager.server_has_oauth(server_name):
+    if not ctx.mcp_manager.server_has_oauth(server_name):  # type: ignore[attr-defined]
         return False
     error = (outcome.get("error", "") or "").lower()
     indicators = ("401", "unauthorized", "token expired", "refresh failed", "invalid token", "access denied")
@@ -80,8 +81,8 @@ def _handle_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -
     """Transition the owning MCP server to needs_auth and return a helpful error."""
     server_name = ""
     if ctx.mcp_manager is not None:
-        server_name = ctx.mcp_manager.server_name_for_tool(tool_name)
-        ctx.mcp_manager.mark_needs_auth(server_name)
+        server_name = ctx.mcp_manager.server_name_for_tool(tool_name)  # type: ignore[attr-defined]
+        ctx.mcp_manager.mark_needs_auth(server_name)  # type: ignore[attr-defined]
     display_name = server_name or "unknown"
     return {
         "success": False,
@@ -221,8 +222,6 @@ class ReactContext:
     # ReactContext without wiring; production paths always inject this from main.py.
     trusted_zone_checker: Optional["TrustedZoneChecker"] = None
 
-    # Per-agent request grant tracker — isolated from other sub-agents; reset each run
-    grant_tracker: Optional["GrantTracker"] = None
 
     # Creativity mode for prompt assembly — passed through to prompt_loader
     creativity_mode: str = "default"
@@ -429,9 +428,15 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     real_path = os.path.realpath(os.path.expanduser(path))
     checker = getattr(ctx, "trusted_zone_checker", None)
     if checker is not None:
+        builtin = getattr(ctx, "builtin_executor", None)
+        request_grants = (
+            builtin.grant_tracker.snapshot()
+            if builtin is not None and builtin.grant_tracker is not None
+            else frozenset()
+        )
         zone = checker.classify(
             path, operation="read",
-            request_grants=ctx.grant_tracker.snapshot() if ctx.grant_tracker else frozenset(),
+            request_grants=request_grants,
         )
         sensitive, reason = _is_sensitive_path(real_path)
         if zone == ZoneClassification.UNRECOGNISED or sensitive:
@@ -629,7 +634,7 @@ def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
             logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
 
     strategies_section = ""
-    if getattr(ctx, "strategy_memory", None) is not None:
+    if ctx.strategy_memory is not None:
         from strategy_memory import classify_task_type, format_strategies_for_prompt
         task_type = classify_task_type(user_goal)
         strategies = ctx.strategy_memory.get_top_k(task_type, k=2)
@@ -719,14 +724,16 @@ def _normalize_shorthand_action(action_obj: dict) -> dict:
                     shorthand_args = parsed
                 else:
                     logger.warning(
-                        "Shorthand action '%s' args parsed to non-dict type %s — keeping string",
+                        "Shorthand action '%s' args parsed to non-dict type %s — wrapping in _raw",
                         action, type(parsed).__name__,
                     )
+                    shorthand_args = {"_raw": shorthand_args}
             except (ValueError, TypeError):
                 logger.warning(
-                    "Shorthand action '%s' args is a non-JSON string — keeping as-is: %s",
+                    "Shorthand action '%s' args is a non-JSON string — wrapping in _raw: %s",
                     action, shorthand_args[:200],
                 )
+                shorthand_args = {"_raw": shorthand_args}
     else:
         shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
     return {"action": "tool", "tool": action, "args": shorthand_args}
@@ -906,9 +913,6 @@ def react_loop(
         ctx._tool_defs = None
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
-
-        if ctx.grant_tracker is not None and ctx.depth == 0:
-            ctx.grant_tracker.reset()
 
         active_model = ctx.llm.llm_cfg.get("model", "?")
         logger.info("%sstart | model: %s | goal: %s", pfx, active_model, user_goal[:80])
@@ -1212,7 +1216,7 @@ def _finish_run(
             tools_used=tools_used,
         )
     # Fire-and-forget strategy extraction on background thread
-    if getattr(ctx, "strategy_memory", None) is not None:
+    if ctx.strategy_memory is not None:
         try:
             from strategy_memory import extract_strategy  # noqa: PLC0415
 
@@ -1252,6 +1256,10 @@ def _dispatch_tool(
     pfx = ""  # run identity is now supplied by structlog contextvars (see agent_logging); avoid double-prefixing
     tool_name = action_obj.get("tool", "")
     args = action_obj.get("args", {})
+    if isinstance(args, str):
+        # Defense-in-depth: bare string args crash .items()/.get() downstream.
+        # _normalize_shorthand_action should have wrapped this already.
+        args = {"_raw": args}
     if isinstance(args, list):
         args = {str(i): v for i, v in enumerate(args)}
 
@@ -1309,15 +1317,12 @@ def _dispatch_tool(
                     _progress(f"✅ Confirmed — executing `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
                 else:
                     ctx.builtin_executor.cancel(token)
-                    outcome = {
-                        "success": False, "output": "", "exit_code": -1,
-                        "error": (
-                            "Operation cancelled by the operator. "
-                            "Do not retry this operation via any other tool or method. "
-                            "Respond with a finish action now."
-                        ),
-                        "_operator_cancelled": True,
-                    }
+                    outcome = fail_outcome(
+                        "Operation cancelled by the operator. "
+                        "Do not retry this operation via any other tool or method. "
+                        "Respond with a finish action now.",
+                    )
+                    outcome["_operator_cancelled"] = True
                     _progress("❌ Cancelled by operator — stopping task.")
         return outcome
 
@@ -1376,9 +1381,4 @@ def _dispatch_tool(
         return outcome
 
     # Unknown tool — no hand-written tools exist anymore
-    return {
-        "success": False,
-        "output": "",
-        "error": f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.",
-        "exit_code": -1,
-    }
+    return fail_outcome(f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.")
