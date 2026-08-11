@@ -379,8 +379,11 @@ class _SdkClientWrapper:
                 self._ready_future.set_exception(exc)
             else:
                 self.connected = False
-                self.last_error = str(exc)
-                logger.error("MCP [%s] session error: %s", self.name, exc)
+                if self.needs_auth:
+                    logger.info("MCP [%s] session ended (needs_auth)", self.name)
+                else:
+                    self.last_error = str(exc)
+                    logger.error("MCP [%s] session error: %s", self.name, exc)
 
     async def _prepare_oauth_provider(self, oauth_cfg: dict) -> None:
         """Resolve OAuth provider and detect whether an interactive flow is needed.
@@ -402,11 +405,17 @@ class _SdkClientWrapper:
             key_path=oauth_cfg["key_path"],
             loop=asyncio.get_running_loop(),
         )
+        def _on_non_interactive() -> None:
+            self.needs_auth = True
+            if not self._ready_future.done():
+                self._ready_future.set_result([])
+
         self._oauth_provider = mcp_oauth.OAuthProviderFactory.build(
             self._cfg,
             self._mcp_tokens_dir,
             cb_server=cb_server,
             tg_iface=self._tg_iface,
+            on_non_interactive=_on_non_interactive,
         )
         storage = mcp_oauth.FileTokenStorage(
             server_name=self.name,
@@ -463,7 +472,8 @@ class _SdkClientWrapper:
             logger.debug(
                 "MCP [%s] list_tools: %d tools discovered", self.name, len(all_tools)
             )
-            self._ready_future.set_result(True)
+            if not self._ready_future.done():
+                self._ready_future.set_result(True)
             try:
                 while True:
                     req = await self._queue.get()

@@ -380,6 +380,7 @@ class OAuthProviderFactory:
         cb_server: CallbackServer,
         tg_iface: object | None = None,
         chat_id: int | None = None,
+        on_non_interactive: Callable[[], None] | None = None,
     ) -> OAuthClientProvider:
         """Build an ``OAuthClientProvider`` for an HTTP MCP server.
 
@@ -396,6 +397,11 @@ class OAuthProviderFactory:
             tg_iface: Optional Telegram interface used to forward the auth URL.
             chat_id: Chat ID to send the authorization prompt to. Required when
                 ``tg_iface`` is provided for interactive flows.
+            on_non_interactive: Optional callback invoked when the redirect
+                handler fires without a Telegram chat in context. This lets
+                non-interactive startup flows mark the server as needing
+                authorization and abort the SDK flow cleanly instead of timing
+                out waiting for a callback.
 
         Returns:
             A configured ``OAuthClientProvider``.
@@ -424,6 +430,7 @@ class OAuthProviderFactory:
         redirect_handler = make_redirect_handler(
             tg_iface, name, cb_server, chat_id=chat_id, trace=trace, timeout=timeout,
             extra_auth_params=oauth_cfg.get("extra_auth_params", {}),
+            on_non_interactive=on_non_interactive,
         )
         callback_handler = make_callback_handler(cb_server, timeout=timeout)
 
@@ -445,6 +452,7 @@ def make_redirect_handler(
     trace: bool = False,
     timeout: int = 300,
     extra_auth_params: dict[str, str] | None = None,
+    on_non_interactive: Callable[[], None] | None = None,
 ) -> Callable[[str], Awaitable[None]]:
     """Return an async handler that forwards the auth URL to Telegram.
 
@@ -470,6 +478,13 @@ def make_redirect_handler(
             ``prompt=consent`` is a standard OIDC parameter that forces a
             consent screen on every re-auth.  Parameters already present
             in the URL are never overwritten.
+        on_non_interactive: Optional callback invoked when the redirect
+            handler fires without a Telegram chat in context. This lets
+            non-interactive startup flows mark the server as needing
+            authorization, stop the callback server, and abort the SDK flow
+            cleanly instead of timing out waiting for a callback. When
+            ``None`` (the default), the handler logs a warning and returns,
+            preserving backward-compatible behavior.
     """
     _extra = extra_auth_params or {}
 
@@ -514,16 +529,34 @@ def make_redirect_handler(
         if tg_iface is None or chat_id is None:
             # Degraded path: no Telegram chat in context (e.g. non-interactive
             # reconnect with a stored refresh token that turned out invalid).
-            # This is a legitimate manual-authorize fallback — the operator
-            # can visit the URL from the logs.  Do NOT raise here; raising
-            # would abort the SDK flow, which is wrong for this path since
-            # the operator may still complete authorization manually.
             logger.warning(
                 "MCP [%s] needs re-authorization but no Telegram chat is in "
                 "context for this flow; visit this URL to authorize: %s",
                 server_name,
                 auth_url,
             )
+            if on_non_interactive is not None:
+                # Startup/non-interactive flow: signal the wrapper to mark
+                # needs_auth and resolve _ready_future immediately, then abort
+                # the SDK flow so connect() returns cleanly instead of timing out.
+                try:
+                    on_non_interactive()
+                except Exception:
+                    logger.exception(
+                        "MCP [%s] on_non_interactive callback raised", server_name,
+                    )
+                # Stop the callback server since callback_handler won't run to stop it.
+                try:
+                    await cb_server.stop()
+                except Exception:
+                    logger.debug("MCP [%s] cb_server stop after non-interactive redirect", server_name)
+                raise RuntimeError(
+                    f"MCP [{server_name}] non-interactive OAuth redirect — "
+                    f"needs manual authorization"
+                )
+            # Backward-compatible path: log the manual-authorize fallback and
+            # return without raising. The SDK will continue to wait for a
+            # callback that the operator must complete manually.
             return
 
         send_fn = getattr(tg_iface, "send_oauth_prompt", None)
