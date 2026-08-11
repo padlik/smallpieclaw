@@ -863,3 +863,60 @@ class TestRuntimeProfileThreading:
 
         profiles = [c["kwargs"]["runtime_profile"] for c in factory.calls]
         assert profiles == [RuntimeProfile.PLAN_STEP_AGENT, RuntimeProfile.DIAGNOSTIC_AGENT]
+
+
+# ---------------------------------------------------------------------------
+# Incomplete-step classification
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyIncomplete:
+    """Direct tests for PlanExecutor._classify_incomplete."""
+
+    def test_cancelled_by_parent_completed_in_grace(self):
+        executor = PlanExecutor()
+        outcome, error_line = executor._classify_incomplete(
+            "s1", cancelled_by_parent=True, completed_in_grace=True,
+        )
+        assert outcome["success"] is False
+        assert "parent agent" in outcome["error"].lower()
+        assert "grace period" in outcome["error"].lower()
+        assert "cancelled" in error_line.lower()
+        assert "parent agent" in error_line.lower()
+
+    def test_timeout_completed_in_grace(self):
+        executor = PlanExecutor()
+        outcome, error_line = executor._classify_incomplete(
+            "s1", cancelled_by_parent=False, completed_in_grace=True,
+        )
+        assert outcome["success"] is False
+        assert outcome.get("error_type") == "tool_timeout"
+        assert outcome.get("recoverable") is True
+        assert "timeout" in outcome["error"].lower()
+        assert "grace period" in outcome["error"].lower()
+        assert "timed out" in error_line.lower()
+
+    def test_cancelled_by_parent_still_running(self):
+        executor = PlanExecutor()
+        outcome, error_line = executor._classify_incomplete(
+            "s1", cancelled_by_parent=True, completed_in_grace=False,
+        )
+        assert outcome["success"] is False
+        assert outcome.get("error_type", "") == ""
+        assert "parent agent" in outcome["error"].lower()
+        assert "still be running" in outcome["error"].lower()
+        assert "cancelled" in error_line.lower()
+        assert "still be running" in error_line.lower()
+
+    def test_timeout_still_running(self):
+        executor = PlanExecutor()
+        outcome, error_line = executor._classify_incomplete(
+            "s1", cancelled_by_parent=False, completed_in_grace=False,
+        )
+        assert outcome["success"] is False
+        assert outcome.get("error_type") == "tool_timeout"
+        assert outcome.get("recoverable") is True
+        assert "timeout" in outcome["error"].lower()
+        assert "still be running" in outcome["error"].lower()
+        assert "timed out" in error_line.lower()
+        assert "still be running" in error_line.lower()
