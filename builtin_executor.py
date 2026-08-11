@@ -238,8 +238,11 @@ class BuiltinExecutor:
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
         # Skill registry — set by main.py after construction (same pattern as trusted_zone_checker)
         self.skill_registry = None  # Optional[SkillRegistry]
-        # Per-executor ephemeral request grant tracker (isolated per agent/sub-agent)
-        self.grant_tracker: GrantTracker = GrantTracker()
+        # Per-executor ephemeral request grant tracker (isolated per agent/sub-agent).
+        # Uses a stack so concurrent sub-agent runs each get their own tracker.
+        # `grant_tracker` property returns the top of stack, or the default if empty.
+        self._default_grant_tracker: GrantTracker = GrantTracker()
+        self._grant_tracker_stack: list[GrantTracker] = []
         # Per-confirmation zone_path store: token -> original path (for Telegram zone buttons)
         self._zone_paths: dict[str, str] = {}
         # Name-keyed dispatch registries (replace the former if/elif chains).
@@ -306,6 +309,28 @@ class BuiltinExecutor:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def grant_tracker(self) -> GrantTracker:
+        """Return the active GrantTracker for the current run.
+
+        Returns the top of the per-run stack when a run is active, otherwise
+        the default (shared) tracker. This preserves backward compatibility for
+        callers that access ``grant_tracker`` outside of a run context while
+        isolating concurrent sub-agent runs via push/pop.
+        """
+        if self._grant_tracker_stack:
+            return self._grant_tracker_stack[-1]
+        return self._default_grant_tracker
+
+    def push_grant_tracker(self, gt: GrantTracker) -> None:
+        """Push a per-run GrantTracker onto the stack (called by AgentController.run)."""
+        self._grant_tracker_stack.append(gt)
+
+    def pop_grant_tracker(self) -> None:
+        """Pop the per-run GrantTracker (called in AgentController.run finally block)."""
+        if self._grant_tracker_stack:
+            self._grant_tracker_stack.pop()
 
     def shutdown(self, graceful_timeout: float = 10.0) -> None:
         """Shut down the sub-agent thread pool.

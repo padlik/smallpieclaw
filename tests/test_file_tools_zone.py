@@ -369,7 +369,7 @@ class TestConfirmRoundTrip:
         checker = MagicMock()
         checker.classify.return_value = ZoneClassification.UNRECOGNISED
         builtin.trusted_zone_checker = checker  # type: ignore[assignment]  # type: ignore[assignment]
-        builtin.grant_tracker = GrantTracker()
+        builtin.push_grant_tracker(GrantTracker())
         return builtin
 
     def test_file_diff_confirm_executes(self):

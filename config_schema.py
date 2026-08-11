@@ -477,7 +477,7 @@ class OAuthConfig:
 @dataclass(frozen=True)
 class MCPServerConfig:
     name: str
-    transport: str  # "stdio" | "http"
+    transport: str  # "stdio" | "http" | "sse"
     command: list[str] = field(default_factory=list)
     url: str = ""
     enabled: bool = True
@@ -676,6 +676,7 @@ def _parse_oauth(entry: dict, server_name: str) -> OAuthConfig | None:
             oauth.get("callback_port"), 8000, f"{section}.callback_port"
         ),
         callback_bind=oauth.get("callback_bind", "0.0.0.0"),
+        timeout=_parse_int(oauth.get("timeout"), 300, f"{section}.timeout"),
         trace=_parse_bool(oauth.get("trace", False), f"{section}.trace"),
         extra_auth_params=extra_auth_params,
     )
@@ -686,14 +687,14 @@ def _parse_mcp_server(entry: dict, index: int) -> MCPServerConfig:
     if not name:
         raise ConfigError(f"[[mcp_servers]] entry #{index} is missing 'name'")
     transport = entry.get("transport", "")
-    if transport not in ("stdio", "http"):
+    if transport not in ("stdio", "http", "sse"):
         raise ConfigError(
-            f"[[mcp_servers]] '{name}': transport must be 'stdio' or 'http', got '{transport}'"
+            f"[[mcp_servers]] '{name}': transport must be 'stdio', 'http', or 'sse', got '{transport}'"
         )
     if transport == "stdio" and not entry.get("command"):
         raise ConfigError(f"[[mcp_servers]] '{name}': stdio transport requires 'command' list")
-    if transport == "http" and not entry.get("url"):
-        raise ConfigError(f"[[mcp_servers]] '{name}': http transport requires 'url'")
+    if transport in ("http", "sse") and not entry.get("url"):
+        raise ConfigError(f"[[mcp_servers]] '{name}': {transport} transport requires 'url'")
     oauth = _parse_oauth(entry, name)
     return MCPServerConfig(
         name=name,

@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional
 from error_registry import ErrorTypeRegistry
 from agent_runtime import RuntimeProfile
 from exceptions import AgentError
+from outcome_utils import fail_outcome
 from react_loop import ReactContext, parse_json
 from sub_agent_registry import (
     SOURCE_DIAGNOSTIC,
@@ -260,12 +261,7 @@ def _standardize_sub_agent_result(result: str, response_format: str) -> dict:
         ``exit_code`` keys.
     """
     if result == "[Cancelled]":
-        return {
-            "success": False,
-            "output": "",
-            "error": "Sub-agent was cancelled.",
-            "exit_code": -1,
-        }
+        return fail_outcome("Sub-agent was cancelled.")
 
     parsed = parse_json(result)
     if isinstance(parsed, dict):
@@ -333,6 +329,7 @@ class PlanExecutor:
         self._sub_agent_factory = sub_agent_factory
         self._error_registry = ErrorTypeRegistry()
         self._active_runners: dict[str, Any] = {}  # step_id -> runner
+        self._active_lock = threading.Lock()
 
     def _get_factory(self, ctx: ReactContext) -> Optional[Callable]:
         """Return the best available sub-agent factory for this context."""
@@ -380,12 +377,7 @@ class PlanExecutor:
             return runner, None
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to create sub-agent for step '%s'", step.id)
-            error = {
-                "success": False,
-                "output": "",
-                "error": f"Failed to create sub-agent: {exc}",
-                "exit_code": -1,
-            }
+            error = fail_outcome(f"Failed to create sub-agent: {exc}")
             return None, error
 
     @staticmethod
@@ -405,12 +397,7 @@ class PlanExecutor:
             return _standardize_sub_agent_result(result_text, response_format)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Sub-agent failed")
-            return {
-                "success": False,
-                "output": "",
-                "error": f"Sub-agent execution failed: {exc}",
-                "exit_code": -1,
-            }
+            return fail_outcome(f"Sub-agent execution failed: {exc}")
 
     def _dependencies_satisfied(self, step: PlanStep, results: dict[str, dict]) -> bool:
         """Return True if all of *step*'s dependencies succeeded."""
@@ -422,15 +409,7 @@ class PlanExecutor:
 
     def _skip_step(self, step: PlanStep, reason: str) -> dict:
         """Return a failure outcome for a skipped step."""
-        return {
-            "success": False,
-            "output": "",
-            "error": f"Skipped: {reason}",
-            "exit_code": -1,
-            "error_type": "",
-            "recoverable": False,
-            "suggestion": "",
-        }
+        return fail_outcome(f"Skipped: {reason}")
 
     def _diagnose_step_failure(
         self,
@@ -515,15 +494,11 @@ class PlanExecutor:
             )
             if runner is None:
                 err = creation_error.get("error", "Sub-agent creation failed.") if creation_error else "Sub-agent creation failed."
-                return {
-                    "success": False,
-                    "output": "",
-                    "error": err,
-                    "exit_code": -1,
-                    "error_type": creation_error.get("error_type", "") if creation_error else "",
-                    "recoverable": False,
-                    "suggestion": creation_error.get("suggestion", "") if creation_error else "",
-                }
+                return fail_outcome(
+                    err,
+                    error_type=creation_error.get("error_type", "") if creation_error else "",
+                    suggestion=creation_error.get("suggestion", "") if creation_error else "",
+                )
             # Re-check after potentially-blocking runner creation. Cancellation
             # may have arrived while the factory was running; discard the runner.
             if cancel_event.is_set():
@@ -540,7 +515,8 @@ class PlanExecutor:
             # "plan-step". Registration and deregistration are co-located with
             # the _active_runners add/pop and owned by this step thread so a
             # cancel/timeout leaves no stale record once the thread unwinds.
-            self._active_runners[step.id] = runner
+            with self._active_lock:
+                self._active_runners[step.id] = runner
             register_run(
                 runner,
                 source=SOURCE_PLAN_STEP,
@@ -551,7 +527,8 @@ class PlanExecutor:
             try:
                 outcome = self._execute_runner(runner, task, response_format)
             finally:
-                self._active_runners.pop(step.id, None)
+                with self._active_lock:
+                    self._active_runners.pop(step.id, None)
                 deregister_run(runner.agent_id)
             try:
                 runner.close()
@@ -595,15 +572,9 @@ class PlanExecutor:
             last_outcome["retry_count"] = retry_count
         elif last_outcome is not None:
             last_outcome["retry_count"] = retry_count
-        return last_outcome or {
-            "success": False,
-            "output": "",
-            "error": "Step execution failed for an unknown reason.",
-            "exit_code": -1,
-            "error_type": "",
-            "recoverable": False,
-            "suggestion": "",
-        }
+        return last_outcome or fail_outcome(
+            "Step execution failed for an unknown reason."
+        )
 
     def execute(
         self,
@@ -754,9 +725,14 @@ class PlanExecutor:
                     cancel_event.set()
                     # Request cooperative cancellation on still-running runners,
                     # then allow a brief grace period to take effect.
-                    for sid in list(futures.values()):
-                        runner = self._active_runners.get(sid)
-                        if runner is not None and hasattr(runner, "cancel"):
+                    with self._active_lock:
+                        active_snapshot = {
+                            sid: runner
+                            for sid in list(futures.values())
+                            if (runner := self._active_runners.get(sid)) is not None
+                        }
+                    for sid, runner in active_snapshot.items():
+                        if hasattr(runner, "cancel"):
                             try:
                                 runner.cancel()
                             except Exception:  # noqa: BLE001
@@ -767,49 +743,34 @@ class PlanExecutor:
 
                     for future in done2:
                         sid = futures[future]
-                        self._active_runners.pop(sid, None)
+                        with self._active_lock:
+                            self._active_runners.pop(sid, None)
                         if cancelled_by_parent:
-                            results[sid] = {
-                                "success": False,
-                                "output": "",
-                                "error": "Cancelled by parent agent (completed during grace period).",
-                                "exit_code": -1,
-                                "error_type": "",
-                                "recoverable": False,
-                                "suggestion": "",
-                            }
+                            results[sid] = fail_outcome(
+                                "Cancelled by parent agent (completed during grace period)."
+                            )
                             errors.append(f"Step '{sid}' cancelled by parent agent.")
                         else:
                             # Completed during grace — deadline was already exceeded.
-                            results[sid] = {
-                                "success": False,
-                                "output": "",
-                                "error": "Plan timeout exceeded (completed during cancellation grace period).",
-                                "exit_code": -1,
-                                "error_type": "tool_timeout",
-                                "recoverable": True,
-                                "suggestion": "Retry the plan with a longer timeout.",
-                            }
+                            results[sid] = fail_outcome(
+                                "Plan timeout exceeded (completed during cancellation grace period).",
+                                error_type="tool_timeout",
+                                recoverable=True,
+                                suggestion="Retry the plan with a longer timeout.",
+                            )
                             errors.append(
                                 f"Step '{sid}' timed out (deadline exceeded; completed during grace period)."
                             )
 
                     for future in pending_futures:
                         sid = futures[future]
-                        self._active_runners.pop(sid, None)
+                        with self._active_lock:
+                            self._active_runners.pop(sid, None)
                         if cancelled_by_parent:
-                            results[sid] = {
-                                "success": False,
-                                "output": "",
-                                "error": (
-                                    "Cancelled by parent agent; the step may still be "
-                                    "running in the background."
-                                ),
-                                "exit_code": -1,
-                                "error_type": "",
-                                "recoverable": False,
-                                "suggestion": "",
-                            }
+                            results[sid] = fail_outcome(
+                                "Cancelled by parent agent; the step may still be "
+                                "running in the background."
+                            )
                             errors.append(
                                 f"Step '{sid}' cancelled by parent agent "
                                 f"(may still be running in the background)."
@@ -819,18 +780,13 @@ class PlanExecutor:
                             # that is already mid-execution (e.g. a running shell
                             # subprocess). Report this honestly rather than claiming
                             # the work was stopped.
-                            results[sid] = {
-                                "success": False,
-                                "output": "",
-                                "error": (
-                                    "Plan timeout exceeded; cancellation was requested "
-                                    "but the step may still be running in the background."
-                                ),
-                                "exit_code": -1,
-                                "error_type": "tool_timeout",
-                                "recoverable": True,
-                                "suggestion": "Retry the plan with a longer timeout.",
-                            }
+                            results[sid] = fail_outcome(
+                                "Plan timeout exceeded; cancellation was requested "
+                                "but the step may still be running in the background.",
+                                error_type="tool_timeout",
+                                recoverable=True,
+                                suggestion="Retry the plan with a longer timeout.",
+                            )
                             errors.append(
                                 f"Step '{sid}' timed out: cancellation requested "
                                 f"(may still be running in the background)."
@@ -842,15 +798,7 @@ class PlanExecutor:
                         outcome = future.result()
                     except Exception as exc:  # noqa: BLE001
                         logger.exception("Step '%s' future raised", sid)
-                        outcome = {
-                            "success": False,
-                            "output": "",
-                            "error": f"Execution error: {exc}",
-                            "exit_code": -1,
-                            "error_type": "",
-                            "recoverable": False,
-                            "suggestion": "",
-                        }
+                        outcome = fail_outcome(f"Execution error: {exc}")
                     results[sid] = outcome
                     diagnosis = outcome.get("diagnosis")
                     retry_count = outcome.get("retry_count", 0)
@@ -870,13 +818,16 @@ class PlanExecutor:
                 # Cancel any runners that did not complete and shut down the
                 # pool without waiting indefinitely. Pending futures that
                 # ignore cancellation will be forcibly discarded.
-                for sid, runner in list(self._active_runners.items()):
+                with self._active_lock:
+                    final_active = list(self._active_runners.items())
+                for sid, runner in final_active:
                     if hasattr(runner, "cancel"):
                         try:
                             runner.cancel()
                         except Exception:  # noqa: BLE001
                             pass
-                self._active_runners.clear()
+                with self._active_lock:
+                    self._active_runners.clear()
                 for future in list(futures.keys()):
                     if not future.done():
                         future.cancel()
@@ -889,15 +840,9 @@ class PlanExecutor:
         for step in plan.steps:
             if step.id not in results:
                 if cancelled_by_parent:
-                    results[step.id] = {
-                        "success": False,
-                        "output": "",
-                        "error": "Cancelled by parent agent before this step could be executed.",
-                        "exit_code": -1,
-                        "error_type": "",
-                        "recoverable": False,
-                        "suggestion": "",
-                    }
+                    results[step.id] = fail_outcome(
+                        "Cancelled by parent agent before this step could be executed."
+                    )
                     errors.append(
                         f"Step '{step.id}' cancelled: parent agent cancelled before execution."
                     )

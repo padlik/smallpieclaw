@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from vector_utils import cosine_similarity
@@ -166,7 +166,7 @@ class MemoryStore:
         """Append a timestamped event to the event log."""
         with self._lock:
             log: list = self._data.setdefault("_event_log", [])
-            log.append({"time": datetime.utcnow().isoformat(), "event": event})
+            log.append({"time": datetime.now(timezone.utc).isoformat(), "event": event})
             # Keep only last 50 events to avoid unbounded growth
             self._data["_event_log"] = log[-50:]
             self._save_with_retry()
@@ -258,13 +258,13 @@ class WorkingMemory:
     def start_task(self, goal: str) -> None:
         self._goal = goal
         self._steps = []
-        self._started_at = datetime.utcnow().isoformat()
+        self._started_at = datetime.now(timezone.utc).isoformat()
 
     def add_step(self, action: str, details: dict) -> None:
         self._steps.append({
             "action": action,
             "details": details,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
     def to_summary_text(self) -> str:
@@ -341,7 +341,7 @@ class LongTermMemory:
             self._data[entry_id] = {
                 "content": content,
                 "source": source,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "vector": vector,
             }
             self._save_with_retry()
@@ -555,7 +555,7 @@ class ResultsMemory:
                 "goal": goal,
                 "summary": summary,
                 "tools_used": tools_used or [],
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "vector": vector,
             }
             self._save_with_retry()

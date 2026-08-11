@@ -30,6 +30,7 @@ from context_manager import maybe_compact
 from interfaces import ToolCall
 from llm_client import LLMClient, LLMCancelledError, LLMError, LLMPermanentError, _encode_images
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
+from outcome_utils import fail_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -719,14 +720,16 @@ def _normalize_shorthand_action(action_obj: dict) -> dict:
                     shorthand_args = parsed
                 else:
                     logger.warning(
-                        "Shorthand action '%s' args parsed to non-dict type %s — keeping string",
+                        "Shorthand action '%s' args parsed to non-dict type %s — wrapping in _raw",
                         action, type(parsed).__name__,
                     )
+                    shorthand_args = {"_raw": shorthand_args}
             except (ValueError, TypeError):
                 logger.warning(
-                    "Shorthand action '%s' args is a non-JSON string — keeping as-is: %s",
+                    "Shorthand action '%s' args is a non-JSON string — wrapping in _raw: %s",
                     action, shorthand_args[:200],
                 )
+                shorthand_args = {"_raw": shorthand_args}
     else:
         shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
     return {"action": "tool", "tool": action, "args": shorthand_args}
@@ -1252,6 +1255,10 @@ def _dispatch_tool(
     pfx = ""  # run identity is now supplied by structlog contextvars (see agent_logging); avoid double-prefixing
     tool_name = action_obj.get("tool", "")
     args = action_obj.get("args", {})
+    if isinstance(args, str):
+        # Defense-in-depth: bare string args crash .items()/.get() downstream.
+        # _normalize_shorthand_action should have wrapped this already.
+        args = {"_raw": args}
     if isinstance(args, list):
         args = {str(i): v for i, v in enumerate(args)}
 
@@ -1309,15 +1316,12 @@ def _dispatch_tool(
                     _progress(f"✅ Confirmed — executing `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
                 else:
                     ctx.builtin_executor.cancel(token)
-                    outcome = {
-                        "success": False, "output": "", "exit_code": -1,
-                        "error": (
-                            "Operation cancelled by the operator. "
-                            "Do not retry this operation via any other tool or method. "
-                            "Respond with a finish action now."
-                        ),
-                        "_operator_cancelled": True,
-                    }
+                    outcome = fail_outcome(
+                        "Operation cancelled by the operator. "
+                        "Do not retry this operation via any other tool or method. "
+                        "Respond with a finish action now.",
+                    )
+                    outcome["_operator_cancelled"] = True
                     _progress("❌ Cancelled by operator — stopping task.")
         return outcome
 
@@ -1376,9 +1380,4 @@ def _dispatch_tool(
         return outcome
 
     # Unknown tool — no hand-written tools exist anymore
-    return {
-        "success": False,
-        "output": "",
-        "error": f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.",
-        "exit_code": -1,
-    }
+    return fail_outcome(f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.")

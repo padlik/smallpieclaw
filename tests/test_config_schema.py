@@ -118,7 +118,7 @@ class TestValidation:
             "name": "bad",
             "transport": "websocket",
         }]
-        with pytest.raises(ConfigError, match="'stdio' or 'http'"):
+        with pytest.raises(ConfigError, match="'stdio', 'http', or 'sse'"):
             parse_config(minimal_config)
 
     def test_mcp_stdio_missing_command(self, minimal_config):
