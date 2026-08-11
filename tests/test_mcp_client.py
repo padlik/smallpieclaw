@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 import mcp_client
@@ -15,6 +19,7 @@ from mcp_client import (
     _sdk_tools_to_registry,
     _tool_outcome,
 )
+from tests.test_mcp_oauth import _make_self_signed_cert
 
 
 # ---------------------------------------------------------------------------
@@ -1390,3 +1395,147 @@ class TestMCPOAuthIntegration:
         assert "oauth result" in tool_result["output"]
 
         mgr.close_all()
+
+    def test_prepare_oauth_provider_non_interactive_redirect_resolves_ready(
+        self, tmp_path: Path
+    ) -> None:
+        """Non-interactive redirect with a stored token marks needs_auth and resolves ready."""
+        import asyncio
+
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        (mcp_tokens_dir / "oauth_srv.json").write_text(
+            json.dumps({"access_token": "expired_tok", "token_type": "Bearer"}),
+            encoding="utf-8",
+        )
+
+        cert_path, key_path = _make_self_signed_cert(tmp_path)
+        cfg = {
+            "name": "oauth_srv",
+            "transport": "http",
+            "url": "http://localhost:8080",
+            "timeout": 5,
+            "oauth": {
+                "client_id": "client1",
+                "client_secret": "secret1",
+                "redirect_uri": "https://localhost/cb",
+                "scope": "tools",
+                "callback_port": 0,
+                "callback_bind": "127.0.0.1",
+                "cert_path": cert_path,
+                "key_path": key_path,
+            },
+        }
+
+        loop = asyncio.new_event_loop()
+        wrapper = _SdkClientWrapper(cfg, loop)
+        wrapper._mcp_tokens_dir = mcp_tokens_dir
+        wrapper._tg_iface = None
+
+        async def _prepare() -> None:
+            await wrapper._prepare_oauth_provider(cfg["oauth"])
+
+        loop.run_until_complete(_prepare())
+        provider = wrapper._oauth_provider
+        assert provider is not None
+        redirect_handler = provider.context.redirect_handler
+        assert redirect_handler is not None
+
+        # Simulate the SDK calling redirect_handler with no Telegram context.
+        async def _simulate_redirect() -> None:
+            with pytest.raises(RuntimeError, match="non-interactive OAuth redirect"):
+                await redirect_handler("https://example.com?state=abc123")
+
+        loop.run_until_complete(_simulate_redirect())
+        loop.close()
+
+        assert wrapper.needs_auth is True
+        assert wrapper._ready_future.done() is True
+        # The ready future should resolve to an empty tool list.
+        assert wrapper._ready_future.result() == []
+
+    def test_session_runner_non_interactive_redirect_sets_needs_auth_no_error(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """_session_runner logs INFO, not ERROR, when the SDK aborts for needs_auth."""
+        import asyncio
+        import logging
+
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        (mcp_tokens_dir / "google-workspace.json").write_text(
+            json.dumps({"access_token": "expired_tok", "token_type": "Bearer"}),
+            encoding="utf-8",
+        )
+
+        cert_path, key_path = _make_self_signed_cert(tmp_path)
+        cfg = {
+            "name": "google-workspace",
+            "transport": "http",
+            "url": "http://localhost:8080",
+            "timeout": 5,
+            "oauth": {
+                "client_id": "client1",
+                "client_secret": "secret1",
+                "redirect_uri": "https://localhost/cb",
+                "scope": "tools",
+                "callback_port": 0,
+                "callback_bind": "127.0.0.1",
+                "cert_path": cert_path,
+                "key_path": key_path,
+            },
+        }
+
+        loop = asyncio.new_event_loop()
+        wrapper = _SdkClientWrapper(cfg, loop)
+        wrapper._mcp_tokens_dir = mcp_tokens_dir
+        wrapper._tg_iface = None
+
+        async def _prepare() -> None:
+            await wrapper._prepare_oauth_provider(cfg["oauth"])
+
+        loop.run_until_complete(_prepare())
+        provider = wrapper._oauth_provider
+        assert provider is not None
+        redirect_handler = provider.context.redirect_handler
+        assert redirect_handler is not None
+
+        class _FailingHttpClient:
+            """Fake async context manager that triggers the non-interactive
+            redirect handler inside __aenter__, then raises to abort the session.
+            """
+
+            def __init__(self, _url: str, **kwargs) -> None:  # noqa: ARG002
+                pass
+
+            async def __aenter__(self) -> tuple[None, None, None]:
+                await redirect_handler("https://example.com/auth?state=abc123")
+                raise RuntimeError("simulated SDK abort after non-interactive redirect")
+
+            async def __aexit__(self, *_exc_info: object) -> bool:  # noqa: ANN001
+                return False
+
+        async def _run_session() -> None:
+            with patch.object(mcp_client, "streamablehttp_client", _FailingHttpClient):
+                await wrapper._session_runner()
+
+        with caplog.at_level(logging.INFO, logger="mcp_client"):
+            loop.run_until_complete(_run_session())
+        loop.close()
+
+        assert wrapper.needs_auth is True
+        assert wrapper.connected is False
+        assert wrapper.last_error == ""
+        assert wrapper._ready_future.done() is True
+        assert wrapper._ready_future.result() == []
+
+        info_messages = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        error_messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            "session ended (needs_auth)" in msg for msg in info_messages
+        )
+        assert not any(
+            "google-workspace" in msg for msg in error_messages
+        ), "needs_auth session must not produce ERROR logs for the server"

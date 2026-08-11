@@ -651,6 +651,84 @@ class TestOAuthProviderFactory:
             loop.run_until_complete(server.stop())
             loop.close()
 
+    def test_redirect_handler_non_interactive_callback(self, tmp_path: Path) -> None:
+        """With on_non_interactive, degraded path signals and raises."""
+        from mcp_oauth import CallbackServer, make_redirect_handler
+
+        cert_path, key_path = _make_self_signed_cert(tmp_path)
+        loop = asyncio.new_event_loop()
+        cb_server = CallbackServer(
+            port=0,
+            bind="127.0.0.1",
+            cert_path=cert_path,
+            key_path=key_path,
+            loop=loop,
+        )
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(cb_server.start())  # Real listener so we can verify stop()
+
+        callback_ran: dict[str, bool] = {"ran": False}
+
+        def _on_non_interactive() -> None:
+            callback_ran["ran"] = True
+
+        handler = make_redirect_handler(
+            None, "srv", cb_server, chat_id=None,
+            on_non_interactive=_on_non_interactive,
+        )
+
+        async def _run() -> None:
+            with pytest.raises(RuntimeError, match="non-interactive OAuth redirect"):
+                await handler("https://example.com?state=abc123")
+
+        try:
+            loop.run_until_complete(_run())
+            assert callback_ran["ran"] is True
+            assert cb_server._server is None, "callback server must be stopped"
+        finally:
+            loop.run_until_complete(cb_server.stop())
+            loop.close()
+
+    def test_redirect_handler_non_interactive_callback_exception_still_raises(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """If on_non_interactive raises, the handler still logs, stops, and raises."""
+        from mcp_oauth import CallbackServer, make_redirect_handler
+
+        cert_path, key_path = _make_self_signed_cert(tmp_path)
+        loop = asyncio.new_event_loop()
+        cb_server = CallbackServer(
+            port=0,
+            bind="127.0.0.1",
+            cert_path=cert_path,
+            key_path=key_path,
+            loop=loop,
+        )
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(cb_server.start())
+
+        def _on_non_interactive() -> None:
+            raise RuntimeError("boom")
+
+        handler = make_redirect_handler(
+            None, "srv", cb_server, chat_id=None,
+            on_non_interactive=_on_non_interactive,
+        )
+
+        async def _run() -> None:
+            with pytest.raises(RuntimeError, match="non-interactive OAuth redirect"):
+                await handler("https://example.com?state=abc123")
+
+        with caplog.at_level(logging.ERROR, logger="mcp_oauth"):
+            try:
+                loop.run_until_complete(_run())
+            finally:
+                loop.run_until_complete(cb_server.stop())
+                loop.close()
+
+        assert "on_non_interactive callback raised" in caplog.text
+        assert cb_server._server is None
+
 
 # ---------------------------------------------------------------------------
 # Extra auth params
