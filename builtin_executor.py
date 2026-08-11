@@ -254,6 +254,9 @@ class BuiltinExecutor:
         self._default_grant_tracker: GrantTracker = GrantTracker()
         # Per-confirmation zone_path store: token -> original path (for Telegram zone buttons)
         self._zone_paths: dict[str, str] = {}
+        # Per-confirmation tracker capture: token -> GrantTracker (so the Telegram
+        # callback thread can write to the run-scoped tracker, not the default).
+        self._zone_trackers: dict[str, "GrantTracker"] = {}
         # Name-keyed dispatch registries (replace the former if/elif chains).
         # Each value is a per-tool adapter that forwards exactly the kwargs that
         # tool accepts today (Decision 3); vision_query has no entry — it is
@@ -489,6 +492,7 @@ class BuiltinExecutor:
         """
         entry = self._pending.pop(token, None)
         self._zone_paths.pop(token, None)
+        self._zone_trackers.pop(token, None)
         if entry is None:
             return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
         tool_name, args = entry
@@ -515,6 +519,7 @@ class BuiltinExecutor:
         """
         entry = self._pending.pop(token, None)
         self._zone_paths.pop(token, None)
+        self._zone_trackers.pop(token, None)
         if entry is None:
             return
         tool_name = entry[0]
@@ -574,6 +579,7 @@ class BuiltinExecutor:
         self._pending[token] = (tool_name, args)
         if zone_path:
             self._zone_paths[token] = zone_path
+            self._zone_trackers[token] = self.grant_tracker
         logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
         return {
             "requires_confirmation": True,

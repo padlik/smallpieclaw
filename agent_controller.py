@@ -191,6 +191,10 @@ class AgentController:
         if self.builtin_executor is not None and self._depth == 0:
             self.builtin_executor._prompt_approval_set = self._confirmation.auto_approve_tools
             self.builtin_executor._current_prompt_id = prompt_id
+            # Reset the default tracker so stale grants from a prior run (or
+            # from a Telegram callback that fell back to the default) don't
+            # accumulate across runs.
+            self.builtin_executor._default_grant_tracker.reset()
         # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
         # keeps only the per-run concerns: trace minting (above), model
         # _active_idx save/restore (below), and progress/image passthrough.

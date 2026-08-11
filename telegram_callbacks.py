@@ -421,8 +421,9 @@ async def cb_zone_allow(iface: "TelegramInterface", update: Update, ctx: Context
         return
 
     zone_path = builtin._zone_paths.pop(token, "")
-    if zone_path:
-        builtin.grant_tracker.add(zone_path)
+    tracker = builtin._zone_trackers.pop(token, None)
+    if zone_path and tracker is not None:
+        tracker.add(zone_path)
 
     if iface.agent:
         iface.agent.resume(token, True)
