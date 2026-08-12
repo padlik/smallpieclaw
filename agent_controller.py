@@ -27,21 +27,8 @@ from conversation_io import _load_or_create_conversation_id, _save_conversation
 from llm_client import LLMClient
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
-from prompt_builder import (
-    estimate_tokens as _estimate_tokens,
-    format_log_section as _format_log_section_impl,
-    format_models as _format_models_impl,
-    format_skills as _format_skills_impl,
-    format_tools as _format_tools_impl,
-)
-from react_loop import (
-    extract_json_candidates,
-    fmt_tool_call,
-    fmt_tool_result_progress,
-    format_tool_result,
-    parse_json,
-    react_loop,
-)
+from prompt_builder import estimate_tokens as _estimate_tokens
+from react_loop import react_loop
 from tool_index import ToolIndex
 from trace_context import child_trace_id
 
@@ -401,54 +388,12 @@ class AgentController:
             f"(−{saved:,}, {pct}% smaller)"
         )
 
-    # ------------------------------------------------------------------
-    # Internals (delegates to react_loop module)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _format_tools(tools) -> str:
-        return _format_tools_impl(tools)
-
-    def _format_skills(self) -> str:
-        """Return the AVAILABLE SKILLS prompt section, or empty string if no skills."""
-        return _format_skills_impl(self.skill_registry)
-
-    def _format_models(self) -> str:
-        """Return the AVAILABLE MODELS prompt section listing all configured models."""
-        return _format_models_impl(self.llm)
-
     def list_models(self) -> list[dict]:
         """Return all configured models as a list of dicts."""
         try:
             return list(self.llm._models)
         except AttributeError:
             return []
-
-    def _format_log_section(self) -> str:
-        """Build the AGENT LOG section for the system prompt."""
-        return _format_log_section_impl(self.log_file, self.log_backup_count)
-
-    @staticmethod
-    def _fmt_tool_call(tool_name: str, args: dict) -> str:
-        return fmt_tool_call(tool_name, args)
-
-    @staticmethod
-    def _fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
-        return fmt_tool_result_progress(tool_name, args, outcome)
-
-    @staticmethod
-    def _format_tool_result(tool_name: str, outcome: dict) -> str:
-        return format_tool_result(tool_name, outcome)
-
-    @staticmethod
-    def _extract_json_candidates(text: str) -> list[str]:
-        return extract_json_candidates(text)
-
-    @staticmethod
-    def _parse_json(text: str) -> Optional[dict]:
-        return parse_json(text)
-
-
 
 # ---------------------------------------------------------------------------
 # SubAgentRunner
