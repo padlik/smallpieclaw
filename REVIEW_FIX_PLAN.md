@@ -234,14 +234,56 @@ All small, isolated, no behavioral change. Safe to batch in one PR.
 
 ---
 
-## Stage 6 — Coverage Gap Review (Research Only)
+## Stage 6 — Coverage Gap Review (Research Only — COMPLETED)
 
 ### 6A. TD-14 — Review `scheduler.py` and `sub_agent_supervisor.py`
 - **Files:** `scheduler.py` (1176 LOC), `sub_agent_supervisor.py` (359 LOC)
-- **Action:** Re-scope a focused review of these two files in a fresh session. They were not covered by the original oracle lane due to a tool loop. Document any new findings and add them to this plan.
+- **Action:** Focused oracle review of both files. 19 findings produced.
 - **Verify:** N/A (research task; produces findings, not code changes)
 
-**Stage 6 Exit Criteria:** Review document produced with findings for scheduler.py + sub_agent_supervisor.py.
+**Stage 6 Exit Criteria:** ✅ Review document produced with findings for scheduler.py + sub_agent_supervisor.py.
+
+---
+
+## Stage 6 Findings
+
+### `scheduler.py` (1176 LOC)
+
+| ID | Category | Severity | File:line | Description | Fix Sketch |
+|---|---|---|---|---|---|
+| SCHED-01 | large-method | high | `scheduler.py:598-774` | `_run_job` is 177 lines with two full execution strategies (spawn_agent + legacy agent_fn) | Extract `_handle_empty_task`, `_run_via_spawn_agent`, `_run_via_agent_fn`; keep `_run_job` as dispatcher |
+| SCHED-02 | risk | high | `scheduler.py:636,702,769,827,839,932` | `_jobs_meta` mutated across threads without a consistent lock; concurrent once-job pop during `_save_state_locked` iteration can raise `RuntimeError: dictionary changed size` | Designate one lock as `_jobs_meta` guard for all mutation/iteration, or snapshot (`list(...)`) inside `_save_state_locked` |
+| SCHED-03 | encapsulation | medium | `scheduler.py:644,685` | Scheduler calls `builtin_executor._exec_spawn_agent` (private) across class boundary; `hasattr` probe on private name | Expose public `spawn_agent(args, options)` on `BuiltinExecutor` |
+| SCHED-04 | tech-debt | medium | `scheduler.py:139,209,210,425,622,1016,1073` | `datetime.utcnow()` deprecated in 3.12+; inconsistent with rest of codebase using `datetime.now(timezone.utc)` | Replace with `datetime.now(timezone.utc)` |
+| SCHED-05 | duplication | medium | `scheduler.py:53,344-347,352` | Tag-normalization logic (`.replace` chain + underscore collapse) duplicated 3 times | Extract single `_normalize_tag(s) -> str` helper |
+| SCHED-06 | duplication | medium | `scheduler.py:634-638,700-704,766-771` | Once-job removal block (`schedule.clear` + `_jobs_meta.pop` + `_save_state` + `_save_scheduler_toml`) copy-pasted 3 times | Extract `_remove_once_job(tag)` |
+| SCHED-07 | tech-debt | low | `scheduler.py:69` | `_legacy_to_cron` has dead `run_at` parameter; `time_str: str = None` should be `Optional[str]` | Drop `run_at`; add `Optional[...]` hints |
+| SCHED-08 | large-method | medium | `scheduler.py:1025-1094,357-448` | `_load_config_jobs` (70 lines) and `add_job` (92 lines) exceed 40 lines | Extract `_build_job_meta` and `_resolve_schedule` helpers |
+| SCHED-09 | tech-debt | medium | `scheduler.py:960-1023` | Hand-rolled TOML serializer (64 lines) is fragile | Serialize with `tomli_w`/`tomlkit`, or extract `_serialize_job(tag, meta) -> list[str]` |
+| SCHED-10 | tech-debt | medium | `scheduler.py:715` | Error detection via `result.startswith("❌")` emoji sentinel — brittle protocol coupling | Have `agent_fn` return structured `{success, result}` or raise |
+| SCHED-11 | idiom | low | `scheduler.py:493` | Redundant `import threading as _threading` inside `run_now` while `threading` is module-level | Use module-level `threading.Thread(...)` |
+| SCHED-12 | risk | low | `scheduler.py:327,455,468,556,562,1133` | `schedule` library (not thread-safe) mutated from main thread and read from loop thread | Serialize all `schedule.*` calls under one lock, or migrate once-jobs to croniter |
+
+### `sub_agent_supervisor.py` (359 LOC)
+
+| ID | Category | Severity | File:line | Description | Fix Sketch |
+|---|---|---|---|---|---|
+| SUBSUP-01 | large-method | high | `sub_agent_supervisor.py:152-333` | `_run_and_notify` is 182 lines with 3 near-duplicate terminal branches (cancelled/done/failed) | Extract `_finalize_terminal(record, status, result, ...)`; keep only branch-specific notify text |
+| SUBSUP-02 | duplication | medium | `sub_agent_supervisor.py:233-244,266-277,300-311` | `result_log_cb` invocation + try/except duplicated 3 times | Extract `_safe_result_log(cb, *, tag, task, result, success, elapsed, model)` |
+| SUBSUP-03 | duplication | low | `sub_agent_supervisor.py:279-285,313-319` | Notification header HTML duplicated (done/failed differ only in emoji/verb) | Extract `_result_header(icon, verb, runner, label, task, elapsed) -> str` |
+| SUBSUP-04 | tech-debt | medium | `sub_agent_supervisor.py:226,228,238` | `"[Cancelled]"` magic-string protocol between runner and supervisor | Define shared `CANCELLED_SENTINEL` constant or signal via `record.status` |
+| SUBSUP-05 | encapsulation | medium | `sub_agent_supervisor.py:130,138,195,205,230,241,247,264,283,298,308,317` | Cross-class private-attribute access on runner/record (`_model_id`, `_short_term`, `_agent._trace_id`, `_result_event`, `_timeout_cancelled`) | Add read properties (`runner.model_id`, `runner.short_term`, `runner.trace_id`) and `record.signal_result()` / `record.timeout_cancelled` public surface |
+| SUBSUP-06 | tech-debt | low | `sub_agent_supervisor.py:152-153` | Missing type hints on `runner`/`record` params in `_run_and_notify` and `submit` | Import `SubAgentRunner`/`SubAgentRecord` under `TYPE_CHECKING` and annotate |
+| SUBSUP-07 | idiom | low | `sub_agent_supervisor.py:175` | Mutable-dict closure flag (`context_save_attempted = {"done": False}`) instead of clearer idiom | Use `nonlocal` after extracting terminal path (SUBSUP-01), or a guard object |
+
+### Summary
+
+| File | High | Medium | Low |
+|---|---|---|---|
+| `scheduler.py` | SCHED-01, SCHED-02 | SCHED-03/04/05/06/08/09/10 | SCHED-07/11/12 |
+| `sub_agent_supervisor.py` | SUBSUP-01 | SUBSUP-02/04/05 | SUBSUP-03/06/07 |
+
+**Priority recommendation:** SCHED-02 (locking crash risk) is the only finding with genuine correctness risk. The two large-method items (SCHED-01, SUBSUP-01) carry the most duplication and are the natural next refactor targets. Encapsulation findings (SCHED-03, SUBSUP-05) are pervasive but low-risk — address opportunistically when surrounding methods are refactored.
 
 ---
 
