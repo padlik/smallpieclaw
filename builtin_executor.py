@@ -40,7 +40,6 @@ import agent_logging
 from builtin_tools.access_control import GrantTracker
 from builtin_tools.agents import AgentTools
 from builtin_tools.context_io import (
-    _load_context,  # noqa: F401  re-exported for agent_runtime + tests
     _save_context,  # noqa: F401  re-exported for tests
     _validate_context_key,  # noqa: F401  re-exported for tests
 )

@@ -12,7 +12,8 @@ import os
 
 import pytest
 
-from builtin_executor import _load_context, _save_context
+from builtin_executor import _save_context
+from builtin_tools.context_io import _load_context
 from memory_store import ShortTermMemory
 from sub_agent_supervisor import SupervisionOptions
 
