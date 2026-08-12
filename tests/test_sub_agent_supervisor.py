@@ -40,10 +40,13 @@ class FakeRunner:
                  block: bool = False, model_id: str = "test-model"):
         self.agent_id = agent_id
         self._model_id = model_id
+        self.model_id = model_id
         self._cancel_event = threading.Event()
         self._llm = MagicMock()  # cancel() calls close_http()
-        self._agent = SimpleNamespace(max_iterations=8, _on_step=None)
+        self._agent = SimpleNamespace(max_iterations=8, _on_step=None, _trace_id=None)
         self._short_term = ShortTermMemory(max_turns=50)
+        self.short_term = self._short_term
+        self.trace_id = None
         self.notify_calls: list[str] = []
         self.closed = False
         self.saw_cancel = False
@@ -117,7 +120,7 @@ class TestSchedulerSynchronousRejection:
         s._jobs_meta["capped_job"] = {"task": "do work", "enabled": True, "notify": True}
 
         mock_executor = MagicMock()
-        mock_executor._exec_spawn_agent = MagicMock(return_value={
+        mock_executor.spawn_agent = MagicMock(return_value={
             "success": False,
             "output": "",
             "error": "spawn_agent: max_subagents cap reached (6/6).",

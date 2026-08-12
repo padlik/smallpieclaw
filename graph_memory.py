@@ -504,14 +504,19 @@ class GraphMemoryStore:
     # Write operations
     # ------------------------------------------------------------------
 
-    def _preload_embeddings(self, vectors: dict[str, list[float]]) -> None:
+    def _preload_embeddings(self, vectors: dict[str, Optional[list[float]]]) -> None:
         """Stage pre-computed entity vectors for the current writer thread.
 
         Used by the batch writer to avoid N serial embedding round-trips
         inside :meth:`upsert_entity`. Vectors are consumed thread-locally and
         cleared after the batch is processed.
+
+        Keys are lower-cased here so staged vectors match regardless of the
+        casing the extractor used for a given mention. A ``None`` value records
+        "pre-embedding was attempted and failed", which suppresses a second
+        attempt in :meth:`_embedding_for_entity`.
         """
-        self._local.precomputed_vectors = dict(vectors)
+        self._local.precomputed_vectors = {name.lower(): vec for name, vec in vectors.items()}
 
     def _clear_preloaded_embeddings(self) -> None:
         """Drop any staged vectors for the current writer thread."""
@@ -535,8 +540,11 @@ class GraphMemoryStore:
         if vector is not None:
             return vector
         local_vectors = getattr(self._local, "precomputed_vectors", None)
-        if local_vectors is not None and name in local_vectors:
-            return local_vectors[name]
+        if local_vectors is not None and name.lower() in local_vectors:
+            # A staged None means the batch pre-embed already tried this name and
+            # failed; retrying here would double the retry/backoff cost during an
+            # embeddings outage and can stall the writer past its join timeout.
+            return local_vectors[name.lower()]
         try:
             return self._embed(name)
         except Exception as exc:  # noqa: BLE001
@@ -1156,18 +1164,24 @@ class GraphMemoryWriter:
         # its provider backends expose native batch embedding (OpenAI's
         # ``/embeddings`` endpoint and Gemini's batch embedContent both accept
         # lists, but the current provider wrappers only accept a single string).
+        # Keyed case-insensitively to match how endpoints are de-duplicated below
+        # (entity_ids uses name.lower()) — otherwise "Alice" in entities and
+        # "alice" in facts would each cost their own embedding round-trip.
         unique_entity_names: set[str] = set()
         for entity in result.entities:
-            unique_entity_names.add(entity.name)
+            unique_entity_names.add(entity.name.lower())
         for fact in result.facts:
-            unique_entity_names.add(fact.source)
-            unique_entity_names.add(fact.target)
+            unique_entity_names.add(fact.source.lower())
+            unique_entity_names.add(fact.target.lower())
 
-        entity_vectors: dict[str, list[float]] = {}
+        entity_vectors: dict[str, Optional[list[float]]] = {}
         for name in unique_entity_names:
             try:
                 entity_vectors[name] = self._store._embed(name)
             except Exception as exc:  # noqa: BLE001
+                # Record the failure (None) rather than omitting the key, so
+                # upsert_entity does not retry the same failing embed call.
+                entity_vectors[name] = None
                 logger.debug("Batch pre-embedding failed for '%s': %s", name, exc)
         self._store._preload_embeddings(entity_vectors)
 

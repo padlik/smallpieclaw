@@ -23,13 +23,20 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from agent_logging import bind_run_context, clear_run_context
 from sub_agent_registry import SOURCE_ON_DEMAND
 from trace_context import child_trace_id
 
+if TYPE_CHECKING:
+    from agent_controller import SubAgentRunner
+    from sub_agent_registry import SubAgentRecord
+
 logger = logging.getLogger(__name__)
+
+
+CANCELLED_SENTINEL = "[Cancelled]"
 
 
 @dataclass
@@ -127,7 +134,7 @@ class SubAgentSupervisor:
         _fb_log = str(fallback_models) if fallback_models is not None else "inherited"
         logger.info(
             "spawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
-            runner.agent_id, request.label, runner._model_id, _fb_log, request.task[:100],
+            runner.agent_id, request.label, runner.model_id, _fb_log, request.task[:100],
         )
 
         self._pool.submit(lambda: self._run_and_notify(request, options, runner, record))
@@ -135,7 +142,7 @@ class SubAgentSupervisor:
         return {
             "success": True,
             "output": (
-                f"Sub-agent spawned (id: {runner.agent_id}, model: {runner._model_id}, "
+                f"Sub-agent spawned (id: {runner.agent_id}, model: {runner.model_id}, "
                 f"response_format: {request.response_format}). "
                 f"Call get_agent_result(\"{runner.agent_id}\") to retrieve the result when needed."
             ),
@@ -149,12 +156,17 @@ class SubAgentSupervisor:
     # Background lifecycle
     # ------------------------------------------------------------------
 
-    def _run_and_notify(self, request: SubmissionRequest, options: SupervisionOptions,
-                        runner, record) -> None:
+    def _run_and_notify(
+        self,
+        request: SubmissionRequest,
+        options: SupervisionOptions,
+        runner: SubAgentRunner,
+        record: SubAgentRecord,
+    ) -> None:
         """Run the sub-agent to completion and deliver its result.
 
         Executes on a pool thread. Preserves the terminal-path invariants:
-        context is saved before ``record._result_event`` is set, stale success
+        context is saved before ``record.signal_result`` is set, stale success
         notifications are suppressed after a get_agent_result timeout cancel,
         and ``finish_cb`` fires exactly once after unregister/close on every
         background terminal path.
@@ -172,7 +184,7 @@ class SubAgentSupervisor:
         notify_result = options.notify
         expandable = options.expandable
         notify_html = request.notify_html_fn
-        context_save_attempted = {"done": False}
+        context_save_attempted = False
 
         def _send_result_html(header_html: str, body: str) -> None:
             """Send header + body, optionally wrapped in an expandable blockquote."""
@@ -188,11 +200,12 @@ class SubAgentSupervisor:
 
         def _save_context_before_completion() -> None:
             """Persist context before exposing completion to get_agent_result callers."""
-            if not context_key or context_save_attempted["done"] or save_context is None:
+            nonlocal context_save_attempted
+            if not context_key or context_save_attempted or save_context is None:
                 return
-            context_save_attempted["done"] = True
+            context_save_attempted = True
             try:
-                save_context(context_key, runner._short_term, data_dir)
+                save_context(context_key, runner.short_term, data_dir)
             except Exception as save_exc:  # noqa: BLE001
                 logger.warning(
                     "spawn_agent: [%s] context save failed for %s: %s",
@@ -202,7 +215,7 @@ class SubAgentSupervisor:
         try:
             # Bind the parent's prompt_id into the pool thread's log context so
             # every sub-agent log line correlates with the originating prompt.
-            parent_trace = getattr(runner._agent, "_trace_id", None)
+            parent_trace = runner.trace_id
             run_trace_id = child_trace_id(parent_trace) if parent_trace else ""
             bind_run_context(
                 trace=run_trace_id,
@@ -223,104 +236,90 @@ class SubAgentSupervisor:
             # risks prompt poisoning. If a result should be remembered, the
             # operator/main agent must explicitly (and with confirmation) call
             # memory_graph_store.
-            if result == "[Cancelled]":
-                record.status = "cancelled"
-                record.result = "[Cancelled]"
-                _save_context_before_completion()
-                record._result_event.set()
+            if result == CANCELLED_SENTINEL:
                 elapsed = int(time.time() - record.started_at)
-                logger.info("spawn_agent: [%s] cancelled | id=%s", label, runner.agent_id)
-                if result_log_cb:
-                    try:
-                        result_log_cb(
-                            tag=job_tag,
-                            task=task,
-                            result="[Cancelled]",
-                            success=False,
-                            elapsed_s=elapsed,
-                            model=runner._model_id,
-                        )
-                    except Exception as log_exc:  # noqa: BLE001
-                        logger.warning("spawn_agent: [%s] result_log_cb failed (cancelled): %s", label, log_exc)
-                # Suppress notification for agents cancelled due to get_agent_result
-                # timeout — the caller already received a timeout response.
-                if notify_result and not record._timeout_cancelled:
-                    try:
-                        runner.notify_fn(
-                            f"🛑 Sub-agent {runner.agent_id} cancelled\n"
-                            f"Job: **{label}**\n"
-                            f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
-                        )
-                    except Exception as notify_exc:  # noqa: BLE001
-                        logger.warning("spawn_agent: [%s] notify failed (cancelled): %s", label, notify_exc)
+                self._finalize_terminal(
+                    record=record,
+                    status="cancelled",
+                    result=CANCELLED_SENTINEL,
+                    runner=runner,
+                    label=label,
+                    task=task,
+                    elapsed=elapsed,
+                    model=runner.model_id,
+                    result_log_cb=result_log_cb,
+                    notify=notify_result,
+                    notify_cb=lambda: self._send_cancelled_text(
+                        runner, record, label
+                    ),
+                    save_context_cb=_save_context_before_completion,
+                    result_log_result=CANCELLED_SENTINEL,
+                    result_log_success=False,
+                    log_level="info",
+                    log_msg=("spawn_agent: [%s] cancelled | id=%s"),
+                    log_args=(label, runner.agent_id),
+                    icon_verb=("🛑", "cancelled"),
+                )
             else:
-                record.status = "done"
-                record.result = result
-                _save_context_before_completion()
-                record._result_event.set()
                 elapsed = int(time.time() - record.started_at)
-                logger.info(
-                    "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds",
-                    label, runner.agent_id, runner._model_id, elapsed,
+                self._finalize_terminal(
+                    record=record,
+                    status="done",
+                    result=result,
+                    runner=runner,
+                    label=label,
+                    task=task,
+                    elapsed=elapsed,
+                    model=runner.model_id,
+                    result_log_cb=result_log_cb,
+                    notify=notify_result,
+                    notify_cb=lambda: _send_result_html(
+                        self._result_header(
+                            "✅", "finished", runner, label, task, elapsed
+                        ),
+                        result,
+                    ),
+                    save_context_cb=_save_context_before_completion,
+                    result_log_result=result,
+                    result_log_success=True,
+                    log_level="info",
+                    log_msg=(
+                        "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds"
+                    ),
+                    log_args=(label, runner.agent_id, runner.model_id, elapsed),
+                    icon_verb=("✅", "finished"),
                 )
-                if result_log_cb:
-                    try:
-                        result_log_cb(
-                            tag=job_tag,
-                            task=task,
-                            result=result,
-                            success=True,
-                            elapsed_s=elapsed,
-                            model=runner._model_id,
-                        )
-                    except Exception as log_exc:  # noqa: BLE001
-                        logger.warning("spawn_agent: [%s] result_log_cb failed: %s", label, log_exc)
-                if notify_result:
-                    header_html = (
-                        f"✅ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
-                        f" finished ({elapsed}s)\n"
-                        f"<b>Job:</b> {_html_mod.escape(label)}"
-                        f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
-                        f"<b>Task:</b> {_html_mod.escape(task[:120])}"
-                    )
-                    try:
-                        _send_result_html(header_html, result)
-                    except Exception as notify_exc:  # noqa: BLE001
-                        logger.warning("spawn_agent: [%s] notify failed (success): %s", label, notify_exc)
         except Exception as exc:  # noqa: BLE001
-            record.status = "failed"
-            record.result = str(exc)
-            _save_context_before_completion()
-            record._result_event.set()
+            error_text = f"Error: {exc}"
             elapsed = int(time.time() - record.started_at)
-            logger.error(
-                "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s",
-                label, runner.agent_id, runner._model_id, elapsed, exc, exc_info=True,
+            self._finalize_terminal(
+                record=record,
+                status="failed",
+                result=str(exc),
+                runner=runner,
+                label=label,
+                task=task,
+                elapsed=elapsed,
+                model=runner.model_id,
+                result_log_cb=result_log_cb,
+                notify=notify_result,
+                notify_cb=lambda: _send_result_html(
+                    self._result_header(
+                        "❌", "failed", runner, label, task, elapsed
+                    ),
+                    error_text,
+                ),
+                save_context_cb=_save_context_before_completion,
+                result_log_result=error_text,
+                result_log_success=False,
+                log_level="error",
+                log_msg=(
+                    "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s"
+                ),
+                log_args=(label, runner.agent_id, runner.model_id, elapsed, exc),
+                icon_verb=("❌", "failed"),
+                exc_info=True,
             )
-            if result_log_cb:
-                try:
-                    result_log_cb(
-                        tag=job_tag,
-                        task=task,
-                        result=f"Error: {exc}",
-                        success=False,
-                        elapsed_s=elapsed,
-                        model=runner._model_id,
-                    )
-                except Exception as log_exc:  # noqa: BLE001
-                    logger.warning("spawn_agent: [%s] result_log_cb failed (error): %s", label, log_exc)
-            if notify_result:
-                header_html = (
-                    f"❌ <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
-                    f" failed ({elapsed}s)\n"
-                    f"<b>Job:</b> {_html_mod.escape(label)}"
-                    f" | <b>Model:</b> <code>{_html_mod.escape(runner._model_id)}</code>\n"
-                    f"<b>Task:</b> {_html_mod.escape(task[:120])}"
-                )
-                try:
-                    _send_result_html(header_html, f"Error: {exc}")
-                except Exception as notify_exc:  # noqa: BLE001
-                    logger.warning("spawn_agent: [%s] notify failed (error): %s", label, notify_exc)
         finally:
             # Persist conversation context (if requested) regardless of
             # success/cancellation/failure so a crash mid-task does not lose
@@ -331,6 +330,125 @@ class SubAgentSupervisor:
             clear_run_context()
             if options.finish_cb:
                 options.finish_cb(finish_tag)
+
+    def _finalize_terminal(
+        self,
+        *,
+        record: SubAgentRecord,
+        status: str,
+        result: str,
+        runner: SubAgentRunner,
+        label: str,
+        task: str,
+        elapsed: int,
+        model: str,
+        result_log_cb: Optional[Callable[..., None]],
+        notify: bool,
+        notify_cb: Callable[[], None],
+        save_context_cb: Callable[[], None],
+        result_log_result: str,
+        result_log_success: bool,
+        log_level: str,
+        log_msg: str,
+        log_args: tuple,
+        icon_verb: tuple[str, str],
+        exc_info: bool = False,
+    ) -> None:
+        """Handle the common terminal sequence for a sub-agent run.
+
+        Sets the record status/result, persists context, signals completion,
+        logs the outcome, invokes the scheduler result callback safely, and
+        delivers any branch-specific notification.
+        """
+        record.status = status
+        record.result = result
+        save_context_cb()
+        record.signal_result()
+        log_fn = logger.error if log_level == "error" else logger.info
+        if exc_info:
+            log_fn(log_msg, *log_args, exc_info=True)
+        else:
+            log_fn(log_msg, *log_args)
+        self._safe_result_log(
+            result_log_cb,
+            tag=label,
+            task=task,
+            result=result_log_result,
+            success=result_log_success,
+            elapsed_s=elapsed,
+            model=model,
+        )
+        if not notify:
+            return
+        if status == "cancelled" and record.timeout_cancelled:
+            return
+        try:
+            notify_cb()
+        except Exception as notify_exc:  # noqa: BLE001
+            logger.warning(
+                "spawn_agent: [%s] notify failed (%s): %s",
+                label, icon_verb[1], notify_exc,
+            )
+
+    def _safe_result_log(
+        self,
+        cb: Optional[Callable[..., None]],
+        *,
+        tag: Optional[str],
+        task: str,
+        result: str,
+        success: bool,
+        elapsed_s: int,
+        model: str,
+    ) -> None:
+        """Invoke the scheduler result callback, swallowing exceptions."""
+        if cb is None:
+            return
+        try:
+            cb(
+                tag=tag,
+                task=task,
+                result=result,
+                success=success,
+                elapsed_s=elapsed_s,
+                model=model,
+            )
+        except Exception as log_exc:  # noqa: BLE001
+            logger.warning(
+                "spawn_agent: [%s] result_log_cb failed (%s): %s",
+                tag, "success" if success else "terminal", log_exc,
+            )
+
+    def _result_header(
+        self,
+        icon: str,
+        verb: str,
+        runner: SubAgentRunner,
+        label: str,
+        task: str,
+        elapsed: int,
+    ) -> str:
+        """Build the common HTML header for a sub-agent result notification."""
+        return (
+            f"{icon} <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
+            f" {verb} ({elapsed}s)\n"
+            f"<b>Job:</b> {_html_mod.escape(label)}"
+            f" | <b>Model:</b> <code>{_html_mod.escape(runner.model_id)}</code>\n"
+            f"<b>Task:</b> {_html_mod.escape(task[:120])}"
+        )
+
+    def _send_cancelled_text(
+        self,
+        runner: SubAgentRunner,
+        record: SubAgentRecord,
+        label: str,
+    ) -> None:
+        """Send the plain-text notification for a cancelled sub-agent run."""
+        runner.notify_fn(
+            f"🛑 Sub-agent {runner.agent_id} cancelled\n"
+            f"Job: **{label}**\n"
+            f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
+        )
 
     # ------------------------------------------------------------------
     # Shutdown

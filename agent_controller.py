@@ -583,6 +583,21 @@ class SubAgentRunner:
 
     # ------------------------------------------------------------------
 
+    @property
+    def model_id(self) -> str:
+        """The model identifier used by this runner."""
+        return self._model_id
+
+    @property
+    def short_term(self):
+        """The runner's short-term memory/context object."""
+        return self._short_term
+
+    @property
+    def trace_id(self) -> Optional[str]:
+        """Parent run trace id, or None."""
+        return getattr(self._agent, "_trace_id", None)
+
     def cancel(self) -> None:
         """Signal cooperative cancellation. Takes effect between iterations."""
         self._cancel_event.set()

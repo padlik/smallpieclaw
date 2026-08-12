@@ -278,21 +278,21 @@ def test_scheduler_spawn_path_passes_result_log_cb(tmp_path, monkeypatch):
     s = _sched(tmp_path, monkeypatch)
     s._jobs_meta["spawn_job"] = {"task": "do spawn task", "enabled": True, "notify": False}
     mock_executor = MagicMock()
-    mock_executor._exec_spawn_agent = MagicMock(return_value={"success": True})
+    mock_executor.spawn_agent = MagicMock(return_value={"success": True})
     s.builtin_executor = mock_executor
 
     s._run_job("spawn_job")
 
-    mock_executor._exec_spawn_agent.assert_called_once()
+    mock_executor.spawn_agent.assert_called_once()
     # Internal controls must NOT leak into the model-facing args dict.
-    spawn_args = mock_executor._exec_spawn_agent.call_args[0][0]
+    spawn_args = mock_executor.spawn_agent.call_args[0][0]
     assert "_result_log_cb" not in spawn_args
     assert "_finish_cb" not in spawn_args
     assert "_job_tag" not in spawn_args
     assert "_notify" not in spawn_args
     assert "expandable" not in spawn_args
     # They arrive through the supervision options channel instead.
-    options = mock_executor._exec_spawn_agent.call_args.kwargs["options"]
+    options = mock_executor.spawn_agent.call_args.kwargs["options"]
     assert options.job_tag == "spawn_job"
     assert callable(options.result_log_cb)
     assert callable(options.finish_cb)

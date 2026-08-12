@@ -743,14 +743,23 @@ class BuiltinExecutor:
                           trace_id: str = "", options: Optional[SupervisionOptions] = None) -> dict:
         """Façade forwarder for the ``spawn_agent`` tool.
 
-        Kept as a real method with the verbatim signature (Decision 4): the
-        scheduler and several tests call it directly and assert on its
-        ``call_args``. The body lives in ``AgentTools``.
+        Kept as a real method with the verbatim signature (Decision 4): several
+        tests call it directly and assert on its ``call_args``. The scheduler now
+        goes through the public :meth:`spawn_agent` instead. The body lives in
+        ``AgentTools``.
         """
         return self._agents._exec_spawn_agent(
             args, caller_depth=caller_depth, caller_tag=caller_tag,
             trace_id=trace_id, options=options,
         )
+
+    def spawn_agent(self, args: dict, options: Optional[SupervisionOptions] = None) -> dict:
+        """Public entry point for spawning a sub-agent.
+
+        Delegates to ``_exec_spawn_agent`` with default caller metadata.
+        Used by the scheduler to avoid reaching into private methods.
+        """
+        return self._exec_spawn_agent(args, options=options)
 
     def _exec_get_agent_result(self, args: dict, caller_tag: str = "") -> dict:
         """Façade forwarder for the ``get_agent_result`` tool.

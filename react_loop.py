@@ -1284,16 +1284,8 @@ def _emit_tool_lifecycle(
     """
     dur_ms = int((time.perf_counter() - start) * 1000)
     if isinstance(outcome_or_exc, BaseException):
-        agent_logging.log_event(
-            agent_logging.LogEvent.ERROR,
-            f"tool error: {tool_name}: {outcome_or_exc}",
-            level=logging.ERROR,
-            logger=slog,
-            tool=tool_name,
-            dur_ms=dur_ms,
-            exit=-1,
-            err=str(outcome_or_exc),
-        )
+        # Only TOOL_FAILED here — an additional ERROR event would double-count
+        # the same failure for anything aggregating agent.jsonl by event_type.
         agent_logging.log_event(
             agent_logging.LogEvent.TOOL_FAILED,
             f"tool failed: {tool_name}",
@@ -1336,13 +1328,31 @@ def _emit_tool_lifecycle(
     return outcome
 
 
+class _ToolSpanOutcome:
+    """Outcome carrier handed to the body of a :func:`_tool_span` block.
+
+    The body calls :meth:`record` with the tool's raw outcome dict; on exit the
+    span replaces :attr:`outcome` with the post-processed dict (e.g. an MCP auth
+    failure translated into an actionable error), which the caller then returns.
+    """
+
+    def __init__(self) -> None:
+        self.outcome: dict = {}
+
+    def record(self, outcome: dict) -> None:
+        """Store the tool's raw outcome dict for lifecycle emission."""
+        self.outcome = outcome
+
+
 @contextmanager
 def _tool_span(tool_name: str, *, mcp_auth: Optional[tuple[ReactContext, str]] = None):
     """Context manager emitting TOOL_START / TOOL_END / TOOL_FAILED lifecycle events.
 
-    Yields a callable that accepts the outcome dict (or an exception can be raised
+    Yields a :class:`_ToolSpanOutcome`; the body must call ``record(outcome)`` so
+    the span can emit the matching terminal event (or an exception can be raised
     out of the block).  For MCP tools pass ``mcp_auth=(ctx, tool_name)`` so that
-    authentication failures are translated before the failure event is emitted.
+    authentication failures are translated before the failure event is emitted —
+    read the translated dict from ``.outcome`` after the block exits.
     """
     agent_logging.log_event(
         agent_logging.LogEvent.TOOL_START,
@@ -1352,14 +1362,15 @@ def _tool_span(tool_name: str, *, mcp_auth: Optional[tuple[ReactContext, str]] =
         tool=tool_name,
     )
     start = time.perf_counter()
-    outcome_holder: list[object] = []
+    span = _ToolSpanOutcome()
     try:
-        yield outcome_holder.append
+        yield span
     except Exception as exc:
         _emit_tool_lifecycle(tool_name, start, exc)
         raise
-    outcome = outcome_holder[0] if outcome_holder else {}
-    _emit_tool_lifecycle(tool_name, start, outcome, auth_recheck=mcp_auth)
+    final = _emit_tool_lifecycle(tool_name, start, span.outcome, auth_recheck=mcp_auth)
+    if final is not None:
+        span.outcome = final
 
 
 def _dispatch_tool(
@@ -1446,9 +1457,10 @@ def _dispatch_tool(
     # themselves), so without this wrapping MCP tools never appear as TOOL_*
     # events. Field conventions match the builtin/tool executors.
     if ctx.mcp_manager and ctx.mcp_manager.has_tool(tool_name):
-        with _tool_span(tool_name, mcp_auth=(ctx, tool_name)):
-            outcome = ctx.mcp_manager.call_tool(tool_name, args)
-        return outcome
+        with _tool_span(tool_name, mcp_auth=(ctx, tool_name)) as span:
+            span.record(ctx.mcp_manager.call_tool(tool_name, args))
+        # .outcome carries the auth-translated dict, not the raw call result.
+        return span.outcome
 
     # Unknown tool — no hand-written tools exist anymore
     return fail_outcome(f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.")

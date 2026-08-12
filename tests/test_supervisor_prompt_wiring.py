@@ -16,10 +16,14 @@ class FakeRunner:
     def __init__(self, agent_id: str = "sa-test"):
         self.agent_id = agent_id
         self._model_id = "test-model"
+        self.model_id = "test-model"
         self._cancel_event = MagicMock()
         self._llm = MagicMock()
         self._agent = MagicMock()
+        self._agent._trace_id = None
         self._short_term = MagicMock()
+        self.short_term = self._short_term
+        self.trace_id = None
         self.notify_fn = MagicMock()
         self.closed = False
 

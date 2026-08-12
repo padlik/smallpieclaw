@@ -483,6 +483,85 @@ class TestGraphMemoryStore:
 # GraphMemoryWriter tests
 # ---------------------------------------------------------------------------
 
+class TestBatchPreEmbedding:
+    """The batch pre-embed (TD-11) must cost exactly one _embed per unique
+    entity name, case-insensitively, and must not retry a failed embed."""
+
+    MESSAGE = "A long enough message to process"
+
+    def _writer(self, store, payload):
+        return GraphMemoryWriter(
+            store=store,
+            llm_call_fn=lambda _p: payload,
+            extract_every_n_turns=1,
+            min_message_length=10,
+        )
+
+    def _run(self, store, payload, embed_fn=None):
+        """Process one batch; return _embed calls made for entity names.
+
+        The episode record embeds the raw message text too — filtered out here so
+        the assertions are about entity-name round-trips only.
+        """
+        embedded: list[str] = []
+
+        def _counting_embed(text: str) -> list[float]:
+            embedded.append(text)
+            if embed_fn is not None:
+                return embed_fn(text)
+            return [0.1, 0.2, 0.3, 0.4]
+
+        store._embed = _counting_embed
+        store._execute = MagicMock()
+        writer = self._writer(store, payload)
+        writer.enqueue(self.MESSAGE, user_id="u1")
+        writer.flush()
+        time.sleep(0.3)
+        writer.stop()
+        return [t for t in embedded if t != self.MESSAGE]
+
+    def test_case_variant_name_embedded_once(self, store):
+        """"Alice" as an entity and "alice" in a fact share one embed call."""
+        payload = (
+            '{"entities":[{"name":"Alice","entity_type":"person"}],'
+            '"facts":[{"source":"alice","target":"Python",'
+            '"relation_type":"USES","fact":"Alice uses Python."}]}'
+        )
+        embedded = self._run(store, payload)
+
+        assert sorted(embedded) == ["alice", "python"]
+
+    def test_failed_pre_embed_not_retried(self, store):
+        """A name whose pre-embed raises is not embedded a second time."""
+        def _always_fails(_text: str) -> list[float]:
+            raise RuntimeError("embeddings 429")
+
+        attempts = self._run(
+            store,
+            '{"entities":[{"name":"Alice","entity_type":"person"}],"facts":[]}',
+            embed_fn=_always_fails,
+        )
+
+        assert attempts == ["alice"]
+
+    def test_preloaded_vector_is_reused(self, store):
+        """_embedding_for_entity honours a staged vector regardless of casing."""
+        store._preload_embeddings({"Alice": [1.0, 0.0, 0.0, 0.0]})
+        assert store._embedding_for_entity("alice") == [1.0, 0.0, 0.0, 0.0]
+        assert store._embedding_for_entity("ALICE") == [1.0, 0.0, 0.0, 0.0]
+        store._clear_preloaded_embeddings()
+
+    def test_staged_none_suppresses_embed(self, store):
+        """A staged None means "already failed" — no fresh _embed attempt."""
+        calls: list[str] = []
+        store._embed = lambda t: calls.append(t) or [0.0, 0.0, 0.0, 0.0]
+        store._preload_embeddings({"alice": None})
+
+        assert store._embedding_for_entity("Alice") is None
+        assert calls == []
+        store._clear_preloaded_embeddings()
+
+
 class TestGraphMemoryWriter:
     def test_short_message_skipped(self, store):
         store.upsert_entity = MagicMock()

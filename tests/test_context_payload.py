@@ -96,11 +96,15 @@ def _make_runner(agent_id: str = "sa-ctx01") -> MagicMock:
     runner = MagicMock()
     runner.agent_id = agent_id
     runner._model_id = "test-model"
+    runner.model_id = "test-model"
     runner._cancel_event = MagicMock()
     runner._llm = MagicMock()
     runner._agent = MagicMock()
     runner._agent.max_iterations = 8
+    runner._agent._trace_id = None
+    runner.trace_id = None
     runner._short_term = ShortTermMemory(max_turns=50)
+    runner.short_term = runner._short_term
     return runner
 
 

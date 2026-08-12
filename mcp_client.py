@@ -294,7 +294,17 @@ class _SdkClientWrapper:
         self._task = task
 
     def create_session_runner(self) -> asyncio.Task:
-        """Create and return an asyncio task running the session runner."""
+        """Create and return an asyncio task running the session runner.
+
+        Must be called from this wrapper's event-loop thread: ``loop.create_task``
+        is not thread-safe and would silently succeed off-thread. Callers on other
+        threads must go through :meth:`connect`, which hops via
+        ``call_soon_threadsafe``.
+        """
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError(
+                "create_session_runner() must be called on the wrapper's event-loop thread",
+            )
         return self._loop.create_task(self._session_runner())
 
     @property
@@ -1503,7 +1513,18 @@ class MCPManager:
             OAuth, or ``None`` when no token verification issue is detected.
         """
         if self._mcp_tokens_dir is None:
-            return None
+            # Fail closed: without a tokens dir there is nothing to verify, so
+            # reporting success would register the server as authenticated with
+            # no token on disk. Unreachable today (authenticate() rejects a None
+            # tokens dir up front) — kept explicit so it stays a hard failure.
+            logger.warning(
+                "MCP [%s] cannot verify token persistence: no tokens directory configured",
+                name,
+            )
+            return {
+                "success": False,
+                "error": "No MCP tokens directory configured — cannot store OAuth token.",
+            }
         token_file = self._mcp_tokens_dir / f"{name}.json"
         if token_file.exists():
             return None

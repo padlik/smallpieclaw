@@ -115,11 +115,15 @@ class TestSpawnSavesContextInFinally:
         runner = MagicMock()
         runner.agent_id = "sa-fin01"
         runner._model_id = "test-model"
+        runner.model_id = "test-model"
         runner._cancel_event = MagicMock()
         runner._llm = MagicMock()
         runner._agent = MagicMock()
         runner._agent.max_iterations = 8
+        runner._agent._trace_id = None
+        runner.trace_id = None
         runner._short_term = _stm([("user", "in flight"), ("assistant", "partial")])
+        runner.short_term = runner._short_term
         if isinstance(run_side_effect, Exception):
             runner.run.side_effect = run_side_effect
         else:
@@ -177,11 +181,15 @@ class TestSpawnSavesContextInFinally:
         runner = MagicMock()
         runner.agent_id = "sa-order"
         runner._model_id = "test-model"
+        runner.model_id = "test-model"
         runner._cancel_event = MagicMock()
         runner._llm = MagicMock()
         runner._agent = MagicMock()
         runner._agent.max_iterations = 8
+        runner._agent._trace_id = None
+        runner.trace_id = None
         runner._short_term = _stm([("user", "ordered")])
+        runner.short_term = runner._short_term
         runner.run.return_value = "done"
 
         def _save_spy(*_args, **_kwargs):

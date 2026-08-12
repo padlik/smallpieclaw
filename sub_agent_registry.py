@@ -63,7 +63,7 @@ class SubAgentRecord:
         # The resulting transport exception is caught as LLMCancelledError in _with_retry.
         if self._llm_client is not None:
             try:
-                self._llm_client.close_http()
+                self._llm_client.close_http()  # type: ignore[attr-defined]
             except Exception:
                 pass
 
@@ -74,6 +74,15 @@ class SubAgentRecord:
     @property
     def cancel_event(self) -> threading.Event:
         return self._cancel_event
+
+    @property
+    def timeout_cancelled(self) -> bool:
+        """True when get_agent_result cancelled this run due to a timeout."""
+        return self._timeout_cancelled
+
+    def signal_result(self) -> None:
+        """Signal that the sub-agent result is available."""
+        self._result_event.set()
 
     @property
     def elapsed_seconds(self) -> float:
