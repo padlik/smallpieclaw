@@ -103,6 +103,211 @@ class _DeferredMessage:
     token: str
 
 
+class _ProgressPanel:
+    """Scrolling step-log panel for a single agent run.
+
+    Owns step accumulation, message classification, edit throttling and the
+    progress callback used by the agent runtime.  All mutable state that used
+    to be threaded through list-cell closures inside
+    `_run_agent_task_locked` now lives on this instance.
+    """
+
+    _MIN_EDIT_INTERVAL: float = 1.5
+    _MAX_STEPS: int = 10
+
+    def __init__(
+        self,
+        interface: "TelegramInterface",
+        status_message: object,
+        loop: asyncio.AbstractEventLoop,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Initialize panel state for one agent run.
+
+        Args:
+            interface: The ``TelegramInterface`` instance that owns this run.
+            status_message: The ``telegram.Message`` used as the live panel.
+            loop: The running asyncio event loop (used to schedule Telegram edits
+                safely from the synchronous progress callback).
+            update: The current PTB ``Update``.
+            ctx: The current PTB ``ContextTypes.DEFAULT_TYPE``.
+        """
+        self._interface = interface
+        self._status_message = status_message
+        self._loop = loop
+        self._update = update
+        self._ctx = ctx
+        self._chat_id = update.effective_chat.id
+        self._steps: list[tuple[float, str]] = []  # (elapsed_secs, html text)
+        self._task_start = time.monotonic()
+        self._last_edit_ts: float = 0.0
+        self._step_n: int = 0
+
+    async def typing_loop(self) -> None:
+        """Keep the "typing…" indicator alive while the agent is working."""
+        while True:
+            try:
+                await self._ctx.bot.send_chat_action(
+                    chat_id=self._chat_id, action=ChatAction.TYPING
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(4)
+
+    def classify(self, msg: str) -> str:
+        """Return a single-line HTML snippet for a progress message."""
+        from react_loop import _tool_icon  # local import to avoid circular at module level
+
+        if "Thinking" in msg or msg.startswith("⚙️"):
+            self._step_n += 1
+            return "⚙️ <i>Thinking…</i>"
+        if "Running tool:" in msg:
+            # e.g. "🖥️ Running tool: `shell`\n..."
+            name = msg.split("`")[1] if "`" in msg else msg.split(":")[-1].strip()
+            icon = _tool_icon(name.strip())
+            return f"{icon} Running: <code>{html.escape(name.strip())}</code>"
+        if "✅" in msg and "**" in msg:
+            # result line e.g. "🖥️ **shell** ✅\n..."
+            first_line = msg.split("\n")[0]
+            match = re.search(r"\*\*(.+?)\*\*", first_line)
+            if match:
+                icon_part = first_line[:first_line.index("**")]
+                suffix = first_line[first_line.rindex("**") + 2:]
+                return (
+                    f"{icon_part}<b>{html.escape(match.group(1))}</b>"
+                    f"{html.escape(suffix)}"
+                )
+            return html.escape(first_line)
+        if "❌" in msg and "**" in msg:
+            first_line = msg.split("\n")[0]
+            match = re.search(r"\*\*(.+?)\*\*", first_line)
+            if match:
+                icon_part = first_line[:first_line.index("**")]
+                suffix = first_line[first_line.rindex("**") + 2:]
+                return (
+                    f"{icon_part}<b>{html.escape(match.group(1))}</b>"
+                    f"{html.escape(suffix)}"
+                )
+            return html.escape(first_line)
+        # Fallback: plain first line, truncated
+        first_line = msg.split("\n")[0][:80]
+        return html.escape(first_line)
+
+    def build_panel(self) -> str:
+        """Render the current panel HTML from the accumulated step log."""
+        elapsed = time.monotonic() - self._task_start
+        mins, secs = divmod(int(elapsed), 60)
+        time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+        header = (
+            f"⚡ <b>Agent working</b>  •  Step {self._step_n}  •  {time_str}\n\n"
+        )
+        visible = self._steps[-self._MAX_STEPS:]
+        lines: list[str] = []
+        for step_elapsed, rendered in visible:
+            sm, ss = divmod(int(step_elapsed), 60)
+            ts = f"{sm}:{ss:02d}" if sm else f"0:{ss:02d}"
+            lines.append(f"<code>[{ts}]</code> {rendered}")
+        return header + "\n".join(lines)
+
+    def flush_panel(self, force: bool = False) -> None:
+        """Throttle-edit the status message with the current panel HTML.
+
+        Args:
+            force: When ``True``, bypass the minimum edit interval throttle.
+        """
+        now = time.monotonic()
+        if not force and now - self._last_edit_ts < self._MIN_EDIT_INTERVAL:
+            return
+        self._last_edit_ts = now
+        asyncio.run_coroutine_threadsafe(
+            self._interface._safe_edit_html(
+                self._status_message, self.build_panel()
+            ),
+            self._loop,
+        )
+
+    def dispatch_progress(self, msg: str) -> None:
+        """Progress callback passed to the agent runtime."""
+        if msg.startswith("__CONFIRM__:"):
+            # Format: __CONFIRM__:{token}:{tool_name}:{description}
+            parts = msg.split(":", 3)
+            token = parts[1]
+            tool_name = parts[2] if len(parts) > 2 else ""
+            description = parts[3] if len(parts) > 3 else tool_name
+            builtin = getattr(
+                getattr(self._interface, "agent", None), "builtin_executor", None
+            )
+            zone_path = builtin._zone_paths.get(token, "") if builtin is not None else ""
+            asyncio.run_coroutine_threadsafe(
+                self._interface._send_confirmation_prompt(
+                    self._update.effective_message,
+                    token,
+                    tool_name,
+                    description,
+                    zone_path=zone_path,
+                ),
+                self._loop,
+            )
+            return
+        if msg.startswith("__EXTEND__:"):
+            parts = msg.split(":", 2)
+            token = parts[1]
+            current_steps = parts[2] if len(parts) > 2 else "?"
+            asyncio.run_coroutine_threadsafe(
+                self._interface._send_extend_prompt(
+                    self._update.effective_message, token, current_steps
+                ),
+                self._loop,
+            )
+            return
+        if msg.startswith("__FILE__"):
+            _, path_b64, caption_b64 = msg.split(":", 2)
+            try:
+                file_path = base64.b64decode(path_b64).decode()
+                caption = base64.b64decode(caption_b64).decode()
+            except Exception:
+                file_path, caption = "", ""
+            if file_path:
+                asyncio.run_coroutine_threadsafe(
+                    self._interface._send_file_to_chat(
+                        self._update.effective_message, file_path, caption
+                    ),
+                    self._loop,
+                )
+            return
+        if self._interface._verbose and any(
+            msg.startswith(prefix) for prefix in _VERBOSE_EVENT_PREFIXES
+        ):
+            asyncio.run_coroutine_threadsafe(
+                self._interface._send_verbose_event(
+                    self._ctx.bot, self._chat_id, msg
+                ),
+                self._loop,
+            )
+            return
+        if msg.startswith("__SHELL_CHUNK__:"):
+            # Live shell output chunk — update the last step entry in-place
+            # to show a scrolling tail rather than adding noise to the log.
+            tail_text = msg[len("__SHELL_CHUNK__:"):]
+            tail_lines = [
+                line for line in tail_text.splitlines() if line.strip()
+            ][-4:]
+            preview = " ↩ ".join(tail_lines)[:120]
+            if self._steps:
+                elapsed_s, _ = self._steps[-1]
+                self._steps[-1] = (
+                    elapsed_s,
+                    f"🖥️ Running: <code>shell</code>  <i>{html.escape(preview)}</i>",
+                )
+            self.flush_panel()
+            return
+        # Normal progress: append to step log and (maybe) flush the panel
+        elapsed = time.monotonic() - self._task_start
+        self._steps.append((elapsed, self.classify(msg)))
+        self.flush_panel()
+
+
 class TelegramInterface:
     """
     Wraps python-telegram-bot and enforces access control.
@@ -540,143 +745,9 @@ class TelegramInterface:
         except Exception:
             return
         loop = asyncio.get_running_loop()
-        chat_id = update.effective_chat.id
 
-        # Keep "typing…" indicator alive while the agent is working
-        async def _typing_loop():
-            while True:
-                try:
-                    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                except Exception:
-                    pass
-                await asyncio.sleep(4)
-
-        typing_task = asyncio.create_task(_typing_loop())
-
-        # --- Scrolling step-log panel state ---
-        _steps: list[tuple[float, str]] = []   # (elapsed_secs, one-line html text)
-        _task_start = time.monotonic()
-        _last_edit_ts: list[float] = [0.0]
-        _step_n: list[int] = [0]
-        _MIN_EDIT_INTERVAL = 1.5
-        _MAX_STEPS = 10
-
-        def _classify(msg: str) -> str:
-            """Return a single-line HTML snippet for a progress message."""
-            from react_loop import _tool_icon  # local import to avoid circular at module level
-            if "Thinking" in msg or msg.startswith("⚙️"):
-                _step_n[0] += 1
-                return "⚙️ <i>Thinking…</i>"
-            if "Running tool:" in msg:
-                # e.g. "🖥️ Running tool: `shell`\n..."
-                name = msg.split("`")[1] if "`" in msg else msg.split(":")[-1].strip()
-                icon = _tool_icon(name.strip())
-                return f"{icon} Running: <code>{html.escape(name.strip())}</code>"
-            if "✅" in msg and "**" in msg:
-                # result line e.g. "🖥️ **shell** ✅\n..."
-                first_line = msg.split("\n")[0]
-                m = re.search(r"\*\*(.+?)\*\*", first_line)
-                if m:
-                    icon_part = first_line[:first_line.index("**")]
-                    suffix = first_line[first_line.rindex("**") + 2:]
-                    return f"{icon_part}<b>{html.escape(m.group(1))}</b>{html.escape(suffix)}"
-                return html.escape(first_line)
-            if "❌" in msg and "**" in msg:
-                first_line = msg.split("\n")[0]
-                m = re.search(r"\*\*(.+?)\*\*", first_line)
-                if m:
-                    icon_part = first_line[:first_line.index("**")]
-                    suffix = first_line[first_line.rindex("**") + 2:]
-                    return f"{icon_part}<b>{html.escape(m.group(1))}</b>{html.escape(suffix)}"
-                return html.escape(first_line)
-            # Fallback: plain first line, truncated
-            first_line = msg.split("\n")[0][:80]
-            return html.escape(first_line)
-
-        def _build_panel() -> str:
-            elapsed = time.monotonic() - _task_start
-            mins, secs = divmod(int(elapsed), 60)
-            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            header = (
-                f"⚡ <b>Agent working</b>  •  Step {_step_n[0]}  •  {time_str}\n\n"
-            )
-            visible = _steps[-_MAX_STEPS:]
-            lines = []
-            for step_elapsed, rendered in visible:
-                sm, ss = divmod(int(step_elapsed), 60)
-                ts = f"{sm}:{ss:02d}" if sm else f"0:{ss:02d}"
-                lines.append(f"<code>[{ts}]</code> {rendered}")
-            return header + "\n".join(lines)
-
-        def _flush_panel(force: bool = False) -> None:
-            now = time.monotonic()
-            if not force and now - _last_edit_ts[0] < _MIN_EDIT_INTERVAL:
-                return
-            _last_edit_ts[0] = now
-            asyncio.run_coroutine_threadsafe(
-                self._safe_edit_html(status_msg, _build_panel()),
-                loop,
-            )
-
-        def progress(msg: str):
-            if msg.startswith("__CONFIRM__:"):
-                # Format: __CONFIRM__:{token}:{tool_name}:{description}
-                parts = msg.split(":", 3)
-                token = parts[1]
-                tool_name = parts[2] if len(parts) > 2 else ""
-                description = parts[3] if len(parts) > 3 else tool_name
-                builtin = getattr(getattr(self, "agent", None), "builtin_executor", None)
-                zone_path = builtin._zone_paths.get(token, "") if builtin is not None else ""
-                asyncio.run_coroutine_threadsafe(
-                    self._send_confirmation_prompt(
-                        update.effective_message, token, tool_name, description, zone_path=zone_path
-                    ),
-                    loop,
-                )
-                return
-            if msg.startswith("__EXTEND__:"):
-                parts = msg.split(":", 2)
-                token = parts[1]
-                current_steps = parts[2] if len(parts) > 2 else "?"
-                asyncio.run_coroutine_threadsafe(
-                    self._send_extend_prompt(update.effective_message, token, current_steps),
-                    loop,
-                )
-                return
-            if msg.startswith("__FILE__"):
-                _, path_b64, caption_b64 = msg.split(":", 2)
-                try:
-                    file_path = base64.b64decode(path_b64).decode()
-                    caption = base64.b64decode(caption_b64).decode()
-                except Exception:
-                    file_path, caption = "", ""
-                if file_path:
-                    asyncio.run_coroutine_threadsafe(
-                        self._send_file_to_chat(update.effective_message, file_path, caption),
-                        loop,
-                    )
-                return
-            if self._verbose and any(msg.startswith(p) for p in _VERBOSE_EVENT_PREFIXES):
-                asyncio.run_coroutine_threadsafe(
-                    self._send_verbose_event(ctx.bot, chat_id, msg),
-                    loop,
-                )
-                return
-            if msg.startswith("__SHELL_CHUNK__:"):
-                # Live shell output chunk — update the last step entry in-place
-                # to show a scrolling tail rather than adding noise to the log.
-                tail_text = msg[len("__SHELL_CHUNK__:"):]
-                tail_lines = [ln for ln in tail_text.splitlines() if ln.strip()][-4:]
-                preview = " ↩ ".join(tail_lines)[:120]
-                if _steps:
-                    elapsed_s, _ = _steps[-1]
-                    _steps[-1] = (elapsed_s, f"🖥️ Running: <code>shell</code>  <i>{html.escape(preview)}</i>")
-                _flush_panel()
-                return
-            # Normal progress: append to step log and (maybe) flush the panel
-            elapsed = time.monotonic() - _task_start
-            _steps.append((elapsed, _classify(msg)))
-            _flush_panel()
+        panel = _ProgressPanel(self, status_msg, loop, update, ctx)
+        typing_task = asyncio.create_task(panel.typing_loop())
 
         trace_id = new_trace_id()
         prompt_record = None
@@ -688,19 +759,19 @@ class TelegramInterface:
             result = await loop.run_in_executor(
                 None,
                 lambda: self.agent_handler(
-                    user.id, task_text, progress, images=images,
+                    user.id, task_text, panel.dispatch_progress, images=images,
                     prompt_id=prompt_record.prompt_id if prompt_record is not None else None,
                     trace_id=trace_id,
                 ),
             )
-            await self._safe_edit_html(status_msg, _build_panel())
+            await self._safe_edit_html(status_msg, panel.build_panel())
             await self._safe_edit(status_msg, "✅ Done")
             for chunk in self._split_message(result):
                 await self._send_safe(update.effective_message, chunk)
             final_status = _classify_final_status(result)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
-            await self._safe_edit_html(status_msg, _build_panel())
+            await self._safe_edit_html(status_msg, panel.build_panel())
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()

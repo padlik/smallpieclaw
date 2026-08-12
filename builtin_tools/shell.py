@@ -45,6 +45,188 @@ class _SupportsWriteClose(Protocol):
     def close(self) -> None: ...
 
 
+def _spawn(command: str, nsjail_cmd: Optional[list[str]] = None) -> subprocess.Popen:
+    """Start the shell command (or nsjail wrapper) in a new process group.
+
+    Returns the ``Popen`` object with stdout/stderr piped.
+    """
+    popen_kwargs: dict = {}
+    if sys.platform != "win32":
+        popen_kwargs["start_new_session"] = True
+    else:  # pragma: no cover - Windows-only
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    if nsjail_cmd is not None:
+        return subprocess.Popen(
+            nsjail_cmd, shell=False,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            **popen_kwargs,
+        )
+    return subprocess.Popen(
+        command, shell=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        **popen_kwargs,
+    )
+
+
+def _pump_streams(
+    proc: subprocess.Popen,
+    deadline: float,
+    append_stdout: Callable[[str], None],
+    append_stderr: Callable[[str], None],
+) -> bool:
+    """Non-blocking select loop that reads stdout/stderr until EOF or timeout.
+
+    Returns ``True`` if the process timed out, ``False`` otherwise.
+    """
+    import select as _select
+
+    def _close_pipe(pipe) -> None:
+        try:
+            pipe.close()
+        except (OSError, ValueError):
+            pass
+
+    # Per-stream incremental UTF-8 decoders keep multibyte characters that
+    # straddle os.read() chunk boundaries intact.
+    streams: dict[int, tuple[object, Callable[[str], None], codecs.IncrementalDecoder]] = {}
+    for _pipe, _append in ((proc.stdout, append_stdout), (proc.stderr, append_stderr)):
+        if _pipe is None:
+            continue
+        try:
+            os.set_blocking(_pipe.fileno(), False)
+            streams[_pipe.fileno()] = (
+                _pipe, _append, codecs.getincrementaldecoder("utf-8")(errors="replace"),
+            )
+        except (OSError, ValueError):
+            _close_pipe(_pipe)
+
+    timed_out = False
+    while streams:
+        now = time.monotonic()
+        if not timed_out and proc.poll() is None and now >= deadline:
+            timed_out = True
+            break
+
+        # If the shell has exited and no stream is immediately readable,
+        # return without waiting for EOF: escaped descendants can keep pipe
+        # fds open indefinitely.
+        select_timeout = 0.05 if proc.poll() is not None else max(0.0, min(0.1, deadline - now))
+        try:
+            ready, _, _ = _select.select(list(streams), [], [], select_timeout)
+        except (OSError, ValueError):
+            break
+        if not ready and proc.poll() is not None:
+            break
+        for fd in ready:
+            pipe, append, decoder = streams.get(fd, (None, None, None))
+            if pipe is None or append is None or decoder is None:
+                continue
+            while True:
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    append(decoder.decode(b"", final=True))
+                    streams.pop(fd, None)
+                    _close_pipe(pipe)
+                    break
+                if not chunk:
+                    append(decoder.decode(b"", final=True))
+                    streams.pop(fd, None)
+                    _close_pipe(pipe)
+                    break
+                append(decoder.decode(chunk))
+
+    for _pipe, _append, _decoder in list(streams.values()):
+        _append(_decoder.decode(b"", final=True))
+        _close_pipe(_pipe)
+    streams.clear()
+
+    return timed_out
+
+
+def _classify_exit(
+    returncode: int,
+    output: str,
+    error: str,
+    elapsed_ms: float,
+    full_log_path: Optional[str],
+    *,
+    timed_out: bool,
+    timeout: int,
+    is_nsjail_error: bool,
+) -> dict:
+    """Classify the exit code and build the result dict.
+
+    Handles timeout, nsjail-error, stderr→stdout promotion, and
+    standard error-type classification (permission_denied, command_not_found,
+    file_not_found).
+    """
+    if timed_out:
+        timeout_error = f"Command timed out after {timeout}s."
+        if error.strip():
+            timeout_error = f"{timeout_error}\nstderr:\n{error}"
+        return {
+            "success": False,
+            "output": output,
+            "error": timeout_error,
+            "exit_code": -1,
+            "elapsed_ms": round(elapsed_ms),
+            "full_log_path": full_log_path,
+            "error_type": "tool_timeout",
+            "recoverable": True,
+            "suggestion": "Try the command again with a longer timeout.",
+        }
+    if is_nsjail_error:
+        return {
+            "success": False,
+            "output": output,
+            "error": error,
+            "exit_code": returncode,
+            "elapsed_ms": round(elapsed_ms),
+            "full_log_path": full_log_path,
+            "error_type": "nsjail_error",
+            "recoverable": False,
+            "suggestion": (
+                "The nsjail sandbox failed to set up. "
+                "Check kernel namespace permissions, cgroup availability, or nsjail binary."
+            ),
+        }
+
+    error_type = ""
+    recoverable = False
+    suggestion = ""
+    if returncode != 0:
+        error_lower = error.lower()
+        output_lower = output.lower()
+        combined = f"{error_lower}\n{output_lower}"
+        if "permission denied" in combined:
+            error_type = "permission_denied"
+            recoverable = False
+            suggestion = "Check file permissions or use sudo."
+        elif "command not found" in combined or ("not found" in error_lower and "file" not in error_lower):
+            error_type = "command_not_found"
+            recoverable = False
+            suggestion = "Check the command name or install the missing executable."
+        elif "no such file or directory" in combined:
+            error_type = "file_not_found"
+            recoverable = False
+            suggestion = "Check the file path or create the missing file."
+    return {
+        "success": returncode == 0,
+        "output": output,
+        "error": error,
+        "exit_code": returncode,
+        "elapsed_ms": round(elapsed_ms),
+        "full_log_path": full_log_path,
+        "error_type": error_type,
+        "recoverable": recoverable,
+        "suggestion": suggestion,
+    }
+
+
 class ShellTools:
     """Shell tool handlers (subprocess + PTY) with run-scoped artifact logging."""
 
@@ -293,33 +475,8 @@ class ShellTools:
         _total_err = 0
         _stderr_header_written = False
 
-        # Start the command in its own process group/session so that on timeout
-        # we can kill the whole tree (the shell plus any children that inherited
-        # the stdout/stderr pipes), not just the top-level shell.  Without this,
-        # a leaked grandchild can keep the pipes open and block the reader threads.
-        _popen_kwargs: dict = {}
-        if sys.platform != "win32":
-            _popen_kwargs["start_new_session"] = True
-        else:  # pragma: no cover - Windows-only
-            _popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-
         try:
-            if nsjail_cmd is not None:
-                proc = subprocess.Popen(
-                    nsjail_cmd,
-                    shell=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    **_popen_kwargs,
-                )
-            else:
-                proc = subprocess.Popen(
-                    command,
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    **_popen_kwargs,
-                )
+            proc = _spawn(command, nsjail_cmd=nsjail_cmd)
         except OSError as exc:
             if _log_fh:
                 _log_fh.close()
@@ -356,12 +513,6 @@ class ShellTools:
             try:
                 proc.kill()
             except OSError:
-                pass
-
-        def _close_pipe(pipe) -> None:
-            try:
-                pipe.close()
-            except (OSError, ValueError):
                 pass
 
         def _disable_artifact_log() -> None:
@@ -408,72 +559,15 @@ class ShellTools:
                 except OSError:
                     _disable_artifact_log()
 
-        import select as _select
-
-        # Per-stream incremental UTF-8 decoders keep multibyte characters that
-        # straddle os.read() chunk boundaries intact (a plain chunk.decode()
-        # would emit U+FFFD replacement chars for the split halves).
-        streams: dict[int, tuple[object, Callable[[str], None], codecs.IncrementalDecoder]] = {}
-        for _pipe, _append in ((proc.stdout, _append_stdout), (proc.stderr, _append_stderr)):
-            if _pipe is None:
-                continue
-            try:
-                os.set_blocking(_pipe.fileno(), False)
-                streams[_pipe.fileno()] = (
-                    _pipe, _append, codecs.getincrementaldecoder("utf-8")(errors="replace"),
-                )
-            except (OSError, ValueError):
-                _close_pipe(_pipe)
-
-        timed_out = False
         deadline = _start + timeout
-        while streams:
-            now = time.monotonic()
-            if not timed_out and proc.poll() is None and now >= deadline:
-                timed_out = True
-                _kill_tree()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-                break
+        timed_out = _pump_streams(proc, deadline, _append_stdout, _append_stderr)
 
-            # If the shell has exited and no stream is immediately readable,
-            # return without waiting for EOF: escaped descendants can keep pipe
-            # fds open indefinitely.  This preserves data already available in
-            # the pipe while avoiding reader-thread leaks/hangs.
-            select_timeout = 0.05 if proc.poll() is not None else max(0.0, min(0.1, deadline - now))
+        if timed_out:
+            _kill_tree()
             try:
-                ready, _, _ = _select.select(list(streams), [], [], select_timeout)
-            except (OSError, ValueError):
-                break
-            if not ready and proc.poll() is not None:
-                break
-            for fd in ready:
-                pipe, append, decoder = streams.get(fd, (None, None, None))
-                if pipe is None or append is None or decoder is None:
-                    continue
-                while True:
-                    try:
-                        chunk = os.read(fd, 4096)
-                    except BlockingIOError:
-                        break
-                    except OSError:
-                        append(decoder.decode(b"", final=True))
-                        streams.pop(fd, None)
-                        _close_pipe(pipe)
-                        break
-                    if not chunk:
-                        append(decoder.decode(b"", final=True))
-                        streams.pop(fd, None)
-                        _close_pipe(pipe)
-                        break
-                    append(decoder.decode(chunk))
-
-        for _pipe, _append, _decoder in list(streams.values()):
-            _append(_decoder.decode(b"", final=True))
-            _close_pipe(_pipe)
-        streams.clear()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
         if proc.poll() is None and not timed_out:
             try:
@@ -497,9 +591,6 @@ class ShellTools:
         returncode = proc.returncode if not timed_out else -1
 
         # Detect nsjail-own failures before any stderr→output promotion.
-        # nsjail prefixes its own error lines with [E][ in its log output (stderr).
-        # This must run before the stderr promotion below, which would move the
-        # [E][ marker into `output` and empty `error`, hiding the nsjail failure.
         is_nsjail_error = (
             nsjail_cmd is not None
             and not timed_out
@@ -508,10 +599,6 @@ class ShellTools:
         )
 
         if not timed_out and returncode != 0 and not output.strip() and error:
-            # Some commands write only to stderr (e.g. systemctl status);
-            # promote stderr → output so the LLM sees the failure reason.
-            # Skip promotion for nsjail-own failures so the [E][ marker stays
-            # in `error` for the nsjail_error classification below.
             if not is_nsjail_error:
                 output = error
                 error = ""
@@ -524,68 +611,11 @@ class ShellTools:
             "Built-in shell exit=%s stdout=%d stderr=%d chars in %.0fms",
             returncode, _total_out, _total_err, elapsed_ms,
         )
-        if timed_out:
-            timeout_error = f"Command timed out after {timeout}s."
-            if error.strip():
-                timeout_error = f"{timeout_error}\nstderr:\n{error}"
-            return {
-                "success": False,
-                "output": output,
-                "error": timeout_error,
-                "exit_code": -1,
-                "elapsed_ms": round(elapsed_ms),
-                "full_log_path": full_log_path,
-                "error_type": "tool_timeout",
-                "recoverable": True,
-                "suggestion": "Try the command again with a longer timeout.",
-            }
-        if is_nsjail_error:
-            return {
-                "success": False,
-                "output": output,
-                "error": error,
-                "exit_code": returncode,
-                "elapsed_ms": round(elapsed_ms),
-                "full_log_path": full_log_path,
-                "error_type": "nsjail_error",
-                "recoverable": False,
-                "suggestion": (
-                    "The nsjail sandbox failed to set up. "
-                    "Check kernel namespace permissions, cgroup availability, or nsjail binary."
-                ),
-            }
 
-        # Classify non-zero exit codes from the shell.
-        error_type = ""
-        recoverable = False
-        suggestion = ""
-        if returncode != 0:
-            error_lower = error.lower()
-            output_lower = output.lower()
-            combined = f"{error_lower}\n{output_lower}"
-            if "permission denied" in combined:
-                error_type = "permission_denied"
-                recoverable = False
-                suggestion = "Check file permissions or use sudo."
-            elif "command not found" in combined or ("not found" in error_lower and "file" not in error_lower):
-                error_type = "command_not_found"
-                recoverable = False
-                suggestion = "Check the command name or install the missing executable."
-            elif "no such file or directory" in combined:
-                error_type = "file_not_found"
-                recoverable = False
-                suggestion = "Check the file path or create the missing file."
-        return {
-            "success": returncode == 0,
-            "output": output,
-            "error": error,
-            "exit_code": returncode,
-            "elapsed_ms": round(elapsed_ms),
-            "full_log_path": full_log_path,
-            "error_type": error_type,
-            "recoverable": recoverable,
-            "suggestion": suggestion,
-        }
+        return _classify_exit(
+            returncode, output, error, elapsed_ms, full_log_path,
+            timed_out=timed_out, timeout=timeout, is_nsjail_error=is_nsjail_error,
+        )
 
     def _run_shell_pty(self, args: dict, caller_tag: str = "",
                        chunk_callback: Optional[Callable[[str], None]] = None) -> dict:

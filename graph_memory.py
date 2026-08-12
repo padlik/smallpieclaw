@@ -633,21 +633,8 @@ class GraphMemoryStore:
     # Read operations
     # ------------------------------------------------------------------
 
-    def search(self, query: str, k: int = 10) -> dict:
-        """Hybrid retrieval: vector ANN → seed entities → 1-hop graph expansion.
-
-        Returns dict with keys:
-          "seeds"    — list of {id, name, type, sim}
-          "facts"    — list of {source, relation, fact, target, admission, confidence}
-          "episodes" — list of {id, content, sim, admission, confidence}
-        """
-        try:
-            query_vec = self._embed(query)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Graph memory search embed failed: %s", exc)
-            return {"seeds": [], "facts": [], "episodes": []}
-
-        # Phase 1: HNSW vector search on entities
+    def _seed_entities(self, query_vec: list[float], k: int) -> list[dict]:
+        """Phase 1: find seed entities by HNSW vector similarity."""
         seeds: list[dict] = []
         try:
             with self._conn_lock:
@@ -668,58 +655,61 @@ class GraphMemoryStore:
                     )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Vector index search failed: %s", exc)
+        return seeds
 
-        # Phase 2: 1-hop graph expansion from seed nodes
+    def _expand_facts(self, seed_ids: list[str], k: int) -> list[dict]:
+        """Phase 2: 1-hop graph expansion from seed entities."""
         facts: list[dict] = []
-        seed_ids = [s["id"] for s in seeds[:5]]
-        if seed_ids:
-            if self._has_admission_meta:
-                fact_query = """
-                    MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
-                    WHERE s.id IN $ids AND r.invalid_at IS NULL
-                    RETURN s.name, r.relation_type, r.fact, t.name,
-                           r.admission_status, r.confidence
-                    LIMIT $lim
-                    """
-            else:
-                fact_query = """
-                    MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
-                    WHERE s.id IN $ids AND r.invalid_at IS NULL
-                    RETURN s.name, r.relation_type, r.fact, t.name
-                    LIMIT $lim
-                    """
-            try:
-                with self._conn_lock:
-                    graph_result = self._conn.execute(
-                        fact_query, {"ids": seed_ids, "lim": k * 2}
+        if not seed_ids:
+            return facts
+        if self._has_admission_meta:
+            fact_query = """
+                MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
+                WHERE s.id IN $ids AND r.invalid_at IS NULL
+                RETURN s.name, r.relation_type, r.fact, t.name,
+                       r.admission_status, r.confidence
+                LIMIT $lim
+                """
+        else:
+            fact_query = """
+                MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
+                WHERE s.id IN $ids AND r.invalid_at IS NULL
+                RETURN s.name, r.relation_type, r.fact, t.name
+                LIMIT $lim
+                """
+        try:
+            with self._conn_lock:
+                graph_result = self._conn.execute(
+                    fact_query, {"ids": seed_ids, "lim": k * 2}
+                )
+                while graph_result.has_next():
+                    row = graph_result.get_next()
+                    admission = (
+                        _coerce_admission(row[4])
+                        if self._has_admission_meta and len(row) > 4
+                        else ADMISSION_OBSERVED
                     )
-                    while graph_result.has_next():
-                        row = graph_result.get_next()
-                        admission = (
-                            _coerce_admission(row[4])
-                            if self._has_admission_meta and len(row) > 4
-                            else ADMISSION_OBSERVED
-                        )
-                        confidence = (
-                            row[5]
-                            if self._has_admission_meta and len(row) > 5 and row[5] is not None
-                            else CONFIDENCE_OBSERVED
-                        )
-                        facts.append(
-                            {
-                                "source": row[0],
-                                "relation": row[1],
-                                "fact": row[2],
-                                "target": row[3],
-                                "admission": admission,
-                                "confidence": confidence,
-                            }
-                        )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Graph expansion failed: %s", exc)
+                    confidence = (
+                        row[5]
+                        if self._has_admission_meta and len(row) > 5 and row[5] is not None
+                        else CONFIDENCE_OBSERVED
+                    )
+                    facts.append(
+                        {
+                            "source": row[0],
+                            "relation": row[1],
+                            "fact": row[2],
+                            "target": row[3],
+                            "admission": admission,
+                            "confidence": confidence,
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Graph expansion failed: %s", exc)
+        return facts
 
-        # Phase 3: Episode vector search — catches manually stored content
-        # that has no extracted entities (short notes, store-only calls).
+    def _search_episodes(self, query_vec: list[float], k: int) -> list[dict]:
+        """Phase 3: find relevant episodes by HNSW vector similarity."""
         episodes: list[dict] = []
         try:
             with self._conn_lock:
@@ -747,6 +737,26 @@ class GraphMemoryStore:
                     )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Episode vector search failed: %s", exc)
+        return episodes
+
+    def search(self, query: str, k: int = 10) -> dict:
+        """Hybrid retrieval: vector ANN → seed entities → 1-hop graph expansion.
+
+        Returns dict with keys:
+          "seeds"    — list of {id, name, type, sim}
+          "facts"    — list of {source, relation, fact, target, admission, confidence}
+          "episodes" — list of {id, content, sim, admission, confidence}
+        """
+        try:
+            query_vec = self._embed(query)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Graph memory search embed failed: %s", exc)
+            return {"seeds": [], "facts": [], "episodes": []}
+
+        seeds = self._seed_entities(query_vec, k)
+        seed_ids = [s["id"] for s in seeds[:5]]
+        facts = self._expand_facts(seed_ids, k)
+        episodes = self._search_episodes(query_vec, k)
 
         # Rank confirmed facts ahead of observed ones, then by confidence/relevance.
         facts.sort(

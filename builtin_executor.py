@@ -217,32 +217,17 @@ class BuiltinExecutor:
         self._agents = AgentTools(self)
         # nsjail config builder — only instantiated when nsjail backend is selected
         self._nsjail_builder: Optional[NsjailConfigBuilder] = None
-        if shell_backend == "nsjail":
-            if not (nsjail_session_tmpdir and tmp_dir):
-                logger.warning(
-                    "shell_backend='nsjail' but nsjail_session_tmpdir=%r/tmp_dir=%r not both "
-                    "set — falling back to subprocess",
-                    nsjail_session_tmpdir, tmp_dir,
-                )
-            else:
-                nsjail_binary = shutil.which("nsjail")
-                if nsjail_binary is not None:
-                    self._shell_nsjail_active = True
-                    self._nsjail_builder = NsjailConfigBuilder(
-                        session_tmpdir=nsjail_session_tmpdir,
-                        tmp_dir=tmp_dir,
-                        trusted_dirs_path=nsjail_trusted_dirs_path,
-                        memory_mb=shell_nsjail_memory_mb,
-                        pids_max=shell_nsjail_pids_max,
-                        cpu_percent=shell_nsjail_cpu_percent,
-                        allow_net=self._allow_net,
-                        dns_nameserver=self._nsjail_dns_nameserver,
-                        skills_dir=skills_dir,
-                        agent_dir=nsjail_agent_dir,
-                    )
-                    logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
-                else:
-                    logger.warning("shell_backend='nsjail' but nsjail binary not found — falling back to subprocess")
+        self._init_nsjail(
+            shell_backend=shell_backend,
+            nsjail_session_tmpdir=nsjail_session_tmpdir,
+            tmp_dir=tmp_dir,
+            nsjail_trusted_dirs_path=nsjail_trusted_dirs_path,
+            shell_nsjail_memory_mb=shell_nsjail_memory_mb,
+            shell_nsjail_pids_max=shell_nsjail_pids_max,
+            shell_nsjail_cpu_percent=shell_nsjail_cpu_percent,
+            skills_dir=skills_dir,
+            nsjail_agent_dir=nsjail_agent_dir,
+        )
         # Zone-based access control — set by main.py after construction
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
         # Skill registry — set by main.py after construction (same pattern as trusted_zone_checker)
@@ -260,7 +245,16 @@ class BuiltinExecutor:
         # Each value is a per-tool adapter that forwards exactly the kwargs that
         # tool accepts today (Decision 3); vision_query has no entry — it is
         # executed by the ReAct loop, not by this dispatch.
-        self._exec_table: dict[str, Callable[[dict, _CallContext], dict]] = {
+        self._exec_table = self._build_exec_table()
+        # Confirmation-capable execution table: tools whose execute() path may
+        # return ``requires_confirmation`` and therefore need a post-approval
+        # runner. The two new sub-agent control tools are intentionally absent
+        # because they are not confirmation-gated.
+        self._run_table = self._build_run_table()
+
+    def _build_exec_table(self) -> dict[str, Callable[[dict, _CallContext], dict]]:
+        """Build the execute-path dispatch table for all built-in tools."""
+        return {
             "shell": lambda a, ctx: self._shell._exec_shell(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
                 chunk_callback=ctx.chunk_callback,
@@ -300,11 +294,10 @@ class BuiltinExecutor:
             "shell_env_list": lambda a, ctx: self._shell_env_tools.shell_env_list(a),
             "shell_env_get": lambda a, ctx: self._shell_env_tools.shell_env_get(a),
         }
-        # Confirmation-capable execution table: tools whose execute() path may
-        # return ``requires_confirmation`` and therefore need a post-approval
-        # runner. The two new sub-agent control tools are intentionally absent
-        # because they are not confirmation-gated.
-        self._run_table: dict[str, Callable[[dict, _CallContext], dict]] = {
+
+    def _build_run_table(self) -> dict[str, Callable[[dict, _CallContext], dict]]:
+        """Build the confirmation-run dispatch table for dangerous tools."""
+        return {
             "shell": lambda a, ctx: self._shell._run_shell(
                 a, caller_tag=ctx.caller_tag, chunk_callback=ctx.chunk_callback,
             ),
@@ -316,6 +309,52 @@ class BuiltinExecutor:
             "memory_graph_store": lambda a, ctx: self._memory_tools._run_memory_graph_store(a, caller_tag=ctx.caller_tag),
             "secret_get": lambda a, ctx: self._secrets._run_secret_get(a, caller_tag=ctx.caller_tag),
         }
+
+    def _init_nsjail(
+        self,
+        shell_backend: str,
+        nsjail_session_tmpdir: str,
+        tmp_dir: str,
+        nsjail_trusted_dirs_path: str,
+        shell_nsjail_memory_mb: int,
+        shell_nsjail_pids_max: int,
+        shell_nsjail_cpu_percent: int,
+        skills_dir: str,
+        nsjail_agent_dir: str,
+    ) -> None:
+        """Activate the nsjail shell backend if selected and configured.
+
+        Requires ``self._allow_net`` and ``self._nsjail_dns_nameserver`` to be set
+        before this helper is called. Falls back to subprocess with a warning
+        when the runtime or binary is unavailable.
+        """
+        if shell_backend != "nsjail":
+            return
+        if not (nsjail_session_tmpdir and tmp_dir):
+            logger.warning(
+                "shell_backend='nsjail' but nsjail_session_tmpdir=%r/tmp_dir=%r not both "
+                "set — falling back to subprocess",
+                nsjail_session_tmpdir, tmp_dir,
+            )
+            return
+        nsjail_binary = shutil.which("nsjail")
+        if nsjail_binary is not None:
+            self._shell_nsjail_active = True
+            self._nsjail_builder = NsjailConfigBuilder(
+                session_tmpdir=nsjail_session_tmpdir,
+                tmp_dir=tmp_dir,
+                trusted_dirs_path=nsjail_trusted_dirs_path,
+                memory_mb=shell_nsjail_memory_mb,
+                pids_max=shell_nsjail_pids_max,
+                cpu_percent=shell_nsjail_cpu_percent,
+                allow_net=self._allow_net,
+                dns_nameserver=self._nsjail_dns_nameserver,
+                skills_dir=skills_dir,
+                agent_dir=nsjail_agent_dir,
+            )
+            logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
+        else:
+            logger.warning("shell_backend='nsjail' but nsjail binary not found — falling back to subprocess")
 
     # ------------------------------------------------------------------
     # Public API

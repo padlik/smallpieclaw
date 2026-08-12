@@ -1067,6 +1067,110 @@ class MCPManager:
         # All tools are mutating or unnamed — skip tools/call
         return None
 
+    @staticmethod
+    def _probe_response_within_size(name: str, response: httpx.Response) -> bool:
+        """Return True if the response body is within the probe size guard.
+
+        Logs a warning and returns False if the ``Content-Length`` header or
+        the actual body size exceeds ``_PROBE_MAX_RESPONSE_BYTES``.
+        """
+        content_length = response.headers.get("content-length")
+        if (
+            content_length is not None
+            and int(content_length) > _PROBE_MAX_RESPONSE_BYTES
+        ):
+            logger.warning(
+                "MCP [%s] probe tools/list response too "
+                "large (%s bytes) — skipping tools/call",
+                name,
+                content_length,
+            )
+            return False
+        if len(response.content) > _PROBE_MAX_RESPONSE_BYTES:
+            logger.warning(
+                "MCP [%s] probe tools/list response too "
+                "large (%d bytes) — skipping tools/call",
+                name,
+                len(response.content),
+            )
+            return False
+        return True
+
+    async def _post_discovery_probe(
+        self, name: str, server_url: str, client: httpx.AsyncClient,
+        challenge_flag: list[bool],
+    ) -> int | None:
+        """Run the two-step POST discovery probe.
+
+        Issues ``tools/list``, parses the first safe tool name, then issues
+        ``tools/call`` with empty arguments. Returns the HTTP status code of the
+        final response (``tools/call`` when run, otherwise ``tools/list``).
+
+        Args:
+            name: Server name (for logging).
+            server_url: MCP server URL.
+            client: Authenticated httpx client with event hooks installed.
+            challenge_flag: A mutable ``[bool]`` box shared with the caller's
+                event hook.  The hook sets ``challenge_flag[0] = True`` when a
+                401/403 is observed.  This method re-checks the flag **after**
+                the ``tools/list`` POST to detect an OAuth challenge that fired
+                during that POST (intermediate 401 → retry → 200).
+
+        Returns:
+            HTTP status code of the final probe response, or ``None`` if the
+            probe is skipped.
+        """
+        list_body = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "tools/list",
+            "params": {},
+        }
+        list_response = await client.post(
+            server_url,
+            json=list_body,
+            headers=_PROBE_POST_HEADERS,
+        )
+        final_status = list_response.status_code
+
+        # Re-check the shared challenge flag AFTER the POST — the event hook
+        # may have observed an intermediate 401 during tools/list (OAuth fired,
+        # retried to 200).  If so, skip tools/call.
+        # Also skip on non-200 status (e.g. 405, 500).
+        if challenge_flag[0] or final_status != 200:
+            return final_status
+
+        # Defense-in-depth: reject oversized responses before parsing to avoid
+        # memory exhaustion.
+        if not self._probe_response_within_size(name, list_response):
+            return final_status
+
+        first_tool_name = self._extract_first_tool_name(list_response)
+        if first_tool_name is None:
+            logger.warning(
+                "MCP [%s] probe tools/list returned no "
+                "usable tool name — skipping tools/call, "
+                "proceeding to session connection",
+                name,
+            )
+            return final_status
+
+        call_body = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "tools/call",
+            "params": {
+                "name": first_tool_name,
+                "arguments": {},
+            },
+        }
+        call_response = await client.post(
+            server_url,
+            json=call_body,
+            headers=_PROBE_POST_HEADERS,
+        )
+        return call_response.status_code
+
     async def _probe_oauth_challenge(
         self, name: str, server_url: str, provider: httpx.Auth, oauth_cfg: dict
     ) -> tuple[bool, int | None, str | None]:
@@ -1110,6 +1214,10 @@ class MCPManager:
             string describing the failure (or None on success).
         """
         probe_saw_auth_challenge = False
+        # Mutable box shared with _post_discovery_probe so it can re-check
+        # the flag AFTER its own tools/list POST (the nonlocal below writes
+        # to probe_saw_auth_challenge, and challenge_flag[0] mirrors it).
+        challenge_flag = [False]
         final_status: int | None = None
         error: str | None = None
 
@@ -1117,6 +1225,7 @@ class MCPManager:
             nonlocal probe_saw_auth_challenge
             if response.status_code in (401, 403):
                 probe_saw_auth_challenge = True
+                challenge_flag[0] = True
 
         timeout = oauth_cfg.get("timeout", 300)
         logger.info(
@@ -1144,76 +1253,9 @@ class MCPManager:
                 # async_auth_flow via the event hook.
                 if not probe_saw_auth_challenge and final_status in (200, 405):
                     final_status = None
-                    list_body = {
-                        "jsonrpc": "2.0",
-                        "id": str(uuid.uuid4()),
-                        "method": "tools/list",
-                        "params": {},
-                    }
-                    list_response = await client.post(
-                        server_url,
-                        json=list_body,
-                        headers=_PROBE_POST_HEADERS,
+                    final_status = await self._post_discovery_probe(
+                        name, server_url, client, challenge_flag,
                     )
-                    final_status = list_response.status_code
-
-                    # If tools/list returned 401, the event hook already set
-                    # probe_saw_auth_challenge=True — OAuth fired on tools/list.
-                    # Do not send tools/call.
-                    # If tools/list returned a non-200 status (e.g. 405, 500),
-                    # skip parsing and tools/call — fall through to the logging
-                    # block with the tools/list status as final_status.
-                    if not probe_saw_auth_challenge and final_status == 200:
-                        # Defense-in-depth: reject oversized responses
-                        # before parsing to avoid memory exhaustion.
-                        content_length = list_response.headers.get(
-                            "content-length"
-                        )
-                        if (
-                            content_length is not None
-                            and int(content_length) > _PROBE_MAX_RESPONSE_BYTES
-                        ):
-                            logger.warning(
-                                "MCP [%s] probe tools/list response too "
-                                "large (%s bytes) — skipping tools/call",
-                                name,
-                                content_length,
-                            )
-                        elif len(list_response.content) > _PROBE_MAX_RESPONSE_BYTES:
-                            logger.warning(
-                                "MCP [%s] probe tools/list response too "
-                                "large (%d bytes) — skipping tools/call",
-                                name,
-                                len(list_response.content),
-                            )
-                        else:
-                            first_tool_name = self._extract_first_tool_name(
-                                list_response
-                            )
-                            if first_tool_name is None:
-                                logger.warning(
-                                    "MCP [%s] probe tools/list returned no "
-                                    "usable tool name — skipping tools/call, "
-                                    "proceeding to session connection",
-                                    name,
-                                )
-                            else:
-                                final_status = None
-                                call_body = {
-                                    "jsonrpc": "2.0",
-                                    "id": str(uuid.uuid4()),
-                                    "method": "tools/call",
-                                    "params": {
-                                        "name": first_tool_name,
-                                        "arguments": {},
-                                    },
-                                }
-                                call_response = await client.post(
-                                    server_url,
-                                    json=call_body,
-                                    headers=_PROBE_POST_HEADERS,
-                                )
-                                final_status = call_response.status_code
         except Exception as exc:
             error = str(exc)
             if probe_saw_auth_challenge:
@@ -1355,6 +1397,108 @@ class MCPManager:
 
         return False, probe_saw_auth_challenge, None
 
+    async def _await_session_ready(
+        self, wrapper: _SdkClientWrapper
+    ) -> tuple[bool, str | None]:
+        """Wait for the wrapper's session to become ready or be cancelled.
+
+        Args:
+            wrapper: The SDK wrapper whose ``_ready_future`` to watch.
+
+        Returns:
+            A tuple ``(cancelled, error)``. ``cancelled`` is True if the flow
+            was cancelled before the session became ready. ``error`` is a human
+            readable failure message, or ``None`` when the session is ready.
+        """
+        cancel_task = asyncio.create_task(self._watch_cancel())
+        ready_task = asyncio.ensure_future(
+            asyncio.wrap_future(wrapper._ready_future)
+        )
+
+        done, pending = await asyncio.wait(
+            {ready_task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        if cancel_task in done and self._oauth_cancel_requested:
+            return True, None
+
+        if ready_task in done:
+            exc = ready_task.exception()
+            if exc is not None:
+                return False, str(exc)
+            return False, None
+
+        return False, "Unexpected state in OAuth flow"
+
+    def _verify_token_persisted(
+        self, name: str, probe_saw_challenge: bool
+    ) -> dict | None:
+        """Verify that the OAuth token file was written after a flow.
+
+        Args:
+            name: Server name (for logging and the token file path).
+            probe_saw_challenge: Whether the probe observed a 401/403.
+
+        Returns:
+            An error dict if the token file is missing and the server required
+            OAuth, or ``None`` when no token verification issue is detected.
+        """
+        if self._mcp_tokens_dir is None:
+            return None
+        token_file = self._mcp_tokens_dir / f"{name}.json"
+        if token_file.exists():
+            return None
+        if probe_saw_challenge:
+            logger.warning(
+                "MCP [%s] OAuth flow returned success but no token file found — "
+                "redirect_handler may not have fired. "
+                "Retry `/mcp auth %s`.",
+                name,
+                name,
+            )
+            return {
+                "success": False,
+                "error": (
+                    "OAuth flow completed but no token was stored — "
+                    "the authorization link may not have been delivered. "
+                    f"Retry /mcp auth {name}."
+                ),
+            }
+        logger.info(
+            "MCP [%s] server did not require OAuth on probe; "
+            "connecting without token",
+            name,
+        )
+        return None
+
+    def _register_wrapper(self, name: str, wrapper: _SdkClientWrapper) -> None:
+        """Register a wrapper's tools in the manager registry.
+
+        Replaces any existing wrapper for ``name`` and maps each tool name to
+        the server, warning on conflicts. Existing wrapper is closed before
+        replacement.
+        """
+        with self._lock:
+            old = self._wrappers.get(name)
+            if old is not None:
+                old.close()
+            self._wrappers[name] = wrapper
+            for tool in wrapper.tools:
+                if tool.name in self._tool_to_server:
+                    logger.warning(
+                        "MCP tool name conflict: '%s' claimed by both '%s' and '%s' — keeping first",
+                        tool.name,
+                        self._tool_to_server[tool.name],
+                        name,
+                    )
+                else:
+                    self._tool_to_server[tool.name] = name
+
     async def _run_oauth_flow(self, name: str, cfg: dict, oauth_cfg: dict) -> dict:
         """Run the interactive OAuth flow by connecting a real session with auth=provider.
 
@@ -1406,112 +1550,44 @@ class MCPManager:
             wrapper._interactive = True
 
             session_task = asyncio.create_task(wrapper._session_runner())
-            cancel_task = asyncio.create_task(self._watch_cancel())
-
-            # Wait for either the session to become ready or a cancel request.
-            # asyncio.create_task() only accepts coroutines, while
-            # asyncio.ensure_future() also accepts an awaitable Future produced by
-            # asyncio.wrap_future(); this keeps the code compatible with Python 3.10.
-            ready_task = asyncio.ensure_future(
-                asyncio.wrap_future(wrapper._ready_future)
-            )
-
-            done, pending = await asyncio.wait(
-                {ready_task, cancel_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            # Cancel anything still running.
-            for t in pending:
-                t.cancel()
-            # Gather cancelled tasks to avoid "Task was destroyed but pending" warnings.
-            await asyncio.gather(*pending, return_exceptions=True)
-
-            if cancel_task in done and self._oauth_cancel_requested:
+            cancelled, ready_error = await self._await_session_ready(wrapper)
+            if cancelled:
                 return {"success": False, "error": "Cancelled by operator"}
+            if ready_error is not None:
+                logger.warning(
+                    "MCP [%s] OAuth session failed: %s",
+                    name,
+                    ready_error,
+                    exc_info=True,
+                )
+                return {"success": False, "error": ready_error}
 
-            if ready_task in done:
-                exc = ready_task.exception()
-                if exc is not None:
-                    logger.warning(
-                        "MCP [%s] OAuth session failed: %s",
-                        name,
-                        exc,
-                        exc_info=True,
-                    )
-                    return {"success": False, "error": str(exc)}
+            # Session is ready — the SDK has completed the OAuth flow and
+            # persisted tokens via storage.set_tokens().
+            logger.info("MCP [%s] session ready; verifying token storage", name)
+            if wrapper.needs_auth:
+                logger.warning(
+                    "MCP [%s] server still needs auth after OAuth flow",
+                    name,
+                )
+                return {
+                    "success": False,
+                    "error": "Server still needs auth after flow",
+                }
 
-                # Session is ready — the SDK has completed the OAuth flow and
-                # persisted tokens via storage.set_tokens().
-                logger.info("MCP [%s] session ready; verifying token storage", name)
-                if wrapper.needs_auth:
-                    logger.warning(
-                        "MCP [%s] server still needs auth after OAuth flow",
-                        name,
-                    )
-                    return {
-                        "success": False,
-                        "error": "Server still needs auth after flow",
-                    }
+            token_error = self._verify_token_persisted(name, probe_saw_auth_challenge)
+            if token_error is not None:
+                return token_error
 
-                token_file = self._mcp_tokens_dir / f"{name}.json"
-                if not token_file.exists():
-                    if probe_saw_auth_challenge:
-                        # Probe saw a 401/403 (OAuth flow was attempted) but no
-                        # token file was created — redirect_handler failed or
-                        # callback timed out.  This is a genuine error.
-                        logger.warning(
-                            "MCP [%s] OAuth flow returned success but no token file found — "
-                            "redirect_handler may not have fired. "
-                            "Retry `/mcp auth %s`.",
-                            name,
-                            name,
-                        )
-                        return {
-                            "success": False,
-                            "error": (
-                                "OAuth flow completed but no token was stored — "
-                                "the authorization link may not have been delivered. "
-                                f"Retry /mcp auth {name}."
-                            ),
-                        }
-                    else:
-                        # Probe did not see an auth challenge — the server did
-                        # not require OAuth on the probe.  No token file is
-                        # expected; the session connects without a token.
-                        logger.info(
-                            "MCP [%s] server did not require OAuth on probe; "
-                            "connecting without token",
-                            name,
-                        )
-
-                wrapper.connected = True
-                # Hand off the session task to the wrapper so it owns its
-                # lifecycle (close_all, close, set_enabled).  Null out the
-                # local so the ``finally`` block does NOT cancel the live
-                # session runner — it must keep running to serve tool calls.
-                wrapper._task = session_task
-                session_task = None
-                with self._lock:
-                    old = self._wrappers.get(name)
-                    if old is not None:
-                        old.close()
-                    self._wrappers[name] = wrapper
-                    for tool in wrapper.tools:
-                        if tool.name in self._tool_to_server:
-                            logger.warning(
-                                "MCP tool name conflict: '%s' claimed by both '%s' and '%s' — keeping first",
-                                tool.name,
-                                self._tool_to_server[tool.name],
-                                name,
-                            )
-                        else:
-                            self._tool_to_server[tool.name] = name
-                return {"success": True}
-
-            # Should not reach here, but handle defensively.
-            logger.warning("MCP [%s] unexpected state in OAuth flow", name)
-            return {"success": False, "error": "Unexpected state in OAuth flow"}
+            wrapper.connected = True
+            # Hand off the session task to the wrapper so it owns its
+            # lifecycle (close_all, close, set_enabled).  Null out the
+            # local so the ``finally`` block does NOT cancel the live
+            # session runner — it must keep running to serve tool calls.
+            wrapper._task = session_task
+            session_task = None
+            self._register_wrapper(name, wrapper)
+            return {"success": True}
         except Exception as exc:
             logger.warning(
                 "MCP [%s] OAuth flow failed: %s",

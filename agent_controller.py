@@ -356,35 +356,53 @@ class AgentController:
                 "assistant",
                 f"[Compressed context summary — deterministic fallback]\n{fallback}",
             )
-            after_tokens = _estimate_tokens(fallback)
-            saved = max(0, before_tokens - after_tokens)
-            pct = int(saved / before_tokens * 100) if before_tokens else 0
-            logger.info(
-                "compress_context (fallback): %d → ~%d tokens (%d%% reduction, %d messages → 1)",
-                before_tokens, after_tokens, pct, len(messages),
-            )
-            return (
-                f"⚠️ LLM compression unavailable — applied deterministic truncation.\n"
-                f"  Messages: {len(messages)} → 1\n"
-                f"  Tokens: ~{before_tokens:,} → ~{after_tokens:,} "
-                f"(−{saved:,}, {pct}% smaller)\n"
-                f"  Reason: {exc}"
+            return self._compression_report(
+                before_tokens,
+                _estimate_tokens(fallback),
+                len(messages),
+                fallback=True,
+                reason=str(exc),
             )
 
         self.short_term.clear()
         self.short_term.add("assistant", f"[Compressed context summary]\n{summary}")
 
-        after_tokens = _estimate_tokens(summary)
-        saved = max(0, before_tokens - after_tokens)
-        pct = int(saved / before_tokens * 100) if before_tokens else 0
-        logger.info(
-            "compress_context: %d → ~%d tokens (%d%% reduction, %d messages → 1)",
-            before_tokens, after_tokens, pct, len(messages),
+        return self._compression_report(
+            before_tokens,
+            _estimate_tokens(summary),
+            len(messages),
+            fallback=False,
         )
+
+    def _compression_report(
+        self,
+        before: int,
+        after: int,
+        n_messages: int,
+        *,
+        fallback: bool,
+        reason: str = "",
+    ) -> str:
+        """Build and log a human-readable compression report, then return it."""
+        saved = max(0, before - after)
+        pct = int(saved / before * 100) if before else 0
+        logger.info(
+            "compress_context%s: %d → ~%d tokens (%d%% reduction, %d messages → 1)",
+            " (fallback)" if fallback else "",
+            before, after, pct, n_messages,
+        )
+        if fallback:
+            return (
+                f"⚠️ LLM compression unavailable — applied deterministic truncation.\n"
+                f"  Messages: {n_messages} → 1\n"
+                f"  Tokens: ~{before:,} → ~{after:,} "
+                f"(−{saved:,}, {pct}% smaller)\n"
+                f"  Reason: {reason}"
+            )
         return (
             f"✅ Context compressed.\n"
-            f"  Messages: {len(messages)} → 1\n"
-            f"  Tokens: ~{before_tokens:,} → ~{after_tokens:,} "
+            f"  Messages: {n_messages} → 1\n"
+            f"  Tokens: ~{before:,} → ~{after:,} "
             f"(−{saved:,}, {pct}% smaller)"
         )
 

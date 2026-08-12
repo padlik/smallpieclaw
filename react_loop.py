@@ -17,6 +17,7 @@ import re
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -55,6 +56,7 @@ _DEFAULT_TOOL_ICON = "🔧"
 # It is not a real unlimited loop; it is large enough to be effectively
 # unlimited while still protecting against runaway execution.
 _EFFECTIVELY_UNLIMITED_STEPS = 10_000_000
+_RE_PROMPT = "__re_prompt__"
 
 
 def _tool_icon(name: str) -> str:
@@ -447,6 +449,8 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     # Zone gate: vision_query reads a file, so apply the same gate as file_read.
     real_path = os.path.realpath(os.path.expanduser(path))
     checker = ctx.trusted_zone_checker
+    needs_confirm = False
+    reason = ""
     if checker is not None:
         builtin = ctx.builtin_executor
         request_grants = (
@@ -458,42 +462,40 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
             path, operation="read",
             request_grants=request_grants,
         )
-        sensitive, reason = _is_sensitive_path(real_path)
+        sensitive, zone_reason = _is_sensitive_path(real_path)
         if zone == ZoneClassification.UNRECOGNISED or sensitive:
-            builtin = ctx.builtin_executor
-            if builtin is None:
-                return {
-                    "success": False, "output": "",
-                    "error": "vision_query: confirmation infrastructure not available.",
-                }
-            desc = f"Vision query: <code>{path}</code>"
-            if real_path != path:
-                desc += f"\n(→ <code>{real_path}</code>)"
-            if sensitive:
-                desc += f"\n⚠️ Reason: {reason}"
-            return builtin._requires_confirmation(
-                "vision_query", args, desc,
-                caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
-                zone_path=real_path,
-            )
+            needs_confirm = True
+            reason = zone_reason if sensitive else "Unrecognised zone"
     else:
         # Checker unwired: degrade to sensitive-only gate (same as file_read).
         logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for vision_query")
-        sensitive, reason = _is_sensitive_path(real_path)
+        sensitive, zone_reason = _is_sensitive_path(real_path)
         if sensitive:
-            builtin = ctx.builtin_executor
-            if builtin is None:
-                return {
-                    "success": False, "output": "",
-                    "error": "vision_query: confirmation infrastructure not available.",
-                }
-            desc = f"Vision query: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
-            if real_path != path:
-                desc += f"\n(→ <code>{real_path}</code>)"
-            return builtin._requires_confirmation(
-                "vision_query", args, desc,
-                caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
-            )
+            needs_confirm = True
+            reason = zone_reason
+
+    if needs_confirm:
+        builtin = ctx.builtin_executor
+        if builtin is None:
+            return {
+                "success": False, "output": "",
+                "error": "vision_query: confirmation infrastructure not available.",
+            }
+        desc = f"Vision query: <code>{path}</code>"
+        if real_path != path:
+            desc += f"\n(→ <code>{real_path}</code>)"
+        desc += f"\n⚠️ Reason for confirmation: {reason}"
+        confirm_kwargs: dict = {
+            "caller_depth": ctx.depth,
+            "caller_tag": ctx.caller_tag,
+        }
+        # Only pass zone_path when the checker classified the path as
+        # UNRECOGNISED — not on the checker-unwired sensitive-only fallback.
+        if checker is not None:
+            confirm_kwargs["zone_path"] = real_path
+        return builtin._requires_confirmation(
+            "vision_query", args, desc, **confirm_kwargs,
+        )
 
     encoded = _encode_images([path])
     if not encoded:
@@ -746,6 +748,70 @@ def _normalize_shorthand_action(action_obj: dict) -> dict:
     return {"action": "tool", "tool": action, "args": shorthand_args}
 
 
+def _handle_non_json(state: _LoopState, turn: _Turn) -> str:
+    """Handle a turn that did not yield a parseable JSON action.
+
+    Increments the consecutive non-JSON streak, logs the raw output, and either
+    returns an error message that should abort the loop (when the streak reaches
+    the limit) or returns the sentinel ``_RE_PROMPT`` so the caller can continue.
+    """
+    state.json_fail_streak += 1
+    logger.warning(
+        "LLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
+        state.step, state.max_steps, state.json_fail_streak, len(turn.raw), turn.raw[:1000],
+    )
+    if state.json_fail_streak >= _JSON_FAIL_LIMIT:
+        logger.error("Non-JSON streak reached %d — aborting with protocol error", state.json_fail_streak)
+        return (
+            f"❌ Agent protocol error: model returned non-JSON "
+            f"{state.json_fail_streak} times in a row. "
+            f"Last response (truncated to 500 chars): {turn.raw[:500]}"
+        )
+    state.messages.append({"role": "assistant", "content": turn.raw})
+    state.messages.append({
+        "role": "user",
+        "content": (
+            'ERROR: Your response was not valid JSON. '
+            'You MUST respond with ONLY a raw JSON object — no markdown, '
+            'no prose, no ```json fences. Example: '
+            '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
+        ),
+    })
+    return _RE_PROMPT
+
+
+def _action_from_turn(turn: _Turn, state: _LoopState) -> tuple[dict, Callable[[str], None]]:
+    """Extract the action dict and result sink from a parsed LLM turn.
+
+    For native tool calls, maps supported tool names (plan/finish/tool) into the
+    canonical action object and uses a native-format result sink. For parsed JSON
+    text, normalizes shorthand actions and uses the plain-text result sink.
+    """
+    if turn.tool_calls:
+        tc = turn.tool_calls[0]
+        if tc.name == "plan":
+            action_obj: dict = {"action": "plan", "plan": tc.arguments}
+        elif tc.name == "finish":
+            action_obj = {"action": "finish", "result": (tc.arguments or {}).get("result", "Done.")}
+        else:
+            action_obj = {"action": "tool", "tool": tc.name, "args": tc.arguments}
+        return action_obj, _result_sink(state, tc)
+
+    action_obj = parse_json(turn.raw)
+    if action_obj is None and turn.text_from_native:
+        logger.warning(
+            "Native path: model returned prose (no tool_calls) — treating as finish. "
+            "In json_mode this would re-prompt; with native tool calling the run ends here.",
+        )
+        action_obj = {"action": "finish", "result": turn.raw}
+    if action_obj is None:
+        raise ValueError("non-json")  # caller should run _handle_non_json
+    state.json_fail_streak = 0
+    state.messages.append({"role": "assistant", "content": turn.raw})
+    action_obj = _normalize_shorthand_action(action_obj)
+    return action_obj, _result_sink(state)
+
+
 def _request_turn(
     ctx: ReactContext,
     state: _LoopState,
@@ -979,48 +1045,14 @@ def react_loop(
                 if turn.linearized_messages is not None:
                     state.messages = turn.linearized_messages
 
-                if turn.tool_calls:
-                    tc = turn.tool_calls[0]
-                    if tc.name == "plan":
-                        action_obj = {"action": "plan", "plan": tc.arguments}
-                    elif tc.name == "finish":
-                        action_obj = {"action": "finish", "result": (tc.arguments or {}).get("result", "Done.")}
-                    else:
-                        action_obj = {"action": "tool", "tool": tc.name, "args": tc.arguments}
-                    sink = _result_sink(state, tc)
-                else:
-                    action_obj = parse_json(turn.raw)
-                    if action_obj is None and turn.text_from_native:
-                        logger.warning("Native path: model returned prose (no tool_calls) — treating as finish. "
-                            "In json_mode this would re-prompt; with native tool calling the run ends here.", )
-                        action_obj = {"action": "finish", "result": turn.raw}
-                    if action_obj is None:
-                        state.json_fail_streak += 1
-                        logger.warning("LLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---", state.step, state.max_steps, state.json_fail_streak, len(turn.raw), turn.raw[:1000], )
-                        if state.json_fail_streak >= _JSON_FAIL_LIMIT:
-                            logger.error("Non-JSON streak reached %d — aborting with protocol error", state.json_fail_streak, )
-                            err_msg = (
-                                f"❌ Agent protocol error: model returned non-JSON "
-                                f"{state.json_fail_streak} times in a row. "
-                                f"Last response (truncated to 500 chars): {turn.raw[:500]}"
-                            )
-                            _progress(err_msg)
-                            return err_msg
-                        state.messages.append({"role": "assistant", "content": turn.raw})
-                        state.messages.append({
-                            "role": "user",
-                            "content": (
-                                'ERROR: Your response was not valid JSON. '
-                                'You MUST respond with ONLY a raw JSON object — no markdown, '
-                                'no prose, no ```json fences. Example: '
-                                '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
-                            ),
-                        })
+                try:
+                    action_obj, sink = _action_from_turn(turn, state)
+                except ValueError:
+                    err_msg = _handle_non_json(state, turn)
+                    if err_msg == _RE_PROMPT:
                         continue
-                    state.json_fail_streak = 0
-                    state.messages.append({"role": "assistant", "content": turn.raw})
-                    action_obj = _normalize_shorthand_action(action_obj)
-                    sink = _result_sink(state)
+                    _progress(err_msg)
+                    return err_msg
 
                 final = _dispatch_action(
                     ctx, action_obj, sink, state, user_goal, run_start, _progress,
@@ -1231,6 +1263,105 @@ def _finish_run(
     return result
 
 
+def _emit_tool_lifecycle(
+    tool_name: str,
+    start: float,
+    outcome_or_exc: object,
+    *,
+    auth_recheck: Optional[tuple[ReactContext, str]] = None,
+) -> Optional[dict]:
+    """Emit matching TOOL_END or TOOL_FAILED events for a completed tool call.
+
+    ``start`` is the ``time.perf_counter()`` value captured when the tool began.
+    ``outcome_or_exc`` may be the result dict returned by the tool backend or an
+    exception instance that escaped the call.  The helper computes duration, emits
+    lifecycle events to ``slog``, and returns the final outcome dict when an
+    outcome was supplied, or ``None`` when an exception was supplied.
+
+    For MCP calls, pass ``auth_recheck=(ctx, tool_name)`` so that the helper can
+    translate an MCP auth failure into the standard error result dict before
+    emitting TOOL_FAILED.
+    """
+    dur_ms = int((time.perf_counter() - start) * 1000)
+    if isinstance(outcome_or_exc, BaseException):
+        agent_logging.log_event(
+            agent_logging.LogEvent.ERROR,
+            f"tool error: {tool_name}: {outcome_or_exc}",
+            level=logging.ERROR,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=-1,
+            err=str(outcome_or_exc),
+        )
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_FAILED,
+            f"tool failed: {tool_name}",
+            level=logging.ERROR,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=-1,
+            err=str(outcome_or_exc),
+        )
+        return None
+
+    outcome: dict = outcome_or_exc  # type: ignore[assignment]
+    if auth_recheck is not None:
+        mcp_ctx, mcp_tool = auth_recheck
+        if _is_mcp_auth_failure(mcp_ctx, mcp_tool, outcome):
+            outcome = _handle_mcp_auth_failure(mcp_ctx, mcp_tool, outcome)
+
+    if outcome.get("success"):
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_END,
+            f"tool end: {tool_name}",
+            level=logging.INFO,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=outcome.get("exit_code", 0),
+        )
+    else:
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_FAILED,
+            f"tool failed: {tool_name}",
+            level=logging.ERROR,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=outcome.get("exit_code", -1),
+            err=outcome.get("error", "") or "",
+        )
+    return outcome
+
+
+@contextmanager
+def _tool_span(tool_name: str, *, mcp_auth: Optional[tuple[ReactContext, str]] = None):
+    """Context manager emitting TOOL_START / TOOL_END / TOOL_FAILED lifecycle events.
+
+    Yields a callable that accepts the outcome dict (or an exception can be raised
+    out of the block).  For MCP tools pass ``mcp_auth=(ctx, tool_name)`` so that
+    authentication failures are translated before the failure event is emitted.
+    """
+    agent_logging.log_event(
+        agent_logging.LogEvent.TOOL_START,
+        f"tool start: {tool_name}",
+        level=logging.INFO,
+        logger=slog,
+        tool=tool_name,
+    )
+    start = time.perf_counter()
+    outcome_holder: list[object] = []
+    try:
+        yield outcome_holder.append
+    except Exception as exc:
+        _emit_tool_lifecycle(tool_name, start, exc)
+        raise
+    outcome = outcome_holder[0] if outcome_holder else {}
+    _emit_tool_lifecycle(tool_name, start, outcome, auth_recheck=mcp_auth)
+
+
 def _dispatch_tool(
     ctx: ReactContext,
     action_obj: dict,
@@ -1278,8 +1409,10 @@ def _dispatch_tool(
 
             chunk_callback = _on_chunk
 
-        outcome = ctx.builtin_executor.execute(tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
-                                                chunk_callback=chunk_callback, trace_id=ctx.trace_id)
+        outcome = ctx.builtin_executor.execute(
+            tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
+            chunk_callback=chunk_callback, trace_id=ctx.trace_id,
+        )
 
         if outcome.get("requires_confirmation"):
             token = outcome["token"]
@@ -1313,53 +1446,8 @@ def _dispatch_tool(
     # themselves), so without this wrapping MCP tools never appear as TOOL_*
     # events. Field conventions match the builtin/tool executors.
     if ctx.mcp_manager and ctx.mcp_manager.has_tool(tool_name):
-        _mcp_start = time.perf_counter()
-        agent_logging.log_event(
-            agent_logging.LogEvent.TOOL_START,
-            f"tool start: {tool_name}",
-            level=logging.INFO,
-            logger=slog,
-            tool=tool_name,
-        )
-        try:
+        with _tool_span(tool_name, mcp_auth=(ctx, tool_name)):
             outcome = ctx.mcp_manager.call_tool(tool_name, args)
-        except Exception as exc:
-            dur_ms = int((time.perf_counter() - _mcp_start) * 1000)
-            agent_logging.log_event(
-                agent_logging.LogEvent.TOOL_FAILED,
-                f"tool failed: {tool_name}",
-                level=logging.ERROR,
-                logger=slog,
-                tool=tool_name,
-                dur_ms=dur_ms,
-                exit=-1,
-                err=str(exc),
-            )
-            raise
-        dur_ms = int((time.perf_counter() - _mcp_start) * 1000)
-        if _is_mcp_auth_failure(ctx, tool_name, outcome):
-            outcome = _handle_mcp_auth_failure(ctx, tool_name, outcome)
-        if isinstance(outcome, dict) and outcome.get("success"):
-            agent_logging.log_event(
-                agent_logging.LogEvent.TOOL_END,
-                f"tool end: {tool_name}",
-                level=logging.INFO,
-                logger=slog,
-                tool=tool_name,
-                dur_ms=dur_ms,
-                exit=0,
-            )
-        else:
-            agent_logging.log_event(
-                agent_logging.LogEvent.TOOL_FAILED,
-                f"tool failed: {tool_name}",
-                level=logging.ERROR,
-                logger=slog,
-                tool=tool_name,
-                dur_ms=dur_ms,
-                exit=-1,
-                err=(outcome.get("error", "") if isinstance(outcome, dict) else "") or "",
-            )
         return outcome
 
     # Unknown tool — no hand-written tools exist anymore
