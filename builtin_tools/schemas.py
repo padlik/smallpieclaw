@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Built-in tool schemas (17 tools, matching BUILTIN_TOOLS in descriptors.py)
+# Built-in tool schemas (21 tools, matching BUILTIN_TOOLS in descriptors.py)
 # ---------------------------------------------------------------------------
 
 BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {

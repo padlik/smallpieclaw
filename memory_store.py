@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -127,7 +128,6 @@ class MemoryStore:
         Internal keys starting with '_' are never purged.
         Returns the number of keys deleted.
         """
-        import re
         pattern = re.compile(
             r"(?:(?<![a-zA-Z])|^)("
             + "|".join(re.escape(s) for s in substrings)

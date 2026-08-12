@@ -272,7 +272,8 @@ class TelegramInterface:
         logger.info("Starting Telegram bot polling…")
         # Save the event loop before run_polling takes over — needed for
         # send_message_to_users() which is called from the scheduler thread.
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
     # ------------------------------------------------------------------
@@ -889,11 +890,7 @@ class TelegramInterface:
                 return False
 
     def _is_authorized(self, user_id: int) -> bool:
-        if self.security_mode == "allowlist":
-            return user_id in self.allowed_ids
-        elif self.security_mode == "pairing":
-            return user_id in self.allowed_ids
-        return False
+        return user_id in self.allowed_ids if self.security_mode in ("allowlist", "pairing") else False
 
     async def _send_unauthorized(self, update: Update) -> None:
         uid = update.effective_user.id

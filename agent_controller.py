@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
+import uuid
 from typing import Callable, Optional
 
 from agent_logging import bind_run_context
@@ -496,7 +498,6 @@ class SubAgentRunner:
         context_payload: dict | None = None,  # Optional parent context dict to inject in system prompt
         prompt_variant: str | None = None,    # None => default system prompts; "sub-agent" => sub-agent prompts
     ):
-        import uuid
         from memory_store import ShortTermMemory, WorkingMemory
 
         self.agent_id = "sa-" + uuid.uuid4().hex[:6]
@@ -585,7 +586,6 @@ class SubAgentRunner:
         Returns the final result string (or an error/cancellation message).
         Should be called from a background thread.
         """
-        import time
         start = time.time()
         self._log.info(
             "Starting (model: %s, context_key: %s)",

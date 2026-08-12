@@ -463,6 +463,13 @@ async def cmd_mode(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     )
 
 
+async def _reply_jobs_list(iface: "TelegramInterface", message) -> None:
+    """Fetch the current scheduler job list, format it, and reply in chunks."""
+    jobs = iface.scheduler.list_jobs()
+    for chunk in iface._split_message(iface._format_jobs_list(jobs)):
+        await message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+
 @_require_auth
 async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not iface.scheduler:
@@ -495,9 +502,7 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         ok = iface.scheduler.remove_job(tag)
         status = f"🗑 Job <code>{html.escape(tag)}</code> removed." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
         await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
-        jobs = iface.scheduler.list_jobs()
-        for chunk in iface._split_message(iface._format_jobs_list(jobs)):
-            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        await _reply_jobs_list(iface, update.effective_message)
         return
 
     # /jobs pause <tag>
@@ -511,9 +516,7 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         ok = iface.scheduler.pause_job(tag)
         status = f"⏸ Job <code>{html.escape(tag)}</code> paused." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
         await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
-        jobs = iface.scheduler.list_jobs()
-        for chunk in iface._split_message(iface._format_jobs_list(jobs)):
-            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        await _reply_jobs_list(iface, update.effective_message)
         return
 
     # /jobs resume <tag>
@@ -527,15 +530,11 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         ok = iface.scheduler.resume_job(tag)
         status = f"▶️ Job <code>{html.escape(tag)}</code> resumed." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
         await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
-        jobs = iface.scheduler.list_jobs()
-        for chunk in iface._split_message(iface._format_jobs_list(jobs)):
-            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        await _reply_jobs_list(iface, update.effective_message)
         return
 
     # Default: list all jobs
-    jobs = iface.scheduler.list_jobs()
-    for chunk in iface._split_message(iface._format_jobs_list(jobs)):
-        await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+    await _reply_jobs_list(iface, update.effective_message)
 
 
 @_require_auth

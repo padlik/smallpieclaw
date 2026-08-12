@@ -242,12 +242,14 @@ class AgentRuntime:
             graph_memory_max_entries=controller._graph_memory_max_entries,
             strategy_memory=controller.strategy_memory,
             max_subagents=getattr(controller.builtin_executor, "_max_subagents", 6),
-            creativity_mode=getattr(controller, "creativity_mode", "default"),
-            plan_max_iterations=getattr(controller, "plan_max_iterations", 50),
-            inactivity_warn_minutes=getattr(controller, "inactivity_warn_minutes", 15),
+            creativity_mode=controller.creativity_mode,
+            plan_max_iterations=controller.plan_max_iterations,
+            inactivity_warn_minutes=controller.inactivity_warn_minutes,
             confirmation=controller._confirmation,
-            trusted_zone_checker=getattr(
-                getattr(controller, "builtin_executor", None), "trusted_zone_checker", None
+            trusted_zone_checker=(
+                controller.builtin_executor.trusted_zone_checker
+                if controller.builtin_executor is not None
+                else None
             ),
         )
         # Sub-agent context sharing: propagate the parent context payload and

@@ -53,7 +53,6 @@ import concurrent.futures
 import logging
 import re
 import threading
-import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -626,29 +625,16 @@ class MCPManager:
             client_id=oauth_cfg["client_id"],
             client_secret=oauth_cfg["client_secret"],
         )
-        data = storage._read_file()
-        if data is None:
+        status = storage.read_status()
+        if status is None:
             return {
                 "has_token": False,
                 "expires_in": None,
                 "has_refresh": False,
                 "scope": oauth_cfg.get("scope"),
             }
-
-        token_data = data.get("token") or data
-        access_token = token_data.get("access_token")
-        _expires_in = token_data.get("expires_in")
-        _issued_at = token_data.get("issued_at")
-        if _expires_in is not None and _issued_at is not None:
-            expires_display: int | None = max(0, int(_issued_at + _expires_in - time.time()))
-        else:
-            expires_display = _expires_in
-        return {
-            "has_token": bool(access_token),
-            "expires_in": expires_display,
-            "has_refresh": bool(token_data.get("refresh_token")),
-            "scope": token_data.get("scope") or oauth_cfg.get("scope"),
-        }
+        status["scope"] = status.get("scope") or oauth_cfg.get("scope")
+        return status
 
     def mark_needs_auth(self, server_name: str) -> None:
         """Mark a server as needing authentication (thread-safe).
