@@ -310,7 +310,7 @@ class AgentRuntime:
         # Local imports avoid import cycles at module load (agent_controller and
         # builtin_executor both sit above this construction boundary).
         from agent_controller import SubAgentRunner
-        from builtin_executor import _load_context
+        from builtin_tools.context_io import _load_context
         from config_schema import resolve_model_id
 
         if self._config is None:

@@ -73,8 +73,8 @@ Consolidated list of deferred items, future work, and out-of-scope items extract
 ## 2026-07-16-replace-mcp-transport-with-official-sdk
 
 - **Wire new MCP features (resources, prompts, sampling)** — come free with the SDK but are not explicitly wired — *design.md* — feature — unspecified
-- **`close_all` manager-level test coverage** (review-log finding: 6.2 covers wrapper close(), but 6.3 omits close_all) — *review-log.md* — test — low
-- **"Disabled server skipped on startup" test assertion** (review-log finding: implemented in 4.2 but not asserted in any test) — *review-log.md* — test — low
+- **`close_all` manager-level test coverage** (review-log finding: 6.2 covers wrapper close(), but 6.3 omits close_all) — *review-log.md* — test — low — **RESOLVED** (`tests/test_mcp_client.py::test_close_all` at :896)
+- **"Disabled server skipped on startup" test assertion** (review-log finding: implemented in 4.2 but not asserted in any test) — *review-log.md* — test — low — **RESOLVED** (`tests/test_mcp_client.py::test_connect_disabled_servers_skipped` at :795)
 - **D7 threading.Lock protection for `_tool_to_server` / `_wrappers` has no explicit task callout** (review-log finding: likely subsumed but a one-line mention would prevent it being dropped) — *review-log.md* — docs — low
 
 ## 2026-07-17-split-telegram-callbacks
@@ -83,7 +83,7 @@ Consolidated list of deferred items, future work, and out-of-scope items extract
 
 ## 2026-07-18-file-access-zones
 
-- **Full per-sub-agent `GrantTracker` isolation** (currently shared; sub-agents reuse the main agent's executor, so grant sets are effectively shared) — *design.md* — security — unspecified
+- **Full per-sub-agent `GrantTracker` isolation** (currently shared; sub-agents reuse the main agent's executor, so grant sets are effectively shared) — *design.md* — security — unspecified — **RESOLVED** (`builtin_executor.py` now uses a `ContextVar` (`_grant_tracker_var`) with `use_grant_tracker()` context manager; `agent_controller.py:205` sets a fresh `GrantTracker()` per run; isolation tests in `tests/test_grant_tracker_isolation.py`)
 - **macOS case-insensitivity handling** (`realpath()` doesn't normalize case — noted as a decision) — *review-log.md* — security — low
 - **`add_trusted` dedup/normalization** against duplicate and trailing-slash variants — *review-log.md* — cleanup — low
 
