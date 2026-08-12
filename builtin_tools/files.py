@@ -96,6 +96,40 @@ class FileTools:
             skill_dir = skill.path  # skill DIRECTORY (not skill_md_path)
         return _expand_skill_paths(content, skill_dir)
 
+    # ---- zone gate helper ----
+
+    def _gate(
+        self, path: str, real_path: str, operation: str, tool_name: str,
+        args: dict, desc: str, *, caller_depth: int, caller_tag: str,
+        sensitive: bool,
+    ) -> dict | None:
+        """Zone-gate a single-path file operation (checker-wired path only).
+
+        Classifies *path* via the trusted-zone checker and stages a
+        confirmation request when the zone is ``UNRECOGNISED`` or the path
+        is sensitive.  Returns a confirmation dict if confirmation is
+        required, or ``None`` if the operation should proceed.  The caller
+        is responsible for the checker-unwired fallback.
+        """
+        checker = self._checker
+        if checker is None:
+            return None
+        zone = checker.classify(
+            path, operation=operation, request_grants=self._request_grants(),
+        )
+        if zone == ZoneClassification.UNRECOGNISED:
+            return self._owner._requires_confirmation(
+                tool_name, args, desc,
+                caller_depth=caller_depth, caller_tag=caller_tag,
+                zone_path=real_path,
+            )
+        if sensitive:
+            return self._owner._requires_confirmation(
+                tool_name, args, desc,
+                caller_depth=caller_depth, caller_tag=caller_tag,
+            )
+        return None
+
     # ---- file_read ----
 
     def _exec_file_read(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
@@ -103,38 +137,27 @@ class FileTools:
         if not path:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
 
-        checker = self._checker
         real_path = os.path.realpath(os.path.expanduser(path))
         args["_resolved_path"] = real_path
-        if checker is not None:
-            zone = checker.classify(path, operation="read", request_grants=self._request_grants())
-            sensitive, reason = _is_sensitive_path(real_path)
-            if zone == ZoneClassification.UNRECOGNISED:
-                desc = f"Read file: <code>{path}</code>"
-                if real_path != path:
-                    desc += f"\n(→ <code>{real_path}</code>)"
-                if sensitive:
-                    desc += f"\n⚠️ Reason: {reason}"
-                return self._owner._requires_confirmation(
-                    "file_read", args, desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                    zone_path=real_path,
-                )
-            if sensitive:
-                desc = f"Read file: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
-                if real_path != path:
-                    desc += f"\n(→ <code>{real_path}</code>)"
-                return self._owner._requires_confirmation(
-                    "file_read", args, desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                )
+        sensitive, reason = _is_sensitive_path(real_path)
+
+        desc = f"Read file: <code>{path}</code>"
+        if real_path != path:
+            desc += f"\n(→ <code>{real_path}</code>)"
+        if sensitive:
+            desc += f"\n⚠️ Reason: {reason}"
+
+        if self._checker is not None:
+            gated = self._gate(path, real_path, "read", "file_read", args, desc,
+                               caller_depth=caller_depth, caller_tag=caller_tag,
+                               sensitive=sensitive)
+            if gated is not None:
+                return gated
             return self._run_file_read(args, caller_tag=caller_tag)
 
         # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
         logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_read")
-        sensitive, reason = _is_sensitive_path(real_path)
         if sensitive:
-            desc = f"Read file: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
             return self._owner._requires_confirmation("file_read", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
         return self._run_file_read(args, caller_tag=caller_tag)
 
@@ -328,27 +351,20 @@ class FileTools:
         action = "append to" if mode == "a" else "overwrite"
         desc = f"{action.capitalize()} file: <code>{path}</code> ({len(content)} chars)"
 
-        checker = self._checker
-        if checker is not None:
-            real_path = os.path.realpath(os.path.expanduser(path))
-            args["_resolved_path"] = real_path
-            if real_path != path:
-                desc += f"\n(→ <code>{real_path}</code>)"
-            zone = checker.classify(path, operation="write", request_grants=self._request_grants())
-            sensitive, _ = _is_sensitive_path(real_path)
-            if zone == ZoneClassification.UNRECOGNISED:
-                if sensitive:
-                    desc += "\n⚠️ Sensitive file"
-                return self._owner._requires_confirmation(
-                    "file_write", args, desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                    zone_path=real_path,
-                )
-            if sensitive:
-                return self._owner._requires_confirmation(
-                    "file_write", args, desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                )
+        real_path = os.path.realpath(os.path.expanduser(path))
+        args["_resolved_path"] = real_path
+        if real_path != path:
+            desc += f"\n(→ <code>{real_path}</code>)"
+        sensitive, _ = _is_sensitive_path(real_path)
+        if sensitive:
+            desc += "\n⚠️ Sensitive file"
+
+        if self._checker is not None:
+            gated = self._gate(path, real_path, "write", "file_write", args, desc,
+                               caller_depth=caller_depth, caller_tag=caller_tag,
+                               sensitive=sensitive)
+            if gated is not None:
+                return gated
             return self._run_file_write(args, caller_tag=caller_tag)
 
         # Fallback: no checker — always confirm
@@ -524,39 +540,28 @@ class FileTools:
         if not path:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
 
-        checker = self._checker
         real_path = os.path.realpath(path)
         args["_resolved_path"] = real_path
-        if checker is not None:
-            zone = checker.classify(path, operation="read", request_grants=self._request_grants())
-            sensitive, reason = _is_sensitive_path(real_path)
-            if zone == ZoneClassification.UNRECOGNISED:
-                send_desc = f"Send file: <code>{path}</code>"
-                if real_path != path:
-                    send_desc += f"\n(→ <code>{real_path}</code>)"
-                if sensitive:
-                    send_desc += f"\n⚠️ {reason}"
-                return self._owner._requires_confirmation(
-                    "file_send", args, send_desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                    zone_path=real_path,
-                )
-            if sensitive:
-                send_desc = f"Send file: <code>{path}</code>\n⚠️ {reason}"
-                if real_path != path:
-                    send_desc += f"\n(→ <code>{real_path}</code>)"
-                return self._owner._requires_confirmation(
-                    "file_send", args, send_desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                )
+        sensitive, reason = _is_sensitive_path(real_path)
+
+        desc = f"Send file: <code>{path}</code>"
+        if real_path != path:
+            desc += f"\n(→ <code>{real_path}</code>)"
+        if sensitive:
+            desc += f"\n⚠️ {reason}"
+
+        if self._checker is not None:
+            gated = self._gate(path, real_path, "read", "file_send", args, desc,
+                               caller_depth=caller_depth, caller_tag=caller_tag,
+                               sensitive=sensitive)
+            if gated is not None:
+                return gated
         else:
             # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
             logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_send")
-            sensitive, reason = _is_sensitive_path(real_path)
             if sensitive:
-                send_desc = f"Send file: <code>{path}</code>\n⚠️ {reason}"
                 return self._owner._requires_confirmation(
-                    "file_send", args, send_desc,
+                    "file_send", args, desc,
                     caller_depth=caller_depth, caller_tag=caller_tag,
                 )
 

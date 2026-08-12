@@ -28,7 +28,7 @@ import random
 import re
 import shutil
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable, Optional
 
 import schedule
@@ -42,6 +42,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Sentinel prefix used by legacy agent_fn to signal execution failure.
+_ERROR_SENTINEL = "❌"
+
+
+def _normalize_tag(s: str) -> str:
+    """Normalize a tag by lowercasing and collapsing separators to underscores.
+
+    Replaces hyphens, spaces, and dots with underscores, collapses repeated
+    underscores, and strips leading/trailing underscores.
+    """
+    s = s.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+    return re.sub(r"_+", "_", s).strip("_")
+
 
 def _normalize_context_key(tag: str) -> str:
     """Convert a scheduler tag into a safe spawn_agent context_key.
@@ -52,7 +65,7 @@ def _normalize_context_key(tag: str) -> str:
     """
     key = tag.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
     key = re.sub(r"[^a-z0-9_]+", "_", key)
-    key = re.sub(r"_+", "_", key).strip("_")
+    key = _normalize_tag(key)
     key = key[:128].rstrip("_")
     return key or "scheduled_job"
 
@@ -66,7 +79,7 @@ except ImportError:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _legacy_to_cron(stype: str, time_str: str = None, hours=None, minutes=None, run_at: str = None) -> Optional[str]:
+def _legacy_to_cron(stype: str, time_str: Optional[str] = None, hours=None, minutes=None) -> Optional[str]:
     """Convert old schedule_type fields to a cron expression. Returns None for 'once'."""
     if stype == "once":
         return None  # handled separately
@@ -136,7 +149,7 @@ class JobExecutionLog:
     ) -> None:
         """Append a new entry and rotate old ones.  Thread-safe."""
         entry = {
-            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "tag": tag,
             "task": (task or "")[:200],
             "result": (result or "")[:_RESULT_MAX_CHARS],
@@ -206,7 +219,7 @@ class JobExecutionLog:
 
     def _rotate(self, entries: list[dict]) -> list[dict]:
         """Remove stale entries.  Returns a new (filtered) list."""
-        cutoff = datetime.utcnow() - timedelta(hours=self._max_age_hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=self._max_age_hours)
         cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Drop entries older than max_age_hours
@@ -294,7 +307,10 @@ class Scheduler:
 
         # Overlap detection: tracks tags of currently executing jobs
         self._running_jobs: set = set()
-        self._running_lock = threading.Lock()
+        # Reentrant lock: guards _running_jobs AND _jobs_meta AND schedule.* calls.
+        # RLock needed because _register_job (which acquires) is called from
+        # resume_job/reload which already hold the lock.
+        self._running_lock = threading.RLock()
         # Serializes all writes to scheduler.toml and scheduler_state.json,
         # preventing race conditions when two jobs finish simultaneously.
         self._save_lock = threading.Lock()
@@ -324,7 +340,8 @@ class Scheduler:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=5)
-        schedule.clear()
+        with self._running_lock:
+            schedule.clear()
         logger.info("Scheduler stopped.")
 
     def _resolve_tag(self, tag: str) -> Optional[str]:
@@ -341,18 +358,102 @@ class Scheduler:
         if tag in self._jobs_meta:
             return tag
         # Normalize: strip, lowercase, collapse spaces/hyphens/dots to underscores
-        normalized = tag.strip().lower()
-        normalized = normalized.replace("-", "_").replace(" ", "_").replace(".", "_")
-        while "__" in normalized:
-            normalized = normalized.replace("__", "_")
+        normalized = _normalize_tag(tag)
         if normalized in self._jobs_meta:
             return normalized
         # Last resort: compare normalized versions of all stored keys
         for stored in self._jobs_meta:
-            stored_norm = stored.lower().replace("-", "_").replace(" ", "_")
+            stored_norm = _normalize_tag(stored)
             if stored_norm == normalized:
                 return stored
         return None
+
+    def _resolve_schedule(
+        self,
+        schedule_type: str,
+        cron: Optional[str],
+        time_str: Optional[str],
+        hours,
+        minutes,
+        run_at: Optional[str],
+    ) -> tuple[Optional[str], str, Optional[str]]:
+        """Resolve the cron expression and effective run_at for a new job.
+
+        Returns ``(expr, schedule_type, effective_run_at)`` or raises
+        ``ValueError`` with a user-facing message on invalid input.
+        """
+        if cron:
+            expr = cron.strip()
+            schedule_type = "cron"
+        elif schedule_type == "once":
+            expr = None  # once jobs don't use cron
+        else:
+            # Convert legacy style to cron
+            expr = _legacy_to_cron(schedule_type, time_str, hours, minutes)
+            if not expr:
+                raise ValueError(
+                    "Could not determine schedule. Provide a 'cron' expression "
+                    "(e.g. '0 */6 * * *') or legacy fields."
+                )
+            schedule_type = "cron"
+
+        # Validate cron expression
+        if expr:
+            try:
+                croniter(expr)
+            except (CroniterBadCronError, ValueError) as exc:
+                raise ValueError(f"Invalid cron expression '{expr}': {exc}") from exc
+
+        if schedule_type == "once" and not (run_at or time_str):
+            raise ValueError("'run_at' (HH:MM) is required for once jobs")
+
+        effective_run_at = run_at or time_str
+        return expr, schedule_type, effective_run_at
+
+    @staticmethod
+    def _build_job_meta(
+        tag: str,
+        task: str,
+        schedule_type: str,
+        expr: Optional[str],
+        effective_run_at: Optional[str],
+        notify: bool,
+        source: str,
+        model: Optional[str],
+        fallback_models: Optional[list],
+        preserve_context: bool,
+        context_max_messages: int,
+        overlap_policy: str,
+        max_iterations,
+    ) -> dict:
+        """Build the meta dict for a new job."""
+        meta = {
+            "tag": tag,
+            "task": task,
+            "schedule_type": schedule_type,
+            "cron": expr,
+            "run_at": effective_run_at if schedule_type == "once" else None,
+            "notify": notify,
+            "enabled": True,
+            "source": source,
+            "last_run": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if model:
+            meta["model"] = model
+        if fallback_models is not None:
+            meta["fallback_models"] = fallback_models
+        if preserve_context:
+            meta["preserve_context"] = preserve_context
+            meta["context_max_messages"] = context_max_messages
+        if overlap_policy != "skip":
+            meta["overlap_policy"] = overlap_policy
+        if max_iterations is not None:
+            try:
+                meta["max_iterations"] = int(max_iterations)
+            except (ValueError, TypeError):
+                pass
+        return meta
 
     def add_job(
         self,
@@ -360,18 +461,18 @@ class Scheduler:
         schedule_type: str,
         task: str,
         notify: bool = True,
-        hours=None,
-        minutes=None,
-        time_str: str = None,
-        run_at: str = None,
-        cron: str = None,
+        hours: Optional[int] = None,
+        minutes: Optional[int] = None,
+        time_str: Optional[str] = None,
+        run_at: Optional[str] = None,
+        cron: Optional[str] = None,
         source: str = "dynamic",
-        model: str = None,
-        fallback_models: list = None,
+        model: Optional[str] = None,
+        fallback_models: Optional[list] = None,
         preserve_context: bool = False,
         context_max_messages: int = 50,
         overlap_policy: str = "skip",
-        max_iterations: int = None,
+        max_iterations: Optional[int] = None,
     ) -> dict:
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
         tag = _normalize_context_key(tag)
@@ -388,58 +489,22 @@ class Scheduler:
         if tag in self._jobs_meta:
             return {"success": False, "error": f"Job '{tag}' already exists."}
 
-        # Resolve cron expression
-        if cron:
-            expr = cron.strip()
-            schedule_type = "cron"
-        elif schedule_type == "once":
-            expr = None  # once jobs don't use cron
-        else:
-            # Convert legacy style to cron
-            expr = _legacy_to_cron(schedule_type, time_str, hours, minutes)
-            if not expr:
-                return {"success": False, "error": "Could not determine schedule. Provide a 'cron' expression (e.g. '0 */6 * * *') or legacy fields."}
-            schedule_type = "cron"
+        # Resolve and validate schedule
+        try:
+            expr, schedule_type, effective_run_at = self._resolve_schedule(
+                schedule_type, cron, time_str, hours, minutes, run_at,
+            )
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
 
-        # Validate cron expression
-        if expr:
-            try:
-                croniter(expr)
-            except (CroniterBadCronError, ValueError) as exc:
-                return {"success": False, "error": f"Invalid cron expression '{expr}': {exc}"}
+        meta = self._build_job_meta(
+            tag, task, schedule_type, expr, effective_run_at, notify, source,
+            model, fallback_models, preserve_context, context_max_messages,
+            overlap_policy, max_iterations,
+        )
 
-        if schedule_type == "once" and not (run_at or time_str):
-            return {"success": False, "error": "'run_at' (HH:MM) is required for once jobs"}
-
-        effective_run_at = run_at or time_str
-        meta = {
-            "tag": tag,
-            "task": task,
-            "schedule_type": schedule_type,
-            "cron": expr,
-            "run_at": effective_run_at if schedule_type == "once" else None,
-            "notify": notify,
-            "enabled": True,
-            "source": source,
-            "last_run": None,
-            "created_at": datetime.utcnow().isoformat(),
-        }
-        if model:
-            meta["model"] = model
-        if fallback_models is not None:
-            meta["fallback_models"] = fallback_models
-        if preserve_context:
-            meta["preserve_context"] = preserve_context
-            meta["context_max_messages"] = context_max_messages
-        if overlap_policy != "skip":
-            meta["overlap_policy"] = overlap_policy
-        if max_iterations is not None:
-            try:
-                meta["max_iterations"] = int(max_iterations)
-            except (ValueError, TypeError):
-                pass
-
-        self._jobs_meta[tag] = meta
+        with self._running_lock:
+            self._jobs_meta[tag] = meta
         self._save_state()
         self._save_scheduler_toml()
         if self.enabled and self._thread and self._thread.is_alive():
@@ -465,7 +530,7 @@ class Scheduler:
             if tag not in self._jobs_meta:
                 return False
             self._jobs_meta[tag]["enabled"] = False
-        schedule.clear(tag)
+            schedule.clear(tag)
         self._save_state()
         self._save_scheduler_toml()
         logger.info("Job paused: %s", tag)
@@ -490,8 +555,7 @@ class Scheduler:
             # Build a helpful error listing known tags
             known = ", ".join(self._jobs_meta.keys()) or "none"
             return {"success": False, "error": f"Job '{tag}' not found. Known jobs: {known}"}
-        import threading as _threading
-        _threading.Thread(target=self._run_job, kwargs={"tag": resolved}, daemon=True).start()
+        threading.Thread(target=self._run_job, kwargs={"tag": resolved}, daemon=True).start()
         logger.info("Job '%s' triggered manually (run_now)", resolved)
         return {"success": True}
 
@@ -553,17 +617,18 @@ class Scheduler:
         """Compute and store the next_run timestamp for cron jobs.
         Once jobs are registered with the schedule library (HH:MM trigger).
         """
-        schedule.clear(tag)
-        stype = meta.get("schedule_type", "cron")
+        with self._running_lock:
+            schedule.clear(tag)
+            stype = meta.get("schedule_type", "cron")
 
-        if stype == "once":
-            run_at = meta.get("run_at") or meta.get("time")
-            if run_at:
-                schedule.every().day.at(run_at).do(self._run_job, tag=tag).tag(tag)
-            else:
-                schedule.every(1).minutes.do(self._run_job, tag=tag).tag(tag)
-            logger.debug("Registered once job: %s at %s", tag, run_at)
-            return
+            if stype == "once":
+                run_at = meta.get("run_at") or meta.get("time")
+                if run_at:
+                    schedule.every().day.at(run_at).do(self._run_job, tag=tag).tag(tag)
+                else:
+                    schedule.every(1).minutes.do(self._run_job, tag=tag).tag(tag)
+                logger.debug("Registered once job: %s at %s", tag, run_at)
+                return
 
         # Cron job — compute next_run using local time
         expr = meta.get("cron")
@@ -595,7 +660,19 @@ class Scheduler:
         with self._running_lock:
             self._running_jobs.discard(tag)
 
+    def _remove_once_job(self, tag: str) -> None:
+        """Remove a completed once-job: clear from schedule, pop meta, persist state + TOML."""
+        with self._running_lock:
+            schedule.clear(tag)
+            self._jobs_meta.pop(tag, None)
+        self._save_state()
+        self._save_scheduler_toml()
+
     def _run_job(self, tag: str) -> None:
+        """Dispatch a scheduled job execution.
+
+        Thin dispatcher: overlap check → route to the appropriate strategy.
+        """
         meta = self._jobs_meta.get(tag)
         if not meta or not meta.get("enabled", True):
             return
@@ -619,92 +696,102 @@ class Scheduler:
         if job_fallbacks is not None:
             _log_extra += f" | fallback_models={job_fallbacks}"
         logger.info("Running scheduled job %s%s", tag, _log_extra)
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         is_once = meta.get("schedule_type") == "once"
 
         # --- Empty task guard ---
         if not task:
-            logger.warning("Job %s: no task — sending direct notification", tag)
-            friendly = tag.replace("_", " ")
-            meta["last_run"] = now
-            self._run_history[tag] = {"last_run": now, "last_error": None}
-            self._save_state()
-            with self._running_lock:
-                self._running_jobs.discard(tag)
-            if is_once:
-                schedule.clear(tag)
-                self._jobs_meta.pop(tag, None)
-                self._save_state()
-                self._save_scheduler_toml()  # structural change: job removed
-            if meta.get("notify", True):
-                self.notify(f"🔔 <b>Reminder:</b> {_html.escape(friendly)}")
+            self._handle_empty_task(tag, meta, now, is_once)
             return
 
         # Prefer spawn_agent via builtin_executor if available
-        if self.builtin_executor is not None and hasattr(self.builtin_executor, '_exec_spawn_agent'):
-            preserve_ctx = meta.get("preserve_context", False)
-            context_key = _normalize_context_key(tag) if preserve_ctx else None
-
-            spawn_args = {"task": task}
-            if job_model:
-                spawn_args["model"] = job_model
-            if context_key:
-                spawn_args["context_key"] = context_key
-            # fallback_models: if key present in meta (even as []), pass it through;
-            # if absent, omit so sub-agent inherits from parent config
-            if "fallback_models" in meta:
-                spawn_args["fallback_models"] = meta["fallback_models"]
-            # max_iterations: per-job override; None = factory uses scheduled_max_iterations
-            if "max_iterations" in meta:
-                spawn_args["max_iterations"] = meta["max_iterations"]
-
-            # Internal supervision controls travel through per-submission options,
-            # NOT through the model-facing spawn_args dict. Per-submission options
-            # avoid the shared-attribute race when multiple jobs fire concurrently.
-            options = SupervisionOptions(
-                job_tag=tag,
-                # finish callback → cleans up _running_jobs when the sub-agent ends
-                finish_cb=self._mark_job_finished,
-                # execution-log recorder so the supervisor logs the job result
-                result_log_cb=self.execution_log.record,
-                # honour the job's notify setting — False suppresses Telegram output
-                notify=meta.get("notify", True),
-                # scheduled results are shown as plain text, not collapsed in an
-                # expandable blockquote (which hides the result by default)
-                expandable=False,
-                # tag the registry record as a scheduled run (internal channel,
-                # never a model-facing spawn_agent arg); still capacity-counted.
-                source=SOURCE_SCHEDULED,
-            )
-
-            # Update last_run before spawning (we know it started)
-            meta["last_run"] = now
-            self._run_history.setdefault(tag, {})["last_run"] = now
-            self._save_state()
-
-            result = self.builtin_executor._exec_spawn_agent(spawn_args, options=options)
-            if not result.get("success"):
-                logger.error("Job %s spawn failed: %s", tag, result.get("error"))
-                meta["last_error"] = result.get("error", "spawn failed")
-                self._run_history[tag]["last_error"] = meta["last_error"]
-                self._save_state()
-                # Always notify on error
-                self.notify(
-                    f"⚠️ <b>Job {_html.escape(tag)} failed to spawn</b>\n{_html.escape(str(meta['last_error']))}"
-                )
-                with self._running_lock:
-                    self._running_jobs.discard(tag)
-            else:
-                # _running_jobs will be cleaned up by _mark_job_finished callback
-                # Auto-remove once jobs (spawn_agent will still deliver result)
-                if is_once:
-                    schedule.clear(tag)
-                    self._jobs_meta.pop(tag, None)
-                    self._save_state()
-                    self._save_scheduler_toml()
+        if self.builtin_executor is not None and hasattr(self.builtin_executor, 'spawn_agent'):
+            self._run_via_spawn_agent(tag, meta, task, job_model, now, is_once)
             return
 
         # Fallback: direct agent_fn call (legacy / no builtin_executor)
+        self._run_via_agent_fn(tag, meta, task, job_model, now, is_once)
+
+    def _handle_empty_task(self, tag: str, meta: dict, now: str, is_once: bool) -> None:
+        """Send a direct notification for jobs with no task text."""
+        logger.warning("Job %s: no task — sending direct notification", tag)
+        friendly = tag.replace("_", " ")
+        meta["last_run"] = now
+        self._run_history[tag] = {"last_run": now, "last_error": None}
+        self._save_state()
+        with self._running_lock:
+            self._running_jobs.discard(tag)
+        if is_once:
+            self._remove_once_job(tag)
+        if meta.get("notify", True):
+            self.notify(f"🔔 <b>Reminder:</b> {_html.escape(friendly)}")
+
+    def _run_via_spawn_agent(
+        self, tag: str, meta: dict, task: str, job_model: Optional[str], now: str, is_once: bool,
+    ) -> None:
+        """Execute a job by spawning a sub-agent via builtin_executor."""
+        preserve_ctx = meta.get("preserve_context", False)
+        context_key = _normalize_context_key(tag) if preserve_ctx else None
+
+        spawn_args: dict = {"task": task}
+        if job_model:
+            spawn_args["model"] = job_model
+        if context_key:
+            spawn_args["context_key"] = context_key
+        # fallback_models: if key present in meta (even as []), pass it through;
+        # if absent, omit so sub-agent inherits from parent config
+        if "fallback_models" in meta:
+            spawn_args["fallback_models"] = meta["fallback_models"]
+        # max_iterations: per-job override; None = factory uses scheduled_max_iterations
+        if "max_iterations" in meta:
+            spawn_args["max_iterations"] = meta["max_iterations"]
+
+        # Internal supervision controls travel through per-submission options,
+        # NOT through the model-facing spawn_args dict. Per-submission options
+        # avoid the shared-attribute race when multiple jobs fire concurrently.
+        options = SupervisionOptions(
+            job_tag=tag,
+            # finish callback → cleans up _running_jobs when the sub-agent ends
+            finish_cb=self._mark_job_finished,
+            # execution-log recorder so the supervisor logs the job result
+            result_log_cb=self.execution_log.record,
+            # honour the job's notify setting — False suppresses Telegram output
+            notify=meta.get("notify", True),
+            # scheduled results are shown as plain text, not collapsed in an
+            # expandable blockquote (which hides the result by default)
+            expandable=False,
+            # tag the registry record as a scheduled run (internal channel,
+            # never a model-facing spawn_agent arg); still capacity-counted.
+            source=SOURCE_SCHEDULED,
+        )
+
+        # Update last_run before spawning (we know it started)
+        meta["last_run"] = now
+        self._run_history.setdefault(tag, {})["last_run"] = now
+        self._save_state()
+
+        result = self.builtin_executor.spawn_agent(spawn_args, options=options)
+        if not result.get("success"):
+            logger.error("Job %s spawn failed: %s", tag, result.get("error"))
+            meta["last_error"] = result.get("error", "spawn failed")
+            self._run_history[tag]["last_error"] = meta["last_error"]
+            self._save_state()
+            # Always notify on error
+            self.notify(
+                f"⚠️ <b>Job {_html.escape(tag)} failed to spawn</b>\n{_html.escape(str(meta['last_error']))}"
+            )
+            with self._running_lock:
+                self._running_jobs.discard(tag)
+        else:
+            # _running_jobs will be cleaned up by _mark_job_finished callback
+            # Auto-remove once jobs (spawn_agent will still deliver result)
+            if is_once:
+                self._remove_once_job(tag)
+
+    def _run_via_agent_fn(
+        self, tag: str, meta: dict, task: str, job_model: Optional[str], now: str, is_once: bool,
+    ) -> None:
+        """Execute a job via the legacy direct agent_fn callback."""
         result = ""
         error_occurred = False
         try:
@@ -712,7 +799,7 @@ class Scheduler:
                 result = self.agent(task)
             else:
                 result = "Agent not available for task."
-            if result.startswith("❌"):
+            if result.startswith(_ERROR_SENTINEL):
                 error_occurred = True
         except (OSError, RuntimeError, ValueError) as exc:
             logger.error("Job %s failed: %s", tag, exc)
@@ -765,10 +852,7 @@ class Scheduler:
         # Auto-remove once/reminder jobs after successful execution
         if is_once:
             logger.info("Once job completed — removing")
-            schedule.clear(tag)
-            self._jobs_meta.pop(tag, None)
-            self._save_state()
-            self._save_scheduler_toml()  # structural change: job removed
+            self._remove_once_job(tag)
 
         if meta.get("notify", True):
             self.notify(f"📅 <b>Scheduled: {_html.escape(tag)}</b>\n\n{_html.escape(result)}")
@@ -819,12 +903,19 @@ class Scheduler:
                 logger.error("Error processing scheduler command %s: %s", cmd, exc)
 
     def _save_state(self) -> None:
+        # Snapshot _jobs_meta under _running_lock BEFORE acquiring _save_lock.
+        # This avoids lock-ordering deadlock: _run_job (called synchronously by
+        # schedule.run_pending in the loop thread) may hold _running_lock and
+        # need _save_lock via _save_state, while another thread could hold
+        # _save_lock and wait for _running_lock.
+        with self._running_lock:
+            jobs_snapshot = [(tag, dict(meta)) for tag, meta in self._jobs_meta.items()]
         with self._save_lock:
-            self._save_state_locked()
+            self._save_state_locked(jobs_snapshot)
 
-    def _save_state_locked(self) -> None:
+    def _save_state_locked(self, jobs_snapshot: list[tuple[str, dict]]) -> None:
         # Merge current job states into run_history so history is never lost
-        for tag, meta in self._jobs_meta.items():
+        for tag, meta in jobs_snapshot:
             if meta.get("last_run") or meta.get("last_error"):
                 self._run_history[tag] = {
                     "last_run": meta.get("last_run"),
@@ -836,7 +927,7 @@ class Scheduler:
                     **meta,
                     "schedule_description": self._describe_schedule(meta),
                 }
-                for tag, meta in self._jobs_meta.items()
+                for tag, meta in jobs_snapshot
             },
             "history": self._run_history,
         }
@@ -928,20 +1019,29 @@ class Scheduler:
         Returns {"reloaded": N, "failed": N}.
         """
         logger.info("Reloading scheduler.toml…")
-        schedule.clear()
-        self._jobs_meta = {}
-        self._load_config_jobs(self._scheduler_config_path)
+        # Parse and fully populate the replacement map BEFORE publishing it. A
+        # reader that legitimately holds _running_lock (e.g. _save_scheduler_toml's
+        # snapshot, fired by a once-job finishing) must never observe the empty or
+        # half-filled map — it would persist an empty scheduler.toml and lose every
+        # job, or trip "dictionary changed size during iteration".
+        new_meta, migrated = self._read_config_jobs(self._scheduler_config_path)
         # Re-overlay run history so last_run/last_error survive a reload
-        for tag, meta in self._jobs_meta.items():
+        for tag, meta in new_meta.items():
             if tag in self._run_history:
                 hist = self._run_history[tag]
                 if hist.get("last_run"):
                     meta["last_run"] = hist["last_run"]
                 if hist.get("last_error"):
                     meta["last_error"] = hist["last_error"]
+        with self._running_lock:
+            schedule.clear()
+            self._jobs_meta = new_meta
+        if migrated:
+            # Write back migrated cron expressions
+            self._save_scheduler_toml()
         reloaded = 0
         failed = 0
-        for tag, meta in self._jobs_meta.items():
+        for tag, meta in list(self._jobs_meta.items()):
             if meta.get("enabled", True):
                 try:
                     self._register_job(tag, meta)
@@ -954,14 +1054,62 @@ class Scheduler:
 
     def _save_scheduler_toml(self) -> None:
         """Persist all current jobs to scheduler.toml (auto-managed file)."""
+        # Snapshot before _save_lock to avoid AB-BA deadlock with _run_job.
+        with self._running_lock:
+            jobs_snapshot = [(tag, dict(meta)) for tag, meta in self._jobs_meta.items()]
         with self._save_lock:
-            self._save_scheduler_toml_locked()
+            self._save_scheduler_toml_locked(jobs_snapshot)
 
-    def _save_scheduler_toml_locked(self) -> None:
-        """Inner (lock-free) implementation — always called under _save_lock."""
+    @staticmethod
+    def _serialize_job(tag: str, meta: dict) -> list[str]:
+        """Serialize a single job's metadata to TOML lines.
+
+        Hand-rolled serializer — no TOML write dependency. Handles escaping,
+        inline arrays, and conditional fields.
+        """
         def _toml_str(v: str) -> str:
             return '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
+        lines: list[str] = []
+        lines.append(f"[jobs.{tag}]\n")
+        lines.append(f"enabled = {str(meta.get('enabled', True)).lower()}\n")
+        stype = meta.get("schedule_type", "cron")
+        if stype == "once":
+            lines.append('schedule = "once"\n')
+            if meta.get("run_at"):
+                lines.append(f'run_at = "{meta["run_at"]}"\n')
+        else:
+            lines.append('schedule = "cron"\n')
+            if meta.get("cron"):
+                lines.append(f'cron = "{meta["cron"]}"\n')
+        lines.append(f"task = {_toml_str(meta.get('task', ''))}\n")
+        lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
+        if meta.get("model"):
+            lines.append(f"model = {_toml_str(meta['model'])}\n")
+        if meta.get("fallback_models") is not None:
+            fb = meta["fallback_models"]
+            # Serialize as TOML inline array using the same escaping as _toml_str
+            items = ", ".join(_toml_str(m) for m in fb)
+            lines.append(f"fallback_models = [{items}]\n")
+        if meta.get("preserve_context"):
+            lines.append('preserve_context = true\n')
+            ctx_max = meta.get("context_max_messages", 50)
+            if ctx_max != 50:
+                lines.append(f'context_max_messages = {ctx_max}\n')
+        if meta.get("overlap_policy", "skip") != "skip":
+            lines.append(f'overlap_policy = "{meta["overlap_policy"]}"\n')
+        if meta.get("max_iterations") is not None:
+            lines.append(f'max_iterations = {int(meta["max_iterations"])}\n')
+        source = meta.get("source", "config")
+        if source != "config":
+            lines.append(f'source = "{source}"\n')
+        if meta.get("created_at"):
+            lines.append(f'created_at = "{meta["created_at"]}"\n')
+        lines.append("\n")
+        return lines
+
+    def _save_scheduler_toml_locked(self, jobs_snapshot: list[tuple[str, dict]]) -> None:
+        """Inner (lock-free) implementation — always called under _save_lock."""
         lines = [
             "# scheduler.toml — auto-managed by scheduler\n",
             "# Edit this file to add static jobs; dynamic/user jobs are appended here.\n",
@@ -970,42 +1118,8 @@ class Scheduler:
             "#   Examples: '0 2 * * *' = daily at 02:00, '0 */6 * * *' = every 6h\n",
             "\n",
         ]
-        for tag, meta in self._jobs_meta.items():
-            lines.append(f"[jobs.{tag}]\n")
-            lines.append(f"enabled = {str(meta.get('enabled', True)).lower()}\n")
-            stype = meta.get("schedule_type", "cron")
-            if stype == "once":
-                lines.append('schedule = "once"\n')
-                if meta.get("run_at"):
-                    lines.append(f'run_at = "{meta["run_at"]}"\n')
-            else:
-                lines.append('schedule = "cron"\n')
-                if meta.get("cron"):
-                    lines.append(f'cron = "{meta["cron"]}"\n')
-            lines.append(f"task = {_toml_str(meta.get('task', ''))}\n")
-            lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
-            if meta.get("model"):
-                lines.append(f"model = {_toml_str(meta['model'])}\n")
-            if meta.get("fallback_models") is not None:
-                fb = meta["fallback_models"]
-                # Serialize as TOML inline array using the same escaping as _toml_str
-                items = ", ".join(_toml_str(m) for m in fb)
-                lines.append(f"fallback_models = [{items}]\n")
-            if meta.get("preserve_context"):
-                lines.append('preserve_context = true\n')
-                ctx_max = meta.get("context_max_messages", 50)
-                if ctx_max != 50:
-                    lines.append(f'context_max_messages = {ctx_max}\n')
-            if meta.get("overlap_policy", "skip") != "skip":
-                lines.append(f'overlap_policy = "{meta["overlap_policy"]}"\n')
-            if meta.get("max_iterations") is not None:
-                lines.append(f'max_iterations = {int(meta["max_iterations"])}\n')
-            source = meta.get("source", "config")
-            if source != "config":
-                lines.append(f'source = "{source}"\n')
-            if meta.get("created_at"):
-                lines.append(f'created_at = "{meta["created_at"]}"\n')
-            lines.append("\n")
+        for tag, meta in jobs_snapshot:
+            lines.extend(self._serialize_job(tag, meta))
 
         tmp = self._scheduler_config_path + ".tmp"
         try:
@@ -1013,7 +1127,7 @@ class Scheduler:
                 f.writelines(lines)
             # Backup existing file before overwriting
             if os.path.exists(self._scheduler_config_path):
-                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 bak = self._scheduler_config_path + f".bak.{ts}"
                 shutil.copy2(self._scheduler_config_path, bak)
                 self._prune_backups()
@@ -1022,21 +1136,27 @@ class Scheduler:
         except OSError as exc:
             logger.warning("Could not save scheduler.toml: %s", exc)
 
-    def _load_config_jobs(self, config_path: str, sched_cfg: dict = None) -> None:
-        """Load all jobs from scheduler.toml. Migrates legacy daily/interval fields to cron."""
+    def _read_config_jobs(self, config_path: str) -> tuple[dict, int]:
+        """Parse scheduler.toml into a fresh job-meta map without touching state.
+
+        Returns ``(jobs_meta, migrated_count)``. Migrates legacy daily/interval
+        fields to cron. Callers publish the result into ``self._jobs_meta`` under
+        ``_running_lock`` so readers never observe a partially built map.
+        """
+        new_meta: dict = {}
         if not os.path.exists(config_path):
             logger.warning(
                 "scheduler.toml not found at %s — no jobs loaded. "
                 "Create the file to configure scheduled jobs.",
                 config_path,
             )
-            return
+            return new_meta, 0
         try:
             with open(config_path, "rb") as f:
                 toml_data = tomli.load(f)
         except (OSError, tomli.TOMLDecodeError) as exc:
             logger.warning("Could not load %s: %s — starting with no jobs", config_path, exc)
-            return
+            return new_meta, 0
 
         jobs_section = toml_data.get("jobs", {})
         migrated = 0
@@ -1060,7 +1180,7 @@ class Scheduler:
                     )
                 stype = "cron"
 
-            self._jobs_meta[tag] = {
+            new_meta[tag] = {
                 "tag": tag,
                 "task": job_cfg.get("task", ""),
                 "schedule_type": stype,
@@ -1070,7 +1190,7 @@ class Scheduler:
                 "enabled": job_cfg.get("enabled", True),
                 "source": job_cfg.get("source", "config"),
                 "last_run": None,
-                "created_at": job_cfg.get("created_at", datetime.utcnow().isoformat()),
+                "created_at": job_cfg.get("created_at", datetime.now(timezone.utc).isoformat()),
                 "model": job_cfg.get("model") or None,
                 "fallback_models": job_cfg.get("fallback_models"),
                 "preserve_context": bool(job_cfg.get("preserve_context", False)),
@@ -1080,15 +1200,22 @@ class Scheduler:
             # Optional per-job step cap
             if job_cfg.get("max_iterations") is not None:
                 try:
-                    self._jobs_meta[tag]["max_iterations"] = int(job_cfg["max_iterations"])
+                    new_meta[tag]["max_iterations"] = int(job_cfg["max_iterations"])
                 except (ValueError, TypeError):
                     pass
 
         logger.info(
             "Loaded %d jobs from %s%s",
-            len(self._jobs_meta), config_path,
+            len(new_meta), config_path,
             f" ({migrated} migrated to cron)" if migrated else "",
         )
+        return new_meta, migrated
+
+    def _load_config_jobs(self, config_path: str, sched_cfg: Optional[dict] = None) -> None:
+        """Merge jobs from scheduler.toml into ``self._jobs_meta`` (startup path)."""
+        new_meta, migrated = self._read_config_jobs(config_path)
+        with self._running_lock:
+            self._jobs_meta.update(new_meta)
         if migrated:
             # Write back migrated cron expressions
             self._save_scheduler_toml()
@@ -1130,6 +1257,12 @@ class Scheduler:
                         except (CroniterBadCronError, TypeError, ValueError) as exc:
                             logger.warning("Could not compute next_run for '%s': %s", tag, exc)
                 # Once-jobs handled by schedule library
+                # NOTE: Not wrapped in _running_lock. run_pending() synchronously
+                # runs _run_job, so holding _running_lock across it would block
+                # every reader (list_jobs, add_job, _save_scheduler_toml) for the
+                # entire job duration. (_save_scheduler_toml snapshots under
+                # _running_lock *before* taking _save_lock, so the lock order is
+                # consistent and there is no AB-BA hazard either way.)
                 schedule.run_pending()
                 if self._warn_minutes > 0:
                     self._check_long_running_agents()

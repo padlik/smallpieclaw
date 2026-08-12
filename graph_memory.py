@@ -111,6 +111,32 @@ except ImportError:  # pragma: no cover
     ladybug = None  # type: ignore[assignment]
     _LADYBUG_AVAILABLE = False
 
+# LadybugDB 0.18.3 — error substring tokens used for recovery/migration.
+# Update these when upgrading LadybugDB. If the library adds typed exceptions
+# for these error categories in a future version, prefer those over substring
+# matching (currently 0.18.3 exposes only builtin RuntimeError).
+_LADYBUG_WAL_ERROR_TOKENS: tuple[str, ...] = (
+    "corrupted wal",
+    "invalid wal record",
+    "wal_record.cpp",
+)
+_LADYBUG_MIGRATION_ERROR_TOKENS: tuple[str, ...] = (
+    "already exist",
+    "duplicate",
+    "already has property",
+)
+_LADYBUG_EXTENSION_NOT_INSTALLED_TOKENS: tuple[str, ...] = (
+    "not been installed",
+    "has not been installed",
+)
+_LADYBUG_INDEX_EXISTS_TOKENS: tuple[str, ...] = ("already exists",)
+
+
+def _is_ladybug_error(exc: BaseException, tokens: tuple[str, ...]) -> bool:
+    """Return True if *exc* text contains any of the LadybugDB error tokens."""
+    exc_text = str(exc).lower()
+    return any(token in exc_text for token in tokens)
+
 # ---------------------------------------------------------------------------
 # Simple data transfer objects for extracted triplets (no Pydantic needed)
 # ---------------------------------------------------------------------------
@@ -263,6 +289,9 @@ class GraphMemoryStore:
         self._conn_lock = threading.RLock()
         self._embed = embedder_fn
         self._embedding_dim = embedding_dim
+        # Thread-local staging area for pre-computed entity vectors from the
+        # batch writer. See :meth:`_preload_embeddings`.
+        self._local = threading.local()
         # True when admission_status/confidence columns are present and usable.
         # Set during _init_schema; when False the store degrades gracefully and
         # all recalled memory is treated as "observed".
@@ -299,13 +328,9 @@ class GraphMemoryStore:
                 max_num_threads=2,
             )
         except Exception as exc:  # noqa: BLE001
-            exc_lower = str(exc).lower()
-            is_wal_corruption = (
-                "corrupted wal" in exc_lower
-                or "invalid wal record" in exc_lower
-                or "wal_record.cpp" in exc_lower
-            )
-            if not is_wal_corruption:
+            # LadybugDB 0.18.3: WAL corruption is signalled via generic
+            # RuntimeError text. See _LADYBUG_WAL_ERROR_TOKENS.
+            if not _is_ladybug_error(exc, _LADYBUG_WAL_ERROR_TOKENS):
                 raise
             # Attempt WAL recovery: remove corrupt WAL files and retry.
             wal_path = db_path + ".wal"
@@ -346,8 +371,9 @@ class GraphMemoryStore:
         try:
             self._execute("LOAD EXTENSION VECTOR")
         except Exception as exc:  # noqa: BLE001
-            exc_str = str(exc).lower()
-            if "not been installed" in exc_str or "has not been installed" in exc_str:
+            # LadybugDB 0.18.3: the VECTOR extension must be installed before
+            # it can be loaded. See _LADYBUG_EXTENSION_NOT_INSTALLED_TOKENS.
+            if _is_ladybug_error(exc, _LADYBUG_EXTENSION_NOT_INSTALLED_TOKENS):
                 logger.info("graph_memory: VECTOR extension not installed — installing now")
                 self._execute("INSTALL VECTOR")
                 self._execute("LOAD EXTENSION VECTOR")
@@ -404,7 +430,9 @@ class GraphMemoryStore:
                     f'CALL CREATE_VECTOR_INDEX("{table}", "{idx}", "embedding")'
                 )
             except Exception as exc:  # noqa: BLE001
-                if "already exists" not in str(exc).lower():
+                # LadybugDB 0.18.3: ignore benign "index already exists" errors.
+                # See _LADYBUG_INDEX_EXISTS_TOKENS.
+                if not _is_ladybug_error(exc, _LADYBUG_INDEX_EXISTS_TOKENS):
                     logger.warning("Vector index creation warning (%s/%s): %s", table, idx, exc)
 
     def _migrate_admission_metadata(self) -> None:
@@ -434,12 +462,10 @@ class GraphMemoryStore:
                     table, col,
                 )
             except Exception as exc:  # noqa: BLE001
-                msg = str(exc).lower()
-                if (
-                    "already exist" in msg
-                    or "duplicate" in msg
-                    or "already has property" in msg
-                ):
+                # LadybugDB 0.18.3: ALTER ADD on an existing column raises a
+                # generic RuntimeError with one of these substrings. See
+                # _LADYBUG_MIGRATION_ERROR_TOKENS.
+                if _is_ladybug_error(exc, _LADYBUG_MIGRATION_ERROR_TOKENS):
                     continue  # column already present — nothing to do
                 logger.warning(
                     "graph_memory: admission metadata migration for %s.%s skipped: %s",
@@ -478,8 +504,66 @@ class GraphMemoryStore:
     # Write operations
     # ------------------------------------------------------------------
 
-    def upsert_entity(self, name: str, entity_type: str, ts: str) -> str:
-        """Create or update an entity node; returns its stable ID."""
+    def _preload_embeddings(self, vectors: dict[str, Optional[list[float]]]) -> None:
+        """Stage pre-computed entity vectors for the current writer thread.
+
+        Used by the batch writer to avoid N serial embedding round-trips
+        inside :meth:`upsert_entity`. Vectors are consumed thread-locally and
+        cleared after the batch is processed.
+
+        Keys are lower-cased here so staged vectors match regardless of the
+        casing the extractor used for a given mention. A ``None`` value records
+        "pre-embedding was attempted and failed", which suppresses a second
+        attempt in :meth:`_embedding_for_entity`.
+        """
+        self._local.precomputed_vectors = {name.lower(): vec for name, vec in vectors.items()}
+
+    def _clear_preloaded_embeddings(self) -> None:
+        """Drop any staged vectors for the current writer thread."""
+        self._local.precomputed_vectors = None
+
+    def _embedding_for_entity(
+        self,
+        name: str,
+        vector: Optional[list[float]] = None,
+    ) -> Optional[list[float]]:
+        """Resolve the embedding vector for an entity name.
+
+        Priority:
+          1. Explicitly supplied *vector*.
+          2. A vector preloaded by the batch writer for this thread.
+          3. A fresh call to ``self._embed(name)``.
+
+        Returns ``None`` when embedding fails so the caller can decide whether
+        to skip setting the vector.
+        """
+        if vector is not None:
+            return vector
+        local_vectors = getattr(self._local, "precomputed_vectors", None)
+        if local_vectors is not None and name.lower() in local_vectors:
+            # A staged None means the batch pre-embed already tried this name and
+            # failed; retrying here would double the retry/backoff cost during an
+            # embeddings outage and can stall the writer past its join timeout.
+            return local_vectors[name.lower()]
+        try:
+            return self._embed(name)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Embedding entity '%s' failed: %s", name, exc)
+            return None
+
+    def upsert_entity(
+        self,
+        name: str,
+        entity_type: str,
+        ts: str,
+        vector: Optional[list[float]] = None,
+    ) -> str:
+        """Create or update an entity node; returns its stable ID.
+
+        If a pre-computed *vector* is supplied, the embedding call is skipped.
+        The batch writer uses :meth:`_preload_embeddings` to stage vectors
+        without changing the public call signature.
+        """
         normalized = name.lower().replace(" ", "_")
         entity_id = f"ent:{normalized}:{entity_type}"
         self._execute(
@@ -494,14 +578,15 @@ class GraphMemoryStore:
             """,
             {"id": entity_id, "name": name, "etype": entity_type, "norm": normalized, "ts": ts},
         )
-        try:
-            emb = self._embed(name)
-            self._execute(
-                "MATCH (e:Entity {id:$id}) SET e.embedding=$emb",
-                {"id": entity_id, "emb": emb},
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Embedding entity '%s' failed: %s", name, exc)
+        emb = self._embedding_for_entity(name, vector=vector)
+        if emb is not None:
+            try:
+                self._execute(
+                    "MATCH (e:Entity {id:$id}) SET e.embedding=$emb",
+                    {"id": entity_id, "emb": emb},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Setting embedding for entity '%s' failed: %s", name, exc)
         return entity_id
 
     def add_relation(
@@ -633,21 +718,8 @@ class GraphMemoryStore:
     # Read operations
     # ------------------------------------------------------------------
 
-    def search(self, query: str, k: int = 10) -> dict:
-        """Hybrid retrieval: vector ANN → seed entities → 1-hop graph expansion.
-
-        Returns dict with keys:
-          "seeds"    — list of {id, name, type, sim}
-          "facts"    — list of {source, relation, fact, target, admission, confidence}
-          "episodes" — list of {id, content, sim, admission, confidence}
-        """
-        try:
-            query_vec = self._embed(query)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Graph memory search embed failed: %s", exc)
-            return {"seeds": [], "facts": [], "episodes": []}
-
-        # Phase 1: HNSW vector search on entities
+    def _seed_entities(self, query_vec: list[float], k: int) -> list[dict]:
+        """Phase 1: find seed entities by HNSW vector similarity."""
         seeds: list[dict] = []
         try:
             with self._conn_lock:
@@ -668,58 +740,61 @@ class GraphMemoryStore:
                     )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Vector index search failed: %s", exc)
+        return seeds
 
-        # Phase 2: 1-hop graph expansion from seed nodes
+    def _expand_facts(self, seed_ids: list[str], k: int) -> list[dict]:
+        """Phase 2: 1-hop graph expansion from seed entities."""
         facts: list[dict] = []
-        seed_ids = [s["id"] for s in seeds[:5]]
-        if seed_ids:
-            if self._has_admission_meta:
-                fact_query = """
-                    MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
-                    WHERE s.id IN $ids AND r.invalid_at IS NULL
-                    RETURN s.name, r.relation_type, r.fact, t.name,
-                           r.admission_status, r.confidence
-                    LIMIT $lim
-                    """
-            else:
-                fact_query = """
-                    MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
-                    WHERE s.id IN $ids AND r.invalid_at IS NULL
-                    RETURN s.name, r.relation_type, r.fact, t.name
-                    LIMIT $lim
-                    """
-            try:
-                with self._conn_lock:
-                    graph_result = self._conn.execute(
-                        fact_query, {"ids": seed_ids, "lim": k * 2}
+        if not seed_ids:
+            return facts
+        if self._has_admission_meta:
+            fact_query = """
+                MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
+                WHERE s.id IN $ids AND r.invalid_at IS NULL
+                RETURN s.name, r.relation_type, r.fact, t.name,
+                       r.admission_status, r.confidence
+                LIMIT $lim
+                """
+        else:
+            fact_query = """
+                MATCH (s:Entity)-[r:RELATES_TO]-(t:Entity)
+                WHERE s.id IN $ids AND r.invalid_at IS NULL
+                RETURN s.name, r.relation_type, r.fact, t.name
+                LIMIT $lim
+                """
+        try:
+            with self._conn_lock:
+                graph_result = self._conn.execute(
+                    fact_query, {"ids": seed_ids, "lim": k * 2}
+                )
+                while graph_result.has_next():
+                    row = graph_result.get_next()
+                    admission = (
+                        _coerce_admission(row[4])
+                        if self._has_admission_meta and len(row) > 4
+                        else ADMISSION_OBSERVED
                     )
-                    while graph_result.has_next():
-                        row = graph_result.get_next()
-                        admission = (
-                            _coerce_admission(row[4])
-                            if self._has_admission_meta and len(row) > 4
-                            else ADMISSION_OBSERVED
-                        )
-                        confidence = (
-                            row[5]
-                            if self._has_admission_meta and len(row) > 5 and row[5] is not None
-                            else CONFIDENCE_OBSERVED
-                        )
-                        facts.append(
-                            {
-                                "source": row[0],
-                                "relation": row[1],
-                                "fact": row[2],
-                                "target": row[3],
-                                "admission": admission,
-                                "confidence": confidence,
-                            }
-                        )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Graph expansion failed: %s", exc)
+                    confidence = (
+                        row[5]
+                        if self._has_admission_meta and len(row) > 5 and row[5] is not None
+                        else CONFIDENCE_OBSERVED
+                    )
+                    facts.append(
+                        {
+                            "source": row[0],
+                            "relation": row[1],
+                            "fact": row[2],
+                            "target": row[3],
+                            "admission": admission,
+                            "confidence": confidence,
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Graph expansion failed: %s", exc)
+        return facts
 
-        # Phase 3: Episode vector search — catches manually stored content
-        # that has no extracted entities (short notes, store-only calls).
+    def _search_episodes(self, query_vec: list[float], k: int) -> list[dict]:
+        """Phase 3: find relevant episodes by HNSW vector similarity."""
         episodes: list[dict] = []
         try:
             with self._conn_lock:
@@ -747,6 +822,26 @@ class GraphMemoryStore:
                     )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Episode vector search failed: %s", exc)
+        return episodes
+
+    def search(self, query: str, k: int = 10) -> dict:
+        """Hybrid retrieval: vector ANN → seed entities → 1-hop graph expansion.
+
+        Returns dict with keys:
+          "seeds"    — list of {id, name, type, sim}
+          "facts"    — list of {source, relation, fact, target, admission, confidence}
+          "episodes" — list of {id, content, sim, admission, confidence}
+        """
+        try:
+            query_vec = self._embed(query)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Graph memory search embed failed: %s", exc)
+            return {"seeds": [], "facts": [], "episodes": []}
+
+        seeds = self._seed_entities(query_vec, k)
+        seed_ids = [s["id"] for s in seeds[:5]]
+        facts = self._expand_facts(seed_ids, k)
+        episodes = self._search_episodes(query_vec, k)
 
         # Rank confirmed facts ahead of observed ones, then by confidence/relevance.
         facts.sort(
@@ -1059,46 +1154,80 @@ class GraphMemoryWriter:
 
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Upsert entities and build id map
-        entity_ids: dict[str, str] = {}
+        # Pre-compute embeddings for every unique entity name referenced in this
+        # batch. The public :meth:`GraphMemoryStore.upsert_entity` will consume
+        # these staged vectors from thread-local storage, avoiding a separate
+        # embedding network round-trip per entity.
+        #
+        # TODO(TD-11): Replace the serial ``_embed(name)`` loop below with a
+        # single ``LLMClient.embed_batch(names)`` call once the LLM client and
+        # its provider backends expose native batch embedding (OpenAI's
+        # ``/embeddings`` endpoint and Gemini's batch embedContent both accept
+        # lists, but the current provider wrappers only accept a single string).
+        # Keyed case-insensitively to match how endpoints are de-duplicated below
+        # (entity_ids uses name.lower()) — otherwise "Alice" in entities and
+        # "alice" in facts would each cost their own embedding round-trip.
+        unique_entity_names: set[str] = set()
         for entity in result.entities:
-            try:
-                eid = self._store.upsert_entity(entity.name, entity.entity_type, ts)
-                entity_ids[entity.name.lower()] = eid
-                self._entities_extracted += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("upsert_entity failed for '%s': %s", entity.name, exc)
-                self._write_failures += 1
-
-        # Upsert relationships. Endpoints must already exist as nodes for
-        # add_relation's MATCH...MERGE to create the edge. If the extractor
-        # referenced an entity it did not list under "entities", create it now
-        # (typed "other") so the relation is not silently dropped.
+            unique_entity_names.add(entity.name.lower())
         for fact in result.facts:
-            src_key = fact.source.lower()
-            tgt_key = fact.target.lower()
-            src_id = entity_ids.get(src_key)
-            tgt_id = entity_ids.get(tgt_key)
-            try:
-                if src_id is None:
-                    src_id = self._store.upsert_entity(fact.source, "other", ts)
-                    entity_ids[src_key] = src_id
-                if tgt_id is None:
-                    tgt_id = self._store.upsert_entity(fact.target, "other", ts)
-                    entity_ids[tgt_key] = tgt_id
-                self._store.add_relation(src_id, tgt_id, fact.relation_type, fact.fact, ts)
-                self._facts_extracted += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("add_relation failed: %s", exc)
-                self._write_failures += 1
+            unique_entity_names.add(fact.source.lower())
+            unique_entity_names.add(fact.target.lower())
 
-        # Optionally record episode
+        entity_vectors: dict[str, Optional[list[float]]] = {}
+        for name in unique_entity_names:
+            try:
+                entity_vectors[name] = self._store._embed(name)
+            except Exception as exc:  # noqa: BLE001
+                # Record the failure (None) rather than omitting the key, so
+                # upsert_entity does not retry the same failing embed call.
+                entity_vectors[name] = None
+                logger.debug("Batch pre-embedding failed for '%s': %s", name, exc)
+        self._store._preload_embeddings(entity_vectors)
+
         try:
-            self._store.add_episode(combined_text[:1000], user_id, source)
-            self._episodes_stored += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("add_episode failed: %s", exc)
-            self._write_failures += 1
+            # Upsert entities and build id map
+            entity_ids: dict[str, str] = {}
+            for entity in result.entities:
+                try:
+                    eid = self._store.upsert_entity(entity.name, entity.entity_type, ts)
+                    entity_ids[entity.name.lower()] = eid
+                    self._entities_extracted += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("upsert_entity failed for '%s': %s", entity.name, exc)
+                    self._write_failures += 1
+
+            # Upsert relationships. Endpoints must already exist as nodes for
+            # add_relation's MATCH...MERGE to create the edge. If the extractor
+            # referenced an entity it did not list under "entities", create it
+            # now (typed "other") so the relation is not silently dropped.
+            for fact in result.facts:
+                src_key = fact.source.lower()
+                tgt_key = fact.target.lower()
+                src_id = entity_ids.get(src_key)
+                tgt_id = entity_ids.get(tgt_key)
+                try:
+                    if src_id is None:
+                        src_id = self._store.upsert_entity(fact.source, "other", ts)
+                        entity_ids[src_key] = src_id
+                    if tgt_id is None:
+                        tgt_id = self._store.upsert_entity(fact.target, "other", ts)
+                        entity_ids[tgt_key] = tgt_id
+                    self._store.add_relation(src_id, tgt_id, fact.relation_type, fact.fact, ts)
+                    self._facts_extracted += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("add_relation failed: %s", exc)
+                    self._write_failures += 1
+
+            # Optionally record episode
+            try:
+                self._store.add_episode(combined_text[:1000], user_id, source)
+                self._episodes_stored += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("add_episode failed: %s", exc)
+                self._write_failures += 1
+        finally:
+            self._store._clear_preloaded_embeddings()
 
         self._batches_processed += 1
         logger.info(

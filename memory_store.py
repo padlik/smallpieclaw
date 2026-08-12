@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -33,7 +34,50 @@ _JSON_FILE_ERRORS = (OSError, json.JSONDecodeError)
 
 
 # ---------------------------------------------------------------------------
-# Shared helper
+# Internal JSON vector store (composition target)
+# ---------------------------------------------------------------------------
+
+class _JsonVectorStore:
+    """Internal JSON-backed vector store used by LongTermMemory and ResultsMemory.
+
+    This is a composition object, not a base class: memory classes contain a
+    ``_JsonVectorStore`` instance and delegate persistence and entry access to
+    it while keeping their own domain-specific logic and logging.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._data: dict[str, Any] = {}
+        self._lock = threading.RLock()
+        self._load()
+
+    def _latest(self, top_k: int) -> list:
+        with self._lock:
+            return sorted(
+                self._data.values(),
+                key=lambda e: e.get("timestamp", ""),
+                reverse=True,
+            )[:top_k]
+
+    def _load(self) -> None:
+        with self._lock:
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path, "r", encoding="utf-8") as f:
+                        self._data = json.load(f)
+                except _JSON_FILE_ERRORS as exc:
+                    logger.warning("Vector store load failed for %s: %s", self.path, exc)
+                    self._data = {}
+            else:
+                self._data = {}
+
+    def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
+        """Write to disk atomically with exponential-backoff retry. Caller must hold _lock."""
+        _atomic_save_json(self.path, self._data, attempts=attempts, base_delay=base_delay)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _atomic_save_json(path: str, data: Any, *, attempts: int = 3, base_delay: float = 0.05) -> None:
@@ -72,6 +116,33 @@ def _atomic_save_json(path: str, data: Any, *, attempts: int = 3, base_delay: fl
                 pass
     if last_exc is not None:
         raise last_exc
+
+
+def _vector_search(data: dict, llm, query: str, top_k: int, label: str) -> list:
+    """Search *data* for entries most similar to *query*.
+
+    Embeds *query* via *llm* when available; otherwise returns the most recent
+    entries by timestamp.  Entries without vectors are skipped during cosine
+    scoring.  Results are returned in descending similarity order (or descending
+    recency when no embedding is available).
+    """
+    query_vec = []
+    if llm:
+        try:
+            query_vec = llm.embed(query)
+        except Exception as exc:
+            logger.warning("%s search embed failed: %s", label, exc)
+    if not query_vec:
+        entries = sorted(data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)
+        return entries[:top_k]
+    scored = []
+    for entry_id, entry in data.items():
+        vec = entry.get("vector", [])
+        if vec:
+            score = cosine_similarity(query_vec, vec)
+            scored.append((score, entry))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [e for _, e in scored[:top_k]]
 
 
 class MemoryStore:
@@ -127,7 +198,6 @@ class MemoryStore:
         Internal keys starting with '_' are never purged.
         Returns the number of keys deleted.
         """
-        import re
         pattern = re.compile(
             r"(?:(?<![a-zA-Z])|^)("
             + "|".join(re.escape(s) for s in substrings)
@@ -316,11 +386,12 @@ class LongTermMemory:
     is_migration_only = True
 
     def __init__(self, path: str, llm=None):
-        self.path = path
         self.llm = llm
-        self._data: dict = {}
-        self._lock = threading.RLock()
-        self._load()
+        self._store = _JsonVectorStore(path)
+
+    @property
+    def path(self) -> str:
+        return self._store.path
 
     def add(self, content: str, source: str = "manual") -> str:
         """DEPRECATED: LongTermMemory is read-only migration support.
@@ -337,41 +408,25 @@ class LongTermMemory:
                 vector = self.llm.embed(content)
             except Exception as exc:
                 logger.warning("LongTermMemory embed failed: %s", exc)
-        with self._lock:
-            self._data[entry_id] = {
+        with self._store._lock:
+            self._store._data[entry_id] = {
                 "content": content,
                 "source": source,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "vector": vector,
             }
-            self._save_with_retry()
+            self._store._save_with_retry()
         return entry_id
 
     def search(self, query: str, top_k: int = 3) -> list:
-        with self._lock:
-            if not self._data:
+        with self._store._lock:
+            if not self._store._data:
                 return []
-        query_vec = []
-        if self.llm:
-            try:
-                query_vec = self.llm.embed(query)
-            except Exception as exc:
-                logger.warning("LongTermMemory search embed failed: %s", exc)
-        with self._lock:
-            if not query_vec:
-                entries = sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)
-                return entries[:top_k]
-            scored = []
-            for entry_id, entry in self._data.items():
-                vec = entry.get("vector", [])
-                if vec:
-                    score = cosine_similarity(query_vec, vec)
-                    scored.append((score, entry))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [e for _, e in scored[:top_k]]
+            snapshot = dict(self._store._data)
+        return _vector_search(snapshot, self.llm, query, top_k, label="LongTermMemory")
 
     def as_prompt_text(self, query: str = "", top_k: int = 3) -> str:
-        entries = self.search(query, top_k) if query else self._latest(top_k)
+        entries = self.search(query, top_k) if query else self._store._latest(top_k)
         if not entries:
             return "No long-term memory entries."
         lines = []
@@ -387,29 +442,11 @@ class LongTermMemory:
         the lock, but callers must not mutate them.  Pairs are sorted oldest-
         first by timestamp so backfill / iteration order is deterministic.
         """
-        with self._lock:
+        with self._store._lock:
             return sorted(
-                ((eid, dict(entry)) for eid, entry in self._data.items()),
+                ((eid, dict(entry)) for eid, entry in self._store._data.items()),
                 key=lambda pair: pair[1].get("timestamp", ""),
             )
-
-    def _latest(self, top_k: int) -> list:
-        with self._lock:
-            return sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)[:top_k]
-
-    def _load(self) -> None:
-        with self._lock:
-            if os.path.exists(self.path):
-                try:
-                    with open(self.path) as f:
-                        self._data = json.load(f)
-                except _JSON_FILE_ERRORS as exc:
-                    logger.warning("LongTermMemory load failed: %s", exc)
-                    self._data = {}
-
-    def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
-        """Write to disk atomically with exponential-backoff retry. Caller must hold _lock."""
-        _atomic_save_json(self.path, self._data, attempts=attempts, base_delay=base_delay)
 
 
 def _task_outcome_text(
@@ -535,11 +572,12 @@ class ResultsMemory:
     """Persisted vector index of past task results."""
 
     def __init__(self, path: str, llm=None):
-        self.path = path
         self.llm = llm
-        self._data: dict = {}
-        self._lock = threading.RLock()
-        self._load()
+        self._store = _JsonVectorStore(path)
+
+    @property
+    def path(self) -> str:
+        return self._store.path
 
     def add_result(self, goal: str, summary: str, tools_used: list | None = None) -> str:
         result_id = str(uuid.uuid4())
@@ -550,42 +588,26 @@ class ResultsMemory:
                 vector = self.llm.embed(content)
             except Exception as exc:
                 logger.warning("ResultsMemory embed failed: %s", exc)
-        with self._lock:
-            self._data[result_id] = {
+        with self._store._lock:
+            self._store._data[result_id] = {
                 "goal": goal,
                 "summary": summary,
                 "tools_used": tools_used or [],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "vector": vector,
             }
-            self._save_with_retry()
+            self._store._save_with_retry()
         return result_id
 
     def search(self, query: str, top_k: int = 3) -> list:
-        with self._lock:
-            if not self._data:
+        with self._store._lock:
+            if not self._store._data:
                 return []
-        query_vec = []
-        if self.llm:
-            try:
-                query_vec = self.llm.embed(query)
-            except Exception as exc:
-                logger.warning("ResultsMemory search embed failed: %s", exc)
-        with self._lock:
-            if not query_vec:
-                entries = sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)
-                return entries[:top_k]
-            scored = []
-            for entry_id, entry in self._data.items():
-                vec = entry.get("vector", [])
-                if vec:
-                    score = cosine_similarity(query_vec, vec)
-                    scored.append((score, entry))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [e for _, e in scored[:top_k]]
+            snapshot = dict(self._store._data)
+        return _vector_search(snapshot, self.llm, query, top_k, label="ResultsMemory")
 
     def as_prompt_text(self, query: str = "", top_k: int = 3) -> str:
-        entries = self.search(query, top_k) if query else self._latest(top_k)
+        entries = self.search(query, top_k) if query else self._store._latest(top_k)
         if not entries:
             return "No past results."
         lines = []
@@ -594,21 +616,3 @@ class ResultsMemory:
             lines.append(f"  [{ts}] Goal: {entry['goal']}")
             lines.append(f"    Result: {entry['summary']}")
         return "\n".join(lines)
-
-    def _latest(self, top_k: int) -> list:
-        with self._lock:
-            return sorted(self._data.values(), key=lambda e: e.get("timestamp", ""), reverse=True)[:top_k]
-
-    def _load(self) -> None:
-        with self._lock:
-            if os.path.exists(self.path):
-                try:
-                    with open(self.path) as f:
-                        self._data = json.load(f)
-                except _JSON_FILE_ERRORS as exc:
-                    logger.warning("ResultsMemory load failed: %s", exc)
-                    self._data = {}
-
-    def _save_with_retry(self, attempts: int = 3, base_delay: float = 0.05) -> None:
-        """Write to disk atomically with exponential-backoff retry. Caller must hold _lock."""
-        _atomic_save_json(self.path, self._data, attempts=attempts, base_delay=base_delay)

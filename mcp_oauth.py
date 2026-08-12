@@ -154,6 +154,42 @@ class FileTokenStorage:
             has_refresh,
         )
 
+    def read_status(self) -> dict[str, Any] | None:
+        """Read and parse the persisted token file synchronously.
+
+        Returns the token status information needed by callers that cannot
+        access the event loop. Returns ``None`` if the token file is missing
+        or unreadable.
+
+        Returns:
+            A dict with keys ``has_token`` (bool), ``expires_in`` (int|None),
+            ``has_refresh`` (bool), and ``scope`` (str|None). The ``expires_in``
+            value is the remaining seconds until expiry when both ``expires_in``
+            and ``issued_at`` are present; otherwise it is the raw ``expires_in``
+            value from the file.
+        """
+        data = self._read_file()
+        if data is None:
+            return None
+        token_data = data.get("token") or data
+        access_token = token_data.get("access_token")
+        _expires_in = token_data.get("expires_in")
+        _issued_at = token_data.get("issued_at")
+        expires_display: int | None
+        if _expires_in is not None and _issued_at is not None:
+            try:
+                expires_display = max(0, int(_issued_at + _expires_in - time.time()))
+            except (TypeError, ValueError, OverflowError):
+                expires_display = None
+        else:
+            expires_display = _expires_in
+        return {
+            "has_token": bool(access_token),
+            "expires_in": expires_display,
+            "has_refresh": bool(token_data.get("refresh_token")),
+            "scope": token_data.get("scope"),
+        }
+
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         """Return OAuth client information.
 

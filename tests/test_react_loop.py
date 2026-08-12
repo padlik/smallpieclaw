@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from react_loop import extract_json_candidates, parse_json
 
 
@@ -272,6 +274,96 @@ class TestOnToolTraceCallback:
             ctx.on_tool_trace(ToolTrace("shell", "", True, 1.0))
         # Just assert we reached here without error
         assert True
+
+
+class TestMcpToolSpan:
+    """MCP dispatch must emit the right lifecycle event and return the
+    auth-translated outcome (regression: the span's outcome sink was never
+    called, so successes logged TOOL_FAILED and the 401 recheck was dead)."""
+
+    def _make_ctx(self, call_result, *, has_oauth=True):
+        import threading
+        from unittest.mock import MagicMock
+        from react_loop import ReactContext
+
+        mcp = MagicMock()
+        mcp.has_tool.return_value = True
+        mcp.call_tool.return_value = call_result
+        mcp.server_name_for_tool.return_value = "srv"
+        mcp.server_has_oauth.return_value = has_oauth
+        return ReactContext(
+            llm=MagicMock(),
+            tool_index=MagicMock(),
+            memory=MagicMock(),
+            builtin_executor=None,
+            mcp_manager=mcp,
+            skill_registry=None,
+            cancel_event=threading.Event(),
+        )
+
+    def _dispatch(self, ctx):
+        """Run _dispatch_tool for an MCP tool, capturing emitted log events."""
+        from unittest.mock import patch
+        import react_loop
+
+        events = []
+
+        def _capture(event, _msg, **kw):
+            events.append((event, kw))
+
+        with patch.object(react_loop.agent_logging, "log_event", _capture):
+            outcome = react_loop._dispatch_tool(
+                ctx, {"tool": "mcp_tool", "args": {}}, lambda _m: None,
+            )
+        return outcome, [e for e, _ in events]
+
+    def test_success_emits_tool_end(self):
+        from agent_logging import LogEvent
+
+        ctx = self._make_ctx({"success": True, "output": "ok", "exit_code": 0})
+        outcome, events = self._dispatch(ctx)
+
+        assert events == [LogEvent.TOOL_START, LogEvent.TOOL_END]
+        assert outcome["success"] is True
+
+    def test_auth_failure_marks_needs_auth_and_translates_error(self):
+        from agent_logging import LogEvent
+
+        ctx = self._make_ctx({"success": False, "output": "", "error": "401 Unauthorized"})
+        outcome, events = self._dispatch(ctx)
+
+        ctx.mcp_manager.mark_needs_auth.assert_called_once_with("srv")
+        assert "/mcp auth srv" in outcome["error"]
+        assert events == [LogEvent.TOOL_START, LogEvent.TOOL_FAILED]
+
+    def test_non_oauth_401_is_left_alone(self):
+        ctx = self._make_ctx(
+            {"success": False, "output": "", "error": "401 Unauthorized"}, has_oauth=False,
+        )
+        outcome, _events = self._dispatch(ctx)
+
+        ctx.mcp_manager.mark_needs_auth.assert_not_called()
+        assert outcome["error"] == "401 Unauthorized"
+
+    def test_raising_tool_emits_single_tool_failed(self):
+        from agent_logging import LogEvent
+
+        from unittest.mock import patch
+        import react_loop
+
+        ctx = self._make_ctx(None)
+        ctx.mcp_manager.call_tool.side_effect = RuntimeError("boom")
+
+        events = []
+        with patch.object(
+            react_loop.agent_logging, "log_event",
+            lambda event, _msg, **kw: events.append(event),
+        ):
+            with pytest.raises(RuntimeError):
+                react_loop._dispatch_tool(ctx, {"tool": "mcp_tool", "args": {}}, lambda _m: None)
+
+        # Exactly one terminal event — no duplicate ERROR + TOOL_FAILED pair.
+        assert events == [LogEvent.TOOL_START, LogEvent.TOOL_FAILED]
 
 
 class TestCancelEventOwnership:

@@ -92,10 +92,12 @@ class TestSubAgentPromptIdBinding:
             def __init__(self):
                 self.agent_id = "sa-test"
                 self._model_id = "test-model"
+                self.model_id = "test-model"
                 self._cancel_event = threading.Event()
                 self._llm = MagicMock()
                 self._agent = MagicMock()
                 self._agent._trace_id = "r-parent"
+                self.trace_id = "r-parent"
                 self.closed = False
                 self.prompt_id_seen = None
 
@@ -135,10 +137,12 @@ class TestSubAgentPromptIdBinding:
             def __init__(self):
                 self.agent_id = "sa-c"
                 self._model_id = "test-model"
+                self.model_id = "test-model"
                 self._cancel_event = threading.Event()
                 self._llm = MagicMock()
                 self._agent = MagicMock()
                 self._agent._trace_id = None
+                self.trace_id = None
                 self.run_done = threading.Event()
 
             def run(self, task, prompt_id=None):
@@ -178,10 +182,12 @@ class TestSubAgentPromptIdBinding:
             def __init__(self):
                 self.agent_id = "sa-legacy"
                 self._model_id = "test-model"
+                self.model_id = "test-model"
                 self._cancel_event = threading.Event()
                 self._llm = MagicMock()
                 self._agent = MagicMock()
                 self._agent._trace_id = None
+                self.trace_id = None
                 self.prompt_id_seen = "not-called"
 
             def run(self, task):

@@ -303,6 +303,13 @@ class TestSdkClientWrapper:
         self._wrappers.append(wrapper)
         return wrapper
 
+    def test_create_session_runner_rejects_off_loop_thread(self):
+        """loop.create_task is not thread-safe — calling off-thread must raise
+        rather than silently scheduling onto a foreign loop."""
+        wrapper = self._make_wrapper()
+        with pytest.raises(RuntimeError):
+            wrapper.create_session_runner()
+
     def test_connect_stdio_success(self):
         sdk_tool = _sdk_tool("tool1", "Tool 1")
         session = _make_mock_session(tools=[sdk_tool])
@@ -789,6 +796,39 @@ class TestSdkClientWrapper:
 # ---------------------------------------------------------------------------
 # TestMCPManager
 # ---------------------------------------------------------------------------
+
+
+class TestVerifyTokenPersisted:
+    """Token verification must fail closed, never report success without a token."""
+
+    def _mgr(self):
+        return MCPManager([{"name": "srv", "transport": "http", "url": "https://x"}])
+
+    def test_missing_tokens_dir_is_an_error(self):
+        mgr = self._mgr()
+        mgr._mcp_tokens_dir = None
+        result = mgr._verify_token_persisted("srv", True)
+        assert result is not None
+        assert result["success"] is False
+
+    def test_existing_token_file_passes(self, tmp_path):
+        mgr = self._mgr()
+        mgr._mcp_tokens_dir = tmp_path
+        (tmp_path / "srv.json").write_text("{}")
+        assert mgr._verify_token_persisted("srv", True) is None
+
+    def test_missing_token_after_challenge_is_an_error(self, tmp_path):
+        mgr = self._mgr()
+        mgr._mcp_tokens_dir = tmp_path
+        result = mgr._verify_token_persisted("srv", True)
+        assert result is not None
+        assert "/mcp auth srv" in result["error"]
+
+    def test_missing_token_without_challenge_is_fine(self, tmp_path):
+        """No 401 on probe means the server never wanted OAuth."""
+        mgr = self._mgr()
+        mgr._mcp_tokens_dir = tmp_path
+        assert mgr._verify_token_persisted("srv", False) is None
 
 
 class TestMCPManager:

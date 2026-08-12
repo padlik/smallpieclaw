@@ -35,6 +35,165 @@ from sub_agent_registry import SOURCE_ON_DEMAND, get_registry as _get_agent_regi
 logger = logging.getLogger(__name__)
 
 
+def _validate_spawn_args(
+    owner: BuiltinExecutor,
+    args: dict,
+    caller_depth: int,
+    options: SupervisionOptions,
+) -> dict | tuple[str, str, Optional[str], Optional[str], str]:
+    """Validate model-facing ``spawn_agent`` arguments.
+
+    Handles task aliases, depth guard, factory availability, concurrency cap,
+    ``response_format`` normalization/task augmentation, and ``context_key``
+    syntax validation.
+
+    Returns either an error dict compatible with tool output, or a tuple of
+    ``(task, response_format, model, context_key, label)``.
+    """
+    from sub_agent_registry import get_registry as get_agent_registry
+
+    task = args.get("task", "").strip()
+    # Accept common LLM aliases for the 'task' parameter
+    if not task:
+        for _alias in ("prompt", "goal", "description"):
+            _v = args.get(_alias, "").strip()
+            if _v:
+                logger.warning(
+                    "spawn_agent: received '%s' instead of 'task' — treating as task (fix your prompt)", _alias
+                )
+                task = _v
+                break
+    if not task:
+        return {
+            "success": False,
+            "output": "",
+            "error": "spawn_agent: 'task' is required.",
+            "exit_code": -1,
+            "error_type": "fundamentally_wrong_approach",
+            "recoverable": False,
+            "suggestion": "Provide a clear task string describing what the sub-agent should do.",
+        }
+
+    # Depth guard — prevent recursive sub-agent spawning (hard error, not a silent no-op)
+    if caller_depth >= 1:
+        return {
+            "success": False,
+            "output": "",
+            "error": "spawn_agent cannot be called from within a sub-agent (max nesting depth: 1).",
+            "exit_code": -1,
+            "error_type": "fundamentally_wrong_approach",
+            "recoverable": False,
+            "suggestion": "Do not spawn sub-agents from within a sub-agent; perform the work directly.",
+        }
+
+    if owner._sub_agent_factory is None:
+        return {
+            "success": False,
+            "output": "",
+            "error": "spawn_agent: sub_agent_factory not configured.",
+            "exit_code": -1,
+            "error_type": "impossible_with_current_tools",
+            "recoverable": False,
+            "suggestion": "The agent runtime is missing sub-agent support; this cannot be recovered in-flight.",
+        }
+
+    # Concurrency cap — preserve current managed-record semantics.
+    # Scheduled launches still use source="on-demand" until the later
+    # running-agent visibility/cap policy change decides otherwise.
+    current_managed = get_agent_registry().count_managed()
+    if current_managed >= owner._max_subagents:
+        return {
+            "success": False,
+            "output": "",
+            "error": (
+                f"spawn_agent: max_subagents cap reached ({current_managed}/{owner._max_subagents}). "
+                "Wait for a managed sub-agent to finish or cancel one with /agents cancel managed."
+            ),
+            "exit_code": -1,
+            "error_type": "tool_timeout",
+            "recoverable": True,
+            "suggestion": "Wait for an existing sub-agent to finish, then retry.",
+        }
+
+    # response_format — how the sub-agent should return its result
+    response_format = args.get("response_format", "text").lower()
+    if response_format not in ("text", "json", "file"):
+        response_format = "text"
+    if response_format == "json":
+        task = task + "\n\nReturn your entire answer as a single valid JSON object. Do not include any prose or markdown fences."
+    elif response_format == "file":
+        task = task + "\n\nWrite your output to a file and return only the absolute file path as your answer."
+
+    model = args.get("model") or None
+    context_key = args.get("context_key") or None
+    if context_key:
+        try:
+            context_key = context_io._validate_context_key(str(context_key))
+        except ValueError as exc:
+            return {
+                "success": False,
+                "output": "",
+                "error": f"spawn_agent: invalid context_key: {exc}",
+                "exit_code": -1,
+                "error_type": "permission_denied",
+                "recoverable": False,
+                "suggestion": "Use a context_key with only letters, digits, underscore, dash, or dot.",
+            }
+
+    label = options.job_tag or context_key or "on-demand"
+    return task, response_format, model, context_key, label
+
+
+def _build_context_payload(task: str, args: dict, owner: BuiltinExecutor) -> dict:
+    """Build the parent context payload for a sub-agent spawn.
+
+    Parses an explicit ``context_payload`` argument, falling back to an
+    automatic summary from available memory sources when none is supplied.
+    """
+    context_payload = args.get("context_payload")
+    if isinstance(context_payload, str):
+        try:
+            context_payload = json.loads(context_payload)
+        except Exception:  # noqa: BLE001
+            context_payload = {"parent_note": context_payload}
+    if context_payload is None:
+        # Implicit context: build an automatic summary from available sources.
+        from prompt_loader import build_spawn_context_summary
+        context_payload = build_spawn_context_summary(
+            user_goal=task,
+            working=owner._working,
+            memory=owner._memory,
+            results=owner._results,
+            graph_memory=owner._graph_memory,
+        )
+    if not isinstance(context_payload, dict):
+        context_payload = {"parent_note": str(context_payload)}
+    return context_payload
+
+
+def _coerce_overrides(args: dict) -> dict[str, Optional[int | float]]:
+    """Coerce optional LLM parameter overrides from model-facing args.
+
+    ``max_tokens`` is converted to ``int``; ``temperature`` and ``top_p`` to
+    ``float``. Unparsable or missing values become ``None``.
+    """
+    overrides: dict[str, Optional[int | float]] = {}
+    for key, converter in (
+        ("max_tokens", int),
+        ("temperature", float),
+        ("top_p", float),
+    ):
+        raw = args.get(key)
+        if raw is None:
+            overrides[key] = None
+            continue
+        try:
+            overrides[key] = converter(raw)
+        except (ValueError, TypeError):
+            overrides[key] = None
+    return overrides
+
+
 class AgentTools:
     """spawn_agent / get_agent_result handlers, delegating to the supervisor."""
 
@@ -60,126 +219,23 @@ class AgentTools:
         caller_depth is the depth of the AgentController that invoked this tool.
         Sub-agents (depth ≥ 1) are not allowed to spawn further sub-agents.
         """
-        from sub_agent_registry import get_registry as get_agent_registry
-
         options = options or SupervisionOptions()
         # Propagate the active prompt id (if any) onto the supervision options
         # so the supervisor can bind it into the sub-agent's log context.
         if options.prompt_id is None:
             options.prompt_id = getattr(self._owner, "_current_prompt_id", None)
 
-        task = args.get("task", "").strip()
-        # Accept common LLM aliases for the 'task' parameter
-        if not task:
-            for _alias in ("prompt", "goal", "description"):
-                _v = args.get(_alias, "").strip()
-                if _v:
-                    logger.warning(
-                        "spawn_agent: received '%s' instead of 'task' — treating as task (fix your prompt)", _alias
-                    )
-                    task = _v
-                    break
-        if not task:
-            return {
-                "success": False,
-                "output": "",
-                "error": "spawn_agent: 'task' is required.",
-                "exit_code": -1,
-                "error_type": "fundamentally_wrong_approach",
-                "recoverable": False,
-                "suggestion": "Provide a clear task string describing what the sub-agent should do.",
-            }
+        validation = _validate_spawn_args(self._owner, args, caller_depth, options)
+        if isinstance(validation, dict):
+            return validation
+        task, response_format, model, context_key, label = validation
 
-        # Depth guard — prevent recursive sub-agent spawning (hard error, not a silent no-op)
-        if caller_depth >= 1:
-            return {
-                "success": False,
-                "output": "",
-                "error": "spawn_agent cannot be called from within a sub-agent (max nesting depth: 1).",
-                "exit_code": -1,
-                "error_type": "fundamentally_wrong_approach",
-                "recoverable": False,
-                "suggestion": "Do not spawn sub-agents from within a sub-agent; perform the work directly.",
-            }
-
-        if self._owner._sub_agent_factory is None:
-            return {
-                "success": False,
-                "output": "",
-                "error": "spawn_agent: sub_agent_factory not configured.",
-                "exit_code": -1,
-                "error_type": "impossible_with_current_tools",
-                "recoverable": False,
-                "suggestion": "The agent runtime is missing sub-agent support; this cannot be recovered in-flight.",
-            }
-
-        # Concurrency cap — preserve current managed-record semantics.
-        # Scheduled launches still use source="on-demand" until the later
-        # running-agent visibility/cap policy change decides otherwise.
-        current_managed = get_agent_registry().count_managed()
-        if current_managed >= self._owner._max_subagents:
-            return {
-                "success": False,
-                "output": "",
-                "error": (
-                    f"spawn_agent: max_subagents cap reached ({current_managed}/{self._owner._max_subagents}). "
-                    "Wait for a managed sub-agent to finish or cancel one with /agents cancel managed."
-                ),
-                "exit_code": -1,
-                "error_type": "tool_timeout",
-                "recoverable": True,
-                "suggestion": "Wait for an existing sub-agent to finish, then retry.",
-            }
-
-        # response_format — how the sub-agent should return its result
-        response_format = args.get("response_format", "text").lower()
-        if response_format not in ("text", "json", "file"):
-            response_format = "text"
-        if response_format == "json":
-            task = task + "\n\nReturn your entire answer as a single valid JSON object. Do not include any prose or markdown fences."
-        elif response_format == "file":
-            task = task + "\n\nWrite your output to a file and return only the absolute file path as your answer."
-
-        model = args.get("model") or None
-        context_key = args.get("context_key") or None
-        if context_key:
-            try:
-                context_key = context_io._validate_context_key(str(context_key))
-            except ValueError as exc:
-                return {
-                    "success": False,
-                    "output": "",
-                    "error": f"spawn_agent: invalid context_key: {exc}",
-                    "exit_code": -1,
-                    "error_type": "permission_denied",
-                    "recoverable": False,
-                    "suggestion": "Use a context_key with only letters, digits, underscore, dash, or dot.",
-                }
-
-        # context_payload — parent context shared with sub-agent
-        context_payload = args.get("context_payload")
-        if isinstance(context_payload, str):
-            try:
-                context_payload = json.loads(context_payload)
-            except Exception:  # noqa: BLE001
-                context_payload = {"parent_note": context_payload}
-        if context_payload is None:
-            # Implicit context: build an automatic summary from available sources.
-            from prompt_loader import build_spawn_context_summary
-            context_payload = build_spawn_context_summary(
-                user_goal=task,
-                working=self._owner._working,
-                memory=self._owner._memory,
-                results=self._owner._results,
-                graph_memory=self._owner._graph_memory,
-            )
-        if not isinstance(context_payload, dict):
-            context_payload = {"parent_note": str(context_payload)}
+        context_payload = _build_context_payload(task, args, self._owner)
+        overrides = _coerce_overrides(args)
 
         fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
         # Internal supervision controls (job tag, callbacks, notify/expandable)
         # arrive via `options`, never through the model-facing `args` dict.
-        label = options.job_tag or context_key or "on-demand"
 
         # Build the sub-agent via factory
         max_iterations = args.get("max_iterations")  # None = use factory default (scheduled_max_iter)
@@ -190,23 +246,6 @@ class AgentTools:
                     max_iterations = None  # treat 0/negative as "use default"
             except (ValueError, TypeError):
                 max_iterations = None
-
-        # Optional per-call LLM parameter overrides
-        _raw_max_tokens = args.get("max_tokens")
-        _raw_temperature = args.get("temperature")
-        _raw_top_p = args.get("top_p")
-        try:
-            max_tokens_override = int(_raw_max_tokens) if _raw_max_tokens is not None else None
-        except (ValueError, TypeError):
-            max_tokens_override = None
-        try:
-            temperature_override = float(_raw_temperature) if _raw_temperature is not None else None
-        except (ValueError, TypeError):
-            temperature_override = None
-        try:
-            top_p_override = float(_raw_top_p) if _raw_top_p is not None else None
-        except (ValueError, TypeError):
-            top_p_override = None
 
         # Construction profile travels through the internal factory channel only
         # (never through the model-facing ``args`` dict). Scheduled launches carry
@@ -227,9 +266,9 @@ class AgentTools:
             notify_fn=None,   # factory sets this from main notify_fn
             fallback_models=fallback_models,
             max_iterations=max_iterations,
-            max_tokens=max_tokens_override,
-            temperature=temperature_override,
-            top_p=top_p_override,
+            max_tokens=overrides["max_tokens"],
+            temperature=overrides["temperature"],
+            top_p=overrides["top_p"],
             trace_id=trace_id or None,
             context_payload=context_payload,
             runtime_profile=runtime_profile,

@@ -203,7 +203,7 @@ class TestExecutionPassesFallback:
                       cron="0 0 * * *", model="model-a", fallback_models=fb)
 
         mock_executor = MagicMock()
-        mock_executor._exec_spawn_agent = MagicMock(return_value={
+        mock_executor.spawn_agent = MagicMock(return_value={
             "success": True, "output": json.dumps({"agent_id": "sa-test123"}),
             "error": "", "exit_code": 0,
         })
@@ -213,8 +213,8 @@ class TestExecutionPassesFallback:
         sched._run_job(tag="exec_test")
 
         # Verify spawn_agent was called with fallback_models in args
-        mock_executor._exec_spawn_agent.assert_called_once()
-        spawn_args = mock_executor._exec_spawn_agent.call_args[0][0]
+        mock_executor.spawn_agent.assert_called_once()
+        spawn_args = mock_executor.spawn_agent.call_args[0][0]
         assert spawn_args["fallback_models"] == fb
         assert spawn_args["model"] == "model-a"
         assert spawn_args["task"] == "do work"
@@ -225,7 +225,7 @@ class TestExecutionPassesFallback:
                       cron="0 0 * * *", model="model-x")
 
         mock_executor = MagicMock()
-        mock_executor._exec_spawn_agent = MagicMock(return_value={
+        mock_executor.spawn_agent = MagicMock(return_value={
             "success": True, "output": json.dumps({"agent_id": "sa-xyz"}),
             "error": "", "exit_code": 0,
         })
@@ -233,7 +233,7 @@ class TestExecutionPassesFallback:
 
         sched._run_job(tag="no_fb_exec")
 
-        spawn_args = mock_executor._exec_spawn_agent.call_args[0][0]
+        spawn_args = mock_executor.spawn_agent.call_args[0][0]
         assert "fallback_models" not in spawn_args
 
     def test_spawn_args_pass_empty_list(self, sched):
@@ -242,7 +242,7 @@ class TestExecutionPassesFallback:
                       cron="0 0 * * *", fallback_models=[])
 
         mock_executor = MagicMock()
-        mock_executor._exec_spawn_agent = MagicMock(return_value={
+        mock_executor.spawn_agent = MagicMock(return_value={
             "success": True, "output": json.dumps({"agent_id": "sa-abc"}),
             "error": "", "exit_code": 0,
         })
@@ -250,7 +250,7 @@ class TestExecutionPassesFallback:
 
         sched._run_job(tag="empty_fb")
 
-        spawn_args = mock_executor._exec_spawn_agent.call_args[0][0]
+        spawn_args = mock_executor.spawn_agent.call_args[0][0]
         assert spawn_args["fallback_models"] == []
 
     def test_preserve_context_normalizes_space_containing_tag(self, sched):
@@ -263,7 +263,7 @@ class TestExecutionPassesFallback:
         }
 
         mock_executor = MagicMock()
-        mock_executor._exec_spawn_agent = MagicMock(return_value={
+        mock_executor.spawn_agent = MagicMock(return_value={
             "success": True, "output": json.dumps({"agent_id": "sa-space"}),
             "error": "", "exit_code": 0,
         })
@@ -271,7 +271,7 @@ class TestExecutionPassesFallback:
 
         sched._run_job(tag="Nightly Health Check")
 
-        spawn_args = mock_executor._exec_spawn_agent.call_args[0][0]
+        spawn_args = mock_executor.spawn_agent.call_args[0][0]
         assert spawn_args["context_key"] == "nightly_health_check"
 
     def test_preserve_context_long_tag_passes_validator(self, sched):

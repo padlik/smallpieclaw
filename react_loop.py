@@ -17,6 +17,7 @@ import re
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -51,9 +52,30 @@ _TOOL_ICONS: dict[str, str] = {
 }
 _DEFAULT_TOOL_ICON = "🔧"
 
+# Safety ceiling used when the operator chooses an "unlimited" step extension.
+# It is not a real unlimited loop; it is large enough to be effectively
+# unlimited while still protecting against runaway execution.
+_EFFECTIVELY_UNLIMITED_STEPS = 10_000_000
+_RE_PROMPT = "__re_prompt__"
+
 
 def _tool_icon(name: str) -> str:
     return _TOOL_ICONS.get(name, _DEFAULT_TOOL_ICON)
+
+
+def _coerce_args(args: object) -> dict:
+    """Coerce list args into an integer-key dict; pass dicts through unchanged.
+
+    Bare strings are wrapped as ``{"_raw": s}`` so downstream tool dispatch
+    preserves the payload (mirrors the defense-in-depth in ``_dispatch_tool``).
+    """
+    if isinstance(args, list):
+        return {str(i): v for i, v in enumerate(args)}
+    if isinstance(args, str):
+        return {"_raw": args}
+    if not isinstance(args, dict):
+        return {}
+    return args
 
 
 def _is_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -> bool:
@@ -105,7 +127,7 @@ def _format_parent_context(ctx: ReactContext) -> str:
     """
     if ctx.depth == 0:
         return ""
-    payload = getattr(ctx, "_context_payload", None)
+    payload = ctx._context_payload
     if not payload:
         return ""
     try:
@@ -426,9 +448,11 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
 
     # Zone gate: vision_query reads a file, so apply the same gate as file_read.
     real_path = os.path.realpath(os.path.expanduser(path))
-    checker = getattr(ctx, "trusted_zone_checker", None)
+    checker = ctx.trusted_zone_checker
+    needs_confirm = False
+    reason = ""
     if checker is not None:
-        builtin = getattr(ctx, "builtin_executor", None)
+        builtin = ctx.builtin_executor
         request_grants = (
             builtin.grant_tracker.snapshot()
             if builtin is not None and builtin.grant_tracker is not None
@@ -438,42 +462,40 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
             path, operation="read",
             request_grants=request_grants,
         )
-        sensitive, reason = _is_sensitive_path(real_path)
+        sensitive, zone_reason = _is_sensitive_path(real_path)
         if zone == ZoneClassification.UNRECOGNISED or sensitive:
-            builtin = getattr(ctx, "builtin_executor", None)
-            if builtin is None:
-                return {
-                    "success": False, "output": "",
-                    "error": "vision_query: confirmation infrastructure not available.",
-                }
-            desc = f"Vision query: <code>{path}</code>"
-            if real_path != path:
-                desc += f"\n(→ <code>{real_path}</code>)"
-            if sensitive:
-                desc += f"\n⚠️ Reason: {reason}"
-            return builtin._requires_confirmation(
-                "vision_query", args, desc,
-                caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
-                zone_path=real_path,
-            )
+            needs_confirm = True
+            reason = zone_reason if sensitive else "Unrecognised zone"
     else:
         # Checker unwired: degrade to sensitive-only gate (same as file_read).
         logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for vision_query")
-        sensitive, reason = _is_sensitive_path(real_path)
+        sensitive, zone_reason = _is_sensitive_path(real_path)
         if sensitive:
-            builtin = getattr(ctx, "builtin_executor", None)
-            if builtin is None:
-                return {
-                    "success": False, "output": "",
-                    "error": "vision_query: confirmation infrastructure not available.",
-                }
-            desc = f"Vision query: <code>{path}</code>\n⚠️ Reason for confirmation: {reason}"
-            if real_path != path:
-                desc += f"\n(→ <code>{real_path}</code>)"
-            return builtin._requires_confirmation(
-                "vision_query", args, desc,
-                caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
-            )
+            needs_confirm = True
+            reason = zone_reason
+
+    if needs_confirm:
+        builtin = ctx.builtin_executor
+        if builtin is None:
+            return {
+                "success": False, "output": "",
+                "error": "vision_query: confirmation infrastructure not available.",
+            }
+        desc = f"Vision query: <code>{path}</code>"
+        if real_path != path:
+            desc += f"\n(→ <code>{real_path}</code>)"
+        desc += f"\n⚠️ Reason for confirmation: {reason}"
+        confirm_kwargs: dict = {
+            "caller_depth": ctx.depth,
+            "caller_tag": ctx.caller_tag,
+        }
+        # Only pass zone_path when the checker classified the path as
+        # UNRECOGNISED — not on the checker-unwired sensitive-only fallback.
+        if checker is not None:
+            confirm_kwargs["zone_path"] = real_path
+        return builtin._requires_confirmation(
+            "vision_query", args, desc, **confirm_kwargs,
+        )
 
     encoded = _encode_images([path])
     if not encoded:
@@ -610,13 +632,12 @@ class _Turn:
 
 def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
     """Assemble the full system prompt string for a run."""
-    pfx = ""
     _job_history_section = ""
     if ctx.job_history_fn:
         try:
             _job_history_section = ctx.job_history_fn() or ""
         except Exception as _jh_exc:
-            logger.warning("%sFailed to get job history: %s", pfx, _jh_exc)
+            logger.warning("Failed to get job history: %s", _jh_exc)
 
     _graph_context_section = ""
     if ctx.graph_memory is not None:
@@ -627,11 +648,11 @@ def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
                 ) or ""
             )
             if _graph_context_section:
-                logger.info("%sGraph memory context injected", pfx)
+                logger.info("Graph memory context injected")
             else:
-                logger.debug("%sGraph memory context: no relevant data found", pfx)
+                logger.debug("Graph memory context: no relevant data found")
         except Exception as _gm_exc:
-            logger.debug("%sGraph memory context failed: %s", pfx, _gm_exc)
+            logger.debug("Graph memory context failed: %s", _gm_exc)
 
     strategies_section = ""
     if ctx.strategy_memory is not None:
@@ -642,7 +663,7 @@ def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
             strategies_section = format_strategies_for_prompt(strategies)
 
     parent_context_section = _format_parent_context(ctx)
-    _sub_agent_prompt_variant = getattr(ctx, "_prompt_variant", None) if ctx.depth >= 1 else None
+    _sub_agent_prompt_variant = ctx._prompt_variant if ctx.depth >= 1 else None
 
     system, _ = _build_system_prompt(
         tool_index=ctx.tool_index,
@@ -675,11 +696,10 @@ def _init_messages(
     images: Optional[list[str]],
 ) -> tuple[list[dict], int]:
     """Build the initial messages list and return (messages, goal_idx)."""
-    pfx = ""
     first_msg: dict = {"role": "user", "content": user_goal}
     if images:
         first_msg["images"] = images
-        logger.info("%s%d image(s) attached to request", pfx, len(images))
+        logger.info("%d image(s) attached to request", len(images))
 
     messages: list[dict] = []
     if ctx.short_term:
@@ -694,27 +714,22 @@ def _init_messages(
 
 def _ensure_tool_defs(ctx: ReactContext) -> None:
     """Lazily build _tool_defs if not already populated."""
-    pfx = ""
     if ctx._tool_defs is None:
         try:
             ctx._tool_defs = build_tool_definitions(
                 mcp_manager=ctx.mcp_manager,
             )
         except Exception as _btd_exc:  # noqa: BLE001
-            logger.warning(
-                "%sbuild_tool_definitions failed: %s — MCP tools skipped",
-                pfx, _btd_exc,
-            )
+            logger.warning("build_tool_definitions failed: %s — MCP tools skipped", _btd_exc, )
             ctx._tool_defs = build_tool_definitions(mcp_manager=None)
 
 
 def _normalize_shorthand_action(action_obj: dict) -> dict:
     """Normalize shorthand action keys to canonical form. Returns the (possibly mutated) dict."""
-    pfx = ""
     action = action_obj.get("action", "")
     if action not in _BUILTIN_NAMES:
         return action_obj
-    logger.warning("%sLLM used shorthand action '%s' — normalizing to tool call", pfx, action)
+    logger.warning("LLM used shorthand action '%s' — normalizing to tool call", action)
     if "args" in action_obj:
         shorthand_args = action_obj["args"]
         if isinstance(shorthand_args, str):
@@ -723,20 +738,78 @@ def _normalize_shorthand_action(action_obj: dict) -> dict:
                 if isinstance(parsed, (dict, list)):
                     shorthand_args = parsed
                 else:
-                    logger.warning(
-                        "Shorthand action '%s' args parsed to non-dict type %s — wrapping in _raw",
-                        action, type(parsed).__name__,
-                    )
+                    logger.warning("Shorthand action '%s' args parsed to non-dict type %s — wrapping in _raw", action, type(parsed).__name__, )
                     shorthand_args = {"_raw": shorthand_args}
             except (ValueError, TypeError):
-                logger.warning(
-                    "Shorthand action '%s' args is a non-JSON string — wrapping in _raw: %s",
-                    action, shorthand_args[:200],
-                )
+                logger.warning("Shorthand action '%s' args is a non-JSON string — wrapping in _raw: %s", action, shorthand_args[:200], )
                 shorthand_args = {"_raw": shorthand_args}
     else:
         shorthand_args = {k: v for k, v in action_obj.items() if k != "action"}
     return {"action": "tool", "tool": action, "args": shorthand_args}
+
+
+def _handle_non_json(state: _LoopState, turn: _Turn) -> str:
+    """Handle a turn that did not yield a parseable JSON action.
+
+    Increments the consecutive non-JSON streak, logs the raw output, and either
+    returns an error message that should abort the loop (when the streak reaches
+    the limit) or returns the sentinel ``_RE_PROMPT`` so the caller can continue.
+    """
+    state.json_fail_streak += 1
+    logger.warning(
+        "LLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
+        state.step, state.max_steps, state.json_fail_streak, len(turn.raw), turn.raw[:1000],
+    )
+    if state.json_fail_streak >= _JSON_FAIL_LIMIT:
+        logger.error("Non-JSON streak reached %d — aborting with protocol error", state.json_fail_streak)
+        return (
+            f"❌ Agent protocol error: model returned non-JSON "
+            f"{state.json_fail_streak} times in a row. "
+            f"Last response (truncated to 500 chars): {turn.raw[:500]}"
+        )
+    state.messages.append({"role": "assistant", "content": turn.raw})
+    state.messages.append({
+        "role": "user",
+        "content": (
+            'ERROR: Your response was not valid JSON. '
+            'You MUST respond with ONLY a raw JSON object — no markdown, '
+            'no prose, no ```json fences. Example: '
+            '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
+        ),
+    })
+    return _RE_PROMPT
+
+
+def _action_from_turn(turn: _Turn, state: _LoopState) -> tuple[dict, Callable[[str], None]]:
+    """Extract the action dict and result sink from a parsed LLM turn.
+
+    For native tool calls, maps supported tool names (plan/finish/tool) into the
+    canonical action object and uses a native-format result sink. For parsed JSON
+    text, normalizes shorthand actions and uses the plain-text result sink.
+    """
+    if turn.tool_calls:
+        tc = turn.tool_calls[0]
+        if tc.name == "plan":
+            action_obj: dict = {"action": "plan", "plan": tc.arguments}
+        elif tc.name == "finish":
+            action_obj = {"action": "finish", "result": (tc.arguments or {}).get("result", "Done.")}
+        else:
+            action_obj = {"action": "tool", "tool": tc.name, "args": tc.arguments}
+        return action_obj, _result_sink(state, tc)
+
+    action_obj = parse_json(turn.raw)
+    if action_obj is None and turn.text_from_native:
+        logger.warning(
+            "Native path: model returned prose (no tool_calls) — treating as finish. "
+            "In json_mode this would re-prompt; with native tool calling the run ends here.",
+        )
+        action_obj = {"action": "finish", "result": turn.raw}
+    if action_obj is None:
+        raise ValueError("non-json")  # caller should run _handle_non_json
+    state.json_fail_streak = 0
+    state.messages.append({"role": "assistant", "content": turn.raw})
+    action_obj = _normalize_shorthand_action(action_obj)
+    return action_obj, _result_sink(state)
 
 
 def _request_turn(
@@ -744,9 +817,9 @@ def _request_turn(
     state: _LoopState,
     system: str,
     progress: Callable[[str], None],
+    supports_native_fallback: bool = False,
 ) -> _Turn:
     """Make one LLM call and return the structured turn result."""
-    pfx = ""
     raw = ""
     tool_calls: list[ToolCall] = []
     native_attempted = False
@@ -754,10 +827,7 @@ def _request_turn(
     linearized_messages = None
     _MAX_EMPTY_RETRIES = 2
 
-    _supports_native = hasattr(ctx.llm, "chat_with_tools_fallback") and callable(
-        ctx.llm.chat_with_tools_fallback
-    )
-    if ctx._tool_defs and _supports_native:
+    if ctx._tool_defs and supports_native_fallback:
         try:
             response = ctx.llm.chat_with_tools_fallback(
                 state.messages, tools=ctx._tool_defs, system=system, progress_cb=progress,
@@ -769,16 +839,13 @@ def _request_turn(
                 raw = response.text
                 text_from_native = True
         except NotImplementedError:
-            logger.debug("%sNative tool calling not supported by provider — falling back to json_mode", pfx)
+            logger.debug("Native tool calling not supported by provider — falling back to json_mode")
         except LLMPermanentError:
             raise
         except LLMError:
-            logger.warning("%sNative tool calling failed (LLMError) — falling back to json_mode", pfx)
+            logger.warning("Native tool calling failed (LLMError) — falling back to json_mode")
         except Exception as exc:
-            logger.warning(
-                "%sNative tool calling unexpected error: %s — falling back to json_mode",
-                pfx, exc,
-            )
+            logger.warning("Native tool calling unexpected error: %s — falling back to json_mode", exc, )
 
     if not raw and not native_attempted:
         linearized_messages = _linearize_native_turns(state.messages)
@@ -797,10 +864,7 @@ def _request_turn(
             if raw.strip():
                 break
             if attempt < _MAX_EMPTY_RETRIES:
-                logger.warning(
-                    "%sLLM returned empty response (step %d/%d), retrying (%d/%d)…",
-                    pfx, state.step, state.max_steps, attempt + 1, _MAX_EMPTY_RETRIES,
-                )
+                logger.warning("LLM returned empty response (step %d/%d), retrying (%d/%d)…", state.step, state.max_steps, attempt + 1, _MAX_EMPTY_RETRIES, )
                 progress(f"⏳ Empty LLM response, retrying ({attempt + 1}/{_MAX_EMPTY_RETRIES})…")
 
     return _Turn(tool_calls, raw, text_from_native, None, linearized_messages)
@@ -840,9 +904,9 @@ def _dispatch_action(
 
     if action == "tool":
         tool_name = action_obj.get("tool", "")
-        args = action_obj.get("args", {})
-        if isinstance(args, list):
-            args = {str(i): v for i, v in enumerate(args)}
+        raw_args = action_obj.get("args", {})
+        args = _coerce_args(raw_args)
+        if args is not raw_args:
             action_obj = {**action_obj, "args": args}
         _t0 = time.time()
         # vision_query needs LLM access — call directly, never through _dispatch_tool
@@ -866,11 +930,7 @@ def _dispatch_action(
         if outcome.get("success", False):
             logger.info("Tool '%s' result: success=True", tool_name)
         else:
-            logger.warning(
-                "Tool '%s' result: success=False | error=%s | args=%s",
-                tool_name, outcome.get("error", ""),
-                {k: str(v)[:120] for k, v in args.items()},
-            )
+            logger.warning("Tool '%s' result: success=False | error=%s | args=%s", tool_name, outcome.get("error", ""), {k: str(v)[:120] for k, v in args.items()}, )
         progress(fmt_tool_result_progress(tool_name, args, outcome))
         sink(tool_result)
         if outcome.get("_operator_cancelled") or ctx.cancel_event.is_set():
@@ -900,14 +960,13 @@ def react_loop(
 ) -> str:
     """Execute the ReAct loop: LLM → parse → dispatch → repeat. Returns the final answer string."""
     run_start = time.time()
-    pfx = ""
     _ctx_tokens = agent_logging.bind_run_context(trace=ctx.trace_id, agent=ctx.label)
     agent_logging.log_event(agent_logging.LogEvent.RUN_BEGIN, "run begin", level=logging.INFO, logger=slog)
 
     def _progress(msg: str):
         if progress_callback:
             progress_callback(msg)
-        logger.debug("%sAgent progress: %s", pfx, msg)
+        logger.debug("Agent progress: %s", msg)
 
     try:
         ctx._tool_defs = None
@@ -915,7 +974,7 @@ def react_loop(
             ctx.cancel_event.clear()
 
         active_model = ctx.llm.llm_cfg.get("model", "?")
-        logger.info("%sstart | model: %s | goal: %s", pfx, active_model, user_goal[:80])
+        logger.info("start | model: %s | goal: %s", active_model, user_goal[:80])
 
         if ctx.working:
             ctx.working.start_task(user_goal)
@@ -928,20 +987,24 @@ def react_loop(
             try:
                 ctx.graph_memory_writer.enqueue(user_goal, source="chat")
             except Exception as _gw_exc:  # noqa: BLE001
-                logger.debug("%sGraph memory enqueue failed: %s", pfx, _gw_exc)
+                logger.debug("Graph memory enqueue failed: %s", _gw_exc)
 
         _ensure_tool_defs(ctx)
+
+        _supports_native_fallback = hasattr(ctx.llm, "chat_with_tools_fallback") and callable(
+            ctx.llm.chat_with_tools_fallback
+        )
 
         state = _LoopState(messages=messages, goal_idx=goal_idx, max_steps=ctx.max_iterations)
 
         while True:
             while state.step < state.max_steps:
                 if ctx.cancel_event.is_set():
-                    logger.warning("%scancelled at step %d/%d", pfx, state.step, state.max_steps)
+                    logger.warning("cancelled at step %d/%d", state.step, state.max_steps)
                     return "[Cancelled]"
 
                 if not state.warned_inactivity and state.step > 1:
-                    warn_minutes = getattr(ctx, "inactivity_warn_minutes", 0)
+                    warn_minutes = ctx.inactivity_warn_minutes
                     if warn_minutes and (time.time() - state.last_action_time) > (warn_minutes * 60):
                         state.warned_inactivity = True
                         minutes = round((time.time() - state.last_action_time) / 60)
@@ -964,73 +1027,32 @@ def react_loop(
                     try:
                         ctx.on_step(state.step)
                     except Exception:
-                        pass
+                        logger.debug("on_step callback failed", exc_info=True)
                 active_model = ctx.llm.llm_cfg.get("model", "?")
-                logger.info("%sstep %d/%d | model: %s", pfx, state.step, state.max_steps, active_model)
+                logger.info("step %d/%d | model: %s", state.step, state.max_steps, active_model)
                 _progress(f"⚙️ Thinking… (step {state.step})")
 
                 state.messages, state.goal_idx = maybe_compact(
                     state.messages, system, ctx.ctx_max_tokens, ctx.llm, goal_idx=state.goal_idx,
                 )
 
-                turn = _request_turn(ctx, state, system, _progress)
+                turn = _request_turn(
+                    ctx, state, system, _progress,
+                    supports_native_fallback=_supports_native_fallback,
+                )
                 if turn.early_return is not None:
                     return turn.early_return
                 if turn.linearized_messages is not None:
                     state.messages = turn.linearized_messages
 
-                if turn.tool_calls:
-                    tc = turn.tool_calls[0]
-                    if tc.name == "plan":
-                        action_obj = {"action": "plan", "plan": tc.arguments}
-                    elif tc.name == "finish":
-                        action_obj = {"action": "finish", "result": (tc.arguments or {}).get("result", "Done.")}
-                    else:
-                        action_obj = {"action": "tool", "tool": tc.name, "args": tc.arguments}
-                    sink = _result_sink(state, tc)
-                else:
-                    action_obj = parse_json(turn.raw)
-                    if action_obj is None and turn.text_from_native:
-                        logger.warning(
-                            "%sNative path: model returned prose (no tool_calls) — treating as finish. "
-                            "In json_mode this would re-prompt; with native tool calling the run ends here.",
-                            pfx,
-                        )
-                        action_obj = {"action": "finish", "result": turn.raw}
-                    if action_obj is None:
-                        state.json_fail_streak += 1
-                        logger.warning(
-                            "%sLLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
-                            pfx, state.step, state.max_steps, state.json_fail_streak,
-                            len(turn.raw), turn.raw[:1000],
-                        )
-                        if state.json_fail_streak >= _JSON_FAIL_LIMIT:
-                            logger.error(
-                                "%sNon-JSON streak reached %d — aborting with protocol error",
-                                pfx, state.json_fail_streak,
-                            )
-                            err_msg = (
-                                f"❌ Agent protocol error: model returned non-JSON "
-                                f"{state.json_fail_streak} times in a row. "
-                                f"Last response (truncated to 500 chars): {turn.raw[:500]}"
-                            )
-                            _progress(err_msg)
-                            return err_msg
-                        state.messages.append({"role": "assistant", "content": turn.raw})
-                        state.messages.append({
-                            "role": "user",
-                            "content": (
-                                'ERROR: Your response was not valid JSON. '
-                                'You MUST respond with ONLY a raw JSON object — no markdown, '
-                                'no prose, no ```json fences. Example: '
-                                '{"action": "tool", "tool": "shell", "args": {"command": "df -h"}}'
-                            ),
-                        })
+                try:
+                    action_obj, sink = _action_from_turn(turn, state)
+                except ValueError:
+                    err_msg = _handle_non_json(state, turn)
+                    if err_msg == _RE_PROMPT:
                         continue
-                    state.json_fail_streak = 0
-                    state.messages.append({"role": "assistant", "content": turn.raw})
-                    action_obj = _normalize_shorthand_action(action_obj)
-                    sink = _result_sink(state)
+                    _progress(err_msg)
+                    return err_msg
 
                 final = _dispatch_action(
                     ctx, action_obj, sink, state, user_goal, run_start, _progress,
@@ -1050,13 +1072,13 @@ def react_loop(
 
             ext_response = ctx.confirmation.request_extension(state.max_steps, _progress)
             if ext_response == "unlimited":
-                state.max_steps = 10_000_000
-                logger.info("%sAgent steps set to unlimited by user", pfx)
-                _progress("♾️ Running until done (unlimited steps)…")
+                state.max_steps = _EFFECTIVELY_UNLIMITED_STEPS
+                logger.info("Agent steps set to effectively unlimited by user")
+                _progress("♾️ Running until done (effectively unlimited, capped at 10M for safety)…")
                 continue
             elif ext_response == "yes":
                 state.max_steps += 10
-                logger.info("%sAgent steps extended to %d by user", pfx, state.max_steps)
+                logger.info("Agent steps extended to %d by user", state.max_steps)
                 _progress(f"⏩ Extended — continuing to step {state.max_steps}…")
                 continue
             break
@@ -1121,21 +1143,19 @@ def _run_plan(
 ) -> tuple[str, int, bool]:
     """Execute a plan. Returns (result_message, new_max_steps, success)."""
     from execution_plan import ExecutionPlan, PlanExecutor, PlanStep  # noqa: PLC0415
-
-    pfx = ""
     old_max_steps = max_steps
-    plan_limit = getattr(ctx, "plan_max_iterations", 0) or (ctx.max_iterations + 20)
+    plan_limit = ctx.plan_max_iterations or (ctx.max_iterations + 20)
     if plan_limit > _ABSOLUTE_PLAN_CEILING:
         plan_limit = _ABSOLUTE_PLAN_CEILING
-        logger.warning("%splan | clamped plan_max_iterations to %d", pfx, _ABSOLUTE_PLAN_CEILING)
+        logger.warning("plan | clamped plan_max_iterations to %d", _ABSOLUTE_PLAN_CEILING)
     if plan_limit > max_steps:
         max_steps = plan_limit
-        logger.info("%splan | raised max_steps from %d to %d", pfx, old_max_steps, max_steps)
+        logger.info("plan | raised max_steps from %d to %d", old_max_steps, max_steps)
 
     _t0 = time.time()
     plan_success = True
     progress("📋 Executing plan…")
-    logger.info("%splan | description: %s", pfx, plan_data.get("description", "")[:60])
+    logger.info("plan | description: %s", plan_data.get("description", "")[:60])
     try:
         steps_raw = plan_data.get("steps", [])
         steps = [
@@ -1155,17 +1175,17 @@ def _run_plan(
         )
         executor = PlanExecutor(max_concurrent=ctx.max_subagents)
         plan_result = executor.execute(plan, ctx, progress_cb=progress)
-        logger.info("%splan | completed | results: %d", pfx, len(plan_result.get("results", {})))
+        logger.info("plan | completed | results: %d", len(plan_result.get("results", {})))
         if max_steps > old_max_steps:
             max_steps = old_max_steps + 10
             if max_steps > _ABSOLUTE_PLAN_CEILING:
                 max_steps = _ABSOLUTE_PLAN_CEILING
-            logger.info("%splan | adjusted max_steps to %d after completion", pfx, max_steps)
+            logger.info("plan | adjusted max_steps to %d after completion", max_steps)
         result_msg = f"Plan execution results:\n{json.dumps(plan_result, ensure_ascii=False, indent=2)}"
     except Exception as exc:
         plan_success = False
         result_msg = f"Plan execution failed: {type(exc).__name__}: {exc}"
-        logger.error("%s%s", pfx, result_msg)
+        logger.error(result_msg)
 
     _duration_ms = (time.time() - _t0) * 1000
     _emit_tool_trace(ctx, "plan", plan_data, success=plan_success, duration_ms=_duration_ms,
@@ -1184,7 +1204,6 @@ def _finish_run(
     run_start: float,
 ) -> str:
     """Handle a finish action: coerce result, summarize, persist outcome. Returns the final result string."""
-    pfx = ""
     result = action_obj.get("result", "Done.")
     if not isinstance(result, str):
         if isinstance(result, (dict, list)):
@@ -1193,7 +1212,7 @@ def _finish_run(
             result = str(result) if result else "Done."
     elapsed = time.time() - run_start
     active_model = ctx.llm.llm_cfg.get("model", "?")
-    logger.info("%sfinish | model: %s | steps: %d | elapsed: %.1fs", pfx, active_model, step, elapsed)
+    logger.info("finish | model: %s | steps: %d | elapsed: %.1fs", active_model, step, elapsed)
     ctx.memory.record_event(f"Agent finished: {result[:80]}")
     if ctx.short_term:
         ctx.short_term.add("user", user_goal)
@@ -1236,12 +1255,122 @@ def _finish_run(
                 daemon=True,
             )
             _thread.start()
-            logger.debug("%sStrategy extraction thread started", pfx)
+            logger.debug("Strategy extraction thread started")
         except Exception as _se_exc:  # noqa: BLE001
-            logger.debug("%sStrategy extraction start failed: %s", pfx, _se_exc)
+            logger.debug("Strategy extraction start failed: %s", _se_exc)
     if ctx.working:
         ctx.working.clear()
     return result
+
+
+def _emit_tool_lifecycle(
+    tool_name: str,
+    start: float,
+    outcome_or_exc: object,
+    *,
+    auth_recheck: Optional[tuple[ReactContext, str]] = None,
+) -> Optional[dict]:
+    """Emit matching TOOL_END or TOOL_FAILED events for a completed tool call.
+
+    ``start`` is the ``time.perf_counter()`` value captured when the tool began.
+    ``outcome_or_exc`` may be the result dict returned by the tool backend or an
+    exception instance that escaped the call.  The helper computes duration, emits
+    lifecycle events to ``slog``, and returns the final outcome dict when an
+    outcome was supplied, or ``None`` when an exception was supplied.
+
+    For MCP calls, pass ``auth_recheck=(ctx, tool_name)`` so that the helper can
+    translate an MCP auth failure into the standard error result dict before
+    emitting TOOL_FAILED.
+    """
+    dur_ms = int((time.perf_counter() - start) * 1000)
+    if isinstance(outcome_or_exc, BaseException):
+        # Only TOOL_FAILED here — an additional ERROR event would double-count
+        # the same failure for anything aggregating agent.jsonl by event_type.
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_FAILED,
+            f"tool failed: {tool_name}",
+            level=logging.ERROR,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=-1,
+            err=str(outcome_or_exc),
+        )
+        return None
+
+    outcome: dict = outcome_or_exc  # type: ignore[assignment]
+    if auth_recheck is not None:
+        mcp_ctx, mcp_tool = auth_recheck
+        if _is_mcp_auth_failure(mcp_ctx, mcp_tool, outcome):
+            outcome = _handle_mcp_auth_failure(mcp_ctx, mcp_tool, outcome)
+
+    if outcome.get("success"):
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_END,
+            f"tool end: {tool_name}",
+            level=logging.INFO,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=outcome.get("exit_code", 0),
+        )
+    else:
+        agent_logging.log_event(
+            agent_logging.LogEvent.TOOL_FAILED,
+            f"tool failed: {tool_name}",
+            level=logging.ERROR,
+            logger=slog,
+            tool=tool_name,
+            dur_ms=dur_ms,
+            exit=outcome.get("exit_code", -1),
+            err=outcome.get("error", "") or "",
+        )
+    return outcome
+
+
+class _ToolSpanOutcome:
+    """Outcome carrier handed to the body of a :func:`_tool_span` block.
+
+    The body calls :meth:`record` with the tool's raw outcome dict; on exit the
+    span replaces :attr:`outcome` with the post-processed dict (e.g. an MCP auth
+    failure translated into an actionable error), which the caller then returns.
+    """
+
+    def __init__(self) -> None:
+        self.outcome: dict = {}
+
+    def record(self, outcome: dict) -> None:
+        """Store the tool's raw outcome dict for lifecycle emission."""
+        self.outcome = outcome
+
+
+@contextmanager
+def _tool_span(tool_name: str, *, mcp_auth: Optional[tuple[ReactContext, str]] = None):
+    """Context manager emitting TOOL_START / TOOL_END / TOOL_FAILED lifecycle events.
+
+    Yields a :class:`_ToolSpanOutcome`; the body must call ``record(outcome)`` so
+    the span can emit the matching terminal event (or an exception can be raised
+    out of the block).  For MCP tools pass ``mcp_auth=(ctx, tool_name)`` so that
+    authentication failures are translated before the failure event is emitted —
+    read the translated dict from ``.outcome`` after the block exits.
+    """
+    agent_logging.log_event(
+        agent_logging.LogEvent.TOOL_START,
+        f"tool start: {tool_name}",
+        level=logging.INFO,
+        logger=slog,
+        tool=tool_name,
+    )
+    start = time.perf_counter()
+    span = _ToolSpanOutcome()
+    try:
+        yield span
+    except Exception as exc:
+        _emit_tool_lifecycle(tool_name, start, exc)
+        raise
+    final = _emit_tool_lifecycle(tool_name, start, span.outcome, auth_recheck=mcp_auth)
+    if final is not None:
+        span.outcome = final
 
 
 def _dispatch_tool(
@@ -1253,15 +1382,13 @@ def _dispatch_tool(
 
     Adds '_operator_cancelled' key to outcome if the user cancelled.
     """
-    pfx = ""  # run identity is now supplied by structlog contextvars (see agent_logging); avoid double-prefixing
     tool_name = action_obj.get("tool", "")
     args = action_obj.get("args", {})
     if isinstance(args, str):
         # Defense-in-depth: bare string args crash .items()/.get() downstream.
         # _normalize_shorthand_action should have wrapped this already.
         args = {"_raw": args}
-    if isinstance(args, list):
-        args = {str(i): v for i, v in enumerate(args)}
+    args = _coerce_args(args)
 
     _progress(f"{_tool_icon(tool_name)} Running tool: `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
 
@@ -1293,18 +1420,17 @@ def _dispatch_tool(
 
             chunk_callback = _on_chunk
 
-        outcome = ctx.builtin_executor.execute(tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
-                                                chunk_callback=chunk_callback, trace_id=ctx.trace_id)
+        outcome = ctx.builtin_executor.execute(
+            tool_name, args, caller_depth=ctx.depth, caller_tag=ctx.caller_tag,
+            chunk_callback=chunk_callback, trace_id=ctx.trace_id,
+        )
 
         if outcome.get("requires_confirmation"):
             token = outcome["token"]
             description = outcome.get("description", tool_name)
 
             if tool_name in ctx.confirmation.auto_approve_tools:
-                logger.info(
-                    "%sAuto-approving '%s' (operator approved all %s)",
-                    pfx, tool_name, tool_name,
-                )
+                logger.info("Auto-approving '%s' (operator approved all %s)", tool_name, tool_name, )
                 outcome = ctx.builtin_executor.confirm(token, chunk_callback=chunk_callback)
                 _progress(f"✅ Auto-approved `{tool_name}` (approve-all active)")
             else:
@@ -1331,54 +1457,10 @@ def _dispatch_tool(
     # themselves), so without this wrapping MCP tools never appear as TOOL_*
     # events. Field conventions match the builtin/tool executors.
     if ctx.mcp_manager and ctx.mcp_manager.has_tool(tool_name):
-        _mcp_start = time.perf_counter()
-        agent_logging.log_event(
-            agent_logging.LogEvent.TOOL_START,
-            f"tool start: {tool_name}",
-            level=logging.INFO,
-            logger=slog,
-            tool=tool_name,
-        )
-        try:
-            outcome = ctx.mcp_manager.call_tool(tool_name, args)
-        except Exception as exc:
-            dur_ms = int((time.perf_counter() - _mcp_start) * 1000)
-            agent_logging.log_event(
-                agent_logging.LogEvent.TOOL_FAILED,
-                f"tool failed: {tool_name}",
-                level=logging.ERROR,
-                logger=slog,
-                tool=tool_name,
-                dur_ms=dur_ms,
-                exit=-1,
-                err=str(exc),
-            )
-            raise
-        dur_ms = int((time.perf_counter() - _mcp_start) * 1000)
-        if _is_mcp_auth_failure(ctx, tool_name, outcome):
-            outcome = _handle_mcp_auth_failure(ctx, tool_name, outcome)
-        if isinstance(outcome, dict) and outcome.get("success"):
-            agent_logging.log_event(
-                agent_logging.LogEvent.TOOL_END,
-                f"tool end: {tool_name}",
-                level=logging.INFO,
-                logger=slog,
-                tool=tool_name,
-                dur_ms=dur_ms,
-                exit=0,
-            )
-        else:
-            agent_logging.log_event(
-                agent_logging.LogEvent.TOOL_FAILED,
-                f"tool failed: {tool_name}",
-                level=logging.ERROR,
-                logger=slog,
-                tool=tool_name,
-                dur_ms=dur_ms,
-                exit=-1,
-                err=(outcome.get("error", "") if isinstance(outcome, dict) else "") or "",
-            )
-        return outcome
+        with _tool_span(tool_name, mcp_auth=(ctx, tool_name)) as span:
+            span.record(ctx.mcp_manager.call_tool(tool_name, args))
+        # .outcome carries the auth-translated dict, not the raw call result.
+        return span.outcome
 
     # Unknown tool — no hand-written tools exist anymore
     return fail_outcome(f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.")

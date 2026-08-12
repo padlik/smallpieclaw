@@ -16,30 +16,19 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
+import uuid
 from typing import Callable, Optional
 
 from agent_logging import bind_run_context
-from agent_runtime import AgentRuntime
+from agent_runtime import AgentRuntime, ControllerDeps
 from confirmation import ConfirmationManager
 from conversation_io import _load_or_create_conversation_id, _save_conversation
 from llm_client import LLMClient
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
-from prompt_builder import (
-    estimate_tokens as _estimate_tokens,
-    format_log_section as _format_log_section_impl,
-    format_models as _format_models_impl,
-    format_skills as _format_skills_impl,
-    format_tools as _format_tools_impl,
-)
-from react_loop import (
-    extract_json_candidates,
-    fmt_tool_call,
-    fmt_tool_result_progress,
-    format_tool_result,
-    parse_json,
-    react_loop,
-)
+from prompt_builder import estimate_tokens as _estimate_tokens
+from react_loop import react_loop
 from tool_index import ToolIndex
 from trace_context import child_trace_id
 
@@ -138,6 +127,61 @@ class AgentController:
         # the result and unblock the worker thread.
         # ------------------------------------------------------------------
         self._confirmation = ConfirmationManager()
+
+    @property
+    def runtime_deps(self) -> ControllerDeps:
+        """Runtime dependency bundle used by AgentRuntime.build_react_context.
+
+        Returned on demand so post-init wiring (graph memory, strategy memory,
+        registry-installed ``_on_step``, etc.) is captured at run start exactly as
+        the legacy inline assembly did.  Keeping the field set in one place
+        eliminates three-way desync when ``ReactContext``/``ControllerDeps``
+        gain a new shared dependency.
+        """
+        return ControllerDeps(
+            llm=self.llm,
+            tool_index=self.tool_index,
+            memory=self.memory,
+            builtin_executor=self.builtin_executor,
+            mcp_manager=self.mcp_manager,
+            skill_registry=self.skill_registry,
+            max_iterations=self.max_iterations,
+            top_tools=self.top_tools,
+            ctx_max_tokens=self.ctx_max_tokens,
+            tmp_dir=self.tmp_dir,
+            downloads_dir=self.downloads_dir,
+            workspace_dir=self.workspace_dir,
+            log_file=self.log_file,
+            log_backup_count=self.log_backup_count,
+            depth=self._depth,
+            label=self.label,
+            short_term=self.short_term,
+            working=self.working,
+            results=self.results,
+            cancel_event=self._cancel_event,
+            owns_cancel_event=self._owns_cancel_event,
+            on_step=self._on_step,
+            on_tool_trace=self._on_tool_trace,
+            job_history_fn=self._job_history_fn,
+            graph_memory=self._graph_memory,
+            graph_memory_writer=self._graph_memory_writer,
+            graph_memory_max_entries=self._graph_memory_max_entries,
+            strategy_memory=self.strategy_memory,
+            max_subagents=(
+                getattr(self.builtin_executor, "_max_subagents", 6)
+                if self.builtin_executor is not None
+                else 6
+            ),
+            creativity_mode=self.creativity_mode,
+            plan_max_iterations=self.plan_max_iterations,
+            inactivity_warn_minutes=self.inactivity_warn_minutes,
+            confirmation=self._confirmation,
+            trusted_zone_checker=(
+                self.builtin_executor.trusted_zone_checker
+                if self.builtin_executor is not None
+                else None
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -367,53 +411,55 @@ class AgentController:
                 "assistant",
                 f"[Compressed context summary — deterministic fallback]\n{fallback}",
             )
-            after_tokens = _estimate_tokens(fallback)
-            saved = max(0, before_tokens - after_tokens)
-            pct = int(saved / before_tokens * 100) if before_tokens else 0
-            logger.info(
-                "compress_context (fallback): %d → ~%d tokens (%d%% reduction, %d messages → 1)",
-                before_tokens, after_tokens, pct, len(messages),
-            )
-            return (
-                f"⚠️ LLM compression unavailable — applied deterministic truncation.\n"
-                f"  Messages: {len(messages)} → 1\n"
-                f"  Tokens: ~{before_tokens:,} → ~{after_tokens:,} "
-                f"(−{saved:,}, {pct}% smaller)\n"
-                f"  Reason: {exc}"
+            return self._compression_report(
+                before_tokens,
+                _estimate_tokens(fallback),
+                len(messages),
+                fallback=True,
+                reason=str(exc),
             )
 
         self.short_term.clear()
         self.short_term.add("assistant", f"[Compressed context summary]\n{summary}")
 
-        after_tokens = _estimate_tokens(summary)
-        saved = max(0, before_tokens - after_tokens)
-        pct = int(saved / before_tokens * 100) if before_tokens else 0
-        logger.info(
-            "compress_context: %d → ~%d tokens (%d%% reduction, %d messages → 1)",
-            before_tokens, after_tokens, pct, len(messages),
+        return self._compression_report(
+            before_tokens,
+            _estimate_tokens(summary),
+            len(messages),
+            fallback=False,
         )
+
+    def _compression_report(
+        self,
+        before: int,
+        after: int,
+        n_messages: int,
+        *,
+        fallback: bool,
+        reason: str = "",
+    ) -> str:
+        """Build and log a human-readable compression report, then return it."""
+        saved = max(0, before - after)
+        pct = int(saved / before * 100) if before else 0
+        logger.info(
+            "compress_context%s: %d → ~%d tokens (%d%% reduction, %d messages → 1)",
+            " (fallback)" if fallback else "",
+            before, after, pct, n_messages,
+        )
+        if fallback:
+            return (
+                f"⚠️ LLM compression unavailable — applied deterministic truncation.\n"
+                f"  Messages: {n_messages} → 1\n"
+                f"  Tokens: ~{before:,} → ~{after:,} "
+                f"(−{saved:,}, {pct}% smaller)\n"
+                f"  Reason: {reason}"
+            )
         return (
             f"✅ Context compressed.\n"
-            f"  Messages: {len(messages)} → 1\n"
-            f"  Tokens: ~{before_tokens:,} → ~{after_tokens:,} "
+            f"  Messages: {n_messages} → 1\n"
+            f"  Tokens: ~{before:,} → ~{after:,} "
             f"(−{saved:,}, {pct}% smaller)"
         )
-
-    # ------------------------------------------------------------------
-    # Internals (delegates to react_loop module)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _format_tools(tools) -> str:
-        return _format_tools_impl(tools)
-
-    def _format_skills(self) -> str:
-        """Return the AVAILABLE SKILLS prompt section, or empty string if no skills."""
-        return _format_skills_impl(self.skill_registry)
-
-    def _format_models(self) -> str:
-        """Return the AVAILABLE MODELS prompt section listing all configured models."""
-        return _format_models_impl(self.llm)
 
     def list_models(self) -> list[dict]:
         """Return all configured models as a list of dicts."""
@@ -421,32 +467,6 @@ class AgentController:
             return list(self.llm._models)
         except AttributeError:
             return []
-
-    def _format_log_section(self) -> str:
-        """Build the AGENT LOG section for the system prompt."""
-        return _format_log_section_impl(self.log_file, self.log_backup_count)
-
-    @staticmethod
-    def _fmt_tool_call(tool_name: str, args: dict) -> str:
-        return fmt_tool_call(tool_name, args)
-
-    @staticmethod
-    def _fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
-        return fmt_tool_result_progress(tool_name, args, outcome)
-
-    @staticmethod
-    def _format_tool_result(tool_name: str, outcome: dict) -> str:
-        return format_tool_result(tool_name, outcome)
-
-    @staticmethod
-    def _extract_json_candidates(text: str) -> list[str]:
-        return extract_json_candidates(text)
-
-    @staticmethod
-    def _parse_json(text: str) -> Optional[dict]:
-        return parse_json(text)
-
-
 
 # ---------------------------------------------------------------------------
 # SubAgentRunner
@@ -496,7 +516,6 @@ class SubAgentRunner:
         context_payload: dict | None = None,  # Optional parent context dict to inject in system prompt
         prompt_variant: str | None = None,    # None => default system prompts; "sub-agent" => sub-agent prompts
     ):
-        import uuid
         from memory_store import ShortTermMemory, WorkingMemory
 
         self.agent_id = "sa-" + uuid.uuid4().hex[:6]
@@ -564,6 +583,21 @@ class SubAgentRunner:
 
     # ------------------------------------------------------------------
 
+    @property
+    def model_id(self) -> str:
+        """The model identifier used by this runner."""
+        return self._model_id
+
+    @property
+    def short_term(self):
+        """The runner's short-term memory/context object."""
+        return self._short_term
+
+    @property
+    def trace_id(self) -> Optional[str]:
+        """Parent run trace id, or None."""
+        return getattr(self._agent, "_trace_id", None)
+
     def cancel(self) -> None:
         """Signal cooperative cancellation. Takes effect between iterations."""
         self._cancel_event.set()
@@ -585,7 +619,6 @@ class SubAgentRunner:
         Returns the final result string (or an error/cancellation message).
         Should be called from a background thread.
         """
-        import time
         start = time.time()
         self._log.info(
             "Starting (model: %s, context_key: %s)",

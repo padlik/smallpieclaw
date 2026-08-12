@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import html
 import logging
 import os
@@ -31,17 +32,31 @@ async def _ack_query(query) -> None:
         logger.warning("query.answer() failed: %s", exc)
 
 
+def _require_cb_auth(fn):
+    """Decorator: reject unauthorized callers before running a callback handler."""
+
+    @functools.wraps(fn)
+    async def _wrapper(
+        iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        caller = query.from_user
+        caller_id = caller.id if caller else None
+        if caller_id is None or not iface._is_authorized(caller_id):
+            try:
+                await query.answer("⛔ Not authorized.", show_alert=True)
+            except Exception:
+                pass
+            return
+        return await fn(iface, update, ctx)
+
+    return _wrapper
+
+
+@_require_cb_auth
 async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Yes / No / Approve-all confirmation button presses."""
     query = update.callback_query
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
     data = query.data  # "confirm_yes:<token>" | "confirm_no:<token>" | "confirm_all:<token>:<tool>"
 
     if data.startswith("confirm_all:"):
@@ -91,17 +106,10 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         logger.debug("Could not edit confirmation message: %s", exc)
 
 
+@_require_cb_auth
 async def cb_extend(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Extend / Unlimited / Cancel button presses for max-steps extension."""
     query = update.callback_query
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
     data = query.data  # "extend_yes:<token>" | "extend_unlimited:<token>" | "extend_no:<token>"
 
     if data.startswith("extend_unlimited:"):
@@ -133,17 +141,10 @@ async def cb_extend(iface: "TelegramInterface", update: Update, ctx: ContextType
         logger.debug("Could not edit extend message: %s", exc)
 
 
+@_require_cb_auth
 async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle model switch button presses."""
     query = update.callback_query
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
     await _ack_query(query)
     model_name = query.data.split(":", 1)[1]
 
@@ -167,17 +168,10 @@ async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: Conte
         pass
 
 
+@_require_cb_auth
 async def cb_mode_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle creativity-mode switch button presses."""
     query = update.callback_query
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
     await _ack_query(query)
     new_mode = query.data.split(":", 1)[1]
 
@@ -197,6 +191,7 @@ async def cb_mode_switch(iface: "TelegramInterface", update: Update, ctx: Contex
         pass
 
 
+@_require_cb_auth
 async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Run / Discard buttons for a deferred agent message.
 
@@ -231,18 +226,8 @@ async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTy
 
     action, token = parts
 
-    # Authorization: only the authorized operator may press these buttons.
-    # Reject with a private callback alert (do NOT edit the shared prompt
-    # message — that would let an unauthorized presser destroy the operator's
-    # Run/Discard controls in a group chat).
     caller = query.from_user
     caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
 
     # Ownership check — purely synchronous, no awaits.
     # Peek at the entry to verify the caller is the owner before touching state.
@@ -306,6 +291,7 @@ async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTy
     await iface._run_agent_task(fake_update, ctx, deferred.task_text, deferred.images or None)
 
 
+@_require_cb_auth
 async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Approve/Deny/Approve-all buttons for headless sub-agent sensitive file operations.
 
@@ -333,15 +319,6 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
     tool_name = parts[2] if len(parts) > 2 else ""
     is_approve_all = action == "subconfirm_all"
     approved = action == "subconfirm_yes" or is_approve_all
-
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
 
     # Access the shared BuiltinExecutor through the wired agent.
     builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
@@ -398,18 +375,10 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
         pass
 
 
+@_require_cb_auth
 async def cb_zone_allow(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle [Allow this request] zone button — grants parent dir for current request cycle."""
     query = update.callback_query
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
-
     token = query.data.split(":", 1)[1]
 
     builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
@@ -438,18 +407,10 @@ async def cb_zone_allow(iface: "TelegramInterface", update: Update, ctx: Context
         logger.debug("Could not edit zone_allow message: %s", exc)
 
 
+@_require_cb_auth
 async def cb_zone_trusted(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle [Add to trusted] zone button — permanently trusts the parent directory."""
     query = update.callback_query
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
-
     token = query.data.split(":", 1)[1]
 
     builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
@@ -481,6 +442,7 @@ async def cb_zone_trusted(iface: "TelegramInterface", update: Update, ctx: Conte
         logger.debug("Could not edit zone_trusted message: %s", exc)
 
 
+@_require_cb_auth
 async def cb_oauth_cancel(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the Cancel button on an in-flight OAuth authorization prompt.
 
@@ -490,15 +452,6 @@ async def cb_oauth_cancel(iface: "TelegramInterface", update: Update, ctx: Conte
     may run at a time.
     """
     query = update.callback_query
-    caller = query.from_user
-    caller_id = caller.id if caller else None
-    if caller_id is None or not iface._is_authorized(caller_id):
-        try:
-            await query.answer("⛔ Not authorized.", show_alert=True)
-        except Exception:
-            pass
-        return
-
     data = query.data or ""
     parts = data.split(":", 1)
     state = parts[1] if len(parts) > 1 else ""
