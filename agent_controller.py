@@ -21,7 +21,7 @@ import uuid
 from typing import Callable, Optional
 
 from agent_logging import bind_run_context
-from agent_runtime import AgentRuntime
+from agent_runtime import AgentRuntime, ControllerDeps
 from confirmation import ConfirmationManager
 from conversation_io import _load_or_create_conversation_id, _save_conversation
 from llm_client import LLMClient
@@ -127,6 +127,61 @@ class AgentController:
         # the result and unblock the worker thread.
         # ------------------------------------------------------------------
         self._confirmation = ConfirmationManager()
+
+    @property
+    def runtime_deps(self) -> ControllerDeps:
+        """Runtime dependency bundle used by AgentRuntime.build_react_context.
+
+        Returned on demand so post-init wiring (graph memory, strategy memory,
+        registry-installed ``_on_step``, etc.) is captured at run start exactly as
+        the legacy inline assembly did.  Keeping the field set in one place
+        eliminates three-way desync when ``ReactContext``/``ControllerDeps``
+        gain a new shared dependency.
+        """
+        return ControllerDeps(
+            llm=self.llm,
+            tool_index=self.tool_index,
+            memory=self.memory,
+            builtin_executor=self.builtin_executor,
+            mcp_manager=self.mcp_manager,
+            skill_registry=self.skill_registry,
+            max_iterations=self.max_iterations,
+            top_tools=self.top_tools,
+            ctx_max_tokens=self.ctx_max_tokens,
+            tmp_dir=self.tmp_dir,
+            downloads_dir=self.downloads_dir,
+            workspace_dir=self.workspace_dir,
+            log_file=self.log_file,
+            log_backup_count=self.log_backup_count,
+            depth=self._depth,
+            label=self.label,
+            short_term=self.short_term,
+            working=self.working,
+            results=self.results,
+            cancel_event=self._cancel_event,
+            owns_cancel_event=self._owns_cancel_event,
+            on_step=self._on_step,
+            on_tool_trace=self._on_tool_trace,
+            job_history_fn=self._job_history_fn,
+            graph_memory=self._graph_memory,
+            graph_memory_writer=self._graph_memory_writer,
+            graph_memory_max_entries=self._graph_memory_max_entries,
+            strategy_memory=self.strategy_memory,
+            max_subagents=(
+                getattr(self.builtin_executor, "_max_subagents", 6)
+                if self.builtin_executor is not None
+                else 6
+            ),
+            creativity_mode=self.creativity_mode,
+            plan_max_iterations=self.plan_max_iterations,
+            inactivity_warn_minutes=self.inactivity_warn_minutes,
+            confirmation=self._confirmation,
+            trusted_zone_checker=(
+                self.builtin_executor.trusted_zone_checker
+                if self.builtin_executor is not None
+                else None
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Public API

@@ -252,6 +252,56 @@ class _SdkClientWrapper:
     def tools(self) -> list[Tool]:
         return self._tools
 
+    @property
+    def ready_future(self) -> concurrent.futures.Future:
+        """Return the future that signals when the session runner is ready."""
+        return self._ready_future
+
+    def configure(
+        self,
+        *,
+        mcp_tokens_dir: Path | None,
+        tg_iface: object | None,
+    ) -> None:
+        """Set the token directory and Telegram interface used by this wrapper.
+
+        These values are normally wired once by ``MCPManager`` before the
+        session runner is started.
+        """
+        self._mcp_tokens_dir = mcp_tokens_dir
+        self._tg_iface = tg_iface
+
+    def clear_tools(self) -> None:
+        """Clear the cached tool list (used when revoking a server)."""
+        self._tools = []
+
+    def drain_task(self) -> Optional[asyncio.Task]:
+        """Return the current session task and clear it from the wrapper.
+
+        The caller is responsible for awaiting or cancelling the returned task.
+        """
+        task = self._task
+        self._task = None
+        return task
+
+    def set_oauth(self, provider: Any, interactive: bool) -> None:
+        """Set the OAuth provider and interactive flag for this session."""
+        self._oauth_provider = provider
+        self._interactive = interactive
+
+    def set_task(self, task: asyncio.Task) -> None:
+        """Assign the live session-runner task to this wrapper."""
+        self._task = task
+
+    def create_session_runner(self) -> asyncio.Task:
+        """Create and return an asyncio task running the session runner."""
+        return self._loop.create_task(self._session_runner())
+
+    @property
+    def queue(self) -> Optional[asyncio.Queue]:
+        """Return the request queue for this wrapper, if created."""
+        return self._queue
+
     def connect(self) -> list[Tool]:
         """Schedule the session runner on the event loop; block until ready."""
 
@@ -690,7 +740,7 @@ class MCPManager:
             except Exception as exc:
                 logger.warning("MCP revoke close error for %s: %s", server_name, exc)
             wrapper.needs_auth = True
-            wrapper._tools = []
+            wrapper.clear_tools()
         return True
 
     def cancel_oauth_flow(self) -> dict:
@@ -742,8 +792,10 @@ class MCPManager:
         if self._loop is None:
             self._start_loop()
         wrapper = _SdkClientWrapper(cfg, self._loop)
-        wrapper._mcp_tokens_dir = self._mcp_tokens_dir
-        wrapper._tg_iface = self._tg_iface
+        wrapper.configure(
+            mcp_tokens_dir=self._mcp_tokens_dir,
+            tg_iface=self._tg_iface,
+        )
         tools = wrapper.connect()
         with self._lock:
             self._wrappers[name] = wrapper
@@ -764,10 +816,12 @@ class MCPManager:
             for name, wrapper in list(self._wrappers.items()):
                 try:
                     wrapper.connected = False
-                    if self._loop is not None and wrapper._queue is not None:
-                        self._loop.call_soon_threadsafe(wrapper._queue.put_nowait, None)
-                    if wrapper._task is not None:
-                        tasks.append(wrapper._task)
+                    queue = wrapper.queue
+                    if self._loop is not None and queue is not None:
+                        self._loop.call_soon_threadsafe(queue.put_nowait, None)
+                    task = wrapper.drain_task()
+                    if task is not None:
+                        tasks.append(task)
                 except Exception as exc:
                     logger.warning("MCP [%s] close error: %s", name, exc)
             self._wrappers.clear()
@@ -1412,7 +1466,7 @@ class MCPManager:
         """
         cancel_task = asyncio.create_task(self._watch_cancel())
         ready_task = asyncio.ensure_future(
-            asyncio.wrap_future(wrapper._ready_future)
+            asyncio.wrap_future(wrapper.ready_future)
         )
 
         done, pending = await asyncio.wait(
@@ -1545,11 +1599,13 @@ class MCPManager:
             # driving the full handshake: redirect → callback → token exchange →
             # set_tokens → retry with Bearer token.
             wrapper = _SdkClientWrapper(cfg, self._loop)
-            wrapper._mcp_tokens_dir = self._mcp_tokens_dir
-            wrapper._oauth_provider = provider
-            wrapper._interactive = True
+            wrapper.configure(
+                mcp_tokens_dir=self._mcp_tokens_dir,
+                tg_iface=self._tg_iface,
+            )
+            wrapper.set_oauth(provider, interactive=True)
 
-            session_task = asyncio.create_task(wrapper._session_runner())
+            session_task = wrapper.create_session_runner()
             cancelled, ready_error = await self._await_session_ready(wrapper)
             if cancelled:
                 return {"success": False, "error": "Cancelled by operator"}
@@ -1584,7 +1640,7 @@ class MCPManager:
             # lifecycle (close_all, close, set_enabled).  Null out the
             # local so the ``finally`` block does NOT cancel the live
             # session runner — it must keep running to serve tool calls.
-            wrapper._task = session_task
+            wrapper.set_task(session_task)
             session_task = None
             self._register_wrapper(name, wrapper)
             return {"success": True}

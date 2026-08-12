@@ -27,10 +27,11 @@ capacity semantics.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
+from confirmation import ConfirmationManager
 from react_loop import ReactContext
 from sub_agent_registry import (
     SOURCE_DIAGNOSTIC,
@@ -46,6 +47,52 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # ---------------------------------------------------------------------------
 # Runtime profile — construction policy
 # ---------------------------------------------------------------------------
+
+@dataclass
+class ControllerDeps:
+    """Runtime dependencies shared between ``AgentController`` and ``ReactContext``.
+
+    A small, typed transfer object. ``AgentController`` constructs one on init
+    from its constructor parameters; ``AgentRuntime.build_react_context`` copies
+    it into a ``ReactContext`` wholesale.  Adding a new runtime dependency now
+    only requires updates in two places: this dataclass and ``ReactContext``.
+    """
+
+    llm: object
+    tool_index: object
+    memory: object
+    builtin_executor: object
+    mcp_manager: object
+    skill_registry: object
+    max_iterations: int = 8
+    top_tools: int = 3
+    ctx_max_tokens: int = 90_000
+    tmp_dir: str = "/tmp/agent"
+    downloads_dir: str = "downloads"
+    workspace_dir: str = "~/Documents"
+    log_file: str = "agent.log"
+    log_backup_count: int = 30
+    depth: int = 0
+    label: str = "main"
+    short_term: object = None
+    working: object = None
+    results: object = None
+    cancel_event: Optional[threading.Event] = None
+    owns_cancel_event: bool = True
+    on_step: Optional[Callable[[int], None]] = None
+    on_tool_trace: Optional[Callable] = None
+    job_history_fn: Optional[Callable[[], str]] = None
+    graph_memory: Optional[object] = None
+    graph_memory_writer: Optional[object] = None
+    graph_memory_max_entries: int = 10
+    strategy_memory: Optional[object] = None
+    max_subagents: int = 6
+    creativity_mode: str = "default"
+    plan_max_iterations: int = 50
+    inactivity_warn_minutes: int = 15
+    confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
+    trusted_zone_checker: Optional[object] = None
+
 
 class RuntimeProfile(Enum):
     """Construction policy for an agent execution.
@@ -204,54 +251,21 @@ class AgentRuntime:
         the per-run trace id, saves/restores the model ``_active_idx``, and sets
         the LLM trace id, then delegates the dataclass assembly here.
 
-        The controller remains the state holder; the runtime owns the assembly so
-        graph/strategy post-init wiring, cancel-event ownership, confirmation,
-        callbacks (including a registry-installed ``_on_step``), context payload,
-        and prompt variant are read from the controller at run start exactly as
-        the legacy inline assembly did — preserving ``_on_step`` ordering because
-        the value is read after registry helpers wire it.
+        The controller exposes its runtime dependencies through
+        ``controller.runtime_deps`` (a :class:`ControllerDeps` dataclass).  The
+        runtime copies every shared field into ``ReactContext`` automatically, so
+        adding a dependency only requires changing the two dataclass definitions.
+        Per-run additions (trace id, parent context payload/prompt variant) are
+        still layered on top here.
+
+        ``_on_step`` ordering is preserved because ``ControllerDeps`` is read from
+        the controller at run start, after registry helpers have wired callbacks.
         """
-        ctx = ReactContext(
-            llm=controller.llm,
-            tool_index=controller.tool_index,
-            memory=controller.memory,
-            builtin_executor=controller.builtin_executor,
-            mcp_manager=controller.mcp_manager,
-            skill_registry=controller.skill_registry,
-            max_iterations=controller.max_iterations,
-            top_tools=controller.top_tools,
-            ctx_max_tokens=controller.ctx_max_tokens,
-            tmp_dir=controller.tmp_dir,
-            downloads_dir=controller.downloads_dir,
-            workspace_dir=controller.workspace_dir,
-            log_file=controller.log_file,
-            log_backup_count=controller.log_backup_count,
-            depth=controller._depth,
-            label=controller.label,
-            trace_id=trace_id,
-            short_term=controller.short_term,
-            working=controller.working,
-            results=controller.results,
-            cancel_event=controller._cancel_event,
-            owns_cancel_event=controller._owns_cancel_event,
-            on_step=controller._on_step,
-            on_tool_trace=controller._on_tool_trace,
-            job_history_fn=controller._job_history_fn,
-            graph_memory=controller._graph_memory,
-            graph_memory_writer=controller._graph_memory_writer,
-            graph_memory_max_entries=controller._graph_memory_max_entries,
-            strategy_memory=controller.strategy_memory,
-            max_subagents=getattr(controller.builtin_executor, "_max_subagents", 6),
-            creativity_mode=controller.creativity_mode,
-            plan_max_iterations=controller.plan_max_iterations,
-            inactivity_warn_minutes=controller.inactivity_warn_minutes,
-            confirmation=controller._confirmation,
-            trusted_zone_checker=(
-                controller.builtin_executor.trusted_zone_checker
-                if controller.builtin_executor is not None
-                else None
-            ),
-        )
+        deps: ControllerDeps = controller.runtime_deps
+        shared = {f.name: getattr(deps, f.name) for f in fields(ControllerDeps)}
+
+        ctx = ReactContext(trace_id=trace_id, **shared)
+
         # Sub-agent context sharing: propagate the parent context payload and
         # prompt variant (set by SubAgentRunner) so react_loop can inject the
         # PARENT CONTEXT section and select the sub-agent prompt variant.
