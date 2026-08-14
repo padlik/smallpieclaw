@@ -971,7 +971,7 @@ class TestPathsExpansion:
 
     def test_workspace_dir_default_expanded(self, minimal_config):
         cfg = parse_config(minimal_config)
-        assert cfg.paths.workspace_dir == os.path.expanduser("~/Documents")
+        assert cfg.paths.workspace_dir == os.path.expanduser("~/Documents/piclaw_workspace")
 
     def test_workspace_dir_tilde_expanded(self, minimal_config):
         minimal_config["paths"]["workspace_dir"] = "~/my-workspace"

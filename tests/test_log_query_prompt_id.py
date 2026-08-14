@@ -6,6 +6,7 @@ import json
 import logging
 
 import pytest
+import structlog
 
 import agent_logging as al
 from builtin_executor import BuiltinExecutor
@@ -96,6 +97,26 @@ class TestPromptIdFilter:
         assert payload["records"] == []
         assert payload["count"] == 0
         assert payload["truncated"] is False
+
+    def test_prompt_id_without_trace_auto_widens(self, executor, tmp_path):
+        # Reproduces the bug where an omitted trace defaulted to the current
+        # run's trace and hid the target prompt's records.
+        records = [
+            {"trace": "r-target", "prompt_id": "01TARGETABCDEFGHJKMNPQRSTUV", "level": "info", "event_type": "TOOL_START", "msg": "target-a"},
+            {"trace": "r-target", "prompt_id": "01TARGETABCDEFGHJKMNPQRSTUV", "level": "info", "event_type": "TOOL_END", "msg": "target-b"},
+            {"trace": "r-current", "prompt_id": "01CURRENTABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "current-a"},
+        ]
+        _write_records(executor._log_jsonl_path, records)
+
+        structlog.contextvars.bind_contextvars(trace="r-current")
+        try:
+            result = executor._logquery._exec_log_query({"prompt_id": "01TARGETABCDEFGHJKMNPQRSTUV"})
+        finally:
+            structlog.contextvars.clear_contextvars()
+        assert result["success"] is True
+        payload = json.loads(result["output"])
+        assert payload["count"] == 2
+        assert {r["msg"] for r in payload["records"]} == {"target-a", "target-b"}
 
 
 if __name__ == "__main__":

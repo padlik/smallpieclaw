@@ -445,7 +445,7 @@ class SchedulerConfig:
 class PathsConfig:
     log_backup_count: int = 30
     prompts_dir: str = "prompts"
-    workspace_dir: str = "~/Documents"
+    workspace_dir: str = "~/Documents/piclaw_workspace"
 
 
 @dataclass(frozen=True)
@@ -613,12 +613,12 @@ def _parse_scheduler(raw: dict) -> SchedulerConfig:
     )
 
 
-def _parse_paths(raw: dict) -> PathsConfig:
+def _parse_paths(raw: dict, agent_name: str = "piclaw") -> PathsConfig:
     section = raw.get("paths") or {}
     expanded = {
         "log_backup_count": _parse_int(section.get("log_backup_count"), 30, "paths.log_backup_count"),
         "prompts_dir": _expand_path(section.get("prompts_dir", "prompts")),
-        "workspace_dir": _expand_path(section.get("workspace_dir", "~/Documents")),
+        "workspace_dir": _expand_path(section.get("workspace_dir", f"~/Documents/{agent_name}_workspace")),
     }
     # Mirror expanded values back into raw so cfg["paths"] and PathsConfig agree.
     if "paths" in raw:
@@ -923,7 +923,7 @@ def _reject_removed_fields(raw: dict) -> None:
         )
 
 
-def parse_config(raw: dict, vault_file: str | None = None) -> AppConfig:
+def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "piclaw") -> AppConfig:
     """Parse and validate a raw TOML config dict into a typed AppConfig.
 
     Environment-variable placeholders (``${VAR}`` and ``${VAR:-default}``) in
@@ -973,7 +973,7 @@ def parse_config(raw: dict, vault_file: str | None = None) -> AppConfig:
         models=models,
         embeddings=_parse_embeddings(raw),
         scheduler=_parse_scheduler(raw),
-        paths=_parse_paths(raw),
+        paths=_parse_paths(raw, agent_name=agent_name),
         vault=_parse_vault(raw),
         graph_memory=_parse_graph_memory(raw),
         mcp_servers=mcp_servers,

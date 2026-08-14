@@ -32,3 +32,14 @@ This is not a blanket rule that all three directories are now mounted — only `
 - **Positive**: Future mounts of `workspace_dir` or `downloads_dir` (if ever needed) have a named precedent instead of each requiring its own ADR.
 - **Negative**: A reader of ADR-0016 alone, without checking the supersession graph, would incorrectly conclude this class of mount isn't permitted. ADR-0016 is left unedited (per the immutable-ADR rule) rather than annotated in place.
 - **Neutral**: Operator-added `trusted_dirs.json` entries and the zone-confirmation approval flow they come through are completely unaffected — this decision only concerns the pre-existing, always-on default-trusted tier, not user-managed directories.
+
+## Update — 2026-08-14: workspace_dir now mounted
+
+`workspace_dir` is now mounted read-write into the nsjail sandbox as a bind mount (`mandatory: false`, `src == dst`). This change implements the precedent this ADR established: workspace_dir is a default-trusted zone (per `access_control.py`'s `TrustedZoneChecker`) and is now visible inside the jail for shell commands, matching the access already granted to `file_*` tools outside the jail.
+
+**Security guardrails:**
+
+- The mount is rejected if `workspace_dir` is or is under a blocked system/user prefix (e.g. `/etc`, `~/.ssh`).
+- The mount is also rejected if `workspace_dir` *contains* a blocked user prefix (e.g. `workspace_dir = ~` would contain `~/.ssh`, `~/.aws`), preventing a broad workspace from exposing sensitive subdirectories.
+- `trusted_dirs.json` entries that fall under `workspace_dir` are deduplicated (skipped) to avoid duplicate mount stanzas.
+- `downloads_dir` remains unmounted.

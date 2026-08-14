@@ -162,7 +162,7 @@ def _check_migration(paths: XDGPaths, agent_name: str) -> None:
         logger.info("migrate: %s", line)
 
 
-def load_config(path: Path, vault_file: str | None = None):
+def load_config(path: Path, vault_file: str | None = None, agent_name: str = "piclaw"):
     if not path.exists():
         logger.error("Config file not found: %s", path)
         sys.exit(f"No config found. Create: {path}")
@@ -178,7 +178,7 @@ def load_config(path: Path, vault_file: str | None = None):
     from config_schema import parse_config
     from exceptions import ConfigError
     try:
-        app_cfg = parse_config(cfg, vault_file=vault_file)
+        app_cfg = parse_config(cfg, vault_file=vault_file, agent_name=agent_name)
     except ConfigError as exc:
         logger.error("Configuration error: %s", exc)
         sys.exit(1)
@@ -328,11 +328,11 @@ def main():
     if not paths.config_file.exists():
         sys.exit(f"No config found. Create: {paths.config_file}")
 
-    cfg, app_cfg = load_config(paths.config_file, vault_file=str(paths.secrets_file))
+    cfg, app_cfg = load_config(paths.config_file, vault_file=str(paths.secrets_file), agent_name=agent_name)
     _warn_relative_paths(cfg)
 
     workspace_dir = os.path.abspath(os.path.expanduser(
-        cfg.get("paths", {}).get("workspace_dir", "~/Documents")
+        cfg.get("paths", {}).get("workspace_dir", f"~/Documents/{agent_name}_workspace")
     ))
     downloads_dir = os.path.join(workspace_dir, "downloads")
     tmp_dir = f"/tmp/{agent_name}"
@@ -454,6 +454,7 @@ def _run(
         agent_name=agent_name,
         tmp_dir=tmp_dir,
         state_home=nsjail_state_dir,
+        workspace_dir=workspace_dir,
         vault_secrets=vault_secrets,
     )
     builtin.conversation_id = conversation_id
