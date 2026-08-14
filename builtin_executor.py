@@ -134,11 +134,12 @@ class BuiltinExecutor:
                    nsjail_trusted_dirs_path: str = "",
                    skills_dir: str = "",
                    nsjail_agent_dir: str = "",
-                   agent_name: str = "piclaw",
-                   tmp_dir: str = "",
-                   state_home: str = "",
-                   vault_secrets: Optional[list[str]] = None,
-                   shell_nsjail_dump_config_on_error: bool = False):
+                    agent_name: str = "piclaw",
+                    tmp_dir: str = "",
+                    state_home: str = "",
+                    workspace_dir: str = "",
+                    vault_secrets: Optional[list[str]] = None,
+                    shell_nsjail_dump_config_on_error: bool = False):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -150,6 +151,7 @@ class BuiltinExecutor:
         # (single source of truth is xdg.py). Falls back to xdg_paths() when unset
         # (tests, ad-hoc callers).
         self._state_home = state_home or str(xdg_paths(agent_name).state_home)
+        self._workspace_dir = workspace_dir
         # Optional[str] — current conversation id; set by main.py on startup and
         # rotated by AgentController.reset_task(). Used for per-conversation
         # session_logs paths and persistence.
@@ -351,6 +353,7 @@ class BuiltinExecutor:
                 dns_nameserver=self._nsjail_dns_nameserver,
                 skills_dir=skills_dir,
                 agent_dir=nsjail_agent_dir,
+                workspace_dir=self._workspace_dir,
             )
             logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
         else:

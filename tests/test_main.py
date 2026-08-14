@@ -96,18 +96,18 @@ class TestDownloadsDirDerivation:
         # config with no explicit workspace_dir.
         cfg = {"paths": {}}
         workspace_dir = os.path.abspath(os.path.expanduser(
-            cfg.get("paths", {}).get("workspace_dir", "~/Documents")
+            cfg.get("paths", {}).get("workspace_dir", "~/Documents/agent_workspace")
         ))
         downloads_dir = os.path.join(workspace_dir, "downloads")
-        assert workspace_dir == os.path.expanduser("~/Documents")
-        assert downloads_dir == os.path.join(os.path.expanduser("~/Documents"), "downloads")
+        assert workspace_dir == os.path.expanduser("~/Documents/agent_workspace")
+        assert downloads_dir == os.path.join(os.path.expanduser("~/Documents/agent_workspace"), "downloads")
 
     def test_custom_workspace_gives_custom_downloads(self, tmp_path):
         import os
 
         cfg = {"paths": {"workspace_dir": str(tmp_path / "myworkspace")}}
         workspace_dir = os.path.abspath(os.path.expanduser(
-            cfg.get("paths", {}).get("workspace_dir", "~/Documents")
+            cfg.get("paths", {}).get("workspace_dir", "~/Documents/agent_workspace")
         ))
         downloads_dir = os.path.join(workspace_dir, "downloads")
         assert workspace_dir == str(tmp_path / "myworkspace")

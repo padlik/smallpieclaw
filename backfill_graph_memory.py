@@ -207,7 +207,7 @@ def main() -> None:
 
     xdg = xdg_paths(args.agent_name)
     try:
-        app_cfg = parse_config(raw_cfg, vault_file=str(xdg.secrets_file))
+        app_cfg = parse_config(raw_cfg, vault_file=str(xdg.secrets_file), agent_name=args.agent_name)
     except ConfigError as exc:
         logger.error("Config error: %s", exc)
         sys.exit(1)

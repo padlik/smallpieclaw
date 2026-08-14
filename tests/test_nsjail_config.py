@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from unittest.mock import mock_open, patch
 
@@ -811,6 +812,142 @@ class TestCgroup2Detection:
         with patch("nsjail_config.os.statfs", None, create=True), \
              patch("builtins.open", side_effect=OSError("nope")):
             assert NsjailConfigBuilder._is_cgroup2_mounted() is False
+
+
+class TestWorkspaceDirMount:
+    """Tests for workspace_dir mount generation in build()."""
+
+    def test_workspace_dir_mounts_when_exists(self) -> None:
+        """An existing workspace_dir produces a read-write bind mount with src==dst."""
+        with tempfile.TemporaryDirectory() as session_tmpdir, \
+             tempfile.TemporaryDirectory() as workspace_dir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                workspace_dir=workspace_dir,
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "# Workspace directory (read-write — agent's designated working area)" in content
+                assert (
+                    f'mount: {{ src: {json.dumps(builder.workspace_dir)} '
+                    f'dst: {json.dumps(builder.workspace_dir)} is_bind: true rw: true mandatory: false }}'
+                ) in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_workspace_dir_empty_produces_no_mount(self) -> None:
+        """Default empty workspace_dir does not produce a workspace mount."""
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "# Workspace directory" not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_workspace_dir_rejected_when_blocked_path(self) -> None:
+        """A workspace_dir under a blocked user prefix is rejected with a warning."""
+        home = os.path.expanduser("~")
+        blocked_dir = os.path.join(home, ".ssh")
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                workspace_dir=blocked_dir,
+            )
+            with patch("os.path.isdir", return_value=True):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert blocked_dir not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_workspace_dir_rejected_when_contains_blocked_prefix(self) -> None:
+        """A broad workspace_dir that contains a blocked user prefix is rejected."""
+        home = os.path.expanduser("~")
+        with tempfile.TemporaryDirectory() as session_tmpdir:
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                workspace_dir=home,
+            )
+            with patch("os.path.isdir", return_value=True):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert "# Workspace directory" not in content
+                assert home not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_trusted_dirs_under_workspace_dir_deduped(self) -> None:
+        """trusted_dirs.json entries under workspace_dir are skipped to avoid duplicates."""
+        with tempfile.TemporaryDirectory() as session_tmpdir, \
+             tempfile.TemporaryDirectory() as workspace_dir:
+            real_workspace_dir = os.path.realpath(workspace_dir)
+            trusted_dirs_path = os.path.join(session_tmpdir, "trusted_dirs.json")
+            with open(trusted_dirs_path, "w", encoding="utf-8") as fh:
+                json.dump([{"path": workspace_dir, "mode": "rw"}], fh)
+            builder = NsjailConfigBuilder(
+                session_tmpdir=session_tmpdir,
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path=trusted_dirs_path,
+                workspace_dir=workspace_dir,
+            )
+            cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                # Workspace mount should appear exactly once; trusted mount should be skipped.
+                assert content.count(f"dst: {json.dumps(real_workspace_dir)}") == 1
+                assert "# Workspace directory (read-write — agent's designated working area)" in content
+                assert "# Trusted mounts" not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_trusted_dirs_under_rejected_workspace_dir_not_deduped(self) -> None:
+        """trusted_dirs.json entries under a rejected workspace_dir are NOT skipped."""
+        home = os.path.expanduser("~")
+        trusted_dir = tempfile.mkdtemp(dir=home)
+        try:
+            with tempfile.TemporaryDirectory() as session_tmpdir:
+                trusted_dirs_path = os.path.join(session_tmpdir, "trusted_dirs.json")
+                with open(trusted_dirs_path, "w", encoding="utf-8") as fh:
+                    json.dump([{"path": trusted_dir, "mode": "rw"}], fh)
+                builder = NsjailConfigBuilder(
+                    session_tmpdir=session_tmpdir,
+                    tmp_dir="/tmp/test-tmpdir",
+                    trusted_dirs_path=trusted_dirs_path,
+                    workspace_dir=home,
+                )
+                cfg_path, _ = builder.build("ls", timeout=30)
+                try:
+                    with open(cfg_path) as f:
+                        content = f.read()
+                    # Workspace mount should NOT appear (home is rejected by reverse blocklist).
+                    assert "# Workspace directory" not in content
+                    # Trusted dir should still be mounted, because workspace_dir won't mount.
+                    assert f"dst: {json.dumps(os.path.realpath(trusted_dir))}" in content
+                    assert "# Trusted mounts" in content
+                finally:
+                    os.unlink(cfg_path)
+        finally:
+            shutil.rmtree(trusted_dir, ignore_errors=True)
 
 
 class TestSessionLogsMount:

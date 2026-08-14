@@ -208,4 +208,12 @@ _builtin_executor_type.use_grant_tracker  # type: ignore[attr-defined]
 from config_schema import AgentConfig as _AgentConfig  # noqa: E402, F811
 _AgentConfig.session_logs_retention_days
 
+# nsjail_config.py — workspace_dir is used by the nsjail mount path generation
+from nsjail_config import NsjailConfigBuilder as _NsjailConfigBuilder  # noqa: E402
+_NsjailConfigBuilder.workspace_dir  # type: ignore[attr-defined]
+
+# builtin_executor.py — _workspace_dir is forwarded to NsjailConfigBuilder
+from builtin_executor import BuiltinExecutor as _BuiltinExecutorForWorkspace  # noqa: E402, F811
+_BuiltinExecutorForWorkspace._workspace_dir  # type: ignore[attr-defined]
+
 

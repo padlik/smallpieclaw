@@ -220,17 +220,17 @@ class LogQueryTools:
 
         # Trace scope resolution (priority: explicit arg > auto-widen > current-run).
         #
-        # When text/query is given and the caller did NOT supply a non-null
-        # ``trace`` value, the scope auto-widens to all traces so that startup
-        # records (no trace or a different trace) are surfaced by a bare
-        # text search.  An explicit non-null trace always overrides this; JSON
-        # null is treated as unset because LLM function calls may emit it for
-        # omitted optional parameters.
+        # When text/query or prompt_id is given and the caller did NOT supply a
+        # non-null ``trace`` value, the scope auto-widens to all traces so that
+        # startup records (no trace or a different trace) or a specific prompt's
+        # records are surfaced.  An explicit non-null trace always overrides
+        # this; JSON null is treated as unset because LLM function calls may
+        # emit it for omitted optional parameters.
         trace_val = args.get("trace")
         if trace_val is not None:
             trace = str(trace_val)
             all_traces = trace in ("*", "")
-        elif text_arg:
+        elif text_arg or prompt_id_arg is not None:
             trace = "*"
             all_traces = True
         else:

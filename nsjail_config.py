@@ -50,6 +50,7 @@ class NsjailConfigBuilder:
         allow_net: bool = False,
         skills_dir: str = "",
         agent_dir: str = "",
+        workspace_dir: str = "",
         dns_nameserver: str = "8.8.8.8",
     ) -> None:
         """Initialize the builder.
@@ -72,6 +73,8 @@ class NsjailConfigBuilder:
             agent_dir: Absolute path to the agent's own installation directory;
                 blocked as a trusted mount to prevent the agent from mounting its
                 source code RW inside the sandbox.
+            workspace_dir: Absolute path to the agent's designated working area;
+                mounted read-write when it exists and is not on a restricted path.
             dns_nameserver: Nameserver IP written to ``/etc/resolv.conf`` inside
                 the jail when ``allow_net`` is true.  The jail has an isolated
                 mount namespace (``clone_newns``), so the host's
@@ -82,6 +85,7 @@ class NsjailConfigBuilder:
         self.tmp_dir = os.path.realpath(os.path.abspath(tmp_dir)) if tmp_dir else ""
         self.trusted_dirs_path = os.path.abspath(trusted_dirs_path) if trusted_dirs_path else ""
         self._agent_dir = os.path.realpath(os.path.abspath(agent_dir)) if agent_dir else ""
+        self.workspace_dir = os.path.realpath(os.path.abspath(workspace_dir)) if workspace_dir else ""
         # Dynamic blocked prefixes: user-home paths that must never be trusted mounts.
         home = os.path.expanduser("~")
         blocked = [
@@ -203,6 +207,25 @@ class NsjailConfigBuilder:
         except OSError:
             return False
 
+    def _workspace_will_mount(self) -> bool:
+        """Return True if workspace_dir will actually be mounted into the sandbox."""
+        if not self.workspace_dir or not os.path.isdir(self.workspace_dir):
+            return False
+        # Check if workspace_dir IS or is UNDER a blocked prefix
+        # OR if workspace_dir CONTAINS a blocked user prefix
+        blocked = (
+            self.workspace_dir == "/"
+            or any(
+                self.workspace_dir == p or self.workspace_dir.startswith(p + "/")
+                for p in (_BLOCKED_SYSTEM_PREFIXES + self._blocked_user_prefixes)
+            )
+            or any(
+                p.startswith(self.workspace_dir + "/")
+                for p in self._blocked_user_prefixes
+            )
+        )
+        return not blocked
+
     def _load_trusted_mounts(self) -> list[str]:
         """Load trusted directory mounts from the configured trusted_dirs.json path.
 
@@ -257,6 +280,9 @@ class NsjailConfigBuilder:
                 continue
             if self.tmp_dir and (real == self.tmp_dir or real.startswith(self.tmp_dir + os.sep)):
                 logger.debug("Trusted directory under tmp_dir, skipping (already mounted): %s", real)
+                continue
+            if self._workspace_will_mount() and (real == self.workspace_dir or real.startswith(self.workspace_dir + os.sep)):
+                logger.debug("Trusted directory under workspace_dir, skipping (already mounted): %s", real)
                 continue
             rw = "true" if mode == "rw" else "false"
             lines.append(
@@ -407,6 +433,23 @@ class NsjailConfigBuilder:
             f'is_bind: true rw: true mandatory: true }}',
             "",
         ])
+
+        if self._workspace_will_mount():
+            lines.append("# Workspace directory (read-write — agent's designated working area)")
+            lines.append(
+                f'mount: {{ src: {json.dumps(self.workspace_dir)} '
+                f'dst: {json.dumps(self.workspace_dir)} is_bind: true rw: true mandatory: false }}'
+            )
+            lines.append("")
+        elif self.workspace_dir:
+            # workspace_dir was set but rejected — log why
+            if not os.path.isdir(self.workspace_dir):
+                logger.debug("nsjail: workspace_dir does not exist, skipping mount: %s", self.workspace_dir)
+            else:
+                logger.warning(
+                    "nsjail: workspace_dir rejected (restricted system path or contains sensitive path), skipping mount: %s",
+                    self.workspace_dir,
+                )
 
         if session_logs_dir and os.path.isdir(session_logs_dir):
             lines.append("# Session logs (read-only mount — agent writes outside jail, shell reads inside)")

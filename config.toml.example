@@ -288,7 +288,7 @@ type = "file"
 # scheduler files) is derived from XDG Base Directory env vars (XDG_CONFIG_HOME,
 # XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME, XDG_RUNTIME_DIR) scoped under
 # the agent's --agent-name. None of those paths are configurable here.
-workspace_dir       = "~/Documents"  # primary user workspace; always a trusted file-access zone (file_* tools auto-allow here)
+workspace_dir       = "~/Documents/piclaw_workspace"  # primary user workspace; always a trusted file-access zone (file_* tools auto-allow here)
 log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups to keep
 # Agent's temp/handoff directory is always /tmp/<agent_name> (agent.agent_name);
 # there is no config override for it.

@@ -234,7 +234,7 @@ The `shell` tool has three backends, selected by `shell_backend` in `[agent]`:
 
 `file_*` tools use zone-based access control. Every path is classified as:
 
-- **Trusted** — inside `workspace_dir` (default `~/Documents`) or a user-added trusted directory. Reads and writes auto-allow with no confirmation.
+- **Trusted** — inside `workspace_dir` (default `~/Documents/piclaw_workspace`) or a user-added trusted directory. Reads and writes auto-allow with no confirmation.
 - **Request-granted** — a directory the user approved for the current request via the `[Allow this request]` button. Allowed for the rest of the current request.
 - **Unrecognised** — anything else, including agent-internal directories (`data/`, `skills/`, log dir, vault dir). Prompts the user.
 

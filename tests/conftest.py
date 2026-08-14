@@ -45,9 +45,7 @@ def minimal_config() -> dict:
                 "base_url": "https://api.openai.com/v1",
             }
         ],
-        "paths": {
-            "workspace_dir": "~/Documents",
-        },
+        "paths": {},
     }
 
 
