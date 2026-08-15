@@ -18,6 +18,12 @@ For OpenSpec propose/apply/verify/archive workflows, use the local `openspec-git
 - Do **not** install any tools, programs and scripts without user approval or direct command. 
 - Do **not** mount any filesystems without user approval.
 
+## Documentation
+- Always plan to include updates into confguration file example with the new features if they are relevant.
+= Always plan to include updates into README files for the new features id the are relevant.
+- Do not forget about usability features
+
+
 ## Dev Commands
 
 ```bash
@@ -77,6 +83,7 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `confirmation.py` | Thread-safe confirmations via `threading.Event` (agent thread blocks, Telegram callback signals) |
 | `trace_context.py` | `r-<8 hex>` trace IDs for log correlation across agents/sub-agents/scheduler |
 | `sub_agent_registry.py` | Tracks all active `SubAgentRunner` instances for `/agents` command |
+| `prompt_registry.py` | ULID prompt-ID registry with dual-write persistence (event log + snapshot archive); `search()`, `show()`, `find_in_archive()`, in-memory eviction at 100, `SearchPage` dataclass; `prompts.jsonl` (event log) + `prompts_archive.jsonl` (snapshot archive) |
 | `token_usage.py` | Per-model daily prompt/completion counters; thread-safe registry |
 | `execution_plan.py` | DAG-based plan generation and execution with parallel/sequential orchestration |
 | `strategy_memory.py` | Learned task-type-to-approach persistence and context injection |
@@ -111,3 +118,4 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 - **PID file locking** in `main.py` uses `fcntl.flock()` — the OS releases the lock on process exit, so stale PID files from crashes are handled automatically.
 - **Logging:** `structlog` integrated with stdlib, one processor chain → dual sink under `~/.local/state/<agent_name>/logs/`: `agent.jsonl` (structured, primary) + `agent.log` (prose `[label trace] message` with source tags like `[main]`, `[sa-<id>]`, or a scheduled job's `[<job-tag>]`, secondary). Events carry structured identity (`trace` and `agent`, the run label) and an `event_type` taxonomy (`TOOL_START/END/FAILED`, `LLM_CALL/FAILED`, `STEP_BEGIN/END`, `RUN_BEGIN/END`, `ERROR`). Daily gzip date-suffixed rotation, 30 backups. The `log_query` built-in tool filters the active `agent.jsonl` (trace-scoped) for self-analysis.
 - **`tomli`** is used for TOML parsing (fallback for Python < 3.11 where `tomllib` is stdlib).
+- **Prompt registry** uses a dual-write persistence pattern (ADR-0014): `prompts.jsonl` (append-only event log, crash-safe) + `prompts_archive.jsonl` (one self-contained snapshot line per finalized prompt, for search/show). In-memory records are capped at 100 finalized (`MAX_IN_MEMORY`); running records are never evicted. `search()` snapshots in-memory under lock then scans the archive lock-free — the only method that does file I/O outside the lock. `get()`/`by_trace()` stay in-memory-only for the hot path; `show()` is the archive-aware lookup.
