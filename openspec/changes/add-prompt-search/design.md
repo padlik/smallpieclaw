@@ -18,7 +18,7 @@ In-force ADRs: ADR-0013 (ULID prompt IDs) is the only directly relevant one. No 
 **Non-Goals:**
 - Semantic/embedding-based search (infrastructure exists in `tool_index.py`/`vector_utils.py` but is a different scope).
 - Archive rotation or retention limits (prompt volume is realistically small; keep forever).
-- Search by `trace_id` (out of scope; can be handled separately if needed).
+- Search by `trace_id` substring (exact match is included; fuzzy/substring trace search is out of scope).
 - Storing agent responses or tool outputs in the registry (only prompt text + metadata).
 - Tracking scheduled job runs in the prompt registry (scheduled runs use a separate execution log in `scheduler.py`).
 
@@ -51,11 +51,23 @@ The sub-agent supervisor calls `get()` and `by_trace()` for active records only.
 
 ### Decision 4: Search scans in-memory + archive, deduplicates
 
-`search(query, days=None, limit=20)`:
+`search(query="", days=None, status=None, trace_id=None, since=None, until=None, limit=20, offset=0) -> SearchPage`:
 1. Acquire `self._lock`, snapshot in-memory `_records` values into a local list, release lock.
-2. Scan the snapshot — case-insensitive substring match on `text`, optional `started_at` time filter.
-3. Stream `prompts_archive.jsonl` **without holding the lock** — same filter, skip `prompt_id`s already found in step 2.
-4. Merge, sort by `started_at` descending, return top `limit`.
+2. Scan the snapshot — case-insensitive substring match on `text` (empty `query` matches all), optional `started_at` time filter, optional `status` exact match, optional `trace_id` exact match.
+3. Stream `prompts_archive.jsonl` **without holding the lock** — same filters, skip `prompt_id`s already found in step 2.
+4. Merge, sort by `started_at` descending, record `total_matched = len(merged)`, skip `offset` results, return `SearchPage(results=next limit, total_matched=total_matched)`.
+
+**Return contract:** `SearchPage` is a lightweight dataclass with two fields: `results: list[PromptRecord]` (the page slice, ≤ `limit` records) and `total_matched: int` (the full count of matched records before offset/limit). The CLI uses `total_matched` to render the pagination footer (Decision 8). This avoids a peek-based heuristic — the search already scans and sorts the full matched set before slicing, so the count is in hand at zero extra cost.
+
+**Time filter precedence:** `since`/`until` (ISO 8601, parsed to epoch float via `datetime.fromisoformat()`) take precedence over `days`. When both are supplied, `days` is ignored. `since` filters `started_at >= since_epoch`; `until` filters `started_at <= until_epoch`. When only `days` is supplied, the cutoff is `now - days*86400` and only `started_at >= cutoff` records pass.
+
+**Timezone handling:** `since`/`until` ISO 8601 strings are parsed via `datetime.fromisoformat()`. Naive inputs (no UTC offset, e.g. `2026-08-01` or `2026-08-01T09:00:00`) are interpreted as UTC, not host-local time, to ensure deterministic filtering across deployments. This is done by checking `dt.tzinfo is None` after parsing and replacing with `timezone.utc` before calling `.timestamp()`. Inputs with an explicit offset (e.g. `2026-08-01T09:00:00+03:00`) are honored as-is.
+
+**Status filter:** Exact string match against `PromptRecord.status`. Valid values: `running`, `done`, `failed`, `cancelled`. No validation at the registry layer — an invalid status simply matches nothing. The CLI layer validates and rejects unknown values before calling `search()`.
+
+**trace_id filter:** Exact string match against `PromptRecord.trace_id`. This reverses the original "trace_id search out of scope" decision — the field is already in the 7-field archive snapshot, so the filter is a one-clause addition with no format change.
+
+**Pagination:** `offset` skips the first N matched results after sorting. The CLI exposes this as `--page=N` (1-indexed), converted to `offset = (page - 1) * limit`. The CLI does not expose `--limit`; page size is fixed at the `search()` default of 20. No cursor state is maintained — each search re-scans and re-sorts. This is acceptable because linear scan of 10K lines is <50ms.
 
 **Lock scope:** The lock is held only long enough to snapshot the in-memory dict reference (O(1) copy of up to 100 entries). The archive file scan happens outside the lock so `start()`, `finish()`, `get()`, and `by_trace()` are not blocked during search. This is a deliberate departure from the existing pattern where every public method holds the lock for its full body — necessary because search is the only method that does potentially long file I/O.
 
@@ -80,9 +92,23 @@ The sub-agent supervisor calls `get()` and `by_trace()` for active records only.
 ```
 ctx.args = []                          → list recent (current behavior)
 ctx.args[0] == "search"               → search mode
-    rest = " ".join(args[1:])
-    last token matching ^(\d+)([dh])$ → time window (days or hours)
-    remaining tokens → query string
+    tokens = args[1:]
+    flags = {}  # --status, --trace, --since, --until, --page
+    positional = []
+    for token in tokens:
+        if token starts with "--" and contains "=":
+            key, value = split on first "="
+            flags[key[2:]] = value
+        else:
+            positional.append(token)
+    last positional token matching ^(\d+)([dh])$ → time window (days or hours)
+    remaining positional tokens → query string (joined with space)
+    flags["status"]  → status filter (validated: running/done/failed/cancelled)
+    flags["trace"]   → trace_id filter
+    flags["since"]   → since (ISO 8601 string, passed as-is to search())
+    flags["until"]   → until (ISO 8601 string, passed as-is to search())
+    flags["page"]    → page number (1-indexed int; offset = (page-1) * limit)
+    unknown flags    → treated as query text (appended to positional)
 ctx.args[0] == "show"                 → show mode
     if len(ctx.args) < 2:              → reply "Usage: /prompts show <id>"
     args[1] → prompt_id (full ULID)
@@ -90,6 +116,10 @@ anything else                         → list recent (backward compat)
 ```
 
 Time-window regex: `^(\d+)([dh])$` — `7d` → 7 days, `12h` → 12 hours. No match → no time filter (search all history).
+
+**Flag validation:** `--status` value is validated against the set `{running, done, failed, cancelled}`. Invalid values produce a reply: `⚠️ Invalid status '<value>'. Valid: running, done, failed, cancelled.` `--page` is parsed as int; non-integer values produce a usage reply. `--since`/`--until` are passed as-is to `search()` — ISO 8601 parsing happens at the registry layer, and invalid formats raise a `ValueError` that the CLI catches and renders as a user-friendly error.
+
+**Unknown flag handling:** Tokens starting with `--` but not matching a recognized flag name are treated as query text (appended to the positional list). This avoids silent drops when an operator typos a flag — the text still contributes to the search.
 
 **Empty query edge case:** If the time-window token is extracted and the remaining query is `""` (e.g., `/prompts search 7d`), `search("", days=7)` treats the empty query as a wildcard — returns all prompts within the time window. This is distinct from `/prompts` (which only lists in-memory records) — `search ""` scans the full archive too.
 
@@ -113,7 +143,15 @@ Full text:
 ❌ Prompt <prompt_id> not found.
 ```
 
-**`search` result list:** Reuses the same entry format as the existing `/prompts` list (icon, status, timestamp, elapsed, sub-agent count, 80-char text preview), with a header `🔍 Search results for "<query>" (<count>)` instead of `📝 Recent Prompts`. If no results: `ℹ️ No prompts matching "<query>".`
+**`search` result list:** Reuses the same entry format as the existing `/prompts` list (icon, status, timestamp, elapsed, sub-agent count, 80-char text preview), with a header `🔍 Search results for "<query>" (<count>)` instead of `📝 Recent Prompts`. `<count>` is `total_matched` from the `SearchPage` (the full match count, not the page slice size), so the header agrees with `total_pages` in the footer. If no results: `ℹ️ No prompts matching "<query>".`
+
+**Pagination footer:** The footer is always rendered when `total_matched > 0`, as a two-part line:
+- Always: `📄 Page <N> of <total_pages>`
+- Conditionally (only when a next page exists, i.e. `offset + len(results) < total_matched`): ` — use --page=<N+1> for next`
+
+`total_pages` is computed as `ceil(total_matched / limit)`. `N` is derived from `offset` (`N = offset // limit + 1`). On the last page, the footer shows `📄 Page <N> of <total_pages>` without the "next" tail. When all results fit on one page (`total_matched <= limit`), the footer still shows `📄 Page 1 of 1` for consistency.
+
+**Out-of-range page:** When `results` is empty but `total_matched > 0` (the requested page is past the last page), render `📄 Page <N> is past the last page (<total_pages> pages total).` instead of the no-matches message. This distinguishes "no matches found" from "matches exist but the page is out of range."
 
 ## Risks / Trade-offs
 
@@ -137,4 +175,10 @@ None. All questions from the explore phase are resolved:
 - MAX_IN_MEMORY = 100 — agreed.
 - Archive rotation — no, keep forever.
 - `/prompts show <id>` — included.
-- Search by trace_id — no, out of scope.
+- Search by trace_id — yes, exact match included (amendment 2026-08-15).
+- `days` vs `since`/`until` precedence — `since`/`until` take precedence, `days` ignored.
+- Unknown flag handling — treated as query text.
+- `--page` indexing — 1-indexed; `offset = (page - 1) * limit`.
+- `status` filter values — `running`, `done`, `failed`, `cancelled` (matches `PromptRecord.status`).
+- `trace_id` filter — exact match only (no substring).
+- `since`/`until` format — ISO 8601 string, parsed to epoch float via `datetime.fromisoformat()`.

@@ -54,12 +54,12 @@ Rule: The archive is the cold-store for search and show. One line per prompt, se
 - **AND** running records from the event log are not archived
 - **AND** the backfill runs only once (subsequent startups skip backfill if the archive exists)
 
-### Requirement: Operator can search prompts by text content
+### Requirement: Operator can search prompts by text content and metadata
 
-The system SHALL provide a `/prompts search <query> [Nd/Nh]` Telegram command that searches all prompt history (in-memory records and the archive file) using case-insensitive substring matching on prompt `text`. An optional time-window suffix (`Nd` for days, `Nh` for hours) filters results to prompts started within the window. Search matches on `text` only; `trace_id` search is out of scope.
+The system SHALL provide a `/prompts search <query> [Nd/Nh] [--status=<S>] [--trace=<T>] [--since=<ISO>] [--until=<ISO>] [--page=<N>]` Telegram command that searches all prompt history (in-memory records and the archive file) using case-insensitive substring matching on prompt `text`. Optional filters narrow results by status (`running`/`done`/`failed`/`cancelled`), exact `trace_id` match, absolute time range (`since`/`until` as ISO 8601 timestamps), and pagination (`--page`, 1-indexed, 20 results per page). An optional relative time-window suffix (`Nd` for days, `Nh` for hours) filters results to prompts started within the window; when both `days` and `since`/`until` are supplied, `since`/`until` take precedence and `days` is ignored. Search matches on `text` only for substring matching; `trace_id` and `status` are exact-match filters. The `search()` method returns a `SearchPage` dataclass with `results` (the page slice) and `total_matched` (the full match count before offset/limit).
 
 Feature: Prompt tracking
-Rule: Search covers the full history, not just the in-memory cache. An empty query with a time window acts as a wildcard listing all prompts in that window.
+Rule: Search covers the full history, not just the in-memory cache. An empty query with a time window acts as a wildcard listing all prompts in that window. Filters can be combined to narrow results for execution-analysis workflows.
 
 #### Scenario: Search finds prompts by substring match
 - **GIVEN** prompts with text "PTO request for next week" and "review worklogs" exist in history
@@ -119,6 +119,101 @@ Rule: Search covers the full history, not just the in-memory cache. An empty que
 - **GIVEN** no prompts contain the text "nonexistent"
 - **WHEN** the operator runs `/prompts search nonexistent`
 - **THEN** the response says no prompts match the query
+
+#### Scenario: Search with results fitting on a single page shows a single-page footer
+- **GIVEN** 5 prompts match the query "worklogs"
+- **WHEN** the operator runs `/prompts search worklogs`
+- **THEN** the response shows all 5 results
+- **AND** a footer shows `📄 Page 1 of 1` (no "next" tail)
+
+#### Scenario: Search filters by status
+- **GIVEN** prompts with statuses "done", "failed", and "running" exist in history
+- **WHEN** the operator runs `/prompts search --status=failed`
+- **THEN** the response includes only prompts with status "failed"
+- **AND** prompts with status "done" or "running" are excluded
+
+#### Scenario: Search with invalid status value returns an error
+- **GIVEN** prompts exist in history
+- **WHEN** the operator runs `/prompts search --status=unknown`
+- **THEN** the response says the status is invalid
+- **AND** the response lists valid status values: running, done, failed, cancelled
+
+#### Scenario: Search filters by trace_id
+- **GIVEN** a prompt with trace_id "r-abc123" and text "PTO request" exists in history
+- **AND** a prompt with trace_id "r-def456" and text "PTO review" exists in history
+- **WHEN** the operator runs `/prompts search PTO --trace=r-abc123`
+- **THEN** the response includes only the prompt with trace_id "r-abc123"
+- **AND** the prompt with trace_id "r-def456" is excluded
+
+#### Scenario: Search with absolute time range using since and until
+- **GIVEN** a prompt with text "deploy" was started on 2026-08-03
+- **AND** a prompt with text "deploy" was started on 2026-08-10
+- **AND** a prompt with text "deploy" was started on 2026-08-14
+- **WHEN** the operator runs `/prompts search deploy --since=2026-08-05 --until=2026-08-12`
+- **THEN** the response includes only the prompt from 2026-08-10
+- **AND** the prompts from 2026-08-03 and 2026-08-14 are excluded
+
+#### Scenario: Search with since only filters by start time lower bound
+- **GIVEN** a prompt with text "worklogs" was started 3 days ago
+- **AND** a prompt with text "worklogs" was started 10 days ago
+- **WHEN** the operator runs `/prompts search worklogs --since=<ISO date 5 days ago>`
+- **THEN** the response includes only the prompt from 3 days ago
+
+#### Scenario: Search with naive ISO timestamp interprets input as UTC
+- **GIVEN** a prompt with text "deploy" was started at epoch time corresponding to 2026-08-10T12:00:00Z
+- **WHEN** the operator runs `/prompts search deploy --since=2026-08-10T12:00:00` (no timezone offset)
+- **THEN** the naive timestamp is interpreted as UTC
+- **AND** the prompt is included in the results
+
+#### Scenario: since and until take precedence over days
+- **GIVEN** a prompt with text "deploy" was started on 2026-08-10
+- **WHEN** the operator runs `/prompts search deploy 7d --since=2026-08-01 --until=2026-08-15`
+- **THEN** the `7d` relative window is ignored
+- **AND** the absolute range 2026-08-01 to 2026-08-15 is applied
+
+#### Scenario: Search with combined status and trace_id filters
+- **GIVEN** a prompt with text "PTO", status "failed", and trace_id "r-abc" was started 2 days ago
+- **AND** a prompt with text "PTO", status "done", and trace_id "r-def" was started 1 day ago
+- **WHEN** the operator runs `/prompts search PTO --status=failed --trace=r-def`
+- **THEN** the response includes no prompts (the filters are mutually exclusive on the two records)
+
+#### Scenario: Search with status filter alone narrows results
+- **GIVEN** a prompt with text "PTO", status "failed", and trace_id "r-abc" was started 2 days ago
+- **AND** a prompt with text "PTO", status "done", and trace_id "r-def" was started 1 day ago
+- **WHEN** the operator runs `/prompts search PTO --status=failed`
+- **THEN** the response includes only the failed prompt with trace_id "r-abc"
+
+#### Scenario: Search results are paginated
+- **GIVEN** 30 prompts match the query "worklogs"
+- **WHEN** the operator runs `/prompts search worklogs`
+- **THEN** the response shows 20 results (page 1)
+- **AND** a footer indicates `Page 1 of 2 — use --page=2 for next`
+
+#### Scenario: Search pagination with --page returns the next page
+- **GIVEN** 30 prompts match the query "worklogs"
+- **WHEN** the operator runs `/prompts search worklogs --page=2`
+- **THEN** the response shows 10 results (page 2)
+- **AND** a footer indicates `Page 2 of 2`
+
+#### Scenario: Search with out-of-range page returns a page-out-of-range message
+- **GIVEN** 30 prompts match the query "worklogs" (2 pages of 20)
+- **WHEN** the operator runs `/prompts search worklogs --page=5`
+- **THEN** the response says `Page 5 is past the last page (2 pages total).`
+- **AND** the response does NOT say "no prompts matching"
+
+#### Scenario: Search returns a SearchPage with total_matched
+- **GIVEN** 30 prompts match the query "worklogs"
+- **WHEN** the search method is called with query "worklogs", limit=20, offset=0
+- **THEN** the returned SearchPage contains 20 results in the `results` field
+- **AND** the `total_matched` field is 30
+
+#### Scenario: Unknown flag is treated as query text
+- **GIVEN** a prompt with text "--verbose PTO request" exists in history
+- **WHEN** the operator runs `/prompts search --verbose PTO`
+- **THEN** `--verbose` is not a recognized flag
+- **AND** it is treated as query text
+- **AND** the search query becomes "--verbose PTO"
+- **AND** the prompt is included in the results
 
 #### Scenario: Search does not block concurrent registry operations
 - **GIVEN** a search is in progress scanning the archive file
