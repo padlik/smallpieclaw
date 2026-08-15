@@ -496,7 +496,7 @@ class TelegramInterface:
             BotCommand("mode", "Set creativity mode"),
             BotCommand("jobs", "List scheduled jobs"),
             BotCommand("agents", "List and manage active sub-agents"),
-            BotCommand("prompts", "List recent prompts and their status"),
+            BotCommand("prompts", "List/search/show prompts and their status"),
             BotCommand("reset", "Save and clear current task context"),
             BotCommand("verbose", "Toggle live tool-call progress messages"),
             BotCommand("reindex", "Re-embed all tools in the semantic index"),

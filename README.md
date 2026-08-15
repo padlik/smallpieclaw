@@ -172,6 +172,7 @@ systemctl --user enable --now telegram-agent
 | `/models` | List LLM models and switch active one (👁 = vision-capable) |
 | `/jobs` | Scheduled jobs; sub-commands: `reload`, `pause <tag>`, `resume <tag>`, `remove <tag>` |
 | `/agents` | Active sub-agents, scheduled jobs, and plan-step agents (with source category); `/agents cancel <id>` to stop one |
+| `/prompts` | Recent prompts with status and elapsed time; `/prompts search <query> [Nd/Nh] [--status=<S>] [--trace=<T>] [--since=<ISO>] [--until=<ISO>] [--page=<N>]` to search history; `/prompts show <id>` for full record |
 | `/dir` | List and remove trusted directories: `list`, `del <n>` |
 | `/mcp` | Manage MCP servers: `list`, `on <name>`, `off <name>`, `info <name>` |
 | `/stop` | Cancel the current running task |

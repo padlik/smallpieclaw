@@ -5,12 +5,15 @@ import functools
 import html
 import io
 import logging
+import math
 import os
 import re as _re
 import secrets
 import time
 from datetime import datetime as _dt
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+from prompt_registry import PromptRecord, SearchPage
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -103,7 +106,7 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /mode    — set creativity mode (default / planner / explorer / resilient)\n"
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
         "  /jobs    — list scheduled jobs\n"
-        "  /prompts — list recent prompts and their status\n"
+        "  /prompts — list recent prompts, or /prompts search &lt;query&gt; [Nd/Nh] [--status=&lt;S&gt;] [--trace=&lt;T&gt;] [--since=&lt;ISO&gt;] [--until=&lt;ISO&gt;] [--page=&lt;N&gt;], or /prompts show &lt;id&gt;\n"
         "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
         "  /pair    — pairing token management\n"
         "  /myid    — show your Telegram user ID\n",
@@ -330,9 +333,103 @@ def _fmt_prompt_elapsed(started_at: float, ended_at: float | None = None) -> str
     return f"{mins}m {secs}s" if mins else f"{secs}s"
 
 
+_TIME_WINDOW_RE = _re.compile(r"^(\d+)([dh])$")
+_VALID_STATUSES = {"running", "done", "failed", "cancelled"}
+_SEARCH_LIMIT = 20
+
+
+def _parse_prompts_search_args(args: list[str]) -> tuple[dict[str, Any], str, float | None]:
+    """Parse the token list after ``search`` into search kwargs.
+
+    Returns ``(search_kwargs, query, days)`` where *search_kwargs* contains
+    ``status``, ``trace_id``, ``since``, ``until``, and ``offset`` derived from
+    ``--page``. *query* is the joined positional tokens, and *days* is the
+    optional relative time window (``7d`` → ``7``, ``12h`` → ``0.5``).
+    """
+    flags: dict[str, str] = {}
+    positional: list[str] = []
+    for token in args:
+        if token.startswith("--") and "=" in token:
+            eq = token.index("=")
+            key = token[2:eq]
+            value = token[eq + 1 :]
+            if key in ("status", "trace", "since", "until", "page"):
+                flags[key] = value
+            else:
+                positional.append(token)
+        else:
+            positional.append(token)
+
+    days: float | None = None
+    if positional:
+        match = _TIME_WINDOW_RE.match(positional[-1])
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2)
+            days = value if unit == "d" else value / 24
+            positional = positional[:-1]
+
+    query = " ".join(positional)
+
+    search_kwargs: dict[str, Any] = {}
+    if "status" in flags:
+        search_kwargs["status"] = flags["status"]
+    if "trace" in flags:
+        search_kwargs["trace_id"] = flags["trace"]
+    if "since" in flags:
+        search_kwargs["since"] = flags["since"]
+    if "until" in flags:
+        search_kwargs["until"] = flags["until"]
+    if "page" in flags:
+        page = int(flags["page"])
+        if page < 1:
+            raise ValueError("page must be >= 1")
+        search_kwargs["offset"] = (page - 1) * _SEARCH_LIMIT
+
+    return search_kwargs, query, days
+
+
+def _render_prompt_entry(rec: PromptRecord) -> str:
+    """Render one prompt record as a display line matching the list format."""
+    icon = _STATUS_ICONS.get(rec.status, "❓")
+    elapsed = _fmt_prompt_elapsed(rec.started_at, rec.ended_at)
+    sub_count = len(rec.sub_agent_ids)
+    sa_info = f" · {sub_count} sub-agent{'s' if sub_count != 1 else ''}" if sub_count else ""
+    ts = _dt.fromtimestamp(rec.started_at).strftime("%Y-%m-%d %H:%M")
+    text_preview = _truncate_desc(rec.text, 80)
+    return (
+        f"<code>{html.escape(str(rec.prompt_id))}</code> {icon} <code>{html.escape(rec.status)}</code>\n"
+        f"  📅 {ts} · ⏱ {elapsed}{sa_info}\n"
+        f"  💬 {text_preview}"
+    )
+
+
+def _render_search_footer(page: SearchPage, limit: int, offset: int = 0) -> str:
+    """Render pagination footer for a ``SearchPage`` result.
+
+    Args:
+        page: The search result page.
+        limit: Page size used to compute total pages.
+        offset: The offset that was requested (used to derive the current page).
+
+    Returns:
+        The appropriate footer text, or an out-of-range message when the
+        requested offset is past the last page.
+    """
+    total_matched = page.total_matched
+    total_pages = max(1, math.ceil(total_matched / limit))
+    current_page = offset // limit + 1
+    if offset >= total_matched:
+        return f"📄 Page {current_page} is past the last page ({total_pages} pages total)."
+    footer = f"📄 Page {current_page} of {total_pages}"
+    if offset + len(page.results) < total_matched:
+        footer += f" — use --page={current_page + 1} for next"
+    return footer
+
+
 @_require_auth
 async def cmd_prompts(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """List recent prompts with status, elapsed time, and sub-agent count."""
+    """List, search, or show prompt records."""
     registry = getattr(iface, "_prompt_registry", None)
     if registry is None:
         await update.effective_message.reply_text(
@@ -341,6 +438,94 @@ async def cmd_prompts(iface: "TelegramInterface", update: Update, ctx: ContextTy
         )
         return
 
+    args = ctx.args or []
+    if args and args[0].lower() == "show":
+        if len(args) < 2:
+            await update.effective_message.reply_text(
+                "Usage: /prompts show &lt;id&gt;",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        prompt_id = args[1]
+        record = registry.show(prompt_id)
+        if record is None:
+            await update.effective_message.reply_text(
+                f"❌ Prompt <code>{html.escape(prompt_id)}</code> not found.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        icon = _STATUS_ICONS.get(record.status, "❓")
+        elapsed = _fmt_prompt_elapsed(record.started_at, record.ended_at)
+        started_ts = _dt.fromtimestamp(record.started_at).strftime("%Y-%m-%d %H:%M")
+        if record.ended_at is None:
+            ended_line = "Ended:  <i>(running)</i>"
+        else:
+            ended_ts = _dt.fromtimestamp(record.ended_at).strftime("%Y-%m-%d %H:%M")
+            ended_line = f"Ended:  <code>{ended_ts}</code> ({elapsed})"
+        sa_text = ", ".join(record.sub_agent_ids) if record.sub_agent_ids else "none"
+        text = (
+            f"📝 Prompt <code>{html.escape(record.prompt_id)}</code>\n"
+            f"Status: {icon} <code>{html.escape(record.status)}</code>\n"
+            f"Trace: <code>{html.escape(record.trace_id)}</code>\n"
+            f"Started: <code>{started_ts}</code>\n"
+            f"{ended_line}\n"
+            f"Sub-agents: {html.escape(sa_text)}\n\n"
+            f"Full text:\n{html.escape(record.text)}"
+        )
+        for chunk in iface._split_message(text):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        return
+
+    if args and args[0].lower() == "search":
+        try:
+            search_kwargs, query, days = _parse_prompts_search_args(args[1:])
+        except ValueError as exc:
+            await update.effective_message.reply_text(
+                f"⚠️ Invalid page number: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if "status" in search_kwargs and search_kwargs["status"] not in _VALID_STATUSES:
+            await update.effective_message.reply_text(
+                f"⚠️ Invalid status '<code>{html.escape(search_kwargs['status'])}</code>'. "
+                "Valid: running, done, failed, cancelled.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        offset = search_kwargs.get("offset", 0)
+        try:
+            page = registry.search(query=query, days=days, limit=_SEARCH_LIMIT, **search_kwargs)
+        except ValueError as exc:
+            await update.effective_message.reply_text(
+                f"⚠️ Invalid timestamp: {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if page.total_matched == 0:
+            await update.effective_message.reply_text(
+                f"ℹ️ No prompts matching \"<code>{html.escape(query)}</code>\".",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if not page.results:
+            footer = _render_search_footer(page, _SEARCH_LIMIT, offset=offset)
+            await update.effective_message.reply_text(footer, parse_mode=ParseMode.HTML)
+            return
+
+        lines = [f"🔍 Search results for \"<code>{html.escape(query)}</code>\" ({page.total_matched})\n"]
+        for rec in page.results:
+            lines.append(_render_prompt_entry(rec))
+        lines.append("")
+        lines.append(_render_search_footer(page, _SEARCH_LIMIT, offset=offset))
+        for chunk in iface._split_message("\n".join(lines)):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        return
+
+    # Default: list recent prompts (unchanged behavior).
     recent = registry.list_recent(20)
     if not recent:
         await update.effective_message.reply_text(
@@ -351,17 +536,8 @@ async def cmd_prompts(iface: "TelegramInterface", update: Update, ctx: ContextTy
 
     lines = [f"📝 <b>Recent Prompts</b> ({len(recent)})\n"]
     for rec in recent:
-        icon = _STATUS_ICONS.get(rec.status, "❓")
-        elapsed = _fmt_prompt_elapsed(rec.started_at, rec.ended_at)
-        sub_count = len(rec.sub_agent_ids)
-        sa_info = f" · {sub_count} sub-agent{'s' if sub_count != 1 else ''}" if sub_count else ""
-        ts = _dt.fromtimestamp(rec.started_at).strftime("%Y-%m-%d %H:%M")
-        text_preview = _truncate_desc(rec.text, 80)
-        lines.append(
-            f"<code>{html.escape(str(rec.prompt_id))}</code> {icon} <code>{html.escape(rec.status)}</code>\n"
-            f"  📅 {ts} · ⏱ {elapsed}{sa_info}\n"
-            f"  💬 {text_preview}"
-        )
+        lines.append(_render_prompt_entry(rec))
+    lines.append("\n💡 <code>/prompts search &lt;query&gt;</code> or <code>/prompts show &lt;id&gt;</code>")
 
     for chunk in iface._split_message("\n".join(lines)):
         await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
