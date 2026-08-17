@@ -449,6 +449,149 @@ class TestCancelEventOwnership:
                 pass
         assert ev.is_set() is False
 
+
+class TestCancelEventRegistry:
+    """CancelEventRegistry gives each run its own private cancel_event instead of
+    sharing one across concurrent runs, so no run's clear() can race with a
+    sibling's, and no run started after a stop can inherit a cancellation meant
+    for someone else."""
+
+    def test_new_run_event_starts_unset(self):
+        from agent_controller import CancelEventRegistry
+
+        reg = CancelEventRegistry()
+        ev = reg.new_run_event()
+        assert ev.is_set() is False
+
+    def test_each_run_gets_a_distinct_event(self):
+        from agent_controller import CancelEventRegistry
+
+        reg = CancelEventRegistry()
+        ev_a = reg.new_run_event()
+        ev_b = reg.new_run_event()
+        assert ev_a is not ev_b
+
+    def test_cancel_all_sets_every_active_run(self):
+        from agent_controller import CancelEventRegistry
+
+        reg = CancelEventRegistry()
+        ev_a = reg.new_run_event()
+        ev_b = reg.new_run_event()
+        reg.cancel_all()
+        assert ev_a.is_set() is True
+        assert ev_b.is_set() is True
+
+    def test_released_run_not_affected_by_later_cancel(self):
+        from agent_controller import CancelEventRegistry
+
+        reg = CancelEventRegistry()
+        ev_a = reg.new_run_event()
+        reg.release(ev_a)
+        reg.cancel_all()
+        assert ev_a.is_set() is False
+
+    def test_unrelated_new_run_started_after_a_stop_is_not_cancelled(self):
+        """The bug the naive shared-event fix introduced: Run A gets stopped,
+        Run B is a brand-new unrelated run starting concurrently — B must NOT
+        inherit A's cancellation."""
+        from agent_controller import CancelEventRegistry
+
+        reg = CancelEventRegistry()
+        ev_a = reg.new_run_event()   # Run A starts
+        reg.cancel_all()             # operator stops Run A
+        assert ev_a.is_set() is True
+        reg.release(ev_a)            # Run A unwinds
+
+        ev_b = reg.new_run_event()   # Run B starts fresh afterward
+        assert ev_b.is_set() is False
+
+    def test_release_of_unregistered_event_is_a_no_op(self):
+        import threading
+        from agent_controller import CancelEventRegistry
+
+        reg = CancelEventRegistry()
+        reg.release(threading.Event())  # never registered — must not raise
+
+
+class TestAgentControllerCancelRegistryWiring:
+    """AgentController must only create a CancelEventRegistry when it owns its
+    cancel_event, mint/release a private event per run(), and fan cancel()
+    out through the registry."""
+
+    def _make_controller(self, cancel_event=None):
+        from unittest.mock import MagicMock
+        from agent_controller import AgentController
+
+        return AgentController(
+            llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(),
+            cancel_event=cancel_event,
+        )
+
+    def test_registry_created_when_owning_event(self):
+        from agent_controller import CancelEventRegistry
+
+        ctrl = self._make_controller(cancel_event=None)
+        assert isinstance(ctrl._cancel_registry, CancelEventRegistry)
+
+    def test_registry_none_for_external_event(self):
+        import threading
+
+        ctrl = self._make_controller(cancel_event=threading.Event())
+        assert ctrl._cancel_registry is None
+
+    def test_run_mints_and_releases_a_private_event(self):
+        """run() must pass a registry-minted event into build_react_context and
+        release it afterward — not the same event across successive runs."""
+        from unittest.mock import patch
+
+        ctrl = self._make_controller(cancel_event=None)
+        seen_events = []
+
+        def _fake_loop(ctx, *args, **kwargs):
+            seen_events.append(ctx.cancel_event)
+            return "ok"
+
+        with patch("agent_controller.react_loop", side_effect=_fake_loop):
+            ctrl.run("first")
+            ctrl.run("second")
+
+        assert len(seen_events) == 2
+        assert seen_events[0] is not seen_events[1]
+        assert ctrl._cancel_registry._events == set()  # both released
+
+    def test_cancel_reaches_only_currently_active_run(self):
+        """The actual bug being fixed: a stop meant for the run in flight when
+        cancel() is called must not affect a later, unrelated run."""
+        from unittest.mock import patch
+
+        ctrl = self._make_controller(cancel_event=None)
+
+        # Run A: still "in flight" (never released) when cancel() fires.
+        run_a_event = ctrl._cancel_registry.new_run_event()
+        ctrl.cancel()
+        assert run_a_event.is_set() is True
+        ctrl._cancel_registry.release(run_a_event)
+
+        # Run B starts afterward and must not see a cancelled state.
+        seen = {}
+
+        def _fake_loop(ctx, *args, **kwargs):
+            seen["was_set"] = ctx.cancel_event.is_set()
+            return "ok"
+
+        with patch("agent_controller.react_loop", side_effect=_fake_loop):
+            ctrl.run("unrelated later request")
+        assert seen["was_set"] is False
+
+    def test_cancel_falls_back_to_direct_set_for_external_event(self):
+        import threading
+
+        ev = threading.Event()
+        ctrl = self._make_controller(cancel_event=ev)
+        ctrl.cancel()
+        assert ev.is_set() is True
+
+
 class TestFormatToolResultRecoveryFields:
     """format_tool_result must surface structured recovery metadata on failure."""
 

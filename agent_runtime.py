@@ -242,7 +242,12 @@ class AgentRuntime:
         return profile_to_source(profile)
 
     @staticmethod
-    def build_react_context(controller: "AgentController", trace_id: str) -> ReactContext:
+    def build_react_context(
+        controller: "AgentController",
+        trace_id: str,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> ReactContext:
         """Assemble the per-run ``ReactContext`` for a controller execution.
 
         This is the runtime-owned per-run context builder. It is deliberately
@@ -258,11 +263,24 @@ class AgentRuntime:
         Per-run additions (trace id, parent context payload/prompt variant) are
         still layered on top here.
 
+        ``cancel_event``, when given, overrides ``deps.cancel_event`` for this one
+        run. ``AgentController.run`` passes a freshly minted, run-private event
+        here for controllers that own their cancellation (see
+        ``AgentController._cancel_registry``): each concurrent run then has its
+        own event, so no run's start-of-loop ``clear()`` can race with a sibling
+        run sharing the same object, and ``cancel()`` fans out to every
+        currently-registered run instead of relying on one shared flag. Callers
+        that omit it (direct ``build_react_context`` calls, tests, the
+        externally-supplied-event path used by sub-agents) get
+        ``deps.cancel_event`` unchanged, exactly as before.
+
         ``_on_step`` ordering is preserved because ``ControllerDeps`` is read from
         the controller at run start, after registry helpers have wired callbacks.
         """
         deps: ControllerDeps = controller.runtime_deps
         shared = {f.name: getattr(deps, f.name) for f in fields(ControllerDeps)}
+        if cancel_event is not None:
+            shared["cancel_event"] = cancel_event
 
         ctx = ReactContext(trace_id=trace_id, **shared)
 

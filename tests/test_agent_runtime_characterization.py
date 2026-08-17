@@ -207,10 +207,20 @@ class TestAgentControllerReactContextAssembly:
         ctrl.llm.set_trace_id.assert_any_call("r-abc12345")  # type: ignore[attr-defined]
 
     def test_cancel_ownership_owned_by_default(self):
+        """When the controller owns its cancellation (no external event supplied),
+        run() mints a run-private event via CancelEventRegistry rather than
+        reusing ctrl._cancel_event, so concurrent runs on one shared controller
+        (e.g. two different users on the MAIN agent) never share an event and
+        can't race on its clear()/set() state. ctrl._cancel_event remains only
+        as the fallback for callers that bypass run() (e.g. a bare
+        build_react_context() call)."""
         ctrl = _make_controller()  # cancel_event defaults to None -> owned
         ctx, _ = _run_capture(ctrl)
         assert ctx.owns_cancel_event is True
-        assert ctx.cancel_event is ctrl._cancel_event
+        assert isinstance(ctx.cancel_event, threading.Event)
+        assert ctx.cancel_event is not ctrl._cancel_event
+        # run() releases the per-run event from the registry once it returns.
+        assert ctx.cancel_event not in ctrl._cancel_registry._events
 
     def test_cancel_ownership_forwarded_not_owned(self):
         shared = threading.Event()
