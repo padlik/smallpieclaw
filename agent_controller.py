@@ -36,6 +36,57 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Cancel-event registry — per-run private events for a shared-owner controller
+# ---------------------------------------------------------------------------
+
+class CancelEventRegistry:
+    """Mints a private cancel_event per run and fans out cancel_all() to whoever
+    is currently registered.
+
+    A single MAIN AgentController instance is shared across every user's
+    request (main.py constructs one; telegram_interface.py's per-user locks only
+    serialize a *single* user's own messages, so two different users' runs can
+    execute concurrently against the same controller). Handing every run the
+    *same* threading.Event and clearing it at loop start doesn't work under that
+    concurrency: whichever run starts next silently clears a cancellation a
+    still-in-flight sibling run is relying on, and — the reverse failure mode —
+    a stop meant for one run can end up killing every *new* run at step 0 for as
+    long as any sibling stays active, since nothing ever gets a chance to see the
+    event settle back to "not cancelled".
+
+    Giving every run its own private event removes the sharing entirely: no
+    run's clear() can affect another run's event, and no run can inherit a
+    cancellation intended for someone else. cancel_all() fans the stop signal
+    out to exactly the runs active *right now*, matching the operator-facing
+    "stop everything currently running" semantics without leaking into runs
+    that start afterward.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: set[threading.Event] = set()
+
+    def new_run_event(self) -> threading.Event:
+        """Create and register a fresh, unset event for a new run."""
+        event = threading.Event()
+        with self._lock:
+            self._events.add(event)
+        return event
+
+    def release(self, event: threading.Event) -> None:
+        """Unregister *event* once its run has finished."""
+        with self._lock:
+            self._events.discard(event)
+
+    def cancel_all(self) -> None:
+        """Set every event currently registered (i.e. every run in flight now)."""
+        with self._lock:
+            events = list(self._events)
+        for event in events:
+            event.set()
+
+
+# ---------------------------------------------------------------------------
 # Agent Controller
 # ---------------------------------------------------------------------------
 
@@ -93,6 +144,14 @@ class AgentController:
         self.log_backup_count = log_backup_count
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._owns_cancel_event = cancel_event is None
+        # When this controller owns its cancellation (no external event was
+        # supplied — the MAIN agent's case), run() mints each run its own
+        # private event via this registry instead of reusing self._cancel_event,
+        # so concurrent runs on this one shared controller can never race on a
+        # single event's clear()/set() state. self._cancel_event remains as the
+        # fallback used only by direct build_react_context() calls that bypass
+        # run() (e.g. characterization tests) — see CancelEventRegistry.
+        self._cancel_registry = CancelEventRegistry() if self._owns_cancel_event else None
         self.label = label
         self._on_step = on_step
         self._on_tool_trace = on_tool_trace
@@ -242,7 +301,20 @@ class AgentController:
         # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
         # keeps only the per-run concerns: trace minting (above), model
         # _active_idx save/restore (below), and progress/image passthrough.
-        ctx = AgentRuntime.build_react_context(self, run_trace_id)
+        #
+        # Cancellation: when this controller owns its cancel_event (no external
+        # event was supplied), mint a run-private event via the registry instead
+        # of reusing self._cancel_event across concurrent runs — see
+        # CancelEventRegistry for the race this avoids. Controllers with an
+        # externally-supplied event (sub-agents forwarding a parent's stop
+        # signal) pass cancel_event=None here and keep using that shared event
+        # unchanged, since that sharing is intentional cascade-cancel behavior.
+        run_cancel_event = (
+            self._cancel_registry.new_run_event()
+            if self._cancel_registry is not None
+            else None
+        )
+        ctx = AgentRuntime.build_react_context(self, run_trace_id, cancel_event=run_cancel_event)
         try:
             if self.builtin_executor is not None:
                 from builtin_tools.access_control import GrantTracker  # noqa: PLC0415
@@ -257,11 +329,22 @@ class AgentController:
                 self.builtin_executor._prompt_approval_set = None
                 self.builtin_executor._current_prompt_id = None
             self._confirmation.clear_auto_approve()
+            if self._cancel_registry is not None and run_cancel_event is not None:
+                self._cancel_registry.release(run_cancel_event)
 
 
     def cancel(self) -> None:
-        """Cancel the currently-running task. Safe to call from any thread."""
-        self._cancel_event.set()
+        """Cancel the currently-running task(s). Safe to call from any thread.
+
+        When this controller owns its cancellation, fans the stop signal out to
+        every run currently in flight (see CancelEventRegistry) rather than
+        setting one shared event — so the stop reaches everything running now
+        without also poisoning runs that start afterward.
+        """
+        if self._cancel_registry is not None:
+            self._cancel_registry.cancel_all()
+        else:
+            self._cancel_event.set()
         logger.info("Cancel requested by operator label=%s", self.label)
 
     def resume(self, token: str, confirmed: bool) -> None:
