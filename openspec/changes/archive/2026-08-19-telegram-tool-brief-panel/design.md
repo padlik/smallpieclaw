@@ -46,16 +46,16 @@ The panel already has a precedent for in-place step updates: the `__SHELL_CHUNK_
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Tool registry (read-only lookup for MCP marking)
+### MCP manager (read-only lookup for MCP marking)
 
 ```
 ┌──────────────────────────────────────────────────┐
-│           ToolRegistry (tool_registry.py)        │
+│           MCPManager (mcp_client.py)             │
 │                                                  │
-│  get(name) → Tool | None                         │
-│  Tool: { name, is_mcp, server_name, ... }        │
+│  has_tool(name) → bool                           │
+│  server_name_for_tool(name) → str                │
 │                                                  │
-│  Already populated by mcp_client at startup.     │
+│  Already populated at startup.                   │
 │  No changes needed — read-only consumer.         │
 └──────────────────────────────────────────────────┘
 ```
@@ -131,11 +131,11 @@ Then truncate to ~35 chars with `…`.
 
 **Edge case — intervening Thinking step:** If a Thinking step was appended between TOOL_START and TOOL_END (shouldn't happen in normal flow — TOOL_END follows TOOL_START directly), the merge finds the last TOOL_RUNNING step by tag and updates it, skipping any intervening Thinking steps.
 
-### Decision 5: `_steps` tuple gains a `tag` field
+### Decision 5: `_steps` gains a `Step` dataclass with `StepTag` enum
 
-**Choice:** Change `_steps: list[tuple[float, str]]` to `_steps: list[tuple[float, str, str | None]]` where the third element is a tag: `"TOOL_RUNNING"`, `"THINKING"`, or `None`.
+**Choice:** Replace `_steps: list[tuple[float, str]]` with `_steps: list[Step]` where `Step` is a mutable `@dataclass` with fields `elapsed: float`, `html: str`, `tag: StepTag | None`. `StepTag` is an `enum.Enum` with values `THINKING` and `TOOL_RUNNING`; `None` represents untagged result/fallback steps.
 
-**Rationale:** The merge logic needs to distinguish "is the last step a tool call I should update?" from "is it a Thinking step?". Parsing HTML to determine this is fragile. A lightweight tag makes the logic explicit and enables the Thinking-duration retroactive patch.
+**Rationale:** The merge logic needs to distinguish "is the last step a tool call I should update?" from "is it a Thinking step?". Parsing HTML to determine this is fragile. A lightweight tag makes the logic explicit and enables the Thinking-duration retroactive patch. The `Step` dataclass with `StepTag` enum follows the codebase's existing dataclass/enum convention (`ReactContext`, `LogEvent`, `RuntimeProfile`) and supports in-place field mutation (`step.html = ...`) without tuple reconstruction.
 
 ### Decision 6: Thinking duration via retroactive patch
 
@@ -143,11 +143,11 @@ Then truncate to ~35 chars with `…`.
 
 **Rationale:** A live-ticking timer would require a background asyncio task editing the panel every second — complex and throttled. The retroactive patch is a single in-place update when the next step arrives, reusing the same update pattern as TOOL_END merge. The user briefly sees `Thinking…` without a duration, then it gets patched — acceptable trade-off for simplicity.
 
-### Decision 7: MCP marking via `ToolRegistry.get()` lookup
+### Decision 7: MCP marking via `mcp_manager.server_name_for_tool()` lookup
 
-**Choice:** At `react_loop.py:1393`, before emitting the TOOL_START progress string, check `ctx.mcp_manager.has_tool(tool_name)`. If True, look up `ToolRegistry.get(tool_name)` to get `server_name`, and pass `is_mcp=True, server_name=tool.server_name` to `fmt_tool_brief()`. The brief appends ` [MCP:{server_name}]`.
+**Choice:** At `react_loop.py:1393`, before emitting the TOOL_START progress string, check `ctx.mcp_manager.has_tool(tool_name)`. If True, look up `server_name` via `ctx.mcp_manager.server_name_for_tool(tool_name)`, and pass `is_mcp=True, server_name=server_name` to `fmt_tool_brief()`. The brief appends ` [MCP:{server_name}]`.
 
-**Rationale:** `Tool.server_name` is already populated by `mcp_client.py` at registration time (`tool_registry.py:53-62`). No new infrastructure needed — just a read-only lookup at the emission site.
+**Rationale:** `server_name_for_tool()` is a thread-safe helper on `MCPManager` (`mcp_client.py`) that maps tool names to their owning server. It is already used elsewhere in `react_loop.py` for MCP auth handling. No new infrastructure needed — just a read-only lookup at the emission site.
 
 ### Decision 8: `_MAX_STEPS` 10 → 5
 
@@ -164,7 +164,7 @@ Then truncate to ~35 chars with `…`.
 ## Risks / Trade-offs
 
 - **[Shell secrets in brief]** → Truncation at ~35 chars is a partial shield. Mitigation: same exposure as the confirmation prompt which shows the full command; verbose mode is opt-in for full detail.
-- **[MCP server-name lookup adds a call per tool]** → `ToolRegistry.get()` is a dict lookup, negligible cost. Mitigation: none needed.
+- **[MCP server-name lookup adds a call per tool]** → `mcp_manager.server_name_for_tool()` is a dict lookup, negligible cost. Mitigation: none needed.
 - **[Retroactive Thinking duration is not live]** → User sees `Thinking…` then `Thinking… 5s` a moment later. Mitigation: acceptable for a progress panel; a live timer would add complexity for marginal gain.
 - **[TOOL_END without matching TOOL_START]** → If a tool call is interrupted or the progress string is lost, the merge finds no TOOL_RUNNING step. Mitigation: fall back to appending a new step (current behavior).
 - **[Brief format changes over time]** → Per-tool branches in `fmt_tool_brief()` need maintenance when new tools are added. Mitigation: generic fallback handles unknown tools; new tools get a branch only if the generic fallback is insufficient.

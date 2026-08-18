@@ -79,7 +79,7 @@ Rule: Every tool call shows a one-line brief of what it's doing, not just the to
 
 ### Requirement: MCP tools marked with server name
 
-The progress panel SHALL mark MCP tool calls with `[MCP:server_name]` so the operator can distinguish built-in tools from external MCP server tools. The server name SHALL be looked up via `ToolRegistry.get(tool_name).server_name` at TOOL_START time.
+The progress panel SHALL mark MCP tool calls with `[MCP:server_name]` so the operator can distinguish built-in tools from external MCP server tools. The server name SHALL be looked up via `mcp_manager.server_name_for_tool(tool_name)` at TOOL_START time.
 
 Feature: Telegram progress panel
 Rule: MCP tools are visually distinguished from built-in tools.

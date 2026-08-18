@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import enum
 import html
 import logging
 import os
 import re
 import secrets
 import time
+from dataclasses import dataclass
 from functools import partial
 from concurrent.futures import Future
 from typing import Callable, Optional
@@ -103,6 +105,23 @@ class _DeferredMessage:
     token: str
 
 
+class StepTag(enum.Enum):
+    """Tag classifying a panel step for merge/patch logic."""
+
+    THINKING = "THINKING"
+    TOOL_RUNNING = "TOOL_RUNNING"
+    # None is used for untagged result/fallback steps.
+
+
+@dataclass
+class Step:
+    """A single panel step: timestamp, rendered HTML, and classification tag."""
+
+    elapsed: float
+    html: str
+    tag: StepTag | None = None
+
+
 class _ProgressPanel:
     """Scrolling step-log panel for a single agent run.
 
@@ -113,7 +132,7 @@ class _ProgressPanel:
     """
 
     _MIN_EDIT_INTERVAL: float = 1.5
-    _MAX_STEPS: int = 10
+    _MAX_STEPS: int = 5
 
     def __init__(
         self,
@@ -139,7 +158,7 @@ class _ProgressPanel:
         self._update = update
         self._ctx = ctx
         self._chat_id = update.effective_chat.id
-        self._steps: list[tuple[float, str]] = []  # (elapsed_secs, html text)
+        self._steps: list[Step] = []
         self._task_start = time.monotonic()
         self._last_edit_ts: float = 0.0
         self._step_n: int = 0
@@ -155,18 +174,33 @@ class _ProgressPanel:
                 pass
             await asyncio.sleep(4)
 
-    def classify(self, msg: str) -> str:
-        """Return a single-line HTML snippet for a progress message."""
+    def classify(self, msg: str) -> tuple[str, StepTag | None]:
+        """Return a single-line HTML snippet for a progress message plus a tag.
+
+        Returns:
+            A 2-tuple of (html_text, tag).  The tag classifies the step for
+            panel management (e.g. ``StepTag.THINKING``, ``StepTag.TOOL_RUNNING``)
+            and may be ``None`` for result/fallback lines.
+        """
         from react_loop import _tool_icon  # local import to avoid circular at module level
 
         if "Thinking" in msg or msg.startswith("⚙️"):
             self._step_n += 1
-            return "⚙️ <i>Thinking…</i>"
+            return "⚙️ <i>Thinking…</i>", StepTag.THINKING
         if "Running tool:" in msg:
-            # e.g. "🖥️ Running tool: `shell`\n..."
+            # e.g. "🖥️ Running tool: `shell`\nshell \"python3 -c ...\""
             name = msg.split("`")[1] if "`" in msg else msg.split(":")[-1].strip()
             icon = _tool_icon(name.strip())
-            return f"{icon} Running: <code>{html.escape(name.strip())}</code>"
+            brief = msg.split("\n", 1)[1] if "\n" in msg else ""
+            brief_html = html.escape(brief.strip()) if brief.strip() else ""
+            return (
+                f"{icon} Running: <code>{html.escape(name.strip())}</code>"
+                f"{(' ' + brief_html) if brief_html else ''}"
+            ), StepTag.TOOL_RUNNING
+        # Defensive fallback: TOOL_END normally arrives via the __TOOL_END__
+        # prefix handler above. These branches handle the rare case where a
+        # result-formatted message reaches classify() directly (e.g. legacy
+        # callers, test harnesses). They are not on the normal panel path.
         if "✅" in msg and "**" in msg:
             # result line e.g. "🖥️ **shell** ✅\n..."
             first_line = msg.split("\n")[0]
@@ -176,9 +210,10 @@ class _ProgressPanel:
                 suffix = first_line[first_line.rindex("**") + 2:]
                 return (
                     f"{icon_part}<b>{html.escape(match.group(1))}</b>"
-                    f"{html.escape(suffix)}"
+                    f"{html.escape(suffix)}",
+                    None,
                 )
-            return html.escape(first_line)
+            return html.escape(first_line), None
         if "❌" in msg and "**" in msg:
             first_line = msg.split("\n")[0]
             match = re.search(r"\*\*(.+?)\*\*", first_line)
@@ -187,12 +222,13 @@ class _ProgressPanel:
                 suffix = first_line[first_line.rindex("**") + 2:]
                 return (
                     f"{icon_part}<b>{html.escape(match.group(1))}</b>"
-                    f"{html.escape(suffix)}"
+                    f"{html.escape(suffix)}",
+                    None,
                 )
-            return html.escape(first_line)
+            return html.escape(first_line), None
         # Fallback: plain first line, truncated
         first_line = msg.split("\n")[0][:80]
-        return html.escape(first_line)
+        return html.escape(first_line), None
 
     def build_panel(self) -> str:
         """Render the current panel HTML from the accumulated step log."""
@@ -204,10 +240,10 @@ class _ProgressPanel:
         )
         visible = self._steps[-self._MAX_STEPS:]
         lines: list[str] = []
-        for step_elapsed, rendered in visible:
-            sm, ss = divmod(int(step_elapsed), 60)
+        for step in visible:
+            sm, ss = divmod(int(step.elapsed), 60)
             ts = f"{sm}:{ss:02d}" if sm else f"0:{ss:02d}"
-            lines.append(f"<code>[{ts}]</code> {rendered}")
+            lines.append(f"<code>[{ts}]</code> {step.html}")
         return header + "\n".join(lines)
 
     def flush_panel(self, force: bool = False) -> None:
@@ -276,6 +312,38 @@ class _ProgressPanel:
                     self._loop,
                 )
             return
+        if msg.startswith("__TOOL_END__:"):
+            rest = msg[len("__TOOL_END__:"):]
+            status, _, remainder = rest.partition(":")
+            tool_name, _, verbose_payload = remainder.partition("\n")
+            success = status == "ok"
+            # Find last TOOL_RUNNING step and merge ✅/❌ in place
+            for i in range(len(self._steps) - 1, -1, -1):
+                if self._steps[i].tag == StepTag.TOOL_RUNNING:
+                    step = self._steps[i]
+                    base = re.sub(r"\s*<i>.*?</i>\s*$", "", step.html, flags=re.DOTALL)
+                    marker = " ✅" if success else " ❌"
+                    step.html = f"{base}{marker}"
+                    break
+            else:
+                # Fallback: no TOOL_RUNNING step — append a new result step
+                from react_loop import _tool_icon
+                icon = _tool_icon(tool_name)
+                marker = "✅" if success else "❌"
+                elapsed = time.monotonic() - self._task_start
+                self._steps.append(
+                    Step(elapsed, f"{icon} <b>{html.escape(tool_name)}</b> {marker}", None)
+                )
+            # If verbose, send the verbose payload as a separate event
+            if self._interface._verbose and verbose_payload:
+                asyncio.run_coroutine_threadsafe(
+                    self._interface._send_verbose_event(
+                        self._ctx.bot, self._chat_id, verbose_payload
+                    ),
+                    self._loop,
+                )
+            self.flush_panel()
+            return
         if self._interface._verbose and any(
             msg.startswith(prefix) for prefix in _VERBOSE_EVENT_PREFIXES
         ):
@@ -294,17 +362,25 @@ class _ProgressPanel:
                 line for line in tail_text.splitlines() if line.strip()
             ][-4:]
             preview = " ↩ ".join(tail_lines)[:120]
-            if self._steps:
-                elapsed_s, _ = self._steps[-1]
-                self._steps[-1] = (
-                    elapsed_s,
-                    f"🖥️ Running: <code>shell</code>  <i>{html.escape(preview)}</i>",
-                )
+            if self._steps and self._steps[-1].tag == StepTag.TOOL_RUNNING:
+                step = self._steps[-1]
+                # Preserve the brief (drop any prior <i>...</i> tail)
+                # and append the live tail, keeping the same tag.
+                base = re.sub(r"\s*<i>.*?</i>\s*$", "", step.html, flags=re.DOTALL)
+                step.html = f"{base} <i>{html.escape(preview)}</i>"
             self.flush_panel()
             return
+
         # Normal progress: append to step log and (maybe) flush the panel
         elapsed = time.monotonic() - self._task_start
-        self._steps.append((elapsed, self.classify(msg)))
+        html_text, tag = self.classify(msg)
+        # Thinking-duration retroactive patch: if the last step is THINKING,
+        # compute duration and patch its HTML in place.
+        if self._steps and self._steps[-1].tag == StepTag.THINKING:
+            step = self._steps[-1]
+            duration = elapsed - step.elapsed
+            step.html = step.html.replace("Thinking…", f"Thinking… {int(duration)}s")
+        self._steps.append(Step(elapsed, html_text, tag))
         self.flush_panel()
 
 
