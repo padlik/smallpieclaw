@@ -381,6 +381,133 @@ def fmt_tool_call(tool_name: str, args: dict) -> str:
     return f"```\n{arg_str}\n```" if arg_str and arg_str != "{}" else ""
 
 
+_BRIEF_MAX = 35
+
+
+def _truncate_brief(text: str, limit: int = _BRIEF_MAX) -> str:
+    """Truncate to limit chars, appending … if truncated."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _strip_shell_wrapper(cmd: str) -> str:
+    """Strip common shell wrapper patterns from a command string.
+
+    Strips, in order:
+    1. ``sh/bash/zsh -c "..."`` wrappers
+    2. Leading ``cd dir && `` prefix
+    3. Leading ``export VAR=value && `` prefix
+    """
+    match = re.match(r'^(sh|bash|zsh)\s+-c\s+"(.+)"$', cmd)
+    if match:
+        cmd = match.group(2)
+    cmd = re.sub(r"^cd\s+\S+\s+&&\s+", "", cmd)
+    cmd = re.sub(r"^export\s+\w+=\S+\s+&&\s+", "", cmd)
+    return cmd
+
+
+def fmt_tool_brief(tool_name: str, args: dict, is_mcp: bool = False, server_name: str = "") -> str:
+    """Format a short one-line brief of what a tool is doing, for the compact panel.
+
+    Extracts the semantically meaningful argument per tool family. Secrets are
+    protected by showing keys only, never values. Truncated to ~35 chars.
+    Appends ``[MCP:{server_name}]`` when ``is_mcp`` is True.
+    """
+    core = ""
+
+    if tool_name in {"file_read", "file_send", "vision_query"}:
+        core = f"{tool_name} {os.path.basename(args.get('path', '?'))}"
+
+    elif tool_name == "file_diff":
+        path_a = args.get("path_a", "?")
+        path_b = args.get("path_b", "?")
+        core = f"{tool_name} {os.path.basename(path_a)} ↔ {os.path.basename(path_b)}"
+
+    elif tool_name == "file_patch":
+        path = args.get("path", "?")
+        old_str = args.get("old_str", "") or ""
+        new_str = args.get("new_str", "") or ""
+        core = f"{tool_name} {os.path.basename(path)} +{len(new_str.splitlines())} -{len(old_str.splitlines())}"
+
+    elif tool_name == "file_write":
+        path = args.get("path", "?")
+        content = args.get("content", "") or ""
+        core = f"{tool_name} {os.path.basename(path)} ({len(content)})"
+
+    elif tool_name == "shell":
+        cmd = args.get("command", "") or ""
+        stripped = _strip_shell_wrapper(cmd)
+        core = f'{tool_name} "{_truncate_brief(stripped)}"'
+
+    elif tool_name == "spawn_agent":
+        task = args.get("task", "")
+        core = f'{tool_name} "{_truncate_brief(task, 30)}"'
+
+    elif tool_name == "schedule":
+        action = args.get("action", "")
+        tag = args.get("tag", "")
+        cron = args.get("cron", "")
+        if action == "list":
+            core = f"{tool_name} list"
+        elif action == "add":
+            core = f'{tool_name} add "{_truncate_brief(tag, 30)}" {cron}'
+        else:
+            core = f'{tool_name} {action} "{_truncate_brief(tag, 30)}"'
+
+    elif tool_name in {"get_agent_result", "cancel_agent"}:
+        core = f"{tool_name} {args.get('agent_id', '')}"
+
+    elif tool_name == "wait_for_any_agent":
+        agent_ids = args.get("agent_ids", []) or []
+        if len(agent_ids) > 2:
+            core = f"{tool_name} [{len(agent_ids)} agents]"
+        else:
+            core = f"{tool_name} {', '.join(str(a) for a in agent_ids)}"
+
+    elif tool_name == "memory_write":
+        action = args.get("action", "")
+        key = args.get("key", "")
+        core = f'{tool_name} {action} "{_truncate_brief(key, 30)}"'
+
+    elif tool_name == "memory_graph_search":
+        query = args.get("query", "")
+        core = f'{tool_name} "{_truncate_brief(query, 30)}"'
+
+    elif tool_name == "memory_graph_store":
+        content = args.get("content", "")
+        core = f'{tool_name} "{_truncate_brief(content, 30)}"'
+
+    elif tool_name == "log_query":
+        text = args.get("text", "")
+        core = f'{tool_name} "{_truncate_brief(text, 30)}"'
+
+    elif tool_name == "secret_get":
+        core = f"{tool_name} {args.get('key', '')}"
+
+    elif tool_name == "shell_env_set":
+        core = f"{tool_name} {args.get('key', '')}"
+
+    elif tool_name in {"shell_env_unset", "shell_env_get"}:
+        core = f"{tool_name} {args.get('key', '')}"
+
+    elif tool_name == "shell_env_list":
+        core = f"{tool_name} list env vars"
+
+    else:
+        # Keys only, never values — protects secrets for MCP/unknown tools.
+        if args:
+            core = f"{tool_name} ({', '.join(str(k) for k in args)})"
+        else:
+            core = tool_name
+
+    core = core.replace("\n", " ").replace("\r", " ")
+    brief = _truncate_brief(core)
+    if is_mcp:
+        brief = f"{brief} [MCP:{server_name}]"
+    return brief
+
+
 def fmt_tool_result_progress(tool_name: str, args: dict, outcome: dict) -> str:
     """Format a tool result as a short progress update."""
     call = fmt_tool_call(tool_name, args)
@@ -931,7 +1058,8 @@ def _dispatch_action(
             logger.info("Tool '%s' result: success=True", tool_name)
         else:
             logger.warning("Tool '%s' result: success=False | error=%s | args=%s", tool_name, outcome.get("error", ""), {k: str(v)[:120] for k, v in args.items()}, )
-        progress(fmt_tool_result_progress(tool_name, args, outcome))
+        _end_status = "ok" if outcome.get("success") else "fail"
+        progress(f"__TOOL_END__:{_end_status}:{tool_name}\n{fmt_tool_result_progress(tool_name, args, outcome)}")
         sink(tool_result)
         if outcome.get("_operator_cancelled") or ctx.cancel_event.is_set():
             state.operator_cancelled = True
@@ -1390,7 +1518,12 @@ def _dispatch_tool(
         args = {"_raw": args}
     args = _coerce_args(args)
 
-    _progress(f"{_tool_icon(tool_name)} Running tool: `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
+    is_mcp = bool(ctx.mcp_manager) and ctx.mcp_manager.has_tool(tool_name)
+    server_name = ""
+    if is_mcp:
+        server_name = ctx.mcp_manager.server_name_for_tool(tool_name)  # type: ignore[union-attr]
+    brief = fmt_tool_brief(tool_name, args, is_mcp=is_mcp, server_name=server_name)
+    _progress(f"{_tool_icon(tool_name)} Running tool: `{tool_name}`\n{brief}")
 
     # vision_query handled directly (needs LLM access)
     if tool_name == "vision_query":
