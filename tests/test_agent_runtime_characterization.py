@@ -77,7 +77,7 @@ def _run_capture(ctrl: AgentController, goal: str = "do it"):
     return captured["ctx"], result
 
 
-def _cfg(fallback=None) -> dict:
+def _cfg() -> dict:
     """A real multi-model config usable to build a real LLMClient."""
     models = [
         {"name": "a", "provider": "openai", "model": "model-a",
@@ -89,12 +89,10 @@ def _cfg(fallback=None) -> dict:
          "api_key": "k", "base_url": "http://x"},
     ]
     agent = {"default_model": "model-a"}
-    if fallback is not None:
-        agent["fallback_models"] = fallback
     return {"models": models, "agent": agent}
 
 
-def _make_runner(config: dict, *, model_cfg=None, fallback_models=None,
+def _make_runner(config: dict, *, model_cfg=None,
                  short_term=None, usage_registry=None, cancel_event=None,
                  context_payload=None, prompt_variant=None, on_step=None,
                  label: str = "on-demand") -> SubAgentRunner:
@@ -113,7 +111,6 @@ def _make_runner(config: dict, *, model_cfg=None, fallback_models=None,
         notify_fn=None,
         label=label,
         usage_registry=usage_registry,
-        fallback_models=fallback_models,
         cancel_event=cancel_event,
         context_payload=context_payload,
         prompt_variant=prompt_variant,
@@ -320,22 +317,6 @@ class TestSubAgentRunnerConstruction:
 
 class TestSubAgentModelConfiguration:
     """Freeze model-configuration construction invariants."""
-
-    def test_fallback_none_inherits_config(self):
-        # config declares two inheritable fallbacks
-        config = _cfg(fallback=["model-b", "model-c"])
-        runner = _make_runner(config, fallback_models=None)
-        assert len(runner._llm._fallback_indices) == 2
-
-    def test_fallback_empty_disables(self):
-        config = _cfg(fallback=["model-b", "model-c"])
-        runner = _make_runner(config, fallback_models=[])
-        assert runner._llm._fallback_indices == []
-
-    def test_fallback_explicit_list(self):
-        config = _cfg(fallback=["model-b", "model-c"])
-        runner = _make_runner(config, fallback_models=["model-b"])
-        assert len(runner._llm._fallback_indices) == 1
 
     def test_per_call_overrides_preserved_in_isolated_client(self):
         config = _cfg()

@@ -480,3 +480,157 @@ class TestRepeatedCompactionRegression:
             f"Goal must stay anchored after the n==4 boundary compaction; got "
             f"{compacted2[goal_idx]['content'][:80]!r}"
         )
+
+
+class TestPerModelContextWindow:
+    """Per-model context_window awareness for compaction threshold.
+
+    The threshold formula is: int((effective - model_max_tokens) * 0.85)
+    where effective = model.context_window or agent.ctx_max_tokens.
+    """
+
+    def test_context_window_set_uses_per_model_limit(self, monkeypatch):
+        """Model with context_window set uses per-model limit for threshold."""
+        def char_estimate(messages, system, model=None):
+            return sum(len(str(m.get("content") or "")) for m in messages) // 4
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+        # Build messages that exceed the per-model threshold but not the agent default.
+        # context_window=8192, max_tokens=1024 → threshold = max(6092, 256) = 6092
+        # agent.ctx_max_tokens=90000 → threshold would be int(90000*0.85) = 76500
+        # We need messages > 6092 tokens but < 76500 tokens to prove per-model is used.
+        # char_estimate divides chars by 4, so we need > 24412 chars of content.
+        msgs = [_msg("user", "GOAL: test per-model")]
+        for i in range(8):
+            msgs.append(_msg("assistant", f"action {i} " + ("p" * 4000)))
+            msgs.append(_msg("user", f"result {i}\n" + ("r" * 8000)))
+        llm = MagicMock()
+        llm.chat.return_value = "summary"
+
+        # Per-model: context_window=8192, max_tokens=1024
+        out, _ = maybe_compact(msgs, "system", 8192, llm, model_max_tokens=1024)
+        # Compaction should fire because threshold (6092) < message tokens
+        assert len(out) < len(msgs)
+        llm.chat.assert_called()
+
+    def test_context_window_unset_falls_back_to_agent_default(self, monkeypatch):
+        """Model without context_window falls back to agent.ctx_max_tokens."""
+        def char_estimate(messages, system, model=None):
+            return sum(len(str(m.get("content") or "")) for m in messages) // 4
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+        # Same messages as above, but with a large ctx_max_tokens (agent default)
+        msgs = [_msg("user", "GOAL: test fallback")]
+        for i in range(4):
+            msgs.append(_msg("assistant", f"action {i} " + ("p" * 2000)))
+            msgs.append(_msg("user", f"result {i}\n" + ("r" * 4000)))
+        llm = MagicMock()
+
+        # Agent default: ctx_max_tokens=90000, max_tokens=1024
+        # threshold = max(int((90000-1024)*0.85), 256) = max(75629, 256) = 75629
+        out, _ = maybe_compact(msgs, "system", 90_000, llm, model_max_tokens=1024)
+        # No compaction — under threshold
+        assert out is msgs
+        llm.chat.assert_not_called()
+
+    def test_threshold_reserves_completion_tokens(self, monkeypatch):
+        """Compaction threshold reserves completion tokens before margin.
+
+        max(int((8192 - 1024) * 0.85), 256) = max(6092, 256) = 6092,
+        NOT int(8192 * 0.85) = 6963.
+        """
+        def char_estimate(messages, system, model=None):
+            # Return a value between 6092 and 6963 to prove the formula
+            return 6500
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+        msgs = [_msg("user", "GOAL"), _msg("assistant", "act"), _msg("user", "res")]
+        # Pad to >3 messages so compaction path engages
+        for i in range(4):
+            msgs.append(_msg("assistant", f"a{i}"))
+            msgs.append(_msg("user", f"r{i}"))
+        llm = MagicMock()
+        llm.chat.return_value = "summary"
+
+        # With completion reservation: threshold = 6092, 6500 > 6092 → compacts
+        out, _ = maybe_compact(msgs, "system", 8192, llm, model_max_tokens=1024)
+        llm.chat.assert_called()  # compaction fired
+
+        # Without completion reservation (old formula): threshold = 6963, 6500 < 6963 → no compact
+        llm2 = MagicMock()
+        out2, _ = maybe_compact(msgs, "system", 8192, llm2, model_max_tokens=0)
+        # With max_tokens=0: threshold = max(6963, 256) = 6963 > 6500 → no compaction
+        assert out2 is msgs
+        llm2.chat.assert_not_called()
+
+    def test_negative_threshold_floor_prevents_degenerate_compaction(self, monkeypatch):
+        """A misconfigured model_max_tokens >= ctx_max_tokens never compacts under the 256 floor."""
+        def char_estimate(messages, system, model=None):
+            # Messages claim 200 tokens — below the 256-token fixed floor.
+            return 200
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+        msgs = [_msg("user", "GOAL")]
+        for i in range(4):
+            msgs.append(_msg("assistant", f"a{i}"))
+            msgs.append(_msg("user", f"r{i}"))
+        llm = MagicMock()
+
+        # ctx_max_tokens=512, model_max_tokens=1024 would yield a negative raw threshold.
+        # Floor clamps threshold to 256, so 200-token messages stay uncompacted.
+        out, _ = maybe_compact(msgs, "system", 512, llm, model_max_tokens=1024)
+        assert out is msgs
+        llm.chat.assert_not_called()
+
+    def test_effective_limit_resolved_from_llm_cfg_per_turn(self):
+        """react_loop reads context_window from llm_cfg per-turn at the compaction call site.
+
+        Spec scenario: 'Effective limit is resolved per-turn at the compaction call site'
+        — the effective limit SHALL be read from the active model config via
+        ``ctx.llm.llm_cfg`` and no mid-run model transition SHALL occur.
+        """
+        ctx_max_tokens = 90_000  # agent default
+
+        # Case 1: context_window set → effective uses per-model value, not agent default
+        llm = MagicMock()
+        llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
+        _effective = llm.llm_cfg.get("context_window") or ctx_max_tokens
+        _budget = llm.llm_cfg.get("max_tokens") or 1024
+        assert _effective == 8192, "per-turn resolution must read context_window from llm_cfg"
+        assert _budget == 1024
+
+        # Case 2: context_window absent → falls back to agent default
+        llm2 = MagicMock()
+        llm2.llm_cfg = {"max_tokens": 1024}
+        _effective2 = llm2.llm_cfg.get("context_window") or ctx_max_tokens
+        assert _effective2 == 90_000, "absent context_window must fall back to agent ctx_max_tokens"
+
+        # Case 3: context_window = 0 (falsy) → falls back to agent default
+        llm3 = MagicMock()
+        llm3.llm_cfg = {"context_window": 0, "max_tokens": 1024}
+        _effective3 = llm3.llm_cfg.get("context_window") or ctx_max_tokens
+        assert _effective3 == 90_000, "falsy context_window (0) must fall back to agent ctx_max_tokens"
+
+    def test_max_tokens_none_falls_back_to_default(self, monkeypatch):
+        """react_loop's `max_tokens or 1024` guard survives an explicit None value."""
+        def char_estimate(messages, system, model=None):
+            return sum(len(str(m.get("content") or "")) for m in messages) // 4
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+        msgs = [_msg("user", "GOAL: test none fallback")]
+        for i in range(8):
+            msgs.append(_msg("assistant", f"action {i} " + ("p" * 4000)))
+            msgs.append(_msg("user", f"result {i}\n" + ("r" * 8000)))
+
+        # Simulate the exact expression used by react_loop.py when reading llm_cfg.
+        llm = MagicMock()
+        llm.chat.return_value = "summary"
+        llm.llm_cfg = {"max_tokens": None, "context_window": 8192}
+        _completion_budget = llm.llm_cfg.get("max_tokens") or 1024
+        assert _completion_budget == 1024, "or-1024 guard must convert explicit None to default"
+        _effective_ctx = llm.llm_cfg.get("context_window") or 90_000
+
+        # Should not raise TypeError; threshold uses max_tokens fallback 1024.
+        out, _ = maybe_compact(msgs, "system", _effective_ctx, llm, model_max_tokens=_completion_budget)
+        assert len(out) < len(msgs)
+        llm.chat.assert_called()

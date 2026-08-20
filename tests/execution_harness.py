@@ -97,19 +97,19 @@ class ScriptedLLM:
         return "• scripted compaction summary"
 
 
-def build_real_llm(models: list[dict], default: str, fallback: list[str],
+def build_real_llm(models: list[dict], default: str,
                    script: list[str]):
     """Build a *real* LLMClient with a scripted ``chat`` for routing scenarios.
 
     Returns ``(client, used_models)`` where ``used_models`` records the active
     model name for each ``chat`` invocation. The real ``chat_with_fallback`` runs
-    (so vision filtering, fallback ordering, and active-index restoration are
-    genuinely exercised) while ``chat`` itself is replaced by the script.
+    (so vision routing and active-index restoration are genuinely exercised)
+    while ``chat`` itself is replaced by the script.
     """
     from llm_client import LLMClient
 
     cfg = {"models": models,
-           "agent": {"default_model": default, "fallback_models": fallback}}
+           "agent": {"default_model": default}}
     client = LLMClient(cfg)
     used: list[str] = []
     seq = list(script)

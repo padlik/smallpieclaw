@@ -46,7 +46,7 @@ _SUB_AGENT_PROFILES = [
 ]
 
 
-def _cfg(fallback=None) -> dict:
+def _cfg() -> dict:
     models = [
         {"name": "a", "provider": "openai", "model": "model-a",
          "api_key": "k", "base_url": "http://x", "max_tokens": 1024,
@@ -57,8 +57,6 @@ def _cfg(fallback=None) -> dict:
          "api_key": "k", "base_url": "http://x"},
     ]
     agent = {"default_model": "model-a"}
-    if fallback is not None:
-        agent["fallback_models"] = fallback
     return {"models": models, "agent": agent}
 
 
@@ -114,7 +112,6 @@ class TestRuntimeOptions:
     def test_defaults_are_inherit_none(self):
         opts = RuntimeOptions()
         assert opts.model is None
-        assert opts.fallback_models is None
         assert opts.max_iterations is None
         assert opts.max_tokens is None
         assert opts.temperature is None
@@ -130,7 +127,6 @@ class TestRuntimeOptions:
         # Freeze the documented option surface (design.md decision 3).
         expected = {
             "model",
-            "fallback_models",
             "max_iterations",
             "max_tokens",
             "temperature",
@@ -148,7 +144,6 @@ class TestRuntimeOptions:
         cancel = threading.Event()
         opts = RuntimeOptions(
             model="model-a",
-            fallback_models=["model-b"],
             max_iterations=12,
             max_tokens=256,
             temperature=0.9,
@@ -161,7 +156,6 @@ class TestRuntimeOptions:
             label="on-demand",
         )
         assert opts.model == "model-a"
-        assert opts.fallback_models == ["model-b"]
         assert opts.max_iterations == 12
         assert opts.max_tokens == 256
         assert opts.temperature == pytest.approx(0.9)
@@ -172,14 +166,6 @@ class TestRuntimeOptions:
         assert opts.trace_id == "r-abc12345"
         assert opts.cancel_event is cancel
         assert opts.label == "on-demand"
-
-    def test_fallback_models_preserves_trichotomy_shapes(self):
-        # None inherits, [] disables, list is explicit — all representable.
-        assert RuntimeOptions(fallback_models=None).fallback_models is None
-        assert RuntimeOptions(fallback_models=[]).fallback_models == []
-        assert RuntimeOptions(
-            fallback_models=["m1", "m2"]
-        ).fallback_models == ["m1", "m2"]
 
 
 # ===========================================================================
@@ -337,30 +323,6 @@ class TestAgentRuntimeCreateSubAgent:
         runtime = _runtime(_cfg())
         runner = runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
         assert runner._model_id == "model-a"
-
-    def test_fallback_none_inherits(self):
-        runtime = _runtime(_cfg(fallback=["model-b", "model-c"]))
-        runner = runtime.create(
-            RuntimeProfile.ON_DEMAND_SUBAGENT,
-            RuntimeOptions(fallback_models=None),
-        )
-        assert len(runner._llm._fallback_indices) == 2
-
-    def test_fallback_empty_disables(self):
-        runtime = _runtime(_cfg(fallback=["model-b", "model-c"]))
-        runner = runtime.create(
-            RuntimeProfile.ON_DEMAND_SUBAGENT,
-            RuntimeOptions(fallback_models=[]),
-        )
-        assert runner._llm._fallback_indices == []
-
-    def test_fallback_explicit_list(self):
-        runtime = _runtime(_cfg(fallback=["model-b", "model-c"]))
-        runner = runtime.create(
-            RuntimeProfile.ON_DEMAND_SUBAGENT,
-            RuntimeOptions(fallback_models=["model-b"]),
-        )
-        assert len(runner._llm._fallback_indices) == 1
 
     def test_per_call_overrides_applied_without_mutating_shared_config(self):
         config = _cfg()

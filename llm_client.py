@@ -94,15 +94,12 @@ class LLMClient:
     """
 
     def __init__(self, config: dict, usage_registry=None, cancel_event=None,
-                 fallback_models: list[str] | None = None, caller_tag: str | None = None):
+                 caller_tag: str | None = None):
         """
         Args:
             config: full agent config dict
             usage_registry: optional TokenUsageRegistry for cross-instance token aggregation
             cancel_event: optional threading.Event; when set, in-progress LLM calls raise LLMCancelledError
-            fallback_models: optional list of model IDs (matching [[models]] entries) to try
-                             in order when the primary model fails. Overrides config
-                             agent.fallback_models when provided (even as empty list).
             caller_tag: optional label for log messages (e.g. "main", "sa-fcf85d"). Used to
                         identify which agent triggered an LLM call in concurrent log streams.
         """
@@ -135,22 +132,6 @@ class LLMClient:
                     f"agent.default_model = {default_model!r} does not match "
                     f"any [[models]] entry. Available: "
                     f"{[m.get('model') for m in self._models]}"
-                )
-
-        # Resolve fallback model indices
-        # Explicit param overrides config; None means use config; [] disables fallback
-        if fallback_models is None:
-            fallback_models = config.get("agent", {}).get("fallback_models", [])
-        self._fallback_indices: list[int] = []
-        for fb_model_id in (fallback_models or []):
-            for i, m in enumerate(self._models):
-                if m.get("model") == fb_model_id:
-                    self._fallback_indices.append(i)
-                    break
-            else:
-                logger.warning(
-                    "fallback_models: model %r not found in [[models]] — ignoring",
-                    fb_model_id,
                 )
 
         # Embeddings config (with fallback to active LLM key/base_url)
@@ -442,90 +423,74 @@ class LLMClient:
         call_fn: Callable,
         progress_cb=None,
     ) -> Any:
-        """Run ``call_fn`` against each fallback model in order on failure.
+        """Run ``call_fn`` against the active model (single-model — no fallback chain).
 
         Shared implementation for ``chat_with_fallback`` and
-        ``chat_with_tools_fallback``. Handles vision-candidate filtering,
-        candidates loop, ``_active_idx`` save/restore, and the exception ladder.
+        ``chat_with_tools_fallback``. Handles vision routing: when images are
+        present and the active model is not vision-capable, scans all configured
+        ``[[models]]`` entries for the first with ``vision = true`` (by config
+        order), routes the request there, and reverts to the primary model
+        afterward in a ``finally`` block (success or error).
 
-        ``LLMPermanentError`` and ``LLMCancelledError`` are never retried via
-        fallback. On success the active model index persists for subsequent
-        calls within this job/run() lifetime; on error ``_active_idx`` is
-        always restored to primary before propagating.
+        ``LLMPermanentError`` and ``LLMCancelledError`` propagate directly. On
+        any error ``_active_idx`` is restored to the primary model before
+        propagating.
         """
         primary_idx = self._active_idx
-        last_exc: Exception | None = None
         _tag = f"[{self._caller_tag.strip()}] " if self._caller_tag.strip() else ""
 
-        candidates = [primary_idx] + self._fallback_indices
-
+        # Vision routing: when images are present, ensure a vision-capable model
+        # is used. Scan ALL configured models (independent of any fallback list)
+        # for the first with vision=true by config order.
+        vision_switch = False
         if self._messages_have_images(messages):
-            vision_candidates = [i for i in candidates if self._models[i].get("vision")]
-            if not vision_candidates:
-                self._active_idx = primary_idx  # restore before propagating
-                configured = [m.get("model", "?") for m in self._models]
-                raise LLMPermanentError(
-                    "This request includes an image, but no vision-capable model is "
-                    "configured. Set `vision = true` on a model in [[models]] (and ensure "
-                    f"it is the active or a fallback model). Configured models: {configured}"
-                )
-            if not self._models[primary_idx].get("vision") and progress_cb:
-                target = self._models[vision_candidates[0]].get("model", "?")
-                progress_cb(
-                    f"⚠️ Active model is not vision-capable; switching to vision model '{target}'…"
-                )
-            candidates = vision_candidates
-
-        for seq, idx in enumerate(candidates):
-            self._active_idx = idx
-            model_id = self._models[idx].get("model", f"model_{idx}")
-            if seq > 0:
-                logger.warning(
-                    "%sFalling back to model '%s' after error: %s",
-                    _tag, model_id, last_exc,
-                )
-                if progress_cb:
-                    progress_cb(f"⚠️ Switching to fallback model '{model_id}'…")
-            try:
-                return call_fn()
-                # On success: _active_idx stays at idx so next step reuses same model
-            except LLMPermanentError:
-                self._active_idx = primary_idx  # restore before propagating
-                raise  # permanent errors — no point trying fallbacks
-            except LLMCancelledError:
-                self._active_idx = primary_idx  # restore before propagating
-                raise  # user cancelled — don't waste quota on fallbacks
-            except _LLM_CALL_ERRORS as exc:
-                last_exc = exc
-                self._active_idx = primary_idx  # reset before trying next candidate
-                if seq < len(candidates) - 1:
-                    logger.warning(
-                        "%sModel '%s' failed (will try next fallback): %s",
-                        _tag, model_id, exc,
+            if not self._models[primary_idx].get("vision"):
+                vision_models = [
+                    i for i, m in enumerate(self._models) if m.get("vision")
+                ]
+                if not vision_models:
+                    self._active_idx = primary_idx  # restore before propagating
+                    configured = [m.get("model", "?") for m in self._models]
+                    raise LLMPermanentError(
+                        "This request includes an image, but no vision-capable model is "
+                        "configured. Set `vision = true` on a model in [[models]]. "
+                        f"Configured models: {configured}"
                     )
-                else:
-                    logger.error("%sAll %d candidate model(s) failed.", _tag, len(candidates))
+                target = self._models[vision_models[0]].get("model", "?")
+                if progress_cb:
+                    progress_cb(
+                        f"⚠️ Active model is not vision-capable; switching to vision model '{target}'…"
+                    )
+                self._active_idx = vision_models[0]
+                vision_switch = True
 
-        raise last_exc  # type: ignore[misc]
+        try:
+            return call_fn()
+        except LLMPermanentError:
+            raise  # permanent errors propagate — no retry, no error log
+        except LLMCancelledError:
+            raise  # user cancelled — no retry, no error log
+        except _LLM_CALL_ERRORS as exc:
+            logger.error("%sActive model failed: %s", _tag, exc)
+            raise
+        finally:
+            if vision_switch:
+                self._active_idx = primary_idx
 
     def chat_with_fallback(self, messages: list[dict], system: str | None = None,
                            progress_cb=None, json_mode: bool = False) -> str:
         """
-        Like chat(), but tries each fallback model in order if the primary fails
-        with a transient error. LLMPermanentError is never retried via fallback.
+        Like chat(), but with vision routing: when the request contains images
+        and the active model is not vision-capable, scans all configured
+        ``[[models]]`` for the first with ``vision = true`` (by config order),
+        routes the request there, and reverts to the primary model afterward.
 
-        When the request contains images, candidates are filtered to
-        vision-capable models (``vision = true`` in ``[[models]]``). A non-vision
-        active model is skipped in favour of a vision-capable fallback; if no
-        vision-capable model is configured a clear permanent error is raised
-        instead of cycling through unsuitable models.
+        The LLM client is single-model — there is no fallback chain. Transient
+        errors on the primary model propagate to the caller. The method name is
+        preserved for backward compatibility with existing call sites.
 
-        On success the active model index is NOT restored — the working model
-        persists for subsequent calls within this job/run() lifetime.
-        AgentController.run() restores _active_idx when the job ends so the
-        next job always starts with the primary model.
-
-        On error _active_idx is always restored to primary before propagating.
+        ``LLMPermanentError`` is raised when images are present but no
+        vision-capable model is configured.
         """
         return self._run_with_fallback(
             messages,
@@ -584,11 +549,12 @@ class LLMClient:
         self, messages: list[dict], tools: list[dict],
         system: str | None = None, progress_cb=None,
     ) -> ChatResponse:
-        """Like chat_with_tools(), but tries each fallback model in order on failure.
+        """Like chat_with_tools(), but with vision routing (single-model, no fallback chain).
 
-        Mirrors ``chat_with_fallback()``: same fallback chain logic, same vision-model
-        filtering, same ``_active_idx`` management. Calls ``chat_with_tools()`` instead
-        of ``chat()``.
+        Mirrors ``chat_with_fallback()``: same vision all-models scan and
+        ``_active_idx`` restore logic. Calls ``chat_with_tools()`` instead of
+        ``chat()``. The LLM client is single-model — transient errors propagate
+        to the caller with no fallback attempt.
         """
         return self._run_with_fallback(
             messages,

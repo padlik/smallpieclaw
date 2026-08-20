@@ -261,8 +261,9 @@ class AgentController:
         Pass images=["/path/to/file.jpg", ...] to include images in the first
         user message for vision-capable models.
 
-        The primary model index is always restored on exit so transient
-        fallbacks during one run never permanently demote subsequent requests.
+        The primary model index is always restored on exit so a vision
+        model switch during this run never permanently demotes subsequent
+        requests.
 
         ``trace_id`` may be supplied by the caller (e.g. TelegramInterface) to
         correlate the run with an externally managed prompt record. When omitted,
@@ -273,9 +274,11 @@ class AgentController:
         tracking.
         """
         # Save primary model index — mirrors the same pattern in SubAgentRunner.run().
-        # chat_with_fallback() intentionally leaves _active_idx on the working model so
-        # the rest of a run re-uses it; but we must restore it afterward so the *next*
-        # interactive request always starts on the configured primary model.
+        # chat_with_fallback() may transiently switch _active_idx to a vision-capable
+        # model for image requests, but always reverts in its own finally block.
+        # This save/restore is belt-and-suspenders: it guarantees the *next*
+        # interactive request always starts on the configured primary model
+        # even if an internal revert path is ever changed.
         _primary_idx = self.llm._active_idx
 
         # Request-scoped trace ID: reuse a propagated parent trace when present,
@@ -591,7 +594,6 @@ class SubAgentRunner:
         workspace_dir: str = "~/Documents",
         usage_registry=None,          # TokenUsageRegistry
         depth: int = 1,
-        fallback_models: list[str] | None = None,  # None = inherit from parent config
         on_step=None,                 # Optional[Callable[[int], None]] — for iteration tracking
         on_tool_trace=None,           # Optional[Callable[[ToolTrace], None]] — for trace collection
         cancel_event=None,            # Optional[threading.Event] — shared cancel signal (e.g. forwarded from a parent agent stop)
@@ -621,10 +623,8 @@ class SubAgentRunner:
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
 
         # Own LLM instance with model override + shared token registry + cancellation
-        # fallback_models=None means inherit from sub_config (which inherited from parent config)
         self._llm = LLMClient(sub_config, usage_registry=usage_registry,
                               cancel_event=self._cancel_event,
-                              fallback_models=fallback_models,
                               caller_tag=self.agent_id)
 
         # Own blank memory (working context for this task)
@@ -708,7 +708,10 @@ class SubAgentRunner:
             self._model_id,
             self.context_key or "none",
         )
-        # Save primary model index; restore after run() so next job starts fresh
+        # Save primary model index; restore after run() so next job starts fresh.
+        # chat_with_fallback() reverts vision switches in its own finally, but
+        # this belt-and-suspenders restore guarantees the next scheduled job
+        # always starts on the configured primary model.
         _primary_idx = self._llm._active_idx
         try:
             result = self._agent.run(task, prompt_id=prompt_id)

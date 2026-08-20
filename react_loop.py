@@ -1160,8 +1160,18 @@ def react_loop(
                 logger.info("step %d/%d | model: %s", state.step, state.max_steps, active_model)
                 _progress(f"⚙️ Thinking… (step {state.step})")
 
+                # Per-model context window: effective limit from the active
+                # model's context_window, falling back to agent.ctx_max_tokens.
+                # Completion tokens (max_tokens) are reserved before the 85%
+                # margin is applied inside maybe_compact().
+                _effective_ctx = (
+                    ctx.llm.llm_cfg.get("context_window") or ctx.ctx_max_tokens
+                )
+                _completion_budget = ctx.llm.llm_cfg.get("max_tokens") or 1024
                 state.messages, state.goal_idx = maybe_compact(
-                    state.messages, system, ctx.ctx_max_tokens, ctx.llm, goal_idx=state.goal_idx,
+                    state.messages, system, _effective_ctx, ctx.llm,
+                    goal_idx=state.goal_idx,
+                    model_max_tokens=_completion_budget,
                 )
 
                 turn = _request_turn(

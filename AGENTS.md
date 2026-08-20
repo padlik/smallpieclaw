@@ -79,7 +79,7 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `telegram_callbacks.py` | Inline-button callback handlers (split from `telegram_commands.py`) |
 | `prompt_builder.py` | System prompt assembly; re-exports `estimate_tokens` from `token_estimator.py` for backward compat |
 | `token_estimator.py` | Two-layer token counting: tiktoken (OpenAI models) + conservative heuristic fallback |
-| `context_manager.py` | Auto-compaction at 85% of `ctx_max_tokens`; content-aware trimming |
+| `context_manager.py` | Auto-compaction at 85% of effective context window (per-model `context_window` or `agent.ctx_max_tokens`), reserving completion tokens with a 256-token floor; content-aware trimming |
 | `confirmation.py` | Thread-safe confirmations via `threading.Event` (agent thread blocks, Telegram callback signals) |
 | `trace_context.py` | `r-<8 hex>` trace IDs for log correlation across agents/sub-agents/scheduler |
 | `sub_agent_registry.py` | Tracks all active `SubAgentRunner` instances for `/agents` command |

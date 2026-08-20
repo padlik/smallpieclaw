@@ -100,7 +100,7 @@ agent_name    = "myagent"
 default_model = "gpt-4o-mini"    # must match the model = "..." value above
 ```
 
-Additional per-model fields: `vision` (bool), `top_p`, `request_timeout`, `max_retries`, `retry_delay`.
+Additional per-model fields: `vision` (bool), `top_p`, `request_timeout`, `max_retries`, `retry_delay`, `context_window` (optional int — per-model context window in tokens; falls back to `agent.ctx_max_tokens` when unset). When `context_window` is set, the compaction threshold is derived from this value instead of the agent-level default, reserving completion tokens (`max_tokens`) before applying the 85% margin.
 
 Provider-level defaults under `[providers.<name>]` are inherited by all matching model entries.
 
@@ -209,7 +209,7 @@ Send any file to Telegram to save it to `downloads/`. Photos with a caption are 
 📷 + "Is there anything wrong with this network diagram?"
 ```
 
-Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google Gemini, Ollama (LLaVA, llama3.2-vision). The `vision = true` field in config adds a 👁 badge in `/models` — image encoding is always attempted when images are present.
+Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google Gemini, Ollama (LLaVA, llama3.2-vision). The `vision = true` field in config adds a 👁 badge in `/models`. When images are present and the active model is not vision-capable, the agent automatically routes the request to the first vision-capable model in `[[models]]` (by config order) and reverts to the primary model afterward — no fallback list needed.
 
 ### Built-in tools reference
 
@@ -459,7 +459,7 @@ Key features: hot-reload without restart (`/jobs reload`), automatic backups bef
 | Results | `data/results_memory.json` (vector index) | Past task summaries saved on `/reset` |
 | Graph (opt-in) | `data/graph_memory` (LadybugDB) | Entities, relationships, episodes; retrieved per turn |
 
-Context compaction fires automatically at 85% of `ctx_max_tokens` — older messages are summarised by the LLM without operator intervention. Use `/reset` to start fresh, or `/reset discard` to skip saving.
+Context compaction fires automatically when the estimated token count exceeds 85% of the effective context window — older messages are summarised by the LLM without operator intervention. The effective window is the active model's `context_window` field (if set) or `agent.ctx_max_tokens` (default 90,000). Completion tokens (`max_tokens`) are reserved before the margin is applied, then clamped to a 256-token floor as a last-resort guard: `threshold = max(int((effective - max_tokens) * 0.85), 256)`. Config validation rejects `context_window <= max_tokens` at startup. Use `/reset` to start fresh, or `/reset discard` to skip saving.
 
 ### Graph memory (optional)
 

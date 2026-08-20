@@ -233,7 +233,6 @@ class AgentTools:
         context_payload = _build_context_payload(task, args, self._owner)
         overrides = _coerce_overrides(args)
 
-        fallback_models = args.get("fallback_models")  # None = inherit; [] = disable
         # Internal supervision controls (job tag, callbacks, notify/expandable)
         # arrive via `options`, never through the model-facing `args` dict.
 
@@ -264,7 +263,6 @@ class AgentTools:
             context_key=context_key,
             label=label,
             notify_fn=None,   # factory sets this from main notify_fn
-            fallback_models=fallback_models,
             max_iterations=max_iterations,
             max_tokens=overrides["max_tokens"],
             temperature=overrides["temperature"],

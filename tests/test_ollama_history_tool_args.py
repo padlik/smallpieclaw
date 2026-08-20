@@ -27,7 +27,7 @@ def _make_client() -> LLMClient:
                     "base_url": "http://localhost:11434",
                 }
             ],
-            "agent": {"default_model": "llama3", "fallback_models": []},
+            "agent": {"default_model": "llama3"},
         }
     )
     mock_sdk = MagicMock()

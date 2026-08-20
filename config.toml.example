@@ -84,6 +84,10 @@ temperature     = 0.2
 vision          = true   # gpt-4o-mini supports image input
 # top_p         = 0.9  # optional: nucleus sampling (omit to use provider default)
 # aliases       = ["gpt-4o-mini"]  # optional: names to match against models_capabilities.json
+# context_window = 128000  # optional: per-model context window in tokens.
+#   When set, the compaction threshold is derived from this value instead of
+#   agent.ctx_max_tokens. Falls back to agent.ctx_max_tokens when unset.
+#   Must be greater than max_tokens (validated at startup).
 request_timeout = 120
 max_retries     = 5
 retry_delay     = 2
@@ -170,10 +174,9 @@ default_model  = "gpt-4o-mini"
 # Model used by sub-agents (scheduled jobs and spawn_agent tool).
 # Must match the 'model' field of a [[models]] entry. Defaults to default_model if not set.
 # background_model = "gpt-4o-mini"
-# Fallback models tried in order when the primary model fails with a transient error.
-# Each entry must match the 'model' field of a [[models]] entry.
-# LLMPermanentError (content filter, invalid key) skips fallback — these indicate a request issue.
-# Omit or leave empty to disable fallback.
+# DEPRECATED: agent.fallback_models — parsed but ignored with a deprecation warning.
+# The LLM client is now single-model. Vision auto-switch works with any configured
+# vision model (set vision = true on a [[models]] entry) — no fallback list needed.
 # fallback_models = ["claude-3-haiku-20240307", "gemini-1.5-flash"]
 # Maximum estimated context tokens per LLM request (4 chars ≈ 1 token).
 # When 85% is reached the agent auto-summarises older messages before the next call.

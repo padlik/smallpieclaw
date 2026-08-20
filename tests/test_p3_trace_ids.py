@@ -161,8 +161,8 @@ class TestReactLoopTraceLogging:
         assert seen.get("agent") == "main"
 
 
-class TestFallbackLogTraceCorrelation:
-    """chat_with_fallback orchestration logs carry the request trace tag."""
+class TestSingleModelErrorTraceCorrelation:
+    """chat_with_fallback error logs carry the request trace tag (single-model)."""
 
     def _client(self):
         from llm_client import LLMClient
@@ -177,27 +177,22 @@ class TestFallbackLogTraceCorrelation:
         }
         return LLMClient(cfg, caller_tag="main")
 
-    def test_fallback_logs_include_trace_tag(self, caplog):
+    def test_error_log_includes_trace_tag(self, caplog):
         from llm_client import LLMError
 
         c = self._client()
         c.set_trace_id("r-fb123456")
-        # Primary fails transiently, fallback also fails -> all three orchestration
-        # log lines fire (falling-back, will-try-next, all-failed).
+        # Primary fails transiently — single-model, no fallback, error propagates.
         c.chat = MagicMock(side_effect=LLMError("boom"))
-        with caplog.at_level(logging.WARNING, logger="llm_client"):
+        with caplog.at_level(logging.ERROR, logger="llm_client"):
             try:
                 c.chat_with_fallback([{"role": "user", "content": "hi"}])
             except LLMError:
                 pass
         messages = [rec.getMessage() for rec in caplog.records]
-        fallback_logs = [
-            m for m in messages
-            if "Falling back to model" in m or "will try next fallback" in m
-            or "candidate model(s) failed" in m
-        ]
-        assert fallback_logs, "expected fallback orchestration logs"
-        assert all("r-fb123456" in m for m in fallback_logs)
+        error_logs = [m for m in messages if "Active model failed" in m]
+        assert error_logs, "expected an active-model-failed error log"
+        assert all("r-fb123456" in m for m in error_logs)
 
 
 class TestSubAgentTracePropagation:
