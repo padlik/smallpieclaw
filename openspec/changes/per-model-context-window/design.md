@@ -65,7 +65,7 @@ LLMClient._run_with_fallback()
 
 ### D3: Per-model context_window config field; compaction reserves completion tokens
 
-**Decision:** Add `context_window: int | None` to `ModelConfig`. At `react_loop.py:1164`, compute `effective = model.context_window or agent.ctx_max_tokens`. Compaction threshold becomes `int((effective - model.max_tokens) * 0.85)` — reserves completion tokens first, then applies the 85% margin. `agent.ctx_max_tokens` stays as the documented ceiling/default.
+**Decision:** Add `context_window: int | None` to `ModelConfig`. At `react_loop.py:1164`, compute `effective = model.context_window or agent.ctx_max_tokens`. Compaction threshold becomes `max(int((effective - model.max_tokens) * 0.85), 256)` — reserves completion tokens first, then applies the 85% margin, then clamps to a 256-token floor as a last-resort guard for the unvalidated raw-dict path. Config validation rejects `context_window <= 0` and `context_window <= max_tokens` at parse time, so validated configs always produce a positive raw threshold. `agent.ctx_max_tokens` stays as the documented ceiling/default.
 
 **Why over alternatives:**
 - *Flat 0.85 of raw context_window:* rejected — conflates output-token reservation with estimation safety. For small windows (8k), `max_tokens=1024` + estimator drift can overshoot.
@@ -80,7 +80,7 @@ config_schema.py:ModelConfig.context_window (new field)
   → react_loop.py:1164 reads ctx.llm.llm_cfg["context_window"]
   → effective = cw or ctx.ctx_max_tokens
   → passes effective to maybe_compact()
-  → context_manager.py: threshold = int((effective - model.max_tokens) * 0.85)
+  → context_manager.py: threshold = max(int((effective - model.max_tokens) * 0.85), 256)
 ```
 
 ### C4 Component Diagram (Mermaid)
@@ -95,7 +95,7 @@ flowchart LR
   subgraph AgentProcess
     CS[config_schema.py<br/>ModelConfig.context_window<br/>AgentConfig.fallback_models warn]
     LC[llm_client.py<br/>single-model + vision scan]
-    CM[context_manager.py<br/>threshold = (eff - max_tokens) * 0.85]
+    CM[context_manager.py<br/>threshold = max((eff - max_tokens) * 0.85, 256)]
     RL[react_loop.py<br/>effective = cw or ctx_max]
     AR[agent_runtime.py<br/>RuntimeOptions - fallback]
     SCH[scheduler.py<br/>drop fallback persistence]
@@ -123,7 +123,7 @@ flowchart LR
 
 - **[Persisted scheduler jobs with fallback_models fail on load]** → Mitigation: warn-and-ignore on load; drop the key from `spawn_args` so the factory doesn't receive it. Document in `scheduler.toml.example`.
 - **[Vision model not configured but images sent]** → Mitigation: preserve the existing `LLMPermanentError` with the same message ("no vision-capable model is configured"). Behavior unchanged for users without a vision model.
-- **[Token estimator drift at small windows]** → Mitigation: the new formula `(effective - max_tokens) * 0.85` reserves completion tokens, which is the main fix. Remaining estimator drift is pre-existing and out of scope for this change.
+- **[Token estimator drift at small windows]** → Mitigation: the new formula `max((effective - max_tokens) * 0.85, 256)` reserves completion tokens and clamps to a 256-token floor, which is the main fix. Remaining estimator drift is pre-existing and out of scope for this change.
 - **[ADR-0007 supersession]** → Mitigation: flag in Open Questions; adr step records the superseding ADR. `RuntimeOptions.fallback_models` removal is a decision-level change to an in-force ADR.
 - **[chat_with_fallback / chat_with_tools_fallback method names]** → Mitigation: keep method names as single-model no-op-fallback so existing native-tool-calling scenarios stay valid. Only the "chains fallback models" scenario is modified.
 

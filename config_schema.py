@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import os
 import re
+import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 try:
     import tomli as _tomllib  # type: ignore[import]
@@ -22,6 +23,8 @@ except ImportError:
     import tomllib as _tomllib  # type: ignore[no-redef]  # Python 3.11+
 
 from exceptions import ConfigError
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -239,12 +242,13 @@ def _parse_bool(value: Any, field_path: str) -> bool:
     )
 
 
-def _parse_int(value: Any, default: int, field_path: str) -> int:
+def _parse_int(value: Any, default: int | None, field_path: str) -> int | None:
     """Return *value* as int, falling back to *default* when absent.
 
     Rejects strings to prevent env-resolved values (e.g. ``"4096"``) from
     silently coercing into numeric fields — env references must only be used
-    on string config fields.
+    on string config fields.  When *value* is absent and *default* is ``None``,
+    ``None`` is returned.
     """
     if value is None:
         return default
@@ -300,7 +304,7 @@ def _parse_int_list(value: Any, field_path: str) -> list[int]:
             f"Config field '{field_path}' must be a list of integers, "
             f"got {type(value).__name__} {value!r}"
         )
-    return [_parse_int(item, 0, f"{field_path}[{i}]") for i, item in enumerate(value)]
+    return [_parse_int(item, 0, f"{field_path}[{i}]") for i, item in enumerate(value)]  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +335,7 @@ class ModelConfig:
     vision: bool = False
     reasoning: bool = False
     aliases: list[str] = field(default_factory=list)
+    context_window: int | None = None
 
 
 @dataclass(frozen=True)
@@ -542,13 +547,13 @@ def _parse_model(entry: dict, index: int) -> ModelConfig:
     model_id = entry.get("model", "")
     if not model_id:
         raise ConfigError(f"[[models]] entry '{name}' is missing 'model'")
-    return ModelConfig(
+    cfg = ModelConfig(
         name=name,
         provider=provider,
         model=model_id,
         api_key=entry.get("api_key", ""),
         base_url=entry.get("base_url", ""),
-        max_tokens=_parse_int(entry.get("max_tokens"), 1024, f"models.{name}.max_tokens"),
+        max_tokens=cast(int, _parse_int(entry.get("max_tokens"), 1024, f"models.{name}.max_tokens")),
         temperature=_parse_float(entry.get("temperature"), 0.2, f"models.{name}.temperature"),
         top_p=_parse_float(entry["top_p"], 0.0, f"models.{name}.top_p") if "top_p" in entry else None,
         request_timeout=_parse_int(entry.get("request_timeout"), 120, f"models.{name}.request_timeout"),
@@ -557,7 +562,22 @@ def _parse_model(entry: dict, index: int) -> ModelConfig:
         vision=_parse_bool(entry.get("vision", False), f"models.{name}.vision"),
         reasoning=_parse_bool(entry.get("reasoning", False), f"models.{name}.reasoning"),
         aliases=list(entry.get("aliases") or []),
+        context_window=(
+            _parse_int(entry.get("context_window"), None, f"models.{name}.context_window")
+            if entry.get("context_window") is not None
+            else None
+        ),
     )
+    if cfg.context_window is not None and cfg.context_window <= 0:
+        raise ConfigError(
+            f"models.{name}.context_window ({cfg.context_window}) must be a positive integer"
+        )
+    if cfg.context_window is not None and cfg.max_tokens is not None and cfg.context_window <= cfg.max_tokens:
+        raise ConfigError(
+            f"models.{name}.context_window ({cfg.context_window}) must be greater than "
+            f"models.{name}.max_tokens ({cfg.max_tokens})"
+        )
+    return cfg
 
 
 def _parse_embeddings(raw: dict) -> EmbeddingsConfig:
@@ -573,6 +593,14 @@ def _parse_embeddings(raw: dict) -> EmbeddingsConfig:
 def _parse_agent(raw: dict) -> AgentConfig:
     section = raw.get("agent") or {}
     agent_name = section.get("agent_name", "piclaw")
+    # Deprecation warning for fallback_models (kept for backward compat, ignored)
+    _fallback_models = list(section.get("fallback_models") or [])
+    if _fallback_models:
+        logger.warning(
+            "agent.fallback_models is deprecated and ignored — the LLM client is now "
+            "single-model. Remove this field from your config. Value: %s",
+            _fallback_models,
+        )
     return AgentConfig(
         agent_name=agent_name,
         max_iterations=_parse_int(section.get("max_iterations"), 8, "agent.max_iterations"),
@@ -587,7 +615,7 @@ def _parse_agent(raw: dict) -> AgentConfig:
         diagnose_empty_responses=_parse_bool(section.get("diagnose_empty_responses", False), "agent.diagnose_empty_responses"),
         default_model=section.get("default_model", ""),
         background_model=section.get("background_model", ""),
-        fallback_models=list(section.get("fallback_models") or []),
+        fallback_models=_fallback_models,
         shell_backend=str(section.get("shell_backend", "subprocess")),
         shell_pty_cols=_parse_int(section.get("shell_pty_cols"), 220, "agent.shell_pty_cols"),
         shell_pty_rows=_parse_int(section.get("shell_pty_rows"), 50, "agent.shell_pty_rows"),

@@ -356,11 +356,6 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "description": "Model identifier for this job's sub-agent.",
                 },
-                "fallback_models": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Ordered list of fallback model identifiers.",
-                },
                 "preserve_context": {
                     "type": "boolean",
                     "description": "Keep conversation history between runs (default: false).",

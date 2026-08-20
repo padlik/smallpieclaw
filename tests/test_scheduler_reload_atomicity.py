@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -19,7 +20,33 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scheduler import Scheduler
-from tests.test_scheduler_fallback import _paths_for
+from xdg import XDGPaths
+
+
+def _paths_for(state_dir) -> XDGPaths:
+    """Build an XDGPaths rooted at *state_dir* without touching real XDG env vars."""
+    state_dir = Path(state_dir)
+    logs_dir = state_dir / "logs"
+    return XDGPaths(
+        config_home=state_dir, data_home=state_dir, state_home=state_dir,
+        cache_home=state_dir, runtime_dir=state_dir,
+        config_file=state_dir / "config.toml",
+        scheduler_config=state_dir / "scheduler.toml",
+        memory_file=state_dir / "memory.json",
+        graph_memory_db=state_dir / "graph_memory",
+        tool_index_file=state_dir / "tool_index.json",
+        pid_file=state_dir / "agent.pid",
+        secrets_file=state_dir / "secrets.toml",
+        mcp_tokens_dir=state_dir / "mcp_tokens",
+        logs_dir=logs_dir,
+        log_file=logs_dir / "agent.log",
+        log_jsonl=logs_dir / "agent.jsonl",
+        skills_dir=state_dir / "skills",
+        scheduler_state=state_dir / "scheduler_state",
+        scheduler_commands=state_dir / "scheduler_commands",
+        scheduler_jobs=state_dir / "scheduler_jobs",
+        job_execution_log=state_dir / "job_execution_log",
+    )
 
 _TOML = """
 [jobs.alpha]

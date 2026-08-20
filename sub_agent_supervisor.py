@@ -130,11 +130,9 @@ class SubAgentSupervisor:
         record.prompt_id = options.prompt_id
 
         # Log spawn params for observability
-        fallback_models = request.factory_kwargs.get("fallback_models")
-        _fb_log = str(fallback_models) if fallback_models is not None else "inherited"
         logger.info(
-            "spawn_agent: id=%s label=%s model=%s fallback=%s task=%s",
-            runner.agent_id, request.label, runner.model_id, _fb_log, request.task[:100],
+            "spawn_agent: id=%s label=%s model=%s task=%s",
+            runner.agent_id, request.label, runner.model_id, request.task[:100],
         )
 
         self._pool.submit(lambda: self._run_and_notify(request, options, runner, record))

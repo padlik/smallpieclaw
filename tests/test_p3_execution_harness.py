@@ -92,7 +92,7 @@ class TestVisionRouting:
 
     def test_image_request_uses_vision_fallback_not_primary(self):
         llm, used = build_real_llm(
-            [self._NONVISION, self._VISION], default="text-x", fallback=["vision-x"],
+            [self._NONVISION, self._VISION], default="text-x",
             script=['{"action": "finish", "result": "saw the image"}'],
         )
         ex = RecordingExecutor()

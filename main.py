@@ -612,7 +612,7 @@ def _run(
     )
 
     def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
-                          fallback_models=None, max_iterations=None,
+                          max_iterations=None,
                           max_tokens=None, temperature=None, top_p=None,
                           on_tool_trace=None, cancel_event=None, trace_id=None,
                           context_payload=None, prompt_variant=None,
@@ -632,7 +632,6 @@ def _run(
         """
         options = RuntimeOptions(
             model=model,
-            fallback_models=fallback_models,
             max_iterations=max_iterations,
             max_tokens=max_tokens,
             temperature=temperature,

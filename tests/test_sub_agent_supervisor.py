@@ -446,7 +446,7 @@ def test_submission_request_direct_submit(tmp_path):
         label="on-demand",
         context_key=None,
         factory=lambda **_k: runner,
-        factory_kwargs={"fallback_models": None},
+        factory_kwargs={},
         data_dir=str(tmp_path),
         notify_html_fn=None,
         save_context=_save_context,

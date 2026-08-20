@@ -146,16 +146,10 @@ class RuntimeOptions:
 
     These mirror the values currently threaded through ``sub_agent_factory`` and
     the controller/runner constructors. ``None`` defaults mean "inherit the
-    profile / configured default"; in particular ``fallback_models`` preserves
-    the existing trichotomy:
-
-    - ``None``  — inherit configured fallback models.
-    - ``[]``    — disable fallback inheritance.
-    - ``[...]`` — use this explicit fallback chain.
+    profile / configured default".
     """
 
     model: Optional[str] = None
-    fallback_models: Optional[list[str]] = None
     max_iterations: Optional[int] = None
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
@@ -337,9 +331,9 @@ class AgentRuntime:
     ) -> "SubAgentRunner":
         """Build a ``SubAgentRunner`` mirroring the legacy ``sub_agent_factory``.
 
-        Preserves model resolution, per-call LLM override shallow-copy, the
-        ``fallback_models`` trichotomy, scheduled ``max_iterations`` default,
-        context preloading, depth=1, and the runner-shaped product surface.
+        Preserves model resolution, per-call LLM override shallow-copy,
+        scheduled ``max_iterations`` default, context preloading, depth=1, and
+        the runner-shaped product surface.
         """
         # Local imports avoid import cycles at module load (agent_controller and
         # builtin_executor both sit above this construction boundary).
@@ -411,7 +405,6 @@ class AgentRuntime:
             workspace_dir=self._workspace_dir,
             usage_registry=self._usage_registry,
             depth=1,
-            fallback_models=options.fallback_models,
             on_tool_trace=on_tool_trace,
             cancel_event=options.cancel_event,
             trace_id=options.trace_id,

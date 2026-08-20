@@ -29,7 +29,7 @@ def _make_client(provider: str) -> LLMClient:
     }
     return LLMClient({
         "models": [model],
-        "agent": {"default_model": "m", "fallback_models": []},
+        "agent": {"default_model": "m"},
     })
 
 

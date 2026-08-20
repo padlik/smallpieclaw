@@ -317,6 +317,60 @@ class TestModelConfig:
         cfg = parse_config(minimal_config)
         assert cfg.models[0].top_p == 0.9
 
+    def test_context_window_positive(self, minimal_config):
+        """A valid positive context_window is parsed."""
+        minimal_config["models"][0]["context_window"] = 8192
+        cfg = parse_config(minimal_config)
+        assert cfg.models[0].context_window == 8192
+
+    def test_context_window_zero_raises(self, minimal_config):
+        """context_window = 0 raises ConfigError naming the field."""
+        minimal_config["models"][0]["context_window"] = 0
+        with pytest.raises(ConfigError, match=r"models\..*\.context_window.*positive"):
+            parse_config(minimal_config)
+
+    def test_context_window_negative_raises(self, minimal_config):
+        """A negative context_window raises ConfigError naming the field."""
+        minimal_config["models"][0]["context_window"] = -1
+        with pytest.raises(ConfigError, match=r"models\..*\.context_window.*positive"):
+            parse_config(minimal_config)
+
+    def test_context_window_non_integer_raises(self, minimal_config):
+        """A non-integer context_window raises ConfigError, not raw ValueError."""
+        minimal_config["models"][0]["context_window"] = "abc"
+        with pytest.raises(ConfigError, match=r"models\..*\.context_window.*integer"):
+            parse_config(minimal_config)
+
+    def test_context_window_less_than_max_tokens_raises(self, minimal_config):
+        """context_window must be greater than max_tokens to avoid negative threshold."""
+        minimal_config["models"][0]["context_window"] = 1024
+        minimal_config["models"][0]["max_tokens"] = 1024
+        with pytest.raises(
+            ConfigError,
+            match=r"models\..*\.context_window.*must be greater than.*max_tokens",
+        ):
+            parse_config(minimal_config)
+
+    def test_context_window_equal_to_max_tokens_raises(self, minimal_config):
+        """context_window equal to max_tokens is rejected."""
+        minimal_config["models"][0]["context_window"] = 2048
+        minimal_config["models"][0]["max_tokens"] = 2048
+        with pytest.raises(
+            ConfigError,
+            match=r"models\..*\.context_window.*must be greater than.*max_tokens",
+        ):
+            parse_config(minimal_config)
+
+    def test_context_window_less_than_default_max_tokens_raises(self, minimal_config):
+        """context_window below the default max_tokens (1024) raises ConfigError."""
+        minimal_config["models"][0]["context_window"] = 512
+        # max_tokens is not explicitly set, so it defaults to 1024.
+        with pytest.raises(
+            ConfigError,
+            match=r"models\..*\.context_window.*must be greater than.*max_tokens",
+        ):
+            parse_config(minimal_config)
+
 
 # ---------------------------------------------------------------------------
 # resolve_model_id

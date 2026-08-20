@@ -420,7 +420,6 @@ class Scheduler:
         notify: bool,
         source: str,
         model: Optional[str],
-        fallback_models: Optional[list],
         preserve_context: bool,
         context_max_messages: int,
         overlap_policy: str,
@@ -441,8 +440,6 @@ class Scheduler:
         }
         if model:
             meta["model"] = model
-        if fallback_models is not None:
-            meta["fallback_models"] = fallback_models
         if preserve_context:
             meta["preserve_context"] = preserve_context
             meta["context_max_messages"] = context_max_messages
@@ -468,7 +465,6 @@ class Scheduler:
         cron: Optional[str] = None,
         source: str = "dynamic",
         model: Optional[str] = None,
-        fallback_models: Optional[list] = None,
         preserve_context: bool = False,
         context_max_messages: int = 50,
         overlap_policy: str = "skip",
@@ -499,7 +495,7 @@ class Scheduler:
 
         meta = self._build_job_meta(
             tag, task, schedule_type, expr, effective_run_at, notify, source,
-            model, fallback_models, preserve_context, context_max_messages,
+            model, preserve_context, context_max_messages,
             overlap_policy, max_iterations,
         )
 
@@ -577,7 +573,6 @@ class Scheduler:
                 "notify": meta.get("notify", True),
                 "source": meta.get("source", "config"),
                 "model": meta.get("model"),
-                "fallback_models": meta.get("fallback_models"),
                 "preserve_context": meta.get("preserve_context", False),
                 "is_running": tag in running,
             }
@@ -691,10 +686,7 @@ class Scheduler:
 
         task = meta.get("task", "").strip()
         job_model = meta.get("model") or None
-        job_fallbacks = meta.get("fallback_models")
         _log_extra = f" | model={job_model}" if job_model else ""
-        if job_fallbacks is not None:
-            _log_extra += f" | fallback_models={job_fallbacks}"
         logger.info("Running scheduled job %s%s", tag, _log_extra)
         now = datetime.now(timezone.utc).isoformat()
         is_once = meta.get("schedule_type") == "once"
@@ -738,10 +730,6 @@ class Scheduler:
             spawn_args["model"] = job_model
         if context_key:
             spawn_args["context_key"] = context_key
-        # fallback_models: if key present in meta (even as []), pass it through;
-        # if absent, omit so sub-agent inherits from parent config
-        if "fallback_models" in meta:
-            spawn_args["fallback_models"] = meta["fallback_models"]
         # max_iterations: per-job override; None = factory uses scheduled_max_iterations
         if "max_iterations" in meta:
             spawn_args["max_iterations"] = meta["max_iterations"]
@@ -1086,11 +1074,6 @@ class Scheduler:
         lines.append(f"notify = {str(meta.get('notify', True)).lower()}\n")
         if meta.get("model"):
             lines.append(f"model = {_toml_str(meta['model'])}\n")
-        if meta.get("fallback_models") is not None:
-            fb = meta["fallback_models"]
-            # Serialize as TOML inline array using the same escaping as _toml_str
-            items = ", ".join(_toml_str(m) for m in fb)
-            lines.append(f"fallback_models = [{items}]\n")
         if meta.get("preserve_context"):
             lines.append('preserve_context = true\n')
             ctx_max = meta.get("context_max_messages", 50)
@@ -1192,11 +1175,17 @@ class Scheduler:
                 "last_run": None,
                 "created_at": job_cfg.get("created_at", datetime.now(timezone.utc).isoformat()),
                 "model": job_cfg.get("model") or None,
-                "fallback_models": job_cfg.get("fallback_models"),
                 "preserve_context": bool(job_cfg.get("preserve_context", False)),
                 "context_max_messages": int(job_cfg.get("context_max_messages", 50)),
                 "overlap_policy": job_cfg.get("overlap_policy", "skip"),
             }
+            # Deprecation: drop fallback_models from loaded jobs, warn if present
+            if "fallback_models" in job_cfg:
+                logger.warning(
+                    "Job '%s' has a deprecated 'fallback_models' field in scheduler.toml — "
+                    "ignored and dropped. The LLM client is now single-model.",
+                    tag,
+                )
             # Optional per-job step cap
             if job_cfg.get("max_iterations") is not None:
                 try:

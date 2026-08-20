@@ -8,18 +8,18 @@ The compaction system SHALL derive the effective context-window limit from the a
 - **GIVEN** the active model's `ModelConfig.context_window` is set to a non-null value
 - **WHEN** the ReAct loop calls `maybe_compact()`
 - **THEN** the effective limit SHALL be the model's `context_window`
-- **AND** the compaction threshold SHALL be `int((effective - model.max_tokens) * 0.85)`
+- **AND** the compaction threshold SHALL be `max(int((effective - model.max_tokens) * 0.85), 256)`
 
 #### Scenario: Model without context_window falls back to agent default
 - **GIVEN** the active model's `ModelConfig.context_window` is null or absent
 - **WHEN** the ReAct loop calls `maybe_compact()`
 - **THEN** the effective limit SHALL be `agent.ctx_max_tokens`
-- **AND** the compaction threshold SHALL be `int((effective - model.max_tokens) * 0.85)`
+- **AND** the compaction threshold SHALL be `max(int((effective - model.max_tokens) * 0.85), 256)`
 
 #### Scenario: Completion tokens are reserved before margin
 - **GIVEN** a model with `context_window = 8192` and `max_tokens = 1024`
 - **WHEN** the compaction threshold is computed
-- **THEN** the threshold SHALL be `int((8192 - 1024) * 0.85)` = 6103
+- **THEN** the threshold SHALL be `max(int((8192 - 1024) * 0.85), 256)` = 6092
 - **AND** the threshold SHALL NOT be `int(8192 * 0.85)` = 6963
 
 #### Scenario: Effective limit is resolved per-turn at the compaction call site

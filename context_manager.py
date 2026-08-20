@@ -157,12 +157,27 @@ def maybe_compact(
     llm: "LLMClient",
     *,
     goal_idx: int = 0,
+    model_max_tokens: int = 1024,
 ) -> tuple[list[dict], int]:
     """Return a (possibly compacted) copy of *messages* and the goal's new index.
 
     If the estimated token count of *messages* plus *system* exceeds 85 % of
-    *ctx_max_tokens*, the middle portion of the conversation is summarised and
-    replaced with a single compaction summary message.
+    the effective context window (after reserving completion tokens), the
+    middle portion of the conversation is summarised and replaced with a single
+    compaction summary message.
+
+    The compaction threshold reserves completion tokens first, then applies the
+    85% margin, finally clamping to a 256-token floor:
+    ``threshold = max(int((ctx_max_tokens - model_max_tokens) * 0.85), 256)``.
+    This prevents the context from growing into the token budget the model needs
+    for its response. ``ctx_max_tokens`` is the effective context-window limit
+    (per-model ``context_window`` or ``agent.ctx_max_tokens``); ``model_max_tokens``
+    is the active model's completion budget (default 1024).
+
+    The 256-token floor is a last-resort guard for the unvalidated raw-dict path
+    where ``max_tokens >= ctx_max_tokens``; validated configs always produce a
+    positive raw threshold because ``context_window > max_tokens`` is enforced at
+    parse time.
 
     The current active goal and the two most recent messages are preserved, but
     very large recent tool-result content is capped head+tail so it cannot
@@ -180,7 +195,8 @@ def maybe_compact(
     Args:
         messages: Conversation history to (potentially) compact.
         system: System prompt string (used for token estimation only).
-        ctx_max_tokens: Hard context-window limit in tokens.
+        ctx_max_tokens: Effective context-window limit in tokens (per-model
+            ``context_window`` or ``agent.ctx_max_tokens``).
         llm: LLM client used for the compaction summary call.
         goal_idx: Index of the current active goal message within *messages*.
             When ``react_loop`` prepends short-term history before the current
@@ -189,6 +205,10 @@ def maybe_compact(
             the ``first`` slot rather than being swept into the summarised
             middle.  Defaults to ``0`` for backward-compatibility when no
             history precedes the goal.
+        model_max_tokens: Completion token budget for the active model. The
+            threshold reserves this before applying the 85% margin, then is
+            clamped to a 256-token floor as a last-resort guard for the
+            unvalidated raw-dict path. Defaults to 1024.
 
     Returns:
         A ``(compacted_messages, new_goal_idx)`` tuple where ``new_goal_idx`` is
@@ -196,7 +216,7 @@ def maybe_compact(
         sites must unpack this tuple.
     """
     total = estimate_messages_tokens(messages, system, model=_active_model(llm))
-    threshold = int(ctx_max_tokens * 0.85)
+    threshold = max(int((ctx_max_tokens - model_max_tokens) * 0.85), 256)
     if total <= threshold:
         # Under threshold: messages returned unchanged, so is the goal position.
         return messages, goal_idx
