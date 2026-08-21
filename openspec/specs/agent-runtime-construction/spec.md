@@ -23,12 +23,12 @@ The system SHALL provide a runtime construction boundary that builds agent execu
 ### Requirement: Runtime options preserve construction knobs
 The runtime SHALL accept per-execution options for construction values currently duplicated across agent construction call sites.
 
-#### Scenario: Model override and fallback trichotomy are preserved
-- **GIVEN** a caller provides a model override and fallback model option
+#### Scenario: Model override is preserved
+- **GIVEN** a caller provides a model override
 - **WHEN** the runtime constructs a sub-agent product
-- **THEN** `fallback_models = null` inherits configured fallbacks
-- **AND** `fallback_models = []` disables fallback inheritance
-- **AND** a non-empty fallback list becomes the explicit fallback chain
+- **THEN** the constructed execution SHALL use the specified model as the active model
+- **AND** token usage accounting continues to use the configured usage registry
+- **AND** caller tagging remains equivalent to the legacy construction path
 
 #### Scenario: Per-call LLM overrides are preserved
 - **GIVEN** a caller provides `max_tokens`, `temperature`, or `top_p` overrides
