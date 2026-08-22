@@ -540,6 +540,16 @@ def _run(
         inactivity_warn_minutes=inactivity_warn_minutes,
     )
 
+    # Checkpoint store for LLM error recovery.
+    from checkpoint_store import CheckpointStore
+    checkpoint_store = CheckpointStore(data_dir)
+    agent.checkpoint_store = checkpoint_store
+
+    # Wire LLM error handling config into the agent runtime.
+    if hasattr(app_cfg, "llm_error_handling"):
+        agent._checkpoint_enabled = app_cfg.llm_error_handling.checkpoint_enabled
+        agent._retry_timeout_seconds = app_cfg.llm_error_handling.retry_timeout_seconds
+
     # Wire strategy memory into the agent so the ReAct loop can query learned
     # approaches in a later iteration. Assigned post-construction to avoid
     # changing the AgentController signature today.
@@ -554,9 +564,17 @@ def _run(
     except Exception as exc:
         logger.warning("Tool index build failed (check embeddings API config): %s", exc)
 
-    def agent_handler(user_id, text, progress_cb, images=None, *, prompt_id=None, trace_id=None):
-        return agent.run(text, progress_callback=progress_cb, images=images or None,
-                         prompt_id=prompt_id, trace_id=trace_id)
+    def agent_handler(
+        user_id, text, progress_cb, images=None, *, prompt_id=None, trace_id=None, resume_from=None,
+    ):
+        return agent.run(
+            text,
+            progress_callback=progress_cb,
+            images=images or None,
+            prompt_id=prompt_id,
+            trace_id=trace_id,
+            resume_from=resume_from,
+        )
 
     # Build TelegramInterface first so notify() can reference it
     # (tg is created after scheduler/sub_agent_factory wiring, so we use nonlocal)
@@ -717,6 +735,19 @@ def _run(
     tg._graph_memory_store = graph_memory_store  # type: ignore[attr-defined]
     tg._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
     tg._prompt_registry = prompt_registry  # type: ignore[attr-defined]  # wire prompt registry for /prompts and lifecycle
+
+    # Startup checkpoint scan — notify operator of recoverable runs.
+    try:
+        checkpoints = checkpoint_store.list()
+        if checkpoints:
+            most_recent = checkpoints[0]
+            goal = most_recent.get("user_goal", "?")[:60]
+            if len(checkpoints) == 1:
+                notify(f"💾 Found unfinished run: '{goal}'. Send /resume to continue.")
+            else:
+                notify(f"💾 Found {len(checkpoints)} unfinished runs. Most recent: '{goal}'. Send /resume to see all.")
+    except Exception as exc:
+        logger.warning("Startup checkpoint scan failed: %s", exc)
 
     # Wire the Telegram interface into the MCP manager so OAuth redirect URLs
     # can be posted to the operator as inline buttons during the auth flow.

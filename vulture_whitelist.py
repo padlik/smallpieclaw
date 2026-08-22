@@ -216,4 +216,33 @@ _NsjailConfigBuilder.workspace_dir  # type: ignore[attr-defined]
 from builtin_executor import BuiltinExecutor as _BuiltinExecutorForWorkspace  # noqa: E402, F811
 _BuiltinExecutorForWorkspace._workspace_dir  # type: ignore[attr-defined]
 
+# LLM error recovery — public API symbols
+from checkpoint_store import CheckpointStore as _CheckpointStoreForWhitelist  # noqa: E402
+_CheckpointStoreForWhitelist
+
+from react_loop import LLMErrorInfo as _LLMErrorInfoForWhitelist  # noqa: E402
+_LLMErrorInfoForWhitelist
+
+from confirmation import RETRY_PREFIX as _RetryPrefixForWhitelist  # noqa: E402
+_RetryPrefixForWhitelist
+
+from confirmation import ConfirmationManager as _ConfirmationManagerForRetry  # noqa: E402, F811
+_ConfirmationManagerForRetry.request_retry  # type: ignore[attr-defined]
+_ConfirmationManagerForRetry.signal_retry  # type: ignore[attr-defined]
+
+# tests/test_react_loop_error_recovery.py — lambda timeout_seconds parameter is required
+# by the patched ConfirmationManager.request_retry signature even when not used.
+from tests.test_react_loop_error_recovery import (  # noqa: E402
+    _build_context as _test_build_context,
+    _checkpoint_path as _test_checkpoint_path,
+    _make_http_status_error as _test_make_http_status_error,
+    ErrorThenSuccessLLM as _test_error_then_success_llm,
+    ScriptedFinishLLM as _test_scripted_finish_llm,
+)
+_test_build_context
+_test_checkpoint_path
+_test_make_http_status_error
+_test_error_then_success_llm
+_test_scripted_finish_llm
+
 

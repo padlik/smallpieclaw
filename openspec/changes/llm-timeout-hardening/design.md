@@ -25,7 +25,7 @@ Key existing patterns this design builds on:
 - No new exception classes in providers — classification is done at `react_loop` level by inspecting `type(exc)`
 - No "retry with different model" button — user can `/model` then `/resume`
 - No periodic checkpoints — checkpoints are written only on LLM error
-- No checkpoint cleanup (TTL, max files, eviction) — checkpoints are deleted on success/cancel; stale files are harmless
+- No TTL-based cleanup — checkpoints are deleted on success/cancel; a max_checkpoints retention cap (default 20) prunes the oldest on each save() to prevent unbounded growth; corrupted files are removed during pruning
 - No loop-level auto-retry — provider already retried 3x; go straight to user prompt
 - No scheduled job auto-retry — next cron run is the natural retry
 - No streaming response caching — the agent doesn't stream; `_LoopState.messages` is the preserved state
@@ -88,6 +88,7 @@ Key existing patterns this design builds on:
 **Alternatives considered:**
 - In-memory checkpoints in `AgentController` — rejected: lost on crash/restart, can't resume after process kill.
 - Periodic checkpoints every N steps — rejected: adds I/O overhead and complexity for a rare edge case (crash during tool execution without LLM error).
+- No retention cap — rejected: unbounded disk growth from stale checkpoints in long-running deployments. A max_checkpoints cap (default 20) with pruning on save() is a simple, low-overhead solution.
 
 ### D3: Thread-blocking retry prompt (ConfirmationManager pattern)
 
@@ -158,7 +159,7 @@ LLM error → checkpoint written → __LLM_ERROR__ marker sent
 
 ## Risks / Trade-offs
 
-- **[Checkpoint file leaks]** → Checkpoints from timed-out retry prompts (120s) that the user never resolves will accumulate. Mitigation: files are small (~10-100KB), one per failed run, and `/resume` listing makes them visible. User can manually delete or ignore. No automatic cleanup needed.
+- **[Checkpoint file leaks]** → Checkpoints from timed-out retry prompts (120s) that the user never resolves will accumulate. Mitigation: a `max_checkpoints` retention cap (default 20) prunes the oldest checkpoints on each `save()` call, preventing unbounded growth. Corrupted checkpoint files are also removed during pruning. `/resume` listing makes remaining checkpoints visible.
 - **[Thread blocking during retry prompt]** → The agent thread is held for up to 120s waiting for user input. Mitigation: same pattern as existing confirmations (300s timeout) and step extensions (120s timeout). The thread is idle, not consuming resources.
 - **[Checkpoint write failure]** → Disk full or permissions error during checkpoint write. Mitigation: `CheckpointStore.save()` catches `OSError`, logs warning, and the retry prompt proceeds without a checkpoint (user can still retry inline, but can't `/resume` after crash). The error is non-fatal.
 - **[Non-retryable checkpoint confusion]** → User might `/resume` a non-retryable error (context overflow) and hit the same error again. Mitigation: `/resume` checks `error_info.retryable` and refuses non-retryable checkpoints, informing the user.

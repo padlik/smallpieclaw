@@ -48,13 +48,13 @@ from telegram_commands import (
     cmd_verbose, cmd_jobs, cmd_agents, cmd_prompts, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
-    cmd_dir,
+    cmd_dir, cmd_resume,
 )
 from telegram_callbacks import (
     cb_confirm, cb_extend, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
     cb_zone_allow, cb_zone_trusted,
-    cb_oauth_cancel,
+    cb_oauth_cancel, cb_llm_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,11 @@ def _task_text_with_artifact(
 
 def _classify_final_status(result: str) -> str:
     """Map a react_loop result string to a PromptRegistry status."""
-    return "cancelled" if result == "[Cancelled]" else "done"
+    if result.startswith("❌"):
+        return "failed"
+    if result == "[Cancelled]":
+        return "cancelled"
+    return "done"
 
 
 @dataclasses.dataclass
@@ -297,6 +301,18 @@ class _ProgressPanel:
                 self._loop,
             )
             return
+        if msg.startswith("__LLM_ERROR__:"):
+            # Format: __LLM_ERROR__:{token}:{json}
+            parts = msg.split(":", 2)
+            token = parts[1] if len(parts) > 1 else ""
+            error_json = parts[2] if len(parts) > 2 else "{}"
+            asyncio.run_coroutine_threadsafe(
+                self._interface._send_llm_error_prompt(
+                    self._update.effective_message, token, error_json
+                ),
+                self._loop,
+            )
+            return
         if msg.startswith("__FILE__"):
             _, path_b64, caption_b64 = msg.split(":", 2)
             try:
@@ -445,6 +461,10 @@ class TelegramInterface:
         # Verbose mode: send each agent action as a new message instead of editing
         self._verbose: bool = False
 
+        # Resume route-through state: per-user stashed checkpoint trace_id so a
+        # resumed run can be passed to agent_handler via _run_agent_task_locked.
+        self._pending_resume: dict[int, str] = {}
+
         self._app: Optional[Application] = None
         # Saved when run() starts — used by send_message_to_users() from threads
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -583,6 +603,7 @@ class TelegramInterface:
             BotCommand("show_ctx", "Show current system prompt snapshot"),
             BotCommand("show_env", "Show runtime environment info"),
             BotCommand("stop", "Cancel the currently running task"),
+            BotCommand("resume", "Resume an interrupted run from a saved checkpoint"),
         ]
         try:
             await app.bot.set_my_commands(commands)
@@ -620,11 +641,13 @@ class TelegramInterface:
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
         app.add_handler(CommandHandler("memory", partial(cmd_memory, self)))
         app.add_handler(CommandHandler("dir", partial(cmd_dir, self)))
+        app.add_handler(CommandHandler("resume", partial(cmd_resume, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(partial(cb_mode_switch, self), pattern=r"^mode:"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
+        app.add_handler(CallbackQueryHandler(partial(cb_llm_retry, self), pattern=r"^llm_retry:"))
         app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
         app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
         app.add_handler(CallbackQueryHandler(partial(cb_zone_allow,   self), pattern=r"^zone_allow:"))
@@ -765,6 +788,9 @@ class TelegramInterface:
         # Non-blocking lock attempt: if the agent is already running, defer this
         # message and return immediately rather than racing the active run.
         if lock.locked():
+            # A /resume intent for this user is being deferred — clear it now
+            # so it does not leak onto a later run that doesn't know about it.
+            self._pending_resume.pop(user_id, None)
             # Replacing any earlier pending item: drop the previous deferred
             # entry for this user so its (now stale) Run/Discard button resolves
             # to "expired" instead of running an outdated message.
@@ -826,6 +852,7 @@ class TelegramInterface:
         typing_task = asyncio.create_task(panel.typing_loop())
 
         trace_id = new_trace_id()
+        resume_from = self._pending_resume.pop(user_id, None)
         prompt_record = None
         if self._prompt_registry is not None:
             prompt_record = self._prompt_registry.start(trace_id, task_text)
@@ -838,13 +865,15 @@ class TelegramInterface:
                     user.id, task_text, panel.dispatch_progress, images=images,
                     prompt_id=prompt_record.prompt_id if prompt_record is not None else None,
                     trace_id=trace_id,
+                    resume_from=resume_from,
                 ),
             )
             await self._safe_edit_html(status_msg, panel.build_panel())
-            await self._safe_edit(status_msg, "✅ Done")
+            final_status = _classify_final_status(result)
+            status_label = "❌ Failed" if final_status == "failed" else "✅ Done"
+            await self._safe_edit(status_msg, status_label)
             for chunk in self._split_message(result):
                 await self._send_safe(update.effective_message, chunk)
-            final_status = _classify_final_status(result)
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
             await self._safe_edit_html(status_msg, panel.build_panel())
@@ -956,6 +985,52 @@ class TelegramInterface:
         await message.reply_text(
             f"⏱ <b>Max steps reached</b> ({current_steps} steps)\n\n"
             "The agent hasn't finished yet. Extend by 10 more steps, run until done, or cancel?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+    async def _send_llm_error_prompt(self, message, token: str, error_info_json: str) -> None:
+        """Send an inline-button error card for LLM errors with Retry/Cancel buttons."""
+        import json as _json
+        try:
+            info = _json.loads(error_info_json)
+        except _json.JSONDecodeError:
+            info = {}
+
+        error_message = info.get("message", "LLM error occurred")
+        retryable = info.get("retryable", True)
+        model = info.get("model", "?")
+        step = info.get("step", "?")
+        max_steps = info.get("max_steps", "?")
+        tool_results = info.get("tool_results_count", 0)
+        detail = info.get("detail", "")
+        if len(detail) > 200:
+            detail = detail[:200] + "…"
+
+        # Build the error card
+        card = (
+            f"⚠️ <b>LLM Error</b>\n\n"
+            f"{html.escape(error_message)}\n\n"
+            f"<b>Model:</b> {html.escape(str(model))}\n"
+            f"<b>Step:</b> {step}/{max_steps}\n"
+            f"<b>Preserved tool results:</b> {tool_results}\n"
+        )
+        if detail:
+            card += f"\n<i>{html.escape(detail)}</i>\n"
+
+        # Build inline keyboard
+        if retryable:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Retry", callback_data=f"llm_retry:{token}:retry"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"llm_retry:{token}:cancel"),
+            ]])
+        else:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data=f"llm_retry:{token}:cancel"),
+            ]])
+
+        await message.reply_text(
+            card,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )

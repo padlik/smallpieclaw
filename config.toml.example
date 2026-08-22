@@ -305,6 +305,25 @@ log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups t
 # first start; new installs start empty.
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LLM error handling
+# ─────────────────────────────────────────────────────────────────────────────
+# Controls how the agent recovers from LLM timeout/network errors.
+# When an LLM call fails after all provider retries, the agent shows an
+# inline error card with Retry/Cancel buttons and writes a checkpoint
+# to disk so the run can be resumed after a crash/restart.
+
+[llm_error_handling]
+# How long (seconds) to wait for the operator to press Retry/Cancel
+# before the agent thread unblocks and returns an error. The checkpoint
+# survives a timeout so the user can /resume later.
+retry_timeout_seconds = 120
+
+# Whether to write disk-persisted checkpoints on LLM errors.
+# When false, inline retry still works (in-memory state), but /resume
+# and crash recovery are not available.
+checkpoint_enabled = true
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MCP Servers (Model Context Protocol)
 # Use [[mcp_servers]] to configure one or more MCP servers.
 # Two transports are supported: "stdio" (subprocess) and "http" (HTTP/HTTPS).

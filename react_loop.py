@@ -21,6 +21,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
+import httpx
+
 if TYPE_CHECKING:
     from builtin_tools.access_control import TrustedZoneChecker
 
@@ -29,7 +31,8 @@ from builtin_tools.schemas import build_tool_definitions
 from confirmation import ConfirmationManager
 from context_manager import maybe_compact
 from interfaces import ToolCall
-from llm_client import LLMClient, LLMCancelledError, LLMError, LLMPermanentError, _encode_images
+from exceptions import LLMContextOverflowError
+from llm_client import LLMClient, LLMCancelledError, LLMEmptyResponseError, LLMError, LLMPermanentError, _encode_images
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from outcome_utils import fail_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
@@ -260,6 +263,13 @@ class ReactContext:
 
     # Confirmation coordination (shared with AgentController and Telegram)
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
+
+    # Checkpoint store for LLM error recovery — Optional[CheckpointStore]
+    checkpoint_store: Optional[object] = None
+    # Whether disk checkpoints are written (config: llm_error_handling.checkpoint_enabled)
+    checkpoint_enabled: bool = True
+    # Retry prompt timeout in seconds (config: llm_error_handling.retry_timeout_seconds)
+    retry_timeout_seconds: int = 120
 
     # Native tool calling — cached tool definitions built once at loop start
     _tool_defs: Optional[list[dict]] = None
@@ -757,6 +767,114 @@ class _Turn:
     linearized_messages: Optional[list] = None  # set when messages were linearized for fallback
 
 
+@dataclass
+class LLMErrorInfo:
+    """Classified LLM error information for retry/recovery."""
+    type: str        # timeout, connection, rate_limit, empty, context, permanent, unknown
+    message: str     # user-facing message
+    retryable: bool
+    detail: str      # raw exception details for logging
+
+
+def _classify_llm_error(exc: Exception) -> LLMErrorInfo:
+    """Classify an LLM exception into a typed error info for retry/recovery.
+
+    LLMCancelledError is NOT classified here — it propagates before classification.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+
+    if isinstance(exc, httpx.TimeoutException):
+        return LLMErrorInfo("timeout", "⏱️ Request timed out", True, detail)
+    if isinstance(exc, httpx.ConnectError):
+        return LLMErrorInfo("connection", "🔌 Connection failed", True, detail)
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response.status_code == 429:
+            return LLMErrorInfo("rate_limit", "🚫 Rate limit reached", True, detail)
+        return LLMErrorInfo("unknown", "❌ LLM error", True, detail)
+    if isinstance(exc, LLMEmptyResponseError):
+        return LLMErrorInfo("empty", "📭 Model returned no content", True, detail)
+    if isinstance(exc, LLMContextOverflowError):
+        return LLMErrorInfo("context", "📏 Context too long", False, detail)
+    if isinstance(exc, LLMPermanentError):
+        return LLMErrorInfo("permanent", f"❌ {exc}", False, detail)
+    return LLMErrorInfo("unknown", f"❌ LLM error: {exc}", True, detail)
+
+
+def _get_user_goal(state: _LoopState) -> str:
+    """Extract the user's goal from the first user message in state."""
+    for msg in state.messages:
+        if msg.get("role") == "user":
+            return msg.get("content", "")
+    return ""
+
+
+def _handle_llm_error(
+    ctx: ReactContext,
+    state: _LoopState,
+    error_info: LLMErrorInfo,
+    progress: Callable[[str], None],
+    user_goal: str,
+) -> Optional[str]:
+    """Handle an LLM error: write checkpoint, prompt user for retry/cancel.
+
+    Returns None to retry (loop continues), or an error string to return.
+    """
+    import json as _json
+    import secrets as _secrets
+
+    # Step 1: Write checkpoint if enabled
+    if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
+        checkpoint = {
+            "trace_id": ctx.trace_id,
+            "user_goal": user_goal,
+            "messages": state.messages,
+            "step": state.step,
+            "goal_idx": state.goal_idx,
+            "max_steps": state.max_steps,
+            "json_fail_streak": state.json_fail_streak,
+            "model": ctx.llm.llm_cfg.get("model", "?"),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "error_info": {
+                "type": error_info.type,
+                "message": error_info.message,
+                "retryable": error_info.retryable,
+                "detail": error_info.detail,
+            },
+        }
+        ctx.checkpoint_store.save(ctx.trace_id, checkpoint)
+
+    # Step 2: Prompt user for retry/cancel
+    token = _secrets.token_hex(4)
+    error_info_json = _json.dumps({
+        "type": error_info.type,
+        "message": error_info.message,
+        "retryable": error_info.retryable,
+        "detail": error_info.detail[:200],
+        "model": ctx.llm.llm_cfg.get("model", "?"),
+        "step": state.step,
+        "max_steps": state.max_steps,
+        "tool_results_count": sum(
+            1 for m in state.messages
+            if m.get("role") == "tool"
+            or m.get("role") == "user"
+            and "tool result" in m.get("content", "").lower()
+        ),
+    })
+    response = ctx.confirmation.request_retry(
+        token, error_info_json, progress, timeout_seconds=ctx.retry_timeout_seconds
+    )
+
+    # Step 3: Handle response
+    if response == "retry":
+        return None  # loop continues, re-calls LLM with same state
+    if response == "cancel":
+        if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
+            ctx.checkpoint_store.delete(ctx.trace_id)
+        return f"❌ {error_info.message}"
+    # timeout
+    return f"❌ {error_info.message}"
+
+
 def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
     """Assemble the full system prompt string for a run."""
     _job_history_section = ""
@@ -976,7 +1094,8 @@ def _request_turn(
 
     if not raw and not native_attempted:
         linearized_messages = _linearize_native_turns(state.messages)
-        for attempt in range(1 + _MAX_EMPTY_RETRIES):
+        empty_retries = 0
+        while True:
             try:
                 raw = ctx.llm.chat_with_fallback(
                     linearized_messages, system=system, progress_cb=progress, json_mode=True,
@@ -984,15 +1103,25 @@ def _request_turn(
             except LLMCancelledError:
                 logger.info("Agent LLM call cancelled at step %d/%d", state.step, state.max_steps)
                 return _Turn([], "", False, "[Cancelled]")
-            except Exception as exc:
-                err = f"❌ LLM error: {type(exc).__name__}: {exc}"
-                progress(err)
-                return _Turn([], "", False, err)
+            except (LLMError, LLMEmptyResponseError, LLMContextOverflowError, httpx.HTTPError) as exc:
+                error_info = _classify_llm_error(exc)
+                logger.warning("LLM error at step %d/%d: %s — %s", state.step, state.max_steps, error_info.type, error_info.detail)
+                # Try to handle the error (checkpoint + retry prompt)
+                result = _handle_llm_error(ctx, state, error_info, progress, _get_user_goal(state))
+                if result is None:
+                    # User pressed Retry — re-attempt the LLM call.
+                    # This is an unbounded, human-paced retry, NOT tied to
+                    # the empty-response retry counter.
+                    continue
+                return _Turn([], "", False, result)
             if raw.strip():
                 break
-            if attempt < _MAX_EMPTY_RETRIES:
-                logger.warning("LLM returned empty response (step %d/%d), retrying (%d/%d)…", state.step, state.max_steps, attempt + 1, _MAX_EMPTY_RETRIES, )
-                progress(f"⏳ Empty LLM response, retrying ({attempt + 1}/{_MAX_EMPTY_RETRIES})…")
+            if empty_retries < _MAX_EMPTY_RETRIES:
+                logger.warning("LLM returned empty response (step %d/%d), retrying (%d/%d)…", state.step, state.max_steps, empty_retries + 1, _MAX_EMPTY_RETRIES, )
+                progress(f"⏳ Empty LLM response, retrying ({empty_retries + 1}/{_MAX_EMPTY_RETRIES})…")
+                empty_retries += 1
+                continue
+            break
 
     return _Turn(tool_calls, raw, text_from_native, None, linearized_messages)
 
@@ -1085,6 +1214,7 @@ def react_loop(
     user_goal: str,
     progress_callback: Optional[Callable[[str], None]] = None,
     images: Optional[list[str]] = None,
+    initial_state: Optional[_LoopState] = None,
 ) -> str:
     """Execute the ReAct loop: LLM → parse → dispatch → repeat. Returns the final answer string."""
     run_start = time.time()
@@ -1123,7 +1253,10 @@ def react_loop(
             ctx.llm.chat_with_tools_fallback
         )
 
-        state = _LoopState(messages=messages, goal_idx=goal_idx, max_steps=ctx.max_iterations)
+        if initial_state is not None:
+            state = initial_state
+        else:
+            state = _LoopState(messages=messages, goal_idx=goal_idx, max_steps=ctx.max_iterations)
 
         while True:
             while state.step < state.max_steps:
@@ -1196,6 +1329,8 @@ def react_loop(
                     ctx, action_obj, sink, state, user_goal, run_start, _progress,
                 )
                 if final is not None:
+                    if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
+                        ctx.checkpoint_store.delete(ctx.trace_id)
                     return final
                 if state.operator_cancelled:
                     break
