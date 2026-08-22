@@ -54,6 +54,7 @@ def _make_iface():
     iface._start_time = time.time()
     iface._pending_pairs = {}
     iface._agent_locks = {}
+    iface._pending_resume = {}
     iface._deferred_messages = {}
     iface._current_deferred_token = {}
     iface._verbose = False

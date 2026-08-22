@@ -124,6 +124,7 @@ class AgentController:
         creativity_mode: str = "default",
         plan_max_iterations: int = 50,
         inactivity_warn_minutes: int = 15,
+        checkpoint_store=None,  # Optional[CheckpointStore]
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -186,6 +187,9 @@ class AgentController:
         # the result and unblock the worker thread.
         # ------------------------------------------------------------------
         self._confirmation = ConfirmationManager()
+        self.checkpoint_store = checkpoint_store
+        self._checkpoint_enabled = True
+        self._retry_timeout_seconds = 120
 
     @property
     def runtime_deps(self) -> ControllerDeps:
@@ -240,6 +244,9 @@ class AgentController:
                 if self.builtin_executor is not None
                 else None
             ),
+            checkpoint_store=self.checkpoint_store,
+            checkpoint_enabled=self._checkpoint_enabled,
+            retry_timeout_seconds=self._retry_timeout_seconds,
         )
 
     # ------------------------------------------------------------------
@@ -254,6 +261,7 @@ class AgentController:
         *,
         prompt_id: Optional[str] = None,
         trace_id: Optional[str] = None,
+        resume_from: Optional[str] = None,
     ) -> str:
         """
         Process a user goal and return the final answer string.
@@ -284,6 +292,27 @@ class AgentController:
         # Request-scoped trace ID: reuse a propagated parent trace when present,
         # otherwise mint a fresh one so each interactive run is correlatable.
         run_trace_id = trace_id if trace_id else child_trace_id(self._trace_id)
+
+        # Load a saved checkpoint when resuming after an LLM error.
+        # This must happen BEFORE build_react_context so the checkpoint's
+        # trace_id is used for the context, LLM trace binding, and log correlation.
+        initial_state = None
+        if resume_from is not None and self.checkpoint_store is not None:
+            checkpoint = self.checkpoint_store.load(resume_from)
+            if checkpoint is not None:
+                from react_loop import _LoopState
+                initial_state = _LoopState(
+                    messages=checkpoint.get("messages", []),
+                    goal_idx=checkpoint.get("goal_idx", 0),
+                    max_steps=checkpoint.get("max_steps", self.max_iterations),
+                    step=checkpoint.get("step", 0),
+                    json_fail_streak=checkpoint.get("json_fail_streak", 0),
+                )
+                # Reuse the checkpoint's trace_id for log correlation and
+                # correct checkpoint deletion on successful completion.
+                run_trace_id = checkpoint.get("trace_id", run_trace_id)
+                user_goal = checkpoint.get("user_goal", user_goal)
+
         _prev_trace = getattr(self.llm, "_trace_id", "")
         if hasattr(self.llm, "set_trace_id"):
             self.llm.set_trace_id(run_trace_id)
@@ -318,12 +347,16 @@ class AgentController:
             else None
         )
         ctx = AgentRuntime.build_react_context(self, run_trace_id, cancel_event=run_cancel_event)
+
+        loop_kwargs: dict = {}
+        if initial_state is not None:
+            loop_kwargs["initial_state"] = initial_state
         try:
             if self.builtin_executor is not None:
                 from builtin_tools.access_control import GrantTracker  # noqa: PLC0415
                 with self.builtin_executor.use_grant_tracker(GrantTracker()):
-                    return react_loop(ctx, user_goal, progress_callback, images)
-            return react_loop(ctx, user_goal, progress_callback, images)
+                    return react_loop(ctx, user_goal, progress_callback, images, **loop_kwargs)
+            return react_loop(ctx, user_goal, progress_callback, images, **loop_kwargs)
         finally:
             self.llm._active_idx = _primary_idx
             if hasattr(self.llm, "set_trace_id"):
@@ -360,6 +393,13 @@ class AgentController:
         response: "yes" | "no" | "unlimited"
         """
         self._confirmation.signal_extension(token, response)
+
+    def resume_llm_error(self, token: str, response: str) -> None:
+        """Called by TelegramInterface when user responds to an LLM error retry prompt.
+
+        response: "retry" | "cancel"
+        """
+        self._confirmation.signal_retry(token, response)
 
     def resume_approve_all(self, token: str, tool_name: str) -> None:
         """Called by TelegramInterface when user presses 'Approve all {tool_name}'.

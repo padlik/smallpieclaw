@@ -142,6 +142,40 @@ async def cb_extend(iface: "TelegramInterface", update: Update, ctx: ContextType
 
 
 @_require_cb_auth
+async def cb_llm_retry(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Retry / Cancel button presses for LLM error recovery."""
+    query = update.callback_query
+    data = query.data  # "llm_retry:{token}:retry" | "llm_retry:{token}:cancel"
+
+    # Parse: llm_retry:{token}:{response}
+    parts = data.split(":", 2)
+    token = parts[1] if len(parts) > 1 else ""
+    response = parts[2] if len(parts) > 2 else "cancel"
+
+    if response == "retry":
+        result_text = "🔄 Retrying…"
+    else:
+        result_text = "❌ Cancelled."
+
+    # Signal the agent thread via the public resume method (same pattern as
+    # cb_confirm → iface.agent.resume and cb_extend → iface.agent.resume_extend).
+    if iface.agent and hasattr(iface.agent, 'resume_llm_error'):
+        iface.agent.resume_llm_error(token, response)
+    else:
+        logger.warning("cb_llm_retry: agent or resume_llm_error method not available")
+
+    await _ack_query(query)
+
+    try:
+        await query.edit_message_text(
+            f"⚠️ <b>LLM Error</b>\n\n{result_text}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        logger.debug("Could not edit LLM error message: %s", exc)
+
+
+@_require_cb_auth
 async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle model switch button presses."""
     query = update.callback_query

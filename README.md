@@ -176,6 +176,7 @@ systemctl --user enable --now telegram-agent
 | `/dir` | List and remove trusted directories: `list`, `del <n>` |
 | `/mcp` | Manage MCP servers: `list`, `on <name>`, `off <name>`, `info <name>` |
 | `/stop` | Cancel the current running task |
+| `/resume` | Resume an interrupted run from a saved checkpoint |
 | `/reset` | Save context to results memory and start fresh |
 | `/reset discard` | Clear context without saving |
 | `/verbose` | Toggle live tool-call progress; `/verbose on` or `/verbose off` |
@@ -540,6 +541,49 @@ Resilience behaviours:
 - **Non-JSON prose** — coerced up to 2 times without consuming a step or polluting history
 - **Multiple JSON objects** — brace-counting parser extracts the correct `{"action":…}` block
 - **Reasoning model support** — `reasoning`/`reasoning_content` field fallback (DeepSeek-R1, Kimi K2.5, QwQ)
+
+### LLM error recovery
+
+When an LLM call fails after all provider retries (timeout, connection error, rate limit, etc.), the agent:
+
+1. **Classifies the error** into one of seven types: `timeout`, `connection`, `rate_limit`, `empty`, `context` (non-retryable), `permanent` (non-retryable), or `unknown`.
+2. **Writes a checkpoint** to `data/run_checkpoints/{trace_id}.json` containing the full conversation state (messages, step, tool results) so the run can be resumed after a crash or restart.
+3. **Shows an inline error card** in Telegram with:
+   - The error type and classified message
+   - Model name, current step/max-steps, and count of preserved tool results
+   - Truncated error detail (first 200 chars)
+   - **[🔄 Retry]** and **[❌ Cancel]** buttons for retryable errors
+   - **[❌ Cancel]** only for non-retryable errors (context overflow, permanent API errors)
+4. **Blocks the agent thread** for up to 120 seconds (configurable) waiting for the operator's decision:
+   - **Retry** — resumes the loop from the saved state, re-calling the LLM with the full conversation context (no tool re-execution)
+   - **Cancel** — deletes the checkpoint and returns an error string
+   - **Timeout** — returns an error string but keeps the checkpoint on disk for later `/resume`
+
+### `/resume` command
+
+Resumes an interrupted run from a saved checkpoint:
+
+- `/resume` — resume the most recent checkpoint
+- `/resume N` — resume the Nth checkpoint when multiple exist
+- `/resume` with no checkpoints — reports "No unfinished runs to resume"
+- `/resume` while agent is busy — reports "⚠️ Agent is currently running. Wait or /stop it first."
+- Non-retryable checkpoints (context overflow) are refused with an explanation
+
+On startup, the agent scans for existing checkpoints and notifies the operator: "💾 Found unfinished run: '{goal}'. Send /resume to continue."
+
+### Scheduled job failure notification
+
+Scheduled jobs that fail due to LLM errors are classified and reported with the error type and next scheduled run time. No auto-retry — the next cron run is the natural retry.
+
+### Configuration
+
+```toml
+[llm_error_handling]
+retry_timeout_seconds = 120  # how long to wait for operator retry/cancel decision
+checkpoint_enabled = true    # whether to write disk-persisted checkpoints
+```
+
+When `checkpoint_enabled = false`, inline retry still works (in-memory state), but `/resume` and crash recovery are not available.
 
 ### Logging
 

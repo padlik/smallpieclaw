@@ -108,6 +108,7 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /jobs    — list scheduled jobs\n"
         "  /prompts — list recent prompts, or /prompts search &lt;query&gt; [Nd/Nh] [--status=&lt;S&gt;] [--trace=&lt;T&gt;] [--since=&lt;ISO&gt;] [--until=&lt;ISO&gt;] [--page=&lt;N&gt;], or /prompts show &lt;id&gt;\n"
         "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
+        "  /resume  — resume an interrupted run from a saved checkpoint\n"
         "  /pair    — pairing token management\n"
         "  /myid    — show your Telegram user ID\n",
         parse_mode=ParseMode.HTML,
@@ -257,6 +258,97 @@ async def cmd_stop(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         )
     else:
         await update.effective_message.reply_text("ℹ️ No active agent to stop.")
+
+
+@_require_auth
+async def cmd_resume(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resume an interrupted run from a saved checkpoint."""
+    user_id = update.effective_user.id
+
+    # Check if agent is busy via the per-user lock
+    agent_lock = iface._get_agent_lock(user_id)
+    if agent_lock.locked():
+        await update.effective_message.reply_text(
+            "⚠️ Agent is currently running. Wait for it to finish or /stop it first."
+        )
+        return
+
+    # Get checkpoint store from agent
+    checkpoint_store = getattr(iface.agent, 'checkpoint_store', None) if iface.agent else None
+    if checkpoint_store is None:
+        await update.effective_message.reply_text(
+            "No unfinished runs to resume."
+        )
+        return
+
+    checkpoints = checkpoint_store.list()
+    if not checkpoints:
+        await update.effective_message.reply_text(
+            "No unfinished runs to resume."
+        )
+        return
+
+    # Parse args
+    args = ctx.args or []
+    if args and args[0].isdigit():
+        idx = int(args[0]) - 1  # 1-indexed
+        if idx < 0 or idx >= len(checkpoints):
+            await update.effective_message.reply_text(
+                "❌ Invalid checkpoint number. Use /resume to list available checkpoints."
+            )
+            return
+        checkpoint = checkpoints[idx]
+    elif len(checkpoints) == 1:
+        checkpoint = checkpoints[0]
+    else:
+        # List checkpoints
+        lines = ["💾 <b>Unfinished runs:</b>\n"]
+        for i, cp in enumerate(checkpoints, 1):
+            goal = html.escape(cp.get("user_goal", "?")[:60])
+            step = cp.get("step", "?")
+            max_steps = cp.get("max_steps", "?")
+            error_type = cp.get("error_info", {}).get("type", "unknown")
+            retryable = cp.get("error_info", {}).get("retryable", True)
+            created = cp.get("created_at", "?")
+            status_icon = "🔄" if retryable else "❌"
+            lines.append(
+                f"{i}. {status_icon} <b>{goal}</b>\n"
+                f"   Step {step}/{max_steps} • Error: {error_type} • {created}\n"
+            )
+        lines.append("\nUse <code>/resume N</code> to resume a specific checkpoint.")
+        await update.effective_message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Check if the checkpoint is retryable
+    error_info = checkpoint.get("error_info", {})
+    if not error_info.get("retryable", True):
+        await update.effective_message.reply_text(
+            f"❌ This run failed with a non-retryable error "
+            f"({error_info.get('type', 'unknown')}). Cannot resume.\n\n"
+            f"Use /resume to list other checkpoints, or the checkpoint will remain on disk."
+        )
+        return
+
+    # Resume the run through the normal agent task path so it gets a
+    # progress panel, typing indicator, prompt registry entry, and result
+    # display — same UX as a normal message.
+    goal = checkpoint.get("user_goal", "")
+    trace_id = checkpoint.get("trace_id", "")
+    step = checkpoint.get("step", 0)
+    max_steps = checkpoint.get("max_steps", 8)
+
+    await update.effective_message.reply_text(
+        f"💾 Resuming: {html.escape(goal[:60])} (step {step}/{max_steps})",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Stash the checkpoint trace_id so _run_agent_task_locked can pass it
+    # as resume_from to agent_handler.
+    iface._pending_resume[user_id] = trace_id  # type: ignore[attr-defined]
+    await iface._run_agent_task(update, ctx, goal)
 
 
 @_require_auth

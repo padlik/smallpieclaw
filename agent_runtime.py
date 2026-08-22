@@ -92,6 +92,9 @@ class ControllerDeps:
     inactivity_warn_minutes: int = 15
     confirmation: ConfirmationManager = field(default_factory=ConfirmationManager)
     trusted_zone_checker: Optional[object] = None
+    checkpoint_store: Optional[object] = None
+    checkpoint_enabled: bool = True
+    retry_timeout_seconds: int = 120
 
 
 class RuntimeProfile(Enum):

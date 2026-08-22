@@ -46,6 +46,30 @@ logger = logging.getLogger(__name__)
 _ERROR_SENTINEL = "❌"
 
 
+def _classify_job_failure(result: str) -> str:
+    """Classify a scheduled job sub-agent result string into an error type.
+
+    Returns an empty string if the result is not a failure.
+    """
+    if not result:
+        return ""
+    if not result.startswith(_ERROR_SENTINEL):
+        return ""
+    # Inspect for known error type strings
+    lower = result.lower()
+    if "timeout" in lower or "timeoutexception" in lower:
+        return "timeout"
+    if "ratelimit" in lower or "rate_limit" in lower or "429" in lower:
+        return "rate_limit"
+    if "connect" in lower or "connection" in lower:
+        return "connection"
+    if "quota" in lower:
+        return "quota"
+    if "context" in lower and ("overflow" in lower or "too long" in lower):
+        return "context"
+    return "unknown"
+
+
 def _normalize_tag(s: str) -> str:
     """Normalize a tag by lowercasing and collapsing separators to underscores.
 
@@ -146,6 +170,7 @@ class JobExecutionLog:
         success: bool,
         elapsed_s: int = 0,
         model: str = "",
+        error_type: str = "",
     ) -> None:
         """Append a new entry and rotate old ones.  Thread-safe."""
         entry = {
@@ -157,6 +182,8 @@ class JobExecutionLog:
             "elapsed_s": int(elapsed_s),
             "model": model or "",
         }
+        if error_type:
+            entry["error_type"] = error_type
         with self._lock:
             entries = self._load()
             entries.append(entry)
@@ -765,8 +792,14 @@ class Scheduler:
             self._run_history[tag]["last_error"] = meta["last_error"]
             self._save_state()
             # Always notify on error
+            error_message = str(meta["last_error"])
+            error_type = _classify_job_failure(_ERROR_SENTINEL + " " + error_message)
+            next_run = meta.get("_next_run", "unknown")
             self.notify(
-                f"⚠️ <b>Job {_html.escape(tag)} failed to spawn</b>\n{_html.escape(str(meta['last_error']))}"
+                f"⚠️ <b>Job {_html.escape(tag)} failed to spawn</b>"
+                f" ({_html.escape(error_type)})\n"
+                f"Next run: {_html.escape(str(next_run))}\n"
+                f"{_html.escape(error_message)}"
             )
             with self._running_lock:
                 self._running_jobs.discard(tag)
@@ -809,6 +842,8 @@ class Scheduler:
         }
         self._save_state()
 
+        error_type = _classify_job_failure(result)
+
         # Record in execution log
         self.execution_log.record(
             tag=tag,
@@ -817,11 +852,18 @@ class Scheduler:
             success=not error_occurred,
             elapsed_s=0,
             model=job_model or "",
+            error_type=error_type,
         )
 
         if error_occurred:
             if meta.get("notify", True):
-                self.notify(f"⚠️ <b>Scheduled job failed:</b> <code>{_html.escape(tag)}</code>\n\n{_html.escape(result)}")
+                next_run = meta.get("_next_run", "unknown")
+                self.notify(
+                    f"⚠️ <b>Scheduled job failed:</b> <code>{_html.escape(tag)}</code>"
+                    f" ({_html.escape(error_type)})\n"
+                    f"Next run: {_html.escape(str(next_run))}\n\n"
+                    f"{_html.escape(result)}"
+                )
             return
 
         if tag == "longterm_memory_update":

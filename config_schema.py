@@ -447,6 +447,14 @@ class SchedulerConfig:
 
 
 @dataclass(frozen=True)
+class LLMErrorHandlingConfig:
+    """Configuration for LLM error recovery (inline retry, checkpoints)."""
+
+    retry_timeout_seconds: int = 120
+    checkpoint_enabled: bool = True
+
+
+@dataclass(frozen=True)
 class PathsConfig:
     log_backup_count: int = 30
     prompts_dir: str = "prompts"
@@ -505,6 +513,7 @@ class AppConfig:
     graph_memory: GraphMemoryConfig = field(default_factory=GraphMemoryConfig)
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
+    llm_error_handling: LLMErrorHandlingConfig = field(default_factory=LLMErrorHandlingConfig)
 
     # Keep reference to raw dict for incremental migration — consumers that
     # haven't been updated yet can use this temporarily.
@@ -638,6 +647,15 @@ def _parse_scheduler(raw: dict) -> SchedulerConfig:
     section = raw.get("scheduler") or {}
     return SchedulerConfig(
         enabled=_parse_bool(section.get("enabled", True), "scheduler.enabled"),
+    )
+
+
+def _parse_llm_error_handling(raw: dict) -> LLMErrorHandlingConfig:
+    """Parse the ``[llm_error_handling]`` section."""
+    section = raw.get("llm_error_handling", {})
+    return LLMErrorHandlingConfig(
+        retry_timeout_seconds=int(section.get("retry_timeout_seconds", 120)),
+        checkpoint_enabled=bool(section.get("checkpoint_enabled", True)),
     )
 
 
@@ -1006,5 +1024,6 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
         graph_memory=_parse_graph_memory(raw),
         mcp_servers=mcp_servers,
         providers=providers,
+        llm_error_handling=_parse_llm_error_handling(raw),
         _raw=raw,
     )
