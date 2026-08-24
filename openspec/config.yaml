@@ -4,13 +4,21 @@ schema: intent-driven
 #     Tech stack: TypeScript, React, Node.js
 #     We use conventional commits
 #     Domain: e-commerce platform
+#
+#     Use senior-dev sub-agent for all src related work and senior-qa for acceptance tests.
+#     Do not optimize the batch the tasks for senior-dev and senior-qa, call them as many times as necessary in smaller batches as dev and qa work may be interleaved.
 
 rules:
   proposal:
     - Must use grill-me skill
+    # - Must use adversaril-authoring skill
+    # - Must use glossary skill
   design:
     - Must use c4-diagrams skill
+    # - Must use glossary skill
   adr:
     - Must use architectural-decision-records skill
-  spec:
-    - Must use gherkin-authoring skill 
+  specs:
+    # - Must use spec-as-source skill
+  tasks:
+    # - Must use spec-as-source skill

@@ -37,6 +37,7 @@ _FROZEN_TOOLS = frozenset({
     "shell_env_unset",
     "shell_env_list",
     "shell_env_get",
+    "context_profile",
 })
 
 _CONFIRMATION_TOOLS = frozenset({
@@ -56,15 +57,15 @@ def _executor() -> BuiltinExecutor:
     return BuiltinExecutor()
 
 
-def test_builtin_set_is_frozen_twenty_one():
-    assert len(_FROZEN_TOOLS) == 21
+def test_builtin_set_is_frozen_twenty_two():
+    assert len(_FROZEN_TOOLS) == 22
     assert set(BUILTIN_TOOLS) == set(_FROZEN_TOOLS)
 
 
 def test_exec_table_covers_every_non_vision_tool():
     ex = _executor()
     assert set(ex._exec_table) == set(_FROZEN_TOOLS) - {"vision_query"}
-    assert len(ex._exec_table) == 20
+    assert len(ex._exec_table) == 21
 
 
 def test_run_table_contains_only_confirmation_capable_tools():

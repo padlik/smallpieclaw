@@ -43,6 +43,7 @@ from builtin_tools.context_io import (
     _save_context,  # noqa: F401  re-exported for tests
     _validate_context_key,  # noqa: F401  re-exported for tests
 )
+from builtin_tools.context_profile import exec_context_profile
 from builtin_tools.descriptors import BUILTIN_TOOLS, BuiltinTool
 from builtin_tools.files import FileTools
 from builtin_tools.logquery_helpers import (
@@ -67,6 +68,7 @@ from builtin_tools.text_utils import (
 )
 
 if TYPE_CHECKING:
+    from context_monitor import ContextMonitor
     from prompt_registry import PromptRegistry
 
 from sub_agent_supervisor import (
@@ -139,7 +141,8 @@ class BuiltinExecutor:
                     state_home: str = "",
                     workspace_dir: str = "",
                     vault_secrets: Optional[list[str]] = None,
-                    shell_nsjail_dump_config_on_error: bool = False):
+                     shell_nsjail_dump_config_on_error: bool = False,
+                     context_monitor: Optional["ContextMonitor"] = None):
         self.default_timeout = default_timeout
         self.max_output = max_output
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
@@ -243,6 +246,8 @@ class BuiltinExecutor:
         # Per-confirmation tracker capture: token -> GrantTracker (so the Telegram
         # callback thread can write to the run-scoped tracker, not the default).
         self._zone_trackers: dict[str, "GrantTracker"] = {}
+        # Shared context-window profiler; read by the context_profile built-in tool.
+        self._context_monitor: Optional["ContextMonitor"] = context_monitor
         # Name-keyed dispatch registries (replace the former if/elif chains).
         # Each value is a per-tool adapter that forwards exactly the kwargs that
         # tool accepts today (Decision 3); vision_query has no entry — it is
@@ -295,6 +300,7 @@ class BuiltinExecutor:
             "shell_env_unset": lambda a, ctx: self._shell_env_tools.shell_env_unset(a),
             "shell_env_list": lambda a, ctx: self._shell_env_tools.shell_env_list(a),
             "shell_env_get": lambda a, ctx: self._shell_env_tools.shell_env_get(a),
+            "context_profile": lambda a, ctx: exec_context_profile(self._context_monitor),
         }
 
     def _build_run_table(self) -> dict[str, Callable[[dict, _CallContext], dict]]:

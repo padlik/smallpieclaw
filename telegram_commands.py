@@ -78,6 +78,17 @@ def _fmt_stat(val: object, suffix: str = "") -> str:
     )
 
 
+def _fmt_signed_stat(val: object, suffix: str = "") -> str:
+    """Format a signed int stat, preserving negative values as actual numbers.
+
+    Use this for values such as ``headroom_real`` where a negative number is
+    meaningful and should be displayed (e.g. ``-5,120`` tokens).
+    """
+    if isinstance(val, int):
+        return f"{val:,}{suffix}"
+    return f"{html.escape(str(val) if val is not None else 'N/A')}{suffix}"
+
+
 @_require_auth
 async def cmd_start(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
@@ -100,8 +111,9 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  <code>show system health</code>\n"
         "  <code>how much RAM is free?</code>\n\n"
         "<b>Commands:</b>\n"
-        "  /status  — agent status, uptime, token usage\n"
-        "  /tools   — list available tools\n"
+        "  /status   — agent status, uptime, token usage\n"
+        "  /context  — show context window consumption profile\n"
+        "  /tools    — list available tools\n"
         "  /models  — list and switch LLM models\n"
         "  /mode    — set creativity mode (default / planner / explorer / resilient)\n"
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
@@ -244,6 +256,97 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         f"{scheduler_line}"
         f"{graph_memory_line}"
         f"{token_line}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+_DANGER_EMOJI = {
+    "safe": "🟢",
+    "approaching": "🟡",
+    "danger": "🔴",
+}
+
+
+def _bar_chart(percentage: float, width: int = 10) -> str:
+    """Return a Unicode block bar chart string for a 0-100 percentage."""
+    if percentage < 0:
+        percentage = 0
+    elif percentage > 100:
+        percentage = 100
+    filled = int(round(percentage / (100 / width)))
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _fmt_context_row(label: str, tokens: int, window: int) -> str:
+    """Format a context-window category row with aligned bar chart."""
+    if window > 0:
+        percentage = tokens / window * 100
+    else:
+        percentage = 0.0
+    bar = _bar_chart(percentage)
+    # Right-align numbers for a fixed-width look inside <pre>
+    return (
+        f"{label:<18} {_fmt_stat(tokens):>12} ({percentage:>4.1f}%) {bar}"
+    )
+
+
+@_require_auth
+async def cmd_context(
+    iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show context window consumption profile."""
+    monitor = getattr(iface.agent, "context_monitor", None) if iface.agent else None
+    snapshot = monitor.read() if monitor is not None else None
+
+    if snapshot is None:
+        await update.effective_message.reply_text(
+            "<b>Context Profile</b>\n"
+            "No context snapshot available yet. The agent hasn't run.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if iface.llm_client:
+        active = iface.llm_client.llm_cfg
+        model_name = f"{active.get('name', '')} / {active.get('model', 'N/A')}".lstrip("/ ")
+    else:
+        model_name = "N/A"
+
+    live_indicator = (
+        f"🔴 LIVE (turn {snapshot.turn})"
+        if snapshot.is_live
+        else f"⚪ idle (last run turn {snapshot.turn})"
+    )
+
+    rows = [
+        _fmt_context_row("System prompt", snapshot.system_prompt_tokens, snapshot.effective_window),
+        _fmt_context_row("Chat history", snapshot.chat_history_tokens, snapshot.effective_window),
+        _fmt_context_row("Tool defs", snapshot.tool_defs_tokens, snapshot.effective_window),
+        _fmt_context_row(
+            "Completion reserve", snapshot.completion_reserve, snapshot.effective_window
+        ),
+    ]
+    chart = "\n".join(rows)
+
+    danger_emoji = _DANGER_EMOJI.get(snapshot.danger_level, "⚪")
+
+    server_lines = []
+    for server, tokens in sorted(snapshot.tool_defs_by_server.items()):
+        server_lines.append(f"  {html.escape(server)}: {_fmt_stat(tokens)}")
+    servers_block = "\n".join(server_lines) if server_lines else "  <i>No tool servers</i>"
+
+    message = (
+        f"<b>Context Profile</b> — model: {html.escape(model_name)}\n"
+        f"Window: {_fmt_stat(snapshot.effective_window)} tokens | {live_indicator}\n\n"
+        f"<pre>{chart}</pre>\n\n"
+        f"Danger: {danger_emoji} {html.escape(snapshot.danger_level)} | "
+        f"Headroom: {_fmt_signed_stat(snapshot.headroom_real)} tokens\n\n"
+        f"<b>Tool defs by server:</b>\n{servers_block}"
+    )
+
+    await update.effective_message.reply_text(
+        message,
         parse_mode=ParseMode.HTML,
     )
 

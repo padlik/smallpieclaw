@@ -167,6 +167,7 @@ systemctl --user enable --now telegram-agent
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
 | `/status` | Uptime, model, tools, scheduler state, graph memory health, per-model token usage |
+| `/context` | Context window consumption profile — tokens by category, danger level, per-MCP-server tool-def breakdown |
 | `/tools` | List all built-in and MCP tools |
 | `/skills` | List available agent skills |
 | `/models` | List LLM models and switch active one (👁 = vision-capable) |
@@ -231,6 +232,7 @@ The `shell` tool has three backends, selected by `shell_backend` in `[agent]`:
 | `memory_write` | Read/write persistent key-value memory (`data/memory.json`) | No |
 | `memory_graph_search` | Search graph memory (requires graph memory enabled) | No |
 | `memory_graph_store` | Store a fact/episode in graph memory | No |
+| `context_profile` | Return a JSON snapshot of context-window consumption by category | No |
 
 ### File access zones
 
@@ -660,6 +662,7 @@ exceptions.py            # Exception hierarchy (AgentError → LLMError, ToolErr
 prompt_builder.py        # System prompt assembly; re-exports estimate_tokens
 token_estimator.py       # Two-layer token counting (tiktoken + heuristic fallback)
 context_manager.py       # Auto-compaction at 85% of ctx_max_tokens
+context_monitor.py       # Context-window consumption monitor (push snapshot per turn)
 skills/                  # Agent Skills — skills/<name>/SKILL.md
 data/                    # Runtime state: tool_index, memory, scheduler state, graph DB
 tests/                   # Test suite (pytest); execution harness in tests/execution_harness.py

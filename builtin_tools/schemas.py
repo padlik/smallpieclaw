@@ -465,6 +465,14 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["key"],
         },
     },
+    "context_profile": {
+        "description": "Return a JSON snapshot of the current context-window consumption by category (system prompt, chat history, tool definitions, completion reserve), with per-MCP-server tool-def grouping, danger level, and headroom.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
 }
 
 

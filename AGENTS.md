@@ -1,5 +1,21 @@
 # AGENTS.md — OpenCode Instructions for smallpieclaw
 
+### CRITICAL: Skill loading
+
+**Before invoking ANY OpenSpec stage or /opsx command, you MUST load TWO skills:**
+
+1. Load `openspec-workflow` — the standard workflow framework
+2. Load the stage-specific skill (e.g. `openspec-apply-change`, `openspec-propose`, etc.)
+
+**Concrete triggers — load both skills when you see:**
+- User says `/opsx-apply`, `/opsx-propose`, `/opsx-verify`, `/opsx-archive`, `/opsx-explore`, `/opsx-sync`
+- User says "implement tasks from an OpenSpec change", "apply this change", "propose a change", etc.
+- You are about to run `openspec instructions apply`, `openspec status`, `openspec list`, etc.
+- You are reading files under `openspec/changes/<name>/`
+
+Failure to load `openspec-workflow` will result in missing critical workflow context.
+
+
 ## Overall
 Prioritize retrieval-led reasoning over pretrained-knowledge-led reasoning.
 
@@ -80,6 +96,7 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `prompt_builder.py` | System prompt assembly; re-exports `estimate_tokens` from `token_estimator.py` for backward compat |
 | `token_estimator.py` | Two-layer token counting: tiktoken (OpenAI models) + conservative heuristic fallback |
 | `context_manager.py` | Auto-compaction at 85% of effective context window (per-model `context_window` or `agent.ctx_max_tokens`), reserving completion tokens with a 256-token floor; content-aware trimming |
+| `context_monitor.py` | Context-window consumption monitor; `ContextSnapshot` (immutable) + `ContextMonitor` (push snapshot per turn, reference swap); `compute_danger_level`, `compute_headroom_real`, `group_tool_defs_by_server` |
 | `confirmation.py` | Thread-safe confirmations via `threading.Event` (agent thread blocks, Telegram callback signals) |
 | `trace_context.py` | `r-<8 hex>` trace IDs for log correlation across agents/sub-agents/scheduler |
 | `sub_agent_registry.py` | Tracks all active `SubAgentRunner` instances for `/agents` command |
