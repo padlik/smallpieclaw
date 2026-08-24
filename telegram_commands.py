@@ -10,11 +10,21 @@ import os
 import re as _re
 import secrets
 import time
+from dataclasses import replace as dataclass_replace
 from datetime import datetime as _dt
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from prompt_registry import PromptRecord, SearchPage
 
+from builtin_tools.schemas import (
+    build_tool_definitions,
+    builtin_tool_names,
+)
+from context_monitor import (
+    compute_danger_level,
+    compute_headroom_real,
+    group_tool_defs_by_server,
+)
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
@@ -1120,6 +1130,63 @@ async def _mcp_auth_revoke(
         f"Run <code>/mcp auth {html.escape(name)}</code> to re-authenticate.",
         parse_mode=ParseMode.HTML,
     )
+    # Note: Unlike _mcp_off, we don't call tool_registry.unregister_mcp_server
+    # here — revoke_server() clears the tools internally (deletes
+    # _tool_to_server entries and calls wrapper.clear_tools()). The refresh
+    # picks up the cleared state via build_tool_definitions(mcp_manager).
+    _refresh_tool_defs_snapshot(iface)
+
+
+def _refresh_tool_defs_snapshot(iface: "TelegramInterface") -> None:
+    """Refresh the context monitor snapshot after the tool set changes.
+
+    Recomputes the tool-definitions-by-server breakdown, token total, danger
+    level, and real headroom from the most recent snapshot. The updated
+    snapshot is published as non-live so ``/context`` reflects the latest
+    available tool configuration immediately after a tool-changing command.
+    """
+    if iface.agent is None or iface.agent.context_monitor is None:
+        return
+    if iface.tool_registry is None or iface.mcp_manager is None:
+        return
+
+    last = iface.agent.context_monitor.read()
+    if last is None:
+        return
+
+    # Thread-safety: This read-modify-write sequence runs on the Telegram event
+    # loop thread and is not atomic with respect to the agent thread's
+    # _publish_context_snapshot. A concurrent live publish could be briefly
+    # clobbered by this is_live=False snapshot. This is benign and self-healing
+    # — the ReAct loop republishes a live snapshot every step.
+    builtin_names = builtin_tool_names()
+    fresh = group_tool_defs_by_server(
+        build_tool_definitions(iface.mcp_manager),
+        iface.tool_registry,
+        iface.mcp_manager,
+        builtin_names,
+    )
+    # NOTE: The refresh uses the full tool set from build_tool_definitions, not
+    # a per-run filtered subset like ctx._tool_defs in the ReAct loop. The
+    # is_live=False marker flags this snapshot as approximate.
+    fresh_tokens = sum(fresh.values())
+    total = last.system_prompt_tokens + last.chat_history_tokens + fresh_tokens
+    danger = compute_danger_level(total, last.compaction_threshold)
+    headroom = compute_headroom_real(
+        last.compaction_threshold,
+        last.system_prompt_tokens,
+        last.chat_history_tokens,
+        fresh_tokens,
+    )
+    updated = dataclass_replace(
+        last,
+        tool_defs_by_server=fresh,
+        tool_defs_tokens=fresh_tokens,
+        danger_level=danger,
+        headroom_real=headroom,
+        is_live=False,
+    )
+    iface.agent.context_monitor.publish(updated)
 
 
 async def _mcp_on(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1145,6 +1212,7 @@ async def _mcp_on(iface: "TelegramInterface", update: Update, ctx: ContextTypes.
     await update.effective_message.reply_text(
         f"✅ MCP server <code>{html.escape(name)}</code> enabled.",
         parse_mode=ParseMode.HTML)
+    _refresh_tool_defs_snapshot(iface)
 
 
 async def _mcp_off(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1167,6 +1235,7 @@ async def _mcp_off(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     await update.effective_message.reply_text(
         f"⏹ MCP server <code>{html.escape(name)}</code> disabled.",
         parse_mode=ParseMode.HTML)
+    _refresh_tool_defs_snapshot(iface)
 
 
 async def _mcp_info(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1303,11 +1372,17 @@ async def _mcp_auth(iface: "TelegramInterface", update: Update, ctx: ContextType
         None, iface.mcp_manager.start_oauth_flow, name, update.effective_chat.id
     )
     if result.get("success"):
+        # Register newly discovered tools in the ToolRegistry (mirrors /mcp on).
+        if iface.tool_registry and iface.mcp_manager:
+            info = iface.mcp_manager.get_server_info(name)
+            if info:
+                iface.tool_registry.register_mcp_tools(name, info["tools"])
         await update.effective_message.reply_text(
             f"✅ OAuth flow completed for <code>{html.escape(name)}</code>. "
             f"Server is now active.",
             parse_mode=ParseMode.HTML,
         )
+        _refresh_tool_defs_snapshot(iface)
     else:
         error = result.get("error", "OAuth flow failed")
         await update.effective_message.reply_text(

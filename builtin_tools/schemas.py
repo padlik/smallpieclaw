@@ -582,3 +582,8 @@ def build_tool_definitions(
             })
 
     return tools
+
+
+def builtin_tool_names() -> set[str]:
+    """Return the set of all built-in and pseudo-tool schema names."""
+    return set(BUILTIN_TOOL_SCHEMAS.keys()) | set(PSEUDO_TOOL_SCHEMAS.keys())

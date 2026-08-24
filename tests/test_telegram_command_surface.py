@@ -425,6 +425,55 @@ class TestMcpAuthCommands:
         iface.mcp_manager.cancel_oauth_flow.assert_called_once()
         assert any("No OAuth flow in progress" in t for t in sent_texts)
 
+    def test_mcp_auth_success_registers_tools(self):
+        """After a successful OAuth flow, discovered tools are registered."""
+        from telegram_commands import cmd_mcp
+
+        iface = _make_iface()
+        iface.mcp_manager = MagicMock()
+        iface.mcp_manager.server_has_oauth = MagicMock(return_value=True)
+        iface.mcp_manager.get_oauth_timeout = MagicMock(return_value=300)
+        iface.mcp_manager.start_oauth_flow = MagicMock(
+            return_value={"success": True}
+        )
+        discovered_tools = [MagicMock(name="tool1")]
+        iface.mcp_manager.get_server_info = MagicMock(
+            return_value={"tools": discovered_tools}
+        )
+        iface.tool_registry = MagicMock()
+        iface.agent = MagicMock()
+        iface.agent.context_monitor = MagicMock()
+        iface.agent.context_monitor.read = MagicMock(return_value=None)
+
+        sent_texts: list[str] = []
+
+        async def _run():
+            mock_message = MagicMock()
+            mock_message.reply_text = AsyncMock(
+                side_effect=lambda text, **kw: sent_texts.append(text)
+            )
+
+            mock_user = MagicMock()
+            mock_user.id = 42
+
+            mock_update = MagicMock()
+            mock_update.effective_user = mock_user
+            mock_update.effective_message = mock_message
+            mock_update.effective_chat = MagicMock()
+            mock_update.effective_chat.id = 123
+
+            mock_ctx = MagicMock()
+            mock_ctx.args = ["auth", "gmail"]
+
+            await cmd_mcp(iface, mock_update, mock_ctx)
+
+        asyncio.run(_run())
+        iface.mcp_manager.get_server_info.assert_called_once_with("gmail")
+        iface.tool_registry.register_mcp_tools.assert_called_once_with(
+            "gmail", discovered_tools
+        )
+        assert any("OAuth flow completed" in t and "gmail" in t for t in sent_texts), sent_texts
+
 
 # ---------------------------------------------------------------------------
 # Tests: Handler registration

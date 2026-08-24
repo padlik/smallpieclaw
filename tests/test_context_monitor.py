@@ -286,3 +286,59 @@ def test_group_tool_defs_none_or_empty_returns_seeded_zeros() -> None:
     expected = {"builtin": 0, "srv1": 0, "srv2": 0}
     assert group_tool_defs_by_server(None, None, manager) == expected
     assert group_tool_defs_by_server([], None, manager) == expected
+
+
+def test_group_tool_defs_builtin_name_not_in_registry_classified_builtin() -> None:
+    """A builtin name in *builtin_names* but absent from the registry is builtin."""
+    shell_def = make_tool_def("shell")
+    registry = FakeToolRegistry([FakeTool("weather", is_mcp=True, server_name="mcp-weather")])
+    manager = FakeMcpManager()
+
+    result = group_tool_defs_by_server(
+        [shell_def],
+        registry,
+        manager,
+        builtin_names={"shell"},
+    )
+
+    assert "builtin" in result
+    assert "unknown" not in result or result["unknown"] == 0
+    assert result["builtin"] == estimate_tokens(
+        __import__("json").dumps([shell_def])
+    )
+
+
+def test_group_tool_defs_builtin_name_no_registry_classified_builtin() -> None:
+    """A builtin name in *builtin_names* with no registry at all is builtin."""
+    shell_def = make_tool_def("shell")
+    manager = FakeMcpManager()
+
+    result = group_tool_defs_by_server(
+        [shell_def],
+        None,
+        manager,
+        builtin_names={"shell"},
+    )
+
+    assert result == {
+        "builtin": estimate_tokens(__import__("json").dumps([shell_def])),
+    }
+
+
+def test_group_tool_defs_unknown_name_not_in_builtin_names() -> None:
+    """A tool not in the registry and not in *builtin_names* stays unknown."""
+    orphan_def = make_tool_def("orphan")
+    registry = FakeToolRegistry([FakeTool("shell", is_mcp=False)])
+    manager = FakeMcpManager()
+
+    result = group_tool_defs_by_server(
+        [orphan_def],
+        registry,
+        manager,
+        builtin_names={"shell"},
+    )
+
+    assert result == {
+        "builtin": 0,
+        "unknown": estimate_tokens(__import__("json").dumps([orphan_def])),
+    }
