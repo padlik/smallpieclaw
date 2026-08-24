@@ -124,6 +124,7 @@ def group_tool_defs_by_server(
     tool_defs: list[dict] | None,
     tool_registry: Any | None,
     mcp_manager: Any | None,
+    builtin_names: set[str] | None = None,
 ) -> dict[str, int]:
     """Group OpenAI-format tool definitions by owning server and estimate tokens.
 
@@ -133,6 +134,11 @@ def group_tool_defs_by_server(
     whether it is builtin or MCP and which server owns it. Definitions not
     present in the registry are grouped under ``"unknown"``.
 
+    When *builtin_names* is provided, a tool whose name is not found in the
+    registry but is present in *builtin_names* is classified as ``"builtin"``
+    rather than ``"unknown"``. This supports classifying built-in tools that
+    are intentionally not registered in the MCP-only ``ToolRegistry``.
+
     Token counts per group are estimated from the JSON-serialised definitions
     via :func:`token_estimator.estimate_tokens`.
 
@@ -140,9 +146,15 @@ def group_tool_defs_by_server(
         tool_defs: OpenAI tool-definition list, each entry shaped like
             ``{"type": "function", "function": {"name": "...", ...}}``.
         tool_registry: Registry used to look up tool ownership. When ``None``,
-            all definitions are classified as ``"unknown"``.
+            all definitions are classified as ``"unknown"`` (unless
+            *builtin_names* matches).
         mcp_manager: Manager exposing ``list_servers()``, each result a dict
             with a ``"name"`` key. When ``None``, MCP servers are not seeded.
+        builtin_names: Optional set of known built-in and pseudo-tool names.
+            When the registry returns ``None`` for a tool name, the name is
+            checked against this set; a match classifies the tool as
+            ``"builtin"``. ``None`` preserves the legacy behaviour (fall
+            through to ``"unknown"``).
 
     Returns:
         Mapping from server name (or ``"builtin"``/``"unknown"``) to estimated
@@ -187,6 +199,10 @@ def group_tool_defs_by_server(
                     group_name = tool.server_name
                 else:
                     group_name = "builtin"
+            elif builtin_names is not None and tool_name in builtin_names:
+                group_name = "builtin"
+        elif builtin_names is not None and tool_name in builtin_names:
+            group_name = "builtin"
 
         groups.setdefault(group_name, []).append(tool_def)
 

@@ -27,7 +27,10 @@ if TYPE_CHECKING:
     from builtin_tools.access_control import TrustedZoneChecker
 
 import agent_logging
-from builtin_tools.schemas import build_tool_definitions
+from builtin_tools.schemas import (
+    build_tool_definitions,
+    builtin_tool_names,
+)
 from confirmation import ConfirmationManager
 from context_manager import maybe_compact, resolve_compaction_threshold
 from context_monitor import (
@@ -900,10 +903,12 @@ def _get_tool_registry_for_grouping(ctx: ReactContext):
 
 def _tool_defs_by_server_for_context(ctx: ReactContext) -> dict[str, int]:
     """Group current tool definitions by server and return per-server token counts."""
+    builtin_names = builtin_tool_names()
     return group_tool_defs_by_server(
         ctx._tool_defs,
         _get_tool_registry_for_grouping(ctx),
         ctx.mcp_manager,
+        builtin_names,
     )
 
 
