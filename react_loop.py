@@ -18,7 +18,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
@@ -29,7 +29,14 @@ if TYPE_CHECKING:
 import agent_logging
 from builtin_tools.schemas import build_tool_definitions
 from confirmation import ConfirmationManager
-from context_manager import maybe_compact
+from context_manager import maybe_compact, resolve_compaction_threshold
+from context_monitor import (
+    ContextMonitor,
+    ContextSnapshot,
+    compute_danger_level,
+    compute_headroom_real,
+    group_tool_defs_by_server,
+)
 from interfaces import ToolCall
 from exceptions import LLMContextOverflowError
 from llm_client import LLMClient, LLMCancelledError, LLMEmptyResponseError, LLMError, LLMPermanentError, _encode_images
@@ -273,6 +280,14 @@ class ReactContext:
 
     # Native tool calling — cached tool definitions built once at loop start
     _tool_defs: Optional[list[dict]] = None
+
+    # Cached grouping of _tool_defs by server, computed once per run when first
+    # needed and reused every subsequent turn.
+    _tool_defs_by_server: dict[str, int] | None = None
+    _tool_defs_tokens: int = 0
+
+    # Shared, lock-free context-window profiler; injected from AgentController/main.py.
+    context_monitor: ContextMonitor | None = None
 
     @property
     def log_prefix(self) -> str:
@@ -875,6 +890,79 @@ def _handle_llm_error(
     return f"❌ {error_info.message}"
 
 
+def _get_tool_registry_for_grouping(ctx: ReactContext):
+    """Return the tool registry to use for server grouping, or None."""
+    try:
+        return ctx.tool_index.registry
+    except AttributeError:
+        return None
+
+
+def _tool_defs_by_server_for_context(ctx: ReactContext) -> dict[str, int]:
+    """Group current tool definitions by server and return per-server token counts."""
+    return group_tool_defs_by_server(
+        ctx._tool_defs,
+        _get_tool_registry_for_grouping(ctx),
+        ctx.mcp_manager,
+    )
+
+
+def _publish_context_snapshot(
+    ctx: ReactContext,
+    state: _LoopState,
+    system: str,
+    tool_defs_by_server: dict[str, int] | None = None,
+    tool_defs_tokens: int | None = None,
+) -> None:
+    """Build and publish a ContextSnapshot from current turn data.
+
+    *tool_defs_by_server* and *tool_defs_tokens* may be supplied when the caller
+    has already computed them (e.g. the main ReAct loop). When omitted, the
+    helper computes them fresh. Token estimation mirrors
+    :func:`context_manager.maybe_compact`: the active model name drives the
+    encoder selection and the system prompt is folded into the messages total.
+    """
+    if ctx.context_monitor is None:
+        return
+
+    from prompt_builder import estimate_tokens, estimate_messages_tokens
+
+    _model = ctx.llm.llm_cfg.get("model")
+    _total_with_system = estimate_messages_tokens(state.messages, system, model=_model)
+    system_prompt_tokens = estimate_tokens(system, model=_model)
+    chat_history_tokens = max(0, _total_with_system - system_prompt_tokens)
+    if tool_defs_by_server is None:
+        tool_defs_by_server = _tool_defs_by_server_for_context(ctx)
+    if tool_defs_tokens is None:
+        tool_defs_tokens = sum(tool_defs_by_server.values())
+    effective_window, compaction_threshold = resolve_compaction_threshold(
+        ctx.llm.llm_cfg, ctx.ctx_max_tokens,
+    )
+    completion_reserve = ctx.llm.llm_cfg.get("max_tokens", 1024)
+    headroom_nominal = compaction_threshold - system_prompt_tokens - chat_history_tokens
+    headroom_real = compute_headroom_real(
+        compaction_threshold, system_prompt_tokens, chat_history_tokens, tool_defs_tokens,
+    )
+    total = system_prompt_tokens + chat_history_tokens + tool_defs_tokens
+    danger_level = compute_danger_level(total, compaction_threshold)
+
+    snapshot = ContextSnapshot(
+        system_prompt_tokens=system_prompt_tokens,
+        chat_history_tokens=chat_history_tokens,
+        tool_defs_tokens=tool_defs_tokens,
+        tool_defs_by_server=tool_defs_by_server,
+        completion_reserve=completion_reserve,
+        effective_window=effective_window,
+        compaction_threshold=compaction_threshold,
+        headroom_nominal=headroom_nominal,
+        headroom_real=headroom_real,
+        danger_level=danger_level,
+        is_live=True,
+        turn=state.step,
+    )
+    ctx.context_monitor.publish(snapshot)
+
+
 def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
     """Assemble the full system prompt string for a run."""
     _job_history_section = ""
@@ -1301,10 +1389,24 @@ def react_loop(
                     ctx.llm.llm_cfg.get("context_window") or ctx.ctx_max_tokens
                 )
                 _completion_budget = ctx.llm.llm_cfg.get("max_tokens") or 1024
+                if ctx._tool_defs_by_server is None:
+                    try:
+                        ctx._tool_defs_by_server = _tool_defs_by_server_for_context(ctx)
+                        ctx._tool_defs_tokens = sum(ctx._tool_defs_by_server.values())
+                    except Exception:
+                        logger.warning(
+                            "tool-def grouping failed; compaction falls back to tool_defs_tokens=0",
+                            exc_info=True,
+                        )
+                        ctx._tool_defs_by_server = {}
+                        ctx._tool_defs_tokens = 0
+                _tool_defs_by_server = ctx._tool_defs_by_server
+                _tool_defs_tokens = ctx._tool_defs_tokens
                 state.messages, state.goal_idx = maybe_compact(
                     state.messages, system, _effective_ctx, ctx.llm,
                     goal_idx=state.goal_idx,
                     model_max_tokens=_completion_budget,
+                    tool_defs_tokens=_tool_defs_tokens,
                 )
 
                 turn = _request_turn(
@@ -1331,6 +1433,14 @@ def react_loop(
                 if final is not None:
                     if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
                         ctx.checkpoint_store.delete(ctx.trace_id)
+                    try:
+                        _publish_context_snapshot(
+                            ctx, state, system,
+                            tool_defs_by_server=_tool_defs_by_server,
+                            tool_defs_tokens=_tool_defs_tokens,
+                        )
+                    except Exception:
+                        logger.warning("context snapshot publication failed", exc_info=True)
                     return final
                 if state.operator_cancelled:
                     break
@@ -1338,6 +1448,14 @@ def react_loop(
                     agent_logging.LogEvent.STEP_END, "step end",
                     level=logging.INFO, logger=slog, step=state.step,
                 )
+                try:
+                    _publish_context_snapshot(
+                        ctx, state, system,
+                        tool_defs_by_server=_tool_defs_by_server,
+                        tool_defs_tokens=_tool_defs_tokens,
+                    )
+                except Exception:
+                    logger.warning("context snapshot publication failed", exc_info=True)
 
             if state.operator_cancelled:
                 ctx.memory.record_event("Task cancelled by operator")
@@ -1359,6 +1477,13 @@ def react_loop(
         ctx.memory.record_event("Agent hit max iterations")
         return "⚠️ Agent reached maximum steps. Operation cancelled."
     finally:
+        if ctx.context_monitor is not None:
+            try:
+                last = ctx.context_monitor.read()
+                if last is not None:
+                    ctx.context_monitor.publish(dataclass_replace(last, is_live=False))
+            except Exception:
+                logger.warning("context snapshot publication failed", exc_info=True)
         agent_logging.log_event(
             agent_logging.LogEvent.RUN_END,
             "run end",

@@ -8,7 +8,7 @@ Define how the agent compaction and routing layers use per-model context-window 
 
 ### Requirement: Per-model context window awareness
 
-The compaction system SHALL derive the effective context-window limit from the active model's configured `context_window` field, falling back to `agent.ctx_max_tokens` when unset, and SHALL reserve completion tokens before applying the compaction margin.
+The compaction system SHALL derive the effective context-window limit from the active model's configured `context_window` field, falling back to `agent.ctx_max_tokens` when unset, and SHALL reserve completion tokens before applying the compaction margin. The compaction threshold SHALL account for tool-definition token cost in addition to system prompt and chat history, so the 85% margin is computed against the real payload size sent to the LLM.
 
 #### Scenario: Model with context_window set uses per-model limit
 - **GIVEN** the active model's `ModelConfig.context_window` is set to a non-null value
@@ -33,6 +33,20 @@ The compaction system SHALL derive the effective context-window limit from the a
 - **WHEN** `maybe_compact()` is called on each turn
 - **THEN** the effective limit SHALL be read from the active model config via `ctx.llm.llm_cfg`
 - **AND** no mid-run model transition SHALL occur (single-model client)
+
+#### Scenario: Tool-definition tokens included in compaction total
+- **GIVEN** the ReAct loop has built tool definitions via `build_tool_definitions()`
+- **AND** the tool definitions consume 18,000 tokens
+- **WHEN** `maybe_compact()` is called
+- **THEN** the total used for threshold comparison SHALL include the tool-definition token cost
+- **AND** the total SHALL be `estimate_messages_tokens(messages, system) + tool_defs_tokens`
+- **AND** if the total exceeds the threshold, compaction SHALL trigger
+
+#### Scenario: Tool-definition tokens default to zero for backward compatibility
+- **GIVEN** a caller invokes `maybe_compact()` without passing `tool_defs_tokens`
+- **WHEN** the compaction total is computed
+- **THEN** the tool-definition token cost SHALL be 0
+- **AND** the behavior SHALL be identical to the pre-change compaction logic
 
 ### Requirement: Vision routing via all-models scan
 

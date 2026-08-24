@@ -23,6 +23,7 @@ from typing import Callable, Optional
 from agent_logging import bind_run_context
 from agent_runtime import AgentRuntime, ControllerDeps
 from confirmation import ConfirmationManager
+from context_monitor import ContextMonitor
 from conversation_io import _load_or_create_conversation_id, _save_conversation
 from llm_client import LLMClient
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
@@ -125,6 +126,7 @@ class AgentController:
         plan_max_iterations: int = 50,
         inactivity_warn_minutes: int = 15,
         checkpoint_store=None,  # Optional[CheckpointStore]
+        context_monitor: ContextMonitor | None = None,
     ):
         self.llm = llm
         self.tool_index = tool_index
@@ -190,6 +192,10 @@ class AgentController:
         self.checkpoint_store = checkpoint_store
         self._checkpoint_enabled = True
         self._retry_timeout_seconds = 120
+        # Shared instance: the same ContextMonitor must be passed to both
+        # AgentController and BuiltinExecutor so that the context_profile tool
+        # reads the same monitor the ReAct loop publishes to. See ADR-0022.
+        self.context_monitor = context_monitor or ContextMonitor()
 
     @property
     def runtime_deps(self) -> ControllerDeps:
@@ -247,6 +253,7 @@ class AgentController:
             checkpoint_store=self.checkpoint_store,
             checkpoint_enabled=self._checkpoint_enabled,
             retry_timeout_seconds=self._retry_timeout_seconds,
+            context_monitor=self.context_monitor,
         )
 
     # ------------------------------------------------------------------

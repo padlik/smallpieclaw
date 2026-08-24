@@ -48,7 +48,7 @@ from telegram_commands import (
     cmd_verbose, cmd_jobs, cmd_agents, cmd_prompts, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
-    cmd_dir, cmd_resume,
+    cmd_dir, cmd_resume, cmd_context,
 )
 from telegram_callbacks import (
     cb_confirm, cb_extend, cb_model_switch, cb_mode_switch,
@@ -601,6 +601,7 @@ class TelegramInterface:
             BotCommand("myid", "Show your Telegram user ID"),
             BotCommand("mcp", "List and manage MCP servers"),
             BotCommand("show_ctx", "Show current system prompt snapshot"),
+            BotCommand("context", "Show context window consumption profile"),
             BotCommand("show_env", "Show runtime environment info"),
             BotCommand("stop", "Cancel the currently running task"),
             BotCommand("resume", "Resume an interrupted run from a saved checkpoint"),
@@ -639,6 +640,7 @@ class TelegramInterface:
         # Hidden diagnostic commands (not registered with BotFather)
         app.add_handler(CommandHandler("show_ctx", partial(cmd_show_ctx, self)))
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
+        app.add_handler(CommandHandler("context", partial(cmd_context, self)))
         app.add_handler(CommandHandler("memory", partial(cmd_memory, self)))
         app.add_handler(CommandHandler("dir", partial(cmd_dir, self)))
         app.add_handler(CommandHandler("resume", partial(cmd_resume, self)))

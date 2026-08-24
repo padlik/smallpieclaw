@@ -104,6 +104,7 @@ from agent_controller import AgentController  # noqa: E402
 from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile  # noqa: E402
 from builtin_executor import BuiltinExecutor  # noqa: E402
 from config_schema import resolve_model_id, parse_vault_content  # noqa: E402
+from context_monitor import ContextMonitor  # noqa: E402
 from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
@@ -426,6 +427,12 @@ def _run(
     data_dir = str(paths.data_home)
     skills_dir_abs = str(paths.skills_dir)
 
+    # Single shared ContextMonitor instance — injected into both BuiltinExecutor
+    # (for the context_profile tool) and AgentController (for the ReAct loop
+    # publish path and /context command). Both must reference the same instance.
+    # See ADR-0022.
+    context_monitor = ContextMonitor()
+
     llm      = LLMClient(cfg, usage_registry=get_token_registry(), caller_tag="main")
     memory   = MemoryStore(str(paths.memory_file))
     # Purge any model/LLM facts the agent may have written in past sessions.
@@ -456,6 +463,7 @@ def _run(
         state_home=nsjail_state_dir,
         workspace_dir=workspace_dir,
         vault_secrets=vault_secrets,
+        context_monitor=context_monitor,
     )
     builtin.conversation_id = conversation_id
     index    = ToolIndex(registry=registry, llm=llm, index_path=str(paths.tool_index_file), builtin_executor=builtin)
@@ -538,6 +546,7 @@ def _run(
         creativity_mode=creativity_mode,
         plan_max_iterations=plan_max_iterations,
         inactivity_warn_minutes=inactivity_warn_minutes,
+        context_monitor=context_monitor,
     )
 
     # Checkpoint store for LLM error recovery.

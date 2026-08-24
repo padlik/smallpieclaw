@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 from prompt_builder import estimate_messages_tokens
 
 if TYPE_CHECKING:
-    from llm_client import LLMClient
+    from llm_client import LLMClient  # noqa
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,32 @@ def _active_model(llm: "LLMClient") -> str | None:
         return llm.llm_cfg.get("model")
     except Exception:  # noqa: BLE001
         return None
+
+
+def resolve_compaction_threshold(llm_cfg: dict, ctx_max_tokens: int) -> tuple[int, int]:
+    """Compute the effective context window and compaction threshold.
+
+    Args:
+        llm_cfg: Active model configuration dict. May contain ``context_window``
+            and ``max_tokens`` keys.
+        ctx_max_tokens: Agent-level context-window limit, used as a fallback when
+            the model does not specify its own ``context_window``.
+
+    Returns:
+        A ``(effective_window, compaction_threshold)`` tuple. The threshold
+        reserves the model's completion-token budget, applies an 85% margin,
+        and clamps to a 256-token floor:
+
+        ``threshold = max(int((effective_window - max_tokens) * 0.85), 256)``.
+    """
+    cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
+    effective = ctx_max_tokens
+    if cfg.get("context_window"):
+        effective = cfg["context_window"]
+    raw_max_tokens = cfg.get("max_tokens")
+    max_tokens = 1024 if raw_max_tokens is None else raw_max_tokens
+    threshold = max(int((effective - max_tokens) * 0.85), 256)
+    return effective, threshold
 
 
 def _build_compacted(
@@ -157,22 +183,23 @@ def maybe_compact(
     llm: "LLMClient",
     *,
     goal_idx: int = 0,
-    model_max_tokens: int = 1024,
+    model_max_tokens: int = 1024,  # noqa: F841
+    tool_defs_tokens: int = 0,
 ) -> tuple[list[dict], int]:
     """Return a (possibly compacted) copy of *messages* and the goal's new index.
 
-    If the estimated token count of *messages* plus *system* exceeds 85 % of
-    the effective context window (after reserving completion tokens), the
-    middle portion of the conversation is summarised and replaced with a single
-    compaction summary message.
+    If the estimated token count of *messages* plus *system* plus
+    ``tool_defs_tokens`` exceeds 85 % of the effective context window (after
+    reserving completion tokens), the middle portion of the conversation is
+    summarised and replaced with a single compaction summary message.
 
-    The compaction threshold reserves completion tokens first, then applies the
-    85% margin, finally clamping to a 256-token floor:
-    ``threshold = max(int((ctx_max_tokens - model_max_tokens) * 0.85), 256)``.
-    This prevents the context from growing into the token budget the model needs
-    for its response. ``ctx_max_tokens`` is the effective context-window limit
-    (per-model ``context_window`` or ``agent.ctx_max_tokens``); ``model_max_tokens``
-    is the active model's completion budget (default 1024).
+    The compaction threshold is computed by :func:`resolve_compaction_threshold`
+    from the active model's ``llm_cfg``; it reserves completion tokens first,
+    then applies the 85% margin, finally clamping to a 256-token floor:
+    ``threshold = max(int((effective - max_tokens) * 0.85), 256)``. This
+    prevents the context from growing into the token budget the model needs
+    for its response. ``ctx_max_tokens`` is the agent-level context-window
+    limit, and the effective limit is the per-model ``context_window`` when set.
 
     The 256-token floor is a last-resort guard for the unvalidated raw-dict path
     where ``max_tokens >= ctx_max_tokens``; validated configs always produce a
@@ -205,18 +232,22 @@ def maybe_compact(
             the ``first`` slot rather than being swept into the summarised
             middle.  Defaults to ``0`` for backward-compatibility when no
             history precedes the goal.
-        model_max_tokens: Completion token budget for the active model. The
-            threshold reserves this before applying the 85% margin, then is
-            clamped to a 256-token floor as a last-resort guard for the
-            unvalidated raw-dict path. Defaults to 1024.
+        model_max_tokens: Completion token budget for the active model.
+            # Deprecated: threshold is now sourced from llm_cfg via
+            # resolve_compaction_threshold. Retained for backward compat; remove
+            # once no caller passes it. Defaults to 1024.
+        tool_defs_tokens: Extra token count to include in the total, e.g. the
+            space consumed by tool definitions that are sent with every model
+            call. This makes compaction aware of otherwise-invisible tool-def
+            overhead. Defaults to 0.
 
     Returns:
         A ``(compacted_messages, new_goal_idx)`` tuple where ``new_goal_idx`` is
         the index of the goal message within ``compacted_messages``. All call
         sites must unpack this tuple.
     """
-    total = estimate_messages_tokens(messages, system, model=_active_model(llm))
-    threshold = max(int((ctx_max_tokens - model_max_tokens) * 0.85), 256)
+    total = estimate_messages_tokens(messages, system, model=_active_model(llm)) + tool_defs_tokens
+    _, threshold = resolve_compaction_threshold(llm.llm_cfg, ctx_max_tokens)
     if total <= threshold:
         # Under threshold: messages returned unchanged, so is the goal position.
         return messages, goal_idx

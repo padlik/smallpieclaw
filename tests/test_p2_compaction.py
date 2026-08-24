@@ -23,6 +23,7 @@ from context_manager import (
     _RECENT_HEAD,
     _RECENT_TAIL,
     maybe_compact,
+    resolve_compaction_threshold,
 )
 
 
@@ -551,6 +552,7 @@ class TestPerModelContextWindow:
             msgs.append(_msg("user", f"r{i}"))
         llm = MagicMock()
         llm.chat.return_value = "summary"
+        llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
 
         # With completion reservation: threshold = 6092, 6500 > 6092 → compacts
         out, _ = maybe_compact(msgs, "system", 8192, llm, model_max_tokens=1024)
@@ -558,6 +560,7 @@ class TestPerModelContextWindow:
 
         # Without completion reservation (old formula): threshold = 6963, 6500 < 6963 → no compact
         llm2 = MagicMock()
+        llm2.llm_cfg = {"context_window": 8192, "max_tokens": 0}
         out2, _ = maybe_compact(msgs, "system", 8192, llm2, model_max_tokens=0)
         # With max_tokens=0: threshold = max(6963, 256) = 6963 > 6500 → no compaction
         assert out2 is msgs
@@ -634,3 +637,131 @@ class TestPerModelContextWindow:
         out, _ = maybe_compact(msgs, "system", _effective_ctx, llm, model_max_tokens=_completion_budget)
         assert len(out) < len(msgs)
         llm.chat.assert_called()
+
+
+class TestToolDefsTokensCompaction:
+    """Tool-definition token overhead must be visible to context compaction."""
+
+    def test_tool_defs_tokens_push_under_over_threshold(self, monkeypatch):
+        """History alone is under threshold; adding tool_defs_tokens triggers compaction."""
+
+        def char_estimate(messages, system, model=None):
+            return sum(len(str(m.get("content") or "")) for m in messages) // 4
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+
+        # ~3000 tokens of history, below the 6092-token threshold for an 8192 model.
+        msgs = [_msg("user", "GOAL: use tools")]
+        for i in range(4):
+            msgs.append(_msg("assistant", f"action {i} " + ("p" * 1500)))
+            msgs.append(_msg("user", f"result {i}\n" + ("r" * 1500)))
+
+        llm = MagicMock()
+        llm.chat.return_value = "• summary"
+        llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
+
+        # Without tool_defs overhead, history stays under the 6092 threshold.
+        out_no_tools, _ = maybe_compact(msgs, "system", 8192, llm, tool_defs_tokens=0)
+        assert out_no_tools is msgs
+        llm.chat.assert_not_called()
+
+        # With tool_defs overhead, the combined total exceeds the threshold.
+        llm2 = MagicMock()
+        llm2.chat.return_value = "• summary"
+        llm2.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
+        out, _ = maybe_compact(msgs, "system", 8192, llm2, tool_defs_tokens=5000)
+
+        assert len(out) < len(msgs)
+        llm2.chat.assert_called_once()
+        assert any("Compacted context" in str(m.get("content")) for m in out)
+        assert out[0]["content"] == "GOAL: use tools"
+
+    def test_tool_defs_tokens_alone_triggers_compaction(self, monkeypatch):
+        """Even tiny messages can exceed the threshold when tool_defs_tokens is large."""
+
+        def char_estimate(messages, system, model=None):
+            return sum(len(str(m.get("content") or "")) for m in messages) // 4
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+
+        msgs = [_msg("user", "GOAL: tiny")]
+        for i in range(4):
+            msgs.append(_msg("assistant", f"a{i}"))
+            msgs.append(_msg("user", f"r{i}"))
+
+        llm = MagicMock()
+        llm.chat.return_value = "• summary"
+        llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
+
+        out, _ = maybe_compact(msgs, "system", 8192, llm, tool_defs_tokens=7000)
+
+        assert len(out) < len(msgs)
+        llm.chat.assert_called_once()
+        assert any("Compacted context" in str(m.get("content")) for m in out)
+
+
+class TestBackwardCompatibility:
+    """Maybe_compact's pre-change signature and behaviour remain intact."""
+
+    def test_call_without_tool_defs_tokens_unchanged(self, monkeypatch):
+        """Default tool_defs_tokens=0 preserves pre-change behaviour."""
+
+        def char_estimate(messages, system, model=None):
+            return sum(len(str(m.get("content") or "")) for m in messages) // 4
+
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", char_estimate)
+
+        msgs = [_msg("user", "GOAL: unchanged")]
+        for i in range(4):
+            msgs.append(_msg("assistant", f"action {i} " + ("p" * 2000)))
+            msgs.append(_msg("user", f"result {i}\n" + ("r" * 3000)))
+
+        llm = MagicMock()
+        llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
+
+        out, _ = maybe_compact(msgs, "system", 8192, llm, model_max_tokens=1024)
+
+        assert out is msgs
+        llm.chat.assert_not_called()
+
+
+class TestResolveCompactionThreshold:
+    """Unit tests for the shared threshold helper."""
+
+    def test_with_context_window(self):
+        effective, threshold = resolve_compaction_threshold(
+            {"context_window": 8192, "max_tokens": 1024}, 90_000,
+        )
+        assert effective == 8192
+        assert threshold == max(int((8192 - 1024) * 0.85), 256)
+        assert threshold == 6092
+
+    def test_without_context_window_falls_back(self):
+        effective, threshold = resolve_compaction_threshold(
+            {"max_tokens": 1024}, 90_000,
+        )
+        assert effective == 90_000
+        assert threshold == max(int((90_000 - 1024) * 0.85), 256)
+        assert threshold == 75_629
+
+    def test_without_max_tokens_uses_default(self):
+        effective, threshold = resolve_compaction_threshold(
+            {"context_window": 8192}, 90_000,
+        )
+        assert effective == 8192
+        assert threshold == max(int((8192 - 1024) * 0.85), 256)
+        assert threshold == 6092
+
+    def test_max_tokens_none_uses_default(self):
+        effective, threshold = resolve_compaction_threshold(
+            {"context_window": 8192, "max_tokens": None}, 90_000,
+        )
+        assert effective == 8192
+        assert threshold == 6092
+
+    def test_floor_for_misconfigured_budget(self):
+        effective, threshold = resolve_compaction_threshold(
+            {"context_window": 512, "max_tokens": 1024}, 512,
+        )
+        assert effective == 512
+        assert threshold == 256

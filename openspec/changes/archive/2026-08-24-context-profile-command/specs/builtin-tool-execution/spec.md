@@ -1,9 +1,4 @@
-# builtin-tool-execution Specification
-
-## Purpose
-Define the built-in tool execution framework: name-based dispatch, two-phase confirmation gating for dangerous/sensitive tools, and the enumeration contract for built-in tools (including `vision_query`, which is executed by the ReAct loop rather than executor dispatch).
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Built-in tool dispatch is total and deterministic
 

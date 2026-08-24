@@ -245,4 +245,15 @@ _test_make_http_status_error
 _test_error_then_success_llm
 _test_scripted_finish_llm
 
+# context_monitor.py — public API for context-window profiling
+from context_monitor import ContextMonitor, ContextSnapshot  # noqa: E402
+_context_monitor_type = ContextMonitor
+_context_snapshot_type = ContextSnapshot
+
+# builtin_executor.py / react_loop.py — public context_monitor attribute wired externally
+from builtin_executor import BuiltinExecutor as _BuiltinExecutorForContextMonitor  # noqa: E402, F811
+_BuiltinExecutorForContextMonitor._context_monitor  # type: ignore[attr-defined]
+
+from react_loop import ReactContext as _ReactContextForContextMonitor  # noqa: E402
+_ReactContextForContextMonitor.context_monitor
 

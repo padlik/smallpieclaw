@@ -282,4 +282,8 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
         description="Get the value of a session-scoped shell environment variable. "
         "Args: key (str, REQUIRED). Returns empty string if not set.",
     ),
+    "context_profile": BuiltinTool(
+        name="context_profile",
+        description="Return a JSON snapshot of the current context-window consumption: token counts by category (system, history, tool defs, completion), danger level, headroom, and per-MCP-server tool-def breakdown. No arguments.",
+    ),
 }

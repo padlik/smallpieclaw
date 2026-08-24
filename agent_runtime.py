@@ -32,6 +32,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Callable, Optional
 
 from confirmation import ConfirmationManager
+from context_monitor import ContextMonitor
 from react_loop import ReactContext
 from sub_agent_registry import (
     SOURCE_DIAGNOSTIC,
@@ -95,6 +96,7 @@ class ControllerDeps:
     checkpoint_store: Optional[object] = None
     checkpoint_enabled: bool = True
     retry_timeout_seconds: int = 120
+    context_monitor: ContextMonitor | None = None
 
 
 class RuntimeProfile(Enum):

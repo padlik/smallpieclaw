@@ -8,7 +8,7 @@ Define the prompt registry that assigns a globally-unique ULID string prompt ID 
 
 ### Requirement: Prompt registry assigns globally-unique prompt IDs
 
-The system SHALL assign a globally-unique, time-sortable string prompt ID (ULID format: 26-char Crockford base32, 48-bit millisecond timestamp + 80-bit random) to each user-initiated agent run, persisted to `data/prompts.jsonl` so the ID is stable across process restarts, registry resets, and day boundaries. The ID is generated inline with no external dependency.
+The system SHALL assign a globally-unique, time-sortable string prompt ID (ULID format: 26-char Crockford base32, 48-bit millisecond timestamp + 80-bit random) to each user-initiated agent run, persisted to `data/prompts.jsonl` so the ID is stable across process restarts, registry resets, and day boundaries. The ID is generated inline with no external dependency. The terminal status SHALL distinguish between successful completion (`done`), cancellation (`cancelled`), and failure (`failed`). A run whose result string starts with "❌" SHALL be classified as `failed`.
 
 Feature: Prompt tracking
 Rule: The prompt ID is the single operator-facing handle for a run — globally unique and stable forever. The trace ID remains the high-cardinality join key for logs but is an implementation detail the operator does not need to know.
@@ -44,6 +44,25 @@ Rule: The prompt ID is the single operator-facing handle for a run — globally 
 - **WHEN** the run completes, fails, or is cancelled
 - **THEN** a finalization record with `ended_at` and the terminal `status` is appended to `data/prompts.jsonl`
 - **AND** the full `sub_agent_ids` list is included in the finalization record
+
+#### Scenario: Failed run is classified as "failed" not "done"
+- **GIVEN** a run completes with a result string starting with "❌"
+- **WHEN** `_classify_final_status()` processes the result
+- **THEN** the terminal status is set to `failed`
+- **AND** the prompt registry records `status="failed"` in the finalization record
+- **AND** the Telegram status message shows "❌ Failed" instead of "✅ Done"
+
+#### Scenario: Cancelled run is classified as "cancelled"
+- **GIVEN** a run completes with result string "[Cancelled]"
+- **WHEN** `_classify_final_status()` processes the result
+- **THEN** the terminal status is set to `cancelled`
+- **AND** the prompt registry records `status="cancelled"` in the finalization record
+
+#### Scenario: Successful run is classified as "done"
+- **GIVEN** a run completes with a normal result string not starting with "❌" and not "[Cancelled]"
+- **WHEN** `_classify_final_status()` processes the result
+- **THEN** the terminal status is set to `done`
+- **AND** the prompt registry records `status="done"` in the finalization record
 
 #### Scenario: Sub-agent IDs are recorded against the originating prompt
 - **GIVEN** a prompt run is active and the main agent spawns sub-agent A

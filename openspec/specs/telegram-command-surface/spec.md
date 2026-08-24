@@ -6,7 +6,8 @@ Define the supported user-visible Telegram slash command surface and the behavio
 ## Requirements
 
 ### Requirement: Public Telegram command discovery excludes removed and hidden commands
-The system SHALL expose only supported user-facing Telegram slash commands through Telegram command discovery and built-in help text.
+
+The system SHALL expose only supported user-facing Telegram slash commands through Telegram command discovery and built-in help text. The `/context` command SHALL be included in the visible command surface.
 
 #### Scenario: Telegram command menu omits health and compress
 - **WHEN** the Telegram interface registers bot commands during startup
@@ -16,6 +17,19 @@ The system SHALL expose only supported user-facing Telegram slash commands throu
 #### Scenario: Help text omits health and compress
 - **WHEN** an authorized user requests `/help`
 - **THEN** the help text MUST NOT list `/health`
+- **AND** the help text MUST NOT list `/compress`
+- **AND** the help text MUST continue to list `/status` and `/reset`
+
+#### Scenario: Telegram command menu includes context
+- **WHEN** the Telegram interface registers bot commands during startup
+- **THEN** the registered command list MUST include `/context`
+- **AND** the registered command list MUST NOT include `/health`
+- **AND** the registered command list MUST NOT include `/compress`
+
+#### Scenario: Help text includes context
+- **WHEN** an authorized user requests `/help`
+- **THEN** the help text MUST include `/context`
+- **AND** the help text MUST NOT list `/health`
 - **AND** the help text MUST NOT list `/compress`
 - **AND** the help text MUST continue to list `/status` and `/reset`
 
@@ -128,3 +142,20 @@ Rule: This requirement governs discovery and surface only; the list's fields, se
 - **THEN** the help text mentions `/prompts search <query> [Nd/Nh]` for searching prompt history
 - **AND** the help text mentions the filter flags `--status`, `--trace`, `--since`, `--until`, and `--page`
 - **AND** the help text mentions `/prompts show <id>` for viewing a single prompt's details
+
+### Requirement: /resume command is registered and discoverable
+
+The `/resume` command SHALL be registered as a Telegram slash command and listed in help text. The command loads disk-persisted checkpoints and resumes interrupted runs. The checkpoint lifecycle, error card rendering, and resume behavior are owned by the `llm-error-recovery` capability; this requirement governs discovery and surface only.
+
+Feature: Telegram command surface
+Rule: `/resume` is the user-facing command for recovering interrupted runs from disk checkpoints.
+
+#### Scenario: /resume is registered as a command
+- **WHEN** the Telegram interface registers bot commands during startup
+- **THEN** the registered command list includes `/resume`
+
+#### Scenario: /resume appears in help
+- **WHEN** an authorized user requests `/help`
+- **THEN** the help text includes `/resume`
+- **AND** the help text describes `/resume` as "Resume an interrupted run from a saved checkpoint"
+- **AND** the help text mentions `/resume N` for selecting a specific checkpoint when multiple exist
