@@ -16,6 +16,8 @@ If the GET probe returns 200 or 405 without an auth challenge, the system SHALL 
 
 If `tools/list` returns an empty tool list or fails without an auth challenge, the system SHALL log a WARNING and proceed to session connection as a fallback. If `tools/list` itself returns 401, the event hook sets `probe_saw_auth_challenge=True` and the OAuth flow fires — the fallback is suppressed.
 
+After a successful OAuth flow, the system SHALL register the newly discovered tools in the `ToolRegistry` via `register_mcp_tools`, so that the tools are attributable by server name in the context profile. This registration SHALL occur in the Telegram command handler after `start_oauth_flow` returns success, mirroring the behaviour of `/mcp on`.
+
 #### Scenario: Successful OAuth flow for a new server
 
 - **GIVEN** an HTTP-transport MCP server is configured with an `oauth` section (client_id, client_secret, redirect_uri, scope, cert_path, key_path) and has no stored token
@@ -24,6 +26,7 @@ If `tools/list` returns an empty tool list or fails without an auth challenge, t
 - **AND** the SDK calls `redirect_handler`, which posts the authorization URL to Telegram as an inline button, and waits for the callback
 - **AND** when the operator taps the button, authenticates with the OAuth provider, and the provider redirects to the callback URL
 - **THEN** the agent receives the authorization code, exchanges it for an access token and refresh token, stores them in `$XDG_STATE_HOME/<agent_name>/mcp_tokens/<server>.json` with `0600` permissions, closes the callback server, connects the MCP session with the Bearer token, and reports success in Telegram
+- **AND** the discovered tools SHALL be registered in the `ToolRegistry` via `register_mcp_tools(name, tools)` so they are attributable by server in the context profile
 
 #### Scenario: OAuth flow with pre-seeded client credentials (no DCR)
 
@@ -138,6 +141,15 @@ If `tools/list` returns an empty tool list or fails without an auth challenge, t
 - **GIVEN** a server `gmail` already has a valid stored access token and is connected
 - **WHEN** the operator runs `/mcp auth gmail` and completes a new OAuth flow
 - **THEN** the new tokens replace the old ones in the token file, the MCP session reconnects with the new Bearer token, and the server remains `active`
+- **AND** the discovered tools SHALL be re-registered in the `ToolRegistry` via `register_mcp_tools(name, tools)`
+
+#### Scenario: Tools registered in ToolRegistry after OAuth success
+
+- **GIVEN** an OAuth flow for server `google-workspace` completes successfully and the MCP session is connected
+- **WHEN** the Telegram command handler processes the successful result
+- **THEN** the handler SHALL call `tool_registry.register_mcp_tools("google-workspace", tools)` with the server's discovered tools
+- **AND** the tools SHALL be attributable to `google-workspace` by `group_tool_defs_by_server`
+- **AND** the context monitor snapshot SHALL be refreshed with the updated tool-defs grouping
 
 ### Requirement: Ephemeral HTTPS callback server
 
