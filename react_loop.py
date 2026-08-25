@@ -895,7 +895,7 @@ def _handle_llm_error(
             1 for m in state.messages
             if m.get("role") == "tool"
             or m.get("role") == "user"
-            and "tool result" in m.get("content", "").lower()
+            and "tool '" in m.get("content", "").lower()
         ),
     })
     response = ctx.confirmation.request_retry(

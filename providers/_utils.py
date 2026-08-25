@@ -19,6 +19,7 @@ import mimetypes
 import re
 import subprocess
 import time
+from typing import Callable
 
 import httpx
 
@@ -30,6 +31,23 @@ from providers._errors import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def make_on_retry(
+    progress_cb: Callable[[str], None] | None = None,
+) -> Callable[[int, int, str], None]:
+    """Return the retry-notification closure shared by all provider backends.
+
+    The returned callable has the signature expected by :func:`_with_retry`:
+    ``on_retry(attempt, max_retries, reason)``. When ``progress_cb`` is provided,
+    it is invoked with a human-readable retry status message; otherwise the
+    notification is silently dropped.
+    """
+    def _on_retry(attempt: int, max_retries: int, reason: str) -> None:
+        if progress_cb:
+            progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
+    return _on_retry
+
 
 # HTTP status codes that are safe to retry
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}

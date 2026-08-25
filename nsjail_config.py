@@ -308,50 +308,10 @@ class NsjailConfigBuilder:
             return "/etc/pki/tls/certs/ca-bundle.crt", "/etc/pki/tls/certs"
         return None, None
 
-    def build(
-        self,
-        command: str,
-        timeout: int,
-        shell_env: Optional[dict] = None,
-        session_logs_dir: str = "",
-    ) -> tuple[str, list[str]]:
-        """Generate the nsjail config file and command list for a shell call.
-
-        Args:
-            command: Shell command to execute inside the sandbox.
-            timeout: Maximum wall-clock execution time in seconds.
-            shell_env: Optional environment variables passed as ``-E KEY=VALUE``
-                flags to nsjail.
-            session_logs_dir: Optional absolute path to session logs directory;
-                mounted read-only inside the jail when it exists.
-
-        Returns:
-            A tuple of ``(config_path, nsjail_cmd)``.  The config file is a
-            temporary ``.cfg`` file created with ``delete=False`` so the caller
-            is responsible for cleaning it up.
-        """
-        system_mounts = self._detect_system_mounts()
-        trusted_mounts = self._load_trusted_mounts()
-        cgroup = self._cgroup_info
-
-        # Re-verify the cached cgroup path still exists; degrade to rlimits if stale.
-        if cgroup["available"] and cgroup["cgroupv2_mount"]:
-            if not os.path.isdir(cgroup["cgroupv2_mount"]):
-                logger.warning(
-                    "nsjail: cached cgroup v2 path no longer exists (%s) — falling back to rlimits",
-                    cgroup["cgroupv2_mount"],
-                )
-                cgroup = {"available": False, "cgroupv2_mount": None}
-
+    def _build_namespace_lines(self) -> list[str]:
+        """Return namespace clone directives and the header comment block."""
         clone_newnet = "true" if not self.allow_net else "false"
-        memory_bytes = self.memory_mb * 1024 * 1024
-        cpu_ms_per_sec = self.cpu_percent * 10
-
-        lines: list[str] = [
-            'name: "agent-shell"',
-            "mode: ONCE",
-            'hostname: "nsjail"',
-            "",
+        return [
             "# Namespaces",
             f"clone_newnet: {clone_newnet}",
             "clone_newuser: true",
@@ -363,6 +323,11 @@ class NsjailConfigBuilder:
             "",
             "# Seccomp: deferred — no policy applied; isolation relies on namespaces + cgroup.",
             "",
+        ]
+
+    def _build_env_lines(self) -> list[str]:
+        """Return the base environment isolation and injected env vars."""
+        return [
             "# Environment",
             "keep_env: false",
             'envar: "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
@@ -375,33 +340,54 @@ class NsjailConfigBuilder:
             "",
         ]
 
+    def _build_dns_tls_lines(self, allow_net: bool) -> tuple[list[str], Optional[str], Optional[str]]:
+        """Return DNS/TLS-related config lines and detected CA cert paths.
+
+        When *allow_net* is true, injects a minimal ``/etc/resolv.conf`` via
+        ``src_content`` and, if a CA store is detected, ``SSL_CERT_*`` env
+        vars.  Returns ``(lines, cafile, capath)`` so the CA store can later be
+        bind-mounted read-only.
+        """
+        lines: list[str] = []
         cafile: Optional[str] = None
         capath: Optional[str] = None
-        if self.allow_net:
-            # DNS resolution: the jail has an isolated mount namespace
-            # (clone_newns), so the host's /etc/resolv.conf is not visible.
-            # Inject a minimal resolv.conf via src_content so tools like curl,
-            # git, and Python ssl can resolve hostnames.  See nsjail's
-            # configs/telegram.cfg for the canonical pattern.
-            resolv_content = f"nameserver {self.dns_nameserver}\n"
-            lines.append("# DNS resolution (allow_net=true)")
-            lines.append(
-                f'mount: {{ src_content: {json.dumps(resolv_content)}'
-                f' dst: {json.dumps("/etc/resolv.conf")} }}'
-            )
-            lines.append("")
-            cafile, capath = self._detect_ca_certs()
-            if cafile is not None or capath is not None:
-                lines.append("# TLS cert env vars (allow_net=true)")
-                if cafile and '"' not in cafile and '\\' not in cafile:
-                    lines.append(f'envar: "SSL_CERT_FILE={cafile}"')
-                if capath and '"' not in capath and '\\' not in capath:
-                    lines.append(f'envar: "SSL_CERT_DIR={capath}"')
-                lines.append("")
+        if not allow_net:
+            return lines, cafile, capath
 
-        lines.extend([
+        # DNS resolution: the jail has an isolated mount namespace
+        # (clone_newns), so the host's /etc/resolv.conf is not visible.
+        # Inject a minimal resolv.conf via src_content so tools like curl,
+        # git, and Python ssl can resolve hostnames.  See nsjail's
+        # configs/telegram.cfg for the canonical pattern.
+        resolv_content = f"nameserver {self.dns_nameserver}\n"
+        lines.append("# DNS resolution (allow_net=true)")
+        lines.append(
+            f'mount: {{ src_content: {json.dumps(resolv_content)}'
+            f' dst: {json.dumps("/etc/resolv.conf")} }}'
+        )
+        lines.append("")
+        cafile, capath = self._detect_ca_certs()
+        if cafile is not None or capath is not None:
+            lines.append("# TLS cert env vars (allow_net=true)")
+            if cafile and '"' not in cafile and '\\' not in cafile:
+                lines.append(f'envar: "SSL_CERT_FILE={cafile}"')
+            if capath and '"' not in capath and '\\' not in capath:
+                lines.append(f'envar: "SSL_CERT_DIR={capath}"')
+            lines.append("")
+        return lines, cafile, capath
+
+    def _build_mount_lines(
+        self,
+        system_mounts: list[str],
+        trusted_mounts: list[str],
+        cafile: Optional[str],
+        capath: Optional[str],
+        session_logs_dir: str,
+    ) -> list[str]:
+        """Return the full mount section: system, trusted, session, and optional mounts."""
+        lines: list[str] = [
             "# System mounts",
-        ])
+        ]
         lines.extend(system_mounts)
 
         # Minimal /dev nodes for shell redirections (2>/dev/null, etc.)
@@ -498,29 +484,38 @@ class NsjailConfigBuilder:
             lines.extend(skills_mounts)
             lines.append("")
 
-        if cgroup["available"] and cgroup["cgroupv2_mount"]:
-            lines.extend([
+        return lines
+
+    def _build_limits_lines(self, cgroup_available: bool, cgroupv2_mount: Optional[str]) -> list[str]:
+        """Return resource limit lines, using cgroup delegation when available."""
+        memory_bytes = self.memory_mb * 1024 * 1024
+        cpu_ms_per_sec = self.cpu_percent * 10
+
+        if cgroup_available and cgroupv2_mount:
+            return [
                 "# Resource limits (Tier 1 - cgroup delegation)",
                 f"cgroup_mem_max: {memory_bytes}",
                 f"cgroup_pids_max: {self.pids_max}",
                 f"cgroup_cpu_ms_per_sec: {cpu_ms_per_sec}",
                 "use_cgroupv2: true",
-                f'cgroupv2_mount: {json.dumps(cgroup["cgroupv2_mount"])}',
-            ])
-        else:
-            logger.warning(
-                "nsjail: cgroup v2 delegation unavailable — using rlimits fallback "
-                "(rlimit_nproc is user-wide, not per-jail)"
-            )
-            lines.extend([
-                "# Resource limits (Tier 2 - rlimits fallback)",
-                f"rlimit_as: {memory_bytes}",
-                "rlimit_fsize: 104857600",
-                "rlimit_nofile: 256",
-                f"rlimit_nproc: {self.pids_max}",
-            ])
+                f'cgroupv2_mount: {json.dumps(cgroupv2_mount)}',
+            ]
 
-        lines.extend([
+        logger.warning(
+            "nsjail: cgroup v2 delegation unavailable — using rlimits fallback "
+            "(rlimit_nproc is user-wide, not per-jail)"
+        )
+        return [
+            "# Resource limits (Tier 2 - rlimits fallback)",
+            f"rlimit_as: {memory_bytes}",
+            "rlimit_fsize: 104857600",
+            "rlimit_nofile: 256",
+            f"rlimit_nproc: {self.pids_max}",
+        ]
+
+    def _build_command_block(self, command: str, timeout: int) -> list[str]:
+        """Return the trailing time limit, cwd, and exec_bin block."""
+        return [
             "",
             f"time_limit: {timeout}",
             "",
@@ -531,7 +526,68 @@ class NsjailConfigBuilder:
             '  arg: "-c"',
             f'  arg: {json.dumps(command)}',
             '}',
-        ])
+        ]
+
+    def build(
+        self,
+        command: str,
+        timeout: int,
+        shell_env: Optional[dict] = None,
+        session_logs_dir: str = "",
+    ) -> tuple[str, list[str]]:
+        """Generate the nsjail config file and command list for a shell call.
+
+        Args:
+            command: Shell command to execute inside the sandbox.
+            timeout: Maximum wall-clock execution time in seconds.
+            shell_env: Optional environment variables passed as ``-E KEY=VALUE``
+                flags to nsjail.
+            session_logs_dir: Optional absolute path to session logs directory;
+                mounted read-only inside the jail when it exists.
+
+        Returns:
+            A tuple of ``(config_path, nsjail_cmd)``.  The config file is a
+            temporary ``.cfg`` file created with ``delete=False`` so the caller
+            is responsible for cleaning it up.
+        """
+        system_mounts = self._detect_system_mounts()
+        trusted_mounts = self._load_trusted_mounts()
+        cgroup = self._cgroup_info
+
+        # Re-verify the cached cgroup path still exists; degrade to rlimits if stale.
+        if cgroup["available"] and cgroup["cgroupv2_mount"]:
+            if not os.path.isdir(cgroup["cgroupv2_mount"]):
+                logger.warning(
+                    "nsjail: cached cgroup v2 path no longer exists (%s) — falling back to rlimits",
+                    cgroup["cgroupv2_mount"],
+                )
+                cgroup = {"available": False, "cgroupv2_mount": None}
+
+        ns_lines = self._build_namespace_lines()
+        env_lines = self._build_env_lines()
+        dns_tls_lines, cafile, capath = self._build_dns_tls_lines(self.allow_net)
+        mount_lines = self._build_mount_lines(
+            system_mounts=system_mounts,
+            trusted_mounts=trusted_mounts,
+            cafile=cafile,
+            capath=capath,
+            session_logs_dir=session_logs_dir,
+        )
+        limits_lines = self._build_limits_lines(cgroup["available"], cgroup.get("cgroupv2_mount"))
+        command_block = self._build_command_block(command, timeout)
+
+        lines: list[str] = [
+            'name: "agent-shell"',
+            "mode: ONCE",
+            'hostname: "nsjail"',
+            "",
+        ]
+        lines.extend(ns_lines)
+        lines.extend(env_lines)
+        lines.extend(dns_tls_lines)
+        lines.extend(mount_lines)
+        lines.extend(limits_lines)
+        lines.extend(command_block)
 
         cfg_fh = tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False)
         cfg_path = cfg_fh.name

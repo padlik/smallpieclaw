@@ -56,8 +56,9 @@ a 3-tuple `(dangerous, reason, category)` where category is one of: `host_escape
 mode to decide whether to stage confirmation.
 
 - `"always"` (default): confirm all dangerous patterns regardless of category. Backward-compatible.
-- `"adaptive"`: skip confirmation for `resource` category patterns (kernel-bounded by cgroup
-  `pids_max`). All other categories still confirm.
+- `"adaptive"`: skip confirmation for `network` category patterns when network isolation is
+  active (`shell_nsjail_network == "none"`). `resource` category always confirms because
+  `rlimit_nproc` is user-wide, not per-jail. All other categories still confirm.
 - `"never"`: skip confirmation for all dangerous patterns when nsjail is active.
 
 When nsjail is NOT active (fallback to subprocess), the confirm mode MUST behave as `"always"`

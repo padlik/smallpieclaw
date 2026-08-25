@@ -20,6 +20,7 @@ from execution_plan import (
     PlanStep,
     PlanValidationError,
     _build_step_task,
+    _parent_cancel_bridge,
     _standardize_sub_agent_result,
     substitute_results,
     topological_sort,
@@ -920,3 +921,55 @@ class TestClassifyIncomplete:
         assert "still be running" in outcome["error"].lower()
         assert "timed out" in error_line.lower()
         assert "still be running" in error_line.lower()
+
+
+class TestParentCancelBridgeHelper:
+    """Direct tests for the _parent_cancel_bridge context manager."""
+
+    def test_no_parent_cancel_yields_without_thread(self):
+        cancel_event = threading.Event()
+        cancelled_flag = [False]
+        with _parent_cancel_bridge(None, cancel_event, cancelled_flag):
+            assert not cancel_event.is_set()
+            assert cancelled_flag[0] is False
+        assert not cancel_event.is_set()
+
+    def test_preexisting_parent_cancel_sets_flag(self):
+        parent = threading.Event()
+        parent.set()
+        cancel_event = threading.Event()
+        cancelled_flag = [False]
+        with _parent_cancel_bridge(parent, cancel_event, cancelled_flag):
+            assert cancel_event.is_set()
+            assert cancelled_flag[0] is True
+
+    def test_parent_cancel_arrives_during_context(self):
+        parent = threading.Event()
+        cancel_event = threading.Event()
+        cancelled_flag = [False]
+
+        def _set_parent_after_short_delay():
+            time.sleep(0.05)
+            parent.set()
+
+        t = threading.Thread(target=_set_parent_after_short_delay, daemon=True)
+        t.start()
+        with _parent_cancel_bridge(parent, cancel_event, cancelled_flag):
+            # Wait long enough for the bridge thread to observe the parent event.
+            parent.wait(timeout=0.5)
+            # Give the bridge thread a chance to propagate.
+            time.sleep(0.15)
+            assert cancel_event.is_set()
+            assert cancelled_flag[0] is True
+        t.join(timeout=0.5)
+
+    def test_no_parent_cancel_flag_stays_false(self):
+        parent = threading.Event()
+        cancel_event = threading.Event()
+        cancelled_flag = [False]
+        with _parent_cancel_bridge(parent, cancel_event, cancelled_flag):
+            time.sleep(0.05)
+            assert not cancel_event.is_set()
+            assert cancelled_flag[0] is False
+        assert not cancel_event.is_set()
+        assert cancelled_flag[0] is False

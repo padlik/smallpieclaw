@@ -17,8 +17,10 @@ import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from functools import partial
+from typing import Any, Callable, Generator, Optional
 
 from error_registry import ErrorTypeRegistry
 from agent_runtime import RuntimeProfile
@@ -304,6 +306,69 @@ def _format_plan_result_message(plan: ExecutionPlan, result: dict) -> str:
     for error in result.get("errors", []):
         lines.append(f"  ⚠️ {error}")
     return "\n".join(lines)
+
+
+def _report_progress(
+    msg: str,
+    progress_cb: Optional[Callable[[str], None]],
+    plan_description: str,
+) -> None:
+    """Forward a progress message to the optional callback and logger."""
+    if progress_cb:
+        try:
+            progress_cb(msg)
+        except Exception:  # noqa: BLE001
+            pass
+    logger.debug("Plan '%s': %s", plan_description, msg)
+
+
+@contextmanager
+def _parent_cancel_bridge(
+    parent_cancel: Optional[threading.Event],
+    cancel_event: threading.Event,
+    cancelled_flag: list[bool],
+) -> Generator[None, None, None]:
+    """Bridge parent-agent cancellation into *cancel_event*.
+
+    While the context is active, a daemon thread watches the parent agent's
+    cancellation event and propagates it to *cancel_event*. The mutable one-element
+    list *cancelled_flag* is set to ``True`` when the parent is the source of
+    cancellation, including when it was already set before entering the context.
+
+    Args:
+        parent_cancel: Parent agent's cancellation event, if any.
+        cancel_event: The plan's shared cancellation event.
+        cancelled_flag: Mutable ``[False]`` list used to record a parent-origin
+            cancellation.
+    """
+    _bridge_stop = threading.Event()
+
+    def _bridge() -> None:
+        while not _bridge_stop.wait(0.1):
+            if parent_cancel is not None and parent_cancel.is_set():
+                cancel_event.set()
+                cancelled_flag[0] = True
+                break
+
+    bridge_thread: Optional[threading.Thread] = None
+    if parent_cancel is not None:
+        # Synchronous check: honour cancellation already set before this context.
+        if parent_cancel.is_set():
+            cancel_event.set()
+            cancelled_flag[0] = True
+        bridge_thread = threading.Thread(
+            target=_bridge,
+            daemon=True,
+            name="plan-cancel-bridge",
+        )
+        bridge_thread.start()
+
+    try:
+        yield
+    finally:
+        _bridge_stop.set()
+        if bridge_thread is not None:
+            bridge_thread.join(timeout=0.5)
 
 
 class PlanExecutor:
@@ -784,6 +849,150 @@ class PlanExecutor:
             "elapsed_seconds": round(time.monotonic() - start, 1),
         }
 
+    def _process_batches(
+        self,
+        batches: list[list[PlanStep]],
+        ctx: ReactContext,
+        factory: Callable,
+        cancel_event: threading.Event,
+        deadline: float,
+        progress: Callable[[str], None],
+        timeout: int,
+        cancelled_by_parent: list[bool],
+    ) -> tuple[dict[str, dict], list[str]]:
+        """Run topologically sorted batches and collect results/errors.
+
+        Args:
+            batches: Parallel batches produced by :func:`topological_sort`.
+            ctx: Parent :class:`ReactContext` for dependency injection.
+            factory: Sub-agent factory callable.
+            cancel_event: Shared plan cancellation event.
+            deadline: Monotonic deadline for the entire plan.
+            progress: Progress callback.
+            timeout: Original plan timeout in seconds (for error messages).
+            cancelled_by_parent: Mutable one-element list tracking whether the
+                cancellation originated from the parent agent.
+
+        Returns:
+            A tuple ``(results, errors)`` after all batches are processed.
+        """
+        results: dict[str, dict] = {}
+        errors: list[str] = []
+
+        for batch_index, batch in enumerate(batches, start=1):
+            if cancel_event.is_set():
+                break
+            if time.monotonic() >= deadline:
+                cancel_event.set()
+                errors.append(f"Plan timeout exceeded ({timeout}s).")
+                break
+
+            # Substitute completed results and skip steps with failed dependencies.
+            ready_steps: list[PlanStep] = []
+            for step in batch:
+                if not self._dependencies_satisfied(step, results):
+                    failed_dep = next(
+                        dep for dep in step.depends_on
+                        if not results.get(dep, {}).get("success", False)
+                    )
+                    results[step.id] = self._skip_step(
+                        step, f"dependency '{failed_dep}' did not succeed"
+                    )
+                    errors.append(f"Step '{step.id}' skipped: dependency '{failed_dep}' failed.")
+                    continue
+                ready_steps.append(substitute_results(step, results))
+
+            if not ready_steps:
+                continue
+
+            step_ids = ", ".join(s.id for s in ready_steps)
+            progress(f"Batch {batch_index}/{len(batches)}: {step_ids}")
+
+            pool, futures = self._run_batch(
+                ready_steps, ctx, factory, cancel_event, deadline,
+            )
+            try:
+                done_futures, pending_futures = self._drain_pending(
+                    set(futures.keys()), cancel_event, deadline, errors, timeout,
+                )
+
+                if pending_futures:
+                    cancel_event.set()
+                    # Request cooperative cancellation on still-running runners,
+                    # then allow a brief grace period to take effect.
+                    with self._active_lock:
+                        active_snapshot = {
+                            sid: runner
+                            for sid in list(futures.values())
+                            if (runner := self._active_runners.get(sid)) is not None
+                        }
+                    for sid, runner in active_snapshot.items():
+                        if hasattr(runner, "cancel"):
+                            try:
+                                runner.cancel()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    done2, pending_futures = wait(
+                        pending_futures, timeout=_CANCELLATION_GRACE_SECONDS,
+                    )
+
+                    for future in done2:
+                        sid = futures[future]
+                        with self._active_lock:
+                            self._active_runners.pop(sid, None)
+                        outcome, error_line = self._classify_incomplete(
+                            sid,
+                            cancelled_by_parent=cancelled_by_parent[0],
+                            completed_in_grace=True,
+                        )
+                        results[sid] = outcome
+                        errors.append(error_line)
+
+                    for future in pending_futures:
+                        sid = futures[future]
+                        with self._active_lock:
+                            self._active_runners.pop(sid, None)
+                        outcome, error_line = self._classify_incomplete(
+                            sid,
+                            cancelled_by_parent=cancelled_by_parent[0],
+                            completed_in_grace=False,
+                        )
+                        results[sid] = outcome
+                        errors.append(error_line)
+
+                for future in done_futures:
+                    sid = futures[future]
+                    try:
+                        outcome = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("Step '%s' future raised", sid)
+                        outcome = fail_outcome(f"Execution error: {exc}")
+                    results[sid] = outcome
+                    self._record_step_outcome(sid, outcome, errors, progress)
+            finally:
+                # Cancel any runners that did not complete and shut down the
+                # pool without waiting indefinitely. Pending futures that
+                # ignore cancellation will be forcibly discarded.
+                with self._active_lock:
+                    final_active = list(self._active_runners.items())
+                for sid, runner in final_active:
+                    if hasattr(runner, "cancel"):
+                        try:
+                            runner.cancel()
+                        except Exception:  # noqa: BLE001
+                            pass
+                with self._active_lock:
+                    self._active_runners.clear()
+                for future in list(futures.keys()):
+                    if not future.done():
+                        future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+
+            if cancel_event.is_set():
+                break
+
+        return results, errors
+
     def execute(
         self,
         plan: ExecutionPlan,
@@ -813,167 +1022,38 @@ class PlanExecutor:
 
         validate_plan(plan)
         batches = topological_sort(plan)
-        results: dict[str, dict] = {}
-        errors: list[str] = []
+
         cancel_event = threading.Event()
         start = time.monotonic()
         deadline = start + max(0, plan.timeout)
 
-        # Bridge parent-agent cancellation into the plan's cancel_event so that
-        # cancelling the main agent also stops plan execution and its sub-agents.
         parent_cancel = getattr(ctx, "cancel_event", None)
-        # Track whether the cancellation came from the parent agent (vs. plan
-        # timeout) so results and errors are classified correctly everywhere,
-        # including for steps that were never submitted.
-        cancelled_by_parent = False
+        cancelled_by_parent: list[bool] = [False]
+        progress = partial(
+            _report_progress,
+            progress_cb=progress_cb,
+            plan_description=plan.description,
+        )
 
-        # Synchronous check: honour cancellation that was already set before
-        # execute() was called.  The bridge thread only handles cancellations
-        # that arrive *after* this point.
-        if parent_cancel is not None and parent_cancel.is_set():
-            cancel_event.set()
-            cancelled_by_parent = True
+        progress(
+            f"Starting plan '{plan.description}' "
+            f"({len(plan.steps)} steps in {len(batches)} batches)"
+        )
 
-        _bridge_stop = threading.Event()
-
-        def _bridge_parent_cancel() -> None:
-            """Set plan cancel_event when the parent agent is cancelled."""
-            nonlocal cancelled_by_parent
-            while not _bridge_stop.wait(0.1):
-                if parent_cancel is not None and parent_cancel.is_set():
-                    cancel_event.set()
-                    cancelled_by_parent = True
-                    break
-
-        bridge_thread: Optional[threading.Thread] = None
-        if parent_cancel is not None:
-            bridge_thread = threading.Thread(
-                target=_bridge_parent_cancel,
-                daemon=True,
-                name="plan-cancel-bridge",
+        with _parent_cancel_bridge(parent_cancel, cancel_event, cancelled_by_parent):
+            results, errors = self._process_batches(
+                batches,
+                ctx,
+                factory,
+                cancel_event,
+                deadline,
+                progress,
+                plan.timeout,
+                cancelled_by_parent,
             )
-            bridge_thread.start()
-
-        def _progress(msg: str) -> None:
-            if progress_cb:
-                try:
-                    progress_cb(msg)
-                except Exception:  # noqa: BLE001
-                    pass
-            logger.debug("Plan '%s': %s", plan.description, msg)
-
-        _progress(f"Starting plan '{plan.description}' ({len(plan.steps)} steps in {len(batches)} batches)")
-
-        for batch_index, batch in enumerate(batches, start=1):
-            if cancel_event.is_set():
-                break
-            if time.monotonic() >= deadline:
-                cancel_event.set()
-                errors.append(f"Plan timeout exceeded ({plan.timeout}s).")
-                break
-
-            # Substitute completed results and skip steps with failed dependencies.
-            ready_steps: list[PlanStep] = []
-            for step in batch:
-                if not self._dependencies_satisfied(step, results):
-                    failed_dep = next(
-                        dep for dep in step.depends_on
-                        if not results.get(dep, {}).get("success", False)
-                    )
-                    results[step.id] = self._skip_step(
-                        step, f"dependency '{failed_dep}' did not succeed"
-                    )
-                    errors.append(f"Step '{step.id}' skipped: dependency '{failed_dep}' failed.")
-                    continue
-                ready_steps.append(substitute_results(step, results))
-
-            if not ready_steps:
-                continue
-
-            step_ids = ", ".join(s.id for s in ready_steps)
-            _progress(f"Batch {batch_index}/{len(batches)}: {step_ids}")
-
-            pool, futures = self._run_batch(
-                ready_steps, ctx, factory, cancel_event, deadline,
-            )
-            try:
-                done_futures, pending_futures = self._drain_pending(
-                    set(futures.keys()), cancel_event, deadline, errors, plan.timeout,
-                )
-
-                if pending_futures:
-                    cancel_event.set()
-                    # Request cooperative cancellation on still-running runners,
-                    # then allow a brief grace period to take effect.
-                    with self._active_lock:
-                        active_snapshot = {
-                            sid: runner
-                            for sid in list(futures.values())
-                            if (runner := self._active_runners.get(sid)) is not None
-                        }
-                    for sid, runner in active_snapshot.items():
-                        if hasattr(runner, "cancel"):
-                            try:
-                                runner.cancel()
-                            except Exception:  # noqa: BLE001
-                                pass
-                    done2, pending_futures = wait(
-                        pending_futures, timeout=_CANCELLATION_GRACE_SECONDS,
-                    )
-
-                    for future in done2:
-                        sid = futures[future]
-                        with self._active_lock:
-                            self._active_runners.pop(sid, None)
-                        outcome, error_line = self._classify_incomplete(
-                            sid, cancelled_by_parent=cancelled_by_parent, completed_in_grace=True,
-                        )
-                        results[sid] = outcome
-                        errors.append(error_line)
-
-                    for future in pending_futures:
-                        sid = futures[future]
-                        with self._active_lock:
-                            self._active_runners.pop(sid, None)
-                        outcome, error_line = self._classify_incomplete(
-                            sid, cancelled_by_parent=cancelled_by_parent, completed_in_grace=False,
-                        )
-                        results[sid] = outcome
-                        errors.append(error_line)
-
-                for future in done_futures:
-                    sid = futures[future]
-                    try:
-                        outcome = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("Step '%s' future raised", sid)
-                        outcome = fail_outcome(f"Execution error: {exc}")
-                    results[sid] = outcome
-                    self._record_step_outcome(sid, outcome, errors, _progress)
-            finally:
-                # Cancel any runners that did not complete and shut down the
-                # pool without waiting indefinitely. Pending futures that
-                # ignore cancellation will be forcibly discarded.
-                with self._active_lock:
-                    final_active = list(self._active_runners.items())
-                for sid, runner in final_active:
-                    if hasattr(runner, "cancel"):
-                        try:
-                            runner.cancel()
-                        except Exception:  # noqa: BLE001
-                            pass
-                with self._active_lock:
-                    self._active_runners.clear()
-                for future in list(futures.keys()):
-                    if not future.done():
-                        future.cancel()
-                pool.shutdown(wait=False, cancel_futures=True)
-
-            if cancel_event.is_set():
-                break
 
         result = self._build_summary(
-            plan, results, errors, cancel_event, start, cancelled_by_parent
+            plan, results, errors, cancel_event, start, cancelled_by_parent[0]
         )
 
         if ctx.short_term is not None:
@@ -984,14 +1064,9 @@ class PlanExecutor:
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to append plan result to short-term memory")
 
-        _progress(
+        progress(
             f"Plan '{plan.description}' finished: success={result['success']}, "
             f"errors={len(result['errors'])}, elapsed={time.monotonic() - start:.1f}s"
         )
-
-        # Stop the parent-cancellation bridge (no-op if it already stopped).
-        _bridge_stop.set()
-        if bridge_thread is not None:
-            bridge_thread.join(timeout=0.5)
 
         return result

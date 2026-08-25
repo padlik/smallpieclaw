@@ -23,7 +23,7 @@ from providers._errors import (
     LLMError,
     LLMPermanentError,
 )
-from providers._utils import _encode_images, _with_retry, diagnose_empty_response
+from providers._utils import _encode_images, _with_retry, diagnose_empty_response, make_on_retry
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +62,7 @@ def chat(
                 continue
         anthropic_messages.append({"role": m["role"], "content": m.get("content", "")})
 
-    def _on_retry(attempt, max_retries, reason):
-        if progress_cb:
-            progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
+    _on_retry = make_on_retry(progress_cb)
 
     def _do_request():
         # Re-read active model config on every attempt so that a mid-flight

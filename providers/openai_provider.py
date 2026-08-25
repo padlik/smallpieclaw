@@ -35,6 +35,7 @@ from providers._utils import (
     _strip_thinking_tags,
     _with_retry,
     diagnose_empty_response,
+    make_on_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,9 +80,7 @@ def chat(
             "_tool_call_id": m.get("tool_call_id"),
         })
 
-    def _on_retry(attempt, max_retries, reason):
-        if progress_cb:
-            progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
+    _on_retry = make_on_retry(progress_cb)
 
     def _do_request():
         # Re-read active model config on every attempt so that a mid-flight

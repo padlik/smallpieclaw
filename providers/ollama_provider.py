@@ -39,6 +39,7 @@ from providers._utils import (
     _extract_thinking_content,
     _strip_thinking_tags,
     _with_retry,
+    make_on_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,9 +131,7 @@ def chat(
                 pm["tool_name"] = _resolved_name
         payload_messages.append(pm)
 
-    def _on_retry(attempt, max_retries, reason):
-        if progress_cb:
-            progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
+    _on_retry = make_on_retry(progress_cb)
 
     def _do_request():
         # Resolve the active ollama.Client on every attempt via the context

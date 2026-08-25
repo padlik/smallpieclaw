@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Callable, Optional
 from unittest.mock import patch
@@ -493,3 +494,76 @@ class TestInitialStateResume:
         state = _LoopState(messages=[{"role": "user", "content": "hello"}], goal_idx=0, max_steps=8)
         assert _get_user_goal(state) == "hello"
         assert _get_user_goal(_LoopState(messages=[], goal_idx=0, max_steps=8)) == ""
+
+
+# ---------------------------------------------------------------------------
+# tool_results_count regression tests
+# ---------------------------------------------------------------------------
+
+class TestToolResultsCount:
+    """Verify the error-card tool_results_count matches json_mode tool results."""
+
+    def test_json_mode_tool_results_count_in_error_card(self, tmp_path):
+        """Tool results formatted by format_tool_result must be counted on json_mode path."""
+        from react_loop import format_tool_result
+
+        error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
+        success_msg = format_tool_result("tool_a", {"success": True, "output": "ok"})
+        failure_msg = format_tool_result(
+            "tool_b",
+            {"success": False, "exit_code": 1, "error": "boom"},
+        )
+        state = _LoopState(
+            messages=[
+                {"role": "user", "content": "goal"},
+                {"role": "assistant", "content": '{"action":"tool_a"}'},
+                {"role": "user", "content": success_msg},
+                {"role": "assistant", "content": '{"action":"tool_b"}'},
+                {"role": "user", "content": failure_msg},
+            ],
+            goal_idx=0,
+            max_steps=8,
+        )
+        llm = ScriptedFinishLLM()
+        ctx = _build_context(tmp_path, llm, RecordingExecutor(), trace_id="r-count")
+
+        captured: list[str] = []
+
+        def request_retry(token, error_info_json, progress_cb, timeout_seconds=120):
+            captured.append(error_info_json)
+            confirmation.signal_retry(token, "retry")
+            return "retry"
+
+        confirmation = ctx.confirmation
+        confirmation.request_retry = request_retry  # type: ignore[method-assign]
+
+        assert _handle_llm_error(ctx, state, error_info, lambda _: None, "goal") is None
+        assert captured
+        payload = json.loads(captured[0])
+        assert payload["tool_results_count"] == 2
+
+    def test_tool_results_count_matches_format_tool_result(self):
+        """format_tool_result output must trigger the count condition."""
+        from react_loop import format_tool_result
+
+        success_msg = format_tool_result("test_tool", {"success": True, "output": "ok"})
+        failed_msg = format_tool_result(
+            "test_tool",
+            {"success": False, "exit_code": 1, "error": "boom"},
+        )
+        assert "tool '" in success_msg.lower()
+        assert "tool '" in failed_msg.lower()
+
+        messages = [
+            {"role": "user", "content": "goal"},
+            {"role": "user", "content": success_msg},
+            {"role": "user", "content": failed_msg},
+        ]
+        count = sum(
+            1
+            for m in messages
+            if m.get("role") == "tool"
+            or m.get("role") == "user"
+            and "tool '" in m.get("content", "").lower()
+        )
+        assert count == 2
