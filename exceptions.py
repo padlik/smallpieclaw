@@ -14,22 +14,6 @@ class AgentError(Exception):
     """Base exception for all agent errors."""
 
 
-class LLMError(AgentError):
-    """LLM communication failure — network, timeout, rate-limit, empty response."""
-
-
-class LLMEmptyResponseError(LLMError):
-    """LLM returned an empty or whitespace-only response."""
-
-
-class LLMRateLimitError(LLMError):
-    """LLM rate-limited the request (HTTP 429 or equivalent)."""
-
-
-class LLMContextOverflowError(LLMError):
-    """Request exceeded the model's context window."""
-
-
 class ToolError(AgentError):
     """Tool execution failure — timeout, crash, invalid output."""
 

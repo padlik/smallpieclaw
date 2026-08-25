@@ -10,7 +10,6 @@ import httpx
 
 from checkpoint_store import CheckpointStore
 from confirmation import ConfirmationManager
-from exceptions import LLMContextOverflowError
 from llm_client import LLMCancelledError, LLMEmptyResponseError, LLMPermanentError
 from react_loop import (
     LLMErrorInfo,
@@ -64,9 +63,42 @@ class TestClassifyLLMError:
         assert info.retryable is True
 
     def test_context_overflow_not_retryable(self):
-        info = _classify_llm_error(LLMContextOverflowError("too long"))
+        exc = _make_http_status_error(400, body='{"error": {"message": "context_length_exceeded"}}')
+        info = _classify_llm_error(exc)
         assert info.type == "context"
         assert info.retryable is False
+
+    def test_context_overflow_413(self):
+        exc = _make_http_status_error(413, body="Request too large: context window exceeded")
+        info = _classify_llm_error(exc)
+        assert info.type == "context"
+        assert info.retryable is False
+
+    def test_context_overflow_gemini_400(self):
+        exc = _make_http_status_error(
+            400,
+            body="The input token count (50000) exceeds the maximum number of tokens allowed (8192).",
+        )
+        info = _classify_llm_error(exc)
+        assert info.type == "context"
+        assert info.retryable is False
+
+    def test_empty_response_still_classified(self):
+        """Verify LLMEmptyResponseError is caught and classified as empty/retryable.
+
+        This is a regression guard: LLMEmptyResponseError is a sibling of LLMError
+        (both extend RuntimeError), not a subclass — it must be listed explicitly
+        in the catch tuple.
+        """
+        info = _classify_llm_error(LLMEmptyResponseError("empty"))
+        assert info.type == "empty"
+        assert info.retryable is True
+
+    def test_400_without_context_indicators_is_unknown(self):
+        exc = _make_http_status_error(400, body='{"error": {"message": "invalid_parameter"}}')
+        info = _classify_llm_error(exc)
+        assert info.type == "unknown"
+        assert info.retryable is True
 
     def test_permanent_not_retryable(self):
         info = _classify_llm_error(LLMPermanentError("bad request"))
@@ -91,10 +123,10 @@ class TestClassifyLLMError:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_http_status_error(status_code: int) -> httpx.HTTPStatusError:
+def _make_http_status_error(status_code: int, body: str = "") -> httpx.HTTPStatusError:
     """Build an httpx.HTTPStatusError with the given status code for testing."""
     request = httpx.Request("POST", "https://example.com/v1/chat")
-    response = httpx.Response(status_code=status_code, request=request)
+    response = httpx.Response(status_code=status_code, content=body.encode(), request=request)
     return httpx.HTTPStatusError(
         "server error",
         request=request,

@@ -41,7 +41,6 @@ from context_monitor import (
     group_tool_defs_by_server,
 )
 from interfaces import ToolCall
-from exceptions import LLMContextOverflowError
 from llm_client import LLMClient, LLMCancelledError, LLMEmptyResponseError, LLMError, LLMPermanentError, _encode_images
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from outcome_utils import fail_outcome
@@ -49,6 +48,22 @@ from prompt_loader import build_system_prompt as _build_system_prompt
 
 logger = logging.getLogger(__name__)
 slog = agent_logging.get_logger(__name__)
+
+# Case-insensitive fragments that indicate an LLM context-window / context-length
+# overflow when present in an HTTP 400/413 response body.
+_CONTEXT_OVERFLOW_INDICATORS: frozenset[str] = frozenset(
+    {
+        "context_length",
+        "context window",
+        "maximum context",
+        "prompt is too long",
+        "context length exceeded",
+        "token limit",
+        "exceeds the maximum number of tokens",
+        "input token count",
+        "maximum number of tokens allowed",
+    }
+)
 
 _TOOL_ICONS: dict[str, str] = {
     "shell":            "🖥️",
@@ -808,11 +823,16 @@ def _classify_llm_error(exc: Exception) -> LLMErrorInfo:
     if isinstance(exc, httpx.HTTPStatusError):
         if exc.response.status_code == 429:
             return LLMErrorInfo("rate_limit", "🚫 Rate limit reached", True, detail)
+        if exc.response.status_code in (400, 413):
+            try:
+                body = exc.response.text.lower()
+            except Exception:
+                body = ""
+            if any(indicator in body for indicator in _CONTEXT_OVERFLOW_INDICATORS):
+                return LLMErrorInfo("context", "📏 Context too long", False, detail)
         return LLMErrorInfo("unknown", "❌ LLM error", True, detail)
     if isinstance(exc, LLMEmptyResponseError):
         return LLMErrorInfo("empty", "📭 Model returned no content", True, detail)
-    if isinstance(exc, LLMContextOverflowError):
-        return LLMErrorInfo("context", "📏 Context too long", False, detail)
     if isinstance(exc, LLMPermanentError):
         return LLMErrorInfo("permanent", f"❌ {exc}", False, detail)
     return LLMErrorInfo("unknown", f"❌ LLM error: {exc}", True, detail)
@@ -1196,7 +1216,7 @@ def _request_turn(
             except LLMCancelledError:
                 logger.info("Agent LLM call cancelled at step %d/%d", state.step, state.max_steps)
                 return _Turn([], "", False, "[Cancelled]")
-            except (LLMError, LLMEmptyResponseError, LLMContextOverflowError, httpx.HTTPError) as exc:
+            except (LLMError, LLMEmptyResponseError, httpx.HTTPError) as exc:
                 error_info = _classify_llm_error(exc)
                 logger.warning("LLM error at step %d/%d: %s — %s", state.step, state.max_steps, error_info.type, error_info.detail)
                 # Try to handle the error (checkpoint + retry prompt)

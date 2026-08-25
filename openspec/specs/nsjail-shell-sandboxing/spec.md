@@ -2,7 +2,7 @@
 
 ### Requirement: nsjail shell backend provides kernel-level isolation
 
-When `shell_backend` is set to `"nsjail"` and the nsjail binary is available, the shell tool MUST execute commands inside an nsjail sandbox with mount, PID, net, user, IPC, UTS, and cgroup namespace isolation, seccomp-bpf syscall filtering, and cgroup v2 resource limits. If the nsjail binary is not found, the system MUST fall back to the subprocess backend and log a warning.
+When `shell_backend` is set to `"nsjail"` and the nsjail binary is available, the shell tool MUST execute commands inside an nsjail sandbox with mount, PID, net, user, IPC, UTS, and cgroup namespace isolation and cgroup v2 resource limits. Seccomp-bpf syscall filtering is deferred — isolation currently relies on namespaces and cgroup limits only. If the nsjail binary is not found, the system MUST fall back to the subprocess backend and log a warning.
 
 Feature: nsjail-shell-sandboxing
 Rule: The nsjail backend is opt-in via config. It is Linux-only. On macOS or when the binary is missing, the subprocess backend is used.
@@ -114,7 +114,7 @@ Rule: The mount closes the stuck-loop bug where a sandboxed script writes result
 
 ### Requirement: nsjail config is generated dynamically per shell call
 
-The nsjail config MUST be generated as a tempfile per shell call, combining static parts (namespaces, seccomp, system mounts, base envars) with dynamic parts (time_limit, cwd, trusted mounts, /tmp mount, command). The config MUST set `cwd` to `/tmp` (the session tmpdir). The tempfile MUST be deleted after the command completes.
+The nsjail config MUST be generated as a tempfile per shell call, combining static parts (namespaces, system mounts, base envars) with dynamic parts (time_limit, cwd, trusted mounts, /tmp mount, command). The config MUST set `cwd` to `/tmp` (the session tmpdir). The tempfile MUST be deleted after the command completes.
 
 #### Scenario: Config includes per-call timeout and command
 - **GIVEN** the nsjail backend is active
