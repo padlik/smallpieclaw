@@ -597,9 +597,16 @@ class LLMClient:
             logger.error("Embedding error: %s", exc)
             raise
 
-        # Evict oldest entry when full (FIFO via dict insertion order, Python 3.7+).
-        # Lock is required: concurrent sub-agents share this LLMClient and can race
-        # on the check-evict-insert sequence causing a KeyError on del.
+        self._cache_embedding(text, vector)
+        return vector
+
+    def _cache_embedding(self, text: str, vector: list[float]) -> None:
+        """Store a single embedding vector in the bounded in-memory cache.
+
+        Evicts the oldest entry (FIFO via dict insertion order, Python 3.7+) when
+        the cache is full. Locking is required because concurrent sub-agents share
+        this LLMClient and can race on the check-evict-insert sequence.
+        """
         with self._embed_cache_lock:
             if len(self._embed_cache) >= self._embed_cache_max:
                 oldest = next(iter(self._embed_cache))
@@ -613,7 +620,61 @@ class LLMClient:
             cache_size,
             self._embed_cache_max,
         )
-        return vector
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Return embedding vectors for multiple text strings in one batch call.
+
+        OpenAI/OpenRouter and Google providers use their native batch embedding
+        endpoints; other providers fall back to serial ``embed()`` calls. Cache
+        hits are served from memory, and misses are cached after the batch call.
+        """
+        if not texts:
+            return []
+
+        results: list[Optional[list[float]]] = [None] * len(texts)
+        missing_indices: list[int] = []
+        missing_texts: list[str] = []
+
+        with self._embed_cache_lock:
+            for idx, text in enumerate(texts):
+                if text in self._embed_cache:
+                    logger.debug("embed_batch: cache hit (text_len=%d)", len(text))
+                    results[idx] = self._embed_cache[text]
+                else:
+                    missing_indices.append(idx)
+                    missing_texts.append(text)
+
+        if not missing_texts:
+            return [v for v in results if v is not None]
+
+        provider = self.emb_cfg.get("provider", "openai")
+        logger.debug(
+            "embed_batch: calling %s provider for %d texts",
+            provider,
+            len(missing_texts),
+        )
+        try:
+            if provider in ("openai", "openrouter"):
+                vectors = openai_provider.embed_batch(self._ctx(), missing_texts)
+            elif provider == "google":
+                vectors = google_provider.embed_batch(self._ctx(), missing_texts)
+            else:
+                logger.warning(
+                    "Embedding provider '%s' has no native batch support; "
+                    "falling back to serial embed() calls.",
+                    provider,
+                )
+                vectors = [self.embed(text) for text in missing_texts]
+        except _LLM_CALL_ERRORS as exc:
+            logger.error("Batch embedding error: %s", exc)
+            raise
+
+        for text, vector in zip(missing_texts, vectors, strict=True):
+            self._cache_embedding(text, vector)
+        for idx, vector in zip(missing_indices, vectors, strict=True):
+            results[idx] = vector
+
+        return [v for v in results if v is not None]
 
     # ------------------------------------------------------------------
     # Utility

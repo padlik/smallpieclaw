@@ -126,6 +126,15 @@ class LLMProvider(Protocol):
         """Generate an embedding vector for a single text string."""
         ...
 
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Generate embedding vectors for multiple text strings.
+
+        Default implementation loops over :meth:`embed` for backward
+        compatibility with Protocol implementors that do not provide a native
+        batch endpoint.
+        """
+        return [self.embed(text) for text in texts]
+
 
 # ---------------------------------------------------------------------------
 # Tool Execution

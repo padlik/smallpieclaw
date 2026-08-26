@@ -1547,3 +1547,59 @@ class TestNsjailDumpConfigOnError:
         with pytest.raises(RuntimeError):
             shell._run_shell_nsjail({"command": "echo", "timeout": 1})
         assert not cfg.exists()  # finally cleaned up despite the raise
+
+
+class TestShellErrorClassificationParity:
+    """Subprocess and PTY backends must classify standard shell errors identically."""
+
+    @pytest.mark.parametrize("backend", ["subprocess", "pty"])
+    @pytest.mark.parametrize(
+        "command, expected_error_type",
+        [
+            ("nonexistent_command_xyz_12345", "command_not_found"),
+            ("cat /nonexistent_file_xyz_12345.txt", "file_not_found"),
+        ],
+    )
+    def test_backend_error_types_match(
+        self, backend: str, command: str, expected_error_type: str, tmp_path
+    ) -> None:
+        ex = BuiltinExecutor(
+            max_output=4000,
+            data_dir=str(tmp_path),
+            shell_backend=backend,
+        )
+        result = ex.execute("shell", {"command": command, "timeout": 5})
+        assert result["error_type"] == expected_error_type
+
+    @pytest.mark.parametrize("backend", ["subprocess", "pty"])
+    def test_backend_permission_denied_matches(self, backend: str, tmp_path) -> None:
+        if sys.platform == "win32":
+            return
+        forbidden = tmp_path / "forbidden.txt"
+        forbidden.write_text("secret", encoding="utf-8")
+        forbidden.chmod(0o000)
+        try:
+            ex = BuiltinExecutor(
+                max_output=4000,
+                data_dir=str(tmp_path),
+                shell_backend=backend,
+            )
+            result = ex.execute("shell", {"command": f"cat {forbidden}", "timeout": 5})
+            assert result["error_type"] == "permission_denied"
+        finally:
+            forbidden.chmod(0o600)
+
+    @pytest.mark.parametrize("backend", ["subprocess", "pty"])
+    def test_backend_timeout_classification_matches(self, backend: str, tmp_path) -> None:
+        if sys.platform == "win32":
+            return
+        ex = BuiltinExecutor(
+            max_output=4000,
+            data_dir=str(tmp_path),
+            shell_backend=backend,
+        )
+        result = ex.execute("shell", {"command": "sleep 30", "timeout": 1})
+        assert result["success"] is False
+        assert result["error_type"] == "tool_timeout"
+        assert "timed out" in result["error"].lower()
+        assert result["exit_code"] == -1

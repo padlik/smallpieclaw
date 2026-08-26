@@ -512,6 +512,7 @@ class TestBatchPreEmbedding:
             return [0.1, 0.2, 0.3, 0.4]
 
         store._embed = _counting_embed
+        store._embed_batch = None
         store._execute = MagicMock()
         writer = self._writer(store, payload)
         writer.enqueue(self.MESSAGE, user_id="u1")
@@ -560,6 +561,45 @@ class TestBatchPreEmbedding:
         assert store._embedding_for_entity("Alice") is None
         assert calls == []
         store._clear_preloaded_embeddings()
+
+    def test_native_batch_embedding_called_once(self, store):
+        """If the embedder exposes embed_batch(), the writer calls it once."""
+        batch_calls: list[list[str]] = []
+
+        class _BatchEmbedder:
+            def __init__(self):
+                self.single_calls: list[str] = []
+
+            def embed(self, text: str) -> list[float]:
+                self.single_calls.append(text)
+                return [0.1, 0.2, 0.3, 0.4]
+
+            def embed_batch(self, texts: list[str]) -> list[list[float]]:
+                batch_calls.append(texts[:])
+                return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+        embedder = _BatchEmbedder()
+        store._embed = embedder.embed
+        store._embed_batch = embedder.embed_batch
+        store._execute = MagicMock()
+        payload = (
+            '{"entities":[{"name":"Alice","entity_type":"person"},'
+            '{"name":"Bob","entity_type":"person"}],'
+            '"facts":[{"source":"alice","target":"bob",'
+            '"relation_type":"KNOWS","fact":"Alice knows Bob."}]}'
+        )
+        writer = self._writer(store, payload)
+        writer.enqueue(self.MESSAGE, user_id="u1")
+        writer.flush()
+        time.sleep(0.3)
+        writer.stop()
+
+        # The writer should have used a single embed_batch call for all unique names.
+        assert len(batch_calls) == 1
+        assert sorted(batch_calls[0]) == ["alice", "bob"]
+        # Entity names should not have triggered serial embedding.
+        for name in ("alice", "bob"):
+            assert name not in embedder.single_calls
 
 
 class TestGraphMemoryWriter:
@@ -1052,3 +1092,57 @@ class TestGraphMemoryWriterStats:
         assert "collected_at" in stats
         assert stats["collected_at"].endswith("Z")
         writer.stop()
+
+    def test_health_status_returns_counters(self, store):
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=lambda p: '{"entities":[],"facts":[]}',
+            extract_every_n_turns=10,
+            min_message_length=10,
+        )
+        health = writer.health_status()
+        assert health == {
+            "llm_failures": 0,
+            "parse_failures": 0,
+            "write_failures": 0,
+            "batches_processed": 0,
+            "entities_extracted": 0,
+            "facts_extracted": 0,
+            "episodes_stored": 0,
+        }
+        writer.stop()
+
+    def test_health_warning_emitted_when_threshold_crossed(self, store, caplog):
+        """Once write failures cross the health threshold a warning is logged."""
+        calls = []
+
+        def _failing_upsert(name, etype, ts):
+            calls.append((name, etype))
+            raise RuntimeError("DB locked")
+
+        store.upsert_entity = _failing_upsert
+        store.add_relation = MagicMock()
+        store.add_episode = MagicMock(return_value="ep:1")
+
+        def _llm(prompt: str) -> str:
+            # Return 10 distinct entity names so we get 10 write failures quickly.
+            entities = ",".join(f'{{"name":"E{i}","entity_type":"other"}}' for i in range(10))
+            return "{" + f'"entities":[{entities}],"facts":[]' + "}"
+
+        writer = GraphMemoryWriter(
+            store=store,
+            llm_call_fn=_llm,
+            extract_every_n_turns=1,
+            min_message_length=10,
+        )
+        writer.enqueue("a long enough message to trigger health check", user_id="u1")
+        import time
+        time.sleep(0.5)
+        writer.stop()
+
+        assert writer._write_failures >= 10
+        assert any(
+            "GraphMemoryWriter health alert" in record.message
+            for record in caplog.records
+            if record.levelname == "WARNING"
+        )

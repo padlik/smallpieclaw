@@ -41,6 +41,10 @@ from datetime import datetime, timezone
 from queue import Empty, Queue
 from typing import Any, Callable, Optional
 
+import httpx
+
+from providers._errors import LLMError
+
 logger = logging.getLogger(__name__)
 
 # Max characters per recalled field rendered into the system prompt.
@@ -287,7 +291,7 @@ class GraphMemoryStore:
         # background writer thread and the main agent read thread share one
         # Connection — so reads and writes must both hold this lock.
         self._conn_lock = threading.RLock()
-        self._embed = embedder_fn
+        self._embed, self._embed_batch = self._resolve_embedder(embedder_fn)
         self._embedding_dim = embedding_dim
         # Thread-local staging area for pre-computed entity vectors from the
         # batch writer. See :meth:`_preload_embeddings`.
@@ -327,7 +331,7 @@ class GraphMemoryStore:
                 buffer_pool_size=buffer_pool_size,
                 max_num_threads=2,
             )
-        except Exception as exc:  # noqa: BLE001
+        except RuntimeError as exc:
             # LadybugDB 0.18.3: WAL corruption is signalled via generic
             # RuntimeError text. See _LADYBUG_WAL_ERROR_TOKENS.
             if not _is_ladybug_error(exc, _LADYBUG_WAL_ERROR_TOKENS):
@@ -357,6 +361,9 @@ class GraphMemoryStore:
                 buffer_pool_size=buffer_pool_size,
                 max_num_threads=2,
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("graph_memory: Unexpected error opening database: %s", exc)
+            raise
 
     # ------------------------------------------------------------------
     # Schema
@@ -370,7 +377,7 @@ class GraphMemoryStore:
         """
         try:
             self._execute("LOAD EXTENSION VECTOR")
-        except Exception as exc:  # noqa: BLE001
+        except RuntimeError as exc:
             # LadybugDB 0.18.3: the VECTOR extension must be installed before
             # it can be loaded. See _LADYBUG_EXTENSION_NOT_INSTALLED_TOKENS.
             if _is_ladybug_error(exc, _LADYBUG_EXTENSION_NOT_INSTALLED_TOKENS):
@@ -380,6 +387,9 @@ class GraphMemoryStore:
             else:
                 logger.warning("graph_memory: Failed to load VECTOR extension: %s", exc)
                 raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("graph_memory: Unexpected error loading VECTOR extension: %s", exc)
+            raise
 
     def _init_schema(self) -> None:
         self._load_vector_extension()
@@ -429,11 +439,13 @@ class GraphMemoryStore:
                 self._execute(
                     f'CALL CREATE_VECTOR_INDEX("{table}", "{idx}", "embedding")'
                 )
-            except Exception as exc:  # noqa: BLE001
+            except RuntimeError as exc:
                 # LadybugDB 0.18.3: ignore benign "index already exists" errors.
                 # See _LADYBUG_INDEX_EXISTS_TOKENS.
                 if not _is_ladybug_error(exc, _LADYBUG_INDEX_EXISTS_TOKENS):
                     logger.warning("Vector index creation warning (%s/%s): %s", table, idx, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Vector index creation warning (%s/%s): %s", table, idx, exc)
 
     def _migrate_admission_metadata(self) -> None:
         """Idempotently add admission metadata columns to a pre-existing graph DB.
@@ -461,7 +473,7 @@ class GraphMemoryStore:
                     "graph_memory: migrated %s.%s (added admission metadata, defaults applied)",
                     table, col,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except RuntimeError as exc:
                 # LadybugDB 0.18.3: ALTER ADD on an existing column raises a
                 # generic RuntimeError with one of these substrings. See
                 # _LADYBUG_MIGRATION_ERROR_TOKENS.
@@ -469,6 +481,11 @@ class GraphMemoryStore:
                     continue  # column already present — nothing to do
                 logger.warning(
                     "graph_memory: admission metadata migration for %s.%s skipped: %s",
+                    table, col, exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "graph_memory: Unexpected error migrating admission metadata for %s.%s: %s",
                     table, col, exc,
                 )
 
@@ -483,10 +500,16 @@ class GraphMemoryStore:
             self._execute("MATCH (e:Episode) RETURN e.admission_status LIMIT 1")
             self._execute("MATCH ()-[r:RELATES_TO]->() RETURN r.admission_status LIMIT 1")
             return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
+        except RuntimeError as exc:
+            logger.debug(
                 "graph_memory: admission metadata columns unavailable — recalled memory "
                 "will be treated as 'observed' (no rebuild required): %s",
+                exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "graph_memory: Unexpected error detecting admission metadata: %s",
                 exc,
             )
             return False
@@ -494,6 +517,31 @@ class GraphMemoryStore:
     # ------------------------------------------------------------------
     # Internal execute helper
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_embedder(
+        embedder_fn: Callable[[str], list[float]],
+    ) -> tuple[Callable[[str], list[float]], Callable[[list[str]], list[list[float]]]]:
+        """Return the single-text embedder and a batch helper.
+
+        If *embedder_fn* itself exposes an ``embed_batch`` attribute, or if the
+        object it is bound to exposes one, use it directly. Bound methods proxy
+        attribute lookup to ``__func__``, so we must also inspect ``__self__``
+        to find the batch implementation on the owning object. Otherwise the
+        batch helper falls back to serial calls through *embedder_fn*.
+        """
+        batch_fn = getattr(embedder_fn, "embed_batch", None)
+        if batch_fn is None:
+            owner = getattr(embedder_fn, "__self__", None)
+            batch_fn = getattr(owner, "embed_batch", None)
+        if batch_fn is not None:
+            return embedder_fn, batch_fn
+
+        def _serial_batch(texts: list[str]) -> list[list[float]]:
+            return [embedder_fn(text) for text in texts]
+
+        return embedder_fn, _serial_batch
+
 
     def _execute(self, query: str, params: Optional[dict] = None):
         """Execute a query holding the connection lock (reads and writes alike)."""
@@ -547,8 +595,13 @@ class GraphMemoryStore:
             return local_vectors[name.lower()]
         try:
             return self._embed(name)
-        except Exception as exc:  # noqa: BLE001
+        except (httpx.HTTPError, LLMError) as exc:
             logger.debug("Embedding entity '%s' failed: %s", name, exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Embedding entity '%s' failed with unexpected error: %s", name, exc
+            )
             return None
 
     def upsert_entity(
@@ -585,8 +638,10 @@ class GraphMemoryStore:
                     "MATCH (e:Entity {id:$id}) SET e.embedding=$emb",
                     {"id": entity_id, "emb": emb},
                 )
-            except Exception as exc:  # noqa: BLE001
+            except (KeyError, ValueError, RuntimeError) as exc:
                 logger.debug("Setting embedding for entity '%s' failed: %s", name, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Setting embedding for entity '%s' failed unexpectedly: %s", name, exc)
         return entity_id
 
     def add_relation(
@@ -675,8 +730,10 @@ class GraphMemoryStore:
         emb: Optional[list[float]] = None
         try:
             emb = self._embed(content[:500])
-        except Exception as exc:  # noqa: BLE001
+        except (httpx.HTTPError, LLMError) as exc:
             logger.debug("Embedding episode failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Embedding episode failed with unexpected error: %s", exc)
         if self._has_admission_meta:
             self._execute(
                 """
@@ -738,8 +795,10 @@ class GraphMemoryStore:
                             "sim": round(max(0.0, 1.0 - dist), 3),
                         }
                     )
-        except Exception as exc:  # noqa: BLE001
+        except (RuntimeError, KeyError, ValueError) as exc:
             logger.debug("Vector index search failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Vector index search failed unexpectedly: %s", exc)
         return seeds
 
     def _expand_facts(self, seed_ids: list[str], k: int) -> list[dict]:
@@ -789,8 +848,10 @@ class GraphMemoryStore:
                             "confidence": confidence,
                         }
                     )
-        except Exception as exc:  # noqa: BLE001
+        except (RuntimeError, KeyError, ValueError) as exc:
             logger.debug("Graph expansion failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Graph expansion failed unexpectedly: %s", exc)
         return facts
 
     def _search_episodes(self, query_vec: list[float], k: int) -> list[dict]:
@@ -820,8 +881,10 @@ class GraphMemoryStore:
                             "confidence": ep_conf if ep_conf is not None else CONFIDENCE_OBSERVED,
                         }
                     )
-        except Exception as exc:  # noqa: BLE001
+        except (RuntimeError, KeyError, ValueError) as exc:
             logger.debug("Episode vector search failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Episode vector search failed unexpectedly: %s", exc)
         return episodes
 
     def search(self, query: str, k: int = 10) -> dict:
@@ -834,8 +897,11 @@ class GraphMemoryStore:
         """
         try:
             query_vec = self._embed(query)
-        except Exception as exc:  # noqa: BLE001
+        except (httpx.HTTPError, LLMError) as exc:
             logger.debug("Graph memory search embed failed: %s", exc)
+            return {"seeds": [], "facts": [], "episodes": []}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Graph memory search embed failed unexpectedly: %s", exc)
             return {"seeds": [], "facts": [], "episodes": []}
 
         seeds = self._seed_entities(query_vec, k)
@@ -912,8 +978,10 @@ class GraphMemoryStore:
         try:
             self._conn.close()
             self._db.close()
-        except Exception as exc:  # noqa: BLE001
+        except (RuntimeError, OSError) as exc:
             logger.debug("GraphMemoryStore close error: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("GraphMemoryStore close error: %s", exc)
 
     def get_stats(self) -> dict[str, Any]:
         """Return privacy-safe DB statistics.
@@ -951,7 +1019,10 @@ class GraphMemoryStore:
                     r = self._conn.execute(query, {})
                     if r.has_next():
                         stats[key] = r.get_next()[0]
+            except (RuntimeError, KeyError, ValueError) as exc:
+                errors.append(f"{key}: {exc}")
             except Exception as exc:  # noqa: BLE001
+                logger.warning("Unexpected error counting %s: %s", key, exc)
                 errors.append(f"{key}: {exc}")
 
         _count("MATCH (e:Entity) RETURN COUNT(e)", "entity_count")
@@ -965,7 +1036,10 @@ class GraphMemoryStore:
                     val = r.get_next()[0]
                     if val is not None:
                         stats["latest_episode_ts"] = str(val)
+        except (RuntimeError, KeyError, ValueError) as exc:
+            errors.append(f"latest_episode_ts: {exc}")
         except Exception as exc:  # noqa: BLE001
+            logger.warning("Unexpected error probing latest episode: %s", exc)
             errors.append(f"latest_episode_ts: {exc}")
 
         try:
@@ -978,7 +1052,10 @@ class GraphMemoryStore:
                 # A successful execute (even with no rows) means the index is reachable.
                 _ = probe.has_next()
             stats["vector_index_ok"] = True
+        except (RuntimeError, KeyError, ValueError) as exc:
+            errors.append(f"vector_index: {exc}")
         except Exception as exc:  # noqa: BLE001
+            logger.warning("Unexpected error probing vector index: %s", exc)
             errors.append(f"vector_index: {exc}")
 
         if errors:
@@ -1035,6 +1112,7 @@ class GraphMemoryWriter:
         self._facts_extracted: int = 0
         self._episodes_stored: int = 0
         self._write_failures: int = 0
+        self._health_alerted: bool = False
         self._thread = threading.Thread(target=self._worker, daemon=True, name="graph-memory-writer")
         self._thread.start()
         logger.info("GraphMemoryWriter started (every_n=%d, min_len=%d)", self._every_n, self._min_len)
@@ -1116,6 +1194,96 @@ class GraphMemoryWriter:
             "collected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
 
+    def health_status(self) -> dict[str, Any]:
+        """Return a snapshot of the writer's operational health.
+
+        Returns a dict with keys:
+          llm_failures      — LLM call failures during extraction
+          parse_failures    — batches where parse_extraction returned nothing
+          write_failures    — individual write errors (entity/fact/episode)
+          batches_processed — batches successfully processed by the worker
+          entities_extracted — total Entity nodes upserted
+          facts_extracted   — total RELATES_TO edges upserted
+          episodes_stored   — total Episode nodes stored
+        """
+        return {
+            "llm_failures": self._llm_failures,
+            "parse_failures": self._parse_failures,
+            "write_failures": self._write_failures,
+            "batches_processed": self._batches_processed,
+            "entities_extracted": self._entities_extracted,
+            "facts_extracted": self._facts_extracted,
+            "episodes_stored": self._episodes_stored,
+        }
+
+    _HEALTH_THRESHOLD = 10
+
+    def _check_health(self) -> None:
+        """Emit a warning when failure counters cross the health threshold.
+
+        Called at the end of every batch; failures are still swallowed so the
+        daemon remains resilient, but operators are alerted once thresholds are
+        crossed.
+        """
+        if (
+            not self._health_alerted
+            and (
+                self._llm_failures >= self._HEALTH_THRESHOLD
+                or self._write_failures >= self._HEALTH_THRESHOLD
+            )
+        ):
+            logger.warning(
+                "GraphMemoryWriter health alert: llm_failures=%d, write_failures=%d, "
+                "parse_failures=%d, batches_processed=%d",
+                self._llm_failures,
+                self._write_failures,
+                self._parse_failures,
+                self._batches_processed,
+            )
+            self._health_alerted = True
+
+    def _compute_entity_vectors(
+        self,
+        unique_entity_names: set[str],
+    ) -> dict[str, Optional[list[float]]]:
+        """Pre-compute embeddings for a set of entity names.
+
+        Attempts a single batch embedding call if the embedder supports it;
+        otherwise falls back to serial per-name embedding. Each failure is
+        recorded as ``None`` so :meth:`_embedding_for_entity` does not retry.
+        """
+        entity_vectors: dict[str, Optional[list[float]]] = {}
+        if not unique_entity_names:
+            return entity_vectors
+
+        names = list(unique_entity_names)
+        batch_fn: Any = getattr(self._store, "_embed_batch", None)
+        if batch_fn is None:
+            batch_fn = getattr(self._store._embed, "embed_batch", None)
+        try:
+            if callable(batch_fn):
+                vectors = batch_fn(names)
+                for name, vector in zip(names, vectors, strict=True):
+                    entity_vectors[name] = vector
+                return entity_vectors
+        except (httpx.HTTPError, LLMError) as exc:
+            logger.debug("Batch entity embedding failed, falling back to serial: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Batch entity embedding failed unexpectedly, falling back to serial: %s", exc
+            )
+
+        for name in names:
+            try:
+                entity_vectors[name] = self._store._embed(name)
+            except (httpx.HTTPError, LLMError) as exc:
+                entity_vectors[name] = None
+                logger.debug("Batch pre-embedding failed for '%s': %s", name, exc)
+            except Exception as exc:  # noqa: BLE001
+                entity_vectors[name] = None
+                logger.warning("Batch pre-embedding failed unexpectedly for '%s': %s", name, exc)
+        return entity_vectors
+
     def _worker(self) -> None:
         while True:
             try:
@@ -1127,6 +1295,8 @@ class GraphMemoryWriter:
             try:
                 self._process_batch(item)
             except Exception as exc:  # noqa: BLE001
+                # This is the daemon's outer resilience boundary: catch anything
+                # that escaped _process_batch so the worker never crashes.
                 logger.warning("GraphMemoryWriter batch failed: %s", exc)
             finally:
                 self._queue.task_done()
@@ -1141,8 +1311,12 @@ class GraphMemoryWriter:
         prompt = EXTRACTION_PROMPT + combined_text
         try:
             response = self._llm_call(prompt)
-        except Exception as exc:  # noqa: BLE001
+        except (LLMError, httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError) as exc:
             logger.debug("Extraction LLM call failed: %s", exc)
+            self._llm_failures += 1
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Extraction LLM call failed unexpectedly: %s", exc)
             self._llm_failures += 1
             return
 
@@ -1157,13 +1331,9 @@ class GraphMemoryWriter:
         # Pre-compute embeddings for every unique entity name referenced in this
         # batch. The public :meth:`GraphMemoryStore.upsert_entity` will consume
         # these staged vectors from thread-local storage, avoiding a separate
-        # embedding network round-trip per entity.
-        #
-        # TODO(TD-11): Replace the serial ``_embed(name)`` loop below with a
-        # single ``LLMClient.embed_batch(names)`` call once the LLM client and
-        # its provider backends expose native batch embedding (OpenAI's
-        # ``/embeddings`` endpoint and Gemini's batch embedContent both accept
-        # lists, but the current provider wrappers only accept a single string).
+        # embedding network round-trip per entity. ``_compute_entity_vectors`` uses
+        # the embedder's native ``embed_batch()`` when available (OpenAI/Gemini)
+        # and falls back to serial embedding for other providers.
         # Keyed case-insensitively to match how endpoints are de-duplicated below
         # (entity_ids uses name.lower()) — otherwise "Alice" in entities and
         # "alice" in facts would each cost their own embedding round-trip.
@@ -1174,15 +1344,7 @@ class GraphMemoryWriter:
             unique_entity_names.add(fact.source.lower())
             unique_entity_names.add(fact.target.lower())
 
-        entity_vectors: dict[str, Optional[list[float]]] = {}
-        for name in unique_entity_names:
-            try:
-                entity_vectors[name] = self._store._embed(name)
-            except Exception as exc:  # noqa: BLE001
-                # Record the failure (None) rather than omitting the key, so
-                # upsert_entity does not retry the same failing embed call.
-                entity_vectors[name] = None
-                logger.debug("Batch pre-embedding failed for '%s': %s", name, exc)
+        entity_vectors = self._compute_entity_vectors(unique_entity_names)
         self._store._preload_embeddings(entity_vectors)
 
         try:
@@ -1193,8 +1355,13 @@ class GraphMemoryWriter:
                     eid = self._store.upsert_entity(entity.name, entity.entity_type, ts)
                     entity_ids[entity.name.lower()] = eid
                     self._entities_extracted += 1
-                except Exception as exc:  # noqa: BLE001
+                except (KeyError, ValueError, RuntimeError) as exc:
                     logger.debug("upsert_entity failed for '%s': %s", entity.name, exc)
+                    self._write_failures += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "upsert_entity failed unexpectedly for '%s': %s", entity.name, exc
+                    )
                     self._write_failures += 1
 
             # Upsert relationships. Endpoints must already exist as nodes for
@@ -1215,21 +1382,30 @@ class GraphMemoryWriter:
                         entity_ids[tgt_key] = tgt_id
                     self._store.add_relation(src_id, tgt_id, fact.relation_type, fact.fact, ts)
                     self._facts_extracted += 1
-                except Exception as exc:  # noqa: BLE001
+                except (KeyError, ValueError, RuntimeError) as exc:
                     logger.debug("add_relation failed: %s", exc)
+                    self._write_failures += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("add_relation failed unexpectedly: %s", exc)
                     self._write_failures += 1
 
             # Optionally record episode
             try:
                 self._store.add_episode(combined_text[:1000], user_id, source)
                 self._episodes_stored += 1
-            except Exception as exc:  # noqa: BLE001
+            except (KeyError, ValueError, RuntimeError) as exc:
                 logger.debug("add_episode failed: %s", exc)
+                self._write_failures += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "add_episode failed unexpectedly: %s", exc
+                )
                 self._write_failures += 1
         finally:
             self._store._clear_preloaded_embeddings()
 
         self._batches_processed += 1
+        self._check_health()
         logger.info(
             "GraphMemory writer: extracted %d entities, %d facts from %d messages",
             len(result.entities),
@@ -1249,6 +1425,7 @@ def create_graph_memory(
     embedder_fn: Callable[[str], list[float]],
     llm_call_fn: Callable[[str], str],
     embedding_dim: int = 1536,
+    embed_batch_fn: Optional[Callable[[list[str]], list[list[float]]]] = None,
 ) -> tuple[Optional[GraphMemoryStore], Optional[GraphMemoryWriter]]:
     """Create GraphMemoryStore + GraphMemoryWriter from AppConfig.
 
@@ -1263,6 +1440,9 @@ def create_graph_memory(
     embedder_fn   : callable(text) -> embedding vector (list of floats)
     llm_call_fn   : callable(prompt) -> response text (extraction LLM)
     embedding_dim : dimension of vectors returned by embedder_fn
+    embed_batch_fn : optional callable(texts) -> list of embedding vectors;
+                     used by the writer to batch entity embeddings. If omitted,
+                     the store resolves a batch helper from ``embedder_fn``.
     """
     gm_cfg = cfg.graph_memory
     if not gm_cfg.enabled:
@@ -1283,6 +1463,8 @@ def create_graph_memory(
             embedding_dim=embedding_dim,
             buffer_pool_mb=gm_cfg.buffer_pool_mb,
         )
+        if embed_batch_fn is not None:
+            store._embed_batch = embed_batch_fn
         writer = GraphMemoryWriter(
             store=store,
             llm_call_fn=llm_call_fn,
@@ -1290,8 +1472,11 @@ def create_graph_memory(
             min_message_length=gm_cfg.min_message_length,
         )
         return store, writer
-    except Exception as exc:  # noqa: BLE001
+    except (RuntimeError, OSError, ValueError) as exc:
         logger.error("Failed to initialise graph memory: %s", exc)
+        return None, None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to initialise graph memory with unexpected error: %s", exc)
         return None, None
 
 
@@ -1403,8 +1588,11 @@ def _load_backfill_state(state_path: str) -> dict:
         if not isinstance(data.get("imported"), dict):
             raise ValueError("malformed state file")
         return data
-    except Exception as exc:  # noqa: BLE001
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
         logger.warning("Backfill state file unreadable (%s) — starting fresh", exc)
+        return {"version": 1, "imported": {}}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Backfill state file unreadable with unexpected error (%s) — starting fresh", exc)
         return {"version": 1, "imported": {}}
 
 
@@ -1506,11 +1694,18 @@ def backfill_longterm_to_graph(
         prompt = EXTRACTION_PROMPT + migration_text
         try:
             response = llm_call_fn(prompt)
-        except Exception as exc:  # noqa: BLE001
+        except (LLMError, httpx.HTTPError, httpx.TimeoutException) as exc:
             result.failed += 1
             er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
             result.entries.append(er)
             logger.warning("Backfill LLM extraction failed for %s: %s", entry_id, exc)
+            _notify(er)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            result.failed += 1
+            er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.entries.append(er)
+            logger.warning("Backfill LLM extraction failed unexpectedly for %s: %s", entry_id, exc)
             _notify(er)
             continue
 
@@ -1519,11 +1714,18 @@ def backfill_longterm_to_graph(
             # No entities/facts found — still write episode for raw-text retrieval
             try:
                 ep_id = store.add_episode(content[:2000], user_id="backfill", source="longterm_memory_backfill")
-            except Exception as exc:  # noqa: BLE001
+            except (KeyError, ValueError, RuntimeError) as exc:
                 result.failed += 1
                 er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
                 result.entries.append(er)
                 logger.warning("Backfill add_episode failed for %s: %s", entry_id, exc)
+                _notify(er)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                result.failed += 1
+                er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+                result.entries.append(er)
+                logger.warning("Backfill add_episode failed unexpectedly for %s: %s", entry_id, exc)
                 _notify(er)
                 continue
             result.no_extraction += 1
@@ -1561,8 +1763,10 @@ def backfill_longterm_to_graph(
                 eid = store.upsert_entity(entity.name, entity.entity_type, ts)
                 entity_ids[entity.name.lower()] = eid
                 entities_written += 1
-            except Exception as exc:  # noqa: BLE001
+            except (KeyError, ValueError, RuntimeError) as exc:
                 logger.debug("Backfill upsert_entity failed for '%s': %s", entity.name, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Backfill upsert_entity failed unexpectedly for '%s': %s", entity.name, exc)
 
         for fact in extraction.facts:
             src_key = fact.source.lower()
@@ -1578,16 +1782,25 @@ def backfill_longterm_to_graph(
                     entity_ids[tgt_key] = tgt_id
                 store.add_relation(src_id, tgt_id, fact.relation_type, fact.fact, ts)
                 facts_written += 1
-            except Exception as exc:  # noqa: BLE001
+            except (KeyError, ValueError, RuntimeError) as exc:
                 logger.debug("Backfill add_relation failed: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Backfill add_relation failed unexpectedly: %s", exc)
 
         try:
             ep_id = store.add_episode(content[:2000], user_id="backfill", source="longterm_memory_backfill")
-        except Exception as exc:  # noqa: BLE001
+        except (KeyError, ValueError, RuntimeError) as exc:
             result.failed += 1
             er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
             result.entries.append(er)
             logger.warning("Backfill add_episode failed for %s: %s", entry_id, exc)
+            _notify(er)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            result.failed += 1
+            er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.entries.append(er)
+            logger.warning("Backfill add_episode failed unexpectedly for %s: %s", entry_id, exc)
             _notify(er)
             continue
 

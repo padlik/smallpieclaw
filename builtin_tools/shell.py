@@ -16,6 +16,7 @@ from __future__ import annotations
 import codecs
 import logging
 import os
+import re as _re
 import secrets
 import signal
 import subprocess
@@ -145,6 +146,185 @@ def _pump_streams(
     streams.clear()
 
     return timed_out
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the whole process group (POSIX) or the process (Windows)."""
+    if sys.platform != "win32":
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+class _ShellArtifactLog:
+    """Wrapper around a run-specific shell artifact log file.
+
+    Handles incremental stdout/stderr writes, the stderr separator header,
+    and best-effort disable-on-error semantics.  When a write fails the log
+    is silently closed and unlinked so a partial artifact is never exposed.
+    """
+
+    def __init__(
+        self,
+        fh: Optional[_SupportsWriteClose],
+        path: Optional[str],
+        max_output: int,
+    ) -> None:
+        self._fh = fh
+        self._path = path
+        self._max_output = max_output
+        self._stderr_header_written = False
+        self._disabled = False
+
+    def write_stdout(self, text: str) -> None:
+        """Append stdout text to the artifact log if active."""
+        self._write(text)
+
+    def write_stderr(self, text: str) -> None:
+        """Append stderr text to the artifact log, inserting the header once."""
+        if self._fh is None or self._disabled:
+            return
+        if text and not self._stderr_header_written:
+            self._write("\n--- stderr ---\n")
+            self._stderr_header_written = True
+        self._write(text)
+
+    def _write(self, text: str) -> None:
+        if not text or self._disabled:
+            return
+        if self._fh is None:
+            return
+        try:
+            self._fh.write(text)
+        except OSError:
+            self.disable()
+
+    def disable(self) -> None:
+        """Silently close and unlink the artifact log on write failure."""
+        if self._disabled:
+            return
+        self._disabled = True
+        fh, path = self._fh, self._path
+        self._fh = None
+        self._path = None
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def finalize(
+        self,
+        shell: ShellTools,
+        total_chars: int,
+        caller_tag: str = "",
+    ) -> Optional[str]:
+        """Delegate finalization to the ShellTools owner and return the kept path or None."""
+        return shell._finalize_shell_log(self._fh, self._path, total_chars, caller_tag)
+
+
+class _StreamAccumulator:
+    """Rolling tail + total-char counters for stdout and stderr streams."""
+
+    def __init__(self, max_output: int) -> None:
+        self._max_output = max_output
+        self._tail_out = ""
+        self._tail_err = ""
+        self._total_out = 0
+        self._total_err = 0
+
+    def append_stdout(self, text: str) -> None:
+        """Add stdout text to the rolling tail and total counter."""
+        if not text:
+            return
+        self._total_out += len(text)
+        self._tail_out = (self._tail_out + text)[-self._max_output:]
+
+    def append_stderr(self, text: str) -> None:
+        """Add stderr text to the rolling tail and total counter."""
+        if not text:
+            return
+        self._total_err += len(text)
+        self._tail_err = (self._tail_err + text)[-self._max_output:]
+
+    def append_output(self, text: str) -> None:
+        """Add merged stdout/stderr text (PTY single-stream) to the rolling tail."""
+        self.append_stdout(text)
+
+    def truncated_output(self) -> str:
+        """Return the truncated stdout representation."""
+        return _truncate_tail(self._tail_out, self._total_out, self._max_output)
+
+    def truncated_error(self) -> str:
+        """Return the truncated stderr representation."""
+        return _truncate_tail(self._tail_err, self._total_err, self._max_output)
+
+    @property
+    def total_combined(self) -> int:
+        """Combined stdout + stderr character count."""
+        return self._total_out + self._total_err
+
+
+def _process_pty_chunk(
+    chunk: str,
+    accumulator: _StreamAccumulator,
+    artifact_log: _ShellArtifactLog,
+    chunk_callback: Optional[Callable[[str], None]],
+    streaming: bool,
+    ansi_re: _re.Pattern[str],
+) -> None:
+    """Normalize and account for one PTY chunk.
+
+    Strips ANSI sequences, updates the rolling tail, writes to the artifact
+    log, and forwards to the streaming callback when enabled.
+    """
+    chunk = chunk.replace('\r\n', '\n').replace('\r', '\n')
+    chunk = ansi_re.sub('', chunk)
+    accumulator.append_output(chunk)
+    artifact_log.write_stdout(chunk)
+    if streaming and chunk_callback is not None:
+        try:
+            chunk_callback(chunk)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _drain_pty_output(
+    proc: object,
+    accumulator: _StreamAccumulator,
+    artifact_log: _ShellArtifactLog,
+    chunk_callback: Optional[Callable[[str], None]],
+    streaming: bool,
+    ansi_re: _re.Pattern[str],
+    max_iterations: int = 20,
+) -> None:
+    """Read remaining PTY output after the main select loop exits.
+
+    Bound by ``max_iterations`` and a short per-iteration select timeout so the
+    drain cannot block indefinitely on an escaped descendant.
+    """
+    import select as _select
+
+    for _ in range(max_iterations):
+        try:
+            r, _, _ = _select.select([proc.fd], [], [], 0.05)
+            if not r:
+                break
+            chunk = proc.read(4096)
+            _process_pty_chunk(chunk, accumulator, artifact_log, chunk_callback, streaming, ansi_re)
+        except (EOFError, OSError, ValueError):
+            break
 
 
 def _classify_exit(
@@ -469,22 +649,13 @@ class ShellTools:
 
         # Open artifact log for incremental writing; kept only if output is large.
         _log_fh, _artifact_path = self._open_shell_log(caller_tag, conv_id=conv_id)
-        _tail_out = ""
-        _tail_err = ""
-        _total_out = 0
-        _total_err = 0
-        _stderr_header_written = False
+        artifact_log = _ShellArtifactLog(_log_fh, _artifact_path, self._owner.max_output)
+        accumulator = _StreamAccumulator(self._owner.max_output)
 
         try:
             proc = _spawn(command, nsjail_cmd=nsjail_cmd)
         except OSError as exc:
-            if _log_fh:
-                _log_fh.close()
-            if _artifact_path:
-                try:
-                    os.unlink(_artifact_path)
-                except OSError:
-                    pass
+            artifact_log.disable()
             err_text = str(exc)
             error_type = "command_not_found" if "No such file or directory" in err_text else "tool_timeout"
             suggestion = (
@@ -502,68 +673,19 @@ class ShellTools:
                 "suggestion": suggestion,
             }
 
-        def _kill_tree() -> None:
-            """Kill the whole process group (POSIX) or the process (Windows)."""
-            if sys.platform != "win32":
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    return
-                except (OSError, ProcessLookupError):
-                    pass
-            try:
-                proc.kill()
-            except OSError:
-                pass
-
-        def _disable_artifact_log() -> None:
-            """Silently close and unlink the artifact on write failure."""
-            nonlocal _log_fh, _artifact_path
-            fh, path = _log_fh, _artifact_path
-            _log_fh = None
-            _artifact_path = None
-            if fh is not None:
-                try:
-                    fh.close()
-                except OSError:
-                    pass
-            if path is not None:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-
         def _append_stdout(text: str) -> None:
-            nonlocal _tail_out, _total_out
-            if not text:
-                return
-            _total_out += len(text)
-            _tail_out = (_tail_out + text)[-self._owner.max_output:]
-            if _log_fh is not None:
-                try:
-                    _log_fh.write(text)
-                except OSError:
-                    _disable_artifact_log()
+            accumulator.append_stdout(text)
+            artifact_log.write_stdout(text)
 
         def _append_stderr(text: str) -> None:
-            nonlocal _tail_err, _total_err, _stderr_header_written
-            if not text:
-                return
-            _total_err += len(text)
-            _tail_err = (_tail_err + text)[-self._owner.max_output:]
-            if _log_fh is not None:
-                try:
-                    if not _stderr_header_written:
-                        _log_fh.write("\n--- stderr ---\n")
-                        _stderr_header_written = True
-                    _log_fh.write(text)
-                except OSError:
-                    _disable_artifact_log()
+            accumulator.append_stderr(text)
+            artifact_log.write_stderr(text)
 
         deadline = _start + timeout
         timed_out = _pump_streams(proc, deadline, _append_stdout, _append_stderr)
 
         if timed_out:
-            _kill_tree()
+            _kill_tree(proc)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -574,19 +696,18 @@ class ShellTools:
                 proc.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 timed_out = True
-                _kill_tree()
+                _kill_tree(proc)
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
 
         elapsed_ms = (time.monotonic() - _start) * 1000.0
-        total_combined = _total_out + _total_err
-        full_log_path = self._finalize_shell_log(_log_fh, _artifact_path, total_combined, caller_tag)
+        full_log_path = artifact_log.finalize(self, accumulator.total_combined, caller_tag)
 
         # Build truncated outputs from rolling tails using correct total counts.
-        output = _truncate_tail(_tail_out, _total_out, self._owner.max_output)
-        error = _truncate_tail(_tail_err, _total_err, self._owner.max_output)
+        output = accumulator.truncated_output()
+        error = accumulator.truncated_error()
 
         returncode = proc.returncode if not timed_out else -1
 
@@ -609,7 +730,7 @@ class ShellTools:
 
         logger.info(
             "Built-in shell exit=%s stdout=%d stderr=%d chars in %.0fms",
-            returncode, _total_out, _total_err, elapsed_ms,
+            returncode, accumulator._total_out, accumulator._total_err, elapsed_ms,
         )
 
         return _classify_exit(
@@ -644,7 +765,6 @@ class ShellTools:
             return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
         import select as _select
-        import re as _re
         _ANSI_RE = _re.compile(r'\x1b\[[0-9;]*[mGKHF]|\x1b\].*?\x07')
 
         try:
@@ -658,16 +778,13 @@ class ShellTools:
             return self._run_shell_subprocess(args, caller_tag=caller_tag)
 
         import time as _time
-        total_chars = 0
         timed_out = False
         _start = _time.monotonic()
         deadline = _start + timeout
 
-        # Rolling tail: bounded memory regardless of how much the process emits.
-        _tail = ""
-
-        # Open artifact log for incremental writing.
+        accumulator = _StreamAccumulator(self._owner.max_output)
         _log_fh, _artifact_path = self._open_shell_log(caller_tag, conv_id=conv_id)
+        artifact_log = _ShellArtifactLog(_log_fh, _artifact_path, self._owner.max_output)
 
         try:
             while proc.isalive():
@@ -685,39 +802,17 @@ class ShellTools:
                     chunk = proc.read(4096)
                 except EOFError:
                     break
-                # Normalize TTY line endings and strip ANSI for clean LLM output
-                chunk = chunk.replace('\r\n', '\n').replace('\r', '\n')
-                chunk = _ANSI_RE.sub('', chunk)
-                total_chars += len(chunk)
-                _tail = (_tail + chunk)[-self._owner.max_output:]
-                if _log_fh is not None:
-                    _log_fh.write(chunk)
-                if streaming and chunk_callback is not None:
-                    try:
-                        chunk_callback(chunk)
-                    except Exception:  # noqa: BLE001
-                        pass
+                _process_pty_chunk(
+                    chunk, accumulator, artifact_log,
+                    chunk_callback, streaming, _ANSI_RE,
+                )
 
             # Drain remaining output after loop
             if not timed_out:
-                for _ in range(20):
-                    try:
-                        r, _, _ = _select.select([proc.fd], [], [], 0.05)
-                        if not r:
-                            break
-                        chunk = proc.read(4096).replace('\r\n', '\n').replace('\r', '\n')
-                        chunk = _ANSI_RE.sub('', chunk)
-                        total_chars += len(chunk)
-                        _tail = (_tail + chunk)[-self._owner.max_output:]
-                        if _log_fh is not None:
-                            _log_fh.write(chunk)
-                        if streaming and chunk_callback is not None:
-                            try:
-                                chunk_callback(chunk)
-                            except Exception:  # noqa: BLE001
-                                pass
-                    except (EOFError, OSError, ValueError):
-                        break
+                _drain_pty_output(
+                    proc, accumulator, artifact_log,
+                    chunk_callback, streaming, _ANSI_RE,
+                )
         finally:
             if timed_out:
                 # On POSIX, signal the PTY child's process group so background
@@ -731,9 +826,10 @@ class ShellTools:
             proc.close(force=False)
 
         elapsed_ms = (_time.monotonic() - _start) * 1000.0
-        full_log_path = self._finalize_shell_log(_log_fh, _artifact_path, total_chars, caller_tag)
+        total_chars = accumulator.total_combined
+        full_log_path = artifact_log.finalize(self, total_chars, caller_tag)
 
-        output = _truncate_tail(_tail, total_chars, self._owner.max_output)
+        output = accumulator.truncated_output()
         if full_log_path:
             output = output + f"\n[full output saved to: {full_log_path} — use file_read to view it]"
 
@@ -745,40 +841,12 @@ class ShellTools:
             "Built-in shell (pty) exit=%s combined=%d chars in %.0fms",
             exit_code, total_chars, elapsed_ms,
         )
-        if timed_out:
-            return {
-                "success": False,
-                "output": output,
-                "error": f"Command timed out after {timeout}s.",
-                "exit_code": -1,
-                "elapsed_ms": round(elapsed_ms),
-                "full_log_path": full_log_path,
-                "error_type": "tool_timeout",
-                "recoverable": True,
-                "suggestion": "Try the command again with a longer timeout.",
-            }
-        error_type = ""
-        recoverable = False
-        suggestion = ""
-        if exit_code != 0:
-            output_lower = output.lower()
-            if "permission denied" in output_lower:
-                error_type = "permission_denied"
-                suggestion = "Check file permissions or use sudo."
-            elif "command not found" in output_lower:
-                error_type = "command_not_found"
-                suggestion = "Check the command name or install the missing executable."
-            elif "no such file or directory" in output_lower:
-                error_type = "file_not_found"
-                suggestion = "Check the file path or create the missing file."
-        return {
-            "success": exit_code == 0,
-            "output": output,
-            "error": "" if exit_code == 0 else output,
-            "exit_code": exit_code,
-            "elapsed_ms": round(elapsed_ms),
-            "full_log_path": full_log_path,
-            "error_type": error_type,
-            "recoverable": recoverable,
-            "suggestion": suggestion,
-        }
+
+        # PTY merges stderr into stdout, so pass the merged output as both
+        # output and the classification error source.  _classify_exit handles
+        # the success/error field split and timeout path uniformly with the
+        # subprocess backend.
+        return _classify_exit(
+            exit_code, output, output if (exit_code != 0 and not timed_out) else "", elapsed_ms, full_log_path,
+            timed_out=timed_out, timeout=timeout, is_nsjail_error=False,
+        )

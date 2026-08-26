@@ -270,3 +270,29 @@ def embed(ctx: ProviderContext, text: str) -> list[float]:
     )
     resp.raise_for_status()
     return resp.json()["data"][0]["embedding"]
+
+
+def embed_batch(ctx: ProviderContext, texts: list[str]) -> list[list[float]]:
+    """Return embedding vectors for a batch of texts via ``/embeddings``.
+
+    OpenAI's embedding endpoint accepts a list of strings in the ``input`` field
+    and returns one ``embedding`` entry per input in the same order.
+    """
+    resp = _with_retry(
+        lambda: ctx.http.post(
+            f"{ctx.emb_cfg['base_url'].rstrip('/')}/embeddings",
+            headers={
+                "Authorization": f"Bearer {ctx.emb_cfg['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={"model": ctx.emb_cfg["model"], "input": texts},
+        ),
+        ctx.max_retries, ctx.retry_delay,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data") or []
+    if len(data) != len(texts):
+        raise LLMError(
+            f"OpenAI embedding batch returned {len(data)} vectors for {len(texts)} inputs"
+        )
+    return [item["embedding"] for item in data]

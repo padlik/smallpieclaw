@@ -329,3 +329,31 @@ def embed(ctx: ProviderContext, text: str) -> list[float]:
     )
     resp.raise_for_status()
     return resp.json()["embedding"]["values"]
+
+
+def embed_batch(ctx: ProviderContext, texts: list[str]) -> list[list[float]]:
+    """Return embedding vectors for a batch of texts via ``:batchEmbedContents``.
+
+    Gemini's batch embedding endpoint accepts a list of ``requests``, each with a
+    ``content`` payload, and returns one ``embedding`` entry per request in the
+    same order.
+    """
+    api_key = ctx.emb_cfg["api_key"]
+    model = ctx.emb_cfg.get("model", "models/text-embedding-004")
+    # Gemini's batchEmbedContents endpoint requires each request to include the
+    # target model (format ``models/...``), not just the content payload.
+    requests = [{"model": model, "content": {"parts": [{"text": text}]}} for text in texts]
+    resp = _with_retry(
+        lambda: ctx.http.post(
+            f"https://generativelanguage.googleapis.com/v1beta/{model}:batchEmbedContents?key={api_key}",
+            json={"requests": requests},
+        ),
+        ctx.max_retries, ctx.retry_delay,
+    )
+    resp.raise_for_status()
+    embeddings = resp.json().get("embeddings") or []
+    if len(embeddings) != len(texts):
+        raise LLMError(
+            f"Google embedding batch returned {len(embeddings)} vectors for {len(texts)} inputs"
+        )
+    return [item["values"] for item in embeddings]

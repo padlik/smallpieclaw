@@ -706,7 +706,7 @@ def _run(
             graph_memory_store, graph_memory_writer = create_graph_memory(
                 cfg=app_cfg,
                 db_path=str(paths.graph_memory_db),
-                embedder_fn=_embedder_fn,
+                embedder_fn=llm.embed,
                 llm_call_fn=_llm_call_fn,
                 embedding_dim=len(llm.embed("test")),
             )
