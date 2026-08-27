@@ -24,10 +24,11 @@ import structlog
 from builtin_tools.logquery_helpers import (
     _LOG_QUERY_MAX_SCAN_LINES,
     _LOG_QUERY_TAIL_BYTES,
+    LogQueryFilters,
     _log_level_to_num,
-    _log_query_default_keep,
     _log_query_project,
     _read_tail_lines,
+    filter_log_lines,
 )
 
 if TYPE_CHECKING:
@@ -216,8 +217,6 @@ class LogQueryTools:
         use_default_view = not level_arg and not event_type_arg and not text_arg
         min_level = _log_level_to_num(level_arg) if level_arg else 0
         # casefold gives correct Unicode case-folding (e.g. German ß → ss).
-        text_folded = text_arg.casefold() if text_arg else ""
-
         # Trace scope resolution (priority: explicit arg > auto-widen > current-run).
         #
         # When text/query or prompt_id is given and the caller did NOT supply a
@@ -260,41 +259,19 @@ class LogQueryTools:
             return self._log_query_result([], 0, False)
         scanned_lines = len(lines)
 
-        matched: list[dict] = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except (ValueError, TypeError):
-                continue  # skip malformed (non-JSON) lines gracefully
-            if not isinstance(rec, dict):
-                continue
-
-            if not all_traces and str(rec.get("trace", "")) != trace:
-                continue
-            if prompt_id_arg is not None:
-                # The logging context stores prompt_id as a string (see
-                # agent_logging.bind_run_context). Tool calls may supply either a
-                # string or an integer; compare both sides as strings.
-                rec_prompt_id = rec.get("prompt_id")
-                if str(rec_prompt_id) != str(prompt_id_arg):
-                    continue
-            if since_arg and str(rec.get("ts", "")) < since_arg:
-                continue
-            if tool_arg and rec.get("tool") != tool_arg:
-                continue
-            if level_arg and _log_level_to_num(rec.get("level")) < min_level:
-                continue
-            if event_type_arg and rec.get("event_type") != event_type_arg:
-                continue
-            if use_default_view and not _log_query_default_keep(rec):
-                continue
-            if text_folded and text_folded not in json.dumps(rec, ensure_ascii=False).casefold():
-                continue
-
-            matched.append(rec)
+        filters = LogQueryFilters(
+            trace=trace,
+            all_traces=all_traces,
+            level=level_arg,
+            min_level=min_level,
+            event_type=event_type_arg,
+            tool=tool_arg,
+            since=since_arg,
+            prompt_id=prompt_id_arg,
+            text=text_arg,
+            use_default_view=use_default_view,
+        )
+        matched = filter_log_lines(lines, filters)
 
         total_matched = len(matched)
         truncated = total_matched > limit

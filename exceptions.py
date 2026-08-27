@@ -18,20 +18,8 @@ class ToolError(AgentError):
     """Tool execution failure — timeout, crash, invalid output."""
 
 
-class ToolTimeoutError(ToolError):
-    """Tool exceeded its allowed execution time."""
-
-
 class MCPError(AgentError):
     """MCP server communication failure."""
-
-
-class MCPConnectionError(MCPError):
-    """Failed to connect to or initialise an MCP server."""
-
-
-class MCPToolCallError(MCPError):
-    """MCP tool invocation failed (server returned error or isError=true)."""
 
 
 class ConfigError(AgentError):

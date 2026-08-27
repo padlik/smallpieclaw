@@ -166,6 +166,13 @@ class _ProgressPanel:
         self._task_start = time.monotonic()
         self._last_edit_ts: float = 0.0
         self._step_n: int = 0
+        self._progress_dispatch: dict[str, Callable[[str], None]] = {
+            "__CONFIRM__:": self._handle_confirm_progress,
+            "__EXTEND__:": self._handle_extend_progress,
+            "__LLM_ERROR__:": self._handle_llm_error_progress,
+            "__FILE__": self._handle_file_progress,
+            "__TOOL_END__:": self._handle_tool_end_progress,
+        }
 
     async def typing_loop(self) -> None:
         """Keep the "typing…" indicator alive while the agent is working."""
@@ -267,127 +274,130 @@ class _ProgressPanel:
             self._loop,
         )
 
-    def dispatch_progress(self, msg: str) -> None:
-        """Progress callback passed to the agent runtime."""
-        if msg.startswith("__CONFIRM__:"):
-            # Format: __CONFIRM__:{token}:{tool_name}:{description}
-            parts = msg.split(":", 3)
-            token = parts[1]
-            tool_name = parts[2] if len(parts) > 2 else ""
-            description = parts[3] if len(parts) > 3 else tool_name
-            builtin = getattr(
-                getattr(self._interface, "agent", None), "builtin_executor", None
-            )
-            zone_path = builtin._zone_paths.get(token, "") if builtin is not None else ""
+    def _handle_confirm_progress(self, msg: str) -> None:
+        """Handle ``__CONFIRM__:{token}:{tool_name}:{description}`` signals."""
+        # Format: __CONFIRM__:{token}:{tool_name}:{description}
+        parts = msg.split(":", 3)
+        token = parts[1]
+        tool_name = parts[2] if len(parts) > 2 else ""
+        description = parts[3] if len(parts) > 3 else tool_name
+        builtin = getattr(
+            getattr(self._interface, "agent", None), "builtin_executor", None
+        )
+        zone_path = builtin._zone_paths.get(token, "") if builtin is not None else ""
+        asyncio.run_coroutine_threadsafe(
+            self._interface._send_confirmation_prompt(
+                self._update.effective_message,
+                token,
+                tool_name,
+                description,
+                zone_path=zone_path,
+            ),
+            self._loop,
+        )
+
+    def _handle_extend_progress(self, msg: str) -> None:
+        """Handle ``__EXTEND__:{token}:{current_steps}`` signals."""
+        parts = msg.split(":", 2)
+        token = parts[1]
+        current_steps = parts[2] if len(parts) > 2 else "?"
+        asyncio.run_coroutine_threadsafe(
+            self._interface._send_extend_prompt(
+                self._update.effective_message, token, current_steps
+            ),
+            self._loop,
+        )
+
+    def _handle_llm_error_progress(self, msg: str) -> None:
+        """Handle ``__LLM_ERROR__:{token}:{json}`` signals."""
+        # Format: __LLM_ERROR__:{token}:{json}
+        parts = msg.split(":", 2)
+        token = parts[1] if len(parts) > 1 else ""
+        error_json = parts[2] if len(parts) > 2 else "{}"
+        asyncio.run_coroutine_threadsafe(
+            self._interface._send_llm_error_prompt(
+                self._update.effective_message, token, error_json
+            ),
+            self._loop,
+        )
+
+    def _handle_file_progress(self, msg: str) -> None:
+        """Handle ``__FILE__:{path_b64}:{caption_b64}`` signals."""
+        _, path_b64, caption_b64 = msg.split(":", 2)
+        try:
+            file_path = base64.b64decode(path_b64).decode()
+            caption = base64.b64decode(caption_b64).decode()
+        except Exception:
+            file_path, caption = "", ""
+        if file_path:
             asyncio.run_coroutine_threadsafe(
-                self._interface._send_confirmation_prompt(
-                    self._update.effective_message,
-                    token,
-                    tool_name,
-                    description,
-                    zone_path=zone_path,
+                self._interface._send_file_to_chat(
+                    self._update.effective_message, file_path, caption
                 ),
                 self._loop,
             )
-            return
-        if msg.startswith("__EXTEND__:"):
-            parts = msg.split(":", 2)
-            token = parts[1]
-            current_steps = parts[2] if len(parts) > 2 else "?"
-            asyncio.run_coroutine_threadsafe(
-                self._interface._send_extend_prompt(
-                    self._update.effective_message, token, current_steps
-                ),
-                self._loop,
+
+    def _handle_tool_end_progress(self, msg: str) -> None:
+        """Handle ``__TOOL_END__:{ok|fail}:{tool_name}`` signals."""
+        rest = msg[len("__TOOL_END__:"):]
+        status, _, remainder = rest.partition(":")
+        tool_name, _, verbose_payload = remainder.partition("\n")
+        success = status == "ok"
+        # Find last TOOL_RUNNING step and merge ✅/❌ in place
+        for i in reversed(range(len(self._steps))):
+            if self._steps[i].tag == StepTag.TOOL_RUNNING:
+                step = self._steps[i]
+                base = re.sub(r"\s*<i>.*?</i>\s*$", "", step.html, flags=re.DOTALL)
+                marker = " ✅" if success else " ❌"
+                step.html = f"{base}{marker}"
+                break
+        else:
+            # Fallback: no TOOL_RUNNING step — append a new result step
+            from react_loop import _tool_icon
+            icon = _tool_icon(tool_name)
+            marker = "✅" if success else "❌"
+            elapsed = time.monotonic() - self._task_start
+            self._steps.append(
+                Step(elapsed, f"{icon} <b>{html.escape(tool_name)}</b> {marker}", None)
             )
-            return
-        if msg.startswith("__LLM_ERROR__:"):
-            # Format: __LLM_ERROR__:{token}:{json}
-            parts = msg.split(":", 2)
-            token = parts[1] if len(parts) > 1 else ""
-            error_json = parts[2] if len(parts) > 2 else "{}"
-            asyncio.run_coroutine_threadsafe(
-                self._interface._send_llm_error_prompt(
-                    self._update.effective_message, token, error_json
-                ),
-                self._loop,
-            )
-            return
-        if msg.startswith("__FILE__"):
-            _, path_b64, caption_b64 = msg.split(":", 2)
-            try:
-                file_path = base64.b64decode(path_b64).decode()
-                caption = base64.b64decode(caption_b64).decode()
-            except Exception:
-                file_path, caption = "", ""
-            if file_path:
-                asyncio.run_coroutine_threadsafe(
-                    self._interface._send_file_to_chat(
-                        self._update.effective_message, file_path, caption
-                    ),
-                    self._loop,
-                )
-            return
-        if msg.startswith("__TOOL_END__:"):
-            rest = msg[len("__TOOL_END__:"):]
-            status, _, remainder = rest.partition(":")
-            tool_name, _, verbose_payload = remainder.partition("\n")
-            success = status == "ok"
-            # Find last TOOL_RUNNING step and merge ✅/❌ in place
-            for i in range(len(self._steps) - 1, -1, -1):
-                if self._steps[i].tag == StepTag.TOOL_RUNNING:
-                    step = self._steps[i]
-                    base = re.sub(r"\s*<i>.*?</i>\s*$", "", step.html, flags=re.DOTALL)
-                    marker = " ✅" if success else " ❌"
-                    step.html = f"{base}{marker}"
-                    break
-            else:
-                # Fallback: no TOOL_RUNNING step — append a new result step
-                from react_loop import _tool_icon
-                icon = _tool_icon(tool_name)
-                marker = "✅" if success else "❌"
-                elapsed = time.monotonic() - self._task_start
-                self._steps.append(
-                    Step(elapsed, f"{icon} <b>{html.escape(tool_name)}</b> {marker}", None)
-                )
-            # If verbose, send the verbose payload as a separate event
-            if self._interface._verbose and verbose_payload:
-                asyncio.run_coroutine_threadsafe(
-                    self._interface._send_verbose_event(
-                        self._ctx.bot, self._chat_id, verbose_payload
-                    ),
-                    self._loop,
-                )
-            self.flush_panel()
-            return
-        if self._interface._verbose and any(
-            msg.startswith(prefix) for prefix in _VERBOSE_EVENT_PREFIXES
-        ):
+        # If verbose, send the verbose payload as a separate event
+        if self._interface._verbose and verbose_payload:
             asyncio.run_coroutine_threadsafe(
                 self._interface._send_verbose_event(
-                    self._ctx.bot, self._chat_id, msg
+                    self._ctx.bot, self._chat_id, verbose_payload
                 ),
                 self._loop,
             )
-            return
-        if msg.startswith("__SHELL_CHUNK__:"):
-            # Live shell output chunk — update the last step entry in-place
-            # to show a scrolling tail rather than adding noise to the log.
-            tail_text = msg[len("__SHELL_CHUNK__:"):]
-            tail_lines = [
-                line for line in tail_text.splitlines() if line.strip()
-            ][-4:]
-            preview = " ↩ ".join(tail_lines)[:120]
-            if self._steps and self._steps[-1].tag == StepTag.TOOL_RUNNING:
-                step = self._steps[-1]
-                # Preserve the brief (drop any prior <i>...</i> tail)
-                # and append the live tail, keeping the same tag.
-                base = re.sub(r"\s*<i>.*?</i>\s*$", "", step.html, flags=re.DOTALL)
-                step.html = f"{base} <i>{html.escape(preview)}</i>"
-            self.flush_panel()
-            return
+        self.flush_panel()
 
-        # Normal progress: append to step log and (maybe) flush the panel
+    def _handle_verbose_event(self, msg: str) -> None:
+        """Forward verbose progress prefixes as separate events."""
+        asyncio.run_coroutine_threadsafe(
+            self._interface._send_verbose_event(
+                self._ctx.bot, self._chat_id, msg
+            ),
+            self._loop,
+        )
+
+    def _handle_shell_chunk(self, msg: str) -> None:
+        """Handle live shell output chunks by updating the running step."""
+        # Live shell output chunk — update the last step entry in-place
+        # to show a scrolling tail rather than adding noise to the log.
+        tail_text = msg[len("__SHELL_CHUNK__:"):]
+        tail_lines = [
+            line for line in tail_text.splitlines() if line.strip()
+        ][-4:]
+        preview = " ↩ ".join(tail_lines)[:120]
+        if self._steps and self._steps[-1].tag == StepTag.TOOL_RUNNING:
+            step = self._steps[-1]
+            # Preserve the brief (drop any prior <i>...</i> tail)
+            # and append the live tail, keeping the same tag.
+            base = re.sub(r"\s*<i>.*?</i>\s*$", "", step.html, flags=re.DOTALL)
+            step.html = f"{base} <i>{html.escape(preview)}</i>"
+        self.flush_panel()
+
+    def _handle_normal_progress(self, msg: str) -> None:
+        """Append a regular progress message to the step log and flush."""
         elapsed = time.monotonic() - self._task_start
         html_text, tag = self.classify(msg)
         # Thinking-duration retroactive patch: if the last step is THINKING,
@@ -398,6 +408,27 @@ class _ProgressPanel:
             step.html = step.html.replace("Thinking…", f"Thinking… {int(duration)}s")
         self._steps.append(Step(elapsed, html_text, tag))
         self.flush_panel()
+
+    def dispatch_progress(self, msg: str) -> None:
+        """Progress callback passed to the agent runtime.
+
+        Routes the message by prefix to a dedicated handler method.  Prefixes
+        that may overlap (``__FILE__`` and ``__SHELL_CHUNK__``) are tested first;
+        verbose-event prefixes and normal progress are handled as fallbacks.
+        """
+        for prefix, handler in self._progress_dispatch.items():
+            if msg.startswith(prefix):
+                handler(msg)
+                return
+        if self._interface._verbose and any(
+            msg.startswith(prefix) for prefix in _VERBOSE_EVENT_PREFIXES
+        ):
+            self._handle_verbose_event(msg)
+            return
+        if msg.startswith("__SHELL_CHUNK__:"):
+            self._handle_shell_chunk(msg)
+            return
+        self._handle_normal_progress(msg)
 
 
 class TelegramInterface:

@@ -153,7 +153,7 @@ Feature: nsjail-shell-sandboxing
 
 ### Requirement: Cgroup delegation uses systemd-run with rlimits fallback
 
-When cgroup v2 with systemd user delegation is available, the nsjail command MUST be wrapped in `systemd-run --user --scope --property=Delegate=yes` and use `use_cgroupv2` with an explicit `cgroupv2_mount` pointing to the user's delegated cgroup subtree. When cgroup v2 or systemd is unavailable, the system MUST fall back to rlimits only (`rlimit_as`, `rlimit_cpu`, `rlimit_fsize`, `rlimit_nofile`) and log a warning that resource limits are weaker.
+When cgroup v2 with systemd user delegation is available, the nsjail command MUST be wrapped in `systemd-run --user --scope --property=Delegate=yes` and use `use_cgroupv2` with an explicit `cgroupv2_mount` pointing to the user's delegated cgroup subtree. When cgroup v2 or systemd is unavailable, the system MUST fall back to rlimits only (`rlimit_as`, `rlimit_nproc`, `rlimit_fsize`, `rlimit_nofile`) and log a warning that resource limits are weaker.
 
 #### Scenario: systemd delegation provides hard memory limit
 - **GIVEN** systemd is available and cgroup v2 is detected
@@ -165,7 +165,7 @@ When cgroup v2 with systemd user delegation is available, the nsjail command MUS
 #### Scenario: rlimits fallback when systemd unavailable
 - **GIVEN** systemd is not available or cgroup v2 is not detected
 - **WHEN** the nsjail backend runs a command
-- **THEN** the nsjail config uses `rlimit_as`, `rlimit_cpu`, `rlimit_fsize`, `rlimit_nofile` instead of cgroup limits
+- **THEN** the nsjail config uses `rlimit_as`, `rlimit_nproc`, `rlimit_fsize`, `rlimit_nofile` instead of cgroup limits
 - **AND** a warning is logged that resource limits are weaker (no hard RSS limit, no PID limit, no CPU quota)
 
 ### Requirement: System mounts are auto-detected at startup

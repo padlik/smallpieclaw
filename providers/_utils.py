@@ -19,9 +19,12 @@ import mimetypes
 import re
 import subprocess
 import time
-from typing import Callable
+from typing import Callable, TYPE_CHECKING, TypeVar
 
 import httpx
+
+if TYPE_CHECKING:
+    from interfaces import ProviderContext
 
 from providers._errors import (
     LLMCancelledError,
@@ -47,6 +50,39 @@ def make_on_retry(
         if progress_cb:
             progress_cb(f"⏳ LLM request failed ({reason}), retry {attempt}/{max_retries}…")
     return _on_retry
+
+
+T = TypeVar("T")
+
+
+def run_with_retry(
+    ctx: "ProviderContext",
+    do_request: Callable[[], T],
+    *,
+    progress_cb: Callable[[str], None] | None = None,
+) -> T:
+    """Wrap a provider-specific request callable with the shared retry policy.
+
+    This helper removes the duplicated boilerplate in every provider ``chat()``:
+    building the retry-notification callback and invoking :func:`_with_retry`
+    with the standard parameters. Each provider supplies its own ``do_request``
+    closure; this function only handles the surrounding retry wiring.
+
+    The initial model name is read from ``ctx.get_cfg()`` once at call time so
+    log tags remain stable across retries even if ``set_model`` switches the
+    active config mid-flight.
+    """
+    _on_retry = make_on_retry(progress_cb)
+    _initial_model = ctx.get_cfg()["model"]
+    return _with_retry(
+        do_request,
+        ctx.max_retries,
+        ctx.retry_delay,
+        on_retry=_on_retry,
+        cancel_event=ctx.cancel_event,
+        model_name=_initial_model,
+        caller_tag=ctx.caller_tag,
+    )
 
 
 # HTTP status codes that are safe to retry

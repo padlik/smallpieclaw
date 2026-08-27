@@ -42,7 +42,7 @@ from providers._utils import (
     _strip_thinking_tags,
     _with_retry,
     diagnose_empty_response,
-    make_on_retry,
+    run_with_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,10 +99,6 @@ def _text_chat(
                 continue
         contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
 
-    _initial_model = ctx.get_cfg()["model"]
-
-    _on_retry = make_on_retry(progress_cb)
-
     def _do_request():
         # Re-read active model config on every attempt so that a mid-flight
         # model switch (set_model) is picked up by subsequent retries.
@@ -158,8 +154,7 @@ def _text_chat(
             raise LLMEmptyResponseError(f"Google returned empty content (model: {model})")
         return text
 
-    return _with_retry(_do_request, ctx.max_retries, ctx.retry_delay, on_retry=_on_retry,
-                       cancel_event=ctx.cancel_event, model_name=_initial_model, caller_tag=ctx.caller_tag)
+    return run_with_retry(ctx, _do_request, progress_cb=progress_cb)
 
 
 def _tool_chat(
@@ -180,8 +175,6 @@ def _tool_chat(
     header, and the ``max_tokens`` token param — the native Gemini
     ``:generateContent`` endpoint does not understand OpenAI-format tools.
     """
-    _initial_model = ctx.get_cfg()["model"]
-
     # Pre-encode images once. Native tool-calling fields are carried through so
     # multi-turn payloads stay well-formed.
     encoded_messages: list[dict] = []
@@ -205,8 +198,6 @@ def _tool_chat(
             "_tool_calls": m.get("tool_calls"),
             "_tool_call_id": m.get("tool_call_id"),
         })
-
-    _on_retry = make_on_retry(progress_cb)
 
     def _do_request():
         cfg = ctx.get_cfg()
@@ -306,8 +297,7 @@ def _tool_chat(
             raise LLMEmptyResponseError(f"Google returned empty content (model: {model})")
         return ChatResponse(text=text)
 
-    return _with_retry(_do_request, ctx.max_retries, ctx.retry_delay, on_retry=_on_retry,
-                       cancel_event=ctx.cancel_event, model_name=_initial_model, caller_tag=ctx.caller_tag)
+    return run_with_retry(ctx, _do_request, progress_cb=progress_cb)
 
 
 def embed(ctx: ProviderContext, text: str) -> list[float]:

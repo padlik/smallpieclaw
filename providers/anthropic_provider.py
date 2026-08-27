@@ -23,7 +23,7 @@ from providers._errors import (
     LLMError,
     LLMPermanentError,
 )
-from providers._utils import _encode_images, _with_retry, diagnose_empty_response, make_on_retry
+from providers._utils import _encode_images, diagnose_empty_response, run_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,6 @@ def chat(
     with the other provider backends (so ``LLMClient._provider_chat`` can invoke
     every backend uniformly) but are ignored.
     """
-    _initial_model = ctx.get_cfg()["model"]
     anthropic_messages: list[dict] = []
     for m in messages:
         imgs = m.get("images")
@@ -61,8 +60,6 @@ def chat(
                 anthropic_messages.append({"role": m["role"], "content": ant_content})
                 continue
         anthropic_messages.append({"role": m["role"], "content": m.get("content", "")})
-
-    _on_retry = make_on_retry(progress_cb)
 
     def _do_request():
         # Re-read active model config on every attempt so that a mid-flight
@@ -119,5 +116,4 @@ def chat(
             raise LLMEmptyResponseError(f"Anthropic returned empty content (model: {model})")
         return text
 
-    return _with_retry(_do_request, ctx.max_retries, ctx.retry_delay, on_retry=_on_retry,
-                       cancel_event=ctx.cancel_event, model_name=_initial_model, caller_tag=ctx.caller_tag)
+    return run_with_retry(ctx, _do_request, progress_cb=progress_cb)

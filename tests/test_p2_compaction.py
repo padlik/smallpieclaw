@@ -509,7 +509,8 @@ class TestPerModelContextWindow:
         llm.chat.return_value = "summary"
 
         # Per-model: context_window=8192, max_tokens=1024
-        out, _ = maybe_compact(msgs, "system", 8192, llm, model_max_tokens=1024)
+        llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
+        out, _ = maybe_compact(msgs, "system", 8192, llm)
         # Compaction should fire because threshold (6092) < message tokens
         assert len(out) < len(msgs)
         llm.chat.assert_called()
@@ -529,7 +530,8 @@ class TestPerModelContextWindow:
 
         # Agent default: ctx_max_tokens=90000, max_tokens=1024
         # threshold = max(int((90000-1024)*0.85), 256) = max(75629, 256) = 75629
-        out, _ = maybe_compact(msgs, "system", 90_000, llm, model_max_tokens=1024)
+        llm.llm_cfg = {"max_tokens": 1024}
+        out, _ = maybe_compact(msgs, "system", 90_000, llm)
         # No compaction — under threshold
         assert out is msgs
         llm.chat.assert_not_called()
@@ -555,13 +557,13 @@ class TestPerModelContextWindow:
         llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
 
         # With completion reservation: threshold = 6092, 6500 > 6092 → compacts
-        out, _ = maybe_compact(msgs, "system", 8192, llm, model_max_tokens=1024)
+        out, _ = maybe_compact(msgs, "system", 8192, llm)
         llm.chat.assert_called()  # compaction fired
 
         # Without completion reservation (old formula): threshold = 6963, 6500 < 6963 → no compact
         llm2 = MagicMock()
         llm2.llm_cfg = {"context_window": 8192, "max_tokens": 0}
-        out2, _ = maybe_compact(msgs, "system", 8192, llm2, model_max_tokens=0)
+        out2, _ = maybe_compact(msgs, "system", 8192, llm2)
         # With max_tokens=0: threshold = max(6963, 256) = 6963 > 6500 → no compaction
         assert out2 is msgs
         llm2.chat.assert_not_called()
@@ -579,9 +581,9 @@ class TestPerModelContextWindow:
             msgs.append(_msg("user", f"r{i}"))
         llm = MagicMock()
 
-        # ctx_max_tokens=512, model_max_tokens=1024 would yield a negative raw threshold.
+        # ctx_max_tokens=512 with default max_tokens=1024 would yield a negative raw threshold.
         # Floor clamps threshold to 256, so 200-token messages stay uncompacted.
-        out, _ = maybe_compact(msgs, "system", 512, llm, model_max_tokens=1024)
+        out, _ = maybe_compact(msgs, "system", 512, llm)
         assert out is msgs
         llm.chat.assert_not_called()
 
@@ -615,7 +617,7 @@ class TestPerModelContextWindow:
         assert _effective3 == 90_000, "falsy context_window (0) must fall back to agent ctx_max_tokens"
 
     def test_max_tokens_none_falls_back_to_default(self, monkeypatch):
-        """react_loop's `max_tokens or 1024` guard survives an explicit None value."""
+        """resolve_compaction_threshold handles an explicit None max_tokens value."""
         def char_estimate(messages, system, model=None):
             return sum(len(str(m.get("content") or "")) for m in messages) // 4
 
@@ -625,16 +627,13 @@ class TestPerModelContextWindow:
             msgs.append(_msg("assistant", f"action {i} " + ("p" * 4000)))
             msgs.append(_msg("user", f"result {i}\n" + ("r" * 8000)))
 
-        # Simulate the exact expression used by react_loop.py when reading llm_cfg.
         llm = MagicMock()
         llm.chat.return_value = "summary"
         llm.llm_cfg = {"max_tokens": None, "context_window": 8192}
-        _completion_budget = llm.llm_cfg.get("max_tokens") or 1024
-        assert _completion_budget == 1024, "or-1024 guard must convert explicit None to default"
         _effective_ctx = llm.llm_cfg.get("context_window") or 90_000
 
         # Should not raise TypeError; threshold uses max_tokens fallback 1024.
-        out, _ = maybe_compact(msgs, "system", _effective_ctx, llm, model_max_tokens=_completion_budget)
+        out, _ = maybe_compact(msgs, "system", _effective_ctx, llm)
         assert len(out) < len(msgs)
         llm.chat.assert_called()
 
@@ -719,7 +718,7 @@ class TestBackwardCompatibility:
         llm = MagicMock()
         llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
 
-        out, _ = maybe_compact(msgs, "system", 8192, llm, model_max_tokens=1024)
+        out, _ = maybe_compact(msgs, "system", 8192, llm)
 
         assert out is msgs
         llm.chat.assert_not_called()

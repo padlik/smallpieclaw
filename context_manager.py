@@ -183,7 +183,6 @@ def maybe_compact(
     llm: "LLMClient",
     *,
     goal_idx: int = 0,
-    model_max_tokens: int = 1024,  # noqa: F841
     tool_defs_tokens: int = 0,
 ) -> tuple[list[dict], int]:
     """Return a (possibly compacted) copy of *messages* and the goal's new index.
@@ -232,10 +231,6 @@ def maybe_compact(
             the ``first`` slot rather than being swept into the summarised
             middle.  Defaults to ``0`` for backward-compatibility when no
             history precedes the goal.
-        model_max_tokens: Completion token budget for the active model.
-            # Deprecated: threshold is now sourced from llm_cfg via
-            # resolve_compaction_threshold. Retained for backward compat; remove
-            # once no caller passes it. Defaults to 1024.
         tool_defs_tokens: Extra token count to include in the total, e.g. the
             space consumed by tool definitions that are sent with every model
             call. This makes compaction aware of otherwise-invisible tool-def

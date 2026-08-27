@@ -35,7 +35,7 @@ from providers._utils import (
     _strip_thinking_tags,
     _with_retry,
     diagnose_empty_response,
-    make_on_retry,
+    run_with_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,6 @@ def chat(
     :class:`ChatResponse` is returned. ``json_mode`` is honoured only on the
     text-only path.
     """
-    _initial_model = ctx.get_cfg()["model"]
     use_tools = tools is not None
 
     # Pre-encode images once — pure data transformation independent of the active
@@ -79,8 +78,6 @@ def chat(
             "_tool_calls": m.get("tool_calls"),
             "_tool_call_id": m.get("tool_call_id"),
         })
-
-    _on_retry = make_on_retry(progress_cb)
 
     def _do_request():
         # Re-read active model config on every attempt so that a mid-flight
@@ -246,9 +243,7 @@ def chat(
             raise LLMEmptyResponseError(f"OpenAI returned empty content (model: {model})")
         return ChatResponse(text=text) if use_tools else text
 
-    return _with_retry(_do_request, ctx.max_retries, ctx.retry_delay, on_retry=_on_retry,
-                       cancel_event=ctx.cancel_event, model_name=_initial_model,
-                       caller_tag=ctx.caller_tag)
+    return run_with_retry(ctx, _do_request, progress_cb=progress_cb)
 
 
 def embed(ctx: ProviderContext, text: str) -> list[float]:

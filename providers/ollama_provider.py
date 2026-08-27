@@ -38,8 +38,7 @@ from providers._utils import (
     _encode_images,
     _extract_thinking_content,
     _strip_thinking_tags,
-    _with_retry,
-    make_on_retry,
+    run_with_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +71,6 @@ def chat(
     content tokens. Reasoning/thinking content wrapped in ``<think>…</think>``
     tags is stripped from the final text before returning.
     """
-    _initial_model = ctx.get_cfg()["model"]
     use_tools = tools is not None
 
     # Build the payload messages once — pure data transformation reused across
@@ -130,8 +128,6 @@ def chat(
             if _resolved_name:
                 pm["tool_name"] = _resolved_name
         payload_messages.append(pm)
-
-    _on_retry = make_on_retry(progress_cb)
 
     def _do_request():
         # Resolve the active ollama.Client on every attempt via the context
@@ -243,6 +239,4 @@ def chat(
             raise LLMEmptyResponseError(f"Ollama returned empty content (model: {model})")
         return ChatResponse(text=text) if use_tools else text
 
-    return _with_retry(_do_request, ctx.max_retries, ctx.retry_delay, on_retry=_on_retry,
-                       cancel_event=ctx.cancel_event, model_name=_initial_model,
-                       caller_tag=ctx.caller_tag)
+    return run_with_retry(ctx, _do_request, progress_cb=progress_cb)

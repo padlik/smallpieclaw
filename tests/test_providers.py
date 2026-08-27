@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from providers._utils import make_on_retry
+from providers._utils import make_on_retry, run_with_retry
 
 
 class TestMakeOnRetry:
@@ -43,6 +43,70 @@ class TestMakeOnRetry:
 
         # _with_retry passes (attempt, max_retries, reason).
         assert on_retry.__code__.co_argcount == 3
+
+
+class TestRunWithRetry:
+    """Exercise the shared retry runner that wires ``make_on_retry`` + ``_with_retry``."""
+
+    def _ctx(self, max_retries=2, retry_delay=0.0, cancel_event=None):
+        from interfaces import ProviderContext
+        return ProviderContext(
+            get_cfg=lambda: {"model": "test-model"},
+            http=MagicMock(),
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            cancel_event=cancel_event,
+            caller_tag="test",
+            diagnose_empty=False,
+            track_usage=MagicMock(),
+        )
+
+    def test_returns_first_success(self):
+        ctx = self._ctx()
+        do_request = MagicMock(return_value="ok")
+
+        result = run_with_retry(ctx, do_request)
+
+        assert result == "ok"
+        do_request.assert_called_once()
+
+    def test_retries_and_calls_progress_cb(self):
+        progress_cb = MagicMock()
+        ctx = self._ctx(max_retries=2, retry_delay=0.0)
+        import httpx
+        do_request = MagicMock(
+            side_effect=[httpx.TimeoutException("boom"), "ok"]
+        )
+
+        result = run_with_retry(ctx, do_request, progress_cb=progress_cb)
+
+        assert result == "ok"
+        assert do_request.call_count == 2
+        progress_cb.assert_called_once()
+        assert "retry 1/2" in progress_cb.call_args[0][0]
+
+    def test_propagates_after_exhaustion(self):
+        import httpx
+        ctx = self._ctx(max_retries=1, retry_delay=0.0)
+        do_request = MagicMock(side_effect=httpx.TimeoutException("final"))
+
+        with pytest.raises(httpx.TimeoutException, match="final"):
+            run_with_retry(ctx, do_request)
+
+        assert do_request.call_count == 1
+
+    def test_cancellation_propagates(self):
+        from threading import Event
+        cancel_event = Event()
+        cancel_event.set()
+        ctx = self._ctx(cancel_event=cancel_event)
+        do_request = MagicMock()
+
+        from providers._errors import LLMCancelledError
+        with pytest.raises(LLMCancelledError):
+            run_with_retry(ctx, do_request)
+
+        do_request.assert_not_called()
 
 
 if __name__ == "__main__":
