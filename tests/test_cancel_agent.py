@@ -9,7 +9,6 @@ from builtin_tools import agents as agents_mod
 
 import pytest
 
-from builtin_executor import BuiltinExecutor
 from sub_agent_registry import (
     SOURCE_DIAGNOSTIC,
     SOURCE_ON_DEMAND,
@@ -40,8 +39,8 @@ def local_registry():
 
 
 @pytest.fixture
-def executor(tmp_path):
-    return BuiltinExecutor(data_dir=str(tmp_path))
+def executor(make_builtin_executor, tmp_path):
+    return make_builtin_executor(data_dir=str(tmp_path))
 
 
 class TestCancelAgent:

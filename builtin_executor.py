@@ -61,6 +61,7 @@ from builtin_tools.shell import ShellTools
 
 from xdg import xdg_paths
 from builtin_tools.shell_env import ShellEnvTools
+from config_schema import AgentConfig, ExecutorPaths
 from nsjail_config import NsjailConfigBuilder
 from builtin_tools.text_utils import (
     _truncate_output,  # noqa: F401  re-exported for tests
@@ -119,42 +120,47 @@ class BuiltinExecutor:
       5. On user rejection: call cancel(token)  → cleans up state.
     """
 
-    def __init__(self, default_timeout: int = 30, max_output: int = 4000, scheduler=None,
-                 sub_agent_factory=None, data_dir: str = "data",
-                 memory=None, max_subagents: int = 6, subagent_result_timeout: int = 300,
-                 notify_html_fn=None, shell_backend: str = "subprocess",
-                 shell_pty_cols: int = 220, shell_pty_rows: int = 50,
-                 shell_streaming: bool = False, working=None, results=None,
-                 vault_path: str = "", log_jsonl_path: str = "",
-                 shell_nsjail_confirm_mode: str = "always",
-                 shell_nsjail_memory_mb: int = 256,
-                 shell_nsjail_pids_max: int = 64,
-                 shell_nsjail_cpu_percent: int = 50,
-                    allow_net: bool = False,
-                    nsjail_dns_nameserver: str = "8.8.8.8",
-                    nsjail_session_tmpdir: str = "",
-                   nsjail_trusted_dirs_path: str = "",
-                   skills_dir: str = "",
-                   nsjail_agent_dir: str = "",
-                    agent_name: str = "piclaw",
-                    tmp_dir: str = "",
-                    state_home: str = "",
-                    workspace_dir: str = "",
-                    vault_secrets: Optional[list[str]] = None,
-                     shell_nsjail_dump_config_on_error: bool = False,
-                     context_monitor: Optional["ContextMonitor"] = None):
-        self.default_timeout = default_timeout
-        self.max_output = max_output
+    def __init__(
+        self,
+        agent_cfg: AgentConfig,
+        paths: ExecutorPaths,
+        *,
+        scheduler=None,
+        sub_agent_factory=None,
+        memory=None,
+        working=None,
+        results=None,
+        notify_html_fn=None,
+        context_monitor: Optional["ContextMonitor"] = None,
+    ) -> None:
+        """Initialize the built-in tool executor from typed config and runtime paths.
+
+        Args:
+            agent_cfg: Typed agent configuration (shell backend, timeouts, limits,
+                sub-agent policy, etc.). This is the single source of truth for
+                all configurable executor behavior.
+            paths: Runtime filesystem paths derived from XDG dirs and session state.
+            scheduler: Optional scheduler for the ``schedule`` built-in.
+            sub_agent_factory: Callable that constructs a ``SubAgentRunner``.
+            memory: Optional ``MemoryStore`` for ``memory_write``.
+            working: Optional ``WorkingMemory`` for spawn_agent context summaries.
+            results: Optional ``ResultsMemory`` for spawn_agent context summaries.
+            notify_html_fn: Optional HTML notification callback.
+            context_monitor: Optional shared ``ContextMonitor`` for the
+                ``context_profile`` built-in.
+        """
+        self._agent_cfg = agent_cfg
+        self._paths = paths
         self.scheduler = scheduler  # Optional[Scheduler] — for the schedule built-in
         self._sub_agent_factory = sub_agent_factory  # Callable[[model, context_key, label, notify_fn], SubAgentRunner]
-        self._data_dir = data_dir
-        self._agent_name = agent_name
+        self._data_dir = paths.data_dir
+        self._agent_name = agent_cfg.agent_name
         # XDGPaths.state_home (already agent_name-suffixed) as a str, passed down
         # explicitly so builtin_tools/shell.py doesn't re-derive it independently
         # (single source of truth is xdg.py). Falls back to xdg_paths() when unset
         # (tests, ad-hoc callers).
-        self._state_home = state_home or str(xdg_paths(agent_name).state_home)
-        self._workspace_dir = workspace_dir
+        self._state_home = paths.state_home or str(xdg_paths(self._agent_name).state_home)
+        self._workspace_dir = paths.workspace_dir
         # Optional[str] — current conversation id; set by main.py on startup and
         # rotated by AgentController.reset_task(). Used for per-conversation
         # session_logs paths and persistence.
@@ -162,27 +168,27 @@ class BuiltinExecutor:
         self._memory = memory  # Optional[MemoryStore] — for memory_write built-in
         self._working = working  # Optional[WorkingMemory] — for spawn_agent context summary
         self._results = results  # Optional[ResultsMemory] — for spawn_agent context summary
-        self._max_subagents = max_subagents
-        self._subagent_result_timeout = subagent_result_timeout
+        self._max_subagents = agent_cfg.max_subagents
+        self._subagent_result_timeout = agent_cfg.subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
-        self._vault_path = vault_path  # Path to TOML vault file for secret_get
-        self._log_jsonl_path = log_jsonl_path  # Active JSONL log sink for the log_query built-in
-        self._vault_secrets: list[str] = list(vault_secrets or [])
+        self._vault_path = paths.vault_path  # Path to TOML vault file for secret_get
+        self._log_jsonl_path = paths.log_jsonl_path  # Active JSONL log sink for the log_query built-in
+        self._vault_secrets: list[str] = list(paths.vault_secrets or [])
         self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
         self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init
-        self._shell_backend = shell_backend   # "subprocess" or "pty"
-        self._shell_pty_cols = shell_pty_cols
-        self._shell_pty_rows = shell_pty_rows
-        self._shell_streaming = shell_streaming  # forward chunks to on_chunk callback (PTY only)
+        self._shell_backend = agent_cfg.shell_backend   # "subprocess" or "pty"
+        self._shell_pty_cols = agent_cfg.shell_pty_cols
+        self._shell_pty_rows = agent_cfg.shell_pty_rows
+        self._shell_streaming = agent_cfg.shell_streaming  # forward chunks to on_chunk callback (PTY only)
         # nsjail shell backend state
-        self._shell_nsjail_confirm_mode = shell_nsjail_confirm_mode
-        self._shell_nsjail_memory_mb = shell_nsjail_memory_mb
-        self._shell_nsjail_pids_max = shell_nsjail_pids_max
-        self._shell_nsjail_cpu_percent = shell_nsjail_cpu_percent
-        self._allow_net = allow_net
-        self._nsjail_dns_nameserver = nsjail_dns_nameserver
-        self._shell_nsjail_session_tmpdir = nsjail_session_tmpdir
-        self._shell_nsjail_dump_config_on_error = shell_nsjail_dump_config_on_error
+        self._shell_nsjail_confirm_mode = agent_cfg.shell_nsjail_confirm_mode
+        self._shell_nsjail_memory_mb = agent_cfg.shell_nsjail_memory_mb
+        self._shell_nsjail_pids_max = agent_cfg.shell_nsjail_pids_max
+        self._shell_nsjail_cpu_percent = agent_cfg.shell_nsjail_cpu_percent
+        self._allow_net = agent_cfg.allow_net
+        self._nsjail_dns_nameserver = agent_cfg.dns_nameserver
+        self._shell_nsjail_session_tmpdir = paths.nsjail_session_tmpdir
+        self._shell_nsjail_dump_config_on_error = agent_cfg.shell_nsjail_dump_config_on_error
         # Session-scoped env dict for nsjail -E flag injection
         self._shell_env: dict[str, str] = {}
         self._shell_env_lock = threading.Lock()
@@ -191,7 +197,7 @@ class BuiltinExecutor:
         # Background sub-agent lifecycle is owned by the supervisor, which also
         # owns the thread pool. The model-facing _exec_spawn_agent shim and the
         # scheduler both delegate accepted runs to it.
-        self._supervisor = SubAgentSupervisor(max_subagents=max_subagents)
+        self._supervisor = SubAgentSupervisor(max_subagents=agent_cfg.max_subagents)
         # pending: token -> (tool_name, args)
         self._pending: dict[str, tuple[str, dict]] = {}
         # Per-prompt approve-all set. Shared reference to the main agent's
@@ -222,17 +228,7 @@ class BuiltinExecutor:
         self._agents = AgentTools(self)
         # nsjail config builder — only instantiated when nsjail backend is selected
         self._nsjail_builder: Optional[NsjailConfigBuilder] = None
-        self._init_nsjail(
-            shell_backend=shell_backend,
-            nsjail_session_tmpdir=nsjail_session_tmpdir,
-            tmp_dir=tmp_dir,
-            nsjail_trusted_dirs_path=nsjail_trusted_dirs_path,
-            shell_nsjail_memory_mb=shell_nsjail_memory_mb,
-            shell_nsjail_pids_max=shell_nsjail_pids_max,
-            shell_nsjail_cpu_percent=shell_nsjail_cpu_percent,
-            skills_dir=skills_dir,
-            nsjail_agent_dir=nsjail_agent_dir,
-        )
+        self._init_nsjail()
         # Zone-based access control — set by main.py after construction
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
         # Skill registry — set by main.py after construction (same pattern as trusted_zone_checker)
@@ -318,47 +314,38 @@ class BuiltinExecutor:
             "secret_get": lambda a, ctx: self._secrets._run_secret_get(a, caller_tag=ctx.caller_tag),
         }
 
-    def _init_nsjail(
-        self,
-        shell_backend: str,
-        nsjail_session_tmpdir: str,
-        tmp_dir: str,
-        nsjail_trusted_dirs_path: str,
-        shell_nsjail_memory_mb: int,
-        shell_nsjail_pids_max: int,
-        shell_nsjail_cpu_percent: int,
-        skills_dir: str,
-        nsjail_agent_dir: str,
-    ) -> None:
+    def _init_nsjail(self) -> None:
         """Activate the nsjail shell backend if selected and configured.
 
         Requires ``self._allow_net`` and ``self._nsjail_dns_nameserver`` to be set
         before this helper is called. Falls back to subprocess with a warning
         when the runtime or binary is unavailable.
         """
-        if shell_backend != "nsjail":
+        if self._agent_cfg.shell_backend != "nsjail":
             return
-        if not (nsjail_session_tmpdir and tmp_dir):
+        session_tmpdir = self._paths.nsjail_session_tmpdir
+        tmp_dir = self._paths.tmp_dir
+        if not (session_tmpdir and tmp_dir):
             logger.warning(
                 "shell_backend='nsjail' but nsjail_session_tmpdir=%r/tmp_dir=%r not both "
                 "set — falling back to subprocess",
-                nsjail_session_tmpdir, tmp_dir,
+                session_tmpdir, tmp_dir,
             )
             return
         nsjail_binary = shutil.which("nsjail")
         if nsjail_binary is not None:
             self._shell_nsjail_active = True
             self._nsjail_builder = NsjailConfigBuilder(
-                session_tmpdir=nsjail_session_tmpdir,
+                session_tmpdir=session_tmpdir,
                 tmp_dir=tmp_dir,
-                trusted_dirs_path=nsjail_trusted_dirs_path,
-                memory_mb=shell_nsjail_memory_mb,
-                pids_max=shell_nsjail_pids_max,
-                cpu_percent=shell_nsjail_cpu_percent,
+                trusted_dirs_path=self._paths.nsjail_trusted_dirs_path,
+                memory_mb=self._agent_cfg.shell_nsjail_memory_mb,
+                pids_max=self._agent_cfg.shell_nsjail_pids_max,
+                cpu_percent=self._agent_cfg.shell_nsjail_cpu_percent,
                 allow_net=self._allow_net,
                 dns_nameserver=self._nsjail_dns_nameserver,
-                skills_dir=skills_dir,
-                agent_dir=nsjail_agent_dir,
+                skills_dir=self._paths.skills_dir,
+                agent_dir=self._paths.nsjail_agent_dir,
                 workspace_dir=self._workspace_dir,
             )
             logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
@@ -368,6 +355,16 @@ class BuiltinExecutor:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def default_timeout(self) -> int:
+        """Default tool timeout in seconds (mirrors ``agent_cfg.tool_timeout``)."""
+        return self._agent_cfg.tool_timeout
+
+    @property
+    def max_output(self) -> int:
+        """Max output size in characters (mirrors ``agent_cfg.max_output_size``)."""
+        return self._agent_cfg.max_output_size
 
     @property
     def grant_tracker(self) -> GrantTracker:

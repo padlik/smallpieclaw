@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from builtin_executor import BuiltinExecutor
 from prompt_registry import PromptRegistry
 
 
@@ -49,9 +48,9 @@ def registry(tmp_path):
 
 
 class TestPromptRegistryWiring:
-    def test_spawned_sub_agent_recorded_against_active_prompt(self, tmp_path, registry):
+    def test_spawned_sub_agent_recorded_against_active_prompt(self, make_builtin_executor, tmp_path, registry):
         runner = FakeRunner(agent_id="sa-prompt")
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner]),
             data_dir=str(tmp_path),
         )
@@ -66,9 +65,9 @@ class TestPromptRegistryWiring:
         assert record is not None
         assert record.sub_agent_ids == ["sa-prompt"]
 
-    def test_no_recording_when_current_prompt_id_is_none(self, tmp_path, registry):
+    def test_no_recording_when_current_prompt_id_is_none(self, make_builtin_executor, tmp_path, registry):
         runner = FakeRunner(agent_id="sa-no-prompt")
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner]),
             data_dir=str(tmp_path),
         )
@@ -87,13 +86,11 @@ class TestDepthGuardProtectsExecutorFields:
     """C2 regression: sub-agent AgentController.run() (depth=1) must not clobber
     the shared executor's _prompt_approval_set / _current_prompt_id."""
 
-    def test_sub_agent_run_preserves_parent_executor_fields(self, tmp_path):
+    def test_sub_agent_run_preserves_parent_executor_fields(self, make_builtin_executor, tmp_path, make_agent_controller):
         from unittest.mock import MagicMock, patch
 
-        from agent_controller import AgentController
-        from builtin_executor import BuiltinExecutor
 
-        executor = BuiltinExecutor(data_dir=str(tmp_path))
+        executor = make_builtin_executor(data_dir=str(tmp_path))
         sentinel_set: set = {"file_read"}
         executor._prompt_approval_set = sentinel_set
         executor._current_prompt_id = "01JARYN6R0ABCDEFGHJKMNPQRS"
@@ -101,10 +98,8 @@ class TestDepthGuardProtectsExecutorFields:
         llm = MagicMock()
         llm._active_idx = 0
 
-        ctrl = AgentController(
+        ctrl = make_agent_controller(
             llm=llm,
-            tool_index=MagicMock(),
-            memory=MagicMock(),
             builtin_executor=executor,
             depth=1,  # sub-agent
         )

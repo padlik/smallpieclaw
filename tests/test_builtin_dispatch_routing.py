@@ -52,39 +52,39 @@ _CONFIRMATION_TOOLS = frozenset({
 })
 
 
-def _executor() -> BuiltinExecutor:
+def _executor(make_builtin_executor) -> BuiltinExecutor:
     """Construct an executor with defaults (no external collaborators wired)."""
-    return BuiltinExecutor()
+    return make_builtin_executor()
 
 
-def test_builtin_set_is_frozen_twenty_two():
+def test_builtin_set_is_frozen_twenty_two(make_builtin_executor):
     assert len(_FROZEN_TOOLS) == 22
     assert set(BUILTIN_TOOLS) == set(_FROZEN_TOOLS)
 
 
-def test_exec_table_covers_every_non_vision_tool():
-    ex = _executor()
+def test_exec_table_covers_every_non_vision_tool(make_builtin_executor):
+    ex = _executor(make_builtin_executor)
     assert set(ex._exec_table) == set(_FROZEN_TOOLS) - {"vision_query"}
     assert len(ex._exec_table) == 21
 
 
-def test_run_table_contains_only_confirmation_capable_tools():
-    ex = _executor()
+def test_run_table_contains_only_confirmation_capable_tools(make_builtin_executor):
+    ex = _executor(make_builtin_executor)
     assert set(ex._run_table) == set(_CONFIRMATION_TOOLS)
     # The two new sub-agent control tools are explicitly not confirmation-gated.
     assert "wait_for_any_agent" not in ex._run_table
     assert "cancel_agent" not in ex._run_table
 
 
-def test_vision_query_is_declared_but_has_no_dispatch_handler():
-    ex = _executor()
+def test_vision_query_is_declared_but_has_no_dispatch_handler(make_builtin_executor):
+    ex = _executor(make_builtin_executor)
     assert ex.is_builtin("vision_query") is True
     assert "vision_query" not in ex._exec_table
     assert "vision_query" not in ex._run_table
 
 
-def test_unknown_tool_returns_error_result_without_raising():
-    ex = _executor()
+def test_unknown_tool_returns_error_result_without_raising(make_builtin_executor):
+    ex = _executor(make_builtin_executor)
     result = ex.execute("no_such_tool_xyz", {})
     assert result["success"] is False
     assert result["error"]

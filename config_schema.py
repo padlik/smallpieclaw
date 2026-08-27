@@ -462,6 +462,38 @@ class PathsConfig:
 
 
 @dataclass(frozen=True)
+class ExecutorPaths:
+    """Runtime filesystem paths for agent execution.
+
+    These paths are derived from XDG directories and session state, not from
+    typed configuration values. They are passed as a single bundle so that
+    ``AgentController`` and ``SubAgentRunner`` constructors do not need a long
+    list of individual path kwargs.
+
+    In addition to the original five path fields, this dataclass now carries
+    the XDG-derived runtime paths required by ``BuiltinExecutor`` (e.g. data
+    dir, vault path, nsjail session tmpdir). These are runtime/session state,
+    not typed config values.
+    """
+
+    tmp_dir: str = "/tmp/agent"
+    downloads_dir: str = "downloads"
+    workspace_dir: str = "~/Documents"
+    log_file: str = "agent.log"
+    log_backup_count: int = 30
+    # Runtime/session paths consumed by BuiltinExecutor.
+    data_dir: str = "data"
+    state_home: str = ""
+    skills_dir: str = ""
+    vault_path: str = ""
+    log_jsonl_path: str = ""
+    nsjail_session_tmpdir: str = ""
+    nsjail_trusted_dirs_path: str = ""
+    nsjail_agent_dir: str = ""
+    vault_secrets: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class OAuthConfig:
     client_id: str
     client_secret: str

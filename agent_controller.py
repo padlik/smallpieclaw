@@ -22,6 +22,7 @@ from typing import Callable, Optional
 
 from agent_logging import bind_run_context
 from agent_runtime import AgentRuntime, ControllerDeps
+from config_schema import AgentConfig, ExecutorPaths
 from confirmation import ConfirmationManager
 from context_monitor import ContextMonitor
 from conversation_io import _load_or_create_conversation_id, _save_conversation
@@ -98,23 +99,18 @@ class AgentController:
 
     def __init__(
         self,
+        agent_cfg: AgentConfig,
+        paths: ExecutorPaths,
+        *,
         llm: LLMClient,
         tool_index: ToolIndex,
         memory: MemoryStore,
-        max_iterations: int = 8,
-        top_tools: int = 3,
-        ctx_max_tokens: int = 90_000,
         short_term=None,       # Optional[ShortTermMemory]
         working=None,          # Optional[WorkingMemory]
         results=None,          # Optional[ResultsMemory]
         builtin_executor=None, # Optional[BuiltinExecutor]
         skill_registry=None,   # Optional[SkillRegistry]
         mcp_manager=None,      # Optional[MCPManager]
-        tmp_dir: str = "/tmp/agent",
-        downloads_dir: str = "downloads",
-        workspace_dir: str = "~/Documents",
-        log_file: str = "agent.log",
-        log_backup_count: int = 30,
         cancel_event: Optional[threading.Event] = None,
         depth: int = 0,
         label: str = "main",   # identifies this agent in log lines
@@ -122,29 +118,20 @@ class AgentController:
         on_tool_trace=None,    # Optional[Callable[[ToolTrace], None]] — called after each tool call
         job_history_fn=None,   # Optional[Callable[[], str]] — returns job execution history for prompt
         trace_id=None,         # Optional[str] — propagate a parent run's trace; None => fresh per run
-        creativity_mode: str = "default",
-        plan_max_iterations: int = 50,
-        inactivity_warn_minutes: int = 15,
         checkpoint_store=None,  # Optional[CheckpointStore]
         context_monitor: ContextMonitor | None = None,
     ):
+        self._agent_cfg = agent_cfg
+        self._paths = paths
         self.llm = llm
         self.tool_index = tool_index
         self.memory = memory
-        self.max_iterations = max_iterations
-        self.top_tools = top_tools
-        self.ctx_max_tokens = ctx_max_tokens
         self.short_term = short_term
         self.working = working
         self.results = results
         self.builtin_executor = builtin_executor
         self.skill_registry = skill_registry
         self.mcp_manager = mcp_manager
-        self.tmp_dir = tmp_dir
-        self.downloads_dir = downloads_dir
-        self.workspace_dir = workspace_dir
-        self.log_file = log_file
-        self.log_backup_count = log_backup_count
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._owns_cancel_event = cancel_event is None
         # When this controller owns its cancellation (no external event was
@@ -171,11 +158,6 @@ class AgentController:
         self._graph_memory = None          # Optional[GraphMemoryStore]
         self._graph_memory_writer = None   # Optional[GraphMemoryWriter]
         self._graph_memory_max_entries = 10
-        # Creativity / inactivity settings passed through to react_loop
-        self.creativity_mode = creativity_mode
-        self.plan_max_iterations = plan_max_iterations
-        self.inactivity_warn_minutes = inactivity_warn_minutes
-
         # ------------------------------------------------------------------
         # Cross-thread synchronisation for operator confirmation prompts.
         #
@@ -196,6 +178,58 @@ class AgentController:
         # AgentController and BuiltinExecutor so that the context_profile tool
         # reads the same monitor the ReAct loop publishes to. See ADR-0022.
         self.context_monitor = context_monitor or ContextMonitor()
+
+    # ------------------------------------------------------------------
+    # AgentConfig / ExecutorPaths accessors
+    #
+    # The constructor accepts typed config objects rather than a long list of
+    # flat kwargs. These properties keep the internal code readable by reading
+    # from the stored config bundles on demand.
+    # ------------------------------------------------------------------
+
+    @property
+    def max_iterations(self) -> int:
+        return self._agent_cfg.max_iterations
+
+    @property
+    def top_tools(self) -> int:
+        return self._agent_cfg.top_tools
+
+    @property
+    def ctx_max_tokens(self) -> int:
+        return self._agent_cfg.ctx_max_tokens
+
+    @property
+    def creativity_mode(self) -> str:
+        return self._agent_cfg.creativity_mode
+
+    @property
+    def plan_max_iterations(self) -> int:
+        return self._agent_cfg.plan_max_iterations
+
+    @property
+    def inactivity_warn_minutes(self) -> int:
+        return self._agent_cfg.inactivity_warn_minutes
+
+    @property
+    def tmp_dir(self) -> str:
+        return self._paths.tmp_dir
+
+    @property
+    def downloads_dir(self) -> str:
+        return self._paths.downloads_dir
+
+    @property
+    def workspace_dir(self) -> str:
+        return self._paths.workspace_dir
+
+    @property
+    def log_file(self) -> str:
+        return self._paths.log_file
+
+    @property
+    def log_backup_count(self) -> int:
+        return self._paths.log_backup_count
 
     @property
     def runtime_deps(self) -> ControllerDeps:
@@ -623,6 +657,8 @@ class SubAgentRunner:
         *,
         model_cfg: dict,              # single [[models]] entry dict
         config: dict,                 # full agent config (for LLMClient)
+        agent_cfg: AgentConfig,        # typed agent config (max iterations, top tools, etc.)
+        paths: ExecutorPaths,          # runtime filesystem paths bundle
         tool_index,                   # ToolIndex (shared)
         base_memory,                  # MemoryStore (shared long-term facts)
         builtin_executor,             # BuiltinExecutor (shared)
@@ -633,12 +669,6 @@ class SubAgentRunner:
         notify_fn=None,               # Callable[[str], None]
         context_key: Optional[str] = None,  # for context persistence
         label: str = "on-demand",     # label for logging/display
-        max_iterations: int = 8,
-        top_tools: int = 3,
-        ctx_max_tokens: int = 90_000,
-        tmp_dir: str = "/tmp/agent",
-        downloads_dir: str = "downloads",
-        workspace_dir: str = "~/Documents",
         usage_registry=None,          # TokenUsageRegistry
         depth: int = 1,
         on_step=None,                 # Optional[Callable[[int], None]] — for iteration tracking
@@ -681,21 +711,17 @@ class SubAgentRunner:
         # Note: strategy_memory is intentionally not forwarded to sub-agents (short-lived runs).
         # Build the isolated AgentController — headless (no confirm callbacks)
         self._agent = AgentController(
+            agent_cfg=agent_cfg,
+            paths=paths,
             llm=self._llm,
             tool_index=tool_index,
             memory=base_memory,
-            max_iterations=max_iterations,
-            top_tools=top_tools,
-            ctx_max_tokens=ctx_max_tokens,
             short_term=self._short_term,
             working=self._working,
             results=results,
             builtin_executor=builtin_executor,
             skill_registry=skill_registry,
             mcp_manager=mcp_manager,
-            tmp_dir=tmp_dir,
-            downloads_dir=downloads_dir,
-            workspace_dir=workspace_dir,
             cancel_event=self._cancel_event,
             depth=depth,
             label=self.agent_id,

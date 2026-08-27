@@ -12,7 +12,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 
-from builtin_executor import BuiltinExecutor
 from memory_store import ShortTermMemory
 from sub_agent_supervisor import SupervisionOptions
 from react_loop import (
@@ -117,9 +116,9 @@ def _make_registry(count: int = 0) -> MagicMock:
 class TestSpawnAgentContextPayload:
     """Tests for ``spawn_agent`` context_payload argument handling."""
 
-    def test_spawn_agent_accepts_context_payload(self):
+    def test_spawn_agent_accepts_context_payload(self, make_builtin_executor):
         factory = MagicMock(return_value=_make_runner())
-        exc = BuiltinExecutor(sub_agent_factory=factory)
+        exc = make_builtin_executor(sub_agent_factory=factory)
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
@@ -136,14 +135,14 @@ class TestSpawnAgentContextPayload:
 
         assert result["success"] is True
 
-    def test_context_payload_passed_to_factory(self):
+    def test_context_payload_passed_to_factory(self, make_builtin_executor):
         captured = {}
 
         def factory(**kwargs):
             captured.update(kwargs)
             return _make_runner()
 
-        exc = BuiltinExecutor(sub_agent_factory=factory)
+        exc = make_builtin_executor(sub_agent_factory=factory)
         payload = {"conversation_summary": "User asked about disk space"}
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
@@ -155,7 +154,7 @@ class TestSpawnAgentContextPayload:
 
         assert captured.get("context_payload") == payload
 
-    def test_implicit_context_payload_builds_summary(self):
+    def test_implicit_context_payload_builds_summary(self, make_builtin_executor):
         """When no context_payload is given, build_spawn_context_summary is used."""
         captured = {}
 
@@ -165,7 +164,7 @@ class TestSpawnAgentContextPayload:
 
         memory = MagicMock()
         memory.as_prompt_text.return_value = "persistent memory text"
-        exc = BuiltinExecutor(sub_agent_factory=factory, memory=memory)
+        exc = make_builtin_executor(sub_agent_factory=factory, memory=memory)
         graph_memory = MagicMock()
         graph_memory.format_for_prompt.return_value = "graph context"
         exc._graph_memory = graph_memory  # type: ignore[attr-defined]
@@ -183,10 +182,10 @@ class TestSpawnAgentContextPayload:
         assert "relevant_memory" in payload
         assert "relevant_graph" in payload
 
-    def test_context_payload_excluded_from_persistence(self, tmp_path):
+    def test_context_payload_excluded_from_persistence(self, make_builtin_executor, tmp_path):
         """context_payload must not be written to the context_key persistence file."""
         factory = MagicMock(return_value=_make_runner())
-        exc = BuiltinExecutor(sub_agent_factory=factory, data_dir=str(tmp_path))
+        exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit",
@@ -244,7 +243,7 @@ class TestPromptVariant:
 
         assert captured.get("prompt_variant") == "sub-agent"
 
-    def test_direct_spawn_uses_system_variant(self):
+    def test_direct_spawn_uses_system_variant(self, make_builtin_executor):
         """A direct spawn_agent call uses system prompts by default."""
         captured = {}
 
@@ -252,7 +251,7 @@ class TestPromptVariant:
             captured.update(kwargs)
             return _make_runner()
 
-        exc = BuiltinExecutor(sub_agent_factory=factory)
+        exc = make_builtin_executor(sub_agent_factory=factory)
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
@@ -322,14 +321,12 @@ class TestSubAgentVariantRendering:
 class TestReactContextPropagation:
     """Tests that AgentController.run propagates sub-agent context fields to ctx."""
 
-    def test_run_propagates_context_payload_and_variant(self):
+    def test_run_propagates_context_payload_and_variant(self, make_agent_controller):
         """``_context_payload`` and ``_prompt_variant`` reach the ReactContext.
 
         Regression test: react_loop reads these off the ReactContext, so
         AgentController.run must copy them from the controller onto ``ctx``.
         """
-        from agent_controller import AgentController
-
         captured = {}
 
         def fake_loop(ctx, *_args, **_kwargs):
@@ -341,10 +338,8 @@ class TestReactContextPropagation:
         llm._active_idx = 0
         llm._trace_id = ""
 
-        agent = AgentController(
+        agent = make_agent_controller(
             llm=llm,
-            tool_index=MagicMock(),
-            memory=MagicMock(),
             builtin_executor=MagicMock(),
         )
         agent._context_payload = {"parent_goal": "check disk"}

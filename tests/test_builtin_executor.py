@@ -320,52 +320,52 @@ class TestIsSensitivePath:
 
 
 class TestFileDiff:
-    def _exec(self, **args):
-        return BuiltinExecutor().execute("file_diff", args)
+    def _exec(self, make_builtin_executor, **args):
+        return make_builtin_executor().execute("file_diff", args)
 
-    def test_identical_files(self, tmp_path):
+    def test_identical_files(self, make_builtin_executor, tmp_path):
         a = tmp_path / "a.txt"
         b = tmp_path / "b.txt"
         a.write_text("line1\nline2\n")
         b.write_text("line1\nline2\n")
-        result = self._exec(path_a=str(a), path_b=str(b))
+        result = self._exec(make_builtin_executor, path_a=str(a), path_b=str(b))
         assert result["success"] is True
         assert result["output"] == "Files are identical."
 
-    def test_differing_files(self, tmp_path):
+    def test_differing_files(self, make_builtin_executor, tmp_path):
         a = tmp_path / "a.txt"
         b = tmp_path / "b.txt"
         a.write_text("line1\nline2\nline3\n")
         b.write_text("line1\nCHANGED\nline3\n")
-        result = self._exec(path_a=str(a), path_b=str(b))
+        result = self._exec(make_builtin_executor, path_a=str(a), path_b=str(b))
         assert result["success"] is True
         out = result["output"]
         assert "---" in out and "+++" in out and "@@" in out
         assert "-line2" in out
         assert "+CHANGED" in out
 
-    def test_missing_file(self, tmp_path):
+    def test_missing_file(self, make_builtin_executor, tmp_path):
         a = tmp_path / "a.txt"
         a.write_text("x\n")
-        result = self._exec(path_a=str(a), path_b=str(tmp_path / "nope.txt"))
+        result = self._exec(make_builtin_executor, path_a=str(a), path_b=str(tmp_path / "nope.txt"))
         assert result["success"] is False
         assert result["exit_code"] == 1
         assert "File not found" in result["error"]
 
-    def test_missing_arg(self, tmp_path):
+    def test_missing_arg(self, make_builtin_executor, tmp_path):
         a = tmp_path / "a.txt"
         a.write_text("x\n")
-        result = self._exec(path_a=str(a))
+        result = self._exec(make_builtin_executor, path_a=str(a))
         assert result["success"] is False
         assert result["exit_code"] == -1
         assert "required" in result["error"]
 
-    def test_context_lines(self, tmp_path):
+    def test_context_lines(self, make_builtin_executor, tmp_path):
         a = tmp_path / "a.txt"
         b = tmp_path / "b.txt"
         a.write_text("\n".join(f"l{i}" for i in range(20)) + "\n")
         b.write_text("\n".join(f"l{i}" for i in range(20)).replace("l10", "CHANGED") + "\n")
-        result = self._exec(path_a=str(a), path_b=str(b), context_lines=1)
+        result = self._exec(make_builtin_executor, path_a=str(a), path_b=str(b), context_lines=1)
         assert result["success"] is True
         assert "CHANGED" in result["output"]
 
@@ -406,60 +406,60 @@ class TestTruncateOutput:
 class TestShellTruncation:
     """Integration tests for shell output truncation behavior."""
 
-    def _exec(self, command, max_output=500, timeout=10):
-        return BuiltinExecutor(max_output=max_output).execute(
+    def _exec(self, make_builtin_executor, command, max_output=500, timeout=10):
+        return make_builtin_executor(max_output=max_output).execute(
             "shell", {"command": command, "timeout": timeout}
         )
 
-    def test_short_output_not_truncated(self):
-        result = self._exec("echo hello")
+    def test_short_output_not_truncated(self, make_builtin_executor):
+        result = self._exec(make_builtin_executor, "echo hello")
         assert result["success"] is True
         assert result["output"].strip() == "hello"
 
-    def test_long_stdout_truncated_with_marker(self):
+    def test_long_stdout_truncated_with_marker(self, make_builtin_executor):
         # Generate more than 100 chars of output; use a small cap
-        result = self._exec("python3 -c \"print('x'*200)\"", max_output=50)
+        result = self._exec(make_builtin_executor, "python3 -c \"print('x'*200)\"", max_output=50)
         assert "omitted" in result["output"]
 
-    def test_long_stdout_tail_preserved(self):
+    def test_long_stdout_tail_preserved(self, make_builtin_executor):
         # End of output must appear in result
-        result = self._exec(
+        result = self._exec(make_builtin_executor, 
             "python3 -c \"for i in range(50): print(f'line{i}')\"",
             max_output=100,
         )
         # Last lines should appear
         assert "line49" in result["output"]
 
-    def test_stderr_uses_configurable_limit_not_500(self):
+    def test_stderr_uses_configurable_limit_not_500(self, make_builtin_executor):
         # Previously stderr was hardcoded to 500 chars.
         # Now it uses max_output; with a generous limit all stderr should pass.
-        result = self._exec("python3 -c \"import sys; sys.stderr.write('e'*600)\"", max_output=5000)
+        result = self._exec(make_builtin_executor, "python3 -c \"import sys; sys.stderr.write('e'*600)\"", max_output=5000)
         # Should NOT be truncated to 500 — all 600 chars must be present in error
         assert "e" * 600 in (result["output"] + result["error"])
 
-    def test_stderr_truncated_with_marker_when_exceeds_limit(self):
-        result = self._exec(
+    def test_stderr_truncated_with_marker_when_exceeds_limit(self, make_builtin_executor):
+        result = self._exec(make_builtin_executor, 
             "python3 -c \"import sys; sys.stderr.write('e'*300)\"",
             max_output=100,
         )
         combined = result["output"] + result["error"]
         assert "omitted" in combined
 
-    def test_failed_command_promotes_stderr_to_output(self):
+    def test_failed_command_promotes_stderr_to_output(self, make_builtin_executor):
         # When stdout empty and command fails, stderr is promoted
-        result = self._exec("ls /nonexistent_path_xyz_that_does_not_exist")
+        result = self._exec(make_builtin_executor, "ls /nonexistent_path_xyz_that_does_not_exist")
         assert result["success"] is False
         # Output should contain the error message (stderr promoted)
         assert result["output"]
 
-    def test_timeout_returns_useful_error(self):
-        result = self._exec("sleep 10", timeout=1)
+    def test_timeout_returns_useful_error(self, make_builtin_executor):
+        result = self._exec(make_builtin_executor, "sleep 10", timeout=1)
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
         assert result["exit_code"] == -1
 
-    def test_exit_code_preserved(self):
-        result = self._exec("exit 42")
+    def test_exit_code_preserved(self, make_builtin_executor):
+        result = self._exec(make_builtin_executor, "exit 42")
         assert result["exit_code"] == 42
         assert result["success"] is False
 
@@ -472,11 +472,10 @@ class TestShellNsjailErrorDetection:
     nsjail binary or Lima VM.
     """
 
-    @staticmethod
-    def _make_executor() -> BuiltinExecutor:
+    def _make_executor(self, make_builtin_executor) -> BuiltinExecutor:
         """Create an executor with a minimal data dir."""
         import tempfile
-        return BuiltinExecutor(
+        return make_builtin_executor(
             max_output=4000,
             data_dir=tempfile.mkdtemp(),
             shell_backend="subprocess",
@@ -484,6 +483,7 @@ class TestShellNsjailErrorDetection:
 
     def _run_with_mocked_popen(
         self,
+        make_builtin_executor,
         nsjail_cmd: list[str] | None,
         stdout: str,
         stderr: str,
@@ -499,7 +499,7 @@ class TestShellNsjailErrorDetection:
         """
         from unittest.mock import patch, MagicMock
 
-        executor = self._make_executor()
+        executor = self._make_executor(make_builtin_executor, )
         shell = executor._shell
 
         mock_proc = MagicMock()
@@ -533,7 +533,7 @@ class TestShellNsjailErrorDetection:
                 nsjail_cmd=nsjail_cmd,
             )
 
-    def test_nsjail_error_detected_and_not_promoted(self):
+    def test_nsjail_error_detected_and_not_promoted(self, make_builtin_executor):
         """nsjail failure with [E][ in stderr is classified as nsjail_error.
 
         The [E][ marker must stay in `error` (not promoted to `output`) so the
@@ -544,7 +544,7 @@ class TestShellNsjailErrorDetection:
             "Failed to mount mandatory point: '/tmp'\n"
             "[F][2026-07-28T21:05:58Z][1] runChild():506 Launching child process failed\n"
         )
-        result = self._run_with_mocked_popen(
+        result = self._run_with_mocked_popen(make_builtin_executor, 
             nsjail_cmd=["nsjail", "--config", "/tmp/fake.cfg"],
             stdout="",
             stderr=nsjail_stderr,
@@ -557,9 +557,9 @@ class TestShellNsjailErrorDetection:
         assert "[E][" in result["error"]
         assert "[E][" not in result["output"]
 
-    def test_nsjail_error_suggestion_present(self):
+    def test_nsjail_error_suggestion_present(self, make_builtin_executor):
         """nsjail_error result includes a helpful suggestion."""
-        result = self._run_with_mocked_popen(
+        result = self._run_with_mocked_popen(make_builtin_executor, 
             nsjail_cmd=["nsjail", "--config", "/tmp/fake.cfg"],
             stdout="",
             stderr="[E][...] Failed to build mount tree\n",
@@ -567,13 +567,13 @@ class TestShellNsjailErrorDetection:
         )
         assert "nsjail sandbox failed" in result["suggestion"].lower()
 
-    def test_plain_subprocess_stderr_still_promoted(self):
+    def test_plain_subprocess_stderr_still_promoted(self, make_builtin_executor):
         """Non-nsjail failures still promote stderr→output when stdout is empty.
 
         This verifies the fix didn't break the existing behavior for the
         subprocess (non-nsjail) path.
         """
-        result = self._run_with_mocked_popen(
+        result = self._run_with_mocked_popen(make_builtin_executor, 
             nsjail_cmd=None,
             stdout="",
             stderr="ls: cannot access '/nonexistent': No such file or directory\n",
@@ -584,12 +584,12 @@ class TestShellNsjailErrorDetection:
         # stderr was promoted to output since stdout was empty
         assert "No such file or directory" in result["output"]
 
-    def test_nsjail_error_with_stdout_does_not_promote(self):
+    def test_nsjail_error_with_stdout_does_not_promote(self, make_builtin_executor):
         """When nsjail fails but the command produced stdout, output is preserved.
 
         The nsjail_error classification still fires; output is not overwritten.
         """
-        result = self._run_with_mocked_popen(
+        result = self._run_with_mocked_popen(make_builtin_executor, 
             nsjail_cmd=["nsjail", "--config", "/tmp/fake.cfg"],
             stdout="some output\n",
             stderr="[E][...] nsjail setup failed\n",
@@ -603,73 +603,72 @@ class TestShellNsjailErrorDetection:
 class TestShellPtyBackend:
     """Tests for the PTY shell backend (POSIX-only)."""
 
-    @staticmethod
-    def _exec(command, max_output=4000, timeout=10):
-        return BuiltinExecutor(
+    def _exec(self, make_builtin_executor, command, max_output=4000, timeout=10):
+        return make_builtin_executor(
             max_output=max_output,
             shell_backend="pty",
             shell_pty_cols=80,
             shell_pty_rows=24,
         ).execute("shell", {"command": command, "timeout": timeout})
 
-    def test_pty_basic_output(self):
+    def test_pty_basic_output(self, make_builtin_executor):
         if sys.platform == "win32":
             return  # PTY not available on Windows
-        result = self._exec("echo hello_pty")
+        result = self._exec(make_builtin_executor, "echo hello_pty")
         assert result["success"] is True
         assert "hello_pty" in result["output"]
 
-    def test_pty_exit_code_zero(self):
+    def test_pty_exit_code_zero(self, make_builtin_executor):
         if sys.platform == "win32":
             return
-        result = self._exec("true")
+        result = self._exec(make_builtin_executor, "true")
         assert result["success"] is True
         assert result["exit_code"] == 0
 
-    def test_pty_exit_code_nonzero(self):
+    def test_pty_exit_code_nonzero(self, make_builtin_executor):
         if sys.platform == "win32":
             return
-        result = self._exec("false")
+        result = self._exec(make_builtin_executor, "false")
         assert result["success"] is False
         assert result["exit_code"] != 0
 
-    def test_pty_multiline_output(self):
+    def test_pty_multiline_output(self, make_builtin_executor):
         if sys.platform == "win32":
             return
-        result = self._exec("printf 'line1\\nline2\\nline3\\n'")
+        result = self._exec(make_builtin_executor, "printf 'line1\\nline2\\nline3\\n'")
         assert result["success"] is True
         assert "line1" in result["output"]
         assert "line3" in result["output"]
 
-    def test_pty_timeout(self):
+    def test_pty_timeout(self, make_builtin_executor):
         if sys.platform == "win32":
             return
-        result = self._exec("sleep 10", timeout=1)
+        result = self._exec(make_builtin_executor, "sleep 10", timeout=1)
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
         assert result["exit_code"] == -1
 
-    def test_pty_truncation_marker(self):
+    def test_pty_truncation_marker(self, make_builtin_executor):
         if sys.platform == "win32":
             return
-        result = self._exec("python3 -c \"print('x'*300)\"", max_output=100)
+        result = self._exec(make_builtin_executor, "python3 -c \"print('x'*300)\"", max_output=100)
         assert "omitted" in result["output"]
 
-    def test_pty_tail_preserved(self):
+    def test_pty_tail_preserved(self, make_builtin_executor):
         if sys.platform == "win32":
             return
         # Last line must be in output
-        result = self._exec(
+        result = self._exec(make_builtin_executor, 
             "for i in $(seq 1 30); do echo \"line$i\"; done",
             max_output=100,
         )
         assert "line30" in result["output"]
 
-    def test_pty_falls_back_on_windows(self, monkeypatch):
+    def test_pty_falls_back_on_windows(self, make_builtin_executor, monkeypatch):
         """On Windows platform, PTY backend falls back to subprocess silently."""
         monkeypatch.setattr("sys.platform", "win32")
         # Should not raise; falls back to subprocess
-        result = BuiltinExecutor(
+        result = make_builtin_executor(
             max_output=4000, shell_backend="pty"
         ).execute("shell", {"command": "echo hi"})
         # On actual Linux/macOS with monkeypatched platform, subprocess used
@@ -679,12 +678,12 @@ class TestShellPtyBackend:
 class TestShellStreaming:
     """Tests for PTY streaming (chunk_callback) support in Phase 4."""
 
-    def test_streaming_callback_called(self):
+    def test_streaming_callback_called(self, make_builtin_executor):
         """chunk_callback receives output chunks during PTY execution."""
         if sys.platform == "win32":
             return
         received: list[str] = []
-        executor = BuiltinExecutor(
+        executor = make_builtin_executor(
             max_output=4000,
             shell_backend="pty",
             shell_streaming=True,
@@ -697,12 +696,12 @@ class TestShellStreaming:
         combined = "".join(received)
         assert "streaming_test" in combined
 
-    def test_streaming_multiple_chunks_accumulated(self):
+    def test_streaming_multiple_chunks_accumulated(self, make_builtin_executor):
         """Each line of output results in one or more callback invocations."""
         if sys.platform == "win32":
             return
         received: list[str] = []
-        executor = BuiltinExecutor(
+        executor = make_builtin_executor(
             max_output=4000,
             shell_backend="pty",
             shell_streaming=True,
@@ -717,12 +716,12 @@ class TestShellStreaming:
             assert f"item{i}" in combined
         assert len(received) >= 1
 
-    def test_streaming_disabled_callback_not_called(self):
+    def test_streaming_disabled_callback_not_called(self, make_builtin_executor):
         """When shell_streaming=False, chunk_callback is NOT invoked even if provided."""
         if sys.platform == "win32":
             return
         received: list[str] = []
-        executor = BuiltinExecutor(
+        executor = make_builtin_executor(
             max_output=4000,
             shell_backend="pty",
             shell_streaming=False,  # streaming disabled
@@ -735,10 +734,10 @@ class TestShellStreaming:
         # streaming disabled → callback must NOT be called
         assert received == []
 
-    def test_streaming_subprocess_backend_no_callback(self):
+    def test_streaming_subprocess_backend_no_callback(self, make_builtin_executor):
         """Subprocess backend ignores chunk_callback (no streaming support)."""
         received: list[str] = []
-        executor = BuiltinExecutor(
+        executor = make_builtin_executor(
             max_output=4000,
             shell_backend="subprocess",
             shell_streaming=True,
@@ -753,7 +752,7 @@ class TestShellStreaming:
         assert "subprocess_test" in result["output"]
         assert received == []
 
-    def test_streaming_callback_exception_does_not_crash(self):
+    def test_streaming_callback_exception_does_not_crash(self, make_builtin_executor):
         """A raising chunk_callback must not kill PTY execution."""
         if sys.platform == "win32":
             return
@@ -761,7 +760,7 @@ class TestShellStreaming:
         def _bad_callback(_chunk: str) -> None:
             raise RuntimeError("boom")
 
-        executor = BuiltinExecutor(
+        executor = make_builtin_executor(
             max_output=4000,
             shell_backend="pty",
             shell_streaming=True,
@@ -774,11 +773,11 @@ class TestShellStreaming:
         assert result["success"] is True
         assert "safe" in result["output"]
 
-    def test_streaming_callback_none_when_streaming_enabled(self):
+    def test_streaming_callback_none_when_streaming_enabled(self, make_builtin_executor):
         """When shell_streaming=True but no callback passed, execution is unaffected."""
         if sys.platform == "win32":
             return
-        executor = BuiltinExecutor(
+        executor = make_builtin_executor(
             max_output=4000,
             shell_backend="pty",
             shell_streaming=True,
@@ -795,9 +794,9 @@ class TestShellStreaming:
 class TestShellLogArtifacts:
     """Tests for full-log artifact persistence when output is truncated."""
 
-    def test_no_artifact_when_within_limit(self, tmp_path, monkeypatch):
+    def test_no_artifact_when_within_limit(self, make_builtin_executor, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path), agent_name="testagent")
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path), agent_name="testagent")
         ex.conversation_id = "testconv"
         result = ex.execute("shell", {"command": "echo small"})
         assert result["success"] is True
@@ -807,9 +806,9 @@ class TestShellLogArtifacts:
         if log_dir.exists():
             assert list(log_dir.iterdir()) == []
 
-    def test_artifact_written_when_truncated(self, tmp_path, monkeypatch):
+    def test_artifact_written_when_truncated(self, make_builtin_executor, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path), agent_name="testagent")
+        ex = make_builtin_executor(max_output=50, data_dir=str(tmp_path), agent_name="testagent")
         ex.conversation_id = "testconv"
         # Produce > 50 chars of output
         result = ex.execute(
@@ -824,8 +823,8 @@ class TestShellLogArtifacts:
         assert path in result["output"]
         assert "file_read" in result["output"]
 
-    def test_artifact_contains_full_output(self, tmp_path):
-        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path))
+    def test_artifact_contains_full_output(self, make_builtin_executor, tmp_path):
+        ex = make_builtin_executor(max_output=50, data_dir=str(tmp_path))
         result = ex.execute(
             "shell",
             {"command": "for i in $(seq 1 40); do echo \"line$i\"; done"},
@@ -837,17 +836,17 @@ class TestShellLogArtifacts:
         assert "line1" in full
         assert "line40" in full
 
-    def test_elapsed_ms_present(self, tmp_path):
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+    def test_elapsed_ms_present(self, make_builtin_executor, tmp_path):
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         result = ex.execute("shell", {"command": "echo timed"})
         assert "elapsed_ms" in result
         assert isinstance(result["elapsed_ms"], int)
         assert result["elapsed_ms"] >= 0
 
-    def test_pty_artifact_written_when_truncated(self, tmp_path):
+    def test_pty_artifact_written_when_truncated(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
-        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path), shell_backend="pty")
+        ex = make_builtin_executor(max_output=50, data_dir=str(tmp_path), shell_backend="pty")
         result = ex.execute(
             "shell",
             {"command": "for i in $(seq 1 40); do echo \"line$i\"; done", "timeout": 10},
@@ -865,9 +864,9 @@ class TestShellLogArtifacts:
 class TestShellLogRedaction:
     """Tests for vault-secret redaction in session log artifacts."""
 
-    def test_secret_is_redacted_in_artifact(self, tmp_path, monkeypatch):
+    def test_secret_is_redacted_in_artifact(self, make_builtin_executor, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-        ex = BuiltinExecutor(
+        ex = make_builtin_executor(
             max_output=50,
             data_dir=str(tmp_path),
             agent_name="testagent",
@@ -888,9 +887,9 @@ class TestShellLogRedaction:
         assert "supersecret" not in content
         assert "[REDACTED]" in content
 
-    def test_large_file_deleted_when_over_size_limit(self, tmp_path, monkeypatch):
+    def test_large_file_deleted_when_over_size_limit(self, make_builtin_executor, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-        ex = BuiltinExecutor(
+        ex = make_builtin_executor(
             max_output=50,
             data_dir=str(tmp_path),
             agent_name="testagent",
@@ -909,10 +908,10 @@ class TestShellLogRedaction:
 class TestShellStreamingThroughConfirm:
     """Streaming must survive the confirmation path (confirm → _run → shell)."""
 
-    def test_confirm_forwards_chunk_callback(self):
+    def test_confirm_forwards_chunk_callback(self, make_builtin_executor):
         if sys.platform == "win32":
             return
-        ex = BuiltinExecutor(
+        ex = make_builtin_executor(
             max_output=4000,
             shell_backend="pty",
             shell_streaming=True,
@@ -928,8 +927,8 @@ class TestShellStreamingThroughConfirm:
         assert "streamed_after_confirm" in combined
         assert "streamed_after_confirm" in result["output"]
 
-    def test_confirm_without_callback_still_runs(self):
-        ex = BuiltinExecutor(max_output=4000, shell_backend="subprocess")
+    def test_confirm_without_callback_still_runs(self, make_builtin_executor):
+        ex = make_builtin_executor(max_output=4000, shell_backend="subprocess")
         staged = ex.execute("shell", {"command": "rm -rf /tmp/does_not_exist_xyz && echo ok_confirm"})
         assert staged.get("requires_confirmation") is True
         token = staged["token"]
@@ -998,8 +997,8 @@ class TestSuccessfulStderrVisible:
         result = fmt_tool_result_progress("shell", {"command": "echo hi"}, outcome)
         assert "stderr" not in result
 
-    def test_subprocess_success_stderr_in_result(self, tmp_path):
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+    def test_subprocess_success_stderr_in_result(self, make_builtin_executor, tmp_path):
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         result = ex.execute(
             "shell",
             {"command": "python3 -c \"import sys; print('out'); sys.stderr.write('warn\\n')\""},
@@ -1012,7 +1011,7 @@ class TestSuccessfulStderrVisible:
 class TestShellTimeoutCleanup:
     """Timeout must kill the whole process tree and not leak children."""
 
-    def test_timeout_kills_child_process_tree(self, tmp_path):
+    def test_timeout_kills_child_process_tree(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
         import time as _t
@@ -1024,7 +1023,7 @@ class TestShellTimeoutCleanup:
             f"(for i in $(seq 1 100); do echo x >> {sentinel}; sleep 0.2; done) & "
             "sleep 30"
         )
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         result = ex.execute("shell", {"command": cmd, "timeout": 1})
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
@@ -1035,10 +1034,10 @@ class TestShellTimeoutCleanup:
         size2 = sentinel.stat().st_size if sentinel.exists() else 0
         assert size2 == size1, "child process kept running after timeout (leak)"
 
-    def test_timeout_returns_partial_tail(self, tmp_path):
+    def test_timeout_returns_partial_tail(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         result = ex.execute(
             "shell",
             {"command": "echo before_timeout; sleep 30", "timeout": 1},
@@ -1051,11 +1050,11 @@ class TestShellTimeoutCleanup:
 class TestShellLogPermissions:
     """Artifact logs must be owner-only (0600) in an owner-only dir (0700)."""
 
-    def test_artifact_file_and_dir_permissions(self, tmp_path):
+    def test_artifact_file_and_dir_permissions(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
         import stat
-        ex = BuiltinExecutor(max_output=50, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=50, data_dir=str(tmp_path))
         result = ex.execute(
             "shell",
             {"command": "for i in $(seq 1 40); do echo \"line$i\"; done"},
@@ -1071,7 +1070,7 @@ class TestShellLogPermissions:
 class TestPtyTimeoutCleanup:
     """PTY timeout must terminate background children that ignore SIGHUP."""
 
-    def test_pty_timeout_kills_background_child_ignoring_sighup(self, tmp_path):
+    def test_pty_timeout_kills_background_child_ignoring_sighup(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
         import time as _t
@@ -1083,7 +1082,7 @@ class TestPtyTimeoutCleanup:
             f"[open('{sentinel}', 'a').write('x') or time.sleep(0.2) for _ in range(100)]"
         )
         cmd = f"(python3 -c \"{child_script}\") & sleep 30"
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path),
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path),
                              shell_backend="pty", shell_pty_cols=80, shell_pty_rows=24)
         result = ex.execute("shell", {"command": cmd, "timeout": 1})
         assert result["success"] is False
@@ -1099,7 +1098,7 @@ class TestPtyTimeoutCleanup:
 class TestSubprocessTimeoutNoBeyond:
     """Subprocess timeout must not hang past timeout when a descendant escapes the group."""
 
-    def test_subprocess_returns_within_bound_when_descendant_escapes(self, tmp_path):
+    def test_subprocess_returns_within_bound_when_descendant_escapes(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
         import time as _t
@@ -1107,7 +1106,7 @@ class TestSubprocessTimeoutNoBeyond:
         # while keeping inherited stdout open.
         child_script = "import os, time; os.setsid(); time.sleep(5)"
         cmd = f"python3 -c \"{child_script}\" &"
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         _started = _t.monotonic()
         ex.execute("shell", {"command": cmd, "timeout": 1})
         elapsed = _t.monotonic() - _started
@@ -1118,8 +1117,8 @@ class TestSubprocessTimeoutNoBeyond:
             f"(escaped descendant held pipe open)"
         )
 
-    def test_subprocess_timeout_preserves_stderr_when_stdout_present(self, tmp_path):
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+    def test_subprocess_timeout_preserves_stderr_when_stdout_present(self, make_builtin_executor, tmp_path):
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         result = ex.execute(
             "shell",
             {"command": "echo out_before_timeout; echo err_before_timeout >&2; sleep 30", "timeout": 1},
@@ -1129,13 +1128,13 @@ class TestSubprocessTimeoutNoBeyond:
         assert "Command timed out after 1s." in result["error"]
         assert "err_before_timeout" in result["error"]
 
-    def test_successful_subprocess_preserves_output_when_descendant_keeps_pipe_open(self, tmp_path):
+    def test_successful_subprocess_preserves_output_when_descendant_keeps_pipe_open(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
         import time as _t
         child_script = "import os, time; os.setsid(); time.sleep(30)"
         cmd = f"python3 -c \"{child_script}\" & echo parent_done"
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         _started = _t.monotonic()
         result = ex.execute("shell", {"command": cmd, "timeout": 1})
         elapsed = _t.monotonic() - _started
@@ -1147,7 +1146,7 @@ class TestSubprocessTimeoutNoBeyond:
 class TestSubprocessMultibyteDecoding:
     """Multibyte UTF-8 characters spanning os.read() chunk boundaries must survive intact."""
 
-    def test_multibyte_output_not_corrupted_across_chunk_boundaries(self, tmp_path):
+    def test_multibyte_output_not_corrupted_across_chunk_boundaries(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
         # Emit ~6000 three-byte characters (~18 KB) so the stream is split across
@@ -1155,7 +1154,7 @@ class TestSubprocessMultibyteDecoding:
         count = 6000
         char = "\u20ac"  # euro sign, 3 bytes in UTF-8
         # large max_output so the full output (not just a tail) is returned.
-        ex = BuiltinExecutor(max_output=100000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=100000, data_dir=str(tmp_path))
         cmd = f"python3 -c \"import sys; sys.stdout.write('{char}' * {count})\""
         result = ex.execute("shell", {"command": cmd, "timeout": 10})
         assert result["success"] is True
@@ -1163,12 +1162,12 @@ class TestSubprocessMultibyteDecoding:
         assert "\ufffd" not in result["output"]
         assert result["output"].count(char) == count
 
-    def test_multibyte_stderr_not_corrupted_across_chunk_boundaries(self, tmp_path):
+    def test_multibyte_stderr_not_corrupted_across_chunk_boundaries(self, make_builtin_executor, tmp_path):
         if sys.platform == "win32":
             return
         count = 6000
         char = "\u4e2d"  # CJK char, 3 bytes in UTF-8
-        ex = BuiltinExecutor(max_output=100000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=100000, data_dir=str(tmp_path))
         cmd = f"python3 -c \"import sys; sys.stderr.write('{char}' * {count})\""
         result = ex.execute("shell", {"command": cmd, "timeout": 10})
         # stderr-only output is promoted into 'output' on failure; here exit==0 so
@@ -1181,7 +1180,7 @@ class TestSubprocessMultibyteDecoding:
 class TestSubprocessArtifactWriteFailure:
     """Artifact write failures must degrade gracefully, not crash the shell tool."""
 
-    def test_artifact_write_oserror_returns_result_not_exception(self, tmp_path, monkeypatch):
+    def test_artifact_write_oserror_returns_result_not_exception(self, make_builtin_executor, tmp_path, monkeypatch):
         """If artifact log write raises OSError (e.g. disk full), shell returns normally."""
         import io
 
@@ -1189,7 +1188,7 @@ class TestSubprocessArtifactWriteFailure:
             def write(self, s):
                 raise OSError("disk full")
 
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         # Inject a failing file handle so the first artifact write triggers OSError.
         original_open = ex._shell._open_shell_log
 
@@ -1213,10 +1212,10 @@ class TestSecretGet:
     the top level.  All values must be strings.
     """
 
-    def test_secret_get_success(self, tmp_path):
+    def test_secret_get_success(self, make_builtin_executor, tmp_path):
         vault = tmp_path / "secrets.toml"
         vault.write_text('api_key = "super-secret"\n', encoding="utf-8")
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         # Simulate approved confirmation.
         staged = ex.execute("secret_get", {"key": "api_key"})
         assert staged["requires_confirmation"] is True
@@ -1227,37 +1226,37 @@ class TestSecretGet:
         assert result["error"] == ""
         assert result["exit_code"] == 0
 
-    def test_secret_get_missing_key(self, tmp_path):
+    def test_secret_get_missing_key(self, make_builtin_executor, tmp_path):
         vault = tmp_path / "secrets.toml"
         vault.write_text('other = "value"\n', encoding="utf-8")
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "missing"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
         assert "missing" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_missing_vault(self, tmp_path):
+    def test_secret_get_missing_vault(self, make_builtin_executor, tmp_path):
         missing_vault = tmp_path / "no_vault.toml"
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(missing_vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(missing_vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
         assert "Cannot read vault" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_corrupt_vault(self, tmp_path):
+    def test_secret_get_corrupt_vault(self, make_builtin_executor, tmp_path):
         """Invalid TOML content is reported as a vault read failure."""
         vault = tmp_path / "secrets.toml"
         vault.write_text("= orphan value\n", encoding="utf-8")  # invalid TOML
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
         assert "Cannot read vault" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_nested_key_not_found(self, tmp_path):
+    def test_secret_get_nested_key_not_found(self, make_builtin_executor, tmp_path):
         """A sibling TOML table no longer poisons the whole vault parse.
 
         With ``[credentials]`` present, ``api_key`` lives *inside* that table,
@@ -1266,7 +1265,7 @@ class TestSecretGet:
         """
         vault = tmp_path / "secrets.toml"
         vault.write_text('[credentials]\napi_key = "secret"\n', encoding="utf-8")
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
@@ -1275,7 +1274,7 @@ class TestSecretGet:
         assert result["error_type"] == "not_found"
         assert result["exit_code"] == -1
 
-    def test_secret_get_string_key_with_sibling_table_succeeds(self, tmp_path):
+    def test_secret_get_string_key_with_sibling_table_succeeds(self, make_builtin_executor, tmp_path):
         """Regression: a non-string SIBLING key must not break a string lookup.
 
         A vault that mixes a top-level string secret with an idiomatic
@@ -1287,7 +1286,7 @@ class TestSecretGet:
             'api_key = "sk-abc"\n\n[jira]\ntoken = "jira-tok"\n',
             encoding="utf-8",
         )
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is True
@@ -1295,7 +1294,7 @@ class TestSecretGet:
         assert result["error"] == ""
         assert result["exit_code"] == 0
 
-    def test_secret_get_sibling_table_value_not_string(self, tmp_path):
+    def test_secret_get_sibling_table_value_not_string(self, make_builtin_executor, tmp_path):
         """Requesting a key whose value is a table returns a config error.
 
         Only the *requested* key's type matters; a table-valued key cannot be
@@ -1306,7 +1305,7 @@ class TestSecretGet:
             'api_key = "sk-abc"\n\n[jira]\ntoken = "jira-tok"\n',
             encoding="utf-8",
         )
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "jira"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
@@ -1316,7 +1315,7 @@ class TestSecretGet:
         assert result["recoverable"] is False
         assert result["exit_code"] == -1
 
-    def test_secret_get_requested_scalar_value_not_string(self, tmp_path):
+    def test_secret_get_requested_scalar_value_not_string(self, make_builtin_executor, tmp_path):
         """Requesting a key whose value is a non-string scalar returns a config error.
 
         Only the *requested* key's type matters; an int-valued key cannot be
@@ -1327,7 +1326,7 @@ class TestSecretGet:
             'api_key = "sk-abc"\nport = 8080\n',
             encoding="utf-8",
         )
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "port"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
@@ -1338,17 +1337,17 @@ class TestSecretGet:
         assert result["recoverable"] is False
         assert result["exit_code"] == -1
 
-    def test_secret_get_requires_key(self, tmp_path):
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(tmp_path / "secrets.toml"))
+    def test_secret_get_requires_key(self, make_builtin_executor, tmp_path):
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(tmp_path / "secrets.toml"))
         result = ex.execute("secret_get", {})
         assert result["success"] is False
         assert "'key' is required" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_user_denial(self, tmp_path):
+    def test_secret_get_user_denial(self, make_builtin_executor, tmp_path):
         vault = tmp_path / "secrets.toml"
         vault.write_text('api_key = "super-secret"\n', encoding="utf-8")
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         assert staged["requires_confirmation"] is True
         ex.cancel(staged["token"])
@@ -1356,40 +1355,40 @@ class TestSecretGet:
         assert result["success"] is False
         assert "expired" in result["error"]
 
-    def test_secret_get_non_string_vault_value_int_fails(self, tmp_path):
+    def test_secret_get_non_string_vault_value_int_fails(self, make_builtin_executor, tmp_path):
         """secret_get must reject non-string vault values (TOML integer)."""
         vault = tmp_path / "secrets.toml"
         vault.write_text("api_key = 12345\n", encoding="utf-8")
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
         assert "api_key" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_non_string_vault_value_bool_fails(self, tmp_path):
+    def test_secret_get_non_string_vault_value_bool_fails(self, make_builtin_executor, tmp_path):
         """secret_get must reject TOML boolean vault values."""
         vault = tmp_path / "secrets.toml"
         vault.write_text("flag = true\n", encoding="utf-8")
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "flag"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
         assert "flag" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_non_string_vault_value_float_fails(self, tmp_path):
+    def test_secret_get_non_string_vault_value_float_fails(self, make_builtin_executor, tmp_path):
         """secret_get must reject TOML float vault values."""
         vault = tmp_path / "secrets.toml"
         vault.write_text("my_key = 3.14\n", encoding="utf-8")
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "my_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is False
         assert "my_key" in result["error"]
         assert result["exit_code"] == -1
 
-    def test_secret_get_toml_with_comments(self, tmp_path):
+    def test_secret_get_toml_with_comments(self, make_builtin_executor, tmp_path):
         """TOML comments in the vault file are ignored; key is retrieved."""
         vault = tmp_path / "secrets.toml"
         vault.write_text(
@@ -1398,20 +1397,20 @@ class TestSecretGet:
             "# end\n",
             encoding="utf-8",
         )
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "api_key"})
         result = ex.confirm(staged["token"])
         assert result["success"] is True
         assert result["output"] == "super-secret"
 
-    def test_secret_get_toml_multiple_keys(self, tmp_path):
+    def test_secret_get_toml_multiple_keys(self, make_builtin_executor, tmp_path):
         """secret_get retrieves the correct key from a multi-key TOML vault."""
         vault = tmp_path / "secrets.toml"
         vault.write_text(
             'api_key = "sk-abc"\nbot_token = "1234:TOKEN"\n',
             encoding="utf-8",
         )
-        ex = BuiltinExecutor(data_dir=str(tmp_path), vault_path=str(vault))
+        ex = make_builtin_executor(data_dir=str(tmp_path), vault_path=str(vault))
         staged = ex.execute("secret_get", {"key": "bot_token"})
         result = ex.confirm(staged["token"])
         assert result["success"] is True
@@ -1421,13 +1420,13 @@ class TestSecretGet:
 class TestSubprocessTimeoutBoundedKill:
     """Timeout kill block must not run more than once; loop must break after kill."""
 
-    def test_timeout_kill_runs_once_for_unkillable_process(self, tmp_path, monkeypatch):
+    def test_timeout_kill_runs_once_for_unkillable_process(self, make_builtin_executor, tmp_path, monkeypatch):
         """Even if proc.wait() after kill keeps timing out, the drain loop exits."""
         if sys.platform == "win32":
             return
         import time as _t
 
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
 
         original_run = ex._shell._run_shell_subprocess
 
@@ -1448,31 +1447,31 @@ class TestSubprocessTimeoutBoundedKill:
 class TestNsjailDumpConfigOnError:
     """Test ShellTools._dump_nsjail_config() and the dump-on-error flag."""
 
-    def test_dump_config_copies_file_to_session_logs(self, tmp_path):
+    def test_dump_config_copies_file_to_session_logs(self, make_builtin_executor, tmp_path):
         cfg = tmp_path / "src.cfg"
         cfg.write_text("name: \"agent-shell\"\nmode: ONCE\n")
         session_logs = tmp_path / "session_logs"
 
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         ex._shell._dump_nsjail_config(str(cfg), str(session_logs))
 
         dumped = list(session_logs.glob("nsjail-config-*.cfg"))
         assert len(dumped) == 1
         assert dumped[0].read_text() == cfg.read_text()
 
-    def test_dump_config_swallows_unwritable_session_logs_dir(self, tmp_path):
+    def test_dump_config_swallows_unwritable_session_logs_dir(self, make_builtin_executor, tmp_path):
         cfg = tmp_path / "src.cfg"
         cfg.write_text("name: x\n")
         # Make "blocker" a file so makedirs for a nested path under it fails.
         (tmp_path / "blocker").write_text("")
         bad_session_logs = str(tmp_path / "blocker" / "nested")
 
-        ex = BuiltinExecutor(max_output=4000, data_dir=str(tmp_path))
+        ex = make_builtin_executor(max_output=4000, data_dir=str(tmp_path))
         # Must not raise.
         ex._shell._dump_nsjail_config(str(cfg), bad_session_logs)
 
-    def test_flag_defaults_to_false(self):
-        ex = BuiltinExecutor()
+    def test_flag_defaults_to_false(self, make_builtin_executor):
+        ex = make_builtin_executor()
         assert ex._shell_nsjail_dump_config_on_error is False
 
     def test_dump_not_triggered_when_flag_off(self, tmp_path, monkeypatch):

@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from builtin_executor import BuiltinExecutor
 from confirmation import ConfirmationManager
 from telegram_callbacks import cb_subagent_confirm
 
@@ -55,8 +54,8 @@ class _FakeIface:
 
 
 @pytest.fixture
-def executor(tmp_path):
-    return BuiltinExecutor(data_dir=str(tmp_path))
+def executor(make_builtin_executor, tmp_path):
+    return make_builtin_executor(data_dir=str(tmp_path))
 
 
 @pytest.fixture

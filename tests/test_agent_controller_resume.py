@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from agent_controller import AgentController
 from checkpoint_store import CheckpointStore
 
 
-def test_run_with_resume_from_loads_checkpoint(tmp_path):
+def test_run_with_resume_from_loads_checkpoint(tmp_path, make_agent_controller):
     """Verify that run(resume_from=...) loads checkpoint and passes initial_state."""
     store = CheckpointStore(str(tmp_path))
 
@@ -37,12 +36,7 @@ def test_run_with_resume_from_loads_checkpoint(tmp_path):
     llm._trace_id = "r-test1234"
     llm.set_trace_id = MagicMock()
 
-    controller = AgentController(
-        llm=llm,
-        tool_index=MagicMock(),
-        memory=MagicMock(),
-        checkpoint_store=store,
-    )
+    controller = make_agent_controller(llm=llm, checkpoint_store=store)
 
     with patch("agent_controller.react_loop") as mock_loop:
         mock_loop.return_value = "success"
@@ -64,7 +58,7 @@ def test_run_with_resume_from_loads_checkpoint(tmp_path):
         llm.set_trace_id.assert_called_with("r-test1234")
 
 
-def test_run_without_resume_from_has_no_initial_state(tmp_path):
+def test_run_without_resume_from_has_no_initial_state(tmp_path, make_agent_controller):
     """Verify that run() without resume_from passes no initial_state."""
     store = CheckpointStore(str(tmp_path))
 
@@ -73,12 +67,7 @@ def test_run_without_resume_from_has_no_initial_state(tmp_path):
     llm.llm_cfg = {"model": "test-model"}
     llm.set_trace_id = MagicMock()
 
-    controller = AgentController(
-        llm=llm,
-        tool_index=MagicMock(),
-        memory=MagicMock(),
-        checkpoint_store=store,
-    )
+    controller = make_agent_controller(llm=llm, checkpoint_store=store)
 
     with patch("agent_controller.react_loop") as mock_loop:
         mock_loop.return_value = "success"
@@ -89,7 +78,7 @@ def test_run_without_resume_from_has_no_initial_state(tmp_path):
         assert initial_state is None
 
 
-def test_run_with_resume_from_nonexistent_checkpoint(tmp_path):
+def test_run_with_resume_from_nonexistent_checkpoint(tmp_path, make_agent_controller):
     """Verify that run(resume_from=...) with missing checkpoint proceeds normally."""
     store = CheckpointStore(str(tmp_path))
 
@@ -98,12 +87,7 @@ def test_run_with_resume_from_nonexistent_checkpoint(tmp_path):
     llm.llm_cfg = {"model": "test-model"}
     llm.set_trace_id = MagicMock()
 
-    controller = AgentController(
-        llm=llm,
-        tool_index=MagicMock(),
-        memory=MagicMock(),
-        checkpoint_store=store,
-    )
+    controller = make_agent_controller(llm=llm, checkpoint_store=store)
 
     with patch("agent_controller.react_loop") as mock_loop:
         mock_loop.return_value = "success"

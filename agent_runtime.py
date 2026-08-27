@@ -27,12 +27,13 @@ capacity semantics.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Optional
 
 from confirmation import ConfirmationManager
 from context_monitor import ContextMonitor
+from config_schema import AgentConfig, ExecutorPaths
 from react_loop import ReactContext
 from sub_agent_registry import (
     SOURCE_DIAGNOSTIC,
@@ -191,6 +192,8 @@ class AgentRuntime:
         config: Optional[dict] = None,
         all_models: Optional[list[dict]] = None,
         background_model_cfg: Optional[dict] = None,
+        agent_cfg: AgentConfig | None = None,
+        paths: ExecutorPaths | None = None,
         tool_index: object = None,
         base_memory: object = None,
         builtin_executor: object = None,
@@ -200,17 +203,15 @@ class AgentRuntime:
         usage_registry: object = None,
         notify_fn: object = None,
         data_dir: str = "data",
-        tmp_dir: str = "/tmp/agent",
-        downloads_dir: str = "downloads",
-        workspace_dir: str = "~/Documents",
-        top_tools: int = 3,
-        ctx_max_tokens: int = 90_000,
         scheduled_max_iterations: int = 100,
     ) -> None:
         # Shared model configuration.
         self._config = config
         self._all_models = all_models if all_models is not None else []
         self._background_model_cfg = background_model_cfg or {}
+        # Typed agent config + runtime path bundle.
+        self._agent_cfg = agent_cfg or AgentConfig()
+        self._paths = paths or ExecutorPaths()
         # Shared tool + memory collaborators.
         self._tool_index = tool_index
         self._base_memory = base_memory
@@ -222,11 +223,6 @@ class AgentRuntime:
         self._notify_fn = notify_fn
         # Filesystem + limit defaults.
         self._data_dir = data_dir
-        self._tmp_dir = tmp_dir
-        self._downloads_dir = downloads_dir
-        self._workspace_dir = workspace_dir
-        self._top_tools = top_tools
-        self._ctx_max_tokens = ctx_max_tokens
         self._scheduled_max_iterations = scheduled_max_iterations
 
     @staticmethod
@@ -392,6 +388,11 @@ class AgentRuntime:
         runner = SubAgentRunner(
             model_cfg=model_cfg,
             config=self._config,
+            agent_cfg=replace(
+                self._agent_cfg,
+                max_iterations=effective_max_iter,
+            ),
+            paths=self._paths,
             tool_index=self._tool_index,
             base_memory=self._base_memory,
             builtin_executor=self._builtin_executor,
@@ -402,12 +403,6 @@ class AgentRuntime:
             notify_fn=notify_fn or self._notify_fn,
             context_key=options.context_key,
             label=options.label if options.label is not None else "on-demand",
-            max_iterations=effective_max_iter,
-            top_tools=self._top_tools,
-            ctx_max_tokens=self._ctx_max_tokens,
-            tmp_dir=self._tmp_dir,
-            downloads_dir=self._downloads_dir,
-            workspace_dir=self._workspace_dir,
             usage_registry=self._usage_registry,
             depth=1,
             on_tool_trace=on_tool_trace,

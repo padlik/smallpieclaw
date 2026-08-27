@@ -15,8 +15,8 @@ from unittest.mock import MagicMock
 from builtin_executor import BuiltinExecutor
 
 
-def _make_executor() -> BuiltinExecutor:
-    return BuiltinExecutor(default_timeout=30)
+def _make_executor(make_builtin_executor) -> BuiltinExecutor:
+    return make_builtin_executor(default_timeout=30)
 
 
 # ---------------------------------------------------------------------------
@@ -44,38 +44,38 @@ def _set_result_after(executor: BuiltinExecutor, token_holder: list, approved: b
 # ---------------------------------------------------------------------------
 
 class TestHeadlessBridgeNotWired:
-    def test_fails_closed_when_no_prompt_fn(self):
-        exe = _make_executor()
+    def test_fails_closed_when_no_prompt_fn(self, make_builtin_executor):
+        exe = _make_executor(make_builtin_executor)
         assert exe._subagent_confirm_prompt_fn is None
         result = exe._requires_confirmation("file_write", {"path": "/tmp/x", "content": "hi"},
                                             "Write /tmp/x", caller_depth=1)
         assert result["success"] is False
         assert "not available" in result["error"]
 
-    def test_fails_closed_sensitive_file_read(self):
-        exe = _make_executor()
+    def test_fails_closed_sensitive_file_read(self, make_builtin_executor):
+        exe = _make_executor(make_builtin_executor)
         result = exe._requires_confirmation("file_read", {"path": "/etc/passwd"},
                                             "Read /etc/passwd", caller_depth=1)
         assert result["success"] is False
 
-    def test_fails_closed_file_patch(self):
-        exe = _make_executor()
+    def test_fails_closed_file_patch(self, make_builtin_executor):
+        exe = _make_executor(make_builtin_executor)
         result = exe._requires_confirmation("file_patch", {"path": "/etc/hosts", "old_str": "a", "new_str": "b"},
                                             "Patch /etc/hosts", caller_depth=1)
         assert result["success"] is False
 
-    def test_shell_still_blocked_at_depth1(self):
+    def test_shell_still_blocked_at_depth1(self, make_builtin_executor):
         """Dangerous shell at depth>=1 is always blocked, regardless of bridge."""
-        exe = _make_executor()
+        exe = _make_executor(make_builtin_executor)
         exe._subagent_confirm_prompt_fn = MagicMock()  # bridge wired, but shell blocked first
         result = exe._requires_confirmation("shell", {"command": "rm -rf /"},
                                             "danger", caller_depth=1)
         assert result["success"] is False
         assert "blocked" in result["error"].lower()
 
-    def test_depth0_still_returns_requires_confirmation(self):
+    def test_depth0_still_returns_requires_confirmation(self, make_builtin_executor):
         """At depth=0 the normal requires_confirmation dict is returned."""
-        exe = _make_executor()
+        exe = _make_executor(make_builtin_executor)
         result = exe._requires_confirmation("file_write", {"path": "/tmp/x", "content": ""},
                                             "desc", caller_depth=0)
         assert result.get("requires_confirmation") is True
@@ -87,8 +87,8 @@ class TestHeadlessBridgeNotWired:
 # ---------------------------------------------------------------------------
 
 class TestHeadlessBridgeApproved:
-    def test_approved_executes_and_returns_success(self, tmp_path):
-        exe = _make_executor()
+    def test_approved_executes_and_returns_success(self, make_builtin_executor, tmp_path):
+        exe = _make_executor(make_builtin_executor)
         test_file = str(tmp_path / "out.txt")
         content = "hello from sub-agent"
 
@@ -124,8 +124,8 @@ class TestHeadlessBridgeApproved:
         assert os.path.exists(test_file)
         assert open(test_file).read() == content
 
-    def test_approved_sensitive_file_read(self, tmp_path):
-        exe = _make_executor()
+    def test_approved_sensitive_file_read(self, make_builtin_executor, tmp_path):
+        exe = _make_executor(make_builtin_executor)
         secret = tmp_path / ".env"
         secret.write_text("SECRET=xyz")
 
@@ -163,8 +163,8 @@ class TestHeadlessBridgeApproved:
 # ---------------------------------------------------------------------------
 
 class TestHeadlessBridgeDenied:
-    def test_denied_returns_failure_and_does_not_write(self, tmp_path):
-        exe = _make_executor()
+    def test_denied_returns_failure_and_does_not_write(self, make_builtin_executor, tmp_path):
+        exe = _make_executor(make_builtin_executor)
         test_file = str(tmp_path / "should_not_exist.txt")
 
         tokens_seen: list[str] = []
@@ -204,8 +204,8 @@ class TestHeadlessBridgeDenied:
 # ---------------------------------------------------------------------------
 
 class TestHeadlessBridgeTimeout:
-    def test_timeout_returns_failure(self):
-        exe = _make_executor()
+    def test_timeout_returns_failure(self, make_builtin_executor):
+        exe = _make_executor(make_builtin_executor)
         exe._subagent_confirm_timeout = 1  # very short for testing
 
         def prompt_fn(token, tool_name, desc, tag):
@@ -221,8 +221,8 @@ class TestHeadlessBridgeTimeout:
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
 
-    def test_timeout_cleans_up_pending(self):
-        exe = _make_executor()
+    def test_timeout_cleans_up_pending(self, make_builtin_executor):
+        exe = _make_executor(make_builtin_executor)
         exe._subagent_confirm_timeout = 1
 
         def prompt_fn(token, tool_name, desc, tag):
@@ -245,8 +245,8 @@ class TestHeadlessBridgeTimeout:
 # ---------------------------------------------------------------------------
 
 class TestHeadlessBridgeDoublePress:
-    def test_second_signal_returns_false(self):
-        exe = _make_executor()
+    def test_second_signal_returns_false(self, make_builtin_executor):
+        exe = _make_executor(make_builtin_executor)
         tokens_seen: list[str] = []
 
         def prompt_fn(token, tool_name, desc, tag):
@@ -283,8 +283,8 @@ class TestHeadlessBridgeDoublePress:
 # ---------------------------------------------------------------------------
 
 class TestHeadlessBridgePromptError:
-    def test_prompt_fn_raises_fails_closed(self):
-        exe = _make_executor()
+    def test_prompt_fn_raises_fails_closed(self, make_builtin_executor):
+        exe = _make_executor(make_builtin_executor)
 
         def bad_prompt_fn(token, tool_name, desc, tag):
             raise ConnectionError("Telegram down")
@@ -299,8 +299,8 @@ class TestHeadlessBridgePromptError:
         assert result["success"] is False
         assert "Telegram" in result["error"] or "prompt" in result["error"].lower()
 
-    def test_prompt_fn_raises_cleans_up(self):
-        exe = _make_executor()
+    def test_prompt_fn_raises_cleans_up(self, make_builtin_executor):
+        exe = _make_executor(make_builtin_executor)
 
         def bad_prompt_fn(token, tool_name, desc, tag):
             raise OSError("network unreachable")
@@ -314,3 +314,4 @@ class TestHeadlessBridgePromptError:
 
         assert len(exe._pending) == 0
         assert len(exe._headless_confirm_events) == 0
+

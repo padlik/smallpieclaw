@@ -9,15 +9,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from agent_controller import AgentController
 from memory_store import ShortTermMemory
 
 
-def _controller(short_term, llm):
-    return AgentController(
+def _controller(short_term, llm, make_agent_controller):
+    return make_agent_controller(
         llm=llm,
-        tool_index=MagicMock(),
-        memory=MagicMock(),
         short_term=short_term,
     )
 
@@ -42,10 +39,10 @@ def _summary_llm(summary="- did things\n- finished"):
 
 
 class TestCompressFallback:
-    def test_llm_failure_shrinks_buffer_to_single_summary(self):
+    def test_llm_failure_shrinks_buffer_to_single_summary(self, make_agent_controller):
         turns = [("user", f"message {i} " + "x" * 200) for i in range(20)]
         stm = _stm(turns)
-        ctrl = _controller(stm, _failing_llm())
+        ctrl = _controller(stm, _failing_llm(), make_agent_controller)
 
         msg = ctrl.compress_context()
 
@@ -55,14 +52,14 @@ class TestCompressFallback:
         assert "deterministic fallback" in remaining[0]["content"]
         assert "deterministic truncation" in msg.lower()
 
-    def test_fallback_preserves_head_and_tail_content(self):
+    def test_fallback_preserves_head_and_tail_content(self, make_agent_controller):
         turns = (
             [("user", "FIRST_MESSAGE_MARKER")]
             + [("assistant", "filler " * 200) for _ in range(20)]
             + [("user", "LAST_MESSAGE_MARKER")]
         )
         stm = _stm(turns)
-        ctrl = _controller(stm, _failing_llm())
+        ctrl = _controller(stm, _failing_llm(), make_agent_controller)
 
         ctrl.compress_context()
 
@@ -70,11 +67,11 @@ class TestCompressFallback:
         assert "FIRST_MESSAGE_MARKER" in content
         assert "LAST_MESSAGE_MARKER" in content
 
-    def test_successful_llm_uses_normal_summary_path(self):
+    def test_successful_llm_uses_normal_summary_path(self, make_agent_controller):
         turns = [("user", "hello there"), ("assistant", "general kenobi")]
         stm = _stm(turns)
         llm = _summary_llm("- greeting exchanged")
-        ctrl = _controller(stm, llm)
+        ctrl = _controller(stm, llm, make_agent_controller)
 
         msg = ctrl.compress_context()
 
@@ -85,17 +82,17 @@ class TestCompressFallback:
         assert "deterministic" not in remaining[0]["content"]
         assert "✅" in msg
 
-    def test_empty_short_term_unchanged(self):
+    def test_empty_short_term_unchanged(self, make_agent_controller):
         stm = _stm([])
-        ctrl = _controller(stm, _failing_llm())
+        ctrl = _controller(stm, _failing_llm(), make_agent_controller)
         msg = ctrl.compress_context()
         # Nothing to compress — no LLM call, no fallback message.
         assert "No short-term" in msg or "already minimal" in msg
         assert stm.get_messages() == []
 
-    def test_single_message_not_compressed(self):
+    def test_single_message_not_compressed(self, make_agent_controller):
         stm = _stm([("user", "only one")])
-        ctrl = _controller(stm, _failing_llm())
+        ctrl = _controller(stm, _failing_llm(), make_agent_controller)
         msg = ctrl.compress_context()
         assert "already minimal" in msg
         assert len(stm.get_messages()) == 1

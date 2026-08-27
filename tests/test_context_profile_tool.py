@@ -7,7 +7,6 @@ result shape.
 
 from __future__ import annotations
 
-from builtin_executor import BuiltinExecutor
 from builtin_tools.context_profile import exec_context_profile
 from builtin_tools.descriptors import BUILTIN_TOOLS
 from builtin_tools.schemas import BUILTIN_TOOL_SCHEMAS, build_tool_definitions
@@ -86,9 +85,9 @@ def test_build_tool_definitions_includes_context_profile() -> None:
     assert "context_profile" in names
 
 
-def test_builtin_executor_is_builtin_recognizes_context_profile() -> None:
+def test_builtin_executor_is_builtin_recognizes_context_profile(make_builtin_executor) -> None:
     """BuiltinExecutor.is_builtin returns True for context_profile."""
-    builtin = BuiltinExecutor(
+    builtin = make_builtin_executor(
         default_timeout=10,
         data_dir="data",
         memory=None,
@@ -96,9 +95,9 @@ def test_builtin_executor_is_builtin_recognizes_context_profile() -> None:
     assert builtin.is_builtin("context_profile") is True
 
 
-def test_context_profile_not_confirmation_capable() -> None:
+def test_context_profile_not_confirmation_capable(make_builtin_executor) -> None:
     """context_profile is not in the dangerous-tool confirmation table."""
-    builtin = BuiltinExecutor(
+    builtin = make_builtin_executor(
         default_timeout=10,
         data_dir="data",
         memory=None,

@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from builtin_executor import BuiltinExecutor
 from react_loop import ReactContext
 
 
@@ -60,8 +59,8 @@ class TestReactContextGraphMemoryDefaults:
 
 class TestBuiltinExecutorGraphMemoryDisabled:
     @pytest.fixture
-    def builtin(self, tmp_path):
-        return BuiltinExecutor(data_dir=str(tmp_path))
+    def builtin(self, make_builtin_executor, tmp_path):
+        return make_builtin_executor(data_dir=str(tmp_path))
 
     def test_memory_graph_search_no_store(self, builtin):
         result = builtin.execute("memory_graph_search", {"query": "test"})
@@ -93,8 +92,8 @@ class TestBuiltinExecutorGraphMemoryDisabled:
 
 class TestBuiltinExecutorGraphMemoryEnabled:
     @pytest.fixture
-    def builtin_with_graph_memory(self, tmp_path):
-        b = BuiltinExecutor(data_dir=str(tmp_path))
+    def builtin_with_graph_memory(self, make_builtin_executor, tmp_path):
+        b = make_builtin_executor(data_dir=str(tmp_path))
         mock_store = MagicMock()
         mock_store.format_for_prompt.return_value = "KNOWLEDGE GRAPH CONTEXT:\n  • Alice (person)"
         mock_store.add_episode.return_value = "ep:123"
@@ -159,16 +158,16 @@ class TestBuiltinExecutorGraphMemoryEnabled:
 # ---------------------------------------------------------------------------
 
 class TestBuiltinRecognition:
-    def test_memory_graph_search_is_builtin(self, tmp_path):
-        b = BuiltinExecutor(data_dir=str(tmp_path))
+    def test_memory_graph_search_is_builtin(self, make_builtin_executor, tmp_path):
+        b = make_builtin_executor(data_dir=str(tmp_path))
         assert b.is_builtin("memory_graph_search")
 
-    def test_memory_graph_store_is_builtin(self, tmp_path):
-        b = BuiltinExecutor(data_dir=str(tmp_path))
+    def test_memory_graph_store_is_builtin(self, make_builtin_executor, tmp_path):
+        b = make_builtin_executor(data_dir=str(tmp_path))
         assert b.is_builtin("memory_graph_store")
 
-    def test_all_tools_includes_graph_memory(self, tmp_path):
-        b = BuiltinExecutor(data_dir=str(tmp_path))
+    def test_all_tools_includes_graph_memory(self, make_builtin_executor, tmp_path):
+        b = make_builtin_executor(data_dir=str(tmp_path))
         names = {t.name for t in b.all_tools()}
         assert "memory_graph_search" in names
         assert "memory_graph_store" in names

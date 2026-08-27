@@ -371,10 +371,13 @@ class TestCancelEventOwnership:
     stop signal forwarded to a sub-agent must not be erased when the sub-agent starts)."""
 
     def _make_controller(self, cancel_event=None):
-        from unittest.mock import MagicMock
         from agent_controller import AgentController
+        from config_schema import AgentConfig, ExecutorPaths
+        from unittest.mock import MagicMock
 
         return AgentController(
+            agent_cfg=AgentConfig(),
+            paths=ExecutorPaths(),
             llm=MagicMock(),
             tool_index=MagicMock(),
             memory=MagicMock(),
@@ -519,10 +522,13 @@ class TestAgentControllerCancelRegistryWiring:
     out through the registry."""
 
     def _make_controller(self, cancel_event=None):
-        from unittest.mock import MagicMock
         from agent_controller import AgentController
+        from config_schema import AgentConfig, ExecutorPaths
+        from unittest.mock import MagicMock
 
         return AgentController(
+            agent_cfg=AgentConfig(),
+            paths=ExecutorPaths(),
             llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(),
             cancel_event=cancel_event,
         )

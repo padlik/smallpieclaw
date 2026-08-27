@@ -146,8 +146,8 @@ class TestReactLoopFinishSummary:
 
 
 class TestAgentControllerResetTaskOutcomeEnqueue:
-    def test_reset_save_enqueues_task_outcome(self, results_memory):
-        from agent_controller import AgentController
+    def test_reset_save_enqueues_task_outcome(self, results_memory, make_agent_controller):
+        from config_schema import AgentConfig
 
         llm = MagicMock()
         llm.chat.return_value = "reset summary"
@@ -160,11 +160,9 @@ class TestAgentControllerResetTaskOutcomeEnqueue:
 
         writer = MagicMock()
 
-        ctrl = AgentController(
+        ctrl = make_agent_controller(
             llm=llm,
-            tool_index=MagicMock(),
-            memory=MagicMock(),
-            max_iterations=2,
+            agent_cfg=AgentConfig(max_iterations=2),
         )
         ctrl.results = results
         ctrl.working = working
@@ -179,8 +177,8 @@ class TestAgentControllerResetTaskOutcomeEnqueue:
         assert "Goal: restart service" in text
         assert "reset summary" in text
 
-    def test_reset_save_without_writer_does_not_fail(self, results_memory):
-        from agent_controller import AgentController
+    def test_reset_save_without_writer_does_not_fail(self, results_memory, make_agent_controller):
+        from config_schema import AgentConfig
 
         llm = MagicMock()
         llm.chat.return_value = "fallback"
@@ -190,11 +188,9 @@ class TestAgentControllerResetTaskOutcomeEnqueue:
         working = WorkingMemory()
         working.start_task("restart service")
 
-        ctrl = AgentController(
+        ctrl = make_agent_controller(
             llm=llm,
-            tool_index=MagicMock(),
-            memory=MagicMock(),
-            max_iterations=2,
+            agent_cfg=AgentConfig(max_iterations=2),
         )
         ctrl.results = results
         ctrl.working = working

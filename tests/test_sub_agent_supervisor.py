@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from builtin_executor import BuiltinExecutor
 from memory_store import ShortTermMemory
 from sub_agent_registry import SubAgentRegistry, get_registry
 from sub_agent_supervisor import (
@@ -146,10 +145,10 @@ class TestSchedulerSynchronousRejection:
 class TestCallbackIsolation:
     """Concurrent scheduled launches must not overwrite each other's callbacks."""
 
-    def test_concurrent_launches_keep_per_submission_callbacks(self, tmp_path):
+    def test_concurrent_launches_keep_per_submission_callbacks(self, make_builtin_executor, tmp_path):
         runner_a = FakeRunner(agent_id="sa-a", result="A-done")
         runner_b = FakeRunner(agent_id="sa-b", result="B-done")
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner_a, runner_b]),
             data_dir=str(tmp_path),
         )
@@ -198,9 +197,9 @@ class TestCallbackIsolation:
 # ---------------------------------------------------------------------------
 
 class TestStaleNotificationSuppression:
-    def _spawn_blocking(self, tmp_path, agent_id):
+    def _spawn_blocking(self, make_builtin_executor, tmp_path, agent_id):
         runner = FakeRunner(agent_id=agent_id, block=True)
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner]),
             data_dir=str(tmp_path),
         )
@@ -213,8 +212,8 @@ class TestStaleNotificationSuppression:
         assert record is not None
         return exc, runner, record
 
-    def test_timeout_cancel_suppresses_stale_notification(self, tmp_path):
-        exc, runner, record = self._spawn_blocking(tmp_path, "sa-stale")
+    def test_timeout_cancel_suppresses_stale_notification(self, make_builtin_executor, tmp_path):
+        exc, runner, record = self._spawn_blocking(make_builtin_executor, tmp_path, "sa-stale")
 
         # get_agent_result times out and auto-cancels the run.
         out = exc._exec_get_agent_result({"agent_id": record.agent_id, "timeout": 0})
@@ -226,9 +225,9 @@ class TestStaleNotificationSuppression:
         # The timed-out run must NOT emit a stale cancellation notification.
         assert runner.notify_calls == []
 
-    def test_manual_cancel_still_notifies(self, tmp_path):
+    def test_manual_cancel_still_notifies(self, make_builtin_executor, tmp_path):
         """Contrast: a non-timeout cancel is not suppressed (flag stays False)."""
-        exc, runner, record = self._spawn_blocking(tmp_path, "sa-manual")
+        exc, runner, record = self._spawn_blocking(make_builtin_executor, tmp_path, "sa-manual")
 
         record.cancel()  # e.g. operator /agents cancel — not a get_agent_result timeout
         assert record._timeout_cancelled is False
@@ -244,14 +243,14 @@ class TestStaleNotificationSuppression:
 # ---------------------------------------------------------------------------
 
 class TestChannelSeparation:
-    def test_supervision_controls_never_enter_context_payload(self, tmp_path):
+    def test_supervision_controls_never_enter_context_payload(self, make_builtin_executor, tmp_path):
         captured = {}
 
         def factory(**kwargs):
             captured.update(kwargs)
             return FakeRunner(agent_id="sa-sep")
 
-        exc = BuiltinExecutor(sub_agent_factory=factory, data_dir=str(tmp_path))
+        exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
 
         with patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
             exc._exec_spawn_agent(
@@ -281,9 +280,9 @@ class TestChannelSeparation:
 # ---------------------------------------------------------------------------
 
 class TestGraphMemoryNonAdmission:
-    def test_completed_result_not_admitted_to_graph(self, tmp_path):
+    def test_completed_result_not_admitted_to_graph(self, make_builtin_executor, tmp_path):
         runner = FakeRunner(agent_id="sa-graph", result="a fact worth remembering")
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner]),
             data_dir=str(tmp_path),
         )
@@ -311,9 +310,9 @@ class TestGraphMemoryNonAdmission:
 # ---------------------------------------------------------------------------
 
 class TestCapacityAndSourcePreservation:
-    def test_spawned_record_source_is_on_demand_and_counts(self, tmp_path):
+    def test_spawned_record_source_is_on_demand_and_counts(self, make_builtin_executor, tmp_path):
         runner = FakeRunner(agent_id="sa-src")
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner]),
             data_dir=str(tmp_path),
         )
@@ -328,10 +327,10 @@ class TestCapacityAndSourcePreservation:
         assert rec.source == "on-demand"
         assert local_reg.count_managed() == 1
 
-    def test_scheduled_launch_record_source_is_scheduled_and_counts(self, tmp_path):
+    def test_scheduled_launch_record_source_is_scheduled_and_counts(self, make_builtin_executor, tmp_path):
         """Scheduled launches (source via options) record source=scheduled and count."""
         runner = FakeRunner(agent_id="sa-sched-src")
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner]),
             data_dir=str(tmp_path),
         )
@@ -353,10 +352,10 @@ class TestCapacityAndSourcePreservation:
         # Scheduled runs still count against the global capacity guard.
         assert local_reg.count_managed() == 1
 
-    def test_cap_reached_rejects_before_submission(self, tmp_path):
+    def test_cap_reached_rejects_before_submission(self, make_builtin_executor, tmp_path):
         runner = FakeRunner(agent_id="sa-capped")
         factory = MagicMock(return_value=runner)
-        exc = BuiltinExecutor(sub_agent_factory=factory, data_dir=str(tmp_path),
+        exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path),
                               max_subagents=2)
         full_reg = MagicMock()
         full_reg.count_managed.return_value = 2
@@ -377,9 +376,9 @@ class TestCapacityAndSourcePreservation:
 # ---------------------------------------------------------------------------
 
 class TestPoolShutdown:
-    def test_shutdown_cancels_active_and_closes_pool(self, tmp_path):
+    def test_shutdown_cancels_active_and_closes_pool(self, make_builtin_executor, tmp_path):
         runner = FakeRunner(agent_id="sa-shutdown", block=True)
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner]),
             data_dir=str(tmp_path),
         )
@@ -412,11 +411,11 @@ class TestPoolShutdown:
 # ---------------------------------------------------------------------------
 
 class TestSubmitRejectionShape:
-    def test_factory_value_error_returns_rejection_without_finish_cb(self, tmp_path):
+    def test_factory_value_error_returns_rejection_without_finish_cb(self, make_builtin_executor, tmp_path):
         def factory(**_kwargs):
             raise ValueError("Model 'nope' not found")
 
-        exc = BuiltinExecutor(sub_agent_factory=factory, data_dir=str(tmp_path))
+        exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
         finish_calls: list[str] = []
 
         res = exc._exec_spawn_agent(

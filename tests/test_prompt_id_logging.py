@@ -54,19 +54,14 @@ def _flush() -> None:
 class TestMainAgentPromptIdBinding:
     """AgentController.run() must bind prompt_id into the log context."""
 
-    def test_run_calls_bind_run_context_with_prompt_id(self):
-        from agent_controller import AgentController
-
+    def test_run_calls_bind_run_context_with_prompt_id(self, make_agent_controller):
+        
         mock_llm = MagicMock()
         mock_llm._active_idx = 0
         mock_llm._models = []
         mock_llm.llm_cfg = {"model": "test"}
 
-        controller = AgentController(
-            llm=mock_llm,
-            tool_index=MagicMock(),
-            memory=MagicMock(),
-        )
+        controller = make_agent_controller(llm=mock_llm)
         controller.tool_index.search.return_value = []
         controller.memory.as_prompt_text.return_value = ""
 
@@ -84,8 +79,7 @@ class TestMainAgentPromptIdBinding:
 class TestSubAgentPromptIdBinding:
     """SubAgentSupervisor._run_and_notify must bind the parent's prompt_id."""
 
-    def test_supervisor_binds_parent_prompt_id_before_run(self, tmp_path):
-        from builtin_executor import BuiltinExecutor
+    def test_supervisor_binds_parent_prompt_id_before_run(self, make_builtin_executor, tmp_path):
         from sub_agent_supervisor import SupervisionOptions
 
         class FakeRunner:
@@ -110,7 +104,7 @@ class TestSubAgentPromptIdBinding:
 
         runner = FakeRunner()
 
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=lambda **_kw: runner,
             data_dir=str(tmp_path),
         )
@@ -129,8 +123,7 @@ class TestSubAgentPromptIdBinding:
         assert kwargs.get("prompt_id") == "01JARYN6R0ABCDEFGHJKMNPQRS"
         assert kwargs.get("agent") == "sa-test"
 
-    def test_supervisor_clears_run_context_after_run(self, tmp_path):
-        from builtin_executor import BuiltinExecutor
+    def test_supervisor_clears_run_context_after_run(self, make_builtin_executor, tmp_path):
         from sub_agent_supervisor import SupervisionOptions
 
         class FakeRunner:
@@ -152,7 +145,7 @@ class TestSubAgentPromptIdBinding:
             def close(self):
                 pass
 
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=lambda **_kw: FakeRunner(),
             data_dir=str(tmp_path),
         )
@@ -172,10 +165,9 @@ class TestSubAgentPromptIdBinding:
 
         mock_clear.assert_called_once()
 
-    def test_supervisor_uses_legacy_run_signature_without_prompt_id(self, tmp_path):
+    def test_supervisor_uses_legacy_run_signature_without_prompt_id(self, make_builtin_executor, tmp_path):
         """A runner that does not accept prompt_id must still run without a
         bare TypeError being swallowed and retried."""
-        from builtin_executor import BuiltinExecutor
         from sub_agent_supervisor import SupervisionOptions
 
         class LegacyRunner:
@@ -198,7 +190,7 @@ class TestSubAgentPromptIdBinding:
                 pass
 
         runner = LegacyRunner()
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=lambda **_kw: runner,
             data_dir=str(tmp_path),
         )

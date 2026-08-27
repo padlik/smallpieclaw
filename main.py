@@ -103,7 +103,7 @@ except ImportError:
 from agent_controller import AgentController  # noqa: E402
 from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile  # noqa: E402
 from builtin_executor import BuiltinExecutor  # noqa: E402
-from config_schema import resolve_model_id, parse_vault_content  # noqa: E402
+from config_schema import resolve_model_id, parse_vault_content, ExecutorPaths  # noqa: E402
 from context_monitor import ContextMonitor  # noqa: E402
 from graph_memory import create_graph_memory  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
@@ -389,34 +389,6 @@ def _run(
     os.environ["TEMP"] = tmp_dir
     logger.info("Downloads dir: %s | Tmp dir: %s", downloads_dir, tmp_dir)
 
-    agent_cfg  = cfg.get("agent", {})
-    max_iter   = agent_cfg.get("max_iterations", 8)
-    timeout    = agent_cfg.get("tool_timeout", 10)
-    max_output = agent_cfg.get("max_output_size", 4000)
-    top_tools  = agent_cfg.get("top_tools", 3)
-    ctx_max_tokens = agent_cfg.get("ctx_max_tokens", 90_000)
-    max_subagents = agent_cfg.get("max_subagents", 6)
-    subagent_result_timeout = agent_cfg.get("subagent_result_timeout", 300)
-    shell_backend = agent_cfg.get("shell_backend", "subprocess")
-    shell_pty_cols = int(agent_cfg.get("shell_pty_cols", 220))
-    shell_pty_rows = int(agent_cfg.get("shell_pty_rows", 50))
-    shell_streaming = bool(agent_cfg.get("shell_streaming", False))
-    shell_nsjail_confirm_mode = agent_cfg.get("shell_nsjail_confirm_mode", "always")
-    shell_nsjail_memory_mb = int(agent_cfg.get("shell_nsjail_memory_mb", 256))
-    shell_nsjail_pids_max = int(agent_cfg.get("shell_nsjail_pids_max", 64))
-    shell_nsjail_cpu_percent = int(agent_cfg.get("shell_nsjail_cpu_percent", 50))
-    shell_nsjail_dump_config_on_error = bool(agent_cfg.get("shell_nsjail_dump_config_on_error", False))
-    allow_net = app_cfg.agent.allow_net
-    dns_nameserver = app_cfg.agent.dns_nameserver
-    creativity_mode = agent_cfg.get("creativity_mode", "default")
-    plan_max_iterations = int(agent_cfg.get("plan_max_iterations", 50))
-    inactivity_warn_minutes = int(agent_cfg.get("inactivity_warn_minutes", 15))
-    # Separate step cap for scheduled/background agents (chat sessions use max_iter)
-    _raw_sched_max = agent_cfg.get("scheduled_max_iterations", 100)
-    scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
-
-    logger.info("Initialising components...")
-
     # Per-session temp dir for nsjail /tmp bind mount — persists across nsjail
     # invocations within a session, cleaned up at agent shutdown.
     nsjail_session_tmpdir = tempfile.mkdtemp(prefix="nsjail-tmp-")
@@ -426,6 +398,29 @@ def _run(
     vault_secrets = _read_vault_secrets(vault_file)
     data_dir = str(paths.data_home)
     skills_dir_abs = str(paths.skills_dir)
+
+    # Separate step cap for scheduled/background agents (chat sessions use max_iterations)
+    _raw_sched_max = app_cfg.agent.scheduled_max_iterations
+    scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
+
+    executor_paths = ExecutorPaths(
+        tmp_dir=tmp_dir,
+        downloads_dir=downloads_dir,
+        workspace_dir=workspace_dir,
+        log_file=str(paths.log_file),
+        log_backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
+        data_dir=data_dir,
+        state_home=nsjail_state_dir,
+        skills_dir=skills_dir_abs,
+        vault_path=vault_file,
+        log_jsonl_path=json_log_path,
+        nsjail_session_tmpdir=nsjail_session_tmpdir,
+        nsjail_trusted_dirs_path=trusted_dirs_path,
+        nsjail_agent_dir=str(Path(__file__).parent.resolve()),
+        vault_secrets=vault_secrets,
+    )
+
+    logger.info("Initialising components...")
 
     # Single shared ContextMonitor instance — injected into both BuiltinExecutor
     # (for the context_profile tool) and AgentController (for the ReAct loop
@@ -442,27 +437,11 @@ def _run(
     if _purged:
         logger.info("Startup: purged %d stale model/provider key(s) from memory store", _purged)
     registry = ToolRegistry()
-    builtin  = BuiltinExecutor(
-        default_timeout=timeout, max_output=max_output, data_dir=data_dir, memory=memory,
-        max_subagents=max_subagents, subagent_result_timeout=subagent_result_timeout,
-        shell_backend=shell_backend, shell_pty_cols=shell_pty_cols, shell_pty_rows=shell_pty_rows,
-        shell_streaming=shell_streaming, vault_path=vault_file, log_jsonl_path=json_log_path,
-        shell_nsjail_confirm_mode=shell_nsjail_confirm_mode,
-        shell_nsjail_memory_mb=shell_nsjail_memory_mb,
-        shell_nsjail_pids_max=shell_nsjail_pids_max,
-        shell_nsjail_cpu_percent=shell_nsjail_cpu_percent,
-        shell_nsjail_dump_config_on_error=shell_nsjail_dump_config_on_error,
-        allow_net=allow_net,
-        nsjail_dns_nameserver=dns_nameserver,
-        nsjail_session_tmpdir=nsjail_session_tmpdir,
-        skills_dir=skills_dir_abs,
-        nsjail_trusted_dirs_path=trusted_dirs_path,
-        nsjail_agent_dir=str(Path(__file__).parent.resolve()),
-        agent_name=agent_name,
-        tmp_dir=tmp_dir,
-        state_home=nsjail_state_dir,
-        workspace_dir=workspace_dir,
-        vault_secrets=vault_secrets,
+    builtin = BuiltinExecutor(
+        agent_cfg=app_cfg.agent,
+        paths=executor_paths,
+        scheduler=None,
+        memory=memory,
         context_monitor=context_monitor,
     )
     builtin.conversation_id = conversation_id
@@ -526,26 +505,17 @@ def _run(
     builtin.skill_registry = skills  # type: ignore[attr-defined]
 
     agent = AgentController(
+        agent_cfg=app_cfg.agent,
+        paths=executor_paths,
         llm=llm,
         tool_index=index,
         memory=memory,
-        max_iterations=max_iter,
-        top_tools=top_tools,
-        ctx_max_tokens=ctx_max_tokens,
         short_term=short_term,
         working=working,
         results=results_mem,
         builtin_executor=builtin,
         skill_registry=skills,
         mcp_manager=mcp_manager,
-        tmp_dir=tmp_dir,
-        downloads_dir=downloads_dir,
-        workspace_dir=workspace_dir,
-        log_file=str(paths.log_file),
-        log_backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
-        creativity_mode=creativity_mode,
-        plan_max_iterations=plan_max_iterations,
-        inactivity_warn_minutes=inactivity_warn_minutes,
         context_monitor=context_monitor,
     )
 
@@ -598,7 +568,7 @@ def _run(
             tg.send_html_to_users(html_msg)
 
     # Resolve background_model for sub-agents
-    background_model_id = agent_cfg.get("background_model") or agent_cfg.get("default_model", "")
+    background_model_id = app_cfg.agent.background_model or app_cfg.agent.default_model
     all_models = cfg.get("models", [])
     _bg_resolved = resolve_model_id(background_model_id, all_models)
     background_model_cfg = next(
@@ -621,6 +591,8 @@ def _run(
         config=cfg,
         all_models=all_models,
         background_model_cfg=background_model_cfg,
+        agent_cfg=app_cfg.agent,
+        paths=executor_paths,
         tool_index=index,
         base_memory=memory,
         builtin_executor=builtin,
@@ -630,11 +602,6 @@ def _run(
         usage_registry=get_token_registry(),
         notify_fn=notify,
         data_dir=data_dir,
-        tmp_dir=tmp_dir,
-        downloads_dir=downloads_dir,
-        workspace_dir=workspace_dir,
-        top_tools=top_tools,
-        ctx_max_tokens=ctx_max_tokens,
         scheduled_max_iterations=scheduled_max_iter,
     )
 

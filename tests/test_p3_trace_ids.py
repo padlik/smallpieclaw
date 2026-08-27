@@ -101,13 +101,20 @@ class TestLLMSetTraceId:
 
 class TestAgentControllerTrace:
     def _controller(self, trace_id=None):
+        from config_schema import AgentConfig, ExecutorPaths
+
         llm = MagicMock()
         llm._active_idx = 0
         llm._trace_id = ""
         applied = []
         llm.set_trace_id.side_effect = lambda t: applied.append(t)
         ctrl = agent_controller.AgentController(
-            llm=llm, tool_index=MagicMock(), memory=MagicMock(), trace_id=trace_id,
+            agent_cfg=AgentConfig(),
+            paths=ExecutorPaths(),
+            llm=llm,
+            tool_index=MagicMock(),
+            memory=MagicMock(),
+            trace_id=trace_id,
         )
         return ctrl, llm, applied
 
@@ -204,6 +211,8 @@ class TestSubAgentTracePropagation:
             captured["trace_id"] = kwargs.get("trace_id")
             return real_init(self, *args, **kwargs)
 
+        from config_schema import AgentConfig, ExecutorPaths
+
         cfg = {
             "models": [{"name": "m", "provider": "openai", "model": "gpt-4o-mini",
                         "api_key": "sk", "base_url": "https://api.openai.com/v1"}],
@@ -212,6 +221,8 @@ class TestSubAgentTracePropagation:
         with patch.object(agent_controller.AgentController, "__init__", spy_init):
             runner = agent_controller.SubAgentRunner(
                 model_cfg=cfg["models"][0], config=cfg,
+                agent_cfg=AgentConfig(),
+                paths=ExecutorPaths(),
                 tool_index=MagicMock(), base_memory=MagicMock(), builtin_executor=MagicMock(),
                 trace_id="r-parent99",
             )

@@ -21,7 +21,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from builtin_executor import BuiltinExecutor
 from graph_memory import (
     ADMISSION_CONFIRMED,
     ADMISSION_OBSERVED,
@@ -263,8 +262,8 @@ class TestAdmissionFormatting:
 
 class TestMemoryGraphStoreConfirmation:
     @pytest.fixture
-    def executor_with_graph(self):
-        b = BuiltinExecutor(default_timeout=30)
+    def executor_with_graph(self, make_builtin_executor):
+        b = make_builtin_executor(default_timeout=30)
         b._graph_memory = MagicMock()
         b._graph_memory.add_episode.return_value = "ep:1"
         b._graph_memory_writer = MagicMock()

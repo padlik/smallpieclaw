@@ -40,15 +40,24 @@ _TRACE_RE = re.compile(r"^r-[0-9a-f]{8}$")
 
 def _make_controller(**overrides) -> AgentController:
     """Construct an AgentController with frozen, inspectable knob values."""
+    from config_schema import AgentConfig, ExecutorPaths
+
     builtin = MagicMock()
     builtin._max_subagents = 5  # frozen expected value for ctx.max_subagents
-    kwargs = dict(
-        llm=MagicMock(),
-        tool_index=MagicMock(),
-        memory=MagicMock(),
+    agent_cfg = AgentConfig(
         max_iterations=11,
         top_tools=4,
         ctx_max_tokens=12345,
+        plan_max_iterations=42,
+        inactivity_warn_minutes=7,
+    )
+    paths = ExecutorPaths()
+    kwargs = dict(
+        agent_cfg=agent_cfg,
+        paths=paths,
+        llm=MagicMock(),
+        tool_index=MagicMock(),
+        memory=MagicMock(),
         short_term=MagicMock(),
         working=MagicMock(),
         results=MagicMock(),
@@ -57,8 +66,6 @@ def _make_controller(**overrides) -> AgentController:
         mcp_manager=MagicMock(),
         depth=0,
         label="main",
-        plan_max_iterations=42,
-        inactivity_warn_minutes=7,
     )
     kwargs.update(overrides)
     return AgentController(**kwargs)  # type: ignore[arg-type]
@@ -97,10 +104,14 @@ def _make_runner(config: dict, *, model_cfg=None,
                  context_payload=None, prompt_variant=None, on_step=None,
                  label: str = "on-demand") -> SubAgentRunner:
     """Construct a real SubAgentRunner (builds a real isolated LLMClient)."""
+    from config_schema import AgentConfig, ExecutorPaths
+
     model_cfg = model_cfg if model_cfg is not None else config["models"][0]
     return SubAgentRunner(
         model_cfg=model_cfg,
         config=config,
+        agent_cfg=AgentConfig(),
+        paths=ExecutorPaths(),
         tool_index=MagicMock(),
         base_memory=MagicMock(),
         builtin_executor=MagicMock(),

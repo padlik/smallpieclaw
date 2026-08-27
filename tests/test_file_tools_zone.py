@@ -362,20 +362,20 @@ class TestConfirmRoundTrip:
             f.write(content)
         return path
 
-    def _make_executor(self) -> BuiltinExecutor:
+    def _make_executor(self, make_builtin_executor) -> BuiltinExecutor:
         """Real BuiltinExecutor with a checker that classifies all paths as UNRECOGNISED."""
-        builtin = BuiltinExecutor()
+        builtin = make_builtin_executor()
         checker = MagicMock()
         checker.classify.return_value = ZoneClassification.UNRECOGNISED
         builtin.trusted_zone_checker = checker  # type: ignore[assignment]  # type: ignore[assignment]
         return builtin
 
-    def test_file_diff_confirm_executes(self):
+    def test_file_diff_confirm_executes(self, make_builtin_executor):
         """file_diff: confirm(token) must execute successfully, not return 'Unknown built-in'."""
         with tempfile.TemporaryDirectory() as tmp:
             path_a = self._write_file(tmp, "a.txt", "hello\n")
             path_b = self._write_file(tmp, "b.txt", "world\n")
-            builtin = self._make_executor()
+            builtin = self._make_executor(make_builtin_executor)
             with patch("builtin_tools.files._is_sensitive_path", return_value=(False, "")):
                 staged = builtin.execute("file_diff", {"path_a": path_a, "path_b": path_b})
             assert staged.get("requires_confirmation") is True
@@ -384,11 +384,11 @@ class TestConfirmRoundTrip:
             assert result.get("success") is True
             assert result.get("error") != "Unknown built-in"
 
-    def test_file_send_confirm_executes(self):
+    def test_file_send_confirm_executes(self, make_builtin_executor):
         """file_send: confirm(token) must execute successfully, not return 'Unknown built-in'."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_file(tmp, "data.txt", "payload\n")
-            builtin = self._make_executor()
+            builtin = self._make_executor(make_builtin_executor)
             with patch("builtin_tools.files._is_sensitive_path", return_value=(False, "")):
                 staged = builtin.execute("file_send", {"path": path})
             assert staged.get("requires_confirmation") is True
@@ -397,11 +397,11 @@ class TestConfirmRoundTrip:
             assert result.get("success") is True
             assert result.get("error") != "Unknown built-in"
 
-    def test_file_write_confirm_executes(self):
+    def test_file_write_confirm_executes(self, make_builtin_executor):
         """file_write: sanity check that the existing _run_table entry still works."""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "out.txt")
-            builtin = self._make_executor()
+            builtin = self._make_executor(make_builtin_executor)
             with patch("builtin_tools.files._is_sensitive_path", return_value=(False, "")):
                 staged = builtin.execute("file_write", {"path": path, "content": "x"})
             assert staged.get("requires_confirmation") is True
@@ -410,11 +410,11 @@ class TestConfirmRoundTrip:
             assert result.get("success") is True
             assert result.get("error") != "Unknown built-in"
 
-    def test_file_patch_confirm_executes(self):
+    def test_file_patch_confirm_executes(self, make_builtin_executor):
         """file_patch: sanity check that the existing _run_table entry still works."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_file(tmp, "target.txt", "hello world")
-            builtin = self._make_executor()
+            builtin = self._make_executor(make_builtin_executor)
             with patch("builtin_tools.files._is_sensitive_path", return_value=(False, "")):
                 staged = builtin.execute(
                     "file_patch", {"path": path, "old_str": "hello", "new_str": "hi"}

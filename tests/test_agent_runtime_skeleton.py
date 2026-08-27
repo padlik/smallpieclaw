@@ -62,10 +62,16 @@ def _cfg() -> dict:
 
 def _runtime(config: dict, *, notify_fn=None, scheduled_max_iterations: int = 100,
              usage_registry=None) -> AgentRuntime:
+    from config_schema import AgentConfig, ExecutorPaths
+
     return AgentRuntime(
         config=config,
         all_models=config["models"],
         background_model_cfg=config["models"][0],
+        agent_cfg=AgentConfig(top_tools=4, ctx_max_tokens=12345),
+        paths=ExecutorPaths(tmp_dir="/tmp/agent", downloads_dir="downloads",
+                            workspace_dir="~/Documents", log_file="agent.log",
+                            log_backup_count=30),
         tool_index=MagicMock(),
         base_memory=MagicMock(),
         builtin_executor=MagicMock(),
@@ -75,8 +81,6 @@ def _runtime(config: dict, *, notify_fn=None, scheduled_max_iterations: int = 10
         usage_registry=usage_registry,
         notify_fn=notify_fn,
         scheduled_max_iterations=scheduled_max_iterations,
-        top_tools=4,
-        ctx_max_tokens=12345,
     )
 
 
@@ -224,22 +228,23 @@ class TestAgentRuntimeSkeleton:
         assert isinstance(runtime, AgentRuntime)
 
     def test_holds_construction_dependencies(self):
+        from config_schema import AgentConfig
+
         tool_index = object()
         base_memory = object()
         runtime = AgentRuntime(
             config={"models": []},
             all_models=[{"model": "model-a"}],
             background_model_cfg={"model": "model-a"},
+            agent_cfg=AgentConfig(top_tools=4, ctx_max_tokens=12345),
             tool_index=tool_index,
             base_memory=base_memory,
-            top_tools=4,
-            ctx_max_tokens=12345,
         )
         assert runtime._tool_index is tool_index
         assert runtime._base_memory is base_memory
         assert runtime._all_models == [{"model": "model-a"}]
-        assert runtime._top_tools == 4
-        assert runtime._ctx_max_tokens == 12345
+        assert runtime._agent_cfg.top_tools == 4
+        assert runtime._agent_cfg.ctx_max_tokens == 12345
 
     def test_source_for_profile_matches_module_helper(self):
         runtime = AgentRuntime()
@@ -426,11 +431,15 @@ class TestAgentRuntimeCreateSubAgent:
         assert runner._agent._on_step is None
 
     def test_context_key_preloads_short_term(self, tmp_path):
+        from config_schema import AgentConfig, ExecutorPaths
+
         # context_key routes through _load_context; a missing key yields fresh memory.
         runtime = AgentRuntime(
             config=_cfg(),
             all_models=_cfg()["models"],
             background_model_cfg=_cfg()["models"][0],
+            agent_cfg=AgentConfig(),
+            paths=ExecutorPaths(),
             tool_index=MagicMock(),
             base_memory=MagicMock(),
             builtin_executor=MagicMock(),

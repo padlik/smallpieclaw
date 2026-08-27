@@ -9,15 +9,14 @@ import pytest
 import structlog
 
 import agent_logging as al
-from builtin_executor import BuiltinExecutor
 
 
 @pytest.fixture
-def executor(tmp_path):
+def executor(make_builtin_executor, tmp_path):
     """A BuiltinExecutor wired to a temp JSONL log file."""
     log_file = str(tmp_path / "agent.log")
     json_file = al.setup_logging(log_file, backup_count=1)
-    exc = BuiltinExecutor(log_jsonl_path=json_file)
+    exc = make_builtin_executor(log_jsonl_path=json_file)
     yield exc
     for handler in logging.getLogger().handlers[:]:
         root = logging.getLogger()

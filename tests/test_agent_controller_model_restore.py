@@ -15,23 +15,17 @@ def _make_llm(initial_idx: int = 0) -> MagicMock:
     return llm
 
 
-def _make_controller(llm):
-    from agent_controller import AgentController
-
-    return AgentController(
-        llm=llm,
-        tool_index=MagicMock(),
-        memory=MagicMock(),
-    )
+def _make_controller(llm, make_agent_controller):
+    return make_agent_controller(llm=llm)
 
 
 class TestAgentControllerModelRestore:
     """AgentController.run() must restore the primary model on completion."""
 
-    def test_restores_primary_model_on_success(self):
+    def test_restores_primary_model_on_success(self, make_agent_controller):
         """_active_idx is reset to the original value when react_loop succeeds."""
         llm = _make_llm(initial_idx=0)
-        ctrl = _make_controller(llm)
+        ctrl = _make_controller(llm, make_agent_controller)
 
         def fake_react_loop(ctx, goal, _progress, images):
             # Simulate a fallback: model switched to index 1 mid-run
@@ -46,10 +40,10 @@ class TestAgentControllerModelRestore:
             "Primary model index must be restored after a successful run"
         )
 
-    def test_restores_primary_model_on_exception(self):
+    def test_restores_primary_model_on_exception(self, make_agent_controller):
         """_active_idx is reset even when react_loop raises an exception."""
         llm = _make_llm(initial_idx=0)
-        ctrl = _make_controller(llm)
+        ctrl = _make_controller(llm, make_agent_controller)
 
         def failing_react_loop(ctx, goal, _progress, images):
             ctx.llm._active_idx = 2  # fallback happened before crash
@@ -65,10 +59,10 @@ class TestAgentControllerModelRestore:
             "Primary model index must be restored even after react_loop raises"
         )
 
-    def test_restores_primary_model_on_cancellation(self):
+    def test_restores_primary_model_on_cancellation(self, make_agent_controller):
         """_active_idx is reset when the run is cancelled (returns early)."""
         llm = _make_llm(initial_idx=0)
-        ctrl = _make_controller(llm)
+        ctrl = _make_controller(llm, make_agent_controller)
 
         def cancelling_react_loop(ctx, goal, _progress, images):
             ctx.llm._active_idx = 1
@@ -82,10 +76,10 @@ class TestAgentControllerModelRestore:
             "Primary model index must be restored after a cancelled run"
         )
 
-    def test_does_not_change_primary_when_no_fallback_occurs(self):
+    def test_does_not_change_primary_when_no_fallback_occurs(self, make_agent_controller):
         """_active_idx stays at 0 throughout when no fallback is triggered."""
         llm = _make_llm(initial_idx=0)
-        ctrl = _make_controller(llm)
+        ctrl = _make_controller(llm, make_agent_controller)
 
         def normal_react_loop(ctx, goal, _progress, images):
             # No fallback — _active_idx never changes

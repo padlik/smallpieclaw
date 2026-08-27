@@ -13,9 +13,9 @@ from builtin_executor import BuiltinExecutor
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_executor(factory=None, max_subagents: int = 6) -> BuiltinExecutor:
+def _make_executor(make_builtin_executor, factory=None, max_subagents: int = 6) -> BuiltinExecutor:
     """Build a BuiltinExecutor with an optional mock factory and no real threads needed."""
-    return BuiltinExecutor(sub_agent_factory=factory, max_subagents=max_subagents)
+    return make_builtin_executor(sub_agent_factory=factory, max_subagents=max_subagents)
 
 
 def _make_runner(agent_id: str = "sa-abc123", model_id: str = "test-model") -> MagicMock:
@@ -44,42 +44,42 @@ def _make_registry(count: int = 0) -> MagicMock:
 class TestSpawnAgentGuards:
     """Tests for early-exit guard conditions in _exec_spawn_agent."""
 
-    def test_missing_task_returns_error(self):
-        exc = _make_executor()
+    def test_missing_task_returns_error(self, make_builtin_executor):
+        exc = _make_executor(make_builtin_executor, )
         result = exc._exec_spawn_agent({})
         assert result["success"] is False
         assert "task" in result["error"].lower()
 
-    def test_empty_task_returns_error(self):
-        exc = _make_executor()
+    def test_empty_task_returns_error(self, make_builtin_executor):
+        exc = _make_executor(make_builtin_executor, )
         result = exc._exec_spawn_agent({"task": "   "})
         assert result["success"] is False
         assert "task" in result["error"].lower()
 
-    def test_depth_guard_blocks_sub_agent(self):
-        exc = _make_executor(factory=MagicMock())
+    def test_depth_guard_blocks_sub_agent(self, make_builtin_executor):
+        exc = _make_executor(make_builtin_executor, factory=MagicMock())
         result = exc._exec_spawn_agent({"task": "do something"}, caller_depth=1)
         assert result["success"] is False
         assert "sub-agent" in result["error"].lower()
 
-    def test_no_factory_configured_returns_error(self):
-        exc = _make_executor(factory=None)
+    def test_no_factory_configured_returns_error(self, make_builtin_executor):
+        exc = _make_executor(make_builtin_executor, factory=None)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)):
             result = exc._exec_spawn_agent({"task": "do something"}, caller_depth=0)
         assert result["success"] is False
         assert "factory" in result["error"].lower()
 
-    def test_max_subagents_cap_returns_error(self):
+    def test_max_subagents_cap_returns_error(self, make_builtin_executor):
         factory = MagicMock()
-        exc = _make_executor(factory=factory, max_subagents=2)
+        exc = _make_executor(make_builtin_executor, factory=factory, max_subagents=2)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(count=2)):
             result = exc._exec_spawn_agent({"task": "do something"}, caller_depth=0)
         assert result["success"] is False
         assert "cap reached" in result["error"]
 
-    def test_invalid_context_key_rejected_before_factory(self):
+    def test_invalid_context_key_rejected_before_factory(self, make_builtin_executor):
         factory = MagicMock()
-        exc = _make_executor(factory=factory)
+        exc = _make_executor(make_builtin_executor, factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)):
             result = exc._exec_spawn_agent(
                 {"task": "do something", "context_key": "../scheduler_state"},
@@ -98,10 +98,10 @@ class TestTaskAliases:
     """LLMs sometimes pass 'prompt'/'goal'/'description' instead of 'task'."""
 
     @pytest.mark.parametrize("alias", ["prompt", "goal", "description"])
-    def test_alias_accepted_as_task(self, alias):
+    def test_alias_accepted_as_task(self, make_builtin_executor, alias):
         runner = _make_runner()
         factory = MagicMock(return_value=runner)
-        exc = _make_executor(factory=factory)
+        exc = _make_executor(make_builtin_executor, factory=factory)
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
@@ -118,7 +118,7 @@ class TestTaskAliases:
 class TestResponseFormat:
     """response_format modifies the task string before passing it to the factory."""
 
-    def _call_with_format(self, fmt: str) -> dict:
+    def _call_with_format(self, make_builtin_executor, fmt: str) -> dict:
         """Call _exec_spawn_agent with the given response_format; return captured factory_kwargs."""
         captured = {}
 
@@ -126,16 +126,16 @@ class TestResponseFormat:
             captured.update(kwargs)
             return _make_runner()
 
-        exc = _make_executor(factory=factory)
+        exc = _make_executor(make_builtin_executor, factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc._exec_spawn_agent({"task": "base task", "response_format": fmt}, caller_depth=0)
 
         return captured
 
-    def test_json_format_appends_instruction(self):
+    def test_json_format_appends_instruction(self, make_builtin_executor):
         runner = _make_runner()
-        exc = _make_executor(factory=MagicMock(return_value=runner))
+        exc = _make_executor(make_builtin_executor, factory=MagicMock(return_value=runner))
         modified_tasks = []
 
         def track_factory(**kwargs):
@@ -152,10 +152,10 @@ class TestResponseFormat:
         # from task[:80]). We verify the overall flow succeeds here.
         assert len(modified_tasks) == 1  # factory was called exactly once
 
-    def test_unknown_format_defaults_to_text(self):
+    def test_unknown_format_defaults_to_text(self, make_builtin_executor):
         runner = _make_runner()
         factory = MagicMock(return_value=runner)
-        exc = _make_executor(factory=factory)
+        exc = _make_executor(make_builtin_executor, factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             result = exc._exec_spawn_agent(
@@ -172,7 +172,7 @@ class TestResponseFormat:
 class TestLLMParameterOverrides:
     """max_tokens / temperature / top_p are parsed and forwarded to the factory."""
 
-    def _spawn_and_capture(self, args: dict) -> dict:
+    def _spawn_and_capture(self, make_builtin_executor, args: dict) -> dict:
         """Run _exec_spawn_agent and return captured factory kwargs."""
         captured = {}
 
@@ -180,41 +180,41 @@ class TestLLMParameterOverrides:
             captured.update(kwargs)
             return _make_runner()
 
-        exc = _make_executor(factory=factory)
+        exc = _make_executor(make_builtin_executor, factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc._exec_spawn_agent({"task": "do work", **args}, caller_depth=0)
         return captured
 
-    def test_max_tokens_forwarded_as_int(self):
-        captured = self._spawn_and_capture({"max_tokens": 512})
+    def test_max_tokens_forwarded_as_int(self, make_builtin_executor):
+        captured = self._spawn_and_capture(make_builtin_executor, {"max_tokens": 512})
         assert captured.get("max_tokens") == 512
 
-    def test_temperature_forwarded_as_float(self):
-        captured = self._spawn_and_capture({"temperature": 0.7})
+    def test_temperature_forwarded_as_float(self, make_builtin_executor):
+        captured = self._spawn_and_capture(make_builtin_executor, {"temperature": 0.7})
         assert captured.get("temperature") == pytest.approx(0.7)
 
-    def test_top_p_forwarded_as_float(self):
-        captured = self._spawn_and_capture({"top_p": 0.9})
+    def test_top_p_forwarded_as_float(self, make_builtin_executor):
+        captured = self._spawn_and_capture(make_builtin_executor, {"top_p": 0.9})
         assert captured.get("top_p") == pytest.approx(0.9)
 
-    def test_string_numbers_coerced(self):
+    def test_string_numbers_coerced(self, make_builtin_executor):
         """LLMs sometimes pass numbers as strings."""
-        captured = self._spawn_and_capture({"max_tokens": "256", "temperature": "0.5"})
+        captured = self._spawn_and_capture(make_builtin_executor, {"max_tokens": "256", "temperature": "0.5"})
         assert captured.get("max_tokens") == 256
         assert captured.get("temperature") == pytest.approx(0.5)
 
-    def test_invalid_max_tokens_becomes_none(self):
-        captured = self._spawn_and_capture({"max_tokens": "not_a_number"})
+    def test_invalid_max_tokens_becomes_none(self, make_builtin_executor):
+        captured = self._spawn_and_capture(make_builtin_executor, {"max_tokens": "not_a_number"})
         assert captured.get("max_tokens") is None
 
-    def test_invalid_temperature_becomes_none(self):
-        captured = self._spawn_and_capture({"temperature": "hot"})
+    def test_invalid_temperature_becomes_none(self, make_builtin_executor):
+        captured = self._spawn_and_capture(make_builtin_executor, {"temperature": "hot"})
         assert captured.get("temperature") is None
 
-    def test_omitted_params_are_none(self):
+    def test_omitted_params_are_none(self, make_builtin_executor):
         """When not provided, overrides are None (factory uses config defaults)."""
-        captured = self._spawn_and_capture({})
+        captured = self._spawn_and_capture(make_builtin_executor, {})
         assert captured.get("max_tokens") is None
         assert captured.get("temperature") is None
         assert captured.get("top_p") is None
@@ -227,29 +227,29 @@ class TestLLMParameterOverrides:
 class TestTracePropagation:
     """The invoking run's trace_id is forwarded through spawn_agent to the factory."""
 
-    def _spawn_with_trace(self, trace_id: str) -> dict:
+    def _spawn_with_trace(self, make_builtin_executor, trace_id: str) -> dict:
         captured = {}
 
         def factory(**kwargs):
             captured.update(kwargs)
             return _make_runner()
 
-        exc = _make_executor(factory=factory)
+        exc = _make_executor(make_builtin_executor, factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc._exec_spawn_agent({"task": "do work"}, caller_depth=0, trace_id=trace_id)
         return captured
 
-    def test_trace_id_forwarded_to_factory(self):
-        captured = self._spawn_with_trace("r-deadbeef")
+    def test_trace_id_forwarded_to_factory(self, make_builtin_executor):
+        captured = self._spawn_with_trace(make_builtin_executor, "r-deadbeef")
         assert captured.get("trace_id") == "r-deadbeef"
 
-    def test_empty_trace_id_becomes_none(self):
+    def test_empty_trace_id_becomes_none(self, make_builtin_executor):
         """No active trace => factory mints a fresh one (None)."""
-        captured = self._spawn_with_trace("")
+        captured = self._spawn_with_trace(make_builtin_executor, "")
         assert captured.get("trace_id") is None
 
-    def test_execute_threads_trace_into_spawn(self):
+    def test_execute_threads_trace_into_spawn(self, make_builtin_executor):
         """execute() forwards its trace_id argument down to the factory."""
         captured = {}
 
@@ -257,7 +257,7 @@ class TestTracePropagation:
             captured.update(kwargs)
             return _make_runner()
 
-        exc = _make_executor(factory=factory)
+        exc = _make_executor(make_builtin_executor, factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit", side_effect=lambda fn, *a, **kw: MagicMock()):
             exc.execute("spawn_agent", {"task": "do work"}, caller_depth=0,
@@ -295,21 +295,21 @@ class TestSubAgentFactoryOverrides:
 
         return factory
 
-    def test_overrides_applied_to_copy(self):
+    def test_overrides_applied_to_copy(self, make_builtin_executor):
         original = {"model": "gpt-4o", "max_tokens": 1024, "temperature": 0.2}
         factory = self._make_factory_fn([original], original)
         result = factory(model="gpt-4o", max_tokens=256, temperature=0.9)
         assert result["max_tokens"] == 256
         assert result["temperature"] == pytest.approx(0.9)
 
-    def test_shared_config_not_mutated_with_overrides(self):
+    def test_shared_config_not_mutated_with_overrides(self, make_builtin_executor):
         original = {"model": "gpt-4o", "max_tokens": 1024, "temperature": 0.2}
         factory = self._make_factory_fn([original], original)
         factory(model="gpt-4o", max_tokens=256)
         # original dict must be unchanged
         assert original["max_tokens"] == 1024
 
-    def test_shared_config_not_mutated_without_overrides(self):
+    def test_shared_config_not_mutated_without_overrides(self, make_builtin_executor):
         """Even with no overrides, the returned cfg must be a copy, not the shared ref."""
         original = {"model": "gpt-4o", "max_tokens": 1024, "temperature": 0.2}
         factory = self._make_factory_fn([original], original)
@@ -317,20 +317,20 @@ class TestSubAgentFactoryOverrides:
         result["max_tokens"] = 999  # mutate the returned dict
         assert original["max_tokens"] == 1024  # shared config must be unaffected
 
-    def test_no_overrides_uses_config_values(self):
+    def test_no_overrides_uses_config_values(self, make_builtin_executor):
         original = {"model": "gpt-4o", "max_tokens": 1024, "temperature": 0.2}
         factory = self._make_factory_fn([original], original)
         result = factory(model="gpt-4o")
         assert result["max_tokens"] == 1024
         assert result["temperature"] == pytest.approx(0.2)
 
-    def test_top_p_override(self):
+    def test_top_p_override(self, make_builtin_executor):
         original = {"model": "gpt-4o", "max_tokens": 1024, "top_p": None}
         factory = self._make_factory_fn([original], original)
         result = factory(model="gpt-4o", top_p=0.95)
         assert result["top_p"] == pytest.approx(0.95)
 
-    def test_unknown_model_raises(self):
+    def test_unknown_model_raises(self, make_builtin_executor):
         factory = self._make_factory_fn([], {})
         with pytest.raises(ValueError, match="not found"):
             factory(model="nonexistent-model")
@@ -368,18 +368,18 @@ class TestGetAgentResultCancelOnTimeout:
         with _patch("builtin_tools.agents._get_agent_registry", return_value=mock_reg):
             return exc._exec_get_agent_result(args)
 
-    def test_cancel_event_set_by_default_on_timeout(self):
+    def test_cancel_event_set_by_default_on_timeout(self, make_builtin_executor):
         """With default cancel_on_timeout=True the sub-agent's cancel event must be set."""
-        exc = _make_executor()
+        exc = _make_executor(make_builtin_executor, )
         record = self._make_timed_out_record()
         result = self._exec_with_record(exc, record, {"agent_id": "sa-test", "timeout": 0})
         assert result["status"] == "timeout"
         assert record._cancel_event.is_set(), "cancel_event should be set after timeout"
         assert record._timeout_cancelled is True
 
-    def test_cancel_event_not_set_when_opted_out(self):
+    def test_cancel_event_not_set_when_opted_out(self, make_builtin_executor):
         """With cancel_on_timeout=False the sub-agent must NOT be cancelled."""
-        exc = _make_executor()
+        exc = _make_executor(make_builtin_executor, )
         record = self._make_timed_out_record()
         result = self._exec_with_record(
             exc, record, {"agent_id": "sa-test", "timeout": 0, "cancel_on_timeout": False}
@@ -388,15 +388,15 @@ class TestGetAgentResultCancelOnTimeout:
         assert not record._cancel_event.is_set(), "cancel_event must not be set when opted out"
         assert record._timeout_cancelled is False
 
-    def test_already_cancelled_agent_not_double_cancelled(self):
+    def test_already_cancelled_agent_not_double_cancelled(self, make_builtin_executor):
         """If the agent is already cancelled, do not set _timeout_cancelled."""
-        exc = _make_executor()
+        exc = _make_executor(make_builtin_executor, )
         record = self._make_timed_out_record()
         record._cancel_event.set()  # pre-cancelled (e.g. user /agents cancel)
         self._exec_with_record(exc, record, {"agent_id": "sa-test", "timeout": 0})
         assert record._timeout_cancelled is False, "_timeout_cancelled must stay False for pre-cancelled agents"
 
-    def test_timeout_cancelled_flag_suppresses_notification(self):
+    def test_timeout_cancelled_flag_suppresses_notification(self, make_builtin_executor):
         """_timeout_cancelled=True on the record should suppress Telegram notification."""
         from sub_agent_registry import SubAgentRecord
 
@@ -425,14 +425,14 @@ class TestRuntimeProfileThreading:
     """spawn/scheduler construction threads the matching RuntimeProfile through
     the internal factory channel (never through model-facing args)."""
 
-    def _capture_factory_kwargs(self, *, args=None, options=None) -> dict:
+    def _capture_factory_kwargs(self, make_builtin_executor, *, args=None, options=None) -> dict:
         captured: dict = {}
 
         def factory(**kwargs):
             captured.update(kwargs)
             return _make_runner()
 
-        exc = _make_executor(factory=factory)
+        exc = _make_executor(make_builtin_executor, factory=factory)
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit",
                           side_effect=lambda fn, *a, **kw: MagicMock()):
@@ -441,27 +441,27 @@ class TestRuntimeProfileThreading:
             )
         return captured
 
-    def test_default_spawn_uses_on_demand_profile(self):
+    def test_default_spawn_uses_on_demand_profile(self, make_builtin_executor):
         from agent_runtime import RuntimeProfile
 
-        captured = self._capture_factory_kwargs()
+        captured = self._capture_factory_kwargs(make_builtin_executor, )
         assert captured.get("runtime_profile") == RuntimeProfile.ON_DEMAND_SUBAGENT
 
-    def test_scheduled_source_uses_scheduled_profile(self):
+    def test_scheduled_source_uses_scheduled_profile(self, make_builtin_executor):
         from agent_runtime import RuntimeProfile
         from sub_agent_registry import SOURCE_SCHEDULED
         from sub_agent_supervisor import SupervisionOptions
 
-        captured = self._capture_factory_kwargs(
+        captured = self._capture_factory_kwargs(make_builtin_executor, 
             options=SupervisionOptions(source=SOURCE_SCHEDULED, notify=False),
         )
         assert captured.get("runtime_profile") == RuntimeProfile.SCHEDULED_AGENT
 
-    def test_runtime_profile_is_not_a_model_facing_arg(self):
+    def test_runtime_profile_is_not_a_model_facing_arg(self, make_builtin_executor):
         # The model-facing spawn_agent args must not carry runtime_profile; it is
         # derived internally from the supervision source.
         from agent_runtime import RuntimeProfile
 
-        captured = self._capture_factory_kwargs(args={"runtime_profile": "attempted-injection"})
+        captured = self._capture_factory_kwargs(make_builtin_executor, args={"runtime_profile": "attempted-injection"})
         # Injection through model args is ignored; the internal derivation wins.
         assert captured.get("runtime_profile") == RuntimeProfile.ON_DEMAND_SUBAGENT

@@ -16,7 +16,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from builtin_executor import BuiltinExecutor
 from memory_store import LongTermMemory
 from sub_agent_supervisor import SupervisionOptions
 
@@ -41,9 +40,9 @@ def _make_registry(count: int = 0) -> MagicMock:
 
 
 class TestSubAgentNoLongTermWrite:
-    def test_completion_does_not_call_long_term_add(self):
+    def test_completion_does_not_call_long_term_add(self, make_builtin_executor):
         runner = _make_runner()
-        exc = BuiltinExecutor(sub_agent_factory=MagicMock(return_value=runner))
+        exc = make_builtin_executor(sub_agent_factory=MagicMock(return_value=runner))
         # Run the spawn closure synchronously so completion logic executes inline.
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit",

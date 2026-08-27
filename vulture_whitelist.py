@@ -47,6 +47,7 @@ MCPManagerProtocol.get_tools
 from config_schema import parse_config, AppConfig, TelegramConfig, AgentConfig  # noqa: E402
 from config_schema import ModelConfig, EmbeddingsConfig, SchedulerConfig  # noqa: E402
 from config_schema import PathsConfig, MCPServerConfig, OAuthConfig  # noqa: E402
+from config_schema import ExecutorPaths  # noqa: E402
 parse_config
 AppConfig
 TelegramConfig
@@ -57,6 +58,7 @@ SchedulerConfig
 PathsConfig
 MCPServerConfig
 OAuthConfig
+ExecutorPaths
 
 # builtin_tools/access_control.py — public API
 from builtin_tools.access_control import (  # noqa: E402

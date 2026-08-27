@@ -14,7 +14,6 @@ import pytest
 import structlog
 
 from builtin_executor import (
-    BuiltinExecutor,
     _LOG_QUERY_MAX_SCAN_LINES,
     _LOG_QUERY_TAIL_BYTES,
 )
@@ -68,8 +67,8 @@ def log_path(tmp_path, sample_records):
 
 
 @pytest.fixture
-def executor(log_path):
-    return BuiltinExecutor(log_jsonl_path=str(log_path))
+def executor(make_builtin_executor, log_path):
+    return make_builtin_executor(log_jsonl_path=str(log_path))
 
 
 def _query(exc, **filters):
@@ -197,8 +196,8 @@ def test_malformed_lines_skipped(executor):
     assert payload["total_matched"] == 8
 
 
-def test_missing_file_returns_empty(tmp_path):
-    exc = BuiltinExecutor(log_jsonl_path=str(tmp_path / "does_not_exist.jsonl"))
+def test_missing_file_returns_empty(make_builtin_executor, tmp_path):
+    exc = make_builtin_executor(log_jsonl_path=str(tmp_path / "does_not_exist.jsonl"))
     result = exc.execute("log_query", {})
     assert result["success"] is True
     payload = json.loads(result["output"])
@@ -210,8 +209,8 @@ def test_missing_file_returns_empty(tmp_path):
     assert payload["scanned_lines"] == 0
 
 
-def test_unset_path_returns_empty():
-    exc = BuiltinExecutor()  # log_jsonl_path defaults to ""
+def test_unset_path_returns_empty(make_builtin_executor):
+    exc = make_builtin_executor()  # log_jsonl_path defaults to ""
     result = exc.execute("log_query", {})
     assert result["success"] is True
     payload = json.loads(result["output"])
@@ -233,7 +232,7 @@ def test_window_fields_present_not_saturated(executor, sample_records):
     assert payload["total_matched"] == 8
 
 
-def test_window_saturation_line_cap(tmp_path):
+def test_window_saturation_line_cap(make_builtin_executor, tmp_path):
     """More lines than the scan cap -> window_saturated, scanned_lines bounded to
     the line cap, and total_matched is a recent-window count (< the file total)."""
     path = tmp_path / "many.jsonl"
@@ -244,7 +243,7 @@ def test_window_saturation_line_cap(tmp_path):
                 "ts": f"{i:08d}", "trace": TRACE_A, "level": "info",
                 "event_type": "TOOL_END", "tool": "shell",
             }) + "\n")
-    exc = BuiltinExecutor(log_jsonl_path=str(path))
+    exc = make_builtin_executor(log_jsonl_path=str(path))
     payload = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=10)
     assert payload["window_saturated"] is True
     assert payload["scanned_lines"] == _LOG_QUERY_MAX_SCAN_LINES
@@ -255,7 +254,7 @@ def test_window_saturation_line_cap(tmp_path):
     assert payload["records"][-1]["ts"] == f"{n - 1:08d}"
 
 
-def test_window_saturation_byte_cap(tmp_path):
+def test_window_saturation_byte_cap(make_builtin_executor, tmp_path):
     """Fewer lines than the line cap but more bytes than the byte cap: the read
     begins mid-file, so window_saturated is True and older lines are dropped."""
     path = tmp_path / "wide.jsonl"
@@ -269,7 +268,7 @@ def test_window_saturation_byte_cap(tmp_path):
             }) + "\n")
     assert path.stat().st_size > _LOG_QUERY_TAIL_BYTES   # sanity: exceeds byte window
     assert n_lines < _LOG_QUERY_MAX_SCAN_LINES           # so the line cap is NOT the trigger
-    exc = BuiltinExecutor(log_jsonl_path=str(path))
+    exc = make_builtin_executor(log_jsonl_path=str(path))
     payload = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=5)
     assert payload["window_saturated"] is True
     assert 0 < payload["scanned_lines"] < n_lines        # older lines outside the byte window
@@ -281,7 +280,7 @@ def test_window_saturation_byte_cap(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def text_search_executor(tmp_path):
+def text_search_executor(make_builtin_executor, tmp_path):
     """Executor with a log containing records that span traces, levels, and a
     distinctive INFO startup message dropped by the Option C default view."""
     records = [
@@ -302,7 +301,7 @@ def text_search_executor(tmp_path):
     with open(path, "w", encoding="utf-8") as fh:
         for rec in records:
             fh.write(json.dumps(rec) + "\n")
-    return BuiltinExecutor(log_jsonl_path=str(path))
+    return make_builtin_executor(log_jsonl_path=str(path))
 
 
 def test_text_search_finds_dropped_info_record(text_search_executor):
@@ -375,7 +374,7 @@ def test_text_search_wildcard_finds_all_traces(text_search_executor):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def no_trace_startup_executor(tmp_path):
+def no_trace_startup_executor(make_builtin_executor, tmp_path):
     """Log with a traceless startup record and a current-run record on TRACE_A.
 
     Simulates the real scenario: the process emits INFO messages before the
@@ -394,7 +393,7 @@ def no_trace_startup_executor(tmp_path):
     with open(path, "w", encoding="utf-8") as fh:
         for rec in records:
             fh.write(json.dumps(rec) + "\n")
-    return BuiltinExecutor(log_jsonl_path=str(path))
+    return make_builtin_executor(log_jsonl_path=str(path))
 
 
 def test_text_auto_widens_finds_no_trace_startup_record(no_trace_startup_executor):
@@ -441,7 +440,7 @@ def test_text_null_trace_auto_widens(no_trace_startup_executor):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def unicode_executor(tmp_path):
+def unicode_executor(make_builtin_executor, tmp_path):
     """Log with a record whose msg contains non-ASCII characters (Straße, café)."""
     records = [
         {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
@@ -452,7 +451,7 @@ def unicode_executor(tmp_path):
     with open(path, "w", encoding="utf-8") as fh:
         for rec in records:
             fh.write(json.dumps(rec) + "\n")
-    return BuiltinExecutor(log_jsonl_path=str(path))
+    return make_builtin_executor(log_jsonl_path=str(path))
 
 
 def test_text_search_casefold_unicode(unicode_executor):
@@ -479,7 +478,7 @@ def test_text_search_casefold_unicode(unicode_executor):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def prompt_id_executor(tmp_path):
+def prompt_id_executor(make_builtin_executor, tmp_path):
     """Log with records whose prompt_id is stored as a string (matching the
     structlog context) plus one record without a prompt_id."""
     records = [
@@ -496,7 +495,7 @@ def prompt_id_executor(tmp_path):
     with open(path, "w", encoding="utf-8") as fh:
         for rec in records:
             fh.write(json.dumps(rec) + "\n")
-    return BuiltinExecutor(log_jsonl_path=str(path))
+    return make_builtin_executor(log_jsonl_path=str(path))
 
 
 def test_prompt_id_filter_string_matches_string(prompt_id_executor):

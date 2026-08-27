@@ -107,10 +107,9 @@ class TestSpawnSavesContextInFinally:
     """The spawn execution path saves context from a ``finally`` block so a
     sub-agent crash mid-task does not lose its short-term memory."""
 
-    def _run_spawn(self, tmp_path, *, run_side_effect, context_key="ctx-key"):
+    def _run_spawn(self, make_builtin_executor, tmp_path, *, run_side_effect, context_key="ctx-key"):
         from unittest.mock import MagicMock, patch
 
-        from builtin_executor import BuiltinExecutor
 
         runner = MagicMock()
         runner.agent_id = "sa-fin01"
@@ -129,7 +128,7 @@ class TestSpawnSavesContextInFinally:
         else:
             runner.run.return_value = run_side_effect
 
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=MagicMock(return_value=runner),
             data_dir=str(tmp_path),
         )
@@ -143,23 +142,22 @@ class TestSpawnSavesContextInFinally:
             )
         return tmp_path / "job_contexts" / f"{context_key}.json"
 
-    def test_context_saved_on_success(self, tmp_path):
-        path = self._run_spawn(tmp_path, run_side_effect="all good")
+    def test_context_saved_on_success(self, make_builtin_executor, tmp_path):
+        path = self._run_spawn(make_builtin_executor, tmp_path, run_side_effect="all good")
         assert path.exists()
         loaded = _load_context("ctx-key", str(tmp_path))
         assert loaded.get_messages()[0]["content"] == "in flight"
 
-    def test_context_saved_on_exception(self, tmp_path):
+    def test_context_saved_on_exception(self, make_builtin_executor, tmp_path):
         # Sub-agent crashes mid-task; context must still be persisted.
-        path = self._run_spawn(tmp_path, run_side_effect=RuntimeError("boom"))
+        path = self._run_spawn(make_builtin_executor, tmp_path, run_side_effect=RuntimeError("boom"))
         assert path.exists()
         loaded = _load_context("ctx-key", str(tmp_path))
         assert loaded.get_messages()[0]["content"] == "in flight"
 
-    def test_context_saved_before_result_event_is_set(self, tmp_path):
+    def test_context_saved_before_result_event_is_set(self, make_builtin_executor, tmp_path):
         from unittest.mock import MagicMock, patch
 
-        from builtin_executor import BuiltinExecutor
 
         class _Registry:
             def __init__(self):
@@ -196,7 +194,7 @@ class TestSpawnSavesContextInFinally:
             assert registry.record is not None
             assert not registry.record._result_event.is_set()
 
-        exc = BuiltinExecutor(
+        exc = make_builtin_executor(
             sub_agent_factory=MagicMock(return_value=runner),
             data_dir=str(tmp_path),
         )

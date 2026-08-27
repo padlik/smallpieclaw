@@ -6,14 +6,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from builtin_executor import BuiltinExecutor
 from confirmation import ConfirmationManager
 
 
 @pytest.fixture
-def executor(tmp_path):
+def executor(make_builtin_executor, tmp_path):
     """Return a fresh BuiltinExecutor with a wired prompt callback."""
-    return BuiltinExecutor(data_dir=str(tmp_path))
+    return make_builtin_executor(data_dir=str(tmp_path))
 
 
 class TestGrantExpiresAtRunEnd:
