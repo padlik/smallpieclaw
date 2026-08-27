@@ -1560,9 +1560,9 @@ class TestShellErrorClassificationParity:
         ],
     )
     def test_backend_error_types_match(
-        self, backend: str, command: str, expected_error_type: str, tmp_path
+        self, make_builtin_executor, backend: str, command: str, expected_error_type: str, tmp_path
     ) -> None:
-        ex = BuiltinExecutor(
+        ex = make_builtin_executor(
             max_output=4000,
             data_dir=str(tmp_path),
             shell_backend=backend,
@@ -1571,14 +1571,14 @@ class TestShellErrorClassificationParity:
         assert result["error_type"] == expected_error_type
 
     @pytest.mark.parametrize("backend", ["subprocess", "pty"])
-    def test_backend_permission_denied_matches(self, backend: str, tmp_path) -> None:
+    def test_backend_permission_denied_matches(self, make_builtin_executor, backend: str, tmp_path) -> None:
         if sys.platform == "win32":
             return
         forbidden = tmp_path / "forbidden.txt"
         forbidden.write_text("secret", encoding="utf-8")
         forbidden.chmod(0o000)
         try:
-            ex = BuiltinExecutor(
+            ex = make_builtin_executor(
                 max_output=4000,
                 data_dir=str(tmp_path),
                 shell_backend=backend,
@@ -1589,10 +1589,10 @@ class TestShellErrorClassificationParity:
             forbidden.chmod(0o600)
 
     @pytest.mark.parametrize("backend", ["subprocess", "pty"])
-    def test_backend_timeout_classification_matches(self, backend: str, tmp_path) -> None:
+    def test_backend_timeout_classification_matches(self, make_builtin_executor, backend: str, tmp_path) -> None:
         if sys.platform == "win32":
             return
-        ex = BuiltinExecutor(
+        ex = make_builtin_executor(
             max_output=4000,
             data_dir=str(tmp_path),
             shell_backend=backend,

@@ -244,7 +244,7 @@ def make_builtin_executor(tmp_path):
             merged = {}
             for field in dataclasses.fields(ExecutorPaths):
                 name = field.name
-                merged[name] = paths_overrides.get(name) or getattr(defaults, name)
+                merged[name] = paths_overrides.get(name, getattr(defaults, name))
             paths = ExecutorPaths(**merged)
         elif paths_overrides:
             raise TypeError(

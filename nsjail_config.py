@@ -26,6 +26,22 @@ _BLOCKED_SYSTEM_PREFIXES: tuple[str, ...] = (
     "/var", "/run",
 )
 
+# User-home subdirectories that are sensitive enough to block for any mount
+# mode (read-only or read-write). These hold credentials, keys, or tokens
+# that must not be exposed inside the sandbox at all.
+_SENSITIVE_USER_PREFIXES: tuple[str, ...] = (
+    ".ssh", ".gnupg", ".aws", ".kube", ".docker"
+)
+
+# User-home subdirectories that are additionally blocked for read-write
+# mounts only. Read-only mounts under these paths are allowed because the RO
+# constraint eliminates the tampering/exfiltration risk the blocklist was
+# designed to prevent. Sensitive prefixes are included here as well so that
+# callers testing a RW mount can check a single set.
+_RW_BLOCKED_USER_PREFIXES: tuple[str, ...] = (
+    ".local", ".config", ".cache", *_SENSITIVE_USER_PREFIXES
+)
+
 # Minimal IPv4 address validator — rejects empty/garbage values that would
 # produce a non-functional /etc/resolv.conf inside the jail.
 _IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$")
@@ -88,19 +104,15 @@ class NsjailConfigBuilder:
         self.workspace_dir = os.path.realpath(os.path.abspath(workspace_dir)) if workspace_dir else ""
         # Dynamic blocked prefixes: user-home paths that must never be trusted mounts.
         home = os.path.expanduser("~")
-        blocked = [
-            os.path.join(home, ".ssh"),
-            os.path.join(home, ".local"),
-            os.path.join(home, ".config"),
-            os.path.join(home, ".gnupg"),
-            os.path.join(home, ".aws"),
-            os.path.join(home, ".kube"),
-            os.path.join(home, ".docker"),
-            os.path.join(home, ".cache"),
-        ]
+        sensitive = [os.path.join(home, p) for p in _SENSITIVE_USER_PREFIXES]
+        rw_blocked = [os.path.join(home, p) for p in _RW_BLOCKED_USER_PREFIXES]
         if self._agent_dir:
-            blocked.append(self._agent_dir)
-        self._blocked_user_prefixes: tuple[str, ...] = tuple(blocked)
+            sensitive.append(self._agent_dir)
+            rw_blocked.append(self._agent_dir)
+        self._sensitive_user_prefixes: tuple[str, ...] = tuple(sensitive)
+        self._rw_blocked_user_prefixes: tuple[str, ...] = tuple(rw_blocked)
+        # Union kept for backward compatibility in _workspace_will_mount().
+        self._blocked_user_prefixes: tuple[str, ...] = tuple(set(sensitive + rw_blocked))
         self.memory_mb = memory_mb
         self.pids_max = pids_max
         self.cpu_percent = cpu_percent
@@ -262,9 +274,14 @@ class NsjailConfigBuilder:
                 continue
             real = os.path.realpath(os.path.abspath(path))
             # Root-containment check: reject the filesystem root and known system paths.
+            blocked_prefixes = list(_BLOCKED_SYSTEM_PREFIXES) + list(self._sensitive_user_prefixes)
+            if mode == "rw":
+                # Read-write mounts are additionally blocked under the broader
+                # RW-only set (.local, .config, .cache plus the sensitive dirs).
+                blocked_prefixes += list(self._rw_blocked_user_prefixes)
             if real == "/" or any(
                 real == p or real.startswith(p + "/")
-                for p in (_BLOCKED_SYSTEM_PREFIXES + self._blocked_user_prefixes)
+                for p in blocked_prefixes
             ):
                 logger.warning("Trusted directory rejected (restricted system path): %s", real)
                 continue

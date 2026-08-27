@@ -663,6 +663,115 @@ class TestBuild:
             finally:
                 os.unlink(cfg_path)
 
+    def test_trusted_dir_local_share_accepted_read_only(self) -> None:
+        """RO mount of ~/.local/share/myproject is accepted."""
+        home = os.path.expanduser("~")
+        local_dir = os.path.join(home, ".local", "share", "myproject")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trusted = [{"path": local_dir, "mode": "r"}]
+            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
+            with open(trusted_path, "w") as f:
+                json.dump(trusted, f)
+
+            builder = NsjailConfigBuilder(
+                session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
+                agent_dir="/tmp/test-agent",
+            )
+            with patch("os.path.exists", return_value=True), \
+                 patch("os.path.realpath", side_effect=lambda p: p), \
+                 patch("os.path.islink", return_value=False):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert local_dir in content
+                assert "rw: false" in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_trusted_dir_local_share_rejected_read_write(self) -> None:
+        """RW mount of ~/.local/share/myproject is blocked."""
+        home = os.path.expanduser("~")
+        local_dir = os.path.join(home, ".local", "share", "myproject")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trusted = [{"path": local_dir, "mode": "rw"}]
+            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
+            with open(trusted_path, "w") as f:
+                json.dump(trusted, f)
+
+            builder = NsjailConfigBuilder(
+                session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
+                agent_dir="/tmp/test-agent",
+            )
+            with patch("os.path.exists", return_value=True), \
+                 patch("os.path.realpath", side_effect=lambda p: p), \
+                 patch("os.path.islink", return_value=False):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert local_dir not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_trusted_dir_ssh_rejected_read_only(self) -> None:
+        """RO mount of ~/.ssh is blocked because .ssh is always sensitive."""
+        home = os.path.expanduser("~")
+        ssh_dir = os.path.join(home, ".ssh")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trusted = [{"path": ssh_dir, "mode": "r"}]
+            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
+            with open(trusted_path, "w") as f:
+                json.dump(trusted, f)
+
+            builder = NsjailConfigBuilder(
+                session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
+                agent_dir="/tmp/test-agent",
+            )
+            with patch("os.path.exists", return_value=True), \
+                 patch("os.path.realpath", side_effect=lambda p: p), \
+                 patch("os.path.islink", return_value=False):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert ssh_dir not in content
+            finally:
+                os.unlink(cfg_path)
+
+    def test_trusted_dir_ssh_rejected_read_write(self) -> None:
+        """RW mount of ~/.ssh is blocked because .ssh is always sensitive."""
+        home = os.path.expanduser("~")
+        ssh_dir = os.path.join(home, ".ssh")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trusted = [{"path": ssh_dir, "mode": "rw"}]
+            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
+            with open(trusted_path, "w") as f:
+                json.dump(trusted, f)
+
+            builder = NsjailConfigBuilder(
+                session_tmpdir="/tmp/session",
+                tmp_dir="/tmp/test-tmpdir",
+                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
+                agent_dir="/tmp/test-agent",
+            )
+            with patch("os.path.exists", return_value=True), \
+                 patch("os.path.realpath", side_effect=lambda p: p), \
+                 patch("os.path.islink", return_value=False):
+                cfg_path, _ = builder.build("ls", timeout=30)
+            try:
+                with open(cfg_path) as f:
+                    content = f.read()
+                assert ssh_dir not in content
+            finally:
+                os.unlink(cfg_path)
+
     def test_missing_trusted_dirs_file_is_graceful(self) -> None:
         """Missing trusted_dirs.json does not cause an error."""
         with tempfile.TemporaryDirectory() as tmpdir:
