@@ -836,6 +836,13 @@ class _Turn:
 
 
 @dataclass
+class _StepResult:
+    """Control result returned by one iteration of the ReAct step loop."""
+    should_continue: bool = False
+    early_return: Optional[str] = None
+
+
+@dataclass
 class LLMErrorInfo:
     """Classified LLM error information for retry/recovery."""
     type: str        # timeout, connection, rate_limit, empty, context, permanent, unknown
@@ -1357,6 +1364,160 @@ def _dispatch_action(
     return None
 
 
+def _run_single_step(
+    ctx: ReactContext,
+    state: _LoopState,
+    system: str,
+    user_goal: str,
+    run_start: float,
+    progress: Callable[[str], None],
+    supports_native_fallback: bool,
+) -> _StepResult:
+    """Execute one ReAct step and return a control result for the outer loop.
+
+    Responsibilities folded in here: cancellation checks, inactivity warnings,
+    step counting/logging, tool-definition grouping, context compaction, the LLM
+    turn request, action extraction/dispatch, and per-step context-snapshot
+    publication. The helper mutates ``state`` (and possibly ``state.max_steps``
+    when a plan action is dispatched). It does **not** handle the step-extension
+    prompt; that remains in :func:`react_loop`.
+    """
+    if ctx.cancel_event.is_set():
+        logger.warning("cancelled at step %d/%d", state.step, state.max_steps)
+        return _StepResult(early_return="[Cancelled]")
+
+    if not state.warned_inactivity and state.step > 1:
+        warn_minutes = ctx.inactivity_warn_minutes
+        if warn_minutes and (time.time() - state.last_action_time) > (warn_minutes * 60):
+            state.warned_inactivity = True
+            minutes = round((time.time() - state.last_action_time) / 60)
+            state.messages.append({
+                "role": "user",
+                "content": (
+                    f"You've been running for {minutes} minutes without finishing. "
+                    "Are you still working? If you're done, use finish."
+                ),
+            })
+            progress(f"⏳ Inactivity prompt after {minutes}m…")
+            return _StepResult(should_continue=True)
+
+    state.step += 1
+    state.last_action_time = time.time()
+
+    agent_logging.log_event(
+        agent_logging.LogEvent.STEP_BEGIN, "step begin",
+        level=logging.INFO, logger=slog, step=state.step,
+    )
+
+    if ctx.on_step:
+        try:
+            ctx.on_step(state.step)
+        except Exception:
+            logger.debug("on_step callback failed", exc_info=True)
+    active_model = ctx.llm.llm_cfg.get("model", "?")
+    logger.info("step %d/%d | model: %s", state.step, state.max_steps, active_model)
+    progress(f"⚙️ Thinking… (step {state.step})")
+
+    # Per-model context window: effective limit from the active model's
+    # context_window, falling back to agent.ctx_max_tokens. Completion tokens
+    # (max_tokens) are reserved before the 85% margin is applied inside
+    # maybe_compact().
+    _effective_ctx = ctx.llm.llm_cfg.get("context_window") or ctx.ctx_max_tokens
+    if ctx._tool_defs_by_server is None:
+        try:
+            ctx._tool_defs_by_server = _tool_defs_by_server_for_context(ctx)
+            ctx._tool_defs_tokens = sum(ctx._tool_defs_by_server.values())
+        except Exception:
+            logger.warning(
+                "tool-def grouping failed; compaction falls back to tool_defs_tokens=0",
+                exc_info=True,
+            )
+            ctx._tool_defs_by_server = {}
+            ctx._tool_defs_tokens = 0
+    _tool_defs_by_server = ctx._tool_defs_by_server
+    _tool_defs_tokens = ctx._tool_defs_tokens
+    state.messages, state.goal_idx = maybe_compact(
+        state.messages, system, _effective_ctx, ctx.llm,
+        goal_idx=state.goal_idx,
+        tool_defs_tokens=_tool_defs_tokens,
+    )
+
+    turn = _request_turn(
+        ctx, state, system, progress,
+        supports_native_fallback=supports_native_fallback,
+    )
+    if turn.early_return is not None:
+        return _StepResult(early_return=turn.early_return)
+    if turn.linearized_messages is not None:
+        state.messages = turn.linearized_messages
+
+    try:
+        action_obj, sink = _action_from_turn(turn, state)
+    except ValueError:
+        err_msg = _handle_non_json(state, turn)
+        if err_msg == _RE_PROMPT:
+            return _StepResult(should_continue=True)
+        progress(err_msg)
+        return _StepResult(early_return=err_msg)
+
+    final = _dispatch_action(
+        ctx, action_obj, sink, state, user_goal, run_start, progress,
+    )
+    if final is not None:
+        if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
+            ctx.checkpoint_store.delete(ctx.trace_id)
+        try:
+            _publish_context_snapshot(
+                ctx, state, system,
+                tool_defs_by_server=_tool_defs_by_server,
+                tool_defs_tokens=_tool_defs_tokens,
+            )
+        except Exception:
+            logger.warning("context snapshot publication failed", exc_info=True)
+        return _StepResult(early_return=final)
+
+    if state.operator_cancelled:
+        return _StepResult(should_continue=False)
+
+    agent_logging.log_event(
+        agent_logging.LogEvent.STEP_END, "step end",
+        level=logging.INFO, logger=slog, step=state.step,
+    )
+    try:
+        _publish_context_snapshot(
+            ctx, state, system,
+            tool_defs_by_server=_tool_defs_by_server,
+            tool_defs_tokens=_tool_defs_tokens,
+        )
+    except Exception:
+        logger.warning("context snapshot publication failed", exc_info=True)
+    return _StepResult(should_continue=True)
+
+
+def _handle_step_limit_reached(
+    ctx: ReactContext,
+    state: _LoopState,
+    progress: Callable[[str], None],
+) -> bool:
+    """Prompt the user when the step limit is reached and apply an extension.
+
+    Returns ``True`` if the outer loop should continue (the user granted an
+    extension), ``False`` if the loop should terminate.
+    """
+    ext_response = ctx.confirmation.request_extension(state.max_steps, progress)
+    if ext_response == "unlimited":
+        state.max_steps = _EFFECTIVELY_UNLIMITED_STEPS
+        logger.info("Agent steps set to effectively unlimited by user")
+        progress("♾️ Running until done (effectively unlimited, capped at 10M for safety)…")
+        return True
+    if ext_response == "yes":
+        state.max_steps += 10
+        logger.info("Agent steps extended to %d by user", state.max_steps)
+        progress(f"⏩ Extended — continuing to step {state.max_steps}…")
+        return True
+    return False
+
+
 def react_loop(
     ctx: ReactContext,
     user_goal: str,
@@ -1408,129 +1569,21 @@ def react_loop(
 
         while True:
             while state.step < state.max_steps:
-                if ctx.cancel_event.is_set():
-                    logger.warning("cancelled at step %d/%d", state.step, state.max_steps)
-                    return "[Cancelled]"
-
-                if not state.warned_inactivity and state.step > 1:
-                    warn_minutes = ctx.inactivity_warn_minutes
-                    if warn_minutes and (time.time() - state.last_action_time) > (warn_minutes * 60):
-                        state.warned_inactivity = True
-                        minutes = round((time.time() - state.last_action_time) / 60)
-                        state.messages.append({
-                            "role": "user",
-                            "content": f"You've been running for {minutes} minutes without finishing. Are you still working? If you're done, use finish.",
-                        })
-                        _progress(f"⏳ Inactivity prompt after {minutes}m…")
-                        continue
-
-                state.step += 1
-                state.last_action_time = time.time()
-
-                agent_logging.log_event(
-                    agent_logging.LogEvent.STEP_BEGIN, "step begin",
-                    level=logging.INFO, logger=slog, step=state.step,
-                )
-
-                if ctx.on_step:
-                    try:
-                        ctx.on_step(state.step)
-                    except Exception:
-                        logger.debug("on_step callback failed", exc_info=True)
-                active_model = ctx.llm.llm_cfg.get("model", "?")
-                logger.info("step %d/%d | model: %s", state.step, state.max_steps, active_model)
-                _progress(f"⚙️ Thinking… (step {state.step})")
-
-                # Per-model context window: effective limit from the active
-                # model's context_window, falling back to agent.ctx_max_tokens.
-                # Completion tokens (max_tokens) are reserved before the 85%
-                # margin is applied inside maybe_compact().
-                _effective_ctx = (
-                    ctx.llm.llm_cfg.get("context_window") or ctx.ctx_max_tokens
-                )
-                if ctx._tool_defs_by_server is None:
-                    try:
-                        ctx._tool_defs_by_server = _tool_defs_by_server_for_context(ctx)
-                        ctx._tool_defs_tokens = sum(ctx._tool_defs_by_server.values())
-                    except Exception:
-                        logger.warning(
-                            "tool-def grouping failed; compaction falls back to tool_defs_tokens=0",
-                            exc_info=True,
-                        )
-                        ctx._tool_defs_by_server = {}
-                        ctx._tool_defs_tokens = 0
-                _tool_defs_by_server = ctx._tool_defs_by_server
-                _tool_defs_tokens = ctx._tool_defs_tokens
-                state.messages, state.goal_idx = maybe_compact(
-                    state.messages, system, _effective_ctx, ctx.llm,
-                    goal_idx=state.goal_idx,
-                    tool_defs_tokens=_tool_defs_tokens,
-                )
-
-                turn = _request_turn(
-                    ctx, state, system, _progress,
+                result = _run_single_step(
+                    ctx, state, system, user_goal, run_start, _progress,
                     supports_native_fallback=_supports_native_fallback,
                 )
-                if turn.early_return is not None:
-                    return turn.early_return
-                if turn.linearized_messages is not None:
-                    state.messages = turn.linearized_messages
-
-                try:
-                    action_obj, sink = _action_from_turn(turn, state)
-                except ValueError:
-                    err_msg = _handle_non_json(state, turn)
-                    if err_msg == _RE_PROMPT:
-                        continue
-                    _progress(err_msg)
-                    return err_msg
-
-                final = _dispatch_action(
-                    ctx, action_obj, sink, state, user_goal, run_start, _progress,
-                )
-                if final is not None:
-                    if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
-                        ctx.checkpoint_store.delete(ctx.trace_id)
-                    try:
-                        _publish_context_snapshot(
-                            ctx, state, system,
-                            tool_defs_by_server=_tool_defs_by_server,
-                            tool_defs_tokens=_tool_defs_tokens,
-                        )
-                    except Exception:
-                        logger.warning("context snapshot publication failed", exc_info=True)
-                    return final
-                if state.operator_cancelled:
+                if result.early_return is not None:
+                    return result.early_return
+                if not result.should_continue:
                     break
-                agent_logging.log_event(
-                    agent_logging.LogEvent.STEP_END, "step end",
-                    level=logging.INFO, logger=slog, step=state.step,
-                )
-                try:
-                    _publish_context_snapshot(
-                        ctx, state, system,
-                        tool_defs_by_server=_tool_defs_by_server,
-                        tool_defs_tokens=_tool_defs_tokens,
-                    )
-                except Exception:
-                    logger.warning("context snapshot publication failed", exc_info=True)
 
             if state.operator_cancelled:
                 ctx.memory.record_event("Task cancelled by operator")
                 return "⚠️ Task stopped by operator."
 
-            ext_response = ctx.confirmation.request_extension(state.max_steps, _progress)
-            if ext_response == "unlimited":
-                state.max_steps = _EFFECTIVELY_UNLIMITED_STEPS
-                logger.info("Agent steps set to effectively unlimited by user")
-                _progress("♾️ Running until done (effectively unlimited, capped at 10M for safety)…")
-                continue
-            elif ext_response == "yes":
-                state.max_steps += 10
-                logger.info("Agent steps extended to %d by user", state.max_steps)
-                _progress(f"⏩ Extended — continuing to step {state.max_steps}…")
-                continue
-            break
+            if not _handle_step_limit_reached(ctx, state, _progress):
+                break
 
         ctx.memory.record_event("Agent hit max iterations")
         return "⚠️ Agent reached maximum steps. Operation cancelled."

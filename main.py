@@ -22,6 +22,7 @@ import shutil
 import signal
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import agent_logging
@@ -105,10 +106,14 @@ from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile  # noqa: 
 from builtin_executor import BuiltinExecutor  # noqa: E402
 from config_schema import resolve_model_id, parse_vault_content, ExecutorPaths  # noqa: E402
 from context_monitor import ContextMonitor  # noqa: E402
-from graph_memory import create_graph_memory  # noqa: E402
+from graph_memory import (  # noqa: E402
+    GraphMemoryStore,
+    GraphMemoryWriter,
+    create_graph_memory,
+)
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
-from memory_store import MemoryStore, WorkingMemory, ResultsMemory  # noqa: E402
+from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
 from prompt_registry import PromptRegistry  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
@@ -310,6 +315,124 @@ def _read_vault_secrets(vault_file: str) -> list[str]:
         return []
 
 
+def _build_executor_paths(
+    cfg: dict,
+    paths: XDGPaths,
+    data_dir: str,
+    skills_dir: str,
+    tmp_dir: str,
+    downloads_dir: str,
+    workspace_dir: str,
+    nsjail_state_dir: str,
+    nsjail_session_tmpdir: str,
+    trusted_dirs_path: str,
+    vault_file: str,
+    vault_secrets: list[str],
+    json_log_path: str,
+) -> ExecutorPaths:
+    """Assemble the runtime filesystem/limit bundle for BuiltinExecutor.
+
+    Bundles every resolved filesystem path, log retention setting, and vault
+    secret list so the executor and controller receive a single typed object
+    instead of ad-hoc strings.
+    """
+    return ExecutorPaths(
+        tmp_dir=tmp_dir,
+        downloads_dir=downloads_dir,
+        workspace_dir=workspace_dir,
+        log_file=str(paths.log_file),
+        log_backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
+        data_dir=data_dir,
+        state_home=nsjail_state_dir,
+        skills_dir=skills_dir,
+        vault_path=vault_file,
+        log_jsonl_path=json_log_path,
+        nsjail_session_tmpdir=nsjail_session_tmpdir,
+        nsjail_trusted_dirs_path=trusted_dirs_path,
+        nsjail_agent_dir=str(Path(__file__).parent.resolve()),
+        vault_secrets=vault_secrets,
+    )
+
+
+def _build_embedder(llm: LLMClient) -> Callable[[str], list[float]]:
+    """Return a callable that embeds text using the shared LLM client."""
+    return llm.embed
+
+
+def _build_memory_stack(
+    app_cfg,
+    paths: XDGPaths,
+    llm: object,
+    conversations_dir: str,
+    conversation_id: str,
+    data_dir: str,
+) -> tuple[ShortTermMemory, WorkingMemory, ResultsMemory, StrategyMemory, PromptRegistry]:
+    """Build the runtime memory layers for the main agent.
+
+    Returns the short-term conversation memory, working memory, results memory,
+    strategy memory, and prompt registry used by the controller and executor.
+    """
+    results_path = str(paths.data_home / "results_memory.json")
+    short_term = _load_conversation(
+        os.path.join(conversations_dir, conversation_id + ".json")
+    )
+    working = WorkingMemory()
+    results_mem = ResultsMemory(path=results_path, llm=llm)
+    strategy_mem = StrategyMemory(data_dir=data_dir)
+    prompt_registry = PromptRegistry(data_dir=data_dir)
+    return short_term, working, results_mem, strategy_mem, prompt_registry
+
+
+def _build_graph_memory(
+    app_cfg,
+    cfg: dict,
+    paths: XDGPaths,
+    agent: AgentController,
+    builtin: BuiltinExecutor,
+    all_models: list[dict],
+    embedder_fn: Callable[[str], list[float]],
+) -> tuple[GraphMemoryStore | None, GraphMemoryWriter | None]:
+    """Initialise graph memory (opt-in) and wire it into agent + executor.
+
+    Returns ``(None, None)`` when disabled, when ladybug is unavailable, or when
+    initialisation fails, matching the original graceful-degradation behaviour.
+    """
+    if not app_cfg.graph_memory.enabled:
+        return None, None
+    try:
+        from graph_memory import build_extraction_llm_call as _build_extraction_llm_call
+
+        llm_call_fn = _build_extraction_llm_call(cfg, app_cfg, all_models)
+
+        graph_memory_store, graph_memory_writer = create_graph_memory(
+            cfg=app_cfg,
+            db_path=str(paths.graph_memory_db),
+            embedder_fn=embedder_fn,
+            llm_call_fn=llm_call_fn,
+            embedding_dim=len(embedder_fn("test")),
+        )
+        if graph_memory_store is not None:
+            # Wire into agent (main react_loop context)
+            agent._graph_memory = graph_memory_store  # type: ignore[attr-defined]
+            agent._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
+            agent._graph_memory_max_entries = app_cfg.graph_memory.max_context_entries
+            # Wire into builtin executor for memory_graph_search/store tools
+            builtin._graph_memory = graph_memory_store  # type: ignore[attr-defined]
+            builtin._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
+            logger.info(
+                "Graph memory enabled (db=%s, extraction_model=%s)",
+                paths.graph_memory_db,
+                app_cfg.graph_memory.extraction_model or app_cfg.agent.default_model,
+            )
+        return graph_memory_store, graph_memory_writer
+    except Exception as _gm_init_exc:
+        logger.warning(
+            "Graph memory initialisation failed (continuing without it): %s",
+            _gm_init_exc,
+        )
+        return None, None
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -403,21 +526,10 @@ def _run(
     _raw_sched_max = app_cfg.agent.scheduled_max_iterations
     scheduled_max_iter = min(_raw_sched_max, 500) if _raw_sched_max > 0 else 500
 
-    executor_paths = ExecutorPaths(
-        tmp_dir=tmp_dir,
-        downloads_dir=downloads_dir,
-        workspace_dir=workspace_dir,
-        log_file=str(paths.log_file),
-        log_backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
-        data_dir=data_dir,
-        state_home=nsjail_state_dir,
-        skills_dir=skills_dir_abs,
-        vault_path=vault_file,
-        log_jsonl_path=json_log_path,
-        nsjail_session_tmpdir=nsjail_session_tmpdir,
-        nsjail_trusted_dirs_path=trusted_dirs_path,
-        nsjail_agent_dir=str(Path(__file__).parent.resolve()),
-        vault_secrets=vault_secrets,
+    executor_paths = _build_executor_paths(
+        cfg, paths, data_dir, skills_dir_abs, tmp_dir, downloads_dir, workspace_dir,
+        nsjail_state_dir, nsjail_session_tmpdir, trusted_dirs_path,
+        vault_file, vault_secrets, json_log_path,
     )
 
     logger.info("Initialising components...")
@@ -469,20 +581,13 @@ def _run(
         except Exception as exc:
             logger.warning("MCP connect_all failed (agent will start without MCP): %s", exc)
 
-    results_path  = str(paths.data_home / "results_memory.json")
-    short_term    = _load_conversation(
-        os.path.join(conversations_dir, conversation_id + ".json")
+    short_term, working, results_mem, strategy_mem, prompt_registry = _build_memory_stack(
+        app_cfg, paths, llm, conversations_dir, conversation_id, data_dir,
     )
-    working       = WorkingMemory()
-    results_mem   = ResultsMemory(path=results_path, llm=llm)
-    strategy_mem  = StrategyMemory(data_dir=data_dir)
     # Wire working memory and results memory into builtin executor so that
     # implicit spawn_agent context summaries include recent tool results.
     builtin._working = working
     builtin._results = results_mem
-
-    # Prompt registry singleton: tracks monotonic "Prompt #N" runs.
-    prompt_registry = PromptRegistry(data_dir=data_dir)
     builtin._prompt_registry = prompt_registry
     from builtin_tools.access_control import TrustedZoneChecker as _TrustedZoneChecker
     _trusted_zone_checker = _TrustedZoneChecker(
@@ -658,40 +763,11 @@ def _run(
     # Give the main agent access to scheduled job execution history
     agent._job_history_fn = scheduler.execution_log.format_for_prompt
 
-    # Initialise graph memory (opt-in — only when enabled in config and ladybug installed)
-    graph_memory_store = None
-    graph_memory_writer = None
-    try:
-        if app_cfg.graph_memory.enabled:
-            from graph_memory import build_extraction_llm_call as _build_extraction_llm_call
-
-            def _embedder_fn(text: str) -> list[float]:
-                return llm.embed(text)
-
-            _llm_call_fn = _build_extraction_llm_call(cfg, app_cfg, all_models)
-
-            graph_memory_store, graph_memory_writer = create_graph_memory(
-                cfg=app_cfg,
-                db_path=str(paths.graph_memory_db),
-                embedder_fn=llm.embed,
-                llm_call_fn=_llm_call_fn,
-                embedding_dim=len(llm.embed("test")),
-            )
-            if graph_memory_store is not None:
-                # Wire into agent (main react_loop context)
-                agent._graph_memory = graph_memory_store  # type: ignore[attr-defined]
-                agent._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
-                agent._graph_memory_max_entries = app_cfg.graph_memory.max_context_entries
-                # Wire into builtin executor for memory_graph_search/store tools
-                builtin._graph_memory = graph_memory_store  # type: ignore[attr-defined]
-                builtin._graph_memory_writer = graph_memory_writer  # type: ignore[attr-defined]
-                logger.info(
-                    "Graph memory enabled (db=%s, extraction_model=%s)",
-                    paths.graph_memory_db,
-                    app_cfg.graph_memory.extraction_model or app_cfg.agent.default_model,
-                )
-    except Exception as _gm_init_exc:
-        logger.warning("Graph memory initialisation failed (continuing without it): %s", _gm_init_exc)
+    # Initialise graph memory (opt-in) and wire it into agent + executor.
+    _embedder_fn = _build_embedder(llm)
+    graph_memory_store, graph_memory_writer = _build_graph_memory(
+        app_cfg, cfg, paths, agent, builtin, all_models, _embedder_fn,
+    )
 
     logger.info("Starting Telegram bot...")
     tg = TelegramInterface(

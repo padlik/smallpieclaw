@@ -151,7 +151,7 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 
 **Built-in tools package:** `builtin_executor.py` is now a dispatcher/facade that imports from the `builtin_tools/` subpackage. Tool logic lives in submodules (`shell.py`, `files.py`, `memory.py`, `agents.py`, `schedule.py`, `context_io.py`, etc.); `descriptors.py` owns the `BUILTIN_TOOLS` registry. `builtin_executor.py` retains confirmation-token management and error-classification contract.
 
-**Agent runtime (ADR-0007):** `agent_runtime.py` introduces `RuntimeProfile` (MAIN, ON_DEMAND_SUBAGENT, SCHEDULED_AGENT, PLAN_STEP_AGENT, DIAGNOSTIC_AGENT) as a construction-time policy enum. `AgentRuntime.create` is Phase 2 scaffolding — intentionally unimplemented.
+**Agent runtime (ADR-0007):** `agent_runtime.py` introduces `RuntimeProfile` (ON_DEMAND_SUBAGENT, SCHEDULED_AGENT, PLAN_STEP_AGENT, DIAGNOSTIC_AGENT) as a construction-time policy enum for sub-agents. `MAIN` construction stays in `main.py`; `AgentRuntime.create` builds `SubAgentRunner` products.
 
 **Sub-agent supervision:** `sub_agent_supervisor.py` centralizes sub-agent lifecycle (admission, execution, cleanup, callbacks) via `SubAgentSupervisor`. Replaces ad-hoc supervision in `agent_controller.py`. Uses `SupervisionOptions` and `SubmissionRequest` dataclasses.
 
@@ -163,7 +163,7 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `builtin_executor.py` | Dispatcher/facade for built-in tools; confirmation-token management and error-classification contract; imports from `builtin_tools/` |
 | `builtin_tools/` | Built-in tool subpackage: `shell.py`, `files.py`, `memory.py`, `agents.py`, `schedule.py`, `context_io.py`, `descriptors.py` (registry), `schemas.py`, `patterns.py`, `logquery_helpers.py`, `secrets_log.py`, `text_utils.py` |
 | `agent_logging.py` | structlog-based dual-sink logging; `LogEvent` enum (TOOL_START/END/FAILED, LLM_CALL/FAILED, STEP_BEGIN/END, RUN_BEGIN/END, ERROR); `setup_logging()`, `log_event()`, `bind_run_context()` |
-| `agent_runtime.py` | Construction-time policy via `RuntimeProfile` enum (MAIN, ON_DEMAND_SUBAGENT, SCHEDULED_AGENT, PLAN_STEP_AGENT, DIAGNOSTIC_AGENT); ADR-0007 scaffolding |
+| `agent_runtime.py` | Construction-time policy via `RuntimeProfile` enum (ON_DEMAND_SUBAGENT, SCHEDULED_AGENT, PLAN_STEP_AGENT, DIAGNOSTIC_AGENT) for sub-agents; `AgentRuntime.create` builds `SubAgentRunner` products |
 | `sub_agent_supervisor.py` | Sub-agent lifecycle (admission, execution, cleanup, callbacks) via `SubAgentSupervisor`; `SupervisionOptions` + `SubmissionRequest` dataclasses |
 | `vector_utils.py` | Vector math utilities for embeddings; `cosine_similarity(a, b) → float` |
 | `tool_registry.py` | MCP tool registry |

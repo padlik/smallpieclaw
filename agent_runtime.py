@@ -3,25 +3,24 @@ agent_runtime.py
 ----------------
 Construction boundary for agent executions (ADR-0007).
 
-This module introduces the vocabulary and skeleton for centralizing agent
-construction:
+This module introduces the vocabulary and construction boundary for agent
+executions (ADR-0007):
 
-- :class:`RuntimeProfile` — *construction policy* for a given execution kind.
+- :class:`RuntimeProfile` — *construction policy* for a sub-agent execution
+  kind. ``MAIN`` construction is intentionally out of scope; the main agent is
+  wired directly in ``main.py``.
 - :class:`RuntimeOptions` — per-execution construction knobs currently
   duplicated across ``main.py``'s ``sub_agent_factory``, ``AgentController``,
   ``SubAgentRunner``, ``BuiltinExecutor.spawn_agent``, and ``PlanExecutor``.
-- :class:`AgentRuntime` — the construction boundary that will (in later phases)
-  build controller / sub-agent-runner / ``ReactContext`` products.
-
-Scope note (Phase 2): this is a **skeleton only**. It establishes the intended
-API and holds construction dependencies, but production call sites are NOT yet
-routed through it. :meth:`AgentRuntime.create` is intentionally unimplemented.
+- :class:`AgentRuntime` — the construction boundary for sub-agent products. It
+  builds :class:`SubAgentRunner` instances for the four supported profiles and
+  provides the per-run :class:`ReactContext` assembler used by
+  :class:`AgentController`.
 
 Design invariant: ``RuntimeProfile`` (construction policy) is deliberately kept
 separate from ``SubAgentRecord.source`` (operator visibility / capacity policy,
-see ADR-0006). The mapping between them is explicit — never identity — because
-``MAIN`` has no source and construction policy must not leak into visibility or
-capacity semantics.
+see ADR-0006). The mapping between them is explicit — never identity — so
+construction policy cannot leak into visibility or capacity semantics.
 """
 
 from __future__ import annotations
@@ -101,15 +100,15 @@ class ControllerDeps:
 
 
 class RuntimeProfile(Enum):
-    """Construction policy for an agent execution.
+    """Construction policy for a sub-agent execution.
 
-    Each profile defines construction defaults (depth, prompt variant, memory
-    layering, trace/cancel behavior, and model configuration). Profiles are
-    independent from :data:`sub_agent_registry.VISIBLE_SOURCES`; see
-    :func:`profile_to_source`.
+    ``MAIN`` is intentionally absent: the main agent is wired directly in
+    ``main.py`` and is not built through this boundary. Each sub-agent profile
+    defines construction defaults (depth, prompt variant, memory layering,
+    trace/cancel behavior, and model configuration). Profiles are independent
+    from :data:`sub_agent_registry.VISIBLE_SOURCES`; see :func:`profile_to_source`.
     """
 
-    MAIN = "main"
     ON_DEMAND_SUBAGENT = "on-demand-subagent"
     SCHEDULED_AGENT = "scheduled-agent"
     PLAN_STEP_AGENT = "plan-step-agent"
@@ -118,11 +117,10 @@ class RuntimeProfile(Enum):
 
 # Explicit profile -> registry source mapping.
 #
-# This is intentionally NOT identity: MAIN has no visibility source, and the
-# sub-agent profile names differ from the source category strings so that
-# construction policy stays decoupled from visibility/capacity policy.
+# This is intentionally NOT identity: the profile names differ from the source
+# category strings so construction policy stays decoupled from visibility/capacity
+# policy. There is no MAIN profile; main runs are not registered as sub-agents.
 _PROFILE_SOURCE: dict[RuntimeProfile, Optional[str]] = {
-    RuntimeProfile.MAIN: None,
     RuntimeProfile.ON_DEMAND_SUBAGENT: SOURCE_ON_DEMAND,
     RuntimeProfile.SCHEDULED_AGENT: SOURCE_SCHEDULED,
     RuntimeProfile.PLAN_STEP_AGENT: SOURCE_PLAN_STEP,
@@ -133,7 +131,6 @@ _PROFILE_SOURCE: dict[RuntimeProfile, Optional[str]] = {
 def profile_to_source(profile: RuntimeProfile) -> Optional[str]:
     """Return the registry visibility source for a construction *profile*.
 
-    ``MAIN`` returns ``None`` (main runs are not registered as sub-agents).
     Sub-agent profiles return their corresponding
     :data:`sub_agent_registry.VISIBLE_SOURCES` category. The mapping is explicit
     so profiles remain construction policy while sources remain visibility and
@@ -173,17 +170,16 @@ class RuntimeOptions:
 # ---------------------------------------------------------------------------
 
 class AgentRuntime:
-    """Construction boundary for agent executions (skeleton).
+    """Construction boundary for sub-agent executions.
 
-    Holds the shared, run-independent collaborators needed to build agent
+    Holds the shared, run-independent collaborators needed to build sub-agent
     products (LLM configuration, tool system, memory layers, notification, and
-    filesystem/limit defaults). In later phases :meth:`create` will build the
-    controller / sub-agent-runner / ``ReactContext`` products currently produced
-    by ``main.py``'s ``sub_agent_factory`` and the controller/runner
-    constructors.
+    filesystem/limit defaults). :meth:`create` builds :class:`SubAgentRunner`
+    products for the four supported profiles; :meth:`build_react_context`
+    assembles the per-run :class:`ReactContext` used by :class:`AgentController`.
 
-    Phase 2 scope: skeleton only. No production call site is routed through this
-    class yet, and :meth:`create` is not implemented.
+    ``MAIN`` construction is intentionally out of scope; the main agent is wired
+    directly in ``main.py``.
     """
 
     def __init__(
@@ -294,9 +290,9 @@ class AgentRuntime:
         notify_fn: object = None,
         on_tool_trace: object = None,
     ) -> "SubAgentRunner":
-        """Build an agent execution product for *profile* using *options*.
+        """Build a ``SubAgentRunner`` for *profile* using *options*.
 
-        Sub-agent profiles (``ON_DEMAND_SUBAGENT``, ``SCHEDULED_AGENT``,
+        All supported profiles (``ON_DEMAND_SUBAGENT``, ``SCHEDULED_AGENT``,
         ``PLAN_STEP_AGENT``, ``DIAGNOSTIC_AGENT``) build a ``SubAgentRunner``
         with the runner-shaped product surface consumed by ``SubAgentSupervisor``,
         ``PlanExecutor``, and the registry helpers. Construction is uniform across
@@ -304,18 +300,13 @@ class AgentRuntime:
         visibility source assigned later by ``register_run`` (see
         :func:`profile_to_source`), never in the built product itself.
 
-        ``MAIN`` construction is intentionally deferred to a later phase; the main
-        controller/client/memory objects are still built directly in ``main.py``.
+        ``MAIN`` is not a supported profile; the main agent is wired directly in
+        ``main.py``. Passing an unknown profile raises ``ValueError``.
 
         ``notify_fn`` and ``on_tool_trace`` are supervisor/collection wiring (not
         ``RuntimeOptions`` construction knobs) and are threaded through to the
         runner exactly as the legacy ``sub_agent_factory`` did.
         """
-        if profile is RuntimeProfile.MAIN:
-            raise NotImplementedError(
-                "AgentRuntime.create(MAIN) is deferred; main construction remains "
-                "in main.py for this change."
-            )
         if profile not in _PROFILE_SOURCE:
             raise ValueError(f"Unknown runtime profile: {profile!r}")
 

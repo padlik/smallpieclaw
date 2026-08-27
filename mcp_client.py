@@ -155,16 +155,17 @@ def _sdk_result_to_outcome(result: CallToolResult) -> dict:
     for item in result.content:
         t = getattr(item, "type", None)
         if t == "text":
-            parts.append(item.text)
+            parts.append(getattr(item, "text", ""))
         elif t == "image":
-            parts.append(f"[image: {item.mimeType}]")
+            parts.append(f"[image: {getattr(item, 'mimeType', 'unknown')}]")
         elif t == "resource":
-            uri = getattr(item.resource, "uri", "") if item.resource else ""
+            res = getattr(item, "resource", None)
+            uri = getattr(res, "uri", "") if res else ""
             parts.append(f"[resource: {uri}]" if uri else "[resource]")
         elif t == "audio":
-            parts.append(f"[audio: {item.mimeType}]")
+            parts.append(f"[audio: {getattr(item, 'mimeType', 'unknown')}]")
         elif t == "resource_link":
-            parts.append(f"[resource_link: {item.uri}]")
+            parts.append(f"[resource_link: {getattr(item, 'uri', '')}]")
     text = "\n".join(parts)
     if result.isError:
         return _tool_outcome(error=text, success=False)
@@ -199,6 +200,69 @@ def _sdk_tools_to_registry(server_name: str, sdk_tools: list) -> list[Tool]:
             )
         )
     return result
+
+
+def _resource_to_dict(resource: Any) -> dict:
+    """Serialize an MCP Resource object into a plain dict."""
+    return {
+        "uri": getattr(resource, "uri", ""),
+        "name": getattr(resource, "name", ""),
+        "title": getattr(resource, "title", ""),
+        "description": getattr(resource, "description", ""),
+        "mimeType": getattr(resource, "mimeType", ""),
+    }
+
+
+def _resource_contents_to_text(contents: list, server_name: str) -> str:
+    """Flatten MCP resource contents into a single text string."""
+    parts: list[str] = []
+    for item in contents:
+        t = getattr(item, "type", None)
+        if t == "text":
+            parts.append(getattr(item, "text", ""))
+        elif t == "blob":
+            parts.append(f"[binary blob: {getattr(item, 'mimeType', 'unknown')}]")
+        else:
+            parts.append(f"[resource content: {getattr(item, 'uri', '')}]")
+    if not parts:
+        logger.warning("MCP [%s] read_resource returned empty contents", server_name)
+    return "\n".join(parts)
+
+
+def _prompt_to_dict(prompt: Any) -> dict:
+    """Serialize an MCP Prompt object into a plain dict."""
+    args: list[dict] = []
+    raw_args = getattr(prompt, "arguments", None)
+    if isinstance(raw_args, list):
+        for arg in raw_args:
+            args.append(
+                {
+                    "name": getattr(arg, "name", ""),
+                    "description": getattr(arg, "description", ""),
+                    "required": getattr(arg, "required", False),
+                }
+            )
+    return {
+        "name": getattr(prompt, "name", ""),
+        "title": getattr(prompt, "title", ""),
+        "description": getattr(prompt, "description", ""),
+        "arguments": args,
+    }
+
+
+def _prompt_message_to_dict(message: Any) -> dict:
+    """Serialize an MCP PromptMessage into a plain dict."""
+    content: Any = getattr(message, "content", None)
+    text = ""
+    if content is not None:
+        if getattr(content, "type", None) == "text":
+            text = getattr(content, "text", "")
+        else:
+            text = f"[{getattr(content, 'type', 'unknown')} content]"
+    return {
+        "role": getattr(message, "role", ""),
+        "content": text,
+    }
 
 
 async def _cancel_and_wait(tasks: list) -> None:
@@ -247,10 +311,21 @@ class _SdkClientWrapper:
         self._mcp_tokens_dir: Path | None = None
         self._interactive: bool = False
         self._tg_iface: object | None = None
+        self._session: Any | None = None
 
     @property
     def tools(self) -> list[Tool]:
         return self._tools
+
+    @property
+    def timeout(self) -> int:
+        """Return the configured per-operation timeout in seconds."""
+        return self._timeout
+
+    @property
+    def session(self) -> Any | None:
+        """Return the active ``ClientSession`` once the session runner is ready."""
+        return self._session
 
     @property
     def ready_future(self) -> concurrent.futures.Future:
@@ -496,6 +571,7 @@ class _SdkClientWrapper:
     async def _run_session(self, read: Any, write: Any) -> None:
         """Enter ClientSession, discover tools, then process requests."""
         async with ClientSession(read, write) as session:
+            self._session = session
             logger.debug("MCP [%s] session.initialize() start", self.name)
             await session.initialize()
             logger.debug("MCP [%s] session.initialize() done", self.name)
@@ -535,7 +611,7 @@ class _SdkClientWrapper:
                 self._ready_future.set_result(True)
             try:
                 while True:
-                    req = await self._queue.get()
+                    req = await self._queue.get()  # type: ignore[union-attr]
                     if req is None:
                         break
                     try:
@@ -559,6 +635,7 @@ class _SdkClientWrapper:
                                 _tool_outcome(error=str(exc), success=False)
                             )
             finally:
+                self._session = None
                 self._drain_queue(f"MCP server '{self.name}' session ended")
 
 
@@ -801,6 +878,7 @@ class MCPManager:
     def _connect_server(self, name: str, cfg: dict) -> None:
         if self._loop is None:
             self._start_loop()
+        assert self._loop is not None
         wrapper = _SdkClientWrapper(cfg, self._loop)
         wrapper.configure(
             mcp_tokens_dir=self._mcp_tokens_dir,
@@ -865,6 +943,171 @@ class MCPManager:
                 error=f"MCP server '{server_name}' not connected", success=False
             )
         return wrapper.call_tool(tool_name, args)
+
+    # ------------------------------------------------------------------
+    # MCP Resources / Prompts
+    #
+    # Scaffolding: these methods expose the MCP SDK's resource and prompt
+    # APIs but are not yet wired to any built-in tool or ReAct loop consumer.
+    # They bypass the per-server serialization queue (calling session methods
+    # directly via run_coroutine_threadsafe). The MCP SDK multiplexes by
+    # request id so this is safe, but it breaks the deliberate serialization
+    # the rest of the class uses for tool calls. Route through the queue if
+    # strict ordering becomes required.
+    #
+    # Sampling is not implemented — it requires server-initiated requests
+    # (server→client) which the current architecture does not support.
+    # ------------------------------------------------------------------
+
+    def list_resources(self, server_name: str) -> list[dict]:
+        """List MCP resources exposed by a connected server.
+
+        Args:
+            server_name: Configured MCP server name.
+
+        Returns:
+            A list of resource dicts with ``uri``, ``name``, ``title``,
+            ``description``, and ``mimeType`` keys. Returns an empty list if the
+            server is not connected or does not support resources.
+        """
+        wrapper = self._wrappers.get(server_name)
+        if wrapper is None or not wrapper.connected or self._loop is None:
+            return []
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                self._list_resources_with_timeout(wrapper), self._loop
+            ).result(timeout=wrapper.timeout)
+        except Exception as exc:
+            logger.warning("MCP [%s] list_resources failed: %s", server_name, exc)
+            return []
+        return result
+
+    def read_resource(self, server_name: str, uri: str) -> str:
+        """Read an MCP resource by URI from a connected server.
+
+        Args:
+            server_name: Configured MCP server name.
+            uri: Resource URI to read.
+
+        Returns:
+            The resource contents as a UTF-8 string for text resources, a
+            placeholder for binary resources, or an empty string on error.
+        """
+        wrapper = self._wrappers.get(server_name)
+        if wrapper is None or not wrapper.connected or self._loop is None:
+            return ""
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                self._read_resource_with_timeout(wrapper, uri), self._loop
+            ).result(timeout=wrapper.timeout)
+        except Exception as exc:
+            logger.warning("MCP [%s] read_resource failed: %s", server_name, exc)
+            return ""
+        return result
+
+    def list_prompts(self, server_name: str) -> list[dict]:
+        """List MCP prompts exposed by a connected server.
+
+        Args:
+            server_name: Configured MCP server name.
+
+        Returns:
+            A list of prompt dicts with ``name``, ``title``, ``description``,
+            and ``arguments`` keys. Returns an empty list if the server is not
+            connected or does not support prompts.
+        """
+        wrapper = self._wrappers.get(server_name)
+        if wrapper is None or not wrapper.connected or self._loop is None:
+            return []
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                self._list_prompts_with_timeout(wrapper), self._loop
+            ).result(timeout=wrapper.timeout)
+        except Exception as exc:
+            logger.warning("MCP [%s] list_prompts failed: %s", server_name, exc)
+            return []
+        return result
+
+    def get_prompt(
+        self, server_name: str, name: str, args: dict | None = None
+    ) -> list[dict]:
+        """Fetch a specific MCP prompt and its messages from a connected server.
+
+        Args:
+            server_name: Configured MCP server name.
+            name: Prompt name.
+            args: Optional prompt argument values keyed by argument name.
+
+        Returns:
+            A list of message dicts with ``role`` and ``content`` keys. Returns
+            an empty list if the server is not connected or the prompt is not
+            found.
+        """
+        wrapper = self._wrappers.get(server_name)
+        if wrapper is None or not wrapper.connected or self._loop is None:
+            return []
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                self._get_prompt_with_timeout(wrapper, name, args or {}),
+                self._loop,
+            ).result(timeout=wrapper.timeout)
+        except Exception as exc:
+            logger.warning("MCP [%s] get_prompt failed: %s", server_name, exc)
+            return []
+        return result
+
+    async def _list_resources_with_timeout(
+        self, wrapper: _SdkClientWrapper
+    ) -> list[dict]:
+        """Async helper to call session.list_resources and serialize results."""
+        session = wrapper.session
+        if session is None:
+            return []
+        page = await asyncio.wait_for(
+            session.list_resources(), timeout=wrapper.timeout
+        )
+        return [_resource_to_dict(r) for r in (getattr(page, "resources", None) or [])]
+
+    async def _read_resource_with_timeout(
+        self, wrapper: _SdkClientWrapper, uri: str
+    ) -> str:
+        """Async helper to call session.read_resource and flatten contents."""
+        session = wrapper.session
+        if session is None:
+            return ""
+        page = await asyncio.wait_for(
+            session.read_resource(uri), timeout=wrapper.timeout
+        )
+        return _resource_contents_to_text(
+            getattr(page, "contents", None) or [], server_name=wrapper.name
+        )
+
+    async def _list_prompts_with_timeout(
+        self, wrapper: _SdkClientWrapper
+    ) -> list[dict]:
+        """Async helper to call session.list_prompts and serialize results."""
+        session = wrapper.session
+        if session is None:
+            return []
+        page = await asyncio.wait_for(
+            session.list_prompts(), timeout=wrapper.timeout
+        )
+        return [_prompt_to_dict(p) for p in (getattr(page, "prompts", None) or [])]
+
+    async def _get_prompt_with_timeout(
+        self, wrapper: _SdkClientWrapper, name: str, args: dict
+    ) -> list[dict]:
+        """Async helper to call session.get_prompt and serialize messages."""
+        session = wrapper.session
+        if session is None:
+            return []
+        result = await asyncio.wait_for(
+            session.get_prompt(name, arguments=args), timeout=wrapper.timeout
+        )
+        return [
+            _prompt_message_to_dict(m)
+            for m in (getattr(result, "messages", None) or [])
+        ]
 
     def get_tools(self) -> list[Tool]:
         """Return all tools from all currently connected servers."""
@@ -1004,6 +1247,7 @@ class MCPManager:
             # would cause the next flow to abort immediately.
             self._oauth_cancel_requested = False
 
+        timeout: int = 300
         try:
             cfg = self._cfgs.get(name)
             if cfg is None:
@@ -1023,9 +1267,11 @@ class MCPManager:
                 }
 
             timeout = oauth_cfg.get("timeout", 300)
+            loop = self._loop
+            assert loop is not None
             future = asyncio.run_coroutine_threadsafe(
                 self._run_oauth_flow(name, cfg, oauth_cfg),
-                self._loop,
+                loop,
             )
             return future.result(timeout=timeout + 10)
         except concurrent.futures.TimeoutError:
@@ -1420,7 +1666,10 @@ class MCPManager:
                         )
                         for t in pending:
                             t.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
+                        _ = await asyncio.gather(
+                            *pending,
+                            return_exceptions=True,
+                        )  # type: ignore[arg-type, misc]
                         return (
                             False,
                             True,
@@ -1486,7 +1735,7 @@ class MCPManager:
 
         for t in pending:
             t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.gather(*pending, return_exceptions=True)  # type: ignore[arg-type]
 
         if cancel_task in done and self._oauth_cancel_requested:
             return True, None

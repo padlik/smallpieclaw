@@ -89,12 +89,11 @@ def _runtime(config: dict, *, notify_fn=None, scheduled_max_iterations: int = 10
 # ===========================================================================
 
 class TestRuntimeProfile:
-    """The five supported construction profiles exist."""
+    """The four supported sub-agent construction profiles exist."""
 
     def test_all_profiles_present(self):
         names = {p.name for p in RuntimeProfile}
         assert names == {
-            "MAIN",
             "ON_DEMAND_SUBAGENT",
             "SCHEDULED_AGENT",
             "PLAN_STEP_AGENT",
@@ -179,8 +178,8 @@ class TestRuntimeOptions:
 class TestProfileToSourceMapping:
     """Profiles are construction policy; sources are visibility/capacity policy."""
 
-    def test_main_has_no_source(self):
-        assert profile_to_source(RuntimeProfile.MAIN) is None
+    def test_main_profile_removed(self):
+        assert not hasattr(RuntimeProfile, "MAIN")
 
     def test_subagent_profiles_map_to_source_constants(self):
         assert profile_to_source(RuntimeProfile.ON_DEMAND_SUBAGENT) == SOURCE_ON_DEMAND
@@ -211,7 +210,7 @@ class TestProfileToSourceMapping:
 
     def test_every_profile_has_a_mapping(self):
         for profile in RuntimeProfile:
-            # Does not raise KeyError; MAIN maps to None, others to a string.
+            # Does not raise KeyError; every sub-agent profile maps to a source.
             source = profile_to_source(profile)
             assert source is None or isinstance(source, str)
 
@@ -250,12 +249,6 @@ class TestAgentRuntimeSkeleton:
         runtime = AgentRuntime()
         for profile in RuntimeProfile:
             assert runtime.source_for_profile(profile) == profile_to_source(profile)
-
-    def test_create_main_is_deferred(self):
-        # MAIN top-level construction stays in main.py for this change.
-        runtime = AgentRuntime()
-        with pytest.raises(NotImplementedError):
-            runtime.create(RuntimeProfile.MAIN, RuntimeOptions())
 
     def test_create_subagent_without_config_raises(self):
         # A runtime with no config cannot build a sub-agent product.
