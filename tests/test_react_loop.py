@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
+from agent_logging import LogEvent
 from react_loop import extract_json_candidates, parse_json
 
 
@@ -859,3 +861,194 @@ class TestNativeFallbackLinearization:
             m["role"] == "user" and "hi" in str(m.get("content", ""))
             for m in fallback_msgs
         )
+
+
+class TestSingleRecordLifecycle:
+    """Lifecycle events replace prose logging after the structlog retrofit.
+
+    Each scenario is driven through the execution harness and asserts both the
+    structured event captured by ``log_event`` and the absence of the old prose
+    log lines that were removed from ``react_loop.py``.
+
+    The harness's stub builtin executor bypasses ``BuiltinExecutor.execute()``
+    (which emits its own TOOL_* events), so this class builds a wrapper that
+    records calls and emits the lifecycle events the real executor would emit.
+    """
+
+    def _stdlib_records(self, caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [r.getMessage() for r in caplog.records]
+
+    def _emitting_executor(self, executor):
+        """Return a stub builtin executor that emits TOOL_START/TOOL_END/TOOL_FAILED."""
+        from tests.execution_harness import _StubBuiltinExecutor
+        from agent_logging import log_event
+
+        class _EmittingStub(_StubBuiltinExecutor):
+            def execute(self, tool_name: str, args: dict, **kwargs) -> dict:
+                log_event(LogEvent.TOOL_START, f"tool start: {tool_name}", level=logging.INFO, tool=tool_name)
+                result = self._executor.execute(tool_name, args)
+                if result.get("success"):
+                    log_event(
+                        LogEvent.TOOL_END, f"tool end: {tool_name}", level=logging.INFO,
+                        tool=tool_name, dur_ms=1, exit=result.get("exit_code", 0),
+                    )
+                else:
+                    log_event(
+                        LogEvent.TOOL_FAILED, f"tool failed: {tool_name}", level=logging.ERROR,
+                        tool=tool_name, dur_ms=1, exit=result.get("exit_code", -1),
+                        err=result.get("error", "") or "",
+                    )
+                return result
+
+        return _EmittingStub(executor)
+
+    def test_successful_tool_completion_emits_single_tool_end(self, caplog):
+        from unittest.mock import MagicMock, patch
+        import react_loop
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, make_outcome, run_react
+
+        caplog.set_level(logging.DEBUG)
+        llm = ScriptedLLM([
+            '{"action":"tool","tool":"shell","args":{"command":"ls"}}',
+            '{"action":"finish","result":"done"}',
+        ])
+        executor = RecordingExecutor({"shell": make_outcome(output="x")})
+
+        events = []
+        stdlib = MagicMock()
+
+        def _capture(event, _msg, **kw):
+            events.append((event, kw))
+
+        with patch.object(react_loop.agent_logging, "log_event", _capture):
+            with patch.object(react_loop, "logger", stdlib):
+                result, _calls, _progress = run_react(
+                    llm, executor, "do it",
+                    builtin_executor=self._emitting_executor(executor),
+                )
+
+        assert result == "done"
+        assert [e for e, _ in events].count(LogEvent.TOOL_END) == 1
+        prose = [call.args[0] for call in stdlib.info.call_args_list + stdlib.warning.call_args_list]
+        assert not any("result: success" in msg for msg in prose)
+
+    def test_failed_tool_emits_single_tool_failed(self, caplog):
+        from unittest.mock import MagicMock, patch
+        import react_loop
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, make_outcome, run_react
+
+        caplog.set_level(logging.DEBUG)
+        llm = ScriptedLLM([
+            '{"action":"tool","tool":"shell","args":{"command":"ls"}}',
+            '{"action":"finish","result":"done"}',
+        ])
+        executor = RecordingExecutor({"shell": make_outcome(success=False, error="boom")})
+
+        events = []
+        stdlib = MagicMock()
+
+        def _capture(event, _msg, **kw):
+            events.append((event, kw))
+
+        with patch.object(react_loop.agent_logging, "log_event", _capture):
+            with patch.object(react_loop, "logger", stdlib):
+                result, _calls, _progress = run_react(
+                    llm, executor, "do it",
+                    builtin_executor=self._emitting_executor(executor),
+                )
+
+        assert [e for e, _ in events].count(LogEvent.TOOL_FAILED) == 1
+        prose = [call.args[0] for call in stdlib.info.call_args_list + stdlib.warning.call_args_list]
+        assert not any("result: success=False" in msg for msg in prose)
+
+    def test_llm_failure_emits_single_llm_failed(self, caplog):
+        from unittest.mock import MagicMock, patch
+        import agent_logging
+        import react_loop
+        from llm_client import LLMError
+        from confirmation import ConfirmationManager
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, run_react
+
+        caplog.set_level(logging.DEBUG)
+        llm = ScriptedLLM(['{"action":"finish","result":"done"}'])
+        executor = RecordingExecutor()
+
+        class _ImmediateCancel(ConfirmationManager):
+            def request_retry(self, token, error_info_json, progress_cb, timeout_seconds=120):
+                return "cancel"
+
+        events = []
+        stdlib = MagicMock()
+        orig_log_event = agent_logging.log_event
+        mock_log_event = MagicMock(wraps=orig_log_event)
+
+        def fake_chat_with_fallback(_self, *args, **kwargs):
+            agent_logging.log_event(
+                LogEvent.LLM_FAILED, "LLM request failed: test-model", level=logging.ERROR,
+                model="test-model", dur_ms=1, err="llm boom",
+            )
+            raise LLMError("llm boom")
+
+        llm.chat_with_fallback = lambda *a, **k: fake_chat_with_fallback(llm, *a, **k)
+
+        try:
+            agent_logging.log_event = mock_log_event
+            with patch.object(react_loop, "logger", stdlib):
+                result, _calls, _progress = run_react(
+                    llm, executor, "do it", confirmation=_ImmediateCancel(),
+                )
+        finally:
+            agent_logging.log_event = orig_log_event
+
+        for c in mock_log_event.call_args_list:
+            events.append((c[0][0], c[1]))
+
+        assert [e for e, _ in events].count(LogEvent.LLM_FAILED) == 1
+        prose = [call.args[0] for call in stdlib.info.call_args_list + stdlib.warning.call_args_list + stdlib.error.call_args_list]
+        assert not any("LLM chat" in msg for msg in prose)
+
+
+class TestStructuredRunFields:
+    """RUN_BEGIN / STEP_BEGIN / RUN_END carry the expected structured fields."""
+
+    def _capture_log_event(self):
+        from unittest.mock import patch
+        import react_loop
+
+        events = []
+
+        def _capture(event, _msg, **kw):
+            events.append((event, kw))
+
+        return events, patch.object(react_loop.agent_logging, "log_event", _capture)
+
+    def test_structured_run_and_step_fields(self, caplog):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, run_react
+
+        caplog.set_level(logging.DEBUG)
+        goal = "this goal is intentionally much longer than eighty characters so truncation is exercised"
+        assert len(goal) > 80
+        llm = ScriptedLLM(['{"action":"finish","result":"done"}'])
+        executor = RecordingExecutor()
+
+        events, patcher = self._capture_log_event()
+        with patcher:
+            result, _calls, _progress = run_react(llm, executor, goal)
+
+        assert result == "done"
+
+        step_begin = [kw for e, kw in events if e == LogEvent.STEP_BEGIN]
+        assert step_begin
+        assert step_begin[0]["model"] == "test-model"
+        assert isinstance(step_begin[0]["step"], int)
+
+        run_begin = [kw for e, kw in events if e == LogEvent.RUN_BEGIN]
+        assert run_begin
+        assert run_begin[0]["model"] == "test-model"
+        assert run_begin[0]["goal"] == goal[:80]
+
+        run_end = [kw for e, kw in events if e == LogEvent.RUN_END]
+        assert run_end
+        assert run_end[0]["model"] == "test-model"
+        assert isinstance(run_end[0]["steps"], int) and run_end[0]["steps"] >= 1
+        assert isinstance(run_end[0]["dur_ms"], int)

@@ -46,11 +46,16 @@ _MIN_REDACTION_LEN = 6
 # Closed event taxonomy
 # ---------------------------------------------------------------------------
 class LogEvent(str, enum.Enum):
-    """Closed, enumerable set of structured event types.
+    """Closed, enumerable set of structured lifecycle event types.
 
     Emitted under the ``event_type`` key (structlog reserves ``event`` for the
-    human message). The agent queries by these values rather than by prose
-    substrings; the set is intentionally small and stable.
+    human message); these records land in ``agent.jsonl`` (primary) and
+    ``agent.log`` (prose). Core lifecycle members are emitted by the react loop
+    and its direct collaborators (llm_client, builtin_executor). Plain
+    ``logger.`` records from other modules flow through the shared processor
+    chain without an ``event_type`` field. Optional background components emit
+    diagnostics to their own component logs, not the primary sinks, and never
+    extend this enum.
     """
 
     TOOL_START = "TOOL_START"
@@ -62,7 +67,7 @@ class LogEvent(str, enum.Enum):
     STEP_END = "STEP_END"
     RUN_BEGIN = "RUN_BEGIN"
     RUN_END = "RUN_END"
-    ERROR = "ERROR"
+    ERROR = "ERROR"  # reserved, zero emitters — kept for future error paths (ADR-0023)
 
     def __str__(self) -> str:  # so f-strings / str() yield the bare value
         return self.value
@@ -211,6 +216,7 @@ def setup_logging(
     log_file: str,
     *,
     json_file: str | None = None,
+    graph_memory_log: str | None = None,
     backup_count: int = 30,
     secret_values: Iterable[str] = (),
     stream=None,
@@ -221,6 +227,8 @@ def setup_logging(
         log_file: Resolved absolute prose log path (``XDGPaths.log_file``).
         json_file: Resolved absolute JSONL log path (``XDGPaths.log_jsonl``).
             Defaults to ``<log_file stem>.jsonl`` when omitted.
+        graph_memory_log: Dedicated component log path for the optional
+            graph-memory component. Defaults to ``<log_file dir>/graph_memory.log``.
         backup_count: Number of daily rotated backups to retain per sink.
         secret_values: Known secret strings to redact from every field.
         stream: Console stream for the prose sink (defaults to ``sys.stdout``).
@@ -233,6 +241,10 @@ def setup_logging(
     os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
     if json_file is None:
         json_file = f"{os.path.splitext(log_file)[0]}.jsonl"
+    if graph_memory_log is None:
+        graph_memory_log = os.path.join(
+            os.path.dirname(os.path.abspath(log_file)), "graph_memory.log"
+        )
     secrets = frozenset(s for s in secret_values if isinstance(s, str) and s)
 
     shared = _shared_processors(secrets)
@@ -275,6 +287,33 @@ def setup_logging(
     # Suppress high-volume INFO noise from HTTP/Telegram internals.
     for noisy in ("httpx", "telegram", "telegram.ext"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Component log isolation (ADR-0023): the optional graph-memory component
+    # writes to a dedicated prose sink instead of the primary agent sinks.
+    # Static and enablement-independent — routing exists even when the
+    # component is disabled, so a disabled-notice can never leak into
+    # agent.jsonl. No run identity is bound for these records: the worker
+    # thread never calls bind_run_context (fire-and-forget enrichment, not
+    # run-scoped work). Console visibility is WARNING+ via handler level, so
+    # INFO detail stays file-only.
+    gm_log = graph_memory_log
+    gm = logging.getLogger("graph_memory")
+    gm.propagate = False
+    gm.setLevel(logging.INFO)
+    for gm_handler in gm.handlers[:]:
+        # Idempotent reconfigure (mirrors _reset_handlers).
+        gm.removeHandler(gm_handler)
+        try:
+            gm_handler.close()
+        except OSError:
+            pass
+    gm_file_handler = _GzipTimedRotatingFileHandler(gm_log, backup_count=backup_count)
+    gm_file_handler.setFormatter(prose_formatter)
+    gm_stream_handler = logging.StreamHandler(stream)
+    gm_stream_handler.setFormatter(prose_formatter)
+    gm_stream_handler.setLevel(logging.WARNING)
+    gm.addHandler(gm_file_handler)
+    gm.addHandler(gm_stream_handler)
 
     return json_file
 

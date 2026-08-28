@@ -388,7 +388,6 @@ class LLMClient:
                 messages, system, json_mode=json_mode, progress_cb=progress_cb,
             )  # type: ignore[return-value]
         except _LLM_CHAT_ERRORS as exc:
-            logger.error("LLM chat error: %s", exc)
             agent_logging.log_event(
                 agent_logging.LogEvent.LLM_FAILED,
                 f"LLM request failed: {model_id}",
@@ -533,7 +532,6 @@ class LLMClient:
                 messages, system, tools=tools, progress_cb=progress_cb,
             )  # type: ignore[return-value]
         except _LLM_CHAT_ERRORS as exc:
-            logger.error("LLM chat (tools) error: %s", exc)
             agent_logging.log_event(
                 agent_logging.LogEvent.LLM_FAILED,
                 f"LLM request (tools) failed: {model_id}",

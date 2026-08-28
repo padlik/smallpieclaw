@@ -1311,7 +1311,7 @@ def _dispatch_action(
     action = action_obj.get("action", "")
 
     if action == "finish":
-        return _finish_run(ctx, action_obj, user_goal, state.step, run_start)
+        return _finish_run(ctx, action_obj, user_goal)
 
     if action == "tool":
         tool_name = action_obj.get("tool", "")
@@ -1338,10 +1338,6 @@ def _dispatch_action(
             caption_b64 = base64.b64encode(outcome.get("caption", "").encode()).decode()
             progress(f"__FILE__:{path_b64}:{caption_b64}")
         tool_result = format_tool_result(tool_name, outcome)
-        if outcome.get("success", False):
-            logger.info("Tool '%s' result: success=True", tool_name)
-        else:
-            logger.warning("Tool '%s' result: success=False | error=%s | args=%s", tool_name, outcome.get("error", ""), {k: str(v)[:120] for k, v in args.items()}, )
         _end_status = "ok" if outcome.get("success") else "fail"
         progress(f"__TOOL_END__:{_end_status}:{tool_name}\n{fmt_tool_result_progress(tool_name, args, outcome)}")
         sink(tool_result)
@@ -1404,9 +1400,11 @@ def _run_single_step(
     state.step += 1
     state.last_action_time = time.time()
 
+    active_model = ctx.llm.llm_cfg.get("model", "?")
     agent_logging.log_event(
         agent_logging.LogEvent.STEP_BEGIN, "step begin",
         level=logging.INFO, logger=slog, step=state.step,
+        model=active_model, max_steps=state.max_steps,
     )
 
     if ctx.on_step:
@@ -1414,8 +1412,6 @@ def _run_single_step(
             ctx.on_step(state.step)
         except Exception:
             logger.debug("on_step callback failed", exc_info=True)
-    active_model = ctx.llm.llm_cfg.get("model", "?")
-    logger.info("step %d/%d | model: %s", state.step, state.max_steps, active_model)
     progress(f"⚙️ Thinking… (step {state.step})")
 
     # Per-model context window: effective limit from the active model's
@@ -1528,20 +1524,22 @@ def react_loop(
     """Execute the ReAct loop: LLM → parse → dispatch → repeat. Returns the final answer string."""
     run_start = time.time()
     _ctx_tokens = agent_logging.bind_run_context(trace=ctx.trace_id, agent=ctx.label)
-    agent_logging.log_event(agent_logging.LogEvent.RUN_BEGIN, "run begin", level=logging.INFO, logger=slog)
+    active_model = ctx.llm.llm_cfg.get("model", "?")
+    agent_logging.log_event(
+        agent_logging.LogEvent.RUN_BEGIN, "run begin", level=logging.INFO, logger=slog,
+        model=active_model, goal=user_goal[:80],
+    )
 
     def _progress(msg: str):
         if progress_callback:
             progress_callback(msg)
         logger.debug("Agent progress: %s", msg)
 
+    state = None
     try:
         ctx._tool_defs = None
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
-
-        active_model = ctx.llm.llm_cfg.get("model", "?")
-        logger.info("start | model: %s | goal: %s", active_model, user_goal[:80])
 
         if ctx.working:
             ctx.working.start_task(user_goal)
@@ -1600,6 +1598,8 @@ def react_loop(
             "run end",
             level=logging.INFO,
             logger=slog,
+            model=ctx.llm.llm_cfg.get("model", "?"),
+            steps=state.step if state is not None else 0,
             dur_ms=int((time.time() - run_start) * 1000),
         )
         agent_logging.reset_run_context(_ctx_tokens)
@@ -1709,8 +1709,6 @@ def _finish_run(
     ctx: ReactContext,
     action_obj: dict,
     user_goal: str,
-    step: int,
-    run_start: float,
 ) -> str:
     """Handle a finish action: coerce result, summarize, persist outcome. Returns the final result string."""
     result = action_obj.get("result", "Done.")
@@ -1719,9 +1717,6 @@ def _finish_run(
             result = json.dumps(result, ensure_ascii=False)
         else:
             result = str(result) if result else "Done."
-    elapsed = time.time() - run_start
-    active_model = ctx.llm.llm_cfg.get("model", "?")
-    logger.info("finish | model: %s | steps: %d | elapsed: %.1fs", active_model, step, elapsed)
     ctx.memory.record_event(f"Agent finished: {result[:80]}")
     if ctx.short_term:
         ctx.short_term.add("user", user_goal)
