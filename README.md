@@ -121,7 +121,7 @@ source .venv/bin/activate
 python main.py
 ```
 
-On first run the agent creates `data/` and `downloads/`. Logs go to `~/.local/state/<agent_name>/logs/` — human-readable `agent.log` plus structured `agent.jsonl` (daily gzip rotation, 30 backups).
+On first run the agent creates `data/` and `downloads/`. Logs go to `~/.local/state/<agent_name>/logs/` — human-readable `agent.log` plus structured `agent.jsonl` (daily gzip rotation, 30 backups), plus `graph_memory.log` (component log for the optional graph-memory feature).
 
 > **Upgrading from a prior version?** The hand-written tool system (`tools/`, `tools_generated/`, `create_tool` action) has been removed. These directories are no longer scanned. You can safely delete them: `rm -rf tools/ tools_generated/`. Any `tools_dir` or `generated_tools_dir` keys in your `config.toml` are now silently ignored.
 
@@ -589,12 +589,13 @@ When `checkpoint_enabled = false`, inline retry still works (in-memory state), b
 
 ### Logging
 
-Logs live under the XDG state directory `~/.local/state/<agent_name>/logs/`, resolved from `agent_name` independently of `agent_home` (a relative `[paths] log_file` lands here; an absolute path overrides). Logging is built on [`structlog`](https://www.structlog.org) integrated with stdlib, writing two sinks from one processor chain so they never drift:
+Logs live under the XDG state directory `~/.local/state/<agent_name>/logs/`, resolved from `agent_name` independently of `agent_home` (a relative `[paths] log_file` lands here; an absolute path overrides). Logging is built on [`structlog`](https://www.structlog.org) integrated with stdlib, writing the two agent sinks from one processor chain so they never drift (plus an isolated component log for the optional graph-memory feature):
 
 - **`agent.jsonl`** — structured JSON-per-line, the **primary** machine-readable surface. Each event carries identity fields (`trace` and `agent`, the run label), a `level`, and an `event_type` from a closed taxonomy (`TOOL_START/END/FAILED`, `LLM_CALL/FAILED`, `STEP_BEGIN/END`, `RUN_BEGIN/END`, `ERROR`) plus key-values (`tool`, `dur_ms`, `exit`, `err`).
 - **`agent.log`** — human-readable prose (secondary), keeping the familiar `[label trace] message` shape for `tail -f`/`grep`.
+- **`graph_memory.log`** — dedicated prose sink for the optional graph-memory background component; isolated from the agent sinks, daily gzip rotation like the others, stdout shows only WARNING+ for this component.
 
-Both rotate daily with date-suffixed, gzip-compressed backups (30 kept, `log_backup_count`); known vault secret values are redacted from both before serialization. The agent can introspect its own run mid-execution with the **`log_query`** built-in tool — an in-process filter over the active `agent.jsonl`, trace-scoped to the current run by default.
+All rotate daily with date-suffixed, gzip-compressed backups (30 kept, `log_backup_count`); known vault secret values are redacted from all of them before serialization. The agent can introspect its own run mid-execution with the **`log_query`** built-in tool — an in-process filter over the active `agent.jsonl`, trace-scoped to the current run by default.
 
 Every line carries a source tag for unambiguous filtering:
 

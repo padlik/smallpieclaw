@@ -46,6 +46,11 @@ class XDGPaths:
     scheduler_jobs: Path
     job_execution_log: Path
 
+    @property
+    def graph_memory_log(self) -> Path:
+        """Path of the isolated graph-memory component log (mirrors ``graph_memory_db`` naming)."""
+        return self.logs_dir / "graph_memory.log"
+
 
 def xdg_paths(agent_name: str) -> XDGPaths:
     """Resolve all XDG paths for *agent_name*.

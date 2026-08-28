@@ -421,7 +421,7 @@ class BuiltinExecutor:
         spawned sub-agents so their logs correlate with the parent request.
 
         Emits TOOL_START before dispatch and TOOL_END/TOOL_FAILED afterwards
-        (plus ERROR on an unexpected exception). These lifecycle events wrap the
+        (TOOL_FAILED on an unexpected exception). These lifecycle events wrap the
         existing dispatch without altering its result-dict contract or exception
         propagation. A deferred result (requires_confirmation) gets no completion
         event — the underlying operation has not run yet.
@@ -481,22 +481,14 @@ class BuiltinExecutor:
             )
 
     def _emit_tool_lifecycle_error(self, tool_name: str, exc: BaseException, dur_ms: int) -> None:
-        """Emit ERROR + TOOL_FAILED for an unexpected exception during a tool run.
+        """Emit a single TOOL_FAILED for an unexpected exception during a tool run.
 
         Shared by the ``execute()`` dispatch wrapper and the confirmed-run path
         in ``confirm()`` so a raised (rather than returned-as-dict) failure still
-        closes the TOOL_START span.
+        closes the TOOL_START span. Only TOOL_FAILED is emitted — an additional
+        ERROR event would double-count the same failure (see ADR-0023 and the
+        react_loop ``_emit_tool_lifecycle`` precedent).
         """
-        agent_logging.log_event(
-            agent_logging.LogEvent.ERROR,
-            f"tool error: {tool_name}: {exc}",
-            level=logging.ERROR,
-            logger=slog,
-            tool=tool_name,
-            dur_ms=dur_ms,
-            exit=-1,
-            err=str(exc),
-        )
         agent_logging.log_event(
             agent_logging.LogEvent.TOOL_FAILED,
             f"tool failed: {tool_name}",

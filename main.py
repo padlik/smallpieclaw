@@ -481,9 +481,11 @@ def _run(
     """Core startup after PID lock is acquired."""
     # Re-initialise logging with the resolved XDG log paths and structlog dual sink.
     # Vault secret values are passed so they are redacted from every log record.
+    # The graph-memory component log is routed explicitly (see ADR-0023).
     json_log_path = agent_logging.setup_logging(
         str(paths.log_file),
         json_file=str(paths.log_jsonl),
+        graph_memory_log=str(paths.graph_memory_log),
         backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
         secret_values=_read_vault_secrets(str(paths.secrets_file)),
     )
