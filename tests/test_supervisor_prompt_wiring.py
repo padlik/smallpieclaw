@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -84,15 +85,15 @@ class TestPromptRegistryWiring:
 
 class TestDepthGuardProtectsExecutorFields:
     """C2 regression: sub-agent AgentController.run() (depth=1) must not clobber
-    the shared executor's _prompt_approval_set / _current_prompt_id."""
+    the shared executor's _coordinator / _current_prompt_id."""
 
     def test_sub_agent_run_preserves_parent_executor_fields(self, make_builtin_executor, tmp_path, make_agent_controller):
         from unittest.mock import MagicMock, patch
 
 
         executor = make_builtin_executor(data_dir=str(tmp_path))
-        sentinel_set: set = {"file_read"}
-        executor._prompt_approval_set = sentinel_set
+        sentinel_coordinator = SimpleNamespace(auto_approve_tools=set())
+        executor._coordinator = sentinel_coordinator
         executor._current_prompt_id = "01JARYN6R0ABCDEFGHJKMNPQRS"
 
         llm = MagicMock()
@@ -111,5 +112,5 @@ class TestDepthGuardProtectsExecutorFields:
 
         assert result == "sub done"
         # Parent's fields survive the sub-agent run unchanged
-        assert executor._prompt_approval_set is sentinel_set
+        assert executor._coordinator is sentinel_coordinator
         assert executor._current_prompt_id == "01JARYN6R0ABCDEFGHJKMNPQRS"

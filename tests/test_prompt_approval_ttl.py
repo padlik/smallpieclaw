@@ -28,7 +28,9 @@ class TestGrantExpiresAtRunEnd:
 
 class TestHeadlessConfirmBridge:
     def test_sub_agent_auto_approves_when_tool_in_set(self, executor):
-        executor._prompt_approval_set = {"file_read"}
+        coordinator = ConfirmationManager()
+        coordinator.auto_approve_tools = {"file_read"}
+        executor._coordinator = coordinator
         executor._subagent_confirm_prompt_fn = MagicMock()
 
         executor._headless_confirm_bridge(
@@ -40,11 +42,13 @@ class TestHeadlessConfirmBridge:
         assert executor._subagent_confirm_prompt_fn.called is False
 
     def test_sub_agent_prompts_when_tool_not_in_set(self, executor):
-        executor._prompt_approval_set = set()
+        coordinator = ConfirmationManager()
+        coordinator.auto_approve_tools = set()
+        executor._coordinator = coordinator
         executor._subagent_confirm_prompt_fn = MagicMock()
 
         # The bridge blocks for the operator timeout; patch it so tests are fast.
-        with patch.object(executor, "_subagent_confirm_timeout", 0):
+        with patch.object(coordinator, "default_headless_timeout", 0):
             result = executor._headless_confirm_bridge(
                 "file_read", {"path": "/tmp/test.txt"}, "read test file", caller_tag="sa-1"
             )
@@ -52,15 +56,14 @@ class TestHeadlessConfirmBridge:
         assert executor._subagent_confirm_prompt_fn.called is True
 
     def test_fail_closed_when_set_is_none(self, executor):
-        executor._prompt_approval_set = None
+        executor._coordinator = None
         executor._subagent_confirm_prompt_fn = MagicMock()
 
-        with patch.object(executor, "_subagent_confirm_timeout", 0):
-            result = executor._headless_confirm_bridge(
-                "file_read", {"path": "/tmp/test.txt"}, "read test file", caller_tag="sa-1"
-            )
+        result = executor._headless_confirm_bridge(
+            "file_read", {"path": "/tmp/test.txt"}, "read test file", caller_tag="sa-1"
+        )
         assert result.get("success") is False
-        assert executor._subagent_confirm_prompt_fn.called is True
+        assert executor._subagent_confirm_prompt_fn.called is False
 
 
 class TestCallerTagSplitLookup:
@@ -71,7 +74,9 @@ class TestCallerTagSplitLookup:
         from unittest.mock import MagicMock
 
         prompt_id = "01JARYN6R0ABCDEFGHJKMNPQRS"
-        executor._prompt_approval_set = {"file_read"}
+        coordinator = ConfirmationManager()
+        coordinator.auto_approve_tools = {"file_read"}
+        executor._coordinator = coordinator
         executor._current_prompt_id = prompt_id
         executor._subagent_confirm_prompt_fn = MagicMock()
 
@@ -95,7 +100,9 @@ class TestCallerTagSplitLookup:
         """Caller from a stale/different prompt must not auto-approve."""
         from unittest.mock import MagicMock
 
-        executor._prompt_approval_set = {"file_read"}
+        coordinator = ConfirmationManager()
+        coordinator.auto_approve_tools = {"file_read"}
+        executor._coordinator = coordinator
         executor._current_prompt_id = "01JARYZ3W2ABCDEFGHJKMNPQRS"
         executor._subagent_confirm_prompt_fn = MagicMock()
 
@@ -105,7 +112,7 @@ class TestCallerTagSplitLookup:
         mock_reg.get.return_value = mock_rec
 
         with patch("sub_agent_registry.get_registry", return_value=mock_reg):
-            with patch.object(executor, "_subagent_confirm_timeout", 0):
+            with patch.object(coordinator, "default_headless_timeout", 0):
                 result = executor._headless_confirm_bridge(
                     "file_read", {"path": "/tmp/x.txt"}, "read x",
                     caller_tag="sa-stale r-deadbeef",

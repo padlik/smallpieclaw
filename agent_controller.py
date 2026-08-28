@@ -365,7 +365,7 @@ class AgentController:
         # Per-prompt shared approval set: sub-agents use the same set object as the
         # main agent for one-prompt approve-all semantics.
         if self.builtin_executor is not None and self._depth == 0:
-            self.builtin_executor._prompt_approval_set = self._confirmation.auto_approve_tools
+            self.builtin_executor._coordinator = self._confirmation
             self.builtin_executor._current_prompt_id = prompt_id
             # Reset the default tracker so stale grants from a prior run (or
             # from a Telegram callback that fell back to the default) don't
@@ -403,7 +403,7 @@ class AgentController:
             if hasattr(self.llm, "set_trace_id"):
                 self.llm.set_trace_id(_prev_trace)
             if self.builtin_executor is not None and self._depth == 0:
-                self.builtin_executor._prompt_approval_set = None
+                self.builtin_executor._coordinator = None
                 self.builtin_executor._current_prompt_id = None
             self._confirmation.clear_auto_approve()
             if self._cancel_registry is not None and run_cancel_event is not None:

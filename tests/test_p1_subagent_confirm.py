@@ -1,6 +1,6 @@
 """P1: Sub-agent headless Telegram confirmation bridge tests.
 
-Tests for BuiltinExecutor._headless_confirm_bridge and signal_headless_confirm,
+Tests for BuiltinExecutor._headless_confirm_bridge and coordinator.signal_headless_confirmation,
 covering: approval, denial, timeout, bridge-not-wired fail-closed, and
 double-press safety.
 """
@@ -12,11 +12,19 @@ import time
 from unittest.mock import MagicMock
 
 
+from confirmation import ConfirmationManager
 from builtin_executor import BuiltinExecutor
 
 
 def _make_executor(make_builtin_executor) -> BuiltinExecutor:
     return make_builtin_executor(default_timeout=30)
+
+
+def _wire_coordinator(executor: BuiltinExecutor) -> ConfirmationManager:
+    """Attach a fresh ConfirmationManager as the executor's coordinator."""
+    coordinator = ConfirmationManager()
+    executor._coordinator = coordinator
+    return coordinator
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +40,9 @@ def _set_result_after(executor: BuiltinExecutor, token_holder: list, approved: b
                 break
             time.sleep(0.005)
         if token_holder:
-            executor.signal_headless_confirm(token_holder[0], approved)
+            coordinator = executor._coordinator
+            assert coordinator is not None
+            coordinator.signal_headless_confirmation(token_holder[0], approved)
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -46,20 +56,33 @@ def _set_result_after(executor: BuiltinExecutor, token_holder: list, approved: b
 class TestHeadlessBridgeNotWired:
     def test_fails_closed_when_no_prompt_fn(self, make_builtin_executor):
         exe = _make_executor(make_builtin_executor)
+        _wire_coordinator(exe)
         assert exe._subagent_confirm_prompt_fn is None
         result = exe._requires_confirmation("file_write", {"path": "/tmp/x", "content": "hi"},
                                             "Write /tmp/x", caller_depth=1)
         assert result["success"] is False
         assert "not available" in result["error"]
 
+    def test_fails_closed_when_no_coordinator(self, make_builtin_executor):
+        """Coordinator None means run ended — bridge must fail closed."""
+        exe = _make_executor(make_builtin_executor)
+        exe._subagent_confirm_prompt_fn = MagicMock()
+        assert exe._coordinator is None
+        result = exe._requires_confirmation("file_write", {"path": "/tmp/x", "content": "hi"},
+                                            "Write /tmp/x", caller_depth=1)
+        assert result["success"] is False
+        assert "run ended" in result["error"]
+
     def test_fails_closed_sensitive_file_read(self, make_builtin_executor):
         exe = _make_executor(make_builtin_executor)
+        _wire_coordinator(exe)
         result = exe._requires_confirmation("file_read", {"path": "/etc/passwd"},
                                             "Read /etc/passwd", caller_depth=1)
         assert result["success"] is False
 
     def test_fails_closed_file_patch(self, make_builtin_executor):
         exe = _make_executor(make_builtin_executor)
+        _wire_coordinator(exe)
         result = exe._requires_confirmation("file_patch", {"path": "/etc/hosts", "old_str": "a", "new_str": "b"},
                                             "Patch /etc/hosts", caller_depth=1)
         assert result["success"] is False
@@ -67,6 +90,7 @@ class TestHeadlessBridgeNotWired:
     def test_shell_still_blocked_at_depth1(self, make_builtin_executor):
         """Dangerous shell at depth>=1 is always blocked, regardless of bridge."""
         exe = _make_executor(make_builtin_executor)
+        _wire_coordinator(exe)
         exe._subagent_confirm_prompt_fn = MagicMock()  # bridge wired, but shell blocked first
         result = exe._requires_confirmation("shell", {"command": "rm -rf /"},
                                             "danger", caller_depth=1)
@@ -89,6 +113,7 @@ class TestHeadlessBridgeNotWired:
 class TestHeadlessBridgeApproved:
     def test_approved_executes_and_returns_success(self, make_builtin_executor, tmp_path):
         exe = _make_executor(make_builtin_executor)
+        coordinator = _wire_coordinator(exe)
         test_file = str(tmp_path / "out.txt")
         content = "hello from sub-agent"
 
@@ -107,7 +132,7 @@ class TestHeadlessBridgeApproved:
                     break
                 time.sleep(0.005)
             if tokens_seen:
-                exe.signal_headless_confirm(tokens_seen[0], True)
+                coordinator.signal_headless_confirmation(tokens_seen[0], True)
 
         t = threading.Thread(target=_approve, daemon=True)
         t.start()
@@ -126,6 +151,7 @@ class TestHeadlessBridgeApproved:
 
     def test_approved_sensitive_file_read(self, make_builtin_executor, tmp_path):
         exe = _make_executor(make_builtin_executor)
+        coordinator = _wire_coordinator(exe)
         secret = tmp_path / ".env"
         secret.write_text("SECRET=xyz")
 
@@ -143,7 +169,7 @@ class TestHeadlessBridgeApproved:
                     break
                 time.sleep(0.005)
             if tokens_seen:
-                exe.signal_headless_confirm(tokens_seen[0], True)
+                coordinator.signal_headless_confirmation(tokens_seen[0], True)
 
         t = threading.Thread(target=_approve, daemon=True)
         t.start()
@@ -165,6 +191,7 @@ class TestHeadlessBridgeApproved:
 class TestHeadlessBridgeDenied:
     def test_denied_returns_failure_and_does_not_write(self, make_builtin_executor, tmp_path):
         exe = _make_executor(make_builtin_executor)
+        coordinator = _wire_coordinator(exe)
         test_file = str(tmp_path / "should_not_exist.txt")
 
         tokens_seen: list[str] = []
@@ -181,7 +208,7 @@ class TestHeadlessBridgeDenied:
                     break
                 time.sleep(0.005)
             if tokens_seen:
-                exe.signal_headless_confirm(tokens_seen[0], False)
+                coordinator.signal_headless_confirmation(tokens_seen[0], False)
 
         t = threading.Thread(target=_deny, daemon=True)
         t.start()
@@ -206,7 +233,8 @@ class TestHeadlessBridgeDenied:
 class TestHeadlessBridgeTimeout:
     def test_timeout_returns_failure(self, make_builtin_executor):
         exe = _make_executor(make_builtin_executor)
-        exe._subagent_confirm_timeout = 1  # very short for testing
+        coordinator = _wire_coordinator(exe)
+        coordinator.default_headless_timeout = 1  # very short for testing
 
         def prompt_fn(token, tool_name, desc, tag):
             pass  # never signals
@@ -223,7 +251,8 @@ class TestHeadlessBridgeTimeout:
 
     def test_timeout_cleans_up_pending(self, make_builtin_executor):
         exe = _make_executor(make_builtin_executor)
-        exe._subagent_confirm_timeout = 1
+        coordinator = _wire_coordinator(exe)
+        coordinator.default_headless_timeout = 1
 
         def prompt_fn(token, tool_name, desc, tag):
             pass
@@ -237,7 +266,7 @@ class TestHeadlessBridgeTimeout:
 
         # After timeout, no orphaned pending entries should remain
         assert len(exe._pending) == 0
-        assert len(exe._headless_confirm_events) == 0
+        assert len(coordinator._headless_confirm_events) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +276,7 @@ class TestHeadlessBridgeTimeout:
 class TestHeadlessBridgeDoublePress:
     def test_second_signal_returns_false(self, make_builtin_executor):
         exe = _make_executor(make_builtin_executor)
+        coordinator = _wire_coordinator(exe)
         tokens_seen: list[str] = []
 
         def prompt_fn(token, tool_name, desc, tag):
@@ -262,7 +292,7 @@ class TestHeadlessBridgeDoublePress:
                     break
                 time.sleep(0.005)
             if tokens_seen:
-                exe.signal_headless_confirm(tokens_seen[0], True)
+                coordinator.signal_headless_confirmation(tokens_seen[0], True)
 
         t = threading.Thread(target=_approve, daemon=True)
         t.start()
@@ -274,7 +304,7 @@ class TestHeadlessBridgeDoublePress:
         t.join(timeout=4.0)
 
         # Now try pressing the button again with the same token
-        second = exe.signal_headless_confirm(tokens_seen[0], True)
+        second = coordinator.signal_headless_confirmation(tokens_seen[0], True)
         assert second is False  # already consumed
 
 
@@ -285,6 +315,7 @@ class TestHeadlessBridgeDoublePress:
 class TestHeadlessBridgePromptError:
     def test_prompt_fn_raises_fails_closed(self, make_builtin_executor):
         exe = _make_executor(make_builtin_executor)
+        _wire_coordinator(exe)
 
         def bad_prompt_fn(token, tool_name, desc, tag):
             raise ConnectionError("Telegram down")
@@ -301,6 +332,7 @@ class TestHeadlessBridgePromptError:
 
     def test_prompt_fn_raises_cleans_up(self, make_builtin_executor):
         exe = _make_executor(make_builtin_executor)
+        coordinator = _wire_coordinator(exe)
 
         def bad_prompt_fn(token, tool_name, desc, tag):
             raise OSError("network unreachable")
@@ -313,5 +345,44 @@ class TestHeadlessBridgePromptError:
         )
 
         assert len(exe._pending) == 0
-        assert len(exe._headless_confirm_events) == 0
+        assert len(coordinator._headless_confirm_events) == 0
 
+
+# ---------------------------------------------------------------------------
+# Coordinator atomicity tests
+# ---------------------------------------------------------------------------
+
+def test_signal_headless_confirmation_atomic_approve_all():
+    """signal_headless_confirmation(approve_all=True) atomically adds to auto_approve_tools AND sets the event."""
+    coord = ConfirmationManager()
+    token = "test-token-1"
+    event = threading.Event()
+    coord._headless_confirm_events[token] = event
+    result = coord.signal_headless_confirmation(token, True, approve_all=True, tool_name="file_write")
+    assert result is True
+    assert "file_write" in coord.auto_approve_tools
+    assert event.is_set()
+
+
+def test_signal_headless_confirmation_expired_token_no_grant():
+    """signal_headless_confirmation(approve_all=True) on an expired token grants nothing."""
+    from confirmation import ConfirmationManager
+    coord = ConfirmationManager()
+    # No event registered for this token — it's expired/unknown
+    result = coord.signal_headless_confirmation("expired-token", True, approve_all=True, tool_name="file_write")
+    assert result is False
+    assert "file_write" not in coord.auto_approve_tools
+
+
+def test_headless_bridge_fail_closed_when_coordinator_none():
+    """_headless_confirm_bridge returns fail-closed error when _coordinator is None (orphaned sub-agent)."""
+    exe = BuiltinExecutor.__new__(BuiltinExecutor)
+    exe._coordinator = None
+    exe._subagent_confirm_prompt_fn = MagicMock()
+    result = exe._headless_confirm_bridge(
+        "file_write", {"path": "/tmp/x", "content": "x"},
+        "Write /tmp/x", caller_tag="sa-1",
+    )
+    assert result["success"] is False
+    assert "run ended" in result["error"]
+    exe._subagent_confirm_prompt_fn.assert_not_called()

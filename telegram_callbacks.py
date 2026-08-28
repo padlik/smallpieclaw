@@ -363,10 +363,14 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
             pass
         return
 
-    # Approve-all: enforce allowlist before adding to the shared per-prompt set.
+    # Coordinator is the ConfirmationManager — access via the agent's _confirmation.
+    coordinator = getattr(getattr(iface, "agent", None), "_confirmation", None)
+
+    # Approve-all: enforce allowlist before signalling atomically.
     if is_approve_all and tool_name:
         if tool_name not in _ALLOWED_APPROVE_ALL_TOOLS:
-            builtin.signal_headless_confirm(token, False)
+            if coordinator is not None:
+                coordinator.signal_headless_confirmation(token, False)
             await _ack_query(query)
             try:
                 await query.edit_message_text(
@@ -376,13 +380,21 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
             except Exception:
                 pass
             return
-        if iface.agent:
-            iface.agent._confirmation.auto_approve_tools.add(tool_name)
         logger.info("Approve-all callback: tool=%s token=%s", tool_name, token[:8])
 
-    # Atomically signal the executor (pops the event before any await).
-    # Returns False if the token was already resolved or expired.
-    signalled = builtin.signal_headless_confirm(token, approved)
+    if coordinator is None:
+        try:
+            await query.answer("⚠️ Coordinator not available.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Atomically signal the coordinator (adds to auto_approve_tools AND sets
+    # the event in one call when approve_all=True). Returns False if the token
+    # was already resolved or expired.
+    signalled = coordinator.signal_headless_confirmation(
+        token, approved, approve_all=is_approve_all, tool_name=tool_name,
+    )
 
     await _ack_query(query)
 

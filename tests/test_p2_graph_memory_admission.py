@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from confirmation import ConfirmationManager
 from graph_memory import (
     ADMISSION_CONFIRMED,
     ADMISSION_OBSERVED,
@@ -277,6 +278,8 @@ class TestMemoryGraphStoreConfirmation:
 
     def test_subagent_uses_headless_bridge_and_stores_confirmed(self, executor_with_graph):
         b = executor_with_graph
+        coordinator = ConfirmationManager()
+        b._coordinator = coordinator
         tokens_seen: list[str] = []
 
         def prompt_fn(token, tool_name, desc, tag):
@@ -291,7 +294,7 @@ class TestMemoryGraphStoreConfirmation:
                     break
                 time.sleep(0.005)
             if tokens_seen:
-                b.signal_headless_confirm(tokens_seen[0], True)
+                coordinator.signal_headless_confirmation(tokens_seen[0], True)
 
         t = threading.Thread(target=_approve, daemon=True)
         t.start()
@@ -304,6 +307,8 @@ class TestMemoryGraphStoreConfirmation:
 
     def test_subagent_denied_writes_nothing(self, executor_with_graph):
         b = executor_with_graph
+        coordinator = ConfirmationManager()
+        b._coordinator = coordinator
         tokens_seen: list[str] = []
 
         def prompt_fn(token, tool_name, desc, tag):
@@ -318,7 +323,7 @@ class TestMemoryGraphStoreConfirmation:
                     break
                 time.sleep(0.005)
             if tokens_seen:
-                b.signal_headless_confirm(tokens_seen[0], False)
+                coordinator.signal_headless_confirmation(tokens_seen[0], False)
 
         t = threading.Thread(target=_deny, daemon=True)
         t.start()
