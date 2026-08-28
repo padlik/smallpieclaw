@@ -56,6 +56,11 @@ class ConfirmationManager:
         self._retry_events: dict[str, threading.Event] = {}
         self._retry_results: dict[str, str] = {}
 
+        # --- Headless (sub-agent) confirmation ---
+        self._headless_confirm_events: dict[str, threading.Event] = {}
+        self._headless_confirm_results: dict[str, bool] = {}
+        self.default_headless_timeout: int = 120
+
     # ------------------------------------------------------------------
     # Tool confirmation
     # ------------------------------------------------------------------
@@ -186,6 +191,71 @@ class ConfirmationManager:
             event.set()
         else:
             logger.warning("signal_retry: token=%s already resolved or timed out", token[:8])
+
+    # ------------------------------------------------------------------
+    # Headless (sub-agent) confirmation
+    # ------------------------------------------------------------------
+
+    def request_headless_confirmation(
+        self,
+        token: str,
+        tool_name: str,
+        description: str,
+        prompt_fn: Callable[[str, str, str, str], None],
+        caller_tag: str = "",
+    ) -> bool:
+        """Block the calling sub-agent thread until the operator responds via Telegram.
+
+        Creates a ``threading.Event``, stores it in ``_headless_confirm_events``,
+        invokes *prompt_fn* to send the Telegram inline keyboard, then blocks on
+        the event. Returns True if the operator approved, False if denied/timed-out.
+        Cleans up its event/result entries on return.
+        """
+        event = threading.Event()
+        self._headless_confirm_events[token] = event
+        self._headless_confirm_results[token] = False
+        try:
+            prompt_fn(token, tool_name, description, caller_tag)
+        except Exception:
+            self._headless_confirm_events.pop(token, None)
+            self._headless_confirm_results.pop(token, None)
+            raise
+        answered = event.wait(self.default_headless_timeout)
+        if not answered:
+            self._headless_confirm_events.pop(token, None)
+            self._headless_confirm_results.pop(token, None)
+            return False
+        return self._headless_confirm_results.pop(token, False)
+
+    def signal_headless_confirmation(
+        self,
+        token: str,
+        approved: bool,
+        approve_all: bool = False,
+        tool_name: str = "",
+    ) -> bool:
+        """Atomically signal the outcome of a headless (sub-agent) confirmation prompt.
+
+        If *approve_all* and *approved* and *tool_name* are set, adds *tool_name*
+        to ``auto_approve_tools`` AND sets the event in one call — no concurrent
+        sub-agent thread can observe the set without the event already being set.
+
+        Returns True if the token was found and signalled, False if it was
+        already expired/resolved (double-press / stale button).
+        """
+        # NOTE: The approve-all tool allowlist (_ALLOWED_APPROVE_ALL_TOOLS) is
+        # enforced in telegram_callbacks.py, not here. This method will add any
+        # tool_name when approve_all=True. The single caller (cb_subagent_confirm)
+        # gates on the allowlist before calling. Defense-in-depth at the
+        # transport boundary is intentional — the coordinator is transport-agnostic.
+        event = self._headless_confirm_events.pop(token, None)
+        if event is None:
+            return False
+        if approve_all and approved and tool_name:
+            self.auto_approve_tools.add(tool_name)
+        self._headless_confirm_results[token] = approved
+        event.set()
+        return True
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -69,6 +69,8 @@ class TestApproveAllButtonRenders:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         captured: dict = {}
+        coordinator = ConfirmationManager()
+        executor._coordinator = coordinator
 
         def fake_prompt(token, tool_name, description, caller_tag=""):
             # Replicate the real send_subagent_confirmation_prompt logic to capture keyboard.
@@ -90,7 +92,7 @@ class TestApproveAllButtonRenders:
         executor._subagent_confirm_prompt_fn = fake_prompt
 
         for tool in ("file_read", "file_write", "file_patch"):
-            with patch.object(executor, "_subagent_confirm_timeout", 0):
+            with patch.object(coordinator, "default_headless_timeout", 0):
                 executor._headless_confirm_bridge(
                     tool, {"path": "/tmp/x"}, "do it", caller_tag="sa-1"
                 )
@@ -104,9 +106,11 @@ class TestApproveAllButtonRenders:
     def test_shell_does_not_render_approve_all_button(self, executor):
         prompt_fn = MagicMock()
         executor._subagent_confirm_prompt_fn = prompt_fn
+        coordinator = ConfirmationManager()
+        executor._coordinator = coordinator
 
         # Shell is blocked in headless mode: it prompts but with no approve-all button.
-        with patch.object(executor, "_subagent_confirm_timeout", 0):
+        with patch.object(coordinator, "default_headless_timeout", 0):
             result = executor._headless_confirm_bridge(
                 "shell", {"command": "rm -rf /"}, "danger", caller_tag="sa-1"
             )
@@ -118,9 +122,11 @@ class TestApproveAllButtonRenders:
 class TestApproveAllCallback:
     @pytest.mark.asyncio
     async def test_subconfirm_all_adds_to_auto_approve_and_confirms(self, executor, iface):
+        coordinator = iface.agent._confirmation
+        executor._coordinator = coordinator
         executor._subagent_confirm_prompt_fn = MagicMock()
         # Stage a headless confirmation so there is a pending token.
-        with patch.object(executor, "_subagent_confirm_timeout", 0):
+        with patch.object(coordinator, "default_headless_timeout", 0):
             executor._headless_confirm_bridge(
                 "file_read", {"path": "/tmp/x"}, "do it", caller_tag="sa-1"
             )
@@ -130,7 +136,7 @@ class TestApproveAllCallback:
         executor._subagent_confirm_prompt_fn = lambda *_a, **_k: None
         token = secrets.token_hex(12)
         event = threading.Event()
-        executor._headless_confirm_events[token] = event
+        coordinator._headless_confirm_events[token] = event
         executor._pending[token] = (tool_name, {})
         query = _MockQuery(f"subconfirm_all:{token}:{tool_name}")
         update = _FakeUpdate(query)
@@ -140,7 +146,7 @@ class TestApproveAllCallback:
         assert tool_name in iface.agent._confirmation.auto_approve_tools
         assert "auto-approved" in html.unescape(query.edited_text or "")
         # Pending event should have been resolved.
-        assert token not in executor._headless_confirm_events
+        assert token not in coordinator._headless_confirm_events
 
     @pytest.mark.asyncio
     async def test_subconfirm_all_not_offered_for_shell(self, executor, iface):
@@ -151,9 +157,10 @@ class TestApproveAllCallback:
 
 class TestSubsequentAutoApprove:
     def test_after_approve_all_sub_agent_file_read_auto_approves(self, executor):
+        coordinator = ConfirmationManager()
+        coordinator.auto_approve_tools.add("file_read")
+        executor._coordinator = coordinator
         executor._subagent_confirm_prompt_fn = MagicMock()
-        executor._prompt_approval_set = executor._prompt_approval_set or set()
-        executor._prompt_approval_set.add("file_read")
 
         # After approve-all, subsequent file_read calls should not prompt.
         executor._headless_confirm_bridge(
@@ -162,8 +169,10 @@ class TestSubsequentAutoApprove:
         assert executor._subagent_confirm_prompt_fn.called is False
 
     def test_shell_never_auto_approves(self, executor):
+        coordinator = ConfirmationManager()
+        coordinator.auto_approve_tools = {"shell"}
+        executor._coordinator = coordinator
         executor._subagent_confirm_prompt_fn = MagicMock()
-        executor._prompt_approval_set = {"shell"}
 
         # Shell bypasses _headless_confirm_bridge via _requires_confirmation,
         # which always blocks shell in headless mode. Use a dangerous command so
@@ -184,10 +193,12 @@ class TestApproveAllCallbackAllowlist:
     @pytest.mark.asyncio
     async def test_crafted_callback_for_disallowed_tool_denied(self, iface, executor):
         """subconfirm_all with 'shell' is rejected; shell is never added to auto_approve_tools."""
+        coordinator = iface.agent._confirmation
+        executor._coordinator = coordinator
         token = secrets.token_hex(12)
-        # Register the token so signal_headless_confirm can resolve it
+        # Register the token so signal_headless_confirmation can resolve it
         event = threading.Event()
-        executor._headless_confirm_events[token] = event
+        coordinator._headless_confirm_events[token] = event
         executor._pending[token] = ("shell", {})
 
         query = _MockQuery(f"subconfirm_all:{token}:shell")
@@ -204,9 +215,11 @@ class TestApproveAllCallbackAllowlist:
     @pytest.mark.asyncio
     async def test_crafted_callback_for_allowed_tool_accepted(self, iface, executor):
         """subconfirm_all with 'file_write' passes the allowlist and adds it to the set."""
+        coordinator = iface.agent._confirmation
+        executor._coordinator = coordinator
         token = secrets.token_hex(12)
         event = threading.Event()
-        executor._headless_confirm_events[token] = event
+        coordinator._headless_confirm_events[token] = event
         executor._pending[token] = ("file_write", {})
 
         query = _MockQuery(f"subconfirm_all:{token}:file_write")
