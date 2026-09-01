@@ -1,52 +1,64 @@
-"""Tests for log_query prompt_id filtering."""
+"""Tests for ``log_query`` prompt_id filtering against the SQLite store."""
 
 from __future__ import annotations
 
 import json
-import logging
+import sqlite3
 
 import pytest
 import structlog
 
-import agent_logging as al
+from sqlite_log import SCHEMA_DDL, record_to_row
+
+
+def _insert_records(path: str, records: list[dict]) -> None:
+    """Create the SQLite store schema and insert *records* as rows."""
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_DDL)
+    if records:
+        rows = [record_to_row(rec) for rec in records]
+        conn.executemany(
+            """
+            INSERT INTO events
+            (ts, level, logger, agent, trace, prompt_id, event_type, msg, extra, search_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    conn.commit()
+    conn.close()
 
 
 @pytest.fixture
 def executor(make_builtin_executor, tmp_path):
-    """A BuiltinExecutor wired to a temp JSONL log file."""
-    log_file = str(tmp_path / "agent.log")
-    json_file = al.setup_logging(log_file, backup_count=1)
-    exc = make_builtin_executor(log_jsonl_path=json_file)
+    """A BuiltinExecutor wired to a temp SQLite store."""
+    log_store_path = str(tmp_path / "agent_logs.sqlite")
+    _insert_records(log_store_path, [])
+    exc = make_builtin_executor(log_store_path=log_store_path)
     yield exc
-    for handler in logging.getLogger().handlers[:]:
-        root = logging.getLogger()
-        root.removeHandler(handler)
-        try:
-            handler.close()
-        except OSError:
-            pass
-    al.clear_run_context()
+
+
+@pytest.fixture(autouse=True)
+def _clear_contextvars():
+    """Keep structlog contextvars isolated between tests."""
+    structlog.contextvars.clear_contextvars()
+    yield
+    structlog.contextvars.clear_contextvars()
 
 
 def _write_records(path: str, records: list[dict]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for rec in records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
-def _flush() -> None:
-    for handler in logging.getLogger().handlers:
-        handler.flush()
+    """Overwrite *path* with a fresh schema and *records*."""
+    _insert_records(path, records)
 
 
 class TestPromptIdFilter:
     def test_filter_by_prompt_id_returns_only_matches(self, executor, tmp_path):
         records = [
-            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "a"},
-            {"trace": "r-2", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
-            {"trace": "r-3", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "c"},
+            {"ts": "2026-07-05T10:00:00", "trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "a"},
+            {"ts": "2026-07-05T10:00:01", "trace": "r-2", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
+            {"ts": "2026-07-05T10:00:02", "trace": "r-3", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "c"},
         ]
-        _write_records(executor._log_jsonl_path, records)
+        _write_records(executor._log_store_path, records)
 
         result = executor._logquery._exec_log_query({"prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "trace": "*"})
         assert result["success"] is True
@@ -56,11 +68,11 @@ class TestPromptIdFilter:
 
     def test_prompt_id_combines_with_trace_filter(self, executor, tmp_path):
         records = [
-            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "a"},
-            {"trace": "r-2", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
-            {"trace": "r-1", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "c"},
+            {"ts": "2026-07-05T10:00:00", "trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "a"},
+            {"ts": "2026-07-05T10:00:01", "trace": "r-2", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
+            {"ts": "2026-07-05T10:00:02", "trace": "r-1", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "c"},
         ]
-        _write_records(executor._log_jsonl_path, records)
+        _write_records(executor._log_store_path, records)
 
         result = executor._logquery._exec_log_query({"prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "trace": "r-2"})
         assert result["success"] is True
@@ -70,11 +82,11 @@ class TestPromptIdFilter:
 
     def test_prompt_id_combines_with_level_and_event(self, executor, tmp_path):
         records = [
-            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "warning", "event_type": "TOOL_FAILED", "msg": "a"},
-            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
-            {"trace": "r-1", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "warning", "event_type": "TOOL_FAILED", "msg": "c"},
+            {"ts": "2026-07-05T10:00:00", "trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "warning", "event_type": "TOOL_FAILED", "msg": "a"},
+            {"ts": "2026-07-05T10:00:01", "trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "b"},
+            {"ts": "2026-07-05T10:00:02", "trace": "r-1", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "warning", "event_type": "TOOL_FAILED", "msg": "c"},
         ]
-        _write_records(executor._log_jsonl_path, records)
+        _write_records(executor._log_store_path, records)
 
         result = executor._logquery._exec_log_query(
             {"prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "WARNING", "event_type": "TOOL_FAILED"},
@@ -86,9 +98,9 @@ class TestPromptIdFilter:
 
     def test_empty_result_is_well_formed(self, executor, tmp_path):
         records = [
-            {"trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "msg": "a"},
+            {"ts": "2026-07-05T10:00:00", "trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "msg": "a"},
         ]
-        _write_records(executor._log_jsonl_path, records)
+        _write_records(executor._log_store_path, records)
 
         result = executor._logquery._exec_log_query({"prompt_id": "01JNONEXISTENTULIDSTRING00000"})
         assert result["success"] is True
@@ -101,11 +113,11 @@ class TestPromptIdFilter:
         # Reproduces the bug where an omitted trace defaulted to the current
         # run's trace and hid the target prompt's records.
         records = [
-            {"trace": "r-target", "prompt_id": "01TARGETABCDEFGHJKMNPQRSTUV", "level": "info", "event_type": "TOOL_START", "msg": "target-a"},
-            {"trace": "r-target", "prompt_id": "01TARGETABCDEFGHJKMNPQRSTUV", "level": "info", "event_type": "TOOL_END", "msg": "target-b"},
-            {"trace": "r-current", "prompt_id": "01CURRENTABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "current-a"},
+            {"ts": "2026-07-05T10:00:00", "trace": "r-target", "prompt_id": "01TARGETABCDEFGHJKMNPQRSTUV", "level": "info", "event_type": "TOOL_START", "msg": "target-a"},
+            {"ts": "2026-07-05T10:00:01", "trace": "r-target", "prompt_id": "01TARGETABCDEFGHJKMNPQRSTUV", "level": "info", "event_type": "TOOL_END", "msg": "target-b"},
+            {"ts": "2026-07-05T10:00:02", "trace": "r-current", "prompt_id": "01CURRENTABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "current-a"},
         ]
-        _write_records(executor._log_jsonl_path, records)
+        _write_records(executor._log_store_path, records)
 
         structlog.contextvars.bind_contextvars(trace="r-current")
         try:
@@ -116,6 +128,30 @@ class TestPromptIdFilter:
         payload = json.loads(result["output"])
         assert payload["count"] == 2
         assert {r["msg"] for r in payload["records"]} == {"target-a", "target-b"}
+
+
+    def test_prompt_id_unambiguous_across_days(self, executor, tmp_path):
+        # Spec scenario "Filter by prompt id is unambiguous across days": one
+        # prompt ULID's records span multiple storage days; querying it today
+        # returns all of them (no day boundary in the store), with no
+        # collision from a different ULID.
+        records = [
+            {"ts": "2026-07-03T10:00:00", "trace": "r-1", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "RUN_BEGIN", "msg": "day one"},
+            {"ts": "2026-07-05T09:00:00", "trace": "r-9", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "day three"},
+            {"ts": "2026-07-05T10:00:01", "trace": "r-2", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS", "level": "info", "event_type": "TOOL_START", "msg": "other prompt"},
+        ]
+        _write_records(executor._log_store_path, records)
+
+        # level=DEBUG disables the Option C default view so the prompt_id
+        # filter is isolated (RUN_BEGIN is not in the six-event default set).
+        result = executor._logquery._exec_log_query(
+            {"prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS", "trace": "*", "level": "DEBUG"}
+        )
+        assert result["success"] is True
+        payload = json.loads(result["output"])
+        assert payload["count"] == 2
+        assert {r["msg"] for r in payload["records"]} == {"day one", "day three"}
+        assert "other prompt" not in json.dumps(payload)
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@ agent_logging.py
 ----------------
 structlog-based structured-primary logging for the agent.
 
-Provides a dual-sink logging setup: a primary machine-readable JSONL sink
-(``agent.jsonl``) and a secondary human prose sink (``agent.log`` + stdout),
+Provides a dual-sink logging setup: a primary machine-readable SQLite sink
+(``agent_logs.sqlite``) and a secondary human prose sink (``agent.log`` + stdout),
 both rendered from one structlog processor chain so their content cannot drift.
 
 Run identity — the trace id (``r-<hex>``), agent label, and source tag — is
@@ -32,6 +32,8 @@ import re
 import shutil
 import sys
 from typing import Any, Iterable, cast
+
+import sqlite_log
 
 import structlog
 from structlog.typing import EventDict, WrappedLogger
@@ -215,18 +217,18 @@ def setup_bootstrap() -> None:
 def setup_logging(
     log_file: str,
     *,
-    json_file: str | None = None,
+    db_path: str | None = None,
     graph_memory_log: str | None = None,
     backup_count: int = 30,
     secret_values: Iterable[str] = (),
     stream=None,
 ) -> str:
-    """Configure structlog dual-sink logging and return the JSONL path.
+    """Configure structlog dual-sink logging and return the SQLite store path.
 
     Args:
         log_file: Resolved absolute prose log path (``XDGPaths.log_file``).
-        json_file: Resolved absolute JSONL log path (``XDGPaths.log_jsonl``).
-            Defaults to ``<log_file stem>.jsonl`` when omitted.
+        db_path: Resolved absolute SQLite store path (``XDGPaths.log_store``).
+            Defaults to ``<log_file dir>/agent_logs.sqlite`` when omitted.
         graph_memory_log: Dedicated component log path for the optional
             graph-memory component. Defaults to ``<log_file dir>/graph_memory.log``.
         backup_count: Number of daily rotated backups to retain per sink.
@@ -234,17 +236,16 @@ def setup_logging(
         stream: Console stream for the prose sink (defaults to ``sys.stdout``).
 
     Returns:
-        The path to the primary JSONL sink.
+        The path to the primary SQLite structured-log sink.
     """
     if stream is None:
         stream = sys.stdout
-    os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
-    if json_file is None:
-        json_file = f"{os.path.splitext(log_file)[0]}.jsonl"
+    log_dir = os.path.dirname(os.path.abspath(log_file))
+    os.makedirs(log_dir, exist_ok=True)
+    if db_path is None:
+        db_path = os.path.join(log_dir, sqlite_log.DEFAULT_STORE_FILENAME)
     if graph_memory_log is None:
-        graph_memory_log = os.path.join(
-            os.path.dirname(os.path.abspath(log_file)), "graph_memory.log"
-        )
+        graph_memory_log = os.path.join(log_dir, "graph_memory.log")
     secrets = frozenset(s for s in secret_values if isinstance(s, str) and s)
 
     shared = _shared_processors(secrets)
@@ -255,7 +256,7 @@ def setup_logging(
         cache_logger_on_first_use=False,
     )
 
-    json_formatter = structlog.stdlib.ProcessorFormatter(
+    structured_formatter = structlog.stdlib.ProcessorFormatter(
         foreign_pre_chain=shared,
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
@@ -270,8 +271,64 @@ def setup_logging(
         ),
     )
 
-    json_handler = _GzipTimedRotatingFileHandler(json_file, backup_count=backup_count)
-    json_handler.setFormatter(json_formatter)
+    def _configure_isolated_logger(
+        name: str,
+        log_path: str,
+        prose_formatter: logging.Formatter,
+        *,
+        stream,
+        backup_count: int,
+        logger_level: int = logging.INFO,
+        console_level: int = logging.WARNING,
+    ) -> logging.Logger:
+        """Configure an isolated component logger with its own file + console handlers.
+
+        Removes and closes any existing handlers before wiring the new ones to
+        make reconfiguration idempotent. The file handler uses the shared gzip
+        rotator; console visibility is gated by *console_level*.
+        """
+        component_logger = logging.getLogger(name)
+        component_logger.propagate = False
+        component_logger.setLevel(logger_level)
+        for handler in component_logger.handlers[:]:
+            component_logger.removeHandler(handler)
+            try:
+                handler.close()
+            except OSError:
+                pass
+        file_handler = _GzipTimedRotatingFileHandler(log_path, backup_count=backup_count)
+        file_handler.setFormatter(prose_formatter)
+        console_handler = logging.StreamHandler(stream)
+        console_handler.setFormatter(prose_formatter)
+        console_handler.setLevel(console_level)
+        component_logger.addHandler(file_handler)
+        component_logger.addHandler(console_handler)
+        return component_logger
+
+    # Writer-warning log isolation: must be wired BEFORE writer.start() so the
+    # writer thread's startup-failure warning lands in agent.log rather than
+    # lastResort stderr. propagate=False prevents overflow/disable warnings from
+    # re-entering SQLiteQueueHandler.emit() on the same call stack (ADR-0025).
+    #
+    # Known footgun (ora-2): this logger attaches its own rotating handler to
+    # ``agent.log`` while the root logger's prose_handler also rotates the same
+    # file (two independent TimedRotatingFileHandler instances on one file ==
+    # rotation-race risk). Accepted because writer warnings are rare.
+    _configure_isolated_logger(
+        "sqlite_log_writer",
+        log_file,
+        prose_formatter,
+        stream=stream,
+        backup_count=backup_count,
+    )
+
+    # Structured sink: queue handler feeding a single SQLite writer thread.
+    writer = sqlite_log.SqliteLogWriter(db_path)
+    writer.start()
+    sqlite_log.set_active_writer(writer)
+    structured_handler = sqlite_log.SQLiteQueueHandler(writer)
+    structured_handler.setFormatter(structured_formatter)
+
     prose_handler = _GzipTimedRotatingFileHandler(log_file, backup_count=backup_count)
     prose_handler.setFormatter(prose_formatter)
     stream_handler = logging.StreamHandler(stream)
@@ -280,7 +337,7 @@ def setup_logging(
     root = logging.getLogger()
     _reset_handlers(root)
     root.setLevel(logging.INFO)
-    root.addHandler(json_handler)
+    root.addHandler(structured_handler)
     root.addHandler(prose_handler)
     root.addHandler(stream_handler)
 
@@ -292,30 +349,20 @@ def setup_logging(
     # writes to a dedicated prose sink instead of the primary agent sinks.
     # Static and enablement-independent — routing exists even when the
     # component is disabled, so a disabled-notice can never leak into
-    # agent.jsonl. No run identity is bound for these records: the worker
+    # agent_logs.sqlite. No run identity is bound for these records: the worker
     # thread never calls bind_run_context (fire-and-forget enrichment, not
     # run-scoped work). Console visibility is WARNING+ via handler level, so
     # INFO detail stays file-only.
     gm_log = graph_memory_log
-    gm = logging.getLogger("graph_memory")
-    gm.propagate = False
-    gm.setLevel(logging.INFO)
-    for gm_handler in gm.handlers[:]:
-        # Idempotent reconfigure (mirrors _reset_handlers).
-        gm.removeHandler(gm_handler)
-        try:
-            gm_handler.close()
-        except OSError:
-            pass
-    gm_file_handler = _GzipTimedRotatingFileHandler(gm_log, backup_count=backup_count)
-    gm_file_handler.setFormatter(prose_formatter)
-    gm_stream_handler = logging.StreamHandler(stream)
-    gm_stream_handler.setFormatter(prose_formatter)
-    gm_stream_handler.setLevel(logging.WARNING)
-    gm.addHandler(gm_file_handler)
-    gm.addHandler(gm_stream_handler)
+    _configure_isolated_logger(
+        "graph_memory",
+        gm_log,
+        prose_formatter,
+        stream=stream,
+        backup_count=backup_count,
+    )
 
-    return json_file
+    return db_path
 
 
 def _reset_handlers(root: logging.Logger) -> None:
@@ -326,6 +373,19 @@ def _reset_handlers(root: logging.Logger) -> None:
             handler.close()
         except OSError:
             pass
+
+
+def shutdown_log_store(timeout: float | None = 5.0) -> None:
+    """Drain and stop the active SQLite structured-log writer.
+
+    This is a convenience wrapper around :func:`sqlite_log.shutdown_log_store`
+    so callers in ``main.py`` do not need to import the storage module directly.
+
+    Args:
+        timeout: Seconds to wait for the writer thread to finish. ``None``
+            waits indefinitely.
+    """
+    sqlite_log.shutdown_log_store(timeout=timeout)
 
 
 # ---------------------------------------------------------------------------

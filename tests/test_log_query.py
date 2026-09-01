@@ -1,22 +1,22 @@
-"""Tests for the ``log_query`` built-in tool and its structured-log filtering.
+"""Tests for the ``log_query`` built-in tool against the SQLite structured log store.
 
 Covers trace filtering, the current-run-trace default, the Option C default
 view (STEP_* excluded / TOOL_*/LLM_CALL & WARNING+ included), the explicit
-level/event_type/tool/since filters, limit/truncation, graceful handling of
-malformed lines, and the empty result when the log path is missing/unset.
+level/event_type/tool/since filters, text search (including extra-field and
+Unicode casefold matches), prompt_id filtering, limit/truncation with exact
+``total_matched``, empty/missing-store handling, and the absence of the
+legacy window-saturation fields.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 import structlog
 
-from builtin_executor import (
-    _LOG_QUERY_MAX_SCAN_LINES,
-    _LOG_QUERY_TAIL_BYTES,
-)
+from sqlite_log import SCHEMA_DDL, record_to_row
 
 TRACE_A = "r-aaaaaaaa"
 TRACE_B = "r-bbbbbbbb"
@@ -53,22 +53,30 @@ def sample_records():
     ]
 
 
-@pytest.fixture
-def log_path(tmp_path, sample_records):
-    """Write the sample records with interleaved malformed lines to a .jsonl."""
-    path = tmp_path / "agent.jsonl"
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("this is not json at all\n")   # malformed -> skipped
-        fh.write("\n")                            # blank -> skipped
-        for rec in sample_records:
-            fh.write(json.dumps(rec) + "\n")
-        fh.write("{ still not: valid json\n")     # malformed tail -> skipped
-    return path
+def _insert_records(path: str, records: list[dict]) -> None:
+    """Create the SQLite store schema and insert *records* as rows."""
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_DDL)
+    if records:
+        rows = [record_to_row(rec) for rec in records]
+        conn.executemany(
+            """
+            INSERT INTO events
+            (ts, level, logger, agent, trace, prompt_id, event_type, msg, extra, search_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    conn.commit()
+    conn.close()
 
 
 @pytest.fixture
-def executor(make_builtin_executor, log_path):
-    return make_builtin_executor(log_jsonl_path=str(log_path))
+def executor(make_builtin_executor, tmp_path, sample_records):
+    """Executor wired to a temp SQLite store containing *sample_records*."""
+    path = str(tmp_path / "agent_logs.sqlite")
+    _insert_records(path, sample_records)
+    return make_builtin_executor(log_store_path=path)
 
 
 def _query(exc, **filters):
@@ -149,6 +157,11 @@ def test_level_filter(executor):
     assert payload["records"][0]["event_type"] == "TOOL_FAILED"
     assert payload["records"][0]["level"] == "error"
 
+    payload_warning = _query(executor, trace="*", level="WARNING")
+    # WARNING includes the error-level TOOL_FAILED plus the warning STEP_END.
+    assert payload_warning["total_matched"] == 2
+    assert {"warning", "error"} == {r["level"] for r in payload_warning["records"]}
+
 
 def test_event_type_filter(executor):
     payload = _query(executor, trace="*", event_type="TOOL_START")
@@ -174,7 +187,7 @@ def test_limit_and_truncation(executor):
     assert payload["total_matched"] == 8
     assert payload["truncated"] is True
     assert payload["count"] == 3
-    # The most recent records are kept.
+    # The most recent records are kept, then re-ascended (oldest-first in output).
     assert [r["ts"] for r in payload["records"]] == [
         "2026-07-05T10:00:05",
         "2026-07-05T10:00:06",
@@ -189,15 +202,15 @@ def test_no_truncation_when_under_limit(executor):
     assert payload["total_matched"] == 8
 
 
-def test_malformed_lines_skipped(executor):
-    # The log file contains malformed/blank lines; a DEBUG all-trace query still
-    # returns exactly the 8 well-formed records.
+def test_response_has_no_window_fields(executor):
+    """The legacy window_saturated / scanned_lines disclosure fields are gone."""
     payload = _query(executor, trace="*", level="DEBUG")
-    assert payload["total_matched"] == 8
+    assert "window_saturated" not in payload
+    assert "scanned_lines" not in payload
 
 
 def test_missing_file_returns_empty(make_builtin_executor, tmp_path):
-    exc = make_builtin_executor(log_jsonl_path=str(tmp_path / "does_not_exist.jsonl"))
+    exc = make_builtin_executor(log_store_path=str(tmp_path / "does_not_exist.sqlite"))
     result = exc.execute("log_query", {})
     assert result["success"] is True
     payload = json.loads(result["output"])
@@ -205,84 +218,96 @@ def test_missing_file_returns_empty(make_builtin_executor, tmp_path):
     assert payload["count"] == 0
     assert payload["truncated"] is False
     assert payload["total_matched"] == 0
-    assert payload["window_saturated"] is False
-    assert payload["scanned_lines"] == 0
+    assert "window_saturated" not in payload
+    assert "scanned_lines" not in payload
 
 
 def test_unset_path_returns_empty(make_builtin_executor):
-    exc = make_builtin_executor()  # log_jsonl_path defaults to ""
+    exc = make_builtin_executor()  # log_store_path defaults to ""
     result = exc.execute("log_query", {})
     assert result["success"] is True
     payload = json.loads(result["output"])
     assert payload["records"] == []
     assert payload["total_matched"] == 0
-    assert payload["window_saturated"] is False
-    assert payload["scanned_lines"] == 0
+    assert payload["truncated"] is False
+    assert "window_saturated" not in payload
+    assert "scanned_lines" not in payload
 
 
-def test_window_fields_present_not_saturated(executor, sample_records):
-    """Small file: the disclosure fields are present, the window is not
-    saturated, and scanned_lines counts every physical tail line (records plus
-    the interleaved malformed/blank lines)."""
-    payload = _query(executor, trace="*", level="DEBUG")
-    assert payload["window_saturated"] is False
-    # The log_path fixture writes the 8 records plus 3 non-record lines
-    # (2 malformed + 1 blank), all inside the (tiny) tail window.
-    assert payload["scanned_lines"] == len(sample_records) + 3
-    assert payload["total_matched"] == 8
+def test_empty_store_well_formed(make_builtin_executor, tmp_path):
+    path = str(tmp_path / "empty.sqlite")
+    _insert_records(path, [])  # creates schema, no rows
+    exc = make_builtin_executor(log_store_path=path)
+    payload = _query(exc)
+    assert payload["records"] == []
+    assert payload["count"] == 0
+    assert payload["truncated"] is False
+    assert payload["total_matched"] == 0
 
 
-def test_window_saturation_line_cap(make_builtin_executor, tmp_path):
-    """More lines than the scan cap -> window_saturated, scanned_lines bounded to
-    the line cap, and total_matched is a recent-window count (< the file total)."""
-    path = tmp_path / "many.jsonl"
-    n = _LOG_QUERY_MAX_SCAN_LINES + 300
-    with open(path, "w", encoding="utf-8") as fh:
-        for i in range(n):
-            fh.write(json.dumps({
-                "ts": f"{i:08d}", "trace": TRACE_A, "level": "info",
-                "event_type": "TOOL_END", "tool": "shell",
-            }) + "\n")
-    exc = make_builtin_executor(log_jsonl_path=str(path))
-    payload = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=10)
-    assert payload["window_saturated"] is True
-    assert payload["scanned_lines"] == _LOG_QUERY_MAX_SCAN_LINES
-    # total_matched reflects only the scanned tail, not the whole file.
-    assert payload["total_matched"] == _LOG_QUERY_MAX_SCAN_LINES
-    assert payload["total_matched"] < n
-    # The most recent record is retained despite older ones falling outside.
-    assert payload["records"][-1]["ts"] == f"{n - 1:08d}"
+def test_bare_sqlite_file_no_events_table_returns_empty(make_builtin_executor, tmp_path):
+    """A file present but with no events table must yield a well-formed empty result."""
+    path = str(tmp_path / "no_events.sqlite")
+    sqlite3.connect(path).close()
+    exc = make_builtin_executor(log_store_path=path)
+    result = exc.execute("log_query", {})
+    assert result["success"] is True
+    payload = json.loads(result["output"])
+    assert payload["records"] == []
+    assert payload["count"] == 0
+    assert payload["truncated"] is False
+    assert payload["total_matched"] == 0
 
 
-def test_window_saturation_byte_cap(make_builtin_executor, tmp_path):
-    """Fewer lines than the line cap but more bytes than the byte cap: the read
-    begins mid-file, so window_saturated is True and older lines are dropped."""
-    path = tmp_path / "wide.jsonl"
-    pad = "x" * 400
-    n_lines = 4000
-    with open(path, "w", encoding="utf-8") as fh:
-        for i in range(n_lines):
-            fh.write(json.dumps({
-                "ts": f"{i:08d}", "trace": TRACE_A, "level": "info",
-                "event_type": "TOOL_END", "tool": "shell", "pad": pad,
-            }) + "\n")
-    assert path.stat().st_size > _LOG_QUERY_TAIL_BYTES   # sanity: exceeds byte window
-    assert n_lines < _LOG_QUERY_MAX_SCAN_LINES           # so the line cap is NOT the trigger
-    exc = make_builtin_executor(log_jsonl_path=str(path))
-    payload = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=5)
-    assert payload["window_saturated"] is True
-    assert 0 < payload["scanned_lines"] < n_lines        # older lines outside the byte window
-    assert payload["scanned_lines"] <= _LOG_QUERY_MAX_SCAN_LINES
+def test_exact_total_matched_across_large_match_set(make_builtin_executor, tmp_path):
+    """120 matching records, limit 50 -> count=50, truncated=True, total_matched=120."""
+    records = [
+        {"ts": f"2026-07-05T12:{i:02d}:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_END", "tool": "shell"}
+        for i in range(120)
+    ]
+    path = str(tmp_path / "many.sqlite")
+    _insert_records(path, records)
+    exc = make_builtin_executor(log_store_path=path, max_output=50000)
+
+    payload = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=50)
+    assert payload["total_matched"] == 120
+    assert payload["count"] == 50
+    assert payload["truncated"] is True
+    # Returned records are the most recent 50, re-ascended.  Because the
+    # artificial timestamps use a fixed hour prefix, lexical sorting on the
+    # formatted minute suffix returns minutes 50-99 (the last 50 inserted).
+    assert [r["ts"] for r in payload["records"]] == [
+        f"2026-07-05T12:{i:02d}:00" for i in range(50, 100)
+    ]
+
+
+def test_huge_limit_is_clamped_to_max(make_builtin_executor, tmp_path):
+    """An LLM-reachable huge limit is clamped so the full store is not
+    materialized; total_matched stays exact and truncation is reported."""
+    records = [
+        {"ts": f"2026-07-05T12:{i:03d}:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_END", "tool": "shell"}
+        for i in range(550)
+    ]
+    path = str(tmp_path / "huge_limit.sqlite")
+    _insert_records(path, records)
+    exc = make_builtin_executor(log_store_path=path, max_output=100_000)
+
+    payload = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=1_000_000)
+    assert payload["total_matched"] == 550
+    assert payload["count"] == 500
+    assert payload["truncated"] is True
 
 
 # ---------------------------------------------------------------------------
-# text / query argument — new bounded text search
+# text / query argument — full-record substring search
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def text_search_executor(make_builtin_executor, tmp_path):
-    """Executor with a log containing records that span traces, levels, and a
-    distinctive INFO startup message dropped by the Option C default view."""
+    """Executor with records that span traces, levels, and a distinctive INFO
+    startup message dropped by the Option C default view."""
     records = [
         # TRACE_A — two TOOL_START events
         {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
@@ -296,12 +321,17 @@ def text_search_executor(make_builtin_executor, tmp_path):
         # TRACE_B — one TOOL_START event
         {"ts": "2026-07-05T10:00:03", "trace": TRACE_B, "level": "info",
          "event_type": "TOOL_START", "tool": "file_read"},
+        # Extra-field text match (err inside extra)
+        {"ts": "2026-07-05T10:00:04", "trace": TRACE_A, "level": "error",
+         "event_type": "TOOL_FAILED", "tool": "shell",
+         "err": "network timeout exceeded"},
+        # Literal % and _ characters (not LIKE wildcards)
+        {"ts": "2026-07-05T10:00:05", "trace": TRACE_A, "level": "info",
+         "event_type": "STEP_END", "msg": "100% complete _done"},
     ]
-    path = tmp_path / "text.jsonl"
-    with open(path, "w", encoding="utf-8") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec) + "\n")
-    return make_builtin_executor(log_jsonl_path=str(path))
+    path = str(tmp_path / "text.sqlite")
+    _insert_records(path, records)
+    return make_builtin_executor(log_store_path=path)
 
 
 def test_text_search_finds_dropped_info_record(text_search_executor):
@@ -318,6 +348,14 @@ def test_text_search_finds_dropped_info_record(text_search_executor):
     assert "GraphMemoryStore" in payload["records"][0]["msg"]
 
 
+def test_text_search_matches_extra_field(text_search_executor):
+    """The full-record search includes values stored in the extra JSON column."""
+    payload = _query(text_search_executor, trace="*", text="timeout exceeded")
+    assert payload["total_matched"] == 1
+    assert payload["records"][0]["event_type"] == "TOOL_FAILED"
+    assert "timeout exceeded" in payload["records"][0]["err"]
+
+
 def test_query_alias_behaves_same(text_search_executor):
     """query= alias produces the same results as text=."""
     payload_text = _query(text_search_executor, trace="*", text="GraphMemoryStore")
@@ -327,22 +365,36 @@ def test_query_alias_behaves_same(text_search_executor):
 
 
 def test_text_search_case_insensitive(text_search_executor):
-    """text= search is case-insensitive."""
+    """text= search is Unicode-aware case-insensitive (casefold)."""
     payload_upper = _query(text_search_executor, trace="*", text="GRAPHMEMORYSTORE")
     payload_lower = _query(text_search_executor, trace="*", text="graphmemorystore")
     payload_mixed = _query(text_search_executor, trace="*", text="GraphMemoryStore")
-    assert payload_upper["total_matched"] == payload_lower["total_matched"] == payload_mixed["total_matched"]
+    assert (
+        payload_upper["total_matched"]
+        == payload_lower["total_matched"]
+        == payload_mixed["total_matched"]
+    )
     assert payload_upper["records"] == payload_lower["records"] == payload_mixed["records"]
     assert payload_upper["total_matched"] == 1
 
 
-def test_text_search_auto_widens_without_explicit_trace(text_search_executor):
-    """Without an explicit trace, a text search auto-widens to all traces.
+def test_text_search_wildcard_chars_are_literal(text_search_executor):
+    """% and _ in the needle are ordinary characters, not LIKE wildcards."""
+    payload_pct = _query(text_search_executor, trace="*", text="100%")
+    assert payload_pct["total_matched"] == 1
+    assert "100%" in payload_pct["records"][0]["msg"]
 
-    Startup records may carry no trace or a different trace; the auto-widen
-    ensures they are found by a bare {"text": "…"} call regardless of the
-    current-run contextvars binding.
-    """
+    payload_underscore = _query(text_search_executor, trace="*", text="_done")
+    assert payload_underscore["total_matched"] == 1
+    assert "_done" in payload_underscore["records"][0]["msg"]
+
+    # A LIKE wildcard should NOT match the literal text.
+    payload_like = _query(text_search_executor, trace="*", text="100Xcomplete")
+    assert payload_like["total_matched"] == 0
+
+
+def test_text_search_auto_widens_without_explicit_trace(text_search_executor):
+    """Without an explicit trace, a text search auto-widens to all traces."""
     # Binding TRACE_B should NOT restrict results: auto-widen ignores contextvars.
     structlog.contextvars.bind_contextvars(trace=TRACE_B)
     try:
@@ -375,11 +427,7 @@ def test_text_search_wildcard_finds_all_traces(text_search_executor):
 
 @pytest.fixture
 def no_trace_startup_executor(make_builtin_executor, tmp_path):
-    """Log with a traceless startup record and a current-run record on TRACE_A.
-
-    Simulates the real scenario: the process emits INFO messages before the
-    trace ID is bound to contextvars, so those records carry no 'trace' key.
-    """
+    """Log with a traceless startup record and a current-run record on TRACE_A."""
     records = [
         # Traceless startup record — emitted before trace ID is available.
         {"ts": "2026-07-05T09:59:58", "level": "info",
@@ -389,21 +437,13 @@ def no_trace_startup_executor(make_builtin_executor, tmp_path):
         {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
          "event_type": "TOOL_START", "tool": "shell"},
     ]
-    path = tmp_path / "startup.jsonl"
-    with open(path, "w", encoding="utf-8") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec) + "\n")
-    return make_builtin_executor(log_jsonl_path=str(path))
+    path = str(tmp_path / "startup.sqlite")
+    _insert_records(path, records)
+    return make_builtin_executor(log_store_path=path)
 
 
 def test_text_auto_widens_finds_no_trace_startup_record(no_trace_startup_executor):
-    """Bare text search finds a startup record that carries no trace field.
-
-    This is the real bug shape: the agent asks "how many dimensions does graph
-    memory have?" and log_query must find the startup INFO record even though
-    the current contextvars trace is TRACE_A and the record has no trace key.
-    Auto-widening (no explicit trace + text given) makes this work.
-    """
+    """Bare text search finds a startup record that carries no trace field."""
     structlog.contextvars.bind_contextvars(trace=TRACE_A)
     try:
         payload = _query(no_trace_startup_executor, text="GraphMemoryStore")
@@ -418,7 +458,6 @@ def test_text_auto_widens_finds_no_trace_startup_record(no_trace_startup_executo
 
 def test_text_explicit_trace_excludes_no_trace_record(no_trace_startup_executor):
     """An explicit trace scopes out records that carry no trace field."""
-    # Explicitly searching TRACE_A should NOT return the traceless startup record.
     payload = _query(no_trace_startup_executor, trace=TRACE_A, text="GraphMemoryStore")
     assert payload["total_matched"] == 0
 
@@ -447,11 +486,9 @@ def unicode_executor(make_builtin_executor, tmp_path):
          "event_type": "STEP_BEGIN",
          "msg": "Straße café: vector store ready"},
     ]
-    path = tmp_path / "unicode.jsonl"
-    with open(path, "w", encoding="utf-8") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec) + "\n")
-    return make_builtin_executor(log_jsonl_path=str(path))
+    path = str(tmp_path / "unicode.sqlite")
+    _insert_records(path, records)
+    return make_builtin_executor(log_store_path=path)
 
 
 def test_text_search_casefold_unicode(unicode_executor):
@@ -474,45 +511,88 @@ def test_text_search_casefold_unicode(unicode_executor):
 
 
 # ---------------------------------------------------------------------------
-# Regression: prompt_id type boundary between schema and log context
+# prompt_id filtering
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def prompt_id_executor(make_builtin_executor, tmp_path):
-    """Log with records whose prompt_id is stored as a string (matching the
-    structlog context) plus one record without a prompt_id."""
+    """Log with records carrying prompt_id values plus one without."""
     records = [
         {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
-         "event_type": "TOOL_START", "tool": "shell", "prompt_id": "7"},
+         "event_type": "TOOL_START", "tool": "shell", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS"},
         {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
-         "event_type": "TOOL_END", "tool": "shell", "prompt_id": "7"},
+         "event_type": "TOOL_END", "tool": "shell", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS"},
         {"ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "info",
-         "event_type": "LLM_CALL", "prompt_id": "42"},
+         "event_type": "LLM_CALL", "prompt_id": "01JARYZ3W2ABCDEFGHJKMNPQRS"},
         {"ts": "2026-07-05T10:00:03", "trace": TRACE_A, "level": "info",
          "event_type": "TOOL_START", "tool": "schedule"},
     ]
-    path = tmp_path / "prompt_id.jsonl"
-    with open(path, "w", encoding="utf-8") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec) + "\n")
-    return make_builtin_executor(log_jsonl_path=str(path))
+    path = str(tmp_path / "prompt_id.sqlite")
+    _insert_records(path, records)
+    return make_builtin_executor(log_store_path=path)
 
 
-def test_prompt_id_filter_string_matches_string(prompt_id_executor):
-    """prompt_id stored as string can be filtered by string argument."""
-    payload = _query(prompt_id_executor, trace="*", prompt_id="7")
+def test_prompt_id_filter_returns_only_matches(prompt_id_executor):
+    payload = _query(prompt_id_executor, trace="*", prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS")
     assert payload["total_matched"] == 2
     assert {r["tool"] for r in payload["records"]} == {"shell"}
 
 
-def test_prompt_id_filter_integer_matches_string(prompt_id_executor):
-    """prompt_id stored as string can be filtered by integer argument (LLMs
-    may emit JSON numbers) because the filter coerces both sides."""
-    payload = _query(prompt_id_executor, trace="*", prompt_id=7)
-    assert payload["total_matched"] == 2
-    assert {r["tool"] for r in payload["records"]} == {"shell"}
+def test_prompt_id_filter_excludes_other(prompt_id_executor):
+    payload = _query(prompt_id_executor, trace="*", prompt_id="01JARYZ3W2ABCDEFGHJKMNPQRS")
+    assert payload["total_matched"] == 1
+    assert payload["records"][0]["event_type"] == "LLM_CALL"
 
 
-def test_prompt_id_filter_no_match_when_different(prompt_id_executor):
-    payload = _query(prompt_id_executor, trace="*", prompt_id=99)
+def test_prompt_id_filter_no_match(prompt_id_executor):
+    payload = _query(prompt_id_executor, trace="*", prompt_id="01JNONEXISTENTULIDSTRING00000")
     assert payload["total_matched"] == 0
+    assert payload["records"] == []
+
+
+def test_prompt_id_auto_widens_to_all_traces(prompt_id_executor):
+    """prompt_id without explicit trace auto-widens so cross-trace matches are found."""
+    structlog.contextvars.bind_contextvars(trace=TRACE_B)
+    try:
+        payload = _query(prompt_id_executor, prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS")
+    finally:
+        structlog.contextvars.clear_contextvars()
+    assert payload["total_matched"] == 2
+
+
+def test_prompt_id_explicit_trace_overrides_widening(make_builtin_executor, tmp_path):
+    """Explicit trace restricts prompt_id matches to that trace."""
+    records = [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS"},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_B, "level": "info",
+         "event_type": "TOOL_START", "prompt_id": "01JARYN6R0ABCDEFGHJKMNPQRS"},
+    ]
+    path = str(tmp_path / "prompt_trace.sqlite")
+    _insert_records(path, records)
+    exc = make_builtin_executor(log_store_path=path)
+    payload = _query(exc, trace=TRACE_B, prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS")
+    assert payload["total_matched"] == 1
+    assert payload["records"][0]["trace"] == TRACE_B
+
+
+# ---------------------------------------------------------------------------
+# max_output size cap
+# ---------------------------------------------------------------------------
+
+def test_max_output_size_cap(make_builtin_executor, tmp_path):
+    """A small max_output truncates the returned records to fit the budget."""
+    records = [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "msg": "short a"},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START", "msg": "x" * 500},
+    ]
+    path = str(tmp_path / "cap.sqlite")
+    _insert_records(path, records)
+    exc = make_builtin_executor(log_store_path=path, max_output=120)
+    payload = _query(exc, trace="*", level="DEBUG")
+    # The newest record is always kept even if it alone exceeds the budget.
+    assert payload["count"] >= 1
+    assert payload["truncated"] is True
+    assert payload["total_matched"] == 2

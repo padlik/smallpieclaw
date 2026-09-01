@@ -6,8 +6,8 @@ Handler module holding two tool groups:
   depth 0, headless operator bridge for sub-agents). It reads ``_vault_path`` and
   stages confirmation through the ``owner`` façade at call time; the
   ``config_schema``/``exceptions`` imports stay function-local (ADR-0003 vault).
-* ``LogQueryTools`` — the read-only ``log_query`` introspection over the active
-  JSONL sink, reading ``_log_jsonl_path`` and ``max_output`` via ``owner``.
+* ``LogQueryTools`` — the read-only ``log_query`` introspection over the SQLite
+  structured log store, reading ``_log_store_path`` and ``max_output`` via ``owner``.
 
 The ``builtin_executor`` import is under ``TYPE_CHECKING`` only (no runtime cycle).
 """
@@ -16,20 +16,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import sqlite3
 from typing import TYPE_CHECKING
 
 import structlog
 
 from builtin_tools.logquery_helpers import (
-    _LOG_QUERY_MAX_SCAN_LINES,
-    _LOG_QUERY_TAIL_BYTES,
     LogQueryFilters,
     _log_level_to_num,
+    _log_query_compile_where,
     _log_query_project,
-    _read_tail_lines,
-    filter_log_lines,
+    _LOG_QUERY_MAX_LIMIT,
 )
+from sqlite_log import connect_store, row_to_record
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
@@ -156,44 +155,41 @@ class SecretsTools:
 
 
 class LogQueryTools:
-    """Read-only ``log_query`` introspection over the active JSONL log sink."""
+    """Read-only ``log_query`` introspection over the SQLite log store."""
 
     def __init__(self, owner: BuiltinExecutor) -> None:
         self._owner = owner
 
     def _exec_log_query(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
-        """Query the active JSONL log sink and return matching records.
+        """Query the SQLite structured log store and return matching records.
 
-        Read-only introspection over ``owner._log_jsonl_path`` (one JSON object
-        per line). Only the trailing ``_LOG_QUERY_TAIL_BYTES`` bytes / most
-        recent ``_LOG_QUERY_MAX_SCAN_LINES`` lines are scanned, so a mid-loop
-        call does bounded work regardless of total log size (``total_matched``
-        therefore counts matches within that tail window). Supports
-        trace/level/event_type/tool/since/text filters, a useful default view
-        (Option C) when neither level, event_type, nor text is supplied, and
-        most-recent-N truncation via ``limit``.
+        Read-only introspection over ``owner._log_store_path``. Queries the
+        full 30-day retention window using indexed SQL filters. Supports
+        trace/level/event_type/tool/since/text/prompt_id filters, a useful
+        default view (Option C) when neither level, event_type, nor text is
+        supplied, and most-recent-N truncation via ``limit``.
 
         The ``text`` argument (alias: ``query``) performs a Unicode-aware
         case-insensitive (casefold) substring search against the compact JSON
-        serialisation of each record so that any key or value — msg, event,
-        logger, tool output, etc. — is searchable.
+        serialisation stored in ``search_text`` so that any key or value — msg,
+        event, logger, tool output, etc. — is searchable.
 
         When ``text`` is provided without an explicit ``level`` or
         ``event_type``, the Option C high-signal default view is **not** applied,
         allowing routine INFO startup records (e.g. "GraphMemoryStore
         initialised at data/graph_memory (dim=1536)") to be surfaced.
 
-        When ``text``/``query`` is given and the caller did **not** supply an
-        explicit ``trace`` argument, the scope is automatically widened to all
-        traces (equivalent to ``trace='*'``). This ensures that startup records
-        — which often carry no trace tag or a different trace — are found by a
-        bare ``{"text": "…"}`` call without the caller needing to know the
-        right trace. Passing an explicit ``trace`` always overrides this
-        auto-widening.
+        When ``text``/``query`` or ``prompt_id`` is given and the caller did
+        **not** supply an explicit ``trace`` argument, the scope is
+        automatically widened to all traces (equivalent to ``trace='*'``).
+        This ensures that startup records — which often carry no trace tag or
+        a different trace — or records for a specific prompt ID are found
+        without the caller needing to know the current run's trace. Passing an
+        explicit ``trace`` always overrides this auto-widening.
 
-        A missing or unset log path yields a well-formed EMPTY result rather
-        than an error. ``caller_depth`` and ``caller_tag`` are accepted for
-        dispatch symmetry with peer handlers.
+        A missing/empty store path or an unreadable store file yields a
+        well-formed EMPTY result rather than an error. ``caller_depth`` and
+        ``caller_tag`` are accepted for dispatch symmetry with peer handlers.
         """
         # limit (most-recent-N kept); fall back to the default on bad input.
         try:
@@ -202,12 +198,13 @@ class LogQueryTools:
             limit = 50
         if limit <= 0:
             limit = 50
+        limit = min(limit, _LOG_QUERY_MAX_LIMIT)
 
         level_arg = args.get("level") or ""
         event_type_arg = args.get("event_type") or ""
         tool_arg = args.get("tool") or ""
         since_arg = str(args.get("since") or "")
-        # prompt_id: exact match against the first-class prompt_id field.
+        # prompt_id: exact match against the first-class prompt_id column.
         prompt_id_arg = args.get("prompt_id")
         # text/query: Unicode-aware case-insensitive full-record substring search.
         # Accept "query" as an alias for "text"; "text" takes precedence.
@@ -222,7 +219,7 @@ class LogQueryTools:
         # When text/query or prompt_id is given and the caller did NOT supply a
         # non-null ``trace`` value, the scope auto-widens to all traces so that
         # startup records (no trace or a different trace) or a specific prompt's
-        # records are surfaced.  An explicit non-null trace always overrides
+        # records are surfaced. An explicit non-null trace always overrides
         # this; JSON null is treated as unset because LLM function calls may
         # emit it for omitted optional parameters.
         trace_val = args.get("trace")
@@ -244,20 +241,16 @@ class LogQueryTools:
             prompt_id_arg or "-", limit,
         )
 
-        path = self._owner._log_jsonl_path
-        if not path or not os.path.exists(path):
+        path = self._owner._log_store_path
+        if not path:
             return self._log_query_result([], 0, False)
 
-        # Bounded tail read: never scan more than the trailing window even if the
-        # active log has grown large within the day (before rotation).
         try:
-            lines, window_saturated = _read_tail_lines(
-                path, _LOG_QUERY_TAIL_BYTES, _LOG_QUERY_MAX_SCAN_LINES
-            )
-        except OSError as exc:
-            logger.warning("log_query: cannot read log sink %s: %s", path, exc)
+            conn = connect_store(path)
+            conn.execute("PRAGMA busy_timeout = 3000")
+        except (OSError, sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            logger.warning("log_query: cannot open log store %s: %s", path, exc)
             return self._log_query_result([], 0, False)
-        scanned_lines = len(lines)
 
         filters = LogQueryFilters(
             trace=trace,
@@ -271,18 +264,35 @@ class LogQueryTools:
             text=text_arg,
             use_default_view=use_default_view,
         )
-        matched = filter_log_lines(lines, filters)
+        where, params = _log_query_compile_where(filters)
 
-        total_matched = len(matched)
+        try:
+            total_matched = conn.execute(
+                f"SELECT COUNT(*) FROM events WHERE {where}", params
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT * FROM events WHERE {where}
+                    ORDER BY ts DESC, id DESC LIMIT ?
+                ) ORDER BY ts ASC, id ASC
+                """,
+                params + [limit],
+            ).fetchall()
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning("log_query: query failed for store %s: %s", path, exc)
+            return self._log_query_result([], 0, False)
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+        records = [row_to_record(row) for row in rows]
         truncated = total_matched > limit
-        out_records = matched[-limit:] if truncated else matched
-        return self._log_query_result(
-            out_records, total_matched, truncated,
-            window_saturated=window_saturated, scanned_lines=scanned_lines,
-        )
+        return self._log_query_result(records, total_matched, truncated)
 
-    def _log_query_result(self, records: list, total_matched: int, truncated: bool,
-                          *, window_saturated: bool = False, scanned_lines: int = 0) -> dict:
+    def _log_query_result(self, records: list, total_matched: int, truncated: bool) -> dict:
         """Render a log_query payload using the peer result-dict convention.
 
         Records are projected (over-long field values truncated) and only the
@@ -292,10 +302,9 @@ class LogQueryTools:
         truncated, total_matched) are preserved; ``truncated`` also reflects any
         size cap. The newest record is always kept even if it alone is large.
 
-        ``window_saturated``/``scanned_lines`` disclose the recent-window scope:
-        ``total_matched`` counts matches only within the ``scanned_lines`` lines
-        of the scanned tail, and when ``window_saturated`` is True older records
-        fell outside that window (so it is a recent-window lower bound).
+        ``total_matched`` is exact across the full retention window (30 days)
+        thanks to the ``COUNT(*)`` query; there are no window-saturation or
+        scanned-line counters.
         """
         projected = [_log_query_project(rec) for rec in records]
         # Single pass newest→oldest: keep records until the serialized size would
@@ -314,8 +323,6 @@ class LogQueryTools:
             "count": len(kept),
             "truncated": truncated,
             "total_matched": total_matched,
-            "window_saturated": window_saturated,
-            "scanned_lines": scanned_lines,
         }
         return {
             "success": True,
@@ -325,3 +332,5 @@ class LogQueryTools:
             "error_type": "",
             "recoverable": True,
         }
+
+

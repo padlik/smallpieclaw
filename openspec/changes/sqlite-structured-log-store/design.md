@@ -61,9 +61,9 @@ Field mapping from the current JSONL record: `ts`, `level`, `logger`, `agent`, `
 
 *Alternative rejected:* one column per known operational field — schema churn every time a call site adds a field; the JSONL record shape already treats these as open.
 
-### D3: Write path — QueueHandler → QueueListener single writer, WAL
+### D3: Write path — SQLiteQueueHandler → bounded queue → SqliteLogWriter, WAL
 
-The structlog chain is untouched. The structured sink handler becomes a `logging.QueueHandler` feeding a `queue.Queue`; a `QueueListener` on a daemon thread owns the only connection and performs batched INSERTs in short transactions. Rationale:
+The structlog chain is untouched. The structured sink handler is `SQLiteQueueHandler`, which formats the structlog-rendered JSON record back to a dict and enqueues it into a bounded `queue.Queue`; a bespoke `SqliteLogWriter` daemon thread owns the only connection and performs batched INSERTs in short transactions. This deviates deliberately from the stdlib queue-listener pattern: the stdlib approach re-emits stdlib `LogRecord` objects to registered handlers, whereas this writer needs dict payloads, batched transactional INSERTs, startup `PRAGMA quick_check`, 30-day retention, and drop-oldest overflow accounting — hence a purpose-built writer with graceful drain-on-stop semantics (queue fully consumed before the thread exits). Rationale:
 
 - **Multi-writer safety**: react loop, sub-agents (pool threads), scheduler, Telegram callbacks all log; the queue serializes them so no SQLite locking can surface in the hot loop.
 - **Hot-path latency**: enqueue is a `queue.put` — cheaper than the current file append.
@@ -115,7 +115,7 @@ flowchart LR
         RC["react_loop / scheduler / telegram\n(stdlib + structlog call sites)"]
         CH["structlog processor chain\n(contextvars identity, redaction)"]
         Q["queue.Queue\n(bounded, drop-oldest)"]
-        W["writer thread\n(QueueListener, sqlite3)"]
+        W["writer thread\n(SqliteLogWriter, sqlite3)"]
         LQ["log_query tool\n(LogQueryFilters → SQL)"]
     end
     subgraph logdir["XDG logs dir ~/.local/state/agent/logs/"]
@@ -162,7 +162,7 @@ sequenceDiagram
 ## Risks / Trade-offs
 
 - [Writer thread dies silently → structured logs stop while prose continues] -> The writer catches all exceptions per batch, retries once, then re-opens the connection; on repeated failure it emits WARNING to the prose sink (which flows even if the store is down) and keeps the queue draining.
-- [Kill -9 loses queued records] -> Accepted: bounded queue, same loss order as a truncated JSONL line; WAL replays all committed transactions. Graceful shutdown drains via `QueueListener.stop()`.
+- [Kill -9 loses queued records] -> Accepted: bounded queue, same loss order as a truncated JSONL line; WAL replays all committed transactions. Graceful shutdown drains via `SqliteLogWriter` stop (queue fully consumed before thread exit).
 - [Backup procedure changes; users who copy only the .sqlite lose recent WAL data] -> Documented in README; retention checkpoint (`wal_checkpoint(TRUNCATE)`) runs daily so the window of risk is bounded.
 - [DB corruption (disk full, bit rot) bricks both write AND query, unlike split files] -> Mitigated by WAL integrity guarantees + a startup `PRAGMA quick_check`; on failure the agent falls back to prose-only operation (structured sink disabled, WARNING emitted) rather than crashing — the react loop never depends on the store.
 - [Grep/jq habits over agent.jsonl break] -> Replaced by `sqlite3` CLI one-liners; documented migration examples in README.

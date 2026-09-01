@@ -168,7 +168,7 @@ def make_builtin_executor(tmp_path):
       ``max_subagents``, ``subagent_result_timeout``, ``agent_name`` ->
       matching ``AgentConfig`` fields.
     * ``data_dir``, ``state_home``, ``workspace_dir``, ``tmp_dir``,
-      ``skills_dir``, ``vault_path``, ``log_jsonl_path``,
+      ``skills_dir``, ``vault_path``, ``log_store_path``,
       ``nsjail_session_tmpdir``, ``nsjail_trusted_dirs_path``,
       ``nsjail_agent_dir``, ``vault_secrets`` -> matching ``ExecutorPaths``
       fields.
@@ -198,7 +198,7 @@ def make_builtin_executor(tmp_path):
     _PATHS_FIELDS: set[str] = {
         "tmp_dir", "downloads_dir", "workspace_dir", "log_file",
         "log_backup_count", "data_dir", "state_home", "skills_dir",
-        "vault_path", "log_jsonl_path", "nsjail_session_tmpdir",
+        "vault_path", "log_store_path", "nsjail_session_tmpdir",
         "nsjail_trusted_dirs_path", "nsjail_agent_dir", "vault_secrets",
     }
     # Collaborators passed straight through to BuiltinExecutor.

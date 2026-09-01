@@ -50,7 +50,7 @@ CREATE INDEX idx_event_type ON events(event_type) WHERE event_type IS NOT NULL;
 
 ## Cross-Module Data Flows
 
-1. **Write path:** `react_loop.py` / `agent_controller.py` / scheduler / sub-agents / Telegram handlers → `log_event()` / plain `logger.*` (unchanged) → structlog processor chain → `QueueHandler` → `QueueListener` single writer thread → `sqlite3` INSERT (WAL, batched commit).
+1. **Write path:** `react_loop.py` / `agent_controller.py` / scheduler / sub-agents / Telegram handlers → `log_event()` / plain `logger.*` (unchanged) → structlog processor chain → `SQLiteQueueHandler` → bounded `queue.Queue` → `SqliteLogWriter` daemon thread → `sqlite3` INSERT (WAL, batched commit).
 2. **Read path:** `builtin_tools/secrets_log.py` `LogQueryTools._exec_log_query()` → SQL SELECT with WHERE clauses built from `LogQueryFilters` → projection/truncation → JSON payload to agent.
 3. **Context binding:** `bind_run_context()` (trace/agent/prompt_id) unchanged; merged via structlog contextvars at write time.
 4. **Retention:** startup or periodic `DELETE FROM events WHERE ts < cutoff` (30 days) replaces gzip rotation + 30-backup prune.

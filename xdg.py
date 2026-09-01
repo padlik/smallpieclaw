@@ -39,7 +39,7 @@ class XDGPaths:
     mcp_tokens_dir: Path
     logs_dir: Path
     log_file: Path
-    log_jsonl: Path
+    log_store: Path
     skills_dir: Path
     scheduler_state: Path
     scheduler_commands: Path
@@ -90,7 +90,7 @@ def xdg_paths(agent_name: str) -> XDGPaths:
         mcp_tokens_dir=state_home / "mcp_tokens",
         logs_dir=logs_dir,
         log_file=logs_dir / "agent.log",
-        log_jsonl=logs_dir / "agent.jsonl",
+        log_store=logs_dir / "agent_logs.sqlite",
         skills_dir=state_home / "skills",
         scheduler_state=state_home / "scheduler_state.json",
         scheduler_commands=state_home / "scheduler_commands.json",

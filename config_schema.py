@@ -486,7 +486,7 @@ class ExecutorPaths:
     state_home: str = ""
     skills_dir: str = ""
     vault_path: str = ""
-    log_jsonl_path: str = ""
+    log_store_path: str = ""
     nsjail_session_tmpdir: str = ""
     nsjail_trusted_dirs_path: str = ""
     nsjail_agent_dir: str = ""

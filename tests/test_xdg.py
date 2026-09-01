@@ -31,7 +31,7 @@ class TestXdgPathsDefaults:
         assert paths.mcp_tokens_dir == paths.state_home / "mcp_tokens"
         assert paths.logs_dir == paths.state_home / "logs"
         assert paths.log_file == paths.logs_dir / "agent.log"
-        assert paths.log_jsonl == paths.logs_dir / "agent.jsonl"
+        assert paths.log_store == paths.logs_dir / "agent_logs.sqlite"
         assert paths.skills_dir == paths.state_home / "skills"
         assert paths.scheduler_state == paths.state_home / "scheduler_state.json"
         assert paths.scheduler_commands == paths.state_home / "scheduler_commands.json"

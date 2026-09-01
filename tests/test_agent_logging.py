@@ -3,25 +3,27 @@
 Covers:
 - XDG log path resolution via xdg_paths().
 - The shared processor chain: contextvars identity merge, secret redaction,
-  and the JSONL render shape.
+  and the SQLite structured render shape.
 - LogEvent taxonomy emission with structured fields.
 
 An autouse fixture snapshots and restores the root logger's handlers (plus the
-isolated ``graph_memory`` component logger's handlers and propagate flag) and
-resets structlog after each test so configuring logging here does not leak into
-the rest of the suite.
+isolated ``graph_memory`` component logger's handlers and propagate flag),
+drains the active SQLite writer, and resets structlog after each test so
+configuring logging here does not leak into the rest of the suite.
 """
 
 import io
 import json
 import logging
 import logging.handlers
+import sqlite3
 import threading
 
 import pytest
 import structlog
 
 import agent_logging as al
+import sqlite_log
 from xdg import xdg_paths
 
 
@@ -35,6 +37,7 @@ def _isolate_logging():
     saved_gm_propagate = gm.propagate
     structlog.contextvars.clear_contextvars()
     yield
+    al.shutdown_log_store()
     for handler in root.handlers[:]:
         root.removeHandler(handler)
     for handler in saved_handlers:
@@ -55,11 +58,29 @@ def _read(path: str) -> str:
         return f.read()
 
 
-def _last_json(path: str) -> dict:
-    return json.loads(_read(path).strip().splitlines()[-1])
+def _last_row(db_path: str) -> dict:
+    """Return the most recently inserted structured record (wide cols + extra).
+
+    Mirrors the previous JSONL shape: columns with ``None`` values are omitted.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    assert row is not None, f"no rows in {db_path}"
+    obj = {k: v for k, v in dict(row).items() if v is not None}
+    extra = json.loads(obj.pop("extra"))
+    obj.update(extra)
+    return obj
 
 
 def _flush() -> None:
+    writer = sqlite_log._active_writer
+    if writer is not None:
+        writer.flush()
     for handler in logging.getLogger().handlers:
         handler.flush()
     for handler in logging.getLogger("graph_memory").handlers:
@@ -88,7 +109,7 @@ class TestXdgPathResolution:
 class TestProcessorChain:
     def test_dual_sink_identity_and_json_shape(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
-        json_file = al.setup_logging(log_file, backup_count=2, secret_values=["S3CR3T"])
+        db_path = al.setup_logging(log_file, backup_count=2, secret_values=["S3CR3T"])
         al.bind_run_context(trace="r-1", agent="sa-9")
         al.log_event(
             al.LogEvent.TOOL_END, "done",
@@ -96,7 +117,7 @@ class TestProcessorChain:
         )
         _flush()
 
-        obj = _last_json(json_file)
+        obj = _last_row(db_path)
         assert {"ts", "level", "logger", "msg"} <= set(obj)
         assert obj["trace"] == "r-1" and obj["agent"] == "sa-9"
         assert obj["event_type"] == "TOOL_END"
@@ -107,27 +128,28 @@ class TestProcessorChain:
 
     def test_secret_redacted_from_both_sinks(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
-        json_file = al.setup_logging(log_file, secret_values=["TOPSECRET"])
+        db_path = al.setup_logging(log_file, secret_values=["TOPSECRET"])
         logging.getLogger("x").warning("leak TOPSECRET here")  # foreign stdlib record
         _flush()
-        assert "TOPSECRET" not in _read(json_file)
+        obj = _last_row(db_path)
+        assert "TOPSECRET" not in obj.get("msg", "")
         assert "TOPSECRET" not in _read(log_file)
 
     def test_foreign_record_gets_identity(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
-        json_file = al.setup_logging(log_file)
+        db_path = al.setup_logging(log_file)
         al.bind_run_context(trace="r-42", agent="main")
         logging.getLogger("foreign").info("hello from stdlib")
         _flush()
-        obj = _last_json(json_file)
+        obj = _last_row(db_path)
         assert obj["trace"] == "r-42" and obj["agent"] == "main"
 
     def test_missing_run_context_is_graceful(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
-        json_file = al.setup_logging(log_file)
+        db_path = al.setup_logging(log_file)
         logging.getLogger("nobody").info("no identity bound")
         _flush()
-        obj = _last_json(json_file)
+        obj = _last_row(db_path)
         assert "trace" not in obj and "agent" not in obj
 
 
@@ -138,13 +160,13 @@ class TestLogEventTaxonomy:
             assert str(event) == event.value
 
     def test_emit_sets_event_type_and_level(self, tmp_path):
-        json_file = al.setup_logging(str(tmp_path / "agent.log"))
+        db_path = al.setup_logging(str(tmp_path / "agent.log"))
         al.log_event(
             al.LogEvent.TOOL_FAILED, "boom", level=logging.ERROR,
             logger=al.get_logger("t"), tool="git", exit=1, dur_ms=7, err="nope",
         )
         _flush()
-        obj = _last_json(json_file)
+        obj = _last_row(db_path)
         assert obj["event_type"] == "TOOL_FAILED"
         assert obj["level"] == "error"
         assert obj["tool"] == "git" and obj["exit"] == 1 and obj["dur_ms"] == 7
@@ -156,7 +178,7 @@ class TestGraphMemoryRouting:
 
     def test_records_routed_to_dedicated_sink_only(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
-        json_file = al.setup_logging(log_file)  # gm path derives from log_file dir
+        db_path = al.setup_logging(log_file)  # gm path derives from log_file dir
         gm_log = str(tmp_path / "graph_memory.log")
         logging.getLogger("graph_memory").info("gm info")
         logging.getLogger("graph_memory").warning("gm warn")
@@ -170,8 +192,8 @@ class TestGraphMemoryRouting:
         prose = _read(log_file)
         assert "gm" not in prose
         assert "other msg" in prose
-        assert "gm" not in _read(json_file)
-        assert "other msg" in _read(json_file)
+        assert "gm" not in _last_row(db_path).get("msg", "")
+        assert "other msg" in _last_row(db_path).get("msg", "")
 
     def test_console_split_info_file_only_warning_on_console(self, tmp_path):
         stream = io.StringIO()
@@ -202,17 +224,25 @@ class TestGraphMemoryRouting:
         assert file_handlers[0].backupCount == 7
 
     def test_routing_independent_of_component_enablement(self, tmp_path):
-        json_file = al.setup_logging(str(tmp_path / "agent.log"))
+        db_path = al.setup_logging(str(tmp_path / "agent.log"))
         gm = logging.getLogger("graph_memory")
         assert gm.propagate is False
         assert gm.handlers
         gm.info("disabled component notice")
         _flush()
-        assert "disabled component notice" not in _read(json_file)
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE msg = ?", ("disabled component notice",)
+            )
+            count = cur.fetchone()[0]
+        finally:
+            conn.close()
+        assert count == 0
 
     def test_worker_thread_records_carry_no_run_identity(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
-        json_file = al.setup_logging(log_file)
+        db_path = al.setup_logging(log_file)
         al.bind_run_context(trace="r-1", agent="main")
 
         def emit():
@@ -232,7 +262,7 @@ class TestGraphMemoryRouting:
         # Contrast: a foreign record on the bound (main) thread does carry it.
         logging.getLogger("foreign").info("foreign msg")
         _flush()
-        obj = _last_json(json_file)
+        obj = _last_row(db_path)
         assert obj["trace"] == "r-1" and obj["agent"] == "main"
 
     def test_backfill_cli_propagate_true_without_setup_logging(self):
@@ -307,6 +337,9 @@ class TestBuiltinExecutorLifecycle:
             ex.confirm("tok")
         assert [event for event, _ in captured] == [al.LogEvent.TOOL_FAILED]
         assert all(event is not al.LogEvent.ERROR for event, _ in captured)
+
+
+class TestLLMFailedLifecycle:
     """Real ``LLMClient.chat`` failure path emits exactly one LLM_FAILED.
 
     Covers spec scenario "LLM failure is recorded exactly once" through the
