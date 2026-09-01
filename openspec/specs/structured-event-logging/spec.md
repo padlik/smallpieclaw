@@ -2,28 +2,28 @@
 
 ## Purpose
 
-Define the structured-primary dual-sink logging behaviour: a machine-readable JSONL event stream (`agent.jsonl`, primary) written alongside the human prose log (`agent.log`, secondary) from one processor chain, carrying structured run identity, a closed event taxonomy, and secret redaction.
+Define the structured-primary dual-sink logging behaviour: a machine-readable SQLite log store (`agent_logs.sqlite`, primary — storage mechanics governed by the `sqlite-log-store` capability) written alongside the human prose log (`agent.log`, secondary) from one processor chain, carrying structured run identity, a closed event taxonomy, and secret redaction.
 
 ## Requirements
 
 ### Requirement: Structured JSONL event sink
 
-The application MUST write a machine-readable structured log to `agent.jsonl` alongside the human prose `agent.log`, with one JSON object per line. Both sinks are written from the same log record so their content never drifts.
+The application MUST write a machine-readable structured log to the SQLite store (`agent_logs.sqlite`, see the `sqlite-log-store` capability for storage mechanics) alongside the human prose `agent.log`. Both sinks are written from the same log record so their content never drift.
 
 Feature: Structured event logging
-Rule: `agent.jsonl` is the primary machine surface; `agent.log` is the retained secondary human surface. Every record emitted to one is emitted to the other — with the exception of components under component log isolation (see the component log isolation requirement), whose records route to their dedicated component log instead.
+Rule: The SQLite store is the primary machine surface; `agent.log` is the retained secondary human surface. Every record emitted to one is emitted to the other — with the exception of components under component log isolation (see the component log isolation requirement), whose records route to their dedicated component log instead. The structured stream is no longer gzip-rotated; retention is time-based DELETE (see the `sqlite-log-store` capability).
 
 #### Scenario: A log record is written to both sinks
 - **GIVEN** the logging system is configured
 - **WHEN** any component not subject to component log isolation emits a log record
 - **THEN** a prose line is appended to `agent.log`
-- **AND** a single JSON object encoding the same record is appended to `agent.jsonl`
-- **AND** the JSON object contains at least `ts`, `level`, `logger`, and `msg` fields
+- **AND** the same record is stored as a row in `agent_logs.sqlite`
+- **AND** the stored record contains at least `ts`, `level`, `logger`, and `msg` fields
 
 #### Scenario: JSONL line is independently parseable
-- **GIVEN** a record has been written to `agent.jsonl`
-- **WHEN** a reader parses any single line as JSON
-- **THEN** parsing succeeds without depending on any other line
+- **GIVEN** a record has been written to the SQLite store
+- **WHEN** a reader retrieves that record's row and parses its fields (including the `extra` JSON)
+- **THEN** parsing succeeds without depending on any other row
 
 ### Requirement: Structured run identity on every record
 
@@ -34,7 +34,7 @@ Rule: Identity is ambient logging context (observability), sourced from context-
 #### Scenario: Identity appears as JSON fields
 - **GIVEN** a run with trace id `r-9f3c` executing under agent label `sa-1a2b` with prompt id 7
 - **WHEN** that run emits a log record
-- **THEN** the `agent.jsonl` object includes `trace = "r-9f3c"`, `agent = "sa-1a2b"`, and `prompt_id = 7` as fields
+- **THEN** the stored record includes `trace = "r-9f3c"`, `agent = "sa-1a2b"`, and `prompt_id = 7` as fields
 - **AND** the `agent.log` line still renders the human prefix `[sa-1a2b r-9f3c]`
 
 #### Scenario: Identity present without a manually threaded prefix
@@ -45,7 +45,7 @@ Rule: Identity is ambient logging context (observability), sourced from context-
 #### Scenario: Sub-agent logs inherit the parent prompt id
 - **GIVEN** a sub-agent spawned during prompt #7 runs on a pool thread
 - **WHEN** the sub-agent's supervisor calls `bind_run_context` before `runner.run(task)`
-- **THEN** the sub-agent's log records carry `prompt_id = 7`
+- **THEN** the sub-agent's stored records carry `prompt_id = 7`
 - **AND** the sub-agent's records are correlatable with the main agent's records by `prompt_id`
 
 #### Scenario: Missing run context degrades gracefully
@@ -115,27 +115,27 @@ Rule: Redaction sources known values from the agent-scoped vault and runs at the
 - **GIVEN** a vault entry whose value is `S3CR3T`
 - **AND** a log record whose `err` field contains `S3CR3T`
 - **WHEN** the record is written
-- **THEN** the `agent.jsonl` `err` field does not contain `S3CR3T`
+- **THEN** the stored record's `err` field does not contain `S3CR3T`
 - **AND** the `agent.log` line does not contain `S3CR3T`
 
 ### Requirement: Component log isolation for optional background components
 
-The application MUST route log records emitted by the optional background graph-memory component (logger name `graph_memory`) to a dedicated `graph_memory.log` file under the agent's XDG logs directory instead of the primary `agent.jsonl` / `agent.log` sinks. The component log MUST use the same daily gzip rotation and retention policy as the primary sinks. Console (stdout) output for this component MUST be limited to WARNING+ — INFO and DEBUG records are file-only.
+The application MUST route log records emitted by the optional background graph-memory component (logger name `graph_memory`) to a dedicated `graph_memory.log` file under the agent's XDG logs directory instead of the primary SQLite store / `agent.log` sinks. The component log MUST use the same daily gzip rotation and retention policy as the prose sink. Console (stdout) output for this component MUST be limited to WARNING+ — INFO and DEBUG records are file-only.
 
 Feature: Structured event logging
-Rule: Optional background components are operationally isolated. Their diagnostics are fire-and-forget enrichment, not run-scoped work: no trace/agent identity is bound for these records and no structured `event_type` events are emitted for them. Routing is static configuration of the `graph_memory` logger (propagation disabled, dedicated handlers) and is independent of whether graph memory is enabled in config. The one-time `backfill_graph_memory.py` CLI is unaffected — it configures its own logging and never touches the primary sinks. `agent.jsonl` remains purely agent lifecycle — tool, LLM, step, and run events plus non-component diagnostics; component records never reach it.
+Rule: Optional background components are operationally isolated. Their diagnostics are fire-and-forget enrichment, not run-scoped work: no trace/agent identity is bound for these records and no structured `event_type` events are emitted for them. Routing is static configuration of the `graph_memory` logger (propagation disabled, dedicated handlers) and is independent of whether graph memory is enabled in config. The one-time `backfill_graph_memory.py` CLI is unaffected — it configures its own logging and never touches the primary sinks. The structured store remains purely agent lifecycle — tool, LLM, step, and run events plus non-component diagnostics; component records never reach it. The `log-store-backfill` capability's CLI (`backfill_log_store.py`) is a distinct program and equally unaffected by this routing.
 
 #### Scenario: Graph-memory records do not appear in the primary sinks
 - **GIVEN** logging is configured for the agent
 - **WHEN** the graph-memory component emits any record (e.g. store initialisation, batch processing, health warnings)
 - **THEN** the record is appended to `graph_memory.log`
-- **AND** no record from the `graph_memory` logger appears in `agent.jsonl` or `agent.log`
+- **AND** no record from the `graph_memory` logger appears in the structured store or `agent.log`
 
 #### Scenario: Graph-memory log uses the shared rotation policy
 - **GIVEN** logging is configured with daily gzip rotation and a backup count
 - **WHEN** `graph_memory.log` rotates at midnight
 - **THEN** the rotated backup is gzip-compressed with a date suffix
-- **AND** retention prunes backups using the same backup count as the primary sinks
+- **AND** retention prunes backups using the same backup count as the prose sink
 
 #### Scenario: Console shows only graph-memory warnings and errors
 - **GIVEN** logging is configured with stdout output
@@ -153,7 +153,7 @@ Rule: Optional background components are operationally isolated. Their diagnosti
 - **GIVEN** graph memory is disabled in config
 - **WHEN** logging is set up
 - **THEN** the `graph_memory` logger is still routed to `graph_memory.log`
-- **AND** any incidental records from the module (e.g. the disabled notice) do not reach `agent.jsonl`
+- **AND** any incidental records from the module (e.g. the disabled notice) do not reach the structured store
 
 #### Scenario: Backfill CLI is unaffected
 - **GIVEN** `backfill_graph_memory.py` runs as a standalone CLI with its own `logging.basicConfig`
