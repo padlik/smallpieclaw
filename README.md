@@ -121,7 +121,7 @@ source .venv/bin/activate
 python main.py
 ```
 
-On first run the agent creates `data/` and `downloads/`. Logs go to `~/.local/state/<agent_name>/logs/` — human-readable `agent.log` plus structured `agent.jsonl` (daily gzip rotation, 30 backups), plus `graph_memory.log` (component log for the optional graph-memory feature).
+On first run the agent creates `data/` and `downloads/`. Logs go to `~/.local/state/<agent_name>/logs/` — structured `agent_logs.sqlite` (SQLite WAL, indexed, 30-day retention), human-readable `agent.log` (daily gzip rotation, 30 backups), plus `graph_memory.log` (component log for the optional graph-memory feature).
 
 > **Upgrading from a prior version?** The hand-written tool system (`tools/`, `tools_generated/`, `create_tool` action) has been removed. These directories are no longer scanned. You can safely delete them: `rm -rf tools/ tools_generated/`. Any `tools_dir` or `generated_tools_dir` keys in your `config.toml` are now silently ignored.
 
@@ -591,11 +591,13 @@ When `checkpoint_enabled = false`, inline retry still works (in-memory state), b
 
 Logs live under the XDG state directory `~/.local/state/<agent_name>/logs/`, resolved from `agent_name` independently of `agent_home` (a relative `[paths] log_file` lands here; an absolute path overrides). Logging is built on [`structlog`](https://www.structlog.org) integrated with stdlib, writing the two agent sinks from one processor chain so they never drift (plus an isolated component log for the optional graph-memory feature):
 
-- **`agent.jsonl`** — structured JSON-per-line, the **primary** machine-readable surface. Each event carries identity fields (`trace` and `agent`, the run label), a `level`, and an `event_type` from a closed taxonomy (`TOOL_START/END/FAILED`, `LLM_CALL/FAILED`, `STEP_BEGIN/END`, `RUN_BEGIN/END`, `ERROR`) plus key-values (`tool`, `dur_ms`, `exit`, `err`).
+- **`agent_logs.sqlite`** — structured SQLite store (WAL mode, indexed), the **primary** machine-readable surface. Each event carries identity fields (`trace` and `agent`, the run label), a `level`, and an `event_type` from a closed taxonomy (`TOOL_START/END/FAILED`, `LLM_CALL/FAILED`, `STEP_BEGIN/END`, `RUN_BEGIN/END`, `ERROR`) plus key-values (`tool`, `dur_ms`, `exit`, `err`). The store keeps 30 days of events via time-based `DELETE` retention and a daily `PRAGMA wal_checkpoint(TRUNCATE)`.
 - **`agent.log`** — human-readable prose (secondary), keeping the familiar `[label trace] message` shape for `tail -f`/`grep`.
-- **`graph_memory.log`** — dedicated prose sink for the optional graph-memory background component; isolated from the agent sinks, daily gzip rotation like the others, stdout shows only WARNING+ for this component.
+- **`graph_memory.log`** — dedicated prose sink for the optional graph-memory background component; isolated from the agent sinks, daily gzip rotation like `agent.log`, stdout shows only WARNING+ for this component.
 
-All rotate daily with date-suffixed, gzip-compressed backups (30 kept, `log_backup_count`); known vault secret values are redacted from all of them before serialization. The agent can introspect its own run mid-execution with the **`log_query`** built-in tool — an in-process filter over the active `agent.jsonl`, trace-scoped to the current run by default.
+`agent.jsonl` is no longer written. Existing `agent.jsonl` and `agent.jsonl.*.gz` archive files remain on disk untouched as a forensic fallback.
+
+Known vault secret values are redacted from all sinks before serialization. The agent can introspect its own run mid-execution with the **`log_query`** built-in tool — an in-process SQL query over the full 30-day store, trace-scoped to the current run by default.
 
 Every line carries a source tag for unambiguous filtering:
 
@@ -609,7 +611,28 @@ Every line carries a source tag for unambiguous filtering:
 ```bash
 # Follow a single sub-agent
 grep '\[sa-fcf85d\]' ~/.local/state/<agent_name>/logs/agent.log
+
+# Recent errors across the full retention window
+sqlite3 ~/.local/state/<agent_name>/logs/agent_logs.sqlite "SELECT ts, agent, msg FROM events WHERE level IN ('error','critical') ORDER BY ts DESC LIMIT 20;"
+
+# All records for a trace
+sqlite3 ~/.local/state/<agent_name>/logs/agent_logs.sqlite "SELECT ts, event_type, msg, extra FROM events WHERE trace='r-1a2b3c4d' ORDER BY ts;"
+
+# Tool failures
+sqlite3 ~/.local/state/<agent_name>/logs/agent_logs.sqlite "SELECT ts, msg, extra FROM events WHERE event_type='TOOL_FAILED' ORDER BY ts DESC;"
 ```
+
+Back up the store by copying `agent_logs.sqlite` together with `agent_logs.sqlite-wal` (and `-shm`), or run `PRAGMA wal_checkpoint(TRUNCATE);` first and then copy the single file.
+
+One-time backfill from existing JSONL archives:
+
+```bash
+python backfill_log_store.py --agent-name <name> --dry-run   # count entries
+python backfill_log_store.py --agent-name <name>             # import
+python backfill_log_store.py --agent-name <name> --verbose
+```
+
+Backfill is idempotent: re-running it skips already-imported lines. Source archives are never modified.
 
 File storage defaults (override in `[paths]`):
 

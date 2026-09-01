@@ -102,6 +102,7 @@ from agent_logging import (  # noqa: E402
     clear_run_context,
     get_logger,
     log_event,
+    shutdown_log_store,
 )
 LogEvent
 setup_bootstrap
@@ -111,6 +112,39 @@ reset_run_context
 clear_run_context
 get_logger
 log_event
+shutdown_log_store
+
+# sqlite_log.py — SQLite structured log store public API
+from sqlite_log import (  # noqa: E402
+    DEFAULT_STORE_FILENAME,
+    record_to_row,
+    connect_store,
+    SQLiteQueueHandler,
+    SqliteLogWriter,
+    set_active_writer,
+    shutdown_log_store as _sqlite_shutdown_log_store,
+    WIDE_COLUMNS,
+    SCHEMA_DDL,
+    INSERT_EVENT_SQL,
+    row_to_record,
+)
+DEFAULT_STORE_FILENAME
+record_to_row
+connect_store
+SQLiteQueueHandler
+SqliteLogWriter
+SqliteLogWriter.start
+SqliteLogWriter.stop
+SqliteLogWriter.flush
+SqliteLogWriter.enqueue
+SqliteLogWriter.disabled
+SqliteLogWriter.dropped
+set_active_writer
+_sqlite_shutdown_log_store
+WIDE_COLUMNS
+SCHEMA_DDL
+INSERT_EVENT_SQL
+row_to_record
 
 # graph_memory.py — backfill public API
 from graph_memory import (  # noqa: E402

@@ -2,13 +2,14 @@
 
 These tests verify that the run entry points (main agent and sub-agent
 supervisor) call ``bind_run_context`` with the correct ``prompt_id`` so every
-log line carries the operator-facing prompt handle.
+log record carries the operator-facing prompt handle in the SQLite store.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -16,11 +17,12 @@ import pytest
 import structlog
 
 import agent_logging as al
+import sqlite_log
 
 
 @pytest.fixture(autouse=True)
 def _reset_logging(tmp_path):
-    """Use a fresh JSONL sink and clear structlog context for each test."""
+    """Use a fresh SQLite store and clear structlog context for each test."""
     root = logging.getLogger()
     saved_handlers = root.handlers[:]
     saved_level = root.level
@@ -28,10 +30,11 @@ def _reset_logging(tmp_path):
         root.removeHandler(handler)
     structlog.contextvars.clear_contextvars()
 
-    json_file = al.setup_logging(str(tmp_path / "agent.log"), backup_count=1)
+    db_path = al.setup_logging(str(tmp_path / "agent.log"), backup_count=1)
 
-    yield tmp_path, json_file
+    yield tmp_path, db_path
 
+    al.shutdown_log_store()
     for handler in root.handlers[:]:
         root.removeHandler(handler)
     for handler in saved_handlers:
@@ -41,21 +44,36 @@ def _reset_logging(tmp_path):
     structlog.reset_defaults()
 
 
-def _last_json(json_file: str) -> dict:
-    with open(json_file, encoding="utf-8") as f:
-        return json.loads(f.read().strip().splitlines()[-1])
+def _last_row(db_path: str) -> dict:
+    """Return the most recently inserted structured record (wide cols + extra).
+
+    Mirrors the previous JSONL shape: columns with ``None`` values are omitted.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    assert row is not None, f"no rows in {db_path}"
+    obj = {k: v for k, v in dict(row).items() if v is not None}
+    extra = json.loads(obj.pop("extra"))
+    obj.update(extra)
+    return obj
 
 
 def _flush() -> None:
-    for handler in logging.getLogger().handlers:
-        handler.flush()
+    writer = sqlite_log._active_writer
+    if writer is not None:
+        writer.flush()
 
 
 class TestMainAgentPromptIdBinding:
     """AgentController.run() must bind prompt_id into the log context."""
 
     def test_run_calls_bind_run_context_with_prompt_id(self, make_agent_controller):
-        
+
         mock_llm = MagicMock()
         mock_llm._active_idx = 0
         mock_llm._models = []
@@ -206,13 +224,13 @@ class TestSubAgentPromptIdBinding:
 
 
 class TestBindRunContextField:
-    """Directly verify bind_run_context emits prompt_id into JSONL records."""
+    """Directly verify bind_run_context emits prompt_id into SQLite rows."""
 
     def test_prompt_id_appears_as_structured_field(self, tmp_path):
         al.bind_run_context(trace="r-1234", agent="main", prompt_id="01JARYN6R0ABCDEFGHJKMNPQRS")
         logging.getLogger("test").info("hello")
         _flush()
-        obj = _last_json(str(tmp_path / "agent.jsonl"))
+        obj = _last_row(str(tmp_path / "agent_logs.sqlite"))
         assert obj.get("prompt_id") == "01JARYN6R0ABCDEFGHJKMNPQRS"
         assert obj.get("trace") == "r-1234"
         assert obj.get("agent") == "main"
@@ -220,7 +238,7 @@ class TestBindRunContextField:
     def test_unbound_log_has_no_prompt_id(self, tmp_path):
         logging.getLogger("startup").info("boot")
         _flush()
-        obj = _last_json(str(tmp_path / "agent.jsonl"))
+        obj = _last_row(str(tmp_path / "agent_logs.sqlite"))
         assert "prompt_id" not in obj
 
 

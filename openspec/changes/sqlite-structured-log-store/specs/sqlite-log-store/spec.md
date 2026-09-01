@@ -43,7 +43,7 @@ Feature: sqlite-log-store
 
 ### Requirement: Single-writer queue ingestion
 
-All structured records MUST flow through a bounded in-memory queue (`QueueHandler` → `QueueListener`) to one writer thread that owns the only database connection and performs batched INSERTs. The emitting hot path MUST never block on database I/O. On graceful shutdown the queue MUST be drained before exit.
+All structured records MUST flow through a bounded in-memory queue (`SQLiteQueueHandler` → bounded `queue.Queue` → `SqliteLogWriter` daemon thread) to one writer thread that owns the only database connection and performs batched INSERTs. The emitting hot path MUST never block on database I/O. On graceful shutdown the queue MUST be drained before exit.
 
 Feature: sqlite-log-store
 Rule: The queue is bounded; when full, the oldest records are dropped, a dropped counter increments, and a WARNING is emitted to the prose sink.

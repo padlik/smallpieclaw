@@ -1,9 +1,33 @@
 """Tests for session_logs age-based retention cleanup on startup."""
 
+import logging
 import os
 import time
 
+import pytest
+import structlog
+
 from main import _cleanup_old_session_logs
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_bootstrap_logging():
+    """Remove root handlers installed by main.py's module-level setup_bootstrap().
+
+    main.py calls agent_logging.setup_bootstrap() at import time, which installs
+    a StreamHandler(stdout) on the root logger. Without teardown, this handler
+    persists into subsequent test modules and causes timing-dependent failures in
+    tests that rely on the pool thread's logger.info() being a cheap no-op.
+    """
+    yield
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+        try:
+            handler.close()
+        except OSError:
+            pass
+    structlog.reset_defaults()
 
 
 class TestSessionLogsRetention:

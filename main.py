@@ -328,7 +328,7 @@ def _build_executor_paths(
     trusted_dirs_path: str,
     vault_file: str,
     vault_secrets: list[str],
-    json_log_path: str,
+    log_store_path: str,
 ) -> ExecutorPaths:
     """Assemble the runtime filesystem/limit bundle for BuiltinExecutor.
 
@@ -346,7 +346,7 @@ def _build_executor_paths(
         state_home=nsjail_state_dir,
         skills_dir=skills_dir,
         vault_path=vault_file,
-        log_jsonl_path=json_log_path,
+        log_store_path=log_store_path,
         nsjail_session_tmpdir=nsjail_session_tmpdir,
         nsjail_trusted_dirs_path=trusted_dirs_path,
         nsjail_agent_dir=str(Path(__file__).parent.resolve()),
@@ -482,9 +482,9 @@ def _run(
     # Re-initialise logging with the resolved XDG log paths and structlog dual sink.
     # Vault secret values are passed so they are redacted from every log record.
     # The graph-memory component log is routed explicitly (see ADR-0023).
-    json_log_path = agent_logging.setup_logging(
+    log_store_path = agent_logging.setup_logging(
         str(paths.log_file),
-        json_file=str(paths.log_jsonl),
+        db_path=str(paths.log_store),
         graph_memory_log=str(paths.graph_memory_log),
         backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
         secret_values=_read_vault_secrets(str(paths.secrets_file)),
@@ -531,7 +531,7 @@ def _run(
     executor_paths = _build_executor_paths(
         cfg, paths, data_dir, skills_dir_abs, tmp_dir, downloads_dir, workspace_dir,
         nsjail_state_dir, nsjail_session_tmpdir, trusted_dirs_path,
-        vault_file, vault_secrets, json_log_path,
+        vault_file, vault_secrets, log_store_path,
     )
 
     logger.info("Initialising components...")
@@ -852,6 +852,7 @@ def _run(
             mcp_manager.close_all()
             logger.info("MCP servers closed.")
         logger.info("Agent stopped.")
+        agent_logging.shutdown_log_store()
 
 
 if __name__ == "__main__":

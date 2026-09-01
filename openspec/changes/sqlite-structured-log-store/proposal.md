@@ -10,7 +10,7 @@
 - **BREAKING**: `log_query` response contract changes — `window_saturated` and `scanned_lines` fields are removed; `total_matched` becomes exact across the full retention window.
 - New one-time backfill CLI imports existing `agent.jsonl` + `agent.jsonl.*.gz` into the SQLite store. Backfill is additive only — old archive files remain on disk untouched as a forensic fallback.
 - New SQLite-backed querying covers the full 30-day retention: prompt-scoped and trace-scoped queries work across day boundaries; aggregation queries (counts by tool/event/day) become single SQL statements.
-- Structured write path moves from direct file append to a single-writer queue (`QueueHandler` → `QueueListener` → batched INSERT) with WAL mode; run identity binding (`bind_run_context`), the closed `LogEvent` taxonomy, and secret redaction are unchanged.
+- Structured write path moves from direct file append to a single-writer queue (`SQLiteQueueHandler` → bounded queue → `SqliteLogWriter` writer thread, batched INSERT) with WAL mode; run identity binding (`bind_run_context`), the closed `LogEvent` taxonomy, and secret redaction are unchanged.
 - The SQLite store lives in the same XDG logs directory as the current sinks: `~/.local/state/<agent_name>/logs/agent_logs.sqlite`.
 - No new dependencies — stdlib `sqlite3`.
 

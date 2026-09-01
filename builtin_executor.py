@@ -46,10 +46,6 @@ from builtin_tools.context_io import (
 from builtin_tools.context_profile import exec_context_profile
 from builtin_tools.descriptors import BUILTIN_TOOLS, BuiltinTool
 from builtin_tools.files import FileTools
-from builtin_tools.logquery_helpers import (
-    _LOG_QUERY_MAX_SCAN_LINES,  # noqa: F401  re-exported for tests
-    _LOG_QUERY_TAIL_BYTES,  # noqa: F401  re-exported for tests
-)
 from builtin_tools.memory import MemoryTools
 from builtin_tools.patterns import (
     _is_dangerous_shell,  # noqa: F401  re-exported for tests
@@ -173,7 +169,7 @@ class BuiltinExecutor:
         self._subagent_result_timeout = agent_cfg.subagent_result_timeout
         self._notify_html_fn = notify_html_fn  # Optional[Callable[[str], None]] — HTML notify path
         self._vault_path = paths.vault_path  # Path to TOML vault file for secret_get
-        self._log_jsonl_path = paths.log_jsonl_path  # Active JSONL log sink for the log_query built-in
+        self._log_store_path = paths.log_store_path  # Active SQLite log store for the log_query built-in
         self._vault_secrets: list[str] = list(paths.vault_secrets or [])
         self._graph_memory = None   # Optional[GraphMemoryStore] — set by main.py after init
         self._graph_memory_writer = None  # Optional[GraphMemoryWriter] — set by main.py after init

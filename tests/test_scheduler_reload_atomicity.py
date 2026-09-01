@@ -40,7 +40,7 @@ def _paths_for(state_dir) -> XDGPaths:
         mcp_tokens_dir=state_dir / "mcp_tokens",
         logs_dir=logs_dir,
         log_file=logs_dir / "agent.log",
-        log_jsonl=logs_dir / "agent.jsonl",
+        log_store=logs_dir / "agent_logs.sqlite",
         skills_dir=state_dir / "skills",
         scheduler_state=state_dir / "scheduler_state",
         scheduler_commands=state_dir / "scheduler_commands",
