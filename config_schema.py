@@ -490,6 +490,9 @@ class ExecutorPaths:
     nsjail_session_tmpdir: str = ""
     nsjail_trusted_dirs_path: str = ""
     nsjail_agent_dir: str = ""
+    # Agent dot-home results dir (~/.<agent>/results) — run-results exchange
+    # surface for oversized payloads (see path_policy.py Tier 1).
+    results_dir: str = ""
     # vault_secrets is NOT a filesystem path — it is a list of secret key
     # names whose values have been loaded from the vault and whose strings
     # must be redacted from tool output/logs. It lives here alongside paths
