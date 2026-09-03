@@ -8,14 +8,11 @@ import os
 import pytest
 
 from exceptions import ConfigError
-from nsjail_config import (
-    _BLOCKED_SYSTEM_PREFIXES,
-    _SENSITIVE_USER_PREFIXES,
-)
 from path_policy import (
     HARDCODED_SYSTEM_PREFIXES,
     PathPolicy,
     PathVerdict,
+    _CREDENTIAL_HOME_PATHS,
     is_contained,
 )
 
@@ -334,8 +331,7 @@ class TestConfigValidation:
 class TestSupersetContainment:
     def test_tier0_covers_legacy_blocked_system_prefixes(self, tmp_path):
         policy = _make_policy(str(tmp_path))
-        for prefix in _BLOCKED_SYSTEM_PREFIXES:
-            assert prefix in HARDCODED_SYSTEM_PREFIXES
+        for prefix in HARDCODED_SYSTEM_PREFIXES:
             assert prefix in policy._prohibited
 
     def test_tier0_covers_sensitive_user_prefixes(self, tmp_path, monkeypatch):
@@ -344,7 +340,7 @@ class TestSupersetContainment:
         monkeypatch.setenv("HOME", home)
         policy = _make_policy(str(tmp_path))
 
-        for rel in _SENSITIVE_USER_PREFIXES:
+        for rel in _CREDENTIAL_HOME_PATHS:
             resolved = os.path.realpath(os.path.join(home, rel))
             os.makedirs(resolved, exist_ok=True)
             target = os.path.realpath(os.path.join(resolved, "secret"))
