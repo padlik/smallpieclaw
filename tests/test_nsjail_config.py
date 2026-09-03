@@ -7,28 +7,74 @@ requiring a real Linux host or nsjail binary.
 from __future__ import annotations
 
 import json
+import logging
 import os
-import shutil
+import pathlib
 import tempfile
-from unittest.mock import mock_open, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 from nsjail_config import NsjailConfigBuilder
+from path_policy import PathPolicy
+
+
+def _make_policy(
+    tmp_path: str,
+    *,
+    allowed_dirs: list[str] | None = None,
+    prohibited_dirs: list[str] | None = None,
+    logger: logging.Logger | None = None,
+    agent_name: str = "test-agent",
+) -> PathPolicy:
+    """Create a PathPolicy using temp paths and monkeypatched HOME/XDG env."""
+    workspace = os.path.join(tmp_path, "workspace")
+    downloads = os.path.join(tmp_path, "downloads")
+    data_home = os.path.join(tmp_path, "xdg", "data", agent_name)
+    state_home = os.path.join(tmp_path, "xdg", "state", agent_name)
+    config_home = os.path.join(tmp_path, "xdg", "config", agent_name)
+    vault = os.path.join(tmp_path, "vault.toml")
+    config = os.path.join(config_home, "config.toml")
+    skills = os.path.join(tmp_path, "skills")
+    results = os.path.join(tmp_path, "results")
+
+    for d in (workspace, downloads, data_home, state_home, config_home, skills, results):
+        os.makedirs(d, exist_ok=True)
+    with open(vault, "w") as f:
+        f.write("[secrets]\n")
+    with open(config, "w") as f:
+        f.write("\n")
+
+    return PathPolicy.create(
+        agent_name=agent_name,
+        workspace_dir=workspace,
+        downloads_dir=downloads,
+        tmp_dir=f"/tmp/{agent_name}",
+        skills_dir=skills,
+        results_dir=results,
+        data_home=data_home,
+        state_home=state_home,
+        config_home=config_home,
+        vault_path=vault,
+        config_path=config,
+        allowed_dirs=allowed_dirs,
+        prohibited_dirs=prohibited_dirs,
+        logger=logger,
+    )
 
 
 class TestDetectSystemMounts:
     """Tests for _detect_system_mounts() — symlink vs real dir detection."""
 
-    def _make_builder(self) -> NsjailConfigBuilder:
+    def _make_builder(self, tmp_path: str) -> NsjailConfigBuilder:
+        policy = _make_policy(str(tmp_path))
         return NsjailConfigBuilder(
             session_tmpdir="/tmp/test-session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/test-data/trusted_dirs.json",
-            agent_dir="/tmp/test-agent",
+            path_policy=policy,
         )
 
-    def test_usr_always_mounted_first_and_mandatory(self) -> None:
+    def test_usr_always_mounted_first_and_mandatory(self, tmp_path: str) -> None:
         """/usr is always mounted read-only with mandatory: true."""
-        builder = self._make_builder()
+        builder = self._make_builder(tmp_path)
         with patch("os.path.exists", return_value=False):
             mounts = builder._detect_system_mounts()
         # /usr should be the first line
@@ -36,9 +82,9 @@ class TestDetectSystemMounts:
         assert "mandatory: true" in mounts[0]
         assert "rw: false" in mounts[0]
 
-    def test_symlinked_dirs_use_mandatory_false(self) -> None:
+    def test_symlinked_dirs_use_mandatory_false(self, tmp_path: str) -> None:
         """Symlinked system dirs (e.g. /bin → usr/bin) use mandatory: false."""
-        builder = self._make_builder()
+        builder = self._make_builder(tmp_path)
 
         def mock_exists(path: str) -> bool:
             return path in {"/usr", "/bin", "/lib"}
@@ -53,9 +99,9 @@ class TestDetectSystemMounts:
         assert "mandatory: false" in mounts[1]  # /bin
         assert "mandatory: false" in mounts[2]  # /lib
 
-    def test_real_dirs_use_mandatory_true(self) -> None:
+    def test_real_dirs_use_mandatory_true(self, tmp_path: str) -> None:
         """Real (non-symlink) system dirs use mandatory: true."""
-        builder = self._make_builder()
+        builder = self._make_builder(tmp_path)
 
         def mock_exists(path: str) -> bool:
             return path in {"/usr", "/bin", "/sbin"}
@@ -67,9 +113,9 @@ class TestDetectSystemMounts:
         for line in mounts:
             assert "mandatory: true" in line
 
-    def test_absent_dirs_are_skipped(self) -> None:
+    def test_absent_dirs_are_skipped(self, tmp_path: str) -> None:
         """Non-existent system dirs are skipped entirely."""
-        builder = self._make_builder()
+        builder = self._make_builder(tmp_path)
 
         def mock_exists(path: str) -> bool:
             return path == "/usr"
@@ -84,12 +130,13 @@ class TestDetectSystemMounts:
 class TestBuild:
     """Tests for build() — full config generation."""
 
-    def test_config_contains_time_limit(self) -> None:
+    def test_config_contains_time_limit(self, tmp_path: str) -> None:
         """Config contains the correct time_limit from the timeout parameter."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("make test", timeout=60)
         try:
@@ -99,12 +146,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_cwd(self) -> None:
+    def test_config_contains_cwd(self, tmp_path: str) -> None:
         """Config contains the cwd set to /tmp."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -114,12 +162,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_has_no_project_mount(self) -> None:
+    def test_config_has_no_project_mount(self, tmp_path: str) -> None:
         """Config does not contain a bind mount for the project directory."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -129,12 +178,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_tmp_mount(self) -> None:
+    def test_config_contains_tmp_mount(self, tmp_path: str) -> None:
         """Config contains a RW bind mount for the session tmpdir as /tmp."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -145,12 +195,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_tmp_dir_mount_after_scratch_mount(self) -> None:
+    def test_config_contains_tmp_dir_mount_after_scratch_mount(self, tmp_path: str) -> None:
         """tmp_dir is bind-mounted RW at its real path, immediately after the /tmp scratch mount."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
-            tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            tmp_dir=f"/tmp/{policy.agent_name}",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -167,12 +218,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_dev_null_and_dev_zero_mounts(self) -> None:
+    def test_config_contains_dev_null_and_dev_zero_mounts(self, tmp_path: str) -> None:
         """Config contains bind mounts for /dev/null and /dev/zero (quoted paths)."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("echo test", timeout=10)
         try:
@@ -188,12 +240,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_base_envars(self) -> None:
+    def test_config_contains_base_envars(self, tmp_path: str) -> None:
         """Config contains base envar entries for PATH, HOME, LANG, TERM."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -206,12 +259,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_tmpdir_tmp_temp_envars_set_to_scratch_tmp(self) -> None:
+    def test_config_contains_tmpdir_tmp_temp_envars_set_to_scratch_tmp(self, tmp_path: str) -> None:
         """TMPDIR/TMP/TEMP are injected as base envars pointing at /tmp (scratch), not tmp_dir."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -223,12 +277,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_keep_env_false(self) -> None:
+    def test_config_contains_keep_env_false(self, tmp_path: str) -> None:
         """Config sets keep_env: false for environment isolation."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -238,12 +293,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_namespaces(self) -> None:
+    def test_config_contains_namespaces(self, tmp_path: str) -> None:
         """Config contains all required namespace clone directives."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
@@ -258,12 +314,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_contains_command(self) -> None:
+    def test_config_contains_command(self, tmp_path: str) -> None:
         """Config contains the command as the exec target."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("make test", timeout=30)
         try:
@@ -274,12 +331,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_allow_net_false_creates_net_namespace(self) -> None:
+    def test_config_allow_net_false_creates_net_namespace(self, tmp_path: str) -> None:
         """allow_net=False sets clone_newnet: true (network isolated)."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
             allow_net=False,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
@@ -290,12 +348,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_allow_net_true_shares_net_namespace(self) -> None:
+    def test_config_allow_net_true_shares_net_namespace(self, tmp_path: str) -> None:
         """allow_net=True sets clone_newnet: false (host network)."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
             allow_net=True,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
@@ -306,112 +365,142 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_config_skills_dir_mounted_when_exists(self) -> None:
-        """Existing skills_dir appears as a RO bind mount."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            skills_dir = os.path.join(tmpdir, "skills")
-            os.makedirs(skills_dir)
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                skills_dir=skills_dir,
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert f'src: {json.dumps(builder.skills_dir)}' in content
-                assert f'dst: {json.dumps(builder.skills_dir)}' in content
-                assert "rw: false" in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_config_skills_dir_mounted_under_home(self) -> None:
-        """skills_dir under /home is accepted and mounted read-only."""
-        with patch("os.path.isdir", return_value=True), \
-             patch("os.path.realpath", side_effect=lambda p: p), \
-             patch("os.path.abspath", side_effect=lambda p: p):
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                skills_dir="/home/user/.agents/skills",
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-        try:
-            with open(cfg_path) as f:
-                content = f.read()
-            assert "# Skills directory mount (read-only)" in content
-            assert '/home/user/.agents/skills' in content
-            assert "rw: false" in content
-        finally:
-            os.unlink(cfg_path)
-
-    def test_config_skills_dir_accepted_on_blocked_user_prefix(self) -> None:
-        """skills_dir on a blocked user prefix (e.g. ~/.local/share/agent/skills) is accepted because the mount is read-only and the user-prefix blocklist only applies to RW trusted-dir mounts."""
-        home = os.path.expanduser("~")
-        skills_dir = os.path.join(home, ".local", "share", "agent", "skills")
-        with patch("os.path.isdir", return_value=True), \
-             patch("os.path.realpath", side_effect=lambda p: p), \
-             patch("os.path.abspath", side_effect=lambda p: p):
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                skills_dir=skills_dir,
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-        try:
-            with open(cfg_path) as f:
-                content = f.read()
-            assert "# Skills directory mount (read-only)" in content
-            assert skills_dir in content
-            assert "rw: false" in content
-        finally:
-            os.unlink(cfg_path)
-
-    def test_config_skills_dir_skipped_when_missing(self) -> None:
-        """A non-existent skills_dir path does not appear in the config."""
-        missing_dir = "/tmp/nonexistent-skills-dir-for-test"
+    def test_tier1_mounts_present(self, tmp_path: str) -> None:
+        """Tier 1 directories from PathPolicy appear as bind mounts."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
-            tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
-            skills_dir=missing_dir,
+            tmp_dir=policy.tmp_dir,
+            path_policy=policy,
         )
         cfg_path, _ = builder.build("ls", timeout=30)
         try:
             with open(cfg_path) as f:
                 content = f.read()
-            assert builder.skills_dir not in content
+            assert f'src: {json.dumps(policy.workspace_dir)}' in content
+            assert f'src: {json.dumps(policy.downloads_dir)}' in content
+            assert f'src: {json.dumps(policy.results_dir)}' in content
+            assert f'src: {json.dumps(policy.skills_dir)}' in content
         finally:
             os.unlink(cfg_path)
 
-    def test_config_skills_dir_rejected_when_blocked_system_path(self) -> None:
-        """A skills_dir under a blocked system prefix is not mounted."""
-        with patch("os.path.isdir", return_value=True):
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                skills_dir="/etc",
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-        try:
-            with open(cfg_path) as f:
-                content = f.read()
-            assert 'src: "/etc"' not in content
-            assert 'dst: "/etc"' not in content
-        finally:
-            os.unlink(cfg_path)
-
-    def test_command_list_contains_nsjail_and_config(self) -> None:
-        """Returned command list starts with nsjail --config."""
+    def test_results_mount_is_rw(self, tmp_path: str) -> None:
+        """results_dir is mounted read-write."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            results_escaped = json.dumps(policy.results_dir).replace("\\", "\\\\")
+            assert f"src: {results_escaped} dst: {results_escaped} is_bind: true rw: true" in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_skills_mount_is_ro(self, tmp_path: str) -> None:
+        """skills_dir is mounted read-only."""
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            skills_escaped = json.dumps(policy.skills_dir).replace("\\", "\\\\")
+            assert f"src: {skills_escaped} dst: {skills_escaped} is_bind: true rw: false" in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_config_skills_dir_skipped_when_missing(self, tmp_path: str) -> None:
+        """A non-existent skills_dir path does not appear in the config."""
+        policy = _make_policy(str(tmp_path))
+        missing_skills = os.path.join(tmp_path, "no-such-skills")
+        # Replace the policy's skills entry with a non-existent path.
+        policy = PathPolicy.create(
+            agent_name=policy.agent_name,
+            workspace_dir=policy.workspace_dir,
+            downloads_dir=policy.downloads_dir,
+            tmp_dir=policy.tmp_dir,
+            skills_dir=missing_skills,
+            results_dir=policy.results_dir,
+            data_home=policy.data_home,
+            state_home=policy.state_home,
+            config_home=policy.config_home,
+            vault_path=policy.vault_path,
+            config_path=policy.config_path,
+            logger=policy.logger,
+        )
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert missing_skills not in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_tier2_mounts_present(self, tmp_path: str) -> None:
+        """Operator allowed_dirs appear as RW bind mounts."""
+        projects = os.path.join(str(tmp_path), "projects")
+        os.makedirs(projects, exist_ok=True)
+        policy = _make_policy(str(tmp_path), allowed_dirs=[projects])
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert projects in content
+            assert f"dst: {json.dumps(projects)} is_bind: true rw: true" in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_tier2_conflict_skip_not_mounted(self, tmp_path: str, caplog) -> None:
+        """An allowed dir that contains a prohibited path is absent from mounts."""
+        caplog.set_level(logging.WARNING)
+        work = os.path.join(str(tmp_path), "work")
+        vaults = os.path.join(work, "vaults")
+        os.makedirs(vaults, exist_ok=True)
+        policy = _make_policy(str(tmp_path), allowed_dirs=[work], prohibited_dirs=[vaults])
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            work_real = os.path.realpath(work)
+            assert f"src: {json.dumps(work_real)} dst: {json.dumps(work_real)}" not in content
+            # Other Tier 1 entries are still present.
+            assert f'src: {json.dumps(policy.workspace_dir)}' in content
+            assert f'src: {json.dumps(policy.downloads_dir)}' in content
+            assert f'src: {json.dumps(policy.results_dir)}' in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_command_list_contains_nsjail_and_config(self, tmp_path: str) -> None:
+        """Returned command list starts with nsjail --config."""
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
         )
         cfg_path, nsjail_cmd = builder.build("ls", timeout=30)
         try:
@@ -421,12 +510,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_command_list_includes_env_flags(self) -> None:
+    def test_command_list_includes_env_flags(self, tmp_path: str) -> None:
         """Returned command list includes -E KEY=VALUE flags from shell_env."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         cfg_path, nsjail_cmd = builder.build(
             "ls", timeout=30, shell_env={"FOO": "bar", "BAZ": "qux"},
@@ -439,357 +529,30 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_trusted_dir_under_session_tmpdir_skipped(self) -> None:
-        """A trusted dir under session_tmpdir is skipped because it is already /tmp."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            session_tmpdir = os.path.join(tmpdir, "test-session-tmp")
-            os.makedirs(session_tmpdir)
-            subdir = os.path.join(session_tmpdir, "subdir")
-            trusted = [{"path": subdir, "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=trusted_path,
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("echo test", timeout=10)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert subdir not in content
-                assert f'src: {json.dumps(builder.session_tmpdir)}' in content
-                assert 'dst: "/tmp"' in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dirs_loaded_from_json(self) -> None:
-        """Trusted dirs from trusted_dirs.json appear as mount entries."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create trusted_dirs.json — use /opt/data (not under /home or other
-            # blocklisted prefixes) so the test is platform-independent.
-            trusted = [{"path": "/srv/archive", "mode": "r"}, {"path": "/opt/data", "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-            )
-            # Mock os.path.exists to return True for trusted dir paths
-            with patch("os.path.exists", return_value=True):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "/srv/archive" in content
-                assert "/opt/data" in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_under_home_accepted(self) -> None:
-        """A trusted dir under /home is accepted and appears as a mount entry."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trusted = [{"path": "/home/user/projects/myproject", "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "/home/user/projects/myproject" in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_gnupg_rejected(self) -> None:
-        """~/.gnupg is rejected by _blocked_user_prefixes when used as a trusted dir."""
-        home = os.path.expanduser("~")
-        gnupg_dir = os.path.join(home, ".gnupg")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trusted = [{"path": gnupg_dir, "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-                agent_dir="/tmp/test-agent",
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert gnupg_dir not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_agent_dir_rejected(self) -> None:
-        """The agent's own directory is rejected when used as a trusted dir."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            agent_dir = os.path.join(tmpdir, "agent-root")
-            os.makedirs(agent_dir)
-            trusted = [{"path": agent_dir, "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-                agent_dir=agent_dir,
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert agent_dir not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_aws_rejected(self) -> None:
-        """~/.aws is rejected by _blocked_user_prefixes when used as a trusted dir."""
-        home = os.path.expanduser("~")
-        aws_dir = os.path.join(home, ".aws")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trusted = [{"path": aws_dir, "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-                agent_dir="/tmp/test-agent",
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert aws_dir not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_kube_rejected(self) -> None:
-        """~/.kube is rejected by _blocked_user_prefixes when used as a trusted dir."""
-        home = os.path.expanduser("~")
-        kube_dir = os.path.join(home, ".kube")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trusted = [{"path": kube_dir, "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-                agent_dir="/tmp/test-agent",
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert kube_dir not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_blocked_paths_rejected_from_trusted_mounts(self) -> None:
-        """Sensitive paths in trusted_dirs.json are rejected by the blocklist."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Paths that should be blocked on all platforms
-            home = os.path.expanduser("~")
-            blocked_paths = [
-                "/etc/something",
-                "/var/log",
-                "/run/socket",
-                os.path.join(home, ".ssh"),
-                os.path.join(home, ".local", "share"),
-            ]
-            trusted = [{"path": p, "mode": "rw"} for p in blocked_paths]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-            )
-            # Mock os.path.exists and os.path.realpath to simulate Linux behavior
-            # (realpath returns input unchanged, not macOS /System/Volumes/Data/...)
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                # None of the blocked paths should appear as mount entries
-                for p in blocked_paths:
-                    assert p not in content, f"Blocked path {p!r} should not appear in config"
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_local_share_accepted_read_only(self) -> None:
-        """RO mount of ~/.local/share/myproject is accepted."""
-        home = os.path.expanduser("~")
-        local_dir = os.path.join(home, ".local", "share", "myproject")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trusted = [{"path": local_dir, "mode": "r"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-                agent_dir="/tmp/test-agent",
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert local_dir in content
-                assert "rw: false" in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_local_share_rejected_read_write(self) -> None:
-        """RW mount of ~/.local/share/myproject is blocked."""
-        home = os.path.expanduser("~")
-        local_dir = os.path.join(home, ".local", "share", "myproject")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trusted = [{"path": local_dir, "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-                agent_dir="/tmp/test-agent",
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert local_dir not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_ssh_rejected_read_only(self) -> None:
-        """RO mount of ~/.ssh is blocked because .ssh is always sensitive."""
-        home = os.path.expanduser("~")
-        ssh_dir = os.path.join(home, ".ssh")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trusted = [{"path": ssh_dir, "mode": "r"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-                agent_dir="/tmp/test-agent",
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert ssh_dir not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dir_ssh_rejected_read_write(self) -> None:
-        """RW mount of ~/.ssh is blocked because .ssh is always sensitive."""
-        home = os.path.expanduser("~")
-        ssh_dir = os.path.join(home, ".ssh")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            trusted = [{"path": ssh_dir, "mode": "rw"}]
-            trusted_path = os.path.join(tmpdir, "trusted_dirs.json")
-            with open(trusted_path, "w") as f:
-                json.dump(trusted, f)
-
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-                agent_dir="/tmp/test-agent",
-            )
-            with patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", side_effect=lambda p: p), \
-                 patch("os.path.islink", return_value=False):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert ssh_dir not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_missing_trusted_dirs_file_is_graceful(self) -> None:
-        """Missing trusted_dirs.json does not cause an error."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir="/tmp/session",
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=os.path.join(tmpdir, "trusted_dirs.json"),
-            )
-            # Should not raise
-            cfg_path, _ = builder.build("ls", timeout=30)
-            os.unlink(cfg_path)
-
-    def test_rlimits_fallback_when_no_cgroup(self) -> None:
-        """When cgroup delegation is unavailable, rlimits are used."""
+    def test_session_logs_mount_absent(self, tmp_path: str) -> None:
+        """No session-logs mount is emitted regardless of caller kwarg."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert "# Session logs" not in content
+            assert 'dst: "/tmp/session/session_logs"' not in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_rlimits_fallback_when_no_cgroup(self, tmp_path: str) -> None:
+        """When cgroup delegation is unavailable, rlimits are used."""
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
             memory_mb=512,
         )
         # Force cgroup unavailable
@@ -806,12 +569,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_cgroup_limits_when_delegation_available(self) -> None:
+    def test_cgroup_limits_when_delegation_available(self, tmp_path: str) -> None:
         """When cgroup delegation is available, cgroup limits are used."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
             memory_mb=256,
             pids_max=64,
             cpu_percent=50,
@@ -834,12 +598,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_systemd_run_wrapper_when_cgroup_available(self) -> None:
+    def test_systemd_run_wrapper_when_cgroup_available(self, tmp_path: str) -> None:
         """When cgroup delegation is available, command is wrapped in systemd-run."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         builder._cgroup_info = {
             "available": True,
@@ -855,12 +620,13 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
-    def test_no_systemd_run_wrapper_when_cgroup_unavailable(self) -> None:
+    def test_no_systemd_run_wrapper_when_cgroup_unavailable(self, tmp_path: str) -> None:
         """When cgroup delegation is unavailable, command is raw nsjail."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         builder._cgroup_info = {"available": False, "cgroupv2_mount": None}
         cfg_path, nsjail_cmd = builder.build("ls", timeout=30)
@@ -868,6 +634,69 @@ class TestBuild:
             assert nsjail_cmd[0] == "nsjail"
         finally:
             os.unlink(cfg_path)
+
+
+class TestStaticConfigCaching:
+    """Tests for once-per-session config generation."""
+
+    def test_static_config_cached_between_builds(self, tmp_path: str) -> None:
+        """Two build() calls reuse the same static config file."""
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+        )
+        cfg_a, _ = builder.build("echo a", timeout=10)
+        cfg_b, _ = builder.build("echo b", timeout=10)
+        try:
+            assert builder._static_config_path is not None
+            assert cfg_a != cfg_b
+            with open(cfg_a) as fa, open(cfg_b) as fb:
+                a_static, _, _ = fa.read().partition('exec_bin {')
+                b_static, _, _ = fb.read().partition('exec_bin {')
+            assert a_static == b_static
+        finally:
+            for p in (cfg_a, cfg_b):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def test_static_config_regenerated_when_deleted(self, tmp_path: str) -> None:
+        """If the cached static config is deleted, build() regenerates it."""
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+        )
+        cfg_a, _ = builder.build("echo a", timeout=10)
+        try:
+            static_a = builder._static_config_path
+            assert static_a is not None
+            os.unlink(static_a)
+            cfg_b, _ = builder.build("echo b", timeout=10)
+            assert builder._static_config_path is not None
+            assert builder._static_config_path != static_a
+        finally:
+            for p in (cfg_a, cfg_b):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def test_per_call_tempfile_cleaned_up(self, tmp_path: str) -> None:
+        """The per-call config tempfile is deleted after build returns."""
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("echo", timeout=10)
+        assert os.path.exists(cfg_path)
+        os.unlink(cfg_path)
 
 
 class TestCgroup2Detection:
@@ -923,201 +752,19 @@ class TestCgroup2Detection:
             assert NsjailConfigBuilder._is_cgroup2_mounted() is False
 
 
-class TestWorkspaceDirMount:
-    """Tests for workspace_dir mount generation in build()."""
-
-    def test_workspace_dir_mounts_when_exists(self) -> None:
-        """An existing workspace_dir produces a read-write bind mount with src==dst."""
-        with tempfile.TemporaryDirectory() as session_tmpdir, \
-             tempfile.TemporaryDirectory() as workspace_dir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                workspace_dir=workspace_dir,
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "# Workspace directory (read-write — agent's designated working area)" in content
-                assert (
-                    f'mount: {{ src: {json.dumps(builder.workspace_dir)} '
-                    f'dst: {json.dumps(builder.workspace_dir)} is_bind: true rw: true mandatory: false }}'
-                ) in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_workspace_dir_empty_produces_no_mount(self) -> None:
-        """Default empty workspace_dir does not produce a workspace mount."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "# Workspace directory" not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_workspace_dir_rejected_when_blocked_path(self) -> None:
-        """A workspace_dir under a blocked user prefix is rejected with a warning."""
-        home = os.path.expanduser("~")
-        blocked_dir = os.path.join(home, ".ssh")
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                workspace_dir=blocked_dir,
-            )
-            with patch("os.path.isdir", return_value=True):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert blocked_dir not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_workspace_dir_rejected_when_contains_blocked_prefix(self) -> None:
-        """A broad workspace_dir that contains a blocked user prefix is rejected."""
-        home = os.path.expanduser("~")
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                workspace_dir=home,
-            )
-            with patch("os.path.isdir", return_value=True):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "# Workspace directory" not in content
-                assert home not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dirs_under_workspace_dir_deduped(self) -> None:
-        """trusted_dirs.json entries under workspace_dir are skipped to avoid duplicates."""
-        with tempfile.TemporaryDirectory() as session_tmpdir, \
-             tempfile.TemporaryDirectory() as workspace_dir:
-            real_workspace_dir = os.path.realpath(workspace_dir)
-            trusted_dirs_path = os.path.join(session_tmpdir, "trusted_dirs.json")
-            with open(trusted_dirs_path, "w", encoding="utf-8") as fh:
-                json.dump([{"path": workspace_dir, "mode": "rw"}], fh)
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path=trusted_dirs_path,
-                workspace_dir=workspace_dir,
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                # Workspace mount should appear exactly once; trusted mount should be skipped.
-                assert content.count(f"dst: {json.dumps(real_workspace_dir)}") == 1
-                assert "# Workspace directory (read-write — agent's designated working area)" in content
-                assert "# Trusted mounts" not in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_trusted_dirs_under_rejected_workspace_dir_not_deduped(self) -> None:
-        """trusted_dirs.json entries under a rejected workspace_dir are NOT skipped."""
-        home = os.path.expanduser("~")
-        trusted_dir = tempfile.mkdtemp(dir=home)
-        try:
-            with tempfile.TemporaryDirectory() as session_tmpdir:
-                trusted_dirs_path = os.path.join(session_tmpdir, "trusted_dirs.json")
-                with open(trusted_dirs_path, "w", encoding="utf-8") as fh:
-                    json.dump([{"path": trusted_dir, "mode": "rw"}], fh)
-                builder = NsjailConfigBuilder(
-                    session_tmpdir=session_tmpdir,
-                    tmp_dir="/tmp/test-tmpdir",
-                    trusted_dirs_path=trusted_dirs_path,
-                    workspace_dir=home,
-                )
-                cfg_path, _ = builder.build("ls", timeout=30)
-                try:
-                    with open(cfg_path) as f:
-                        content = f.read()
-                    # Workspace mount should NOT appear (home is rejected by reverse blocklist).
-                    assert "# Workspace directory" not in content
-                    # Trusted dir should still be mounted, because workspace_dir won't mount.
-                    assert f"dst: {json.dumps(os.path.realpath(trusted_dir))}" in content
-                    assert "# Trusted mounts" in content
-                finally:
-                    os.unlink(cfg_path)
-        finally:
-            shutil.rmtree(trusted_dir, ignore_errors=True)
-
-
-class TestSessionLogsMount:
-    """Tests for session_logs_dir kwarg in build()."""
-
-    def test_session_logs_dir_mounts_when_directory_exists(self) -> None:
-        """A real session_logs_dir produces a read-only bind mount with src==dst."""
-        with tempfile.TemporaryDirectory() as session_tmpdir, \
-             tempfile.TemporaryDirectory() as session_logs_dir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-            )
-            cfg_path, _ = builder.build(
-                "ls", timeout=30, session_logs_dir=session_logs_dir,
-            )
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "# Session logs" in content
-                assert (
-                    f'mount: {{ src: {json.dumps(session_logs_dir)} '
-                    f'dst: {json.dumps(session_logs_dir)}'
-                ) in content
-                assert "is_bind: true" in content
-                assert "rw: false" in content
-                assert "mandatory: false" in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_session_logs_dir_empty_produces_no_mount(self) -> None:
-        """Default empty session_logs_dir does not produce a session logs mount."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "# Session logs" not in content
-            finally:
-                os.unlink(cfg_path)
-
-
 class TestCaCertDetection:
     """Tests for CA certificate detection and env var injection."""
 
-    def test_allow_net_true_injects_mount_and_envars(self) -> None:
+    def test_allow_net_true_injects_mount_and_envars(self, tmp_path: str) -> None:
         """allow_net=True with detected CA certs adds mount + SSL_CERT_* envars."""
-        with tempfile.TemporaryDirectory() as session_tmpdir, \
-             tempfile.TemporaryDirectory() as capath, \
+        policy = _make_policy(str(tmp_path))
+        with tempfile.TemporaryDirectory() as capath, \
              tempfile.NamedTemporaryFile(suffix=".crt") as cafile_fh:
             cafile = cafile_fh.name
             builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
+                session_tmpdir=str(tmp_path / "session"),
                 tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                path_policy=policy,
                 allow_net=True,
             )
             with patch.object(
@@ -1137,54 +784,53 @@ class TestCaCertDetection:
             finally:
                 os.unlink(cfg_path)
 
-    def test_allow_net_false_skips_ca_certs(self) -> None:
+    def test_allow_net_false_skips_ca_certs(self, tmp_path: str) -> None:
         """allow_net=False does not inject SSL_CERT_* envars or CA cert mount."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                allow_net=False,
-            )
-            cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "SSL_CERT_FILE" not in content
-                assert "SSL_CERT_DIR" not in content
-                assert "# CA certificate store" not in content
-            finally:
-                os.unlink(cfg_path)
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+            allow_net=False,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert "SSL_CERT_FILE" not in content
+            assert "SSL_CERT_DIR" not in content
+            assert "# CA certificate store" not in content
+        finally:
+            os.unlink(cfg_path)
 
-    def test_allow_net_true_no_ca_certs_graceful(self) -> None:
+    def test_allow_net_true_no_ca_certs_graceful(self, tmp_path: str) -> None:
         """allow_net=True with no detected CA certs still generates valid config."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                allow_net=True,
-            )
-            with patch.object(
-                builder, "_detect_ca_certs", return_value=(None, None),
-            ):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "SSL_CERT_FILE" not in content
-                assert "SSL_CERT_DIR" not in content
-                assert "# CA certificate store" not in content
-                assert "time_limit: 30" in content
-            finally:
-                os.unlink(cfg_path)
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+            allow_net=True,
+        )
+        with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
+            cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert "SSL_CERT_FILE" not in content
+            assert "SSL_CERT_DIR" not in content
+            assert "# CA certificate store" not in content
+            assert "time_limit: 30" in content
+        finally:
+            os.unlink(cfg_path)
 
-    def test_detect_ca_certs_debian(self) -> None:
+    def test_detect_ca_certs_debian(self, tmp_path: str) -> None:
         """Debian/Ubuntu layout returns ca-certificates.crt + certs dir."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
 
         def mock_isdir(path: str) -> bool:
@@ -1199,12 +845,13 @@ class TestCaCertDetection:
         assert cafile == "/etc/ssl/certs/ca-certificates.crt"
         assert capath == "/etc/ssl/certs"
 
-    def test_detect_ca_certs_alpine(self) -> None:
+    def test_detect_ca_certs_alpine(self, tmp_path: str) -> None:
         """Alpine layout returns cert.pem file with no capath."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
 
         def mock_isfile(path: str) -> bool:
@@ -1216,12 +863,13 @@ class TestCaCertDetection:
         assert cafile == "/etc/ssl/cert.pem"
         assert capath is None
 
-    def test_detect_ca_certs_fedora(self) -> None:
+    def test_detect_ca_certs_fedora(self, tmp_path: str) -> None:
         """Fedora/RHEL layout returns ca-bundle.crt + certs dir."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
 
         def mock_isdir(path: str) -> bool:
@@ -1236,12 +884,13 @@ class TestCaCertDetection:
         assert cafile == "/etc/pki/tls/certs/ca-bundle.crt"
         assert capath == "/etc/pki/tls/certs"
 
-    def test_detect_ca_certs_none_when_missing(self) -> None:
+    def test_detect_ca_certs_none_when_missing(self, tmp_path: str) -> None:
         """When no known CA layout exists, returns (None, None)."""
+        policy = _make_policy(str(tmp_path))
         builder = NsjailConfigBuilder(
             session_tmpdir="/tmp/session",
             tmp_dir="/tmp/test-tmpdir",
-            trusted_dirs_path="/tmp/data/trusted_dirs.json",
+            path_policy=policy,
         )
         with patch("os.path.isdir", return_value=False), \
              patch("os.path.isfile", return_value=False):
@@ -1253,101 +902,101 @@ class TestCaCertDetection:
 class TestDnsResolvConf:
     """Tests for /etc/resolv.conf injection when allow_net is true."""
 
-    def test_allow_net_true_injects_resolv_conf(self) -> None:
+    def test_allow_net_true_injects_resolv_conf(self, tmp_path: str) -> None:
         """allow_net=True injects a src_content mount for /etc/resolv.conf."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                allow_net=True,
-            )
-            with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "# DNS resolution (allow_net=true)" in content
-                assert 'dst: "/etc/resolv.conf"' in content
-                assert "src_content:" in content
-                assert "nameserver 8.8.8.8" in content
-            finally:
-                os.unlink(cfg_path)
-
-    def test_allow_net_false_skips_resolv_conf(self) -> None:
-        """allow_net=False does not inject a resolv.conf mount."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                allow_net=False,
-            )
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+            allow_net=True,
+        )
+        with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
             cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "/etc/resolv.conf" not in content
-                assert "src_content:" not in content
-            finally:
-                os.unlink(cfg_path)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert "# DNS resolution (allow_net=true)" in content
+            assert 'dst: "/etc/resolv.conf"' in content
+            assert "src_content:" in content
+            assert "nameserver 8.8.8.8" in content
+        finally:
+            os.unlink(cfg_path)
 
-    def test_custom_dns_nameserver_used(self) -> None:
+    def test_allow_net_false_skips_resolv_conf(self, tmp_path: str) -> None:
+        """allow_net=False does not inject a resolv.conf mount."""
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+            allow_net=False,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert "/etc/resolv.conf" not in content
+            assert "src_content:" not in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_custom_dns_nameserver_used(self, tmp_path: str) -> None:
         """A custom dns_nameserver is written into the resolv.conf content."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                allow_net=True,
-                dns_nameserver="1.1.1.1",
-            )
-            with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                assert "nameserver 1.1.1.1" in content
-                assert "nameserver 8.8.8.8" not in content
-            finally:
-                os.unlink(cfg_path)
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+            allow_net=True,
+            dns_nameserver="1.1.1.1",
+        )
+        with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
+            cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            assert "nameserver 1.1.1.1" in content
+            assert "nameserver 8.8.8.8" not in content
+        finally:
+            os.unlink(cfg_path)
 
-    def test_resolv_conf_src_content_has_real_newline(self) -> None:
+    def test_resolv_conf_src_content_has_real_newline(self, tmp_path: str) -> None:
         """src_content value contains a real newline, not a literal backslash-n."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                allow_net=True,
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+            allow_net=True,
+        )
+        with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
+            cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            # json.dumps("nameserver 8.8.8.8\n") => "nameserver 8.8.8.8\n"
+            # The \n is the two-character JSON escape (backslash + n),
+            # which nsjail's protobuf text parser interprets as a real
+            # newline. A double-escaped \\n (literal backslash + n) would
+            # be a bug.
+            assert '"nameserver 8.8.8.8\\n"' in content, (
+                "src_content must contain the JSON newline escape (\\n), not a literal backslash-n (\\\\n)"
             )
-            with patch.object(builder, "_detect_ca_certs", return_value=(None, None)):
-                cfg_path, _ = builder.build("ls", timeout=30)
-            try:
-                with open(cfg_path) as f:
-                    content = f.read()
-                # json.dumps("nameserver 8.8.8.8\n") => "nameserver 8.8.8.8\n"
-                # The \n is the two-character JSON escape (backslash + n),
-                # which nsjail's protobuf text parser interprets as a real
-                # newline. A double-escaped \\n (literal backslash + n) would
-                # be a bug.
-                assert '"nameserver 8.8.8.8\\n"' in content, (
-                    "src_content must contain the JSON newline escape (\\n), not a literal backslash-n (\\\\n)"
-                )
-                assert '"nameserver 8.8.8.8\\\\n"' not in content
-            finally:
-                os.unlink(cfg_path)
+            assert '"nameserver 8.8.8.8\\\\n"' not in content
+        finally:
+            os.unlink(cfg_path)
 
-    def test_dns_and_ca_certs_both_present_when_allow_net(self) -> None:
+    def test_dns_and_ca_certs_both_present_when_allow_net(self, tmp_path: str) -> None:
         """allow_net=True with detected CA certs produces both DNS and CA mounts."""
-        with tempfile.TemporaryDirectory() as session_tmpdir, \
-             tempfile.TemporaryDirectory() as capath, \
+        policy = _make_policy(str(tmp_path))
+        with tempfile.TemporaryDirectory() as capath, \
              tempfile.NamedTemporaryFile(suffix=".crt") as cafile_fh:
             cafile = cafile_fh.name
             builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
+                session_tmpdir=str(tmp_path / "session"),
                 tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
+                path_policy=policy,
                 allow_net=True,
             )
             with patch.object(
@@ -1367,26 +1016,132 @@ class TestDnsResolvConf:
             finally:
                 os.unlink(cfg_path)
 
-    def test_invalid_dns_nameserver_falls_back_to_default(self) -> None:
+    def test_invalid_dns_nameserver_falls_back_to_default(self, tmp_path: str) -> None:
         """An invalid dns_nameserver falls back to 8.8.8.8 with a warning."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                allow_net=True,
-                dns_nameserver="not-an-ip",
-            )
-            assert builder.dns_nameserver == "8.8.8.8"
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+            allow_net=True,
+            dns_nameserver="not-an-ip",
+        )
+        assert builder.dns_nameserver == "8.8.8.8"
 
-    def test_empty_dns_nameserver_falls_back_to_default(self) -> None:
+    def test_empty_dns_nameserver_falls_back_to_default(self, tmp_path: str) -> None:
         """An empty dns_nameserver falls back to 8.8.8.8."""
-        with tempfile.TemporaryDirectory() as session_tmpdir:
-            builder = NsjailConfigBuilder(
-                session_tmpdir=session_tmpdir,
-                tmp_dir="/tmp/test-tmpdir",
-                trusted_dirs_path="/tmp/data/trusted_dirs.json",
-                allow_net=True,
-                dns_nameserver="",
-            )
-            assert builder.dns_nameserver == "8.8.8.8"
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir=str(tmp_path / "session"),
+            tmp_dir="/tmp/test-tmpdir",
+            path_policy=policy,
+            allow_net=True,
+            dns_nameserver="",
+        )
+        assert builder.dns_nameserver == "8.8.8.8"
+
+
+class TestShellArtifactRelocation:
+    """Tests for _finalize_shell_log artifact relocation to results_dir."""
+
+    def _make_shell(self, results_dir: str, max_output: int = 50, vault_secrets=None):
+        owner = MagicMock()
+        owner._paths.results_dir = results_dir
+        owner.max_output = max_output
+        owner._vault_secrets = vault_secrets or []
+        from builtin_tools.shell import ShellTools
+        return ShellTools(owner)
+
+    def _read_results_artifact(self, tmp_path: pathlib.Path, kept: str) -> str:
+        """Find and read the relocated artifact file under results_dir."""
+        results_dir = tmp_path / "results"
+        candidates = list(results_dir.rglob("shell-*"))
+        assert len(candidates) == 1, candidates
+        return candidates[0].read_text()
+
+    def test_artifact_relocated_to_results_trace_dir(self, tmp_path: str) -> None:
+        """Oversized output is moved to results/<trace-id>/shell-<name>."""
+        results_dir = str(tmp_path / "results")
+        shell = self._make_shell(results_dir)
+        session_log = tmp_path / "session_logs" / "conv" / "shell-test.log"
+        session_log.parent.mkdir(parents=True)
+        session_log.write_text("x" * 100)
+        kept = shell._finalize_shell_log(
+            None, str(session_log), 100, caller_tag="main r-deadbeef"
+        )
+        assert kept is not None
+        assert kept.startswith(results_dir)
+        assert "r-deadbeef" in kept
+        assert "shell-" in os.path.basename(kept)
+        assert not session_log.exists()
+        assert os.path.exists(kept)
+
+    def test_artifact_path_reported_in_result(self, tmp_path: str) -> None:
+        """The relocated artifact path flows through full_log_path in the result."""
+        results_dir = str(tmp_path / "results")
+        shell = self._make_shell(results_dir)
+        session_log = tmp_path / "session_logs" / "conv" / "shell-test.log"
+        session_log.parent.mkdir(parents=True)
+        session_log.write_text("x" * 100)
+        kept = shell._finalize_shell_log(
+            None, str(session_log), 100, caller_tag="main r-cafebabe"
+        )
+        assert kept is not None
+        assert kept.startswith(results_dir)
+        assert "r-cafebabe" in kept
+        assert "file_read" not in kept
+
+    def test_redaction_applied_to_relocated_artifact(self, tmp_path: str) -> None:
+        """Vault secrets are redacted from the retained artifact."""
+        results_dir = str(tmp_path / "results")
+        shell = self._make_shell(results_dir, vault_secrets=["supersecret"])
+        session_log = tmp_path / "session_logs" / "conv" / "shell-test.log"
+        session_log.parent.mkdir(parents=True)
+        session_log.write_text("prefix supersecret suffix\n")
+        kept = shell._finalize_shell_log(None, str(session_log), 100)
+        assert kept is not None
+        text = self._read_results_artifact(tmp_path, kept)
+        assert "supersecret" not in text
+        assert "[REDACTED]" in text
+
+    def test_results_dir_empty_fallback(self, tmp_path: str) -> None:
+        """When results_dir is empty, the artifact stays in session_logs."""
+        shell = self._make_shell(results_dir="", max_output=50)
+        session_log = tmp_path / "session_logs" / "conv" / "shell-test.log"
+        session_log.parent.mkdir(parents=True)
+        session_log.write_text("x" * 100)
+        kept = shell._finalize_shell_log(None, str(session_log), 100)
+        assert kept == str(session_log)
+        assert session_log.exists()
+
+    def test_artifacts_persist_for_manual_cleanup(self, tmp_path: str) -> None:
+        """Repeated finalize calls do not delete anything under results_dir."""
+        results_dir = str(tmp_path / "results")
+        shell = self._make_shell(results_dir)
+        for i in range(3):
+            session_log = tmp_path / "session_logs" / "conv" / f"shell-{i}.log"
+            session_log.parent.mkdir(parents=True, exist_ok=True)
+            session_log.write_text("x" * 100)
+            shell._finalize_shell_log(None, str(session_log), 100, caller_tag="main")
+        assert len(list((tmp_path / "results").rglob("shell-*"))) == 3
+
+    def test_artifact_file_permissions_after_relocation(self, tmp_path: str) -> None:
+        """Relocated artifact retains owner-only (0600) permissions."""
+        if os.name == "nt":
+            return
+        import stat
+        results_dir = str(tmp_path / "results")
+        shell = self._make_shell(results_dir)
+        session_log = tmp_path / "session_logs" / "conv" / "shell-test.log"
+        session_log.parent.mkdir(parents=True)
+        # Open with _open_shell_log to ensure the file is created with 0600.
+        fh, log_path = shell._open_shell_log()
+        assert log_path is not None
+        try:
+            fh.write("x" * 100)
+        finally:
+            fh.close()
+        kept = shell._finalize_shell_log(None, log_path, 100)
+        assert kept is not None
+        mode = stat.S_IMODE(os.stat(kept).st_mode)
+        assert mode == 0o600

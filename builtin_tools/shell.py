@@ -498,7 +498,10 @@ class ShellTools:
         """Close the artifact file and decide whether to keep or delete it.
 
         Keeps the file (and returns path) only when total_chars exceeds
-        max_output.  Otherwise removes the file and returns None.
+        max_output.  Oversized artifacts are relocated to the run's results
+        subdirectory under ``<results_dir>/<trace-id>/`` so they can be retrieved
+        via ``file_read``.  Vault-secret redaction is applied before the
+        artifact is retained.
         """
         if fh is not None:
             try:
@@ -507,52 +510,98 @@ class ShellTools:
                 pass
         if path is None:
             return None
-        if total_chars > self._owner.max_output:
-            logger.info("Built-in shell: full output (%d chars) saved to %s",
-                        total_chars, path)
-            _secrets = getattr(self._owner, '_vault_secrets', [])
-            if _secrets:
-                _REDACT_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB
+        if total_chars <= self._owner.max_output:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return None
+
+        # Relocate oversized artifacts to the results directory when available.
+        results_dir = getattr(self._owner._paths, "results_dir", "")
+        if results_dir:
+            trace_id = self._extract_trace_id(caller_tag)
+            dest_dir = os.path.join(results_dir, trace_id)
+            try:
+                os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+                dest_path = os.path.join(dest_dir, os.path.basename(path))
+                # Avoid collisions while preserving the shell-* name.
+                counter = 0
+                unique_path = dest_path
+                while os.path.exists(unique_path):
+                    counter += 1
+                    base, ext = os.path.splitext(dest_path)
+                    unique_path = f"{base}-{counter}{ext}"
+                os.replace(path, unique_path)
+                path = unique_path
+            except OSError as exc:
+                logger.warning(
+                    "Built-in shell: cannot relocate artifact to %s: %s; "
+                    "leaving in session_logs",
+                    dest_dir,
+                    exc,
+                )
+        else:
+            logger.warning(
+                "Built-in shell: results_dir unset — oversized artifact left in session_logs "
+                "for backward compatibility"
+            )
+
+        logger.info("Built-in shell: full output (%d chars) saved to %s",
+                    total_chars, path)
+        _secrets = getattr(self._owner, '_vault_secrets', [])
+        if _secrets:
+            _REDACT_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB
+            try:
+                file_size = os.path.getsize(path)
+            except OSError:
+                file_size = 0
+            if file_size > _REDACT_SIZE_LIMIT:
                 try:
-                    file_size = os.path.getsize(path)
+                    os.unlink(path)
                 except OSError:
-                    file_size = 0
-                if file_size > _REDACT_SIZE_LIMIT:
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-                    logger.warning(
-                        "session log at %s exceeded redaction size limit (%d bytes) — deleted",
-                        path,
-                        file_size,
-                    )
-                    return None
-                _tmp = path + '.tmp'
+                    pass
+                logger.warning(
+                    "session log at %s exceeded redaction size limit (%d bytes) — deleted",
+                    path,
+                    file_size,
+                )
+                return None
+            _tmp = path + '.tmp'
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as _f:
+                    _content = _f.read()
+                for _s in _secrets:
+                    if _s:
+                        _content = _content.replace(_s, '[REDACTED]')
+                with open(_tmp, 'w', encoding='utf-8') as _f:
+                    _f.write(_content)
                 try:
-                    with open(path, 'r', encoding='utf-8', errors='replace') as _f:
-                        _content = _f.read()
-                    for _s in _secrets:
-                        if _s:
-                            _content = _content.replace(_s, '[REDACTED]')
-                    with open(_tmp, 'w', encoding='utf-8') as _f:
-                        _f.write(_content)
-                    try:
-                        os.chmod(_tmp, 0o600)
-                    except OSError:
-                        pass
-                    os.replace(_tmp, path)
+                    os.chmod(_tmp, 0o600)
                 except OSError:
-                    try:
-                        os.unlink(_tmp)
-                    except OSError:
-                        pass
-            return path
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        return None
+                    pass
+                os.replace(_tmp, path)
+            except OSError:
+                try:
+                    os.unlink(_tmp)
+                except OSError:
+                    pass
+        return path
+
+    @staticmethod
+    def _extract_trace_id(caller_tag: str) -> str:
+        """Extract the trace id from a caller_tag, or return a fresh one.
+
+        The executor's dispatch context passes ``caller_tag`` as
+        ``"<label> <trace-id>"`` (e.g. ``"main r-deadbeef"``).  When no trace id
+        is present, a new trace id is generated for the artifact subdir.
+        """
+        parts = caller_tag.split()
+        for part in parts:
+            if part.startswith("r-") and len(part) >= 3:
+                return part
+        from trace_context import new_trace_id
+        return new_trace_id()
 
     def _run_shell_nsjail(self, args: dict, caller_tag: str = "") -> dict:
         """Run a shell command inside an nsjail sandbox.
@@ -594,16 +643,15 @@ class ShellTools:
             os.makedirs(session_logs_dir, mode=0o700, exist_ok=True)
         except OSError:
             pass
-        cfg_path, nsjail_cmd = builder.build(
-            command, timeout, shell_env=env_snapshot, session_logs_dir=session_logs_dir
-        )
+        cfg_path, nsjail_cmd = builder.build(command, timeout, shell_env=env_snapshot)
 
         try:
             result = self._run_shell_subprocess(args, caller_tag=caller_tag, nsjail_cmd=nsjail_cmd, conv_id=conv_id)
             # On nsjail setup failure, optionally snapshot the generated config
             # into the per-conversation session_logs directory for post-mortem
             # debugging. The dump runs inside the try block so it only fires on
-            # a real result; the finally below always cleans up the tempfile.
+            # a real result; the finally below always cleans up the per-call
+            # tempfile.
             if (
                 result.get("error_type") == "nsjail_error"
                 and self._owner._shell_nsjail_dump_config_on_error

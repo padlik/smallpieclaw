@@ -2,7 +2,9 @@
 
 Generates per-call nsjail configuration files and command lists, adapting to the
 host Linux environment for system mount layout, cgroup v2 availability, and
-resource limit delegation.
+resource limit delegation.  The jail's mount table is derived from the frozen
+:class:`path_policy.PathPolicy`; the static config (mounts, namespaces, limits)
+is generated once per session and reused for every shell call.
 """
 
 from __future__ import annotations
@@ -13,34 +15,14 @@ import os
 import re
 import shutil
 import tempfile
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from path_policy import PathPolicy
 
 logger = logging.getLogger(__name__)
 
 CGROUP2_SUPER_MAGIC: int = 0x63677270
-
-# Paths that must never appear as trusted-dir mount entries.
-_BLOCKED_SYSTEM_PREFIXES: tuple[str, ...] = (
-    "/etc", "/proc", "/sys", "/dev", "/boot",
-    "/bin", "/sbin", "/lib", "/lib64", "/usr", "/root",
-    "/var", "/run",
-)
-
-# User-home subdirectories that are sensitive enough to block for any mount
-# mode (read-only or read-write). These hold credentials, keys, or tokens
-# that must not be exposed inside the sandbox at all.
-_SENSITIVE_USER_PREFIXES: tuple[str, ...] = (
-    ".ssh", ".gnupg", ".aws", ".kube", ".docker"
-)
-
-# User-home subdirectories that are additionally blocked for read-write
-# mounts only. Read-only mounts under these paths are allowed because the RO
-# constraint eliminates the tampering/exfiltration risk the blocklist was
-# designed to prevent. Sensitive prefixes are included here as well so that
-# callers testing a RW mount can check a single set.
-_RW_BLOCKED_USER_PREFIXES: tuple[str, ...] = (
-    ".local", ".config", ".cache", *_SENSITIVE_USER_PREFIXES
-)
 
 # Minimal IPv4 address validator — rejects empty/garbage values that would
 # produce a non-functional /etc/resolv.conf inside the jail.
@@ -53,20 +35,27 @@ def _is_valid_ipv4(value: str) -> bool:
 
 
 class NsjailConfigBuilder:
-    """Build an nsjail config and command list for a single shell invocation."""
+    """Build an nsjail config and command list for a single shell invocation.
+
+    The builder receives a frozen :class:`path_policy.PathPolicy` at construction
+    time.  The mount table is derived exclusively from the policy tiers; the
+    builder performs no path filtering of its own.  The static parts of the
+    nsjail config (namespaces, system mounts, base envars, tier-derived mounts,
+    limits) are generated lazily on the first :meth:`build` call and cached for
+    the lifetime of the builder.  Only the per-call exec block (command,
+    ``time_limit``, ``-E`` env flags) varies between calls.
+    """
 
     def __init__(
         self,
         session_tmpdir: str,
         tmp_dir: str,
-        trusted_dirs_path: str = "",
+        path_policy: "PathPolicy",
+        *,
         memory_mb: int = 256,
         pids_max: int = 64,
         cpu_percent: int = 50,
         allow_net: bool = False,
-        skills_dir: str = "",
-        agent_dir: str = "",
-        workspace_dir: str = "",
         dns_nameserver: str = "8.8.8.8",
     ) -> None:
         """Initialize the builder.
@@ -78,19 +67,14 @@ class NsjailConfigBuilder:
                 (``f"/tmp/{agent_name}"``, already resolved and guaranteed to
                 exist by agent startup). Bind-mounted read-write at its real
                 host path, immediately after the ``/tmp`` scratch mount.
-            trusted_dirs_path: Absolute path to ``trusted_dirs.json``.
+            path_policy: Frozen session-static path policy.  Tier 1 and Tier 2
+                entries are mounted read-write (or read-only for skills) inside
+                the jail at their real host paths.
             memory_mb: Memory limit in megabytes.
             pids_max: Maximum number of PIDs allowed inside the sandbox.
             cpu_percent: Cgroup CPU limit as a percentage of one CPU.
             allow_net: When False (default) networking is isolated inside the
                 sandbox; when True the host network namespace is shared.
-            skills_dir: Absolute path to the skills directory; mounted read-only
-                when it exists and is not on a restricted path.
-            agent_dir: Absolute path to the agent's own installation directory;
-                blocked as a trusted mount to prevent the agent from mounting its
-                source code RW inside the sandbox.
-            workspace_dir: Absolute path to the agent's designated working area;
-                mounted read-write when it exists and is not on a restricted path.
             dns_nameserver: Nameserver IP written to ``/etc/resolv.conf`` inside
                 the jail when ``allow_net`` is true.  The jail has an isolated
                 mount namespace (``clone_newns``), so the host's
@@ -99,20 +83,7 @@ class NsjailConfigBuilder:
         """
         self.session_tmpdir = os.path.realpath(os.path.abspath(session_tmpdir))
         self.tmp_dir = os.path.realpath(os.path.abspath(tmp_dir)) if tmp_dir else ""
-        self.trusted_dirs_path = os.path.abspath(trusted_dirs_path) if trusted_dirs_path else ""
-        self._agent_dir = os.path.realpath(os.path.abspath(agent_dir)) if agent_dir else ""
-        self.workspace_dir = os.path.realpath(os.path.abspath(workspace_dir)) if workspace_dir else ""
-        # Dynamic blocked prefixes: user-home paths that must never be trusted mounts.
-        home = os.path.expanduser("~")
-        sensitive = [os.path.join(home, p) for p in _SENSITIVE_USER_PREFIXES]
-        rw_blocked = [os.path.join(home, p) for p in _RW_BLOCKED_USER_PREFIXES]
-        if self._agent_dir:
-            sensitive.append(self._agent_dir)
-            rw_blocked.append(self._agent_dir)
-        self._sensitive_user_prefixes: tuple[str, ...] = tuple(sensitive)
-        self._rw_blocked_user_prefixes: tuple[str, ...] = tuple(rw_blocked)
-        # Union kept for backward compatibility in _workspace_will_mount().
-        self._blocked_user_prefixes: tuple[str, ...] = tuple(set(sensitive + rw_blocked))
+        self.path_policy = path_policy
         self.memory_mb = memory_mb
         self.pids_max = pids_max
         self.cpu_percent = cpu_percent
@@ -125,8 +96,10 @@ class NsjailConfigBuilder:
             self.dns_nameserver = "8.8.8.8"
         else:
             self.dns_nameserver = dns_nameserver
-        self.skills_dir = os.path.realpath(os.path.abspath(skills_dir)) if skills_dir else ""
         self._cgroup_info = self._detect_cgroup_capability()
+        # Cache for the session-static config text (without the per-call exec
+        # block).  Populated lazily by the first build() call.
+        self._static_config_path: Optional[str] = None
 
     def _detect_system_mounts(self) -> list[str]:
         """Detect system mount layout and return nsjail mount config lines.
@@ -219,93 +192,99 @@ class NsjailConfigBuilder:
         except OSError:
             return False
 
-    def _workspace_will_mount(self) -> bool:
-        """Return True if workspace_dir will actually be mounted into the sandbox."""
-        if not self.workspace_dir or not os.path.isdir(self.workspace_dir):
-            return False
-        # Check if workspace_dir IS or is UNDER a blocked prefix
-        # OR if workspace_dir CONTAINS a blocked user prefix
-        blocked = (
-            self.workspace_dir == "/"
-            or any(
-                self.workspace_dir == p or self.workspace_dir.startswith(p + "/")
-                for p in (_BLOCKED_SYSTEM_PREFIXES + self._blocked_user_prefixes)
-            )
-            or any(
-                p.startswith(self.workspace_dir + "/")
-                for p in self._blocked_user_prefixes
-            )
-        )
-        return not blocked
+    def _load_static_config(self) -> str:
+        """Generate and cache the session-static nsjail config.
 
-    def _load_trusted_mounts(self) -> list[str]:
-        """Load trusted directory mounts from the configured trusted_dirs.json path.
-
-        The file is read fresh on every call and is expected to contain a list of
-        dictionaries with ``path`` and ``mode`` keys.  Missing files are handled
-        gracefully by returning an empty list.  Each resolved path is checked
-        against a denylist of critical system prefixes before being accepted.
+        The static config contains everything except the per-call exec block:
+        namespaces, environment, DNS/TLS, mounts, and resource limits.  It is
+        written to a stable tempfile inside ``session_tmpdir`` so it can be
+        reused for every shell call in the session.
 
         Returns:
-            List of nsjail ``mount: {{ ... }}`` configuration lines.
+            Absolute path to the cached static config file.
         """
-        trusted_path = self.trusted_dirs_path
-        if not os.path.exists(trusted_path):
-            return []
+        if self._static_config_path is not None and os.path.exists(
+            self._static_config_path
+        ):
+            return self._static_config_path
 
+        system_mounts = self._detect_system_mounts()
+        cgroup = self._cgroup_info
+        ns_lines = self._build_namespace_lines()
+        env_lines = self._build_env_lines()
+        dns_tls_lines, cafile, capath = self._build_dns_tls_lines(self.allow_net)
+        mount_lines = self._build_mount_lines(
+            system_mounts=system_mounts,
+            cafile=cafile,
+            capath=capath,
+        )
+        limits_lines = self._build_limits_lines(
+            cgroup["available"], cgroup.get("cgroupv2_mount")
+        )
+
+        lines: list[str] = [
+            'name: "agent-shell"',
+            "mode: ONCE",
+            'hostname: "nsjail"',
+            "",
+        ]
+        lines.extend(ns_lines)
+        lines.extend(env_lines)
+        lines.extend(dns_tls_lines)
+        lines.extend(mount_lines)
+        lines.extend(limits_lines)
+
+        os.makedirs(self.session_tmpdir, mode=0o700, exist_ok=True)
+        cfg_fd, cfg_path = tempfile.mkstemp(
+            suffix="-static.cfg", dir=self.session_tmpdir, text=True
+        )
+        with os.fdopen(cfg_fd, "w") as cfg_fh:
+            cfg_fh.write("\n".join(lines))
+            cfg_fh.write("\n")
+
+        self._static_config_path = cfg_path
+        return cfg_path
+
+    def _build_tier_mounts(self) -> list[str]:
+        """Return bind-mount lines derived from the PathPolicy tiers.
+
+        Tier 1 entries are emitted in policy order with their designated modes.
+        The agent's default temp directory (``tmp_dir``) is skipped if it is
+        already covered by the dedicated ``/tmp/<agent>`` system mount, so it is
+        never double-mounted.  Tier 2 entries are emitted read-write with
+        ``mandatory: true``.  Non-existent Tier 1/2 directories are skipped with
+        a debug log (PathPolicy already warned at construction time).  The
+        skills directory is skipped silently when it does not exist, per spec.
+        """
         lines: list[str] = []
-        try:
-            with open(trusted_path, encoding="utf-8") as fh:
-                entries = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Unable to load trusted_dirs.json: %s", exc)
-            return []
+        tmp_dir_real = self.tmp_dir
 
-        if not isinstance(entries, list):
-            logger.warning("trusted_dirs.json did not contain a list")
-            return []
-
-        for entry in entries:
-            if not isinstance(entry, dict):
+        # Tier 1: workspace, downloads, tmp, skills, results (in policy order).
+        for path, mode in self.path_policy.tier1_entries():
+            if not path or not os.path.isdir(path):
+                logger.debug("nsjail: tier1 dir does not exist, skipping mount: %s", path)
                 continue
-            path = entry.get("path")
-            mode = entry.get("mode", "r")
-            if not path or not isinstance(path, str):
-                continue
-            real = os.path.realpath(os.path.abspath(path))
-            # Root-containment check: reject the filesystem root and known system paths.
-            blocked_prefixes = list(_BLOCKED_SYSTEM_PREFIXES) + list(self._sensitive_user_prefixes)
-            if mode == "rw":
-                # Read-write mounts are additionally blocked under the broader
-                # RW-only set (.local, .config, .cache plus the sensitive dirs).
-                blocked_prefixes += list(self._rw_blocked_user_prefixes)
-            if real == "/" or any(
-                real == p or real.startswith(p + "/")
-                for p in blocked_prefixes
-            ):
-                logger.warning("Trusted directory rejected (restricted system path): %s", real)
-                continue
-            if not os.path.exists(real):
-                logger.warning("Trusted directory does not exist: %s", real)
-                continue
-            # Skip trusted-dir entries that are under an already-mounted path
-            # (e.g., session_tmpdir is mounted as /tmp, tmp_dir gets its own
-            # unconditional mount) — otherwise the same destination would get
-            # two mount stanzas in the generated config.
-            if real == self.session_tmpdir or real.startswith(self.session_tmpdir + os.sep):
-                logger.debug("Trusted directory under session_tmpdir, skipping (already mounted as /tmp): %s", real)
-                continue
-            if self.tmp_dir and (real == self.tmp_dir or real.startswith(self.tmp_dir + os.sep)):
-                logger.debug("Trusted directory under tmp_dir, skipping (already mounted): %s", real)
-                continue
-            if self._workspace_will_mount() and (real == self.workspace_dir or real.startswith(self.workspace_dir + os.sep)):
-                logger.debug("Trusted directory under workspace_dir, skipping (already mounted): %s", real)
+            # Avoid double-mounting tmp_dir — the dedicated /tmp/<agent> system
+            # mount covers it and is emitted with mandatory: true right after
+            # the per-session /tmp scratch mount.
+            if mode == "rw" and tmp_dir_real and path == tmp_dir_real:
                 continue
             rw = "true" if mode == "rw" else "false"
             lines.append(
-                f'mount: {{ src: {json.dumps(real)} dst: {json.dumps(real)} is_bind: true '
-                f'rw: {rw} mandatory: true }}'
+                f'mount: {{ src: {json.dumps(path)} dst: {json.dumps(path)} '
+                f'is_bind: true rw: {rw} mandatory: true }}'
             )
+
+        # Tier 2: operator-allowed directories (rw-only).
+        for path in self.path_policy.tier2_entries():
+            if not path or not os.path.isdir(path):
+                logger.debug("nsjail: tier2 dir does not exist, skipping mount: %s", path)
+                continue
+            lines.append(
+                f'mount: {{ src: {json.dumps(path)} dst: {json.dumps(path)} '
+                f'is_bind: true rw: true mandatory: true }}'
+            )
+
         return lines
 
     def _detect_ca_certs(self) -> tuple[Optional[str], Optional[str]]:
@@ -396,12 +375,10 @@ class NsjailConfigBuilder:
     def _build_mount_lines(
         self,
         system_mounts: list[str],
-        trusted_mounts: list[str],
         cafile: Optional[str],
         capath: Optional[str],
-        session_logs_dir: str,
     ) -> list[str]:
-        """Return the full mount section: system, trusted, session, and optional mounts."""
+        """Return the full mount section: system, tier-derived, session, and optional mounts."""
         lines: list[str] = [
             "# System mounts",
         ]
@@ -420,13 +397,13 @@ class NsjailConfigBuilder:
         )
         lines.append("")
 
-        if trusted_mounts:
+        tier_mounts = self._build_tier_mounts()
+        if tier_mounts:
+            lines.append("# Tier-derived mounts")
+            lines.extend(tier_mounts)
             lines.append("")
-            lines.append("# Trusted mounts")
-            lines.extend(trusted_mounts)
 
         lines.extend([
-            "",
             "# Session mounts",
             f'mount: {{ src: {json.dumps(self.session_tmpdir)} dst: "/tmp" '
             f'is_bind: true rw: true mandatory: true }}',
@@ -436,31 +413,6 @@ class NsjailConfigBuilder:
             f'is_bind: true rw: true mandatory: true }}',
             "",
         ])
-
-        if self._workspace_will_mount():
-            lines.append("# Workspace directory (read-write — agent's designated working area)")
-            lines.append(
-                f'mount: {{ src: {json.dumps(self.workspace_dir)} '
-                f'dst: {json.dumps(self.workspace_dir)} is_bind: true rw: true mandatory: false }}'
-            )
-            lines.append("")
-        elif self.workspace_dir:
-            # workspace_dir was set but rejected — log why
-            if not os.path.isdir(self.workspace_dir):
-                logger.debug("nsjail: workspace_dir does not exist, skipping mount: %s", self.workspace_dir)
-            else:
-                logger.warning(
-                    "nsjail: workspace_dir rejected (restricted system path or contains sensitive path), skipping mount: %s",
-                    self.workspace_dir,
-                )
-
-        if session_logs_dir and os.path.isdir(session_logs_dir):
-            lines.append("# Session logs (read-only mount — agent writes outside jail, shell reads inside)")
-            lines.append(
-                f'mount: {{ src: {json.dumps(session_logs_dir)} dst: {json.dumps(session_logs_dir)}'
-                f' is_bind: true rw: false mandatory: false }}'
-            )
-            lines.append("")
 
         if self.allow_net and (cafile is not None or capath is not None):
             lines.append("# CA certificate store (read-only, allow_net=true)")
@@ -474,31 +426,6 @@ class NsjailConfigBuilder:
                     f'mount: {{ src: {json.dumps(cafile)} dst: {json.dumps(cafile)}'
                     f' is_bind: true rw: false mandatory: false }}'
                 )
-            lines.append("")
-
-        skills_mounts: list[str] = []
-        if self.skills_dir and os.path.isdir(self.skills_dir):
-            # skills_dir is mounted read-only (rw: false), so the user-prefix
-            # blocklist — designed to prevent sensitive RW trusted-dir mounts —
-            # does not apply. Only system prefixes are checked. See
-            # openspec/changes/archive/2026-07-followups.md (2026-07-28-nsjail-
-            # directory-access) for the debt rationale.
-            if self.skills_dir == "/" or any(
-                self.skills_dir == p or self.skills_dir.startswith(p + "/")
-                for p in _BLOCKED_SYSTEM_PREFIXES
-            ):
-                logger.warning(
-                    "nsjail: skills_dir rejected (restricted system path), skipping mount: %s",
-                    self.skills_dir,
-                )
-            else:
-                lines.append("# Skills directory mount (read-only)")
-                skills_mounts.append(
-                    f'mount: {{ src: {json.dumps(self.skills_dir)} dst: {json.dumps(self.skills_dir)} '
-                    f'is_bind: true rw: false mandatory: true }}'
-                )
-        if skills_mounts:
-            lines.extend(skills_mounts)
             lines.append("")
 
         return lines
@@ -550,27 +477,28 @@ class NsjailConfigBuilder:
         command: str,
         timeout: int,
         shell_env: Optional[dict] = None,
-        session_logs_dir: str = "",
     ) -> tuple[str, list[str]]:
         """Generate the nsjail config file and command list for a shell call.
+
+        The session-static parts of the config are generated once and cached; a
+        per-call tempfile is created that includes the static config plus the
+        command-specific exec block.  The caller is responsible for deleting
+        the returned per-call config file.
 
         Args:
             command: Shell command to execute inside the sandbox.
             timeout: Maximum wall-clock execution time in seconds.
             shell_env: Optional environment variables passed as ``-E KEY=VALUE``
                 flags to nsjail.
-            session_logs_dir: Optional absolute path to session logs directory;
-                mounted read-only inside the jail when it exists.
 
         Returns:
             A tuple of ``(config_path, nsjail_cmd)``.  The config file is a
             temporary ``.cfg`` file created with ``delete=False`` so the caller
             is responsible for cleaning it up.
         """
-        system_mounts = self._detect_system_mounts()
-        trusted_mounts = self._load_trusted_mounts()
-        cgroup = self._cgroup_info
+        static_path = self._load_static_config()
 
+        cgroup = dict(self._cgroup_info)
         # Re-verify the cached cgroup path still exists; degrade to rlimits if stale.
         if cgroup["available"] and cgroup["cgroupv2_mount"]:
             if not os.path.isdir(cgroup["cgroupv2_mount"]):
@@ -580,37 +508,17 @@ class NsjailConfigBuilder:
                 )
                 cgroup = {"available": False, "cgroupv2_mount": None}
 
-        ns_lines = self._build_namespace_lines()
-        env_lines = self._build_env_lines()
-        dns_tls_lines, cafile, capath = self._build_dns_tls_lines(self.allow_net)
-        mount_lines = self._build_mount_lines(
-            system_mounts=system_mounts,
-            trusted_mounts=trusted_mounts,
-            cafile=cafile,
-            capath=capath,
-            session_logs_dir=session_logs_dir,
-        )
-        limits_lines = self._build_limits_lines(cgroup["available"], cgroup.get("cgroupv2_mount"))
+        # The per-call config is the static config plus the command block.
         command_block = self._build_command_block(command, timeout)
-
-        lines: list[str] = [
-            'name: "agent-shell"',
-            "mode: ONCE",
-            'hostname: "nsjail"',
-            "",
-        ]
-        lines.extend(ns_lines)
-        lines.extend(env_lines)
-        lines.extend(dns_tls_lines)
-        lines.extend(mount_lines)
-        lines.extend(limits_lines)
-        lines.extend(command_block)
-
-        cfg_fh = tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False)
-        cfg_path = cfg_fh.name
-        with cfg_fh:
-            cfg_fh.write("\n".join(lines))
-            cfg_fh.write("\n")
+        per_call_fh = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".cfg", delete=False
+        )
+        cfg_path = per_call_fh.name
+        with per_call_fh:
+            with open(static_path, encoding="utf-8") as static_fh:
+                shutil.copyfileobj(static_fh, per_call_fh)
+            per_call_fh.write("\n".join(command_block))
+            per_call_fh.write("\n")
 
         nsjail_cmd: list[str] = ["nsjail", "--config", cfg_path]
         for key, value in (shell_env or {}).items():
