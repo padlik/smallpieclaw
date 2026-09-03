@@ -87,6 +87,82 @@ _grant_tracker_var: contextvars.ContextVar[Optional[GrantTracker]] = contextvars
 
 
 @dataclass
+class PendingConfirmations:
+    """Locked staging area for pending confirmation tokens.
+
+    Encapsulates the legacy ``_pending`` (token → (tool_name, args)),
+    ``_zone_paths`` and ``_zone_trackers`` dictionaries, plus the new
+    ``_scope`` (token → scope_owner or None) behind one threading.Lock.
+
+    ``take`` is atomic: it returns the full stored tuple for a token and
+    removes all associated state, or returns None if the token is absent.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: dict[str, tuple[str, dict]] = {}
+        self._zone_paths: dict[str, str] = {}
+        self._zone_trackers: dict[str, GrantTracker] = {}
+        self._scope: dict[str, Optional[str]] = {}
+
+    def stage(
+        self,
+        token: str,
+        tool_name: str,
+        args: dict,
+        zone_path: str = "",
+        zone_tracker: Optional[GrantTracker] = None,
+        scope_owner: Optional[str] = None,
+    ) -> None:
+        """Atomically stage a pending confirmation and its associated metadata."""
+        with self._lock:
+            self._pending[token] = (tool_name, args)
+            if zone_path:
+                self._zone_paths[token] = zone_path
+            if zone_tracker is not None:
+                self._zone_trackers[token] = zone_tracker
+            if scope_owner is not None:
+                self._scope[token] = scope_owner
+
+    def take(self, token: str) -> Optional[tuple[str, dict]]:
+        """Atomically pop the payload and all associated metadata for *token*."""
+        with self._lock:
+            entry = self._pending.pop(token, None)
+            self._zone_paths.pop(token, None)
+            self._zone_trackers.pop(token, None)
+            self._scope.pop(token, None)
+            return entry
+
+    def discard(self, token: str) -> bool:
+        """Remove all state for *token* and return True if it existed."""
+        with self._lock:
+            existed = token in self._pending
+            self._pending.pop(token, None)
+            self._zone_paths.pop(token, None)
+            self._zone_trackers.pop(token, None)
+            self._scope.pop(token, None)
+            return existed
+
+    def zone_path(self, token: str) -> str:
+        """Return the stored zone path for *token*, or ''."""
+        with self._lock:
+            return self._zone_paths.get(token, "")
+
+    def scope(self, token: str) -> Optional[str]:
+        """Return the stored scope_owner for *token*, or None."""
+        with self._lock:
+            return self._scope.get(token)
+
+    def reset(self) -> None:
+        """Clear all staged confirmation state (run-scoped cleanup)."""
+        with self._lock:
+            self._pending.clear()
+            self._zone_paths.clear()
+            self._zone_trackers.clear()
+            self._scope.clear()
+
+
+@dataclass
 class _CallContext:
     """Per-call routing context passed to the dispatch-table adapters.
 
@@ -195,8 +271,10 @@ class BuiltinExecutor:
         # owns the thread pool. The model-facing _exec_spawn_agent shim and the
         # scheduler both delegate accepted runs to it.
         self._supervisor = SubAgentSupervisor(max_subagents=agent_cfg.max_subagents)
-        # pending: token -> (tool_name, args)
-        self._pending: dict[str, tuple[str, dict]] = {}
+        # PendingConfirmations encapsulates staged confirmation state behind one
+        # lock. It stores token -> (tool_name, args), plus optional zone_path,
+        # zone_tracker and scope_owner for backward-compatible Telegram callbacks.
+        self._pending_confirmations = PendingConfirmations()
         # Coordinator reference: set to the ConfirmationManager at run start,
         # set to None at run end (fail-closed for orphaned sub-agents).
         self._coordinator: Optional[ConfirmationManager] = None
@@ -226,11 +304,11 @@ class BuiltinExecutor:
         # Runs use a context-scoped ContextVar (set via use_grant_tracker) so
         # concurrent sub-agents are isolated automatically without push/pop bookkeeping.
         self._default_grant_tracker: GrantTracker = GrantTracker()
-        # Per-confirmation zone_path store: token -> original path (for Telegram zone buttons)
-        self._zone_paths: dict[str, str] = {}
-        # Per-confirmation tracker capture: token -> GrantTracker (so the Telegram
-        # callback thread can write to the run-scoped tracker, not the default).
-        self._zone_trackers: dict[str, "GrantTracker"] = {}
+        # NOTE: _zone_paths and _zone_trackers are compat shims that expose the
+        # internal PendingConfirmations dicts for the legacy Telegram callbacks
+        # in telegram_callbacks.py (deleted in Wave 3G/4H). New code should call
+        # PendingConfirmations methods or the public executor helpers instead.
+        # The lock is held by PendingConfirmations for all mutations.
         # Shared context-window profiler; read by the context_profile built-in tool.
         self._context_monitor: Optional["ContextMonitor"] = context_monitor
         # Name-keyed dispatch registries (replace the former if/elif chains).
@@ -354,6 +432,21 @@ class BuiltinExecutor:
     def max_output(self) -> int:
         """Max output size in characters (mirrors ``agent_cfg.max_output_size``)."""
         return self._agent_cfg.max_output_size
+
+    @property
+    def _pending(self) -> dict[str, tuple[str, dict]]:
+        """Backward-compat read-only view of staged token payloads (token -> (tool, args))."""
+        return self._pending_confirmations._pending  # noqa: SLF001
+
+    @property
+    def _zone_paths(self) -> dict[str, str]:
+        """Backward-compat read-only view of token -> zone_path."""
+        return self._pending_confirmations._zone_paths  # noqa: SLF001
+
+    @property
+    def _zone_trackers(self) -> dict[str, "GrantTracker"]:
+        """Backward-compat read-only view of token -> zone_tracker."""
+        return self._pending_confirmations._zone_trackers  # noqa: SLF001
 
     @property
     def grant_tracker(self) -> GrantTracker:
@@ -515,9 +608,7 @@ class BuiltinExecutor:
         headless bridge, whose own execute() wrapper still owns the span and
         would otherwise double-log the completion.
         """
-        entry = self._pending.pop(token, None)
-        self._zone_paths.pop(token, None)
-        self._zone_trackers.pop(token, None)
+        entry = self._pending_confirmations.take(token)
         if entry is None:
             return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
         tool_name, args = entry
@@ -542,9 +633,7 @@ class BuiltinExecutor:
         operation: emits a cancelled TOOL_END (``cancelled=True``) when the
         token was still pending. An unknown/expired token is a no-op.
         """
-        entry = self._pending.pop(token, None)
-        self._zone_paths.pop(token, None)
-        self._zone_trackers.pop(token, None)
+        entry = self._pending_confirmations.take(token)
         if entry is None:
             return
         tool_name = entry[0]
@@ -567,6 +656,7 @@ class BuiltinExecutor:
         # In headless mode (sub-agents, caller_depth >= 1):
         #   shell/dangerous → always deny (too risky to run destructive commands unattended)
         #   file_read/sensitive, file_write, file_patch → require operator confirmation via Telegram
+        scope_owner = self._scope_owner_from_caller_tag(caller_depth, caller_tag)
         if caller_depth >= 1:
             if tool_name == "shell":
                 command = args.get("command", "")
@@ -587,10 +677,11 @@ class BuiltinExecutor:
             return self._headless_confirm_bridge(tool_name, args, description, caller_tag=caller_tag)
 
         token = secrets.token_hex(12)
-        self._pending[token] = (tool_name, args)
-        if zone_path:
-            self._zone_paths[token] = zone_path
-            self._zone_trackers[token] = self.grant_tracker
+        zone_tracker = self.grant_tracker if zone_path else None
+        self._pending_confirmations.stage(
+            token, tool_name, args,
+            zone_path=zone_path, zone_tracker=zone_tracker, scope_owner=scope_owner,
+        )
         logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
         return {
             "requires_confirmation": True,
@@ -619,6 +710,7 @@ class BuiltinExecutor:
                 "exit_code": -1,
             }
 
+        scope_owner = self._scope_owner_from_caller_tag(1, caller_tag)
         if tool_name in self._coordinator.auto_approve_tools:
             caller_ok = True
             if self._current_prompt_id is not None and caller_tag:
@@ -631,7 +723,7 @@ class BuiltinExecutor:
                     "Headless sub-agent: auto-approving '%s' (prompt-scoped approve-all)", tool_name
                 )
                 token = secrets.token_hex(12)
-                self._pending[token] = (tool_name, args)
+                self._pending_confirmations.stage(token, tool_name, args, scope_owner=scope_owner)
                 return self.confirm(token, _emit_lifecycle=False)
 
         if self._subagent_confirm_prompt_fn is None:
@@ -650,7 +742,7 @@ class BuiltinExecutor:
             }
 
         token = secrets.token_hex(12)
-        self._pending[token] = (tool_name, args)
+        self._pending_confirmations.stage(token, tool_name, args, scope_owner=scope_owner)
 
         logger.info(
             "Headless sub-agent: sending Telegram confirmation prompt for %s (token=%s)",
@@ -667,7 +759,7 @@ class BuiltinExecutor:
                 "Headless sub-agent: failed to send Telegram prompt for %s: %s — blocking (fail-closed)",
                 tool_name, exc,
             )
-            self._pending.pop(token, None)
+            self._pending_confirmations.discard(token)
             return {
                 "success": False,
                 "output": "",
@@ -676,7 +768,7 @@ class BuiltinExecutor:
             }
 
         if not approved:
-            self._pending.pop(token, None)
+            self._pending_confirmations.discard(token)
             logger.info("Headless sub-agent: operator denied/timed-out %s (token=%s)", tool_name, token[:8])
             return {
                 "success": False,
@@ -701,6 +793,20 @@ class BuiltinExecutor:
             return {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1}
         ctx = _CallContext(caller_tag=caller_tag, chunk_callback=chunk_callback)
         return handler(args, ctx)
+
+    @staticmethod
+    def _scope_owner_from_caller_tag(caller_depth: int, caller_tag: str) -> Optional[str]:
+        """Return the sub-agent id for headless confirmation scoping, or None for main.
+
+        Parses the bare agent id from a compound caller_tag (e.g. ``sa-1 r-deadbeef``)
+        the same way the auto-approve registry lookup does.
+        """
+        if caller_depth == 0:
+            return None
+        if not caller_tag:
+            return None
+        bare_id = caller_tag.split()[0]
+        return bare_id if bare_id else None
 
     # ---- schedule ----
 
