@@ -12,10 +12,13 @@ so no additional lock is needed for the shared dicts.
 
 from __future__ import annotations
 
+import enum
 import logging
+import os
 import secrets
 import threading
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,145 @@ logger = logging.getLogger(__name__)
 CONFIRM_PREFIX = "__CONFIRM__"
 EXTEND_PREFIX = "__EXTEND__"
 RETRY_PREFIX = "__LLM_ERROR__"
+
+# Tools that can never hold standing grants (sink-side veto). Confirmations for
+# these tools are always per-operation.
+NO_STANDING_GRANT_TOOLS: frozenset[str] = frozenset({"shell", "secret_get"})
+
+
+class GrantLifetime(enum.Enum):
+    """Lifetime of a standing operator grant."""
+
+    PROMPT = "prompt"
+    SESSION = "session"
+
+
+@dataclass(frozen=True)
+class Grant:
+    """A single standing operator consent grant.
+
+    Args:
+        tool: The tool name the grant applies to (exactly one tool).
+        dir: Realpath of the directory whose contents are covered recursively.
+        lifetime: PROMPT (one user-message cycle) or SESSION (until /reset).
+        scope_owner: None for main-agent grants; a sub-agent id for scoped grants.
+    """
+
+    tool: str
+    dir: str
+    lifetime: GrantLifetime
+    scope_owner: Optional[str] = None
+
+
+def _grant_normalize_dir(dir_path: str) -> str:
+    """Return the canonical realpath for a directory grant path."""
+    return os.path.realpath(os.path.expanduser(dir_path))
+
+
+def grant_covers(grant_dir: str, path: str) -> bool:
+    """Return True when *grant_dir* recursively covers *path*.
+
+    Boundary-safe containment: *path* is covered when it is identical to
+    *grant_dir* or sits somewhere underneath it. Uses normcase to tolerate
+    case-insensitive filesystems on a best-effort basis; separator handling
+    avoids false positives for path-prefix collisions (e.g. ``/data/reports``
+    must not cover ``/data/repo``).
+    """
+    norm_zone = os.path.normcase(grant_dir)
+    norm_path = os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+    if norm_path == norm_zone:
+        return True
+    # os.sep boundary: norm_path must be grant_dir + sep + something
+    prefix = norm_zone + os.path.normcase(os.sep)
+    return norm_path.startswith(prefix)
+
+
+class GrantLedger:
+    """Thread-safe in-memory store for standing operator grants.
+
+    Grants are ``(tool, dir, lifetime, scope_owner)`` and are checked with
+    boundary-safe recursive directory coverage. The ledger enforces a sink-side
+    veto: ``shell`` and ``secret_get`` may never hold grants, so even crafted
+    callbacks cannot create them.
+
+    Scope semantics (decision for Wave 2B):
+    * ``scope_owner=None`` grants are main-agent scoped and do NOT cover sub-agent
+      calls (``check`` with a non-None *scope_owner* returns False for them).
+    * Sub-agent grants (``scope_owner="sa-..."``) cover only calls whose
+      *scope_owner* matches exactly; they never cover the main agent.
+    This is the conservative reading of the "no upward privilege leak" mandate
+    and treats the ledger as single, depth-0-owned with explicit scoping.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._grants: set[Grant] = set()
+
+    @staticmethod
+    def may_hold_grant(tool: str) -> bool:
+        """Return True when *tool* is permitted to hold a standing grant."""
+        return tool not in NO_STANDING_GRANT_TOOLS
+
+    def add(
+        self,
+        tool: str,
+        dir: str,
+        lifetime: GrantLifetime,
+        scope_owner: Optional[str] = None,
+    ) -> bool:
+        """Add a grant. Returns True on success, False if sink-vetoed.
+
+        Adding an identical grant is a no-op and returns True. The directory is
+        normalized with realpath/expanduser before storage.
+        """
+        if not self.may_hold_grant(tool):
+            logger.warning("GrantLedger refused standing grant for tool=%s", tool)
+            return False
+        norm_dir = _grant_normalize_dir(dir)
+        grant = Grant(tool=tool, dir=norm_dir, lifetime=lifetime, scope_owner=scope_owner)
+        with self._lock:
+            self._grants.add(grant)
+        return True
+
+    def check(self, tool: str, dir: str, scope_owner: Optional[str] = None) -> bool:
+        """Return True when an active grant covers ``(tool, dir)`` for *scope_owner*.
+
+        A grant matches only when its tool equals *tool*, its directory covers
+        *dir* (recursively, with boundary-safe containment), and its scope equals
+        *scope_owner*. Main-scoped grants (scope_owner=None) are returned only for
+        main checks (scope_owner=None). Sub-agent grants never cover the main
+        agent. The sink-side veto is also applied here: shell/secret_get always
+        return False.
+        """
+        if not self.may_hold_grant(tool):
+            return False
+        norm_dir = _grant_normalize_dir(dir)
+        with self._lock:
+            grants = list(self._grants)
+        return any(
+            g.tool == tool
+            and g.scope_owner == scope_owner
+            and grant_covers(g.dir, norm_dir)
+            for g in grants
+        )
+
+    def clear_prompt_scope(self, scope_owner: Optional[str] = None) -> None:
+        """Clear PROMPT-lifetime grants.
+
+        With *scope_owner=None* (the default), clears main-scoped prompt grants.
+        Pass a sub-agent id to clear that scope's prompt grants.
+        """
+        with self._lock:
+            self._grants = {
+                g
+                for g in self._grants
+                if not (g.lifetime == GrantLifetime.PROMPT and g.scope_owner == scope_owner)
+            }
+
+    def clear_all(self) -> None:
+        """Clear every grant (all lifetimes, all scopes)."""
+        with self._lock:
+            self._grants.clear()
 
 
 class ConfirmationManager:
@@ -60,6 +202,32 @@ class ConfirmationManager:
         self._headless_confirm_events: dict[str, threading.Event] = {}
         self._headless_confirm_results: dict[str, bool] = {}
         self.default_headless_timeout: int = 120
+
+        # --- Grant ledger (depth-0 owned single ledger) ---
+        self.grant_ledger = GrantLedger()
+
+    # ------------------------------------------------------------------
+    # Grant ledger convenience helpers
+    # ------------------------------------------------------------------
+
+    def add_grant(
+        self,
+        tool: str,
+        dir: str,
+        lifetime: GrantLifetime,
+        scope_owner: Optional[str] = None,
+    ) -> bool:
+        """Delegate to ``self.grant_ledger.add``."""
+        return self.grant_ledger.add(tool, dir, lifetime, scope_owner=scope_owner)
+
+    def check_grant(
+        self,
+        tool: str,
+        dir: str,
+        scope_owner: Optional[str] = None,
+    ) -> bool:
+        """Delegate to ``self.grant_ledger.check``."""
+        return self.grant_ledger.check(tool, dir, scope_owner=scope_owner)
 
     # ------------------------------------------------------------------
     # Tool confirmation

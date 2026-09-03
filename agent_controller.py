@@ -371,6 +371,9 @@ class AgentController:
             # from a Telegram callback that fell back to the default) don't
             # accumulate across runs.
             self.builtin_executor._default_grant_tracker.reset()
+            # Clear main-agent prompt-lifetime grants at the start of each
+            # depth-0 run (react_loop entry boundary).
+            self._confirmation.grant_ledger.clear_prompt_scope(None)
         # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
         # keeps only the per-run concerns: trace minting (above), model
         # _active_idx save/restore (below), and progress/image passthrough.
@@ -405,6 +408,9 @@ class AgentController:
             if self.builtin_executor is not None and self._depth == 0:
                 self.builtin_executor._coordinator = None
                 self.builtin_executor._current_prompt_id = None
+                # Run-scoped cleanup: abandoned staged confirmation tokens from this
+                # run must not leak into the next interactive run.
+                self.builtin_executor._pending_confirmations.reset()
             self._confirmation.clear_auto_approve()
             if self._cancel_registry is not None and run_cancel_event is not None:
                 self._cancel_registry.release(run_cancel_event)
@@ -516,6 +522,8 @@ class AgentController:
         if self.short_term:
             self.short_term.clear()
         self._confirmation.clear_auto_approve()
+        # /reset clears both prompt and session grants (session lifetime boundary).
+        self._confirmation.grant_ledger.clear_all()
         return msg
 
     def compress_context(self) -> str:

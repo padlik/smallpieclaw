@@ -56,6 +56,7 @@ class SupervisionOptions:
     expandable: bool = True                             # wrap result in expandable blockquote
     source: str = SOURCE_ON_DEMAND                      # registry source category (internal only)
     prompt_id: Optional[str] = None                     # parent prompt id for log correlation
+    grant_scope_cb: Optional[Callable[[str], None]] = None  # called with agent_id on terminal so the depth-0 grant ledger can expire that sub-agent's prompt grants
 
 
 @dataclass
@@ -326,6 +327,14 @@ class SubAgentSupervisor:
             deregister_run(runner.agent_id)
             runner.close()
             clear_run_context()
+            if options.grant_scope_cb:
+                try:
+                    options.grant_scope_cb(runner.agent_id)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "spawn_agent: grant_scope_cb failed for %s", runner.agent_id,
+                        exc_info=True,
+                    )
             if options.finish_cb:
                 options.finish_cb(finish_tag)
 
