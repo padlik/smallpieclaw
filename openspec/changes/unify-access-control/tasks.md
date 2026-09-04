@@ -23,9 +23,9 @@
 
 ## 4. File tools rewire
 
-- [ ] 4.1 Rewire `_exec_file_read`/`_exec_file_diff`/`_exec_file_write`/`_exec_file_patch`/`_exec_file_send` in `builtin_tools/files.py`: classify via PathPolicy; PROHIBITED → hard error (`error_type: "prohibited_path"`, reason); ALLOWED → execute; UNRECOGNISED → ledger check → miss stages 3-button prompt; preserve `file_patch` confirm-before-read (description from args only)
-- [ ] 4.2 Remove the `_is_sensitive_path` overlay from all `files.py` gates and delete `_SENSITIVE_PATH_PATTERNS` from `builtin_tools/patterns.py` (keep `_DANGEROUS_SHELL_PATTERNS` untouched — execution plane)
-- [ ] 4.3 Update file-tool tests: replace zone/sensitive suites with tier-matrix + ledger-driven cases; prohibited hard-error cases; `file_diff` dual-path (prohibited either side fails, unrecognised either side prompts)
+- [x] 4.1 Rewire `_exec_file_read`/`_exec_file_diff`/`_exec_file_write`/`_exec_file_patch`/`_exec_file_send` in `builtin_tools/files.py`: classify via PathPolicy; PROHIBITED → hard error (`error_type: "prohibited_path"`, reason); ALLOWED → execute; UNRECOGNISED → ledger check → miss stages 3-button prompt; preserve `file_patch` confirm-before-read (description from args only)
+- [x] 4.2 Remove the `_is_sensitive_path` overlay from all `files.py` gates and delete `_SENSITIVE_PATH_PATTERNS` from `builtin_tools/patterns.py` (keep `_DANGEROUS_SHELL_PATTERNS` untouched — execution plane)
+- [x] 4.3 Update file-tool tests: replace zone/sensitive suites with tier-matrix + ledger-driven cases; prohibited hard-error cases; `file_diff` dual-path (prohibited either side fails, unrecognised either side prompts)
 
 ## 5. nsjail builder rewire
 
