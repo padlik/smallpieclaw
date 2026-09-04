@@ -21,8 +21,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_ALLOWED_APPROVE_ALL_TOOLS: frozenset[str] = frozenset({"file_read", "file_write", "file_patch"})
-
 
 async def _ack_query(query) -> None:
     """Best-effort button-press acknowledgment (Telegram requires within ~10 s)."""
@@ -55,36 +53,49 @@ def _require_cb_auth(fn):
 
 @_require_cb_auth
 async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Yes / No / Approve-all confirmation button presses."""
+    """Handle Confirm / Till /reset / Deny confirmation button presses.
+
+    For grant-capable file tools, the pressed button creates a corresponding
+    grant on the depth-0 ledger (prompt or session lifetime) before resuming
+    the agent. Shell/secret_get never receive standing grants — their prompts
+    only render Confirm/Deny and no ledger entry is created.
+    """
     query = update.callback_query
-    data = query.data  # "confirm_yes:<token>" | "confirm_no:<token>" | "confirm_all:<token>:<tool>"
+    data = query.data  # "confirm_yes:<token>" | "confirm_no:<token>" | "confirm_till_reset:<token>"
 
-    if data.startswith("confirm_all:"):
-        # Format: confirm_all:{token}:{tool_name}
-        parts = data.split(":", 2)
-        token = parts[1]
-        tool_name = parts[2] if len(parts) > 2 else ""
-        logger.info("Approve-all callback: tool=%s token=%s", tool_name, token[:8])
-        if iface.agent:
-            iface.agent.resume_approve_all(token, tool_name)
-        else:
-            logger.warning("_cb_confirm: iface.agent is None — cannot resume agent")
-        await _ack_query(query)
-        result_text = f"✅✅ All future <code>{html.escape(tool_name)}</code> operations in this task auto-approved."
-        try:
-            await query.edit_message_text(
-                f"⚠️ <b>Confirmation</b>\n\n{result_text}",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as exc:
-            logger.debug("Could not edit confirmation message: %s", exc)
-        return
-
-    confirmed = data.startswith("confirm_yes:")
+    action = data.split(":", 1)[0]
     token = data.split(":", 1)[1]
+    confirmed = action != "confirm_no"
+    is_session = action == "confirm_till_reset"
 
-    logger.info("Confirmation callback: confirmed=%s token=%s agent=%s",
-                confirmed, token[:8], "set" if iface.agent else "None")
+    builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
+    tool_name = ""
+    zone_path = ""
+    if builtin is not None:
+        entry = builtin._pending.get(token)
+        if entry is not None:
+            tool_name, _args = entry
+        zone_path = builtin._zone_paths.get(token, "")
+
+    logger.info(
+        "Confirmation callback: action=%s token=%s agent=%s",
+        action, token[:8], "set" if iface.agent else "None",
+    )
+
+    # Grant bookkeeping before resume, but never let grant failure lose the op.
+    if confirmed and iface.agent and tool_name and zone_path:
+        try:
+            from confirmation import GrantLifetime
+
+            ledger = iface.agent._confirmation.grant_ledger
+            grant_dir = os.path.dirname(os.path.realpath(zone_path))
+            lifetime = GrantLifetime.SESSION if is_session else GrantLifetime.PROMPT
+            ledger.add(tool_name, grant_dir, lifetime, scope_owner=None)
+        except Exception as exc:
+            logger.warning(
+                "cb_confirm: grant bookkeeping failed for token=%s: %s",
+                token[:8], exc, exc_info=True,
+            )
 
     # Resume the agent FIRST — before any Telegram API calls that might fail
     if iface.agent:
@@ -96,7 +107,13 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     await _ack_query(query)
 
     # Edit the message to reflect the decision (best-effort)
-    result_text = "✅ Confirmed — executing…" if confirmed else "❌ Cancelled."
+    if confirmed:
+        if is_session:
+            result_text = "✅✅ Confirmed until /reset — executing…"
+        else:
+            result_text = "✅ Confirmed for this prompt — executing…"
+    else:
+        result_text = "❌ Denied."
     try:
         await query.edit_message_text(
             f"⚠️ <b>Confirmation</b>\n\n{result_text}",
@@ -327,12 +344,12 @@ async def cb_deferred(iface: "TelegramInterface", update: Update, ctx: ContextTy
 
 @_require_cb_auth
 async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Approve/Deny/Approve-all buttons for headless sub-agent sensitive file operations.
+    """Handle Approve / Till /reset / Deny buttons for headless sub-agent sensitive file operations.
 
     Callback data format:
       subconfirm_yes:<token>
+      subconfirm_till_reset:<token>
       subconfirm_no:<token>
-      subconfirm_all:<token>:<tool_name>
 
     Authorization and same-operator double-press safety mirror cb_deferred:
     - Unauthorized presses get a private alert and do not edit the prompt.
@@ -342,7 +359,7 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
     """
     query = update.callback_query
 
-    data = query.data  # "subconfirm_yes:<token>" | "subconfirm_no:<token>" | "subconfirm_all:<token>:<tool>"
+    data = query.data  # "subconfirm_yes:<token>" | "subconfirm_no:<token>" | "subconfirm_till_reset:<token>"
     parts = data.split(":", 2)
     if len(parts) < 2:
         await _ack_query(query)
@@ -350,51 +367,44 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
 
     action = parts[0]
     token = parts[1]
-    tool_name = parts[2] if len(parts) > 2 else ""
-    is_approve_all = action == "subconfirm_all"
-    approved = action == "subconfirm_yes" or is_approve_all
+    approved = action != "subconfirm_no"
+    is_session = action == "subconfirm_till_reset"
 
-    # Access the shared BuiltinExecutor through the wired agent.
+    # Access the shared BuiltinExecutor and depth-0 coordinator through the agent.
     builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
-    if builtin is None:
-        try:
-            await query.answer("⚠️ Executor not available.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    # Coordinator is the ConfirmationManager — access via the agent's _confirmation.
     coordinator = getattr(getattr(iface, "agent", None), "_confirmation", None)
 
-    # Approve-all: enforce allowlist before signalling atomically.
-    if is_approve_all and tool_name:
-        if tool_name not in _ALLOWED_APPROVE_ALL_TOOLS:
-            if coordinator is not None:
-                coordinator.signal_headless_confirmation(token, False)
-            await _ack_query(query)
-            try:
-                await query.edit_message_text(
-                    f"❌ Approve-all is not permitted for <code>{html.escape(tool_name)}</code>.",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            return
-        logger.info("Approve-all callback: tool=%s token=%s", tool_name, token[:8])
-
-    if coordinator is None:
+    if builtin is None or coordinator is None:
         try:
-            await query.answer("⚠️ Coordinator not available.", show_alert=True)
+            await query.answer("⚠️ Executor/coordinator not available.", show_alert=True)
         except Exception:
             pass
         return
 
-    # Atomically signal the coordinator (adds to auto_approve_tools AND sets
-    # the event in one call when approve_all=True). Returns False if the token
-    # was already resolved or expired.
-    signalled = coordinator.signal_headless_confirmation(
-        token, approved, approve_all=is_approve_all, tool_name=tool_name,
-    )
+    # Grant bookkeeping for sub-agent confirmations before the signal.
+    if approved:
+        try:
+            entry = builtin._pending.get(token)
+            tool_name = entry[0] if entry else ""
+            zone_path = builtin._zone_paths.get(token, "")
+            if tool_name and zone_path:
+                from confirmation import GrantLifetime
+
+                grant_dir = os.path.dirname(os.path.realpath(zone_path))
+                lifetime = GrantLifetime.SESSION if is_session else GrantLifetime.PROMPT
+                scope_owner = builtin._pending_confirmations.scope(token)
+                coordinator.grant_ledger.add(
+                    tool_name, grant_dir, lifetime, scope_owner=scope_owner,
+                )
+        except Exception as exc:
+            logger.warning(
+                "cb_subagent_confirm: grant bookkeeping failed for token=%s: %s",
+                token[:8], exc, exc_info=True,
+            )
+
+    # Atomically signal the coordinator. Returns False if the token was already
+    # resolved or expired (double-press / stale button).
+    signalled = coordinator.signal_headless_confirmation(token, approved)
 
     await _ack_query(query)
 
@@ -408,10 +418,13 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
             pass
         return
 
-    if is_approve_all and tool_name:
-        result_text = f"✅✅ All future <code>{html.escape(tool_name)}</code> operations in this prompt auto-approved."
+    if approved:
+        if is_session:
+            result_text = "✅✅ Approved until /reset — executing…"
+        else:
+            result_text = "✅ Approved for this run — executing…"
     else:
-        result_text = "✅ Approved — sub-agent sensitive file operation." if approved else "❌ Denied."
+        result_text = "❌ Denied."
     try:
         await query.edit_message_text(
             f"🤖 <b>Sub-agent confirmation</b>\n\n{result_text}",
@@ -419,73 +432,6 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
         )
     except Exception:
         pass
-
-
-@_require_cb_auth
-async def cb_zone_allow(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle [Allow this request] zone button — grants parent dir for current request cycle."""
-    query = update.callback_query
-    token = query.data.split(":", 1)[1]
-
-    builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
-    if builtin is None:
-        try:
-            await query.answer("⚠️ Executor not available.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    zone_path = builtin._zone_paths.pop(token, "")
-    tracker = builtin._zone_trackers.pop(token, None)
-    if zone_path and tracker is not None:
-        tracker.add(zone_path)
-
-    if iface.agent:
-        iface.agent.resume(token, True)
-
-    await _ack_query(query)
-    try:
-        await query.edit_message_text(
-            "🔓 <b>Access granted for this request.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as exc:
-        logger.debug("Could not edit zone_allow message: %s", exc)
-
-
-@_require_cb_auth
-async def cb_zone_trusted(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle [Add to trusted] zone button — permanently trusts the parent directory."""
-    query = update.callback_query
-    token = query.data.split(":", 1)[1]
-
-    builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
-    if builtin is None:
-        try:
-            await query.answer("⚠️ Executor not available.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    zone_path = builtin._zone_paths.pop(token, "")
-    checker = getattr(builtin, "trusted_zone_checker", None)
-    trusted_dir = ""
-    if zone_path and checker is not None:
-        trusted_dir = os.path.dirname(os.path.realpath(zone_path))
-        checker.add_trusted(trusted_dir)
-
-    if iface.agent:
-        iface.agent.resume(token, True)
-
-    await _ack_query(query)
-    label = f"<code>{html.escape(trusted_dir)}</code>" if trusted_dir else "directory"
-    try:
-        await query.edit_message_text(
-            f"📁 <b>Added to trusted directories:</b> {label}",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as exc:
-        logger.debug("Could not edit zone_trusted message: %s", exc)
 
 
 @_require_cb_auth
