@@ -162,7 +162,7 @@ tool_timeout   = 10
 # Maximum chars returned by the shell tool and registered tools per stream
 # (stdout and stderr each). When output exceeds this limit the tail is kept
 # and a truncation marker is prepended, so the LLM always sees the end of
-# the output (where errors and results typically appear). The full untruncated
+# the output (where errors and results typically live). The full untruncated
 # output is also saved to a run-specific artifact under
 # ~/.local/state/<agent>/session_logs/<conversation_id>/
 # and the returned tail includes the path so it can be recovered via file_read.
@@ -241,7 +241,7 @@ long_run_warn_minutes = 30
 # shell_nsjail_memory_mb    = 256   # memory cap in MB (cgroup, or RLIMIT_AS fallback)
 # shell_nsjail_pids_max     = 64    # max PIDs inside the jail (cgroup only)
 # shell_nsjail_cpu_percent  = 50    # CPU quota as % of one core (cgroup only)
-# shell_nsjail_dump_config_on_error = false  # when true, on an nsjail setup failure
+# shell_nsjail_dump_config_on_error = false  # when true, on a nsjail setup failure
 #                          the generated nsjail config file is copied into the
 #                          per-conversation session_logs directory for debugging.
 #                          Default: false.
@@ -303,6 +303,31 @@ log_backup_count   = 30         # daily gzip-compressed, date-suffixed backups t
 # its own mount list. Managed at runtime via the /dir command (list/del/reload).
 # A one-time migration copies data/trusted_dirs.json to the XDG location on
 # first start; new installs start empty.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Security / Path Policy
+#
+# The [security] section lets the operator extend the frozen three-tier path
+# policy used by file tools and the nsjail mount table. Hardcoded and derived
+# entries cannot be removed or weakened; these lists only extend them.
+# Paths are ~-expanded and realpath'd once at startup. Nonexistent entries
+# produce a warning and are skipped; they do NOT fail startup.
+#
+# prohibited_dirs — append-only list of additional directories that are always
+#                   denied with a hard error (no confirmation prompt). These are
+#                   added to the hardcoded system dirs, credential homes, and
+#                   agent-internal XDG homes. There is no way to shrink this set.
+#
+# allowed_dirs    — read-write operator-allowed directories. Mode is always rw;
+#                   there is no mode syntax. These extend the hardcoded agent
+#                   zones (workspace, downloads, /tmp/<agent>, ~/.<agent>/skills
+#                   read-only, ~/.<agent>/results). If an allowed directory
+#                   contains a prohibited path, the overlap remains prohibited
+#                   and that directory is NOT mounted inside the nsjail sandbox.
+# ─────────────────────────────────────────────────────────────────────────────
+[security]
+# prohibited_dirs = ["~/vaults"]
+# allowed_dirs    = ["~/projects"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM error handling

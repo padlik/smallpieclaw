@@ -106,6 +106,7 @@ from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile  # noqa: 
 from builtin_executor import BuiltinExecutor  # noqa: E402
 from config_schema import resolve_model_id, parse_vault_content, ExecutorPaths  # noqa: E402
 from context_monitor import ContextMonitor  # noqa: E402
+from exceptions import ConfigError  # noqa: E402
 from graph_memory import (  # noqa: E402
     GraphMemoryStore,
     GraphMemoryWriter,
@@ -114,6 +115,7 @@ from graph_memory import (  # noqa: E402
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
+from path_policy import PathPolicy  # noqa: E402
 from prompt_registry import PromptRegistry  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
 from skill_registry import SkillRegistry  # noqa: E402
@@ -315,6 +317,36 @@ def _read_vault_secrets(vault_file: str) -> list[str]:
         return []
 
 
+def _bootstrap_dot_home(agent_name: str, xdg_state_home: str) -> tuple[str, str]:
+    """Create the agent dot-home exchange surfaces (ADR-0028).
+
+    Creates ``~/.<agent_name>/skills/`` and ``~/.<agent_name>/results/`` and
+    performs the one-time idempotent skills migration: when the dot-home
+    skills dir is empty and the legacy XDG state skills dir
+    (``$XDG_STATE_HOME/<agent_name>/skills/``) exists and is non-empty, its
+    contents are COPIED into the dot-home (the legacy dir is left untouched).
+    Subsequent startups skip the copy while the target is populated.
+
+    Returns:
+        ``(skills_dir, results_dir)`` — absolute dot-home paths.
+    """
+    dot_home = os.path.join(os.path.expanduser("~"), f".{agent_name}")
+    skills_dir = os.path.join(dot_home, "skills")
+    results_dir = os.path.join(dot_home, "results")
+    os.makedirs(skills_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+
+    if not os.listdir(skills_dir):
+        legacy_skills = os.path.join(xdg_state_home, "skills")
+        if os.path.isdir(legacy_skills) and os.listdir(legacy_skills):
+            shutil.copytree(legacy_skills, skills_dir, dirs_exist_ok=True)
+            logger.info(
+                "Migrated legacy skills from %s to %s (one-time copy)",
+                legacy_skills, skills_dir,
+            )
+    return skills_dir, results_dir
+
+
 def _build_executor_paths(
     cfg: dict,
     paths: XDGPaths,
@@ -329,6 +361,7 @@ def _build_executor_paths(
     vault_file: str,
     vault_secrets: list[str],
     log_store_path: str,
+    results_dir: str = "",
 ) -> ExecutorPaths:
     """Assemble the runtime filesystem/limit bundle for BuiltinExecutor.
 
@@ -350,6 +383,7 @@ def _build_executor_paths(
         nsjail_session_tmpdir=nsjail_session_tmpdir,
         nsjail_trusted_dirs_path=trusted_dirs_path,
         nsjail_agent_dir=str(Path(__file__).parent.resolve()),
+        results_dir=results_dir,
         vault_secrets=vault_secrets,
     )
 
@@ -522,7 +556,31 @@ def _run(
     vault_file = str(paths.secrets_file)
     vault_secrets = _read_vault_secrets(vault_file)
     data_dir = str(paths.data_home)
-    skills_dir_abs = str(paths.skills_dir)
+    # Skills live in the agent dot-home (ADR-0028); the one-time migration
+    # from the legacy XDG state skills dir happens inside the bootstrap helper.
+    skills_dir_abs, results_dir_abs = _bootstrap_dot_home(agent_name, nsjail_state_dir)
+
+    # Frozen three-tier path policy (ADR-0026) — constructed once at startup;
+    # invalid [security] config fails startup (fail closed, no fallback).
+    try:
+        path_policy = PathPolicy.create(
+            agent_name=agent_name,
+            workspace_dir=workspace_dir,
+            downloads_dir=downloads_dir,
+            tmp_dir=tmp_dir,
+            skills_dir=skills_dir_abs,
+            results_dir=results_dir_abs,
+            data_home=str(paths.data_home),
+            state_home=str(paths.state_home),
+            config_home=str(paths.config_home),
+            vault_path=vault_file,
+            config_path=str(paths.config_file),
+            prohibited_dirs=app_cfg.security.prohibited_dirs,
+            allowed_dirs=app_cfg.security.allowed_dirs,
+        )
+    except ConfigError as exc:
+        logger.error("Invalid [security] configuration: %s", exc)
+        sys.exit(1)
 
     # Separate step cap for scheduled/background agents (chat sessions use max_iterations)
     _raw_sched_max = app_cfg.agent.scheduled_max_iterations
@@ -532,6 +590,7 @@ def _run(
         cfg, paths, data_dir, skills_dir_abs, tmp_dir, downloads_dir, workspace_dir,
         nsjail_state_dir, nsjail_session_tmpdir, trusted_dirs_path,
         vault_file, vault_secrets, log_store_path,
+        results_dir=results_dir_abs,
     )
 
     logger.info("Initialising components...")
@@ -557,6 +616,7 @@ def _run(
         scheduler=None,
         memory=memory,
         context_monitor=context_monitor,
+        path_policy=path_policy,
     )
     builtin.conversation_id = conversation_id
     index    = ToolIndex(registry=registry, llm=llm, index_path=str(paths.tool_index_file), builtin_executor=builtin)
@@ -641,6 +701,9 @@ def _run(
     # changing the AgentController signature today.
     agent.strategy_memory = strategy_mem
     agent.trusted_zone_checker = _trusted_zone_checker  # type: ignore[attr-defined]
+    # Frozen three-tier path policy (ADR-0026) — shared by file tools and the
+    # nsjail builder; constructed once at startup, never mutated at runtime.
+    agent.path_policy = path_policy  # type: ignore[attr-defined]
     # Let reset_task() save/rotate the conversation id.
     agent._conversation_state_dir = nsjail_state_dir  # type: ignore[attr-defined]
 

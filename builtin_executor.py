@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from confirmation import ConfirmationManager
     from context_monitor import ContextMonitor
     from prompt_registry import PromptRegistry
+    from path_policy import PathPolicy
 
 from sub_agent_supervisor import (
     SubAgentSupervisor,
@@ -205,6 +206,7 @@ class BuiltinExecutor:
         results=None,
         notify_html_fn=None,
         context_monitor: Optional["ContextMonitor"] = None,
+        path_policy: Optional["PathPolicy"] = None,
     ) -> None:
         """Initialize the built-in tool executor from typed config and runtime paths.
 
@@ -221,6 +223,11 @@ class BuiltinExecutor:
             notify_html_fn: Optional HTML notification callback.
             context_monitor: Optional shared ``ContextMonitor`` for the
                 ``context_profile`` built-in.
+            path_policy: Optional frozen :class:`path_policy.PathPolicy`
+                constructed at startup (main.py). Required for the nsjail
+                backend — mount-table derivation fails closed without it.
+                File tools consult it for tier classification (wired in a
+                later change step); tests may omit it.
         """
         self._agent_cfg = agent_cfg
         self._paths = paths
@@ -295,6 +302,9 @@ class BuiltinExecutor:
         self._agents = AgentTools(self)
         # nsjail config builder — only instantiated when nsjail backend is selected
         self._nsjail_builder: Optional[NsjailConfigBuilder] = None
+        # Frozen three-tier path policy (ADR-0026). Must be set before
+        # _init_nsjail() so the builder can derive its mount table.
+        self.path_policy: Optional["PathPolicy"] = path_policy
         self._init_nsjail()
         # Zone-based access control — set by main.py after construction
         self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
@@ -401,19 +411,25 @@ class BuiltinExecutor:
             return
         nsjail_binary = shutil.which("nsjail")
         if nsjail_binary is not None:
+            if self.path_policy is None:
+                # Fail closed (ADR-0026): no frozen policy → no jail. main.py
+                # constructs PathPolicy at startup; tests/legacy setups that
+                # build executors without a policy get the subprocess backend.
+                logger.warning(
+                    "shell_backend='nsjail' but no path_policy was provided — "
+                    "falling back to subprocess"
+                )
+                return
             self._shell_nsjail_active = True
             self._nsjail_builder = NsjailConfigBuilder(
                 session_tmpdir=session_tmpdir,
                 tmp_dir=tmp_dir,
-                trusted_dirs_path=self._paths.nsjail_trusted_dirs_path,
+                path_policy=self.path_policy,
                 memory_mb=self._agent_cfg.shell_nsjail_memory_mb,
                 pids_max=self._agent_cfg.shell_nsjail_pids_max,
                 cpu_percent=self._agent_cfg.shell_nsjail_cpu_percent,
                 allow_net=self._allow_net,
                 dns_nameserver=self._nsjail_dns_nameserver,
-                skills_dir=self._paths.skills_dir,
-                agent_dir=self._paths.nsjail_agent_dir,
-                workspace_dir=self._workspace_dir,
             )
             logger.info("nsjail shell backend active (binary: %s)", nsjail_binary)
         else:

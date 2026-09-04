@@ -541,6 +541,53 @@ class MCPServerConfig:
 
 
 @dataclass(frozen=True)
+class SecurityConfig:
+    """Typed ``[security]`` config section — static path-policy lists.
+
+    Paths are validated for type only at parse time; ``~``-expansion and
+    realpath resolution happen once at startup in :mod:`path_policy`
+    (``PathPolicy.create``). ``prohibited_dirs`` is append-only (config can
+    only extend the prohibited set); ``allowed_dirs`` is rw-only (no mode
+    syntax exists). Nonexistent entries produce a startup warning from the
+    policy constructor, not a config error.
+    """
+
+    prohibited_dirs: list[str] = field(default_factory=list)
+    allowed_dirs: list[str] = field(default_factory=list)
+
+
+def _parse_str_list(value: Any, field_path: str) -> list[str]:
+    """Return *value* as a list of strings, raising ConfigError otherwise."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ConfigError(
+            f"Config field '{field_path}' must be a list of strings, "
+            f"got {type(value).__name__} {value!r}"
+        )
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ConfigError(
+                f"Config field '{field_path}[{i}]' must be a string, "
+                f"got {type(item).__name__} {item!r}"
+            )
+    return list(value)
+
+
+def _parse_security(raw: dict) -> SecurityConfig:
+    """Parse the [security] config section into a SecurityConfig."""
+    section = raw.get("security") or {}
+    return SecurityConfig(
+        prohibited_dirs=_parse_str_list(
+            section.get("prohibited_dirs"), "security.prohibited_dirs"
+        ),
+        allowed_dirs=_parse_str_list(
+            section.get("allowed_dirs"), "security.allowed_dirs"
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Top-level application configuration — the single source of truth."""
     telegram: TelegramConfig
@@ -554,6 +601,7 @@ class AppConfig:
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     llm_error_handling: LLMErrorHandlingConfig = field(default_factory=LLMErrorHandlingConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
 
     # Keep reference to raw dict for incremental migration — consumers that
     # haven't been updated yet can use this temporarily.
@@ -1065,5 +1113,6 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
         mcp_servers=mcp_servers,
         providers=providers,
         llm_error_handling=_parse_llm_error_handling(raw),
+        security=_parse_security(raw),
         _raw=raw,
     )

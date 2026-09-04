@@ -204,7 +204,7 @@ def make_builtin_executor(tmp_path):
     # Collaborators passed straight through to BuiltinExecutor.
     _COLLABORATORS: set[str] = {
         "scheduler", "sub_agent_factory", "memory", "working", "results",
-        "notify_html_fn", "context_monitor",
+        "notify_html_fn", "context_monitor", "path_policy",
     }
 
     def _factory(**kwargs):
