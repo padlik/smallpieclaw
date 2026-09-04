@@ -129,7 +129,7 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
         "  /jobs    — list scheduled jobs\n"
         "  /prompts — list recent prompts, or /prompts search &lt;query&gt; [Nd/Nh] [--status=&lt;S&gt;] [--trace=&lt;T&gt;] [--since=&lt;ISO&gt;] [--until=&lt;ISO&gt;] [--page=&lt;N&gt;], or /prompts show &lt;id&gt;\n"
-        "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving)\n"
+        "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving); also clears session grants\n"
         "  /resume  — resume an interrupted run from a saved checkpoint\n"
         "  /pair    — pairing token management\n"
         "  /myid    — show your Telegram user ID\n",
@@ -1659,60 +1659,3 @@ async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 
 
 
-@_require_auth
-async def cmd_dir(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Operator command to list or remove user-added trusted directories.
-
-    Usage:
-      /dir list     -- show user-added trusted dirs
-      /dir del N    -- remove entry N (1-based)
-      /dir reload   -- reload trusted dirs from disk
-    """
-    msg = update.effective_message
-    if msg is None:
-        return
-
-    text = (msg.text or "").strip()
-    parts = text.split()
-    sub = parts[1].lower() if len(parts) > 1 else "list"
-
-    builtin = getattr(iface, "agent", None)
-    builtin = getattr(builtin, "builtin_executor", None) if builtin else None
-    checker = getattr(builtin, "trusted_zone_checker", None) if builtin else None
-
-    if checker is None:
-        await msg.reply_text("⚠️ Trusted zone checker not available.")
-        return
-
-    if sub == "list":
-        dirs = checker.list_user_trusted()
-        if not dirs:
-            await msg.reply_text("No custom trusted directories added yet.")
-            return
-        lines = [f"  {i}. {d.path} [{d.mode}]  added {d.added[:10]}" for i, d in enumerate(dirs, 1)]
-        await msg.reply_text("Trusted directories:\n" + "\n".join(lines))
-
-    elif sub == "del":
-        if len(parts) < 3:
-            await msg.reply_text("Usage: /dir del N")
-            return
-        try:
-            n = int(parts[2])
-        except ValueError:
-            await msg.reply_text("Usage: /dir del N (N must be a number)")
-            return
-        try:
-            removed = checker.remove_trusted(n)
-            await msg.reply_text(f"Removed: {removed}")
-        except IndexError:
-            await msg.reply_text(f"No trusted directory #{n}.")
-
-    elif sub == "reload":
-        try:
-            n = checker.reload_user_trusted()
-            await msg.reply_text(f"Reloaded trusted directories from disk: {n} entries.")
-        except Exception as exc:
-            await msg.reply_text(f"⚠️ Reload failed, kept existing entries: {exc}")
-
-    else:
-        await msg.reply_text("Usage: /dir list | /dir del N | /dir reload")

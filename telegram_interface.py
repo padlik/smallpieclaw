@@ -48,12 +48,11 @@ from telegram_commands import (
     cmd_verbose, cmd_jobs, cmd_agents, cmd_prompts, cmd_tools, cmd_skills, cmd_mcp,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
-    cmd_dir, cmd_resume, cmd_context,
+    cmd_resume, cmd_context,
 )
 from telegram_callbacks import (
     cb_confirm, cb_extend, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
-    cb_zone_allow, cb_zone_trusted,
     cb_oauth_cancel, cb_llm_retry,
 )
 
@@ -673,18 +672,15 @@ class TelegramInterface:
         app.add_handler(CommandHandler("show_env", partial(cmd_show_env, self)))
         app.add_handler(CommandHandler("context", partial(cmd_context, self)))
         app.add_handler(CommandHandler("memory", partial(cmd_memory, self)))
-        app.add_handler(CommandHandler("dir", partial(cmd_dir, self)))
         app.add_handler(CommandHandler("resume", partial(cmd_resume, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(partial(cb_mode_switch, self), pattern=r"^mode:"))
-        app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|all):"))
+        app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|till_reset):"))
         app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_llm_retry, self), pattern=r"^llm_retry:"))
         app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
         app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
-        app.add_handler(CallbackQueryHandler(partial(cb_zone_allow,   self), pattern=r"^zone_allow:"))
-        app.add_handler(CallbackQueryHandler(partial(cb_zone_trusted, self), pattern=r"^zone_trusted:"))
         app.add_handler(CallbackQueryHandler(partial(cb_oauth_cancel, self), pattern=r"^oauth_cancel:"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
@@ -985,22 +981,27 @@ class TelegramInterface:
     async def _send_confirmation_prompt(
         self, message, token: str, tool_name: str, description: str, zone_path: str = ""
     ) -> None:
-        """Send an inline-button confirmation prompt for a dangerous operation."""
-        approve_all_label = f"✅✅ Approve all {tool_name}" if tool_name else "✅✅ Approve all"
+        """Send an inline-button confirmation prompt for a dangerous operation.
+
+        Per the unified grant-ledger design, dangerous operations now show a
+        single row of action buttons:
+          * Confirm / Till /reset / Deny for grant-capable file tools.
+          * Confirm / Deny only for tools that can never hold standing grants
+            (shell, secret_get).
+        """
+        from confirmation import NO_STANDING_GRANT_TOOLS
+
+        grant_capable = tool_name and tool_name not in NO_STANDING_GRANT_TOOLS and zone_path
         rows = [
             [
-                InlineKeyboardButton("✅ Yes, execute", callback_data=f"confirm_yes:{token}"),
-                InlineKeyboardButton("❌ No, cancel",   callback_data=f"confirm_no:{token}"),
-            ],
-            [
-                InlineKeyboardButton(approve_all_label, callback_data=f"confirm_all:{token}:{tool_name}"),
-            ],
+                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_yes:{token}"),
+            ]
         ]
-        if zone_path:
-            rows.append([
-                InlineKeyboardButton("🔓 Allow this request", callback_data=f"zone_allow:{token}"),
-                InlineKeyboardButton("📁 Add to trusted",     callback_data=f"zone_trusted:{token}"),
-            ])
+        if grant_capable:
+            rows[0].append(
+                InlineKeyboardButton("✅✅ Till /reset", callback_data=f"confirm_till_reset:{token}")
+            )
+        rows[0].append(InlineKeyboardButton("❌ Deny", callback_data=f"confirm_no:{token}"))
         keyboard = InlineKeyboardMarkup(rows)
         await message.reply_text(
             f"⚠️ <b>Confirmation required</b>\n\n{_md_to_html(description)}",
@@ -1261,20 +1262,19 @@ class TelegramInterface:
             f"{_md_to_html(description)}\n\n"
             "Approve or deny this action."
         )
+        from confirmation import NO_STANDING_GRANT_TOOLS
+
+        grant_capable = tool_name and tool_name not in NO_STANDING_GRANT_TOOLS
         rows = [
             [
                 InlineKeyboardButton("✅ Approve", callback_data=f"subconfirm_yes:{token}"),
-                InlineKeyboardButton("❌ Deny", callback_data=f"subconfirm_no:{token}"),
             ]
         ]
-        _FILE_TOOLS_WITH_APPROVE_ALL = {"file_read", "file_write", "file_patch"}
-        if tool_name in _FILE_TOOLS_WITH_APPROVE_ALL:
-            rows.append([
-                InlineKeyboardButton(
-                    f"✅✅ Approve all {tool_name}",
-                    callback_data=f"subconfirm_all:{token}:{tool_name}",
-                )
-            ])
+        if grant_capable:
+            rows[0].append(
+                InlineKeyboardButton("✅✅ Till /reset", callback_data=f"subconfirm_till_reset:{token}")
+            )
+        rows[0].append(InlineKeyboardButton("❌ Deny", callback_data=f"subconfirm_no:{token}"))
         keyboard = InlineKeyboardMarkup(rows)
 
         async def _send():
