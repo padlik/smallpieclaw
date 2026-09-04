@@ -19,7 +19,7 @@
 
 - [x] 3.1 Add `[security]` section to `config_schema.py` (`prohibited_dirs: list[str]`, `allowed_dirs: list[str]`, typed dataclass fields) with validation; update `config.toml.example`
 - [x] 3.2 Construct PathPolicy in `main.py` after XDG/vault resolution; pass to `BuiltinExecutor`/`AgentController`/nsjail builder; startup fails on construction error (delete "checker unwired" fallbacks in `files.py`)
-- [ ] 3.3 Update README security section (new config keys, removal of trusted dirs, new confirmation semantics)
+- [x] 3.3 Update README security section (new config keys, removal of trusted dirs, new confirmation semantics)
 
 ## 4. File tools rewire
 
@@ -41,10 +41,10 @@
 
 ## 7. Telegram UX
 
-- [ ] 7.1 Replace confirmation prompt rows in `telegram_interface.py`: file ops → `[✅ Confirm]` `[✅✅ Till /reset]` `[❌ Deny]` (callback data carries grant semantics); `shell`/`secret_get` prompts render Confirm/Deny only; delete zone buttons (zone_allow/zone_trusted rows) and the main-agent "Approve all" button
-- [ ] 7.2 Rewire `telegram_callbacks.py`: Confirm → resume + `ledger.add((tool, dir), prompt)`; Till /reset → resume + session grant; Deny → refusal; delete `cb_zone_*`, `confirm_all:`/`subconfirm_all:` approve-all handlers and `_ALLOWED_APPROVE_ALL_TOOLS`; headless sub-agent bridge passes scope annotation
-- [ ] 7.3 Remove `/dir` command handlers and registration (`telegram_commands.py`); update `/help` text
-- [ ] 7.4 Update Telegram tests: 3-button rendering, shell 2-button rendering, grant creation on button press, crafted-callback rejection at the ledger sink (port `test_subagent_approve_all.py` defense), `/reset` clears ledger
+- [x] 7.1 Replace confirmation prompt rows in `telegram_interface.py`: file ops → `[✅ Confirm]` `[✅✅ Till /reset]` `[❌ Deny]` (callback data carries grant semantics); `shell`/`secret_get` prompts render Confirm/Deny only; delete zone buttons (zone_allow/zone_trusted rows) and the main-agent "Approve all" button
+- [x] 7.2 Rewire `telegram_callbacks.py`: Confirm → resume + `ledger.add((tool, dir), prompt)`; Till /reset → resume + session grant; Deny → refusal; delete `cb_zone_*`, `confirm_all:`/`subconfirm_all:` approve-all handlers and `_ALLOWED_APPROVE_ALL_TOOLS`; headless sub-agent bridge passes scope annotation
+- [x] 7.3 Remove `/dir` command handlers and registration (`telegram_commands.py`); update `/help` text
+- [x] 7.4 Update Telegram tests: 3-button rendering, shell 2-button rendering, grant creation on button press, crafted-callback rejection at the ledger sink (port `test_subagent_approve_all.py` defense), `/reset` clears ledger
 
 ## 8. Deletions + cleanup
 
