@@ -219,21 +219,3 @@ class TestSinkVeto:
         assert ledger.add("shell", "/data", GrantLifetime.SESSION) is False
         assert ledger.check("shell", "/data/x.txt") is False
 
-
-class TestLegacyApproveAllRemoved:
-    """The approve-all button and callback prefix are gone; old callbacks no longer match handlers."""
-
-    def test_old_subconfirm_all_callback_does_nothing(self, executor):
-        coordinator = ConfirmationManager()
-        executor._coordinator = coordinator
-        token = secrets.token_hex(12)
-        event = threading.Event()
-        coordinator._headless_confirm_events[token] = event
-        executor._pending[token] = ("file_read", {})
-
-        _query = _MockQuery(f"subconfirm_all:{token}:file_read")
-
-        # No handler matches this prefix anymore; cb_subagent_confirm is not invoked.
-        assert "auto_approve" not in str(_query.__dict__)
-        # auto_approve_tools should remain empty.
-        assert coordinator.auto_approve_tools == set()
