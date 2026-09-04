@@ -164,8 +164,9 @@ class TestSubAgentGrantCallbacks:
         await cb_subagent_confirm(iface, update, MagicMock())
 
         assert coordinator.grant_ledger.check("file_read", target, scope_owner="sa-1") is True
-        # Session grant with sub-agent scope_owner is still scoped to that sub-agent per Wave 2B semantics.
-        assert coordinator.grant_ledger.check("file_read", target, scope_owner=None) is False
+        # Session grants are scope-free: "Till /reset" consent covers the whole
+        # session (approval-grants spec) — main agent included.
+        assert coordinator.grant_ledger.check("file_read", target, scope_owner=None) is True
         assert "Approved until /reset" in html.unescape(query.edited_text or "")
 
     @pytest.mark.asyncio

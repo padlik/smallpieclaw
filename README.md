@@ -174,7 +174,6 @@ systemctl --user enable --now telegram-agent
 | `/jobs` | Scheduled jobs; sub-commands: `reload`, `pause <tag>`, `resume <tag>`, `remove <tag>` |
 | `/agents` | Active sub-agents, scheduled jobs, and plan-step agents (with source category); `/agents cancel <id>` to stop one |
 | `/prompts` | Recent prompts with status and elapsed time; `/prompts search <query> [Nd/Nh] [--status=<S>] [--trace=<T>] [--since=<ISO>] [--until=<ISO>] [--page=<N>]` to search history; `/prompts show <id>` for full record |
-| `/dir` | List and remove trusted directories: `list`, `del <n>` |
 | `/mcp` | Manage MCP servers: `list`, `on <name>`, `off <name>`, `info <name>` |
 | `/stop` | Cancel the current running task |
 | `/resume` | Resume an interrupted run from a saved checkpoint |
@@ -223,9 +222,9 @@ The `shell` tool has three backends, selected by `shell_backend` in `[agent]`:
 
 - **`subprocess`** (default) — cross-platform, fully buffered. Every dangerous pattern requires confirmation.
 - **`pty`** — POSIX only; gives commands a real TTY for line buffering, colour, and progress bars. Same confirmation rules as `subprocess`.
-- **`nsjail`** — Linux only; runs commands inside a kernel-level sandbox (mount/PID/net/user/IPC/UTS/cgroup namespaces + cgroup v2 limits). Confines blast radius to the project dir and explicitly trusted RW dirs. The confirmation gate becomes configurable via `shell_nsjail_confirm_mode` (`always` | `adaptive` | `never`); when nsjail is inactive (binary missing or non-Linux host) all modes fall back to `always`. See [`docs/nsjail-setup.md`](docs/nsjail-setup.md) for installation and prerequisites.
-| `file_read` | Read a file; `offset: -5000` reads last 5 KB | Yes — if outside trusted zones |
-| `file_write` | Write content to a file | Yes — if outside trusted zones |
+- **`nsjail`** — Linux only; runs commands inside a kernel-level sandbox (mount/PID/net/user/IPC/UTS/cgroup namespaces + cgroup v2 limits). The mount table is derived once per session from the frozen path policy (agent-controlled dirs + `[security] allowed_dirs`); prohibited paths are never mounted. The confirmation gate becomes configurable via `shell_nsjail_confirm_mode` (`always` | `adaptive` | `never`); when nsjail is inactive (binary missing or non-Linux host) all modes fall back to `always`. See [`docs/nsjail-setup.md`](docs/nsjail-setup.md) for installation and prerequisites.
+| `file_read` | Read a file; `offset: -5000` reads last 5 KB | Yes — if outside allowed tiers |
+| `file_write` | Write content to a file | Yes — if outside allowed tiers |
 | `file_send` | Send a file or photo to Telegram chat | No |
 | `schedule` | Manage scheduled jobs and reminders | No |
 | `spawn_agent` | Spawn a background sub-agent | No |
@@ -234,25 +233,23 @@ The `shell` tool has three backends, selected by `shell_backend` in `[agent]`:
 | `memory_graph_store` | Store a fact/episode in graph memory | No |
 | `context_profile` | Return a JSON snapshot of context-window consumption by category | No |
 
-### File access zones
+### File access policy
 
-`file_*` tools use zone-based access control. Every path is classified as:
+`file_*` tools classify every path (after `realpath` resolution) through a frozen three-tier path policy, constructed once at startup from hardcoded rules plus the `[security]` config section:
 
-- **Trusted** — inside `workspace_dir` (default `~/Documents/piclaw_workspace`) or a user-added trusted directory. Reads and writes auto-allow with no confirmation.
-- **Request-granted** — a directory the user approved for the current request via the `[Allow this request]` button. Allowed for the rest of the current request.
-- **Unrecognised** — anything else, including agent-internal directories (`data/`, `skills/`, log dir, vault dir). Prompts the user.
+- **Prohibited** — system directories, credential homes (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`), the agent's own XDG data/state/config homes, the vault and config files, plus anything the operator adds to `[security] prohibited_dirs` (append-only). Access is a **hard error** — never prompted, never grantable, and immune to operator recklessness (e.g. `allowed_dirs = ["/"]` changes nothing for prohibited paths).
+- **Allowed** — agent-controlled directories (`workspace_dir`, `downloads_dir`, `/tmp/<agent_name>`, `~/.<agent_name>/skills` read-only, `~/.<agent_name>/results` read-write) plus operator dirs in `[security] allowed_dirs` (read-write; no mode syntax). Auto-allowed without confirmation.
+- **Unrecognised** — everything else: the grant ledger is consulted; on a miss the bot sends a confirmation prompt.
 
-Out-of-zone prompts offer four options: **Approve** (once), **Deny**, **Allow this request** (grants the parent directory for the current request), and **Add to trusted** (persists to `~/.local/state/<agent_name>/trusted_dirs.json` under `XDG_STATE_HOME`).
+Out-of-policy prompts offer three buttons: **[✅ Confirm]** (execute once + grant the parent directory for the current prompt cycle), **[✅✅ Till /reset]** (execute once + grant until `/reset`), **[❌ Deny]** (refuse; the agent re-plans). `shell` and `secret_get` always ask per-operation and render Confirm/Deny only — they can never hold standing grants.
 
-Trusted directory entries support an optional `mode` field — `"r"` (read-only) auto-allows reads but still prompts for writes; `"rw"` (default) auto-allows both.
+Grants are `(tool, directory-recursive)`, in-memory only, never persisted to disk. Prompt-cycle grants die at the next user message; session grants die at `/reset`. Grants created from a sub-agent's confirmation expire with that sub-agent's run.
 
-Agent-internal directories are always unrecognised even if a parent directory is trusted — the LLM must use dedicated built-ins (`memory_read`, `secret_get`, `log_query`) for agent-internal data.
+**Migration from trusted dirs:** the dynamic trust store (`trusted_dirs.json`), the `/dir` command, and the zone/approve-all buttons are removed. Standing filesystem access now comes from `[security] allowed_dirs` in config.toml (edit + restart — the policy is frozen per session); in-session consent uses the grant buttons above. Stale `trusted_dirs.json` files are silently ignored.
 
-Use the `/dir` command to list and remove user-added trusted directories: `/dir list`, `/dir del <n>`.
+Agent-internal data is reachable only through dedicated tools — `log_query` for the structured log store, `memory_*` for memory, `secret_get` for vault secrets. The agent can never read or patch its own config or vault by filesystem path.
 
-Per-request grants reset at the start of each new user message.
-
-When a dangerous operation is requested the bot sends an inline confirmation prompt. For recurring dangerous actions, **Approve All** suppresses further prompts for the same action type for the rest of the current task.
+Run results (oversized shell output, sub-agent handoffs) land in `~/.<agent_name>/results/<trace-id>/` — kept until manually deleted; there is no automatic cleanup.
 
 When the agent hits the interactive step limit (`max_iterations`, default 8), inline buttons offer **Extend 10**, **Unlimited**, or **Cancel**.
 

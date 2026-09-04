@@ -116,6 +116,22 @@ class TestSubAgentScope:
         ledger.clear_prompt_scope("sa-123")
         assert ledger.check("file_write", "/data/x.txt", scope_owner="sa-123") is True
 
+    def test_scope_free_session_grant_covers_every_scope(self, ledger: GrantLedger) -> None:
+        # "Till /reset" consent is session-wide (approval-grants spec): a
+        # scope-free SESSION grant covers the main agent and any sub-agent.
+        assert ledger.add("file_write", "/data", GrantLifetime.SESSION) is True
+        assert ledger.check("file_write", "/data/x.txt", scope_owner=None) is True
+        assert ledger.check("file_write", "/data/x.txt", scope_owner="sa-123") is True
+        assert ledger.check("file_write", "/data/x.txt", scope_owner="sa-456") is True
+
+    def test_scoped_session_grant_does_not_cover_main(self, ledger: GrantLedger) -> None:
+        # Legacy/explicitly-scoped session grants stay scope-exact.
+        assert ledger.add(
+            "file_write", "/data", GrantLifetime.SESSION, scope_owner="sa-123"
+        ) is True
+        assert ledger.check("file_write", "/data/x.txt", scope_owner="sa-123") is True
+        assert ledger.check("file_write", "/data/x.txt", scope_owner=None) is False
+
 
 class TestDirectoryNormalization:
     def test_realpath_expansion(self, ledger: GrantLedger) -> None:

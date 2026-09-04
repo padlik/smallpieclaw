@@ -87,13 +87,17 @@ class GrantLedger:
     veto: ``shell`` and ``secret_get`` may never hold grants, so even crafted
     callbacks cannot create them.
 
-    Scope semantics (decision for Wave 2B):
+    Scope semantics:
     * ``scope_owner=None`` grants are main-agent scoped and do NOT cover sub-agent
       calls (``check`` with a non-None *scope_owner* returns False for them).
     * Sub-agent grants (``scope_owner="sa-..."``) cover only calls whose
       *scope_owner* matches exactly; they never cover the main agent.
-    This is the conservative reading of the "no upward privilege leak" mandate
-    and treats the ledger as single, depth-0-owned with explicit scoping.
+    * SESSION grants created scope-free (``scope_owner=None``) cover every scope —
+      per the approval-grants spec, "Till /reset" consent stops prompting for the
+      whole session, main agent and sub-agents alike. Sub-agent confirmations
+      create session grants scope-free for exactly this reason.
+    This treats the ledger as single, depth-0-owned with explicit scoping, while
+    honouring the operator's session-wide consent intent.
     """
 
     def __init__(self) -> None:
@@ -129,11 +133,14 @@ class GrantLedger:
     def check(self, tool: str, dir: str, scope_owner: Optional[str] = None) -> bool:
         """Return True when an active grant covers ``(tool, dir)`` for *scope_owner*.
 
-        A grant matches only when its tool equals *tool*, its directory covers
-        *dir* (recursively, with boundary-safe containment), and its scope equals
-        *scope_owner*. Main-scoped grants (scope_owner=None) are returned only for
-        main checks (scope_owner=None). Sub-agent grants never cover the main
-        agent. The sink-side veto is also applied here: shell/secret_get always
+        A grant matches when its tool equals *tool* and its directory covers
+        *dir* (recursively, with boundary-safe containment). Scope matching:
+        * PROMPT-lifetime grants match only when their scope equals
+          *scope_owner* exactly (sub-agent prompt grants never cover the main
+          agent — no upward privilege leak).
+        * SESSION-lifetime grants created scope-free (``scope_owner=None``)
+          cover every scope: "Till /reset" consent is session-wide by spec.
+        The sink-side veto is also applied here: shell/secret_get always
         return False.
         """
         if not self.may_hold_grant(tool):
@@ -143,8 +150,11 @@ class GrantLedger:
             grants = list(self._grants)
         return any(
             g.tool == tool
-            and g.scope_owner == scope_owner
             and grant_covers(g.dir, norm_dir)
+            and (
+                (g.lifetime == GrantLifetime.SESSION and g.scope_owner is None)
+                or g.scope_owner == scope_owner
+            )
             for g in grants
         )
 

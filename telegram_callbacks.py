@@ -392,7 +392,13 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
 
                 grant_dir = os.path.dirname(os.path.realpath(zone_path))
                 lifetime = GrantLifetime.SESSION if is_session else GrantLifetime.PROMPT
-                scope_owner = builtin._pending_confirmations.scope(token)
+                # Session grants are created scope-free: per the approval-grants
+                # spec, "Till /reset" consent is session-wide (covers the main
+                # agent and every sub-agent). Prompt grants keep the staged
+                # sub-agent run scope and expire with that run.
+                scope_owner = (
+                    None if is_session else builtin._pending_confirmations.scope(token)
+                )
                 coordinator.grant_ledger.add(
                     tool_name, grant_dir, lifetime, scope_owner=scope_owner,
                 )
