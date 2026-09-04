@@ -357,7 +357,6 @@ def _build_executor_paths(
     workspace_dir: str,
     nsjail_state_dir: str,
     nsjail_session_tmpdir: str,
-    trusted_dirs_path: str,
     vault_file: str,
     vault_secrets: list[str],
     log_store_path: str,
@@ -381,7 +380,6 @@ def _build_executor_paths(
         vault_path=vault_file,
         log_store_path=log_store_path,
         nsjail_session_tmpdir=nsjail_session_tmpdir,
-        nsjail_trusted_dirs_path=trusted_dirs_path,
         nsjail_agent_dir=str(Path(__file__).parent.resolve()),
         results_dir=results_dir,
         vault_secrets=vault_secrets,
@@ -542,7 +540,6 @@ def _run(
         )
     except OSError:
         logger.warning("session_logs retention cleanup failed", exc_info=True)
-    trusted_dirs_path = os.path.join(nsjail_state_dir, "trusted_dirs.json")
     os.environ["TMPDIR"] = tmp_dir
     os.environ["TMP"] = tmp_dir
     os.environ["TEMP"] = tmp_dir
@@ -588,7 +585,7 @@ def _run(
 
     executor_paths = _build_executor_paths(
         cfg, paths, data_dir, skills_dir_abs, tmp_dir, downloads_dir, workspace_dir,
-        nsjail_state_dir, nsjail_session_tmpdir, trusted_dirs_path,
+        nsjail_state_dir, nsjail_session_tmpdir,
         vault_file, vault_secrets, log_store_path,
         results_dir=results_dir_abs,
     )
@@ -651,17 +648,6 @@ def _run(
     builtin._working = working
     builtin._results = results_mem
     builtin._prompt_registry = prompt_registry
-    from builtin_tools.access_control import TrustedZoneChecker as _TrustedZoneChecker
-    _trusted_zone_checker = _TrustedZoneChecker(
-        workspace_dir=workspace_dir,
-        downloads_dir=downloads_dir,
-        data_dir=data_dir,
-        agent_name=agent_name,
-        vault_path=vault_file,
-        trusted_dirs_path=trusted_dirs_path,
-        skills_dir=skills_dir_abs,
-    )
-    builtin.trusted_zone_checker = _trusted_zone_checker  # type: ignore[attr-defined]
     # NOTE: JSON LongTermMemory is no longer constructed or wired into runtime
     # agents (P2 consolidation). Runtime semantic recall is served by graph
     # memory; the legacy JSON store is migration/backfill-only via
@@ -700,7 +686,6 @@ def _run(
     # approaches in a later iteration. Assigned post-construction to avoid
     # changing the AgentController signature today.
     agent.strategy_memory = strategy_mem
-    agent.trusted_zone_checker = _trusted_zone_checker  # type: ignore[attr-defined]
     # Frozen three-tier path policy (ADR-0026) — shared by file tools and the
     # nsjail builder; constructed once at startup, never mutated at runtime.
     agent.path_policy = path_policy  # type: ignore[attr-defined]

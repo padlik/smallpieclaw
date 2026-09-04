@@ -19,12 +19,9 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace as dataclass_replace
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import Callable, Optional
 
 import httpx
-
-if TYPE_CHECKING:
-    from builtin_tools.access_control import TrustedZoneChecker
 
 import agent_logging
 from builtin_tools.schemas import (
@@ -268,9 +265,6 @@ class ReactContext:
     # Strategy memory — Optional[StrategyMemory]; None when disabled/unconfigured
     strategy_memory: Optional[object] = None
 
-    # Zone-based file access control — Optional to allow existing tests/sub-agents to construct
-    # ReactContext without wiring; production paths always inject this from main.py.
-    trusted_zone_checker: Optional["TrustedZoneChecker"] = None
 
 
     # Creativity mode for prompt assembly — passed through to prompt_loader

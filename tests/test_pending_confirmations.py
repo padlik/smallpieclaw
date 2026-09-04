@@ -8,8 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from builtin_executor import PendingConfirmations
-from builtin_tools.access_control import GrantTracker
-from confirmation import GrantLifetime
 from sub_agent_supervisor import SubAgentSupervisor, SupervisionOptions
 
 
@@ -24,10 +22,9 @@ class TestPendingConfirmationsBasics:
         assert pending.take("t1") == ("file_write", {"path": "/tmp/x"})
 
     def test_take_is_atomic_and_removes_all_metadata(self, pending: PendingConfirmations) -> None:
-        gt = GrantTracker()
         pending.stage(
             "t1", "file_write", {"path": "/tmp/x"},
-            zone_path="/tmp/x", zone_tracker=gt, scope_owner="sa-1",
+            zone_path="/tmp/x", scope_owner="sa-1",
         )
         assert pending.take("t1") == ("file_write", {"path": "/tmp/x"})
         assert pending.zone_path("t1") == ""
@@ -43,9 +40,8 @@ class TestPendingConfirmationsBasics:
         assert pending.discard("t1") is False
 
     def test_reset_clears_everything(self, pending: PendingConfirmations) -> None:
-        gt = GrantTracker()
         pending.stage(
-            "t1", "file_write", {}, zone_path="/tmp/x", zone_tracker=gt, scope_owner="sa-1",
+            "t1", "file_write", {}, zone_path="/tmp/x", scope_owner="sa-1",
         )
         pending.stage("t2", "file_read", {})
         pending.reset()
@@ -84,14 +80,6 @@ class TestExecutorCompatShims:
         # Legacy callback-style access still works through the property shim.
         assert executor._zone_paths.get("t1") == "/tmp/x"
 
-    def test_zone_trackers_compat_view(self, make_builtin_executor) -> None:
-        executor = make_builtin_executor()
-        gt = GrantTracker()
-        executor._pending_confirmations.stage(
-            "t1", "file_write", {}, zone_tracker=gt,
-        )
-        assert executor._zone_trackers.get("t1") is gt
-
     def test_confirm_and_cancel_use_locked_take(self, make_builtin_executor, tmp_path) -> None:
         executor = make_builtin_executor()
         out_file = str(tmp_path / "out.txt")
@@ -117,6 +105,8 @@ class TestAgentControllerRunBoundaries:
     def test_depth0_run_entry_clears_main_prompt_grants(
         self, make_agent_controller, make_builtin_executor
     ) -> None:
+        from confirmation import GrantLifetime
+
         executor = make_builtin_executor()
         ctrl = make_agent_controller(builtin_executor=executor)
         ctrl._confirmation.add_grant("file_write", "/data", GrantLifetime.PROMPT)
@@ -133,6 +123,8 @@ class TestAgentControllerRunBoundaries:
         assert ctrl._confirmation.check_grant("file_write", "/data/x.txt") is False
 
     def test_reset_task_calls_clear_all(self, make_agent_controller) -> None:
+        from confirmation import GrantLifetime
+
         ctrl = make_agent_controller()
         ctrl._confirmation.add_grant("file_read", "/data", GrantLifetime.SESSION)
         assert ctrl._confirmation.check_grant("file_read", "/data/x.txt") is True

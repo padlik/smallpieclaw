@@ -10,7 +10,6 @@ import os
 import tempfile
 from unittest.mock import MagicMock
 
-from builtin_tools.access_control import GrantTracker
 from builtin_tools.files import FileTools, _expand_skill_paths
 from path_policy import PathPolicy
 from skill_registry import Skill
@@ -58,7 +57,6 @@ def _make_ft_with_registry(skill_dir: str, skill_md_path: str) -> FileTools:
     registry.all.return_value = [skill]
     owner = MagicMock()
     owner.skill_registry = registry
-    owner.grant_tracker = GrantTracker()
     owner.path_policy = _make_policy(skill_dir)
     owner._scope_owner_from_caller_tag = lambda _d, _t: None
     return FileTools(owner)
@@ -67,7 +65,6 @@ def _make_ft_with_registry(skill_dir: str, skill_md_path: str) -> FileTools:
 def _make_ft_registry_none() -> FileTools:
     owner = MagicMock()
     owner.skill_registry = None
-    owner.grant_tracker = GrantTracker()
     owner.path_policy = None
     owner._scope_owner_from_caller_tag = lambda _d, _t: None
     return FileTools(owner)
@@ -78,7 +75,6 @@ def _make_ft_skill_not_found() -> FileTools:
     registry.all.return_value = []
     owner = MagicMock()
     owner.skill_registry = registry
-    owner.grant_tracker = GrantTracker()
     owner.path_policy = None
     owner._scope_owner_from_caller_tag = lambda _d, _t: None
     return FileTools(owner)

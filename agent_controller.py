@@ -279,11 +279,6 @@ class AgentController:
             plan_max_iterations=self.plan_max_iterations,
             inactivity_warn_minutes=self.inactivity_warn_minutes,
             confirmation=self._confirmation,
-            trusted_zone_checker=(
-                self.builtin_executor.trusted_zone_checker
-                if self.builtin_executor is not None
-                else None
-            ),
             checkpoint_store=self.checkpoint_store,
             checkpoint_enabled=self._checkpoint_enabled,
             retry_timeout_seconds=self._retry_timeout_seconds,
@@ -362,15 +357,9 @@ class AgentController:
         # trace/agent/prompt_id.
         bind_run_context(trace=run_trace_id, agent=self.label, prompt_id=str(prompt_id) if prompt_id is not None else "")
 
-        # Per-prompt shared approval set: sub-agents use the same set object as the
-        # main agent for one-prompt approve-all semantics.
         if self.builtin_executor is not None and self._depth == 0:
             self.builtin_executor._coordinator = self._confirmation
             self.builtin_executor._current_prompt_id = prompt_id
-            # Reset the default tracker so stale grants from a prior run (or
-            # from a Telegram callback that fell back to the default) don't
-            # accumulate across runs.
-            self.builtin_executor._default_grant_tracker.reset()
             # Clear main-agent prompt-lifetime grants at the start of each
             # depth-0 run (react_loop entry boundary).
             self._confirmation.grant_ledger.clear_prompt_scope(None)
@@ -396,10 +385,6 @@ class AgentController:
         if initial_state is not None:
             loop_kwargs["initial_state"] = initial_state
         try:
-            if self.builtin_executor is not None:
-                from builtin_tools.access_control import GrantTracker  # noqa: PLC0415
-                with self.builtin_executor.use_grant_tracker(GrantTracker()):
-                    return react_loop(ctx, user_goal, progress_callback, images, **loop_kwargs)
             return react_loop(ctx, user_goal, progress_callback, images, **loop_kwargs)
         finally:
             self.llm._active_idx = _primary_idx
@@ -411,7 +396,6 @@ class AgentController:
                 # Run-scoped cleanup: abandoned staged confirmation tokens from this
                 # run must not leak into the next interactive run.
                 self.builtin_executor._pending_confirmations.reset()
-            self._confirmation.clear_auto_approve()
             if self._cancel_registry is not None and run_cancel_event is not None:
                 self._cancel_registry.release(run_cancel_event)
 
@@ -447,14 +431,6 @@ class AgentController:
         response: "retry" | "cancel"
         """
         self._confirmation.signal_retry(token, response)
-
-    def resume_approve_all(self, token: str, tool_name: str) -> None:
-        """Called by TelegramInterface when user presses 'Approve all {tool_name}'.
-
-        Confirms the current pending operation AND registers tool_name for
-        automatic approval for the rest of this task.
-        """
-        self._confirmation.signal_approve_all(token, tool_name)
 
     def build_system_prompt(self, user_goal: str = "(context snapshot)") -> tuple[str, int]:
         """Build the full system prompt as it would be sent to the LLM.
@@ -521,7 +497,6 @@ class AgentController:
             self.working.clear()
         if self.short_term:
             self.short_term.clear()
-        self._confirmation.clear_auto_approve()
         # /reset clears both prompt and session grants (session lifetime boundary).
         self._confirmation.grant_ledger.clear_all()
         return msg

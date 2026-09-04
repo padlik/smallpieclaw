@@ -488,7 +488,6 @@ class ExecutorPaths:
     vault_path: str = ""
     log_store_path: str = ""
     nsjail_session_tmpdir: str = ""
-    nsjail_trusted_dirs_path: str = ""
     nsjail_agent_dir: str = ""
     # Agent dot-home results dir (~/.<agent>/results) — run-results exchange
     # surface for oversized payloads (see path_policy.py Tier 1).

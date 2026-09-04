@@ -180,11 +180,9 @@ class GrantLedger:
 class ConfirmationManager:
     """Manages all pending operator confirmations for a single agent session.
 
-    Two confirmation flows are supported:
-
-    1. **Tool confirmation** — request_confirmation / signal_confirmation /
-       signal_approve_all.  Used for shell / file_write (and any other builtin
-       that returns ``requires_confirmation``).
+    1. **Tool confirmation** — request_confirmation / signal_confirmation.
+       Used for shell / file_write (and any other builtin that returns
+       ``requires_confirmation``).
 
     2. **Step extension** — request_extension / signal_extension.  Prompted
        when the agent reaches its ``max_iterations`` limit.
@@ -198,7 +196,6 @@ class ConfirmationManager:
         # --- Confirmation ---
         self._confirm_events: dict[str, threading.Event] = {}
         self._confirm_results: dict[str, bool] = {}
-        self.auto_approve_tools: set[str] = set()
 
         # --- Extension ---
         self._extend_events: dict[str, threading.Event] = {}
@@ -279,22 +276,6 @@ class ConfirmationManager:
         else:
             logger.warning(
                 "signal_confirmation: token=%s already resolved or timed out", token[:8]
-            )
-
-    def signal_approve_all(self, token: str, tool_name: str) -> None:
-        """Approve-all: register *tool_name* for automatic approval for this
-        task, then unblock the current ``request_confirmation`` as confirmed.
-
-        Only acts if the request has not already timed out.
-        """
-        self.auto_approve_tools.add(tool_name)
-        if event := self._confirm_events.get(token):
-            logger.info("signal_approve_all: token=%s tool_name=%s", token[:8], tool_name)
-            self._confirm_results[token] = True
-            event.set()
-        else:
-            logger.warning(
-                "signal_approve_all: token=%s already resolved or timed out", token[:8]
             )
 
     # ------------------------------------------------------------------
@@ -409,28 +390,15 @@ class ConfirmationManager:
         self,
         token: str,
         approved: bool,
-        approve_all: bool = False,
-        tool_name: str = "",
     ) -> bool:
         """Atomically signal the outcome of a headless (sub-agent) confirmation prompt.
-
-        If *approve_all* and *approved* and *tool_name* are set, adds *tool_name*
-        to ``auto_approve_tools`` AND sets the event in one call — no concurrent
-        sub-agent thread can observe the set without the event already being set.
 
         Returns True if the token was found and signalled, False if it was
         already expired/resolved (double-press / stale button).
         """
-        # NOTE: The approve-all tool allowlist (_ALLOWED_APPROVE_ALL_TOOLS) is
-        # enforced in telegram_callbacks.py, not here. This method will add any
-        # tool_name when approve_all=True. The single caller (cb_subagent_confirm)
-        # gates on the allowlist before calling. Defense-in-depth at the
-        # transport boundary is intentional — the coordinator is transport-agnostic.
         event = self._headless_confirm_events.pop(token, None)
         if event is None:
             return False
-        if approve_all and approved and tool_name:
-            self.auto_approve_tools.add(tool_name)
         self._headless_confirm_results[token] = approved
         event.set()
         return True
@@ -438,7 +406,3 @@ class ConfirmationManager:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
-
-    def clear_auto_approve(self) -> None:
-        """Clear the auto-approve set, typically called at task reset."""
-        self.auto_approve_tools.clear()

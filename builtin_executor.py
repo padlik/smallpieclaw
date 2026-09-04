@@ -26,18 +26,15 @@ Result dicts produced by built-in tools include the following recovery fields:
 
 from __future__ import annotations
 
-import contextvars
 import logging
 import secrets
 import shutil
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import agent_logging
-from builtin_tools.access_control import GrantTracker
 from builtin_tools.agents import AgentTools
 from builtin_tools.context_io import (
     _save_context,  # noqa: F401  re-exported for tests
@@ -78,21 +75,13 @@ slog = agent_logging.get_logger(__name__)
 
 logger = logging.getLogger(__name__)
 
-# Module-level ContextVar holding the active per-run GrantTracker.
-# None means no run context is active; the BuiltinExecutor property will fall
-# back to the executor-wide default tracker for backward compatibility.
-_grant_tracker_var: contextvars.ContextVar[Optional[GrantTracker]] = contextvars.ContextVar(
-    "grant_tracker", default=None
-)
-
-
 @dataclass
 class PendingConfirmations:
     """Locked staging area for pending confirmation tokens.
 
-    Encapsulates the legacy ``_pending`` (token → (tool_name, args)),
-    ``_zone_paths`` and ``_zone_trackers`` dictionaries, plus the new
-    ``_scope`` (token → scope_owner or None) behind one threading.Lock.
+    Encapsulates ``_pending`` (token → (tool_name, args)), ``_zone_paths``
+    (token → directory whose grant was requested), and ``_scope`` (token →
+    sub-agent scope_owner or None) behind one ``threading.Lock``.
 
     ``take`` is atomic: it returns the full stored tuple for a token and
     removes all associated state, or returns None if the token is absent.
@@ -102,7 +91,6 @@ class PendingConfirmations:
         self._lock = threading.Lock()
         self._pending: dict[str, tuple[str, dict]] = {}
         self._zone_paths: dict[str, str] = {}
-        self._zone_trackers: dict[str, GrantTracker] = {}
         self._scope: dict[str, Optional[str]] = {}
 
     def stage(
@@ -111,7 +99,6 @@ class PendingConfirmations:
         tool_name: str,
         args: dict,
         zone_path: str = "",
-        zone_tracker: Optional[GrantTracker] = None,
         scope_owner: Optional[str] = None,
     ) -> None:
         """Atomically stage a pending confirmation and its associated metadata."""
@@ -119,8 +106,6 @@ class PendingConfirmations:
             self._pending[token] = (tool_name, args)
             if zone_path:
                 self._zone_paths[token] = zone_path
-            if zone_tracker is not None:
-                self._zone_trackers[token] = zone_tracker
             if scope_owner is not None:
                 self._scope[token] = scope_owner
 
@@ -129,7 +114,6 @@ class PendingConfirmations:
         with self._lock:
             entry = self._pending.pop(token, None)
             self._zone_paths.pop(token, None)
-            self._zone_trackers.pop(token, None)
             self._scope.pop(token, None)
             return entry
 
@@ -139,7 +123,6 @@ class PendingConfirmations:
             existed = token in self._pending
             self._pending.pop(token, None)
             self._zone_paths.pop(token, None)
-            self._zone_trackers.pop(token, None)
             self._scope.pop(token, None)
             return existed
 
@@ -158,7 +141,6 @@ class PendingConfirmations:
         with self._lock:
             self._pending.clear()
             self._zone_paths.clear()
-            self._zone_trackers.clear()
             self._scope.clear()
 
 
@@ -305,17 +287,10 @@ class BuiltinExecutor:
         # _init_nsjail() so the builder can derive its mount table.
         self.path_policy: Optional["PathPolicy"] = path_policy
         self._init_nsjail()
-        # Zone-based access control — set by main.py after construction
-        self.trusted_zone_checker = None  # Optional[TrustedZoneChecker]
-        # Skill registry — set by main.py after construction (same pattern as trusted_zone_checker)
+        # Skill registry — set by main.py after construction.
         self.skill_registry = None  # Optional[SkillRegistry]
-        # Per-executor fallback GrantTracker used outside of an active run context.
-        # Runs use a context-scoped ContextVar (set via use_grant_tracker) so
-        # concurrent sub-agents are isolated automatically without push/pop bookkeeping.
-        self._default_grant_tracker: GrantTracker = GrantTracker()
-        # NOTE: _zone_paths and _zone_trackers are compat shims that expose the
-        # internal PendingConfirmations dicts for the legacy Telegram callbacks
-        # in telegram_callbacks.py (deleted in Wave 3G/4H). New code should call
+        # NOTE: _zone_paths is a compat shim that exposes the internal
+        # PendingConfirmations dict for Telegram callbacks. New code should call
         # PendingConfirmations methods or the public executor helpers instead.
         # The lock is held by PendingConfirmations for all mutations.
         # Shared context-window profiler; read by the context_profile built-in tool.
@@ -457,36 +432,6 @@ class BuiltinExecutor:
     def _zone_paths(self) -> dict[str, str]:
         """Backward-compat read-only view of token -> zone_path."""
         return self._pending_confirmations._zone_paths  # noqa: SLF001
-
-    @property
-    def _zone_trackers(self) -> dict[str, "GrantTracker"]:
-        """Backward-compat read-only view of token -> zone_tracker."""
-        return self._pending_confirmations._zone_trackers  # noqa: SLF001
-
-    @property
-    def grant_tracker(self) -> GrantTracker:
-        """Return the active GrantTracker for the current run context.
-
-        Uses a module-level ContextVar so each concurrent run (main or sub-agent)
-        gets its own isolated tracker automatically. Falls back to the executor-wide
-        default tracker when called outside of an active ``use_grant_tracker`` block.
-        """
-        active = _grant_tracker_var.get()
-        return active if active is not None else self._default_grant_tracker
-
-    @contextmanager
-    def use_grant_tracker(self, gt: GrantTracker) -> Iterator[None]:
-        """Set *gt* as the active GrantTracker for the current context.
-
-        Thread- and asyncio-safe: the tracker is bound to the current thread/task
-        context via a ContextVar, so concurrent sub-agent runs cannot see each
-        other's grants. The previous value is restored on exit.
-        """
-        token = _grant_tracker_var.set(gt)
-        try:
-            yield
-        finally:
-            _grant_tracker_var.reset(token)
 
     def shutdown(self, graceful_timeout: float = 10.0) -> None:
         """Shut down the sub-agent thread pool.
@@ -692,10 +637,9 @@ class BuiltinExecutor:
             return self._headless_confirm_bridge(tool_name, args, description, caller_tag=caller_tag)
 
         token = secrets.token_hex(12)
-        zone_tracker = self.grant_tracker if zone_path else None
         self._pending_confirmations.stage(
             token, tool_name, args,
-            zone_path=zone_path, zone_tracker=zone_tracker, scope_owner=scope_owner,
+            zone_path=zone_path, scope_owner=scope_owner,
         )
         logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
         return {
@@ -726,21 +670,6 @@ class BuiltinExecutor:
             }
 
         scope_owner = self._scope_owner_from_caller_tag(1, caller_tag)
-        if tool_name in self._coordinator.auto_approve_tools:
-            caller_ok = True
-            if self._current_prompt_id is not None and caller_tag:
-                from sub_agent_registry import get_registry as _sar_get_registry
-                _rec = _sar_get_registry().get(caller_tag.split()[0])
-                if _rec is None or _rec.prompt_id != self._current_prompt_id:
-                    caller_ok = False
-            if caller_ok:
-                logger.info(
-                    "Headless sub-agent: auto-approving '%s' (prompt-scoped approve-all)", tool_name
-                )
-                token = secrets.token_hex(12)
-                self._pending_confirmations.stage(token, tool_name, args, scope_owner=scope_owner)
-                return self.confirm(token, _emit_lifecycle=False)
-
         if self._subagent_confirm_prompt_fn is None:
             logger.warning(
                 "Headless sub-agent: Telegram bridge not wired — blocking %s (fail-closed)",
