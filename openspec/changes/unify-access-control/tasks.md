@@ -17,8 +17,8 @@
 
 ## 3. Config schema + startup wiring
 
-- [ ] 3.1 Add `[security]` section to `config_schema.py` (`prohibited_dirs: list[str]`, `allowed_dirs: list[str]`, typed dataclass fields) with validation; update `config.toml.example`
-- [ ] 3.2 Construct PathPolicy in `main.py` after XDG/vault resolution; pass to `BuiltinExecutor`/`AgentController`/nsjail builder; startup fails on construction error (delete "checker unwired" fallbacks in `files.py`)
+- [x] 3.1 Add `[security]` section to `config_schema.py` (`prohibited_dirs: list[str]`, `allowed_dirs: list[str]`, typed dataclass fields) with validation; update `config.toml.example`
+- [x] 3.2 Construct PathPolicy in `main.py` after XDG/vault resolution; pass to `BuiltinExecutor`/`AgentController`/nsjail builder; startup fails on construction error (delete "checker unwired" fallbacks in `files.py`)
 - [ ] 3.3 Update README security section (new config keys, removal of trusted dirs, new confirmation semantics)
 
 ## 4. File tools rewire
@@ -35,7 +35,7 @@
 
 ## 6. Agent dot-home + results dir
 
-- [ ] 6.1 Add dot-home bootstrap in `main.py`: create `~/.<agent>/skills/` and `~/.<agent>/results/`; one-time idempotent copy from legacy `$XDG_STATE_HOME/<agent>/skills/` (copy, legacy untouched)
+- [x] 6.1 Add dot-home bootstrap in `main.py`: create `~/.<agent>/skills/` and `~/.<agent>/results/`; one-time idempotent copy from legacy `$XDG_STATE_HOME/<agent>/skills/` (copy, legacy untouched)
 - [x] 6.2 Relocate oversized shell artifacts: `_finalize_shell_log` writes to `~/.<agent>/results/<trace-id>/` (trace ID from `trace_context`), keep `_vault_secrets` redaction, report artifact path in tool result
 - [x] 6.3 Write tests: dot-home creation, skills one-time copy idempotency, artifact relocation + redaction + path reporting, manual-clean retention (no automatic deletion anywhere)
 
