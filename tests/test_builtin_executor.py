@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _is_sensitive_path, _truncate_output
+from builtin_executor import BuiltinExecutor, _is_dangerous_shell, _truncate_output
 from builtin_tools.shell import ShellTools
 from builtin_tools.shell_env import ShellEnvTools
 
@@ -240,95 +240,32 @@ class TestShellEnv:
         assert os.environ.get("HOME") != "/tmp"
 
 
-class TestIsSensitivePath:
-    """Test sensitive path detection."""
-
-    # ---- Sensitive paths (should be flagged) ----
-
-    def test_etc_passwd(self):
-        flagged, _ = _is_sensitive_path("/etc/passwd")
-        assert flagged
-
-    def test_etc_shadow(self):
-        flagged, _ = _is_sensitive_path("/etc/shadow")
-        assert flagged
-
-    def test_etc_sudoers(self):
-        flagged, _ = _is_sensitive_path("/etc/sudoers")
-        assert flagged
-
-    def test_ssh_private_key(self):
-        flagged, _ = _is_sensitive_path("/home/user/.ssh/id_rsa")
-        assert flagged
-
-    def test_ssh_authorized_keys(self):
-        flagged, _ = _is_sensitive_path("/home/user/.ssh/authorized_keys")
-        assert flagged
-
-    def test_id_ed25519(self):
-        flagged, _ = _is_sensitive_path("/root/.ssh/id_ed25519")
-        assert flagged
-
-    def test_pem_file(self):
-        flagged, _ = _is_sensitive_path("/etc/ssl/private/server.pem")
-        assert flagged
-
-    def test_key_file(self):
-        flagged, _ = _is_sensitive_path("/etc/ssl/private/server.key")
-        assert flagged
-
-    def test_secret_file(self):
-        flagged, _ = _is_sensitive_path("/app/.secret")
-        assert flagged
-
-    def test_config_toml(self):
-        flagged, _ = _is_sensitive_path("/home/user/agent/config.toml")
-        assert flagged
-
-    def test_dotenv(self):
-        flagged, _ = _is_sensitive_path("/app/.env")
-        assert flagged
-
-    def test_secrets_yaml(self):
-        flagged, _ = _is_sensitive_path("/app/secrets.yaml")
-        assert flagged
-
-    # ---- Safe paths (should NOT be flagged) ----
-
-    def test_safe_tmp(self):
-        flagged, _ = _is_sensitive_path("/tmp/output.txt")
-        assert not flagged
-
-    def test_safe_home_file(self):
-        flagged, _ = _is_sensitive_path("/home/user/documents/notes.txt")
-        assert not flagged
-
-    def test_safe_log(self):
-        flagged, _ = _is_sensitive_path("/var/log/syslog")
-        assert not flagged
-
-    def test_safe_etc_hostname(self):
-        flagged, _ = _is_sensitive_path("/etc/hostname")
-        assert not flagged
-
-    def test_safe_public_key(self):
-        # .pub is not flagged — only private keys
-        flagged, _ = _is_sensitive_path("/home/user/.ssh/id_rsa.pub")
-        # id_rsa matches the pattern since it contains "id_rsa"
-        # This is a known conservative false positive — acceptable for security
-        assert flagged  # conservative match: "id_rsa" substring matches
-
-
 class TestFileDiff:
-    def _exec(self, make_builtin_executor, **args):
-        return make_builtin_executor().execute("file_diff", args)
+    def _exec(self, make_builtin_executor, tmp_path, **args):
+        from path_policy import PathPolicy
+
+        workspace = str(tmp_path)
+        policy = PathPolicy.create(
+            agent_name="test-agent",
+            workspace_dir=workspace,
+            downloads_dir=workspace,
+            tmp_dir="/tmp/test-agent",
+            skills_dir=workspace,
+            results_dir=os.path.join(workspace, "results"),
+            data_home=os.path.join(workspace, "xdg", "data", "test-agent"),
+            state_home=os.path.join(workspace, "xdg", "state", "test-agent"),
+            config_home=os.path.join(workspace, "xdg", "config", "test-agent"),
+            vault_path=os.path.join(workspace, "vault.toml"),
+            config_path=os.path.join(workspace, "xdg", "config", "test-agent", "config.toml"),
+        )
+        return make_builtin_executor(path_policy=policy).execute("file_diff", args)
 
     def test_identical_files(self, make_builtin_executor, tmp_path):
         a = tmp_path / "a.txt"
         b = tmp_path / "b.txt"
         a.write_text("line1\nline2\n")
         b.write_text("line1\nline2\n")
-        result = self._exec(make_builtin_executor, path_a=str(a), path_b=str(b))
+        result = self._exec(make_builtin_executor, tmp_path, path_a=str(a), path_b=str(b))
         assert result["success"] is True
         assert result["output"] == "Files are identical."
 
@@ -337,7 +274,7 @@ class TestFileDiff:
         b = tmp_path / "b.txt"
         a.write_text("line1\nline2\nline3\n")
         b.write_text("line1\nCHANGED\nline3\n")
-        result = self._exec(make_builtin_executor, path_a=str(a), path_b=str(b))
+        result = self._exec(make_builtin_executor, tmp_path, path_a=str(a), path_b=str(b))
         assert result["success"] is True
         out = result["output"]
         assert "---" in out and "+++" in out and "@@" in out
@@ -347,7 +284,7 @@ class TestFileDiff:
     def test_missing_file(self, make_builtin_executor, tmp_path):
         a = tmp_path / "a.txt"
         a.write_text("x\n")
-        result = self._exec(make_builtin_executor, path_a=str(a), path_b=str(tmp_path / "nope.txt"))
+        result = self._exec(make_builtin_executor, tmp_path, path_a=str(a), path_b=str(tmp_path / "nope.txt"))
         assert result["success"] is False
         assert result["exit_code"] == 1
         assert "File not found" in result["error"]
@@ -355,7 +292,7 @@ class TestFileDiff:
     def test_missing_arg(self, make_builtin_executor, tmp_path):
         a = tmp_path / "a.txt"
         a.write_text("x\n")
-        result = self._exec(make_builtin_executor, path_a=str(a))
+        result = self._exec(make_builtin_executor, tmp_path, path_a=str(a))
         assert result["success"] is False
         assert result["exit_code"] == -1
         assert "required" in result["error"]
@@ -365,7 +302,7 @@ class TestFileDiff:
         b = tmp_path / "b.txt"
         a.write_text("\n".join(f"l{i}" for i in range(20)) + "\n")
         b.write_text("\n".join(f"l{i}" for i in range(20)).replace("l10", "CHANGED") + "\n")
-        result = self._exec(make_builtin_executor, path_a=str(a), path_b=str(b), context_lines=1)
+        result = self._exec(make_builtin_executor, tmp_path, path_a=str(a), path_b=str(b), context_lines=1)
         assert result["success"] is True
         assert "CHANGED" in result["output"]
 

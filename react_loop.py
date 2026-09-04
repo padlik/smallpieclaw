@@ -643,63 +643,58 @@ def format_tool_result(tool_name: str, outcome: dict) -> str:
 
 def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     """Execute a vision_query built-in: ask the LLM to analyse a local image file."""
-    from builtin_tools.access_control import ZoneClassification
-    from builtin_tools.patterns import _is_sensitive_path
+    from path_policy import PathVerdict
 
     path = str(args.get("path", "")).strip()
     question = args.get("question", "What is in this image?")
     if not path:
         return {"success": False, "output": "", "error": "vision_query: 'path' argument is required."}
 
-    # Zone gate: vision_query reads a file, so apply the same gate as file_read.
+    # ADR-0026 path-policy gate: vision_query reads a file, so apply the same
+    # tier classification as file_read. This gate was ported from the legacy
+    # trusted_zone_checker + _is_sensitive_path overlay when that overlay was
+    # deleted in Wave 4.
     real_path = os.path.realpath(os.path.expanduser(path))
-    checker = ctx.trusted_zone_checker
-    needs_confirm = False
-    reason = ""
-    if checker is not None:
-        builtin = ctx.builtin_executor
-        request_grants = (
-            builtin.grant_tracker.snapshot()
-            if builtin is not None and builtin.grant_tracker is not None
-            else frozenset()
-        )
-        zone = checker.classify(
-            path, operation="read",
-            request_grants=request_grants,
-        )
-        sensitive, zone_reason = _is_sensitive_path(real_path)
-        if zone == ZoneClassification.UNRECOGNISED or sensitive:
-            needs_confirm = True
-            reason = zone_reason if sensitive else "Unrecognised zone"
-    else:
-        # Checker unwired: degrade to sensitive-only gate (same as file_read).
-        logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for vision_query")
-        sensitive, zone_reason = _is_sensitive_path(real_path)
-        if sensitive:
-            needs_confirm = True
-            reason = zone_reason
+    builtin = ctx.builtin_executor
+    if builtin is None:
+        return {
+            "success": False, "output": "",
+            "error": "vision_query: confirmation infrastructure not available.",
+        }
 
-    if needs_confirm:
-        builtin = ctx.builtin_executor
-        if builtin is None:
-            return {
-                "success": False, "output": "",
-                "error": "vision_query: confirmation infrastructure not available.",
-            }
+    policy = getattr(builtin, "path_policy", None)
+    if policy is None:
+        logger.error("PathPolicy not wired — refusing vision_query")
+        return {
+            "success": False,
+            "output": "",
+            "error": "vision_query: path policy not configured — refusing file operation",
+            "error_type": "prohibited_path",
+            "recoverable": False,
+            "suggestion": "Restart the agent with a valid configuration so the path policy is initialised.",
+        }
+
+    verdict, mode_or_reason = policy.classify(real_path, "read")
+    if verdict == PathVerdict.PROHIBITED:
+        return {
+            "success": False,
+            "output": "",
+            "error": f"vision_query: permission denied: prohibited path ({mode_or_reason})",
+            "error_type": "prohibited_path",
+            "recoverable": False,
+            "suggestion": "Use an allowed directory for image files.",
+        }
+
+    if verdict == PathVerdict.UNRECOGNISED:
         desc = f"Vision query: <code>{path}</code>"
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
-        desc += f"\n⚠️ Reason for confirmation: {reason}"
-        confirm_kwargs: dict = {
-            "caller_depth": ctx.depth,
-            "caller_tag": ctx.caller_tag,
-        }
-        # Only pass zone_path when the checker classified the path as
-        # UNRECOGNISED — not on the checker-unwired sensitive-only fallback.
-        if checker is not None:
-            confirm_kwargs["zone_path"] = real_path
+        desc += "\n⚠️ Reason for confirmation: Unrecognised zone"
         return builtin._requires_confirmation(
-            "vision_query", args, desc, **confirm_kwargs,
+            "vision_query", args, desc,
+            caller_depth=ctx.depth,
+            caller_tag=ctx.caller_tag,
+            zone_path=real_path,
         )
 
     encoded = _encode_images([path])
