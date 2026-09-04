@@ -5,12 +5,14 @@ Covers _expand_skill_paths (unit) and _run_file_read SKILL.md intercept (integra
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from unittest.mock import MagicMock
 
 from builtin_tools.access_control import GrantTracker
 from builtin_tools.files import FileTools, _expand_skill_paths
+from path_policy import PathPolicy
 from skill_registry import Skill
 
 
@@ -18,22 +20,56 @@ from skill_registry import Skill
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _make_policy(skill_dir: str) -> PathPolicy:
+    """Create a PathPolicy that allows reads under *skill_dir*."""
+    workspace = os.path.realpath(skill_dir)
+    downloads = workspace
+    data_home = os.path.join(workspace, "xdg", "data", "test-agent")
+    state_home = os.path.join(workspace, "xdg", "state", "test-agent")
+    config_home = os.path.join(workspace, "xdg", "config", "test-agent")
+    vault = os.path.join(workspace, "vault.toml")
+    config = os.path.join(config_home, "config.toml")
+    results = os.path.join(workspace, "results")
+    for d in (workspace, data_home, state_home, config_home, results):
+        os.makedirs(d, exist_ok=True)
+    with open(vault, "w") as f:
+        f.write("[secrets]\n")
+    with open(config, "w") as f:
+        f.write("\n")
+    return PathPolicy.create(
+        agent_name="test-agent",
+        workspace_dir=workspace,
+        downloads_dir=downloads,
+        tmp_dir="/tmp/test-agent",
+        skills_dir=workspace,
+        results_dir=results,
+        data_home=data_home,
+        state_home=state_home,
+        config_home=config_home,
+        vault_path=vault,
+        config_path=config,
+        logger=logging.getLogger("test"),
+    )
+
+
 def _make_ft_with_registry(skill_dir: str, skill_md_path: str) -> FileTools:
     skill = Skill(name="test-skill", description="test", path=skill_dir, skill_md_path=skill_md_path)
     registry = MagicMock()
     registry.all.return_value = [skill]
     owner = MagicMock()
     owner.skill_registry = registry
-    owner.trusted_zone_checker = None
     owner.grant_tracker = GrantTracker()
+    owner.path_policy = _make_policy(skill_dir)
+    owner._scope_owner_from_caller_tag = lambda _d, _t: None
     return FileTools(owner)
 
 
 def _make_ft_registry_none() -> FileTools:
     owner = MagicMock()
     owner.skill_registry = None
-    owner.trusted_zone_checker = None
     owner.grant_tracker = GrantTracker()
+    owner.path_policy = None
+    owner._scope_owner_from_caller_tag = lambda _d, _t: None
     return FileTools(owner)
 
 
@@ -42,8 +78,9 @@ def _make_ft_skill_not_found() -> FileTools:
     registry.all.return_value = []
     owner = MagicMock()
     owner.skill_registry = registry
-    owner.trusted_zone_checker = None
     owner.grant_tracker = GrantTracker()
+    owner.path_policy = None
+    owner._scope_owner_from_caller_tag = lambda _d, _t: None
     return FileTools(owner)
 
 

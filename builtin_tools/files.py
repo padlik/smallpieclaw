@@ -15,11 +15,11 @@ import os
 import re
 from typing import TYPE_CHECKING
 
-from builtin_tools.access_control import ZoneClassification
-from builtin_tools.patterns import _is_sensitive_path
+from path_policy import PathVerdict
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
+    from path_policy import PathPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +72,44 @@ class FileTools:
         self._owner = owner
 
     @property
-    def _checker(self):
-        """Return the TrustedZoneChecker from the owner, or None if not wired."""
-        return getattr(self._owner, "trusted_zone_checker", None)
+    def _policy(self) -> "PathPolicy | None":
+        """Return the frozen PathPolicy from the owner, or None if not wired."""
+        return getattr(self._owner, "path_policy", None)
 
-    def _request_grants(self):
-        """Return a frozenset of current request grants, or empty frozenset."""
-        gt = getattr(self._owner, "grant_tracker", None)
-        return gt.snapshot() if gt is not None else frozenset()
+    def _policy_none_error(self) -> dict:
+        """Fail-closed error when path_policy is not configured."""
+        return {
+            "success": False,
+            "output": "",
+            "error": "Path policy not configured — refusing file operation",
+            "error_type": "prohibited_path",
+            "recoverable": False,
+            "suggestion": "Restart the agent with a valid configuration so the path policy is initialised.",
+        }
+
+    def _prohibited_error(self, reason: str) -> dict:
+        """Fail-closed error for a path classified as PROHIBITED."""
+        state_home = getattr(self._owner, "_state_home", "")
+        if state_home and reason.startswith("agent state home"):
+            suggestion = (
+                "Use the dedicated built-in tools (log_query, memory_*, secret_get, schedule) "
+                "instead of direct filesystem access to agent state."
+            )
+        elif state_home and reason.startswith("agent "):
+            suggestion = "Use the dedicated built-in tools instead of direct filesystem access to agent internals."
+        else:
+            suggestion = (
+                "Limit file operations to allowed directories (e.g. the workspace). "
+                "Ask the operator to add the directory to allowed_dirs if legitimate access is needed."
+            )
+        return {
+            "success": False,
+            "output": "",
+            "error": f"Permission denied: prohibited path ({reason})",
+            "error_type": "prohibited_path",
+            "recoverable": False,
+            "suggestion": suggestion,
+        }
 
     def _resolve_skill_paths(self, content: str, path: str) -> str:
         """Resolve relative paths in SKILL.md content using the skill registry."""
@@ -96,37 +126,53 @@ class FileTools:
             skill_dir = skill.path  # skill DIRECTORY (not skill_md_path)
         return _expand_skill_paths(content, skill_dir)
 
+    def _check_grant(self, tool_name: str, real_path: str, caller_depth: int, caller_tag: str) -> bool:
+        """Return True when a standing GrantLedger grant covers this path.
+
+        The ledger is owned by the depth-0 ConfirmationManager wired as the
+        executor's ``_coordinator``.  When no coordinator is wired (tests,
+        ad-hoc callers) we conservatively report no grant.
+        """
+        coordinator = getattr(self._owner, "_coordinator", None)
+        if coordinator is None:
+            return False
+        ledger = getattr(coordinator, "grant_ledger", None)
+        if ledger is None:
+            return False
+        scope_owner = self._owner._scope_owner_from_caller_tag(caller_depth, caller_tag)
+        grant_dir = os.path.dirname(real_path)
+        return ledger.check(tool_name, grant_dir, scope_owner=scope_owner)
+
     # ---- zone gate helper ----
 
     def _gate(
-        self, path: str, real_path: str, operation: str, tool_name: str,
+        self, real_path: str, operation: str, tool_name: str,
         args: dict, desc: str, *, caller_depth: int, caller_tag: str,
-        sensitive: bool,
     ) -> dict | None:
-        """Zone-gate a single-path file operation (checker-wired path only).
+        """Path-policy gate for a single-path file operation.
 
-        Classifies *path* via the trusted-zone checker and stages a
-        confirmation request when the zone is ``UNRECOGNISED`` or the path
-        is sensitive.  Returns a confirmation dict if confirmation is
-        required, or ``None`` if the operation should proceed.  The caller
-        is responsible for the checker-unwired fallback.
+        Classifies *real_path* via the owner's frozen ``PathPolicy`` and:
+
+        * ``PROHIBITED`` -> returns a fail-closed error dict.
+        * ``ALLOWED``     -> returns ``None`` so the caller proceeds.
+        * ``UNRECOGNISED`` -> stages a confirmation request (``zone_path`` set
+          to *real_path*) and returns the confirmation dict.
+
+        The caller must handle ``path_policy is None`` before calling this
+        helper.
         """
-        checker = self._checker
-        if checker is None:
-            return None
-        zone = checker.classify(
-            path, operation=operation, request_grants=self._request_grants(),
-        )
-        if zone == ZoneClassification.UNRECOGNISED:
+        policy = self._policy
+        assert policy is not None
+        verdict, mode_or_reason = policy.classify(real_path, operation)
+        if verdict == PathVerdict.PROHIBITED:
+            return self._prohibited_error(mode_or_reason)
+        if verdict == PathVerdict.UNRECOGNISED:
+            if self._check_grant(tool_name, real_path, caller_depth, caller_tag):
+                return None
             return self._owner._requires_confirmation(
                 tool_name, args, desc,
                 caller_depth=caller_depth, caller_tag=caller_tag,
                 zone_path=real_path,
-            )
-        if sensitive:
-            return self._owner._requires_confirmation(
-                tool_name, args, desc,
-                caller_depth=caller_depth, caller_tag=caller_tag,
             )
         return None
 
@@ -139,26 +185,22 @@ class FileTools:
 
         real_path = os.path.realpath(os.path.expanduser(path))
         args["_resolved_path"] = real_path
-        sensitive, reason = _is_sensitive_path(real_path)
 
         desc = f"Read file: <code>{path}</code>"
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
-        if sensitive:
-            desc += f"\n⚠️ Reason: {reason}"
 
-        if self._checker is not None:
-            gated = self._gate(path, real_path, "read", "file_read", args, desc,
-                               caller_depth=caller_depth, caller_tag=caller_tag,
-                               sensitive=sensitive)
-            if gated is not None:
-                return gated
-            return self._run_file_read(args, caller_tag=caller_tag)
+        policy = self._policy
+        if policy is None:
+            logger.error("PathPolicy not wired — refusing file_read")
+            return self._policy_none_error()
 
-        # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
-        logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_read")
-        if sensitive:
-            return self._owner._requires_confirmation("file_read", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
+        gated = self._gate(
+            real_path, "read", "file_read", args, desc,
+            caller_depth=caller_depth, caller_tag=caller_tag,
+        )
+        if gated is not None:
+            return gated
         return self._run_file_read(args, caller_tag=caller_tag)
 
     def _run_file_read(self, args: dict, caller_tag: str = "") -> dict:
@@ -238,67 +280,52 @@ class FileTools:
             context_lines = 0
         logger.info("Built-in file_diff: %s <-> %s (context=%d)", path_a, path_b, context_lines)
 
-        checker = self._checker
-        if checker is not None:
-            real_path_a = os.path.realpath(os.path.expanduser(path_a))
-            real_path_b = os.path.realpath(os.path.expanduser(path_b))
-            args["_resolved_path_a"] = real_path_a
-            args["_resolved_path_b"] = real_path_b
-            grants = self._request_grants()
-            zone_a = checker.classify(path_a, operation="read", request_grants=grants)
-            zone_b = checker.classify(path_b, operation="read", request_grants=grants)
-            sensitive_a, reason_a = _is_sensitive_path(real_path_a)
-            sensitive_b, reason_b = _is_sensitive_path(real_path_b)
+        policy = self._policy
+        if policy is None:
+            logger.error("PathPolicy not wired — refusing file_diff")
+            return self._policy_none_error()
 
-            # Prefer the actually-unrecognised path for zone_path so zone buttons grant the right dir
-            unrecognised_path = None
-            if zone_b == ZoneClassification.UNRECOGNISED:
-                unrecognised_path = real_path_b
-            elif zone_a == ZoneClassification.UNRECOGNISED:
-                unrecognised_path = real_path_a
+        real_path_a = os.path.realpath(os.path.expanduser(path_a))
+        real_path_b = os.path.realpath(os.path.expanduser(path_b))
+        args["_resolved_path_a"] = real_path_a
+        args["_resolved_path_b"] = real_path_b
 
-            needs_confirm = unrecognised_path is not None
-            needs_sensitive_confirm = (
-                not needs_confirm and (sensitive_a or sensitive_b)
-            )
+        verdict_a, reason_a = policy.classify(real_path_a, "read")
+        verdict_b, reason_b = policy.classify(real_path_b, "read")
 
-            if needs_confirm or needs_sensitive_confirm:
-                diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
-                if real_path_a != path_a:
-                    diff_desc += f"\n(→ <code>{real_path_a}</code>)"
-                if real_path_b != path_b:
-                    diff_desc += f"\n(→ <code>{real_path_b}</code>)"
-                if sensitive_a:
-                    diff_desc += f"\n⚠️ {path_a}: {reason_a}"
-                if sensitive_b:
-                    diff_desc += f"\n⚠️ {path_b}: {reason_b}"
-                return self._owner._requires_confirmation(
-                    "file_diff", args, diff_desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                    zone_path=unrecognised_path or "",
-                )
-        else:
-            # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
-            logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_diff")
-            real_path_a = os.path.realpath(os.path.expanduser(path_a))
-            real_path_b = os.path.realpath(os.path.expanduser(path_b))
-            args["_resolved_path_a"] = real_path_a
-            args["_resolved_path_b"] = real_path_b
-            sensitive_a, reason_a = _is_sensitive_path(real_path_a)
-            sensitive_b, reason_b = _is_sensitive_path(real_path_b)
-            if sensitive_a or sensitive_b:
-                diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
-                if sensitive_a:
-                    diff_desc += f"\n⚠️ {path_a}: {reason_a}"
-                if sensitive_b:
-                    diff_desc += f"\n⚠️ {path_b}: {reason_b}"
-                return self._owner._requires_confirmation(
-                    "file_diff", args, diff_desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                )
+        if verdict_a == PathVerdict.PROHIBITED:
+            return self._prohibited_error(reason_a)
+        if verdict_b == PathVerdict.PROHIBITED:
+            return self._prohibited_error(reason_b)
 
-        # Zone-gated: now safe to access filesystem
-        return self._run_file_diff(args, caller_tag=caller_tag)
+        if verdict_a == PathVerdict.ALLOWED and verdict_b == PathVerdict.ALLOWED:
+            return self._run_file_diff(args, caller_tag=caller_tag)
+
+        # One or both paths are UNRECOGNISED.  Need a grant for every
+        # unrecognised side; if all are granted, proceed.  Otherwise stage one
+        # confirmation (prefer path_b for zone_path) that, on approval, grants
+        # the missing directory.
+        unrecognised_paths = [
+            p for p, v in ((real_path_a, verdict_a), (real_path_b, verdict_b))
+            if v == PathVerdict.UNRECOGNISED
+        ]
+        if all(
+            self._check_grant("file_diff", p, caller_depth, caller_tag)
+            for p in unrecognised_paths
+        ):
+            return self._run_file_diff(args, caller_tag=caller_tag)
+
+        unrecognised_path = real_path_b if verdict_b == PathVerdict.UNRECOGNISED else real_path_a
+        diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
+        if real_path_a != path_a:
+            diff_desc += f"\n(→ <code>{real_path_a}</code>)"
+        if real_path_b != path_b:
+            diff_desc += f"\n(→ <code>{real_path_b}</code>)"
+        return self._owner._requires_confirmation(
+            "file_diff", args, diff_desc,
+            caller_depth=caller_depth, caller_tag=caller_tag,
+            zone_path=unrecognised_path,
+        )
 
     def _run_file_diff(self, args: dict, caller_tag: str = "") -> dict:
         """Execute file_diff after zone gate has passed."""
@@ -355,21 +382,19 @@ class FileTools:
         args["_resolved_path"] = real_path
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
-        sensitive, _ = _is_sensitive_path(real_path)
-        if sensitive:
-            desc += "\n⚠️ Sensitive file"
 
-        if self._checker is not None:
-            gated = self._gate(path, real_path, "write", "file_write", args, desc,
-                               caller_depth=caller_depth, caller_tag=caller_tag,
-                               sensitive=sensitive)
-            if gated is not None:
-                return gated
-            return self._run_file_write(args, caller_tag=caller_tag)
+        policy = self._policy
+        if policy is None:
+            logger.error("PathPolicy not wired — refusing file_write")
+            return self._policy_none_error()
 
-        # Fallback: no checker — always confirm
-        logger.error("Zone: trusted_zone_checker not wired — always confirming file_write")
-        return self._owner._requires_confirmation("file_write", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
+        gated = self._gate(
+            real_path, "write", "file_write", args, desc,
+            caller_depth=caller_depth, caller_tag=caller_tag,
+        )
+        if gated is not None:
+            return gated
+        return self._run_file_write(args, caller_tag=caller_tag)
 
     def _run_file_write(self, args: dict, caller_tag: str = "") -> dict:
         path = args.get("_resolved_path") or str(args.get("path", "")).strip()
@@ -433,10 +458,6 @@ class FileTools:
         # FIX 2: realpath + zone classification BEFORE any file read (content oracle fix)
         real_path = os.path.realpath(os.path.expanduser(path))
         args["_resolved_path"] = real_path
-        checker = self._checker
-        zone = None
-        if checker is not None:
-            zone = checker.classify(path, operation="write", request_grants=self._request_grants())
 
         # Build confirmation description from args only — no file read before confirm
         old_lines = old_str.splitlines()
@@ -452,34 +473,30 @@ class FileTools:
             f"Patch file: <code>{path}</code>{replace_note}\n"
             f"{removed}\n{added}"
         )
-        sensitive, _ = _is_sensitive_path(real_path)
-        if sensitive:
-            desc += "\n⚠️ Sensitive file"
-        if checker is not None and real_path != path:
+        if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
 
-        # FIX 2: stage confirmation before any file read for UNRECOGNISED zone
-        if checker is not None:
-            if zone == ZoneClassification.UNRECOGNISED:
+        policy = self._policy
+        if policy is None:
+            logger.error("PathPolicy not wired — refusing file_patch")
+            return self._policy_none_error()
+
+        verdict, reason = policy.classify(real_path, "write")
+        if verdict == PathVerdict.PROHIBITED:
+            return self._prohibited_error(reason)
+        if verdict == PathVerdict.UNRECOGNISED:
+            if not self._check_grant("file_patch", real_path, caller_depth, caller_tag):
+                # FIX 2: stage confirmation before any file read for UNRECOGNISED zone
                 return self._owner._requires_confirmation(
                     "file_patch", args, desc,
                     caller_depth=caller_depth, caller_tag=caller_tag,
                     zone_path=real_path,
                 )
-            if sensitive:
-                return self._owner._requires_confirmation(
-                    "file_patch", args, desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                )
-            # Auto-allowed: TRUSTED, REQUEST_GRANT
-            if not os.path.exists(path):
-                return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
-            return self._run_file_patch(args, caller_tag=caller_tag)
 
-        # No checker: check existence then always confirm
+        # ALLOWED or grant-covered: check existence, then patch
         if not os.path.exists(path):
             return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
-        return self._owner._requires_confirmation("file_patch", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
+        return self._run_file_patch(args, caller_tag=caller_tag)
 
     def _run_file_patch(self, args: dict, caller_tag: str = "") -> dict:
         path = args.get("_resolved_path") or str(args.get("path", "")).strip()
@@ -542,30 +559,24 @@ class FileTools:
 
         real_path = os.path.realpath(path)
         args["_resolved_path"] = real_path
-        sensitive, reason = _is_sensitive_path(real_path)
 
         desc = f"Send file: <code>{path}</code>"
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
-        if sensitive:
-            desc += f"\n⚠️ {reason}"
 
-        if self._checker is not None:
-            gated = self._gate(path, real_path, "read", "file_send", args, desc,
-                               caller_depth=caller_depth, caller_tag=caller_tag,
-                               sensitive=sensitive)
-            if gated is not None:
-                return gated
-        else:
-            # checker unwired: reads degrade to sensitive-only gate (writes fail closed)
-            logger.error("Zone: trusted_zone_checker not wired — falling back to sensitive-only gate for file_send")
-            if sensitive:
-                return self._owner._requires_confirmation(
-                    "file_send", args, desc,
-                    caller_depth=caller_depth, caller_tag=caller_tag,
-                )
+        policy = self._policy
+        if policy is None:
+            logger.error("PathPolicy not wired — refusing file_send")
+            return self._policy_none_error()
 
-        # Zone-gated: now safe to access filesystem
+        gated = self._gate(
+            real_path, "read", "file_send", args, desc,
+            caller_depth=caller_depth, caller_tag=caller_tag,
+        )
+        if gated is not None:
+            return gated
+
+        # Allowed or granted: now safe to access filesystem
         return self._run_file_send(args, caller_tag=caller_tag)
 
     def _run_file_send(self, args: dict, caller_tag: str = "") -> dict:

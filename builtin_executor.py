@@ -49,7 +49,6 @@ from builtin_tools.files import FileTools
 from builtin_tools.memory import MemoryTools
 from builtin_tools.patterns import (
     _is_dangerous_shell,  # noqa: F401  re-exported for tests
-    _is_sensitive_path,  # noqa: F401  re-exported for tests
 )
 from builtin_tools.schedule import exec_schedule
 from builtin_tools.secrets_log import LogQueryTools, SecretsTools

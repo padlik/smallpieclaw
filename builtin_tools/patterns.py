@@ -25,23 +25,6 @@ _DANGEROUS_SHELL_PATTERNS: list[tuple[str, str, str]] = [
     (r"\bnc\s+-e\b", "netcat reverse shell", "network"),
 ]
 
-_SENSITIVE_PATH_PATTERNS: list[str] = [
-    r"/etc/passwd",
-    r"/etc/shadow",
-    r"/etc/sudoers",
-    r"\.ssh/id_",
-    r"\.ssh/authorized_keys",
-    r"id_rsa",
-    r"id_ecdsa",
-    r"id_ed25519",
-    r"\.pem$",
-    r"\.key$",
-    r"\.secret",
-    r"config\.toml$",
-    r"\.env$",
-    r"secrets\.",
-]
-
 
 def _is_dangerous_shell(command: str) -> tuple[bool, str, str]:
     """Return (is_dangerous, reason, category).
@@ -54,11 +37,3 @@ def _is_dangerous_shell(command: str) -> tuple[bool, str, str]:
         if re.search(pattern, command, re.IGNORECASE):
             return True, reason, category
     return False, "", ""
-
-
-def _is_sensitive_path(path: str) -> tuple[bool, str]:
-    """Return (is_sensitive, reason). Check path against sensitive file patterns."""
-    for pattern in _SENSITIVE_PATH_PATTERNS:
-        if re.search(pattern, path, re.IGNORECASE):
-            return True, f"matches sensitive pattern: {pattern}"
-    return False, ""
