@@ -1,4 +1,10 @@
-## ADDED Requirements
+# nsjail-shell-sandboxing Specification
+
+## Purpose
+
+The jail's mount table is derived from the PathPolicy tiers and built once per session; the session-logs read-only mount is removed (logs are served by the SQLite store via `log_query`). Execution-plane isolation semantics (namespaces, cgroups, env, DNS/TLS, network) are unchanged.
+
+## Requirements
 
 ### Requirement: nsjail shell backend provides kernel-level isolation
 
@@ -32,40 +38,58 @@ Rule: The nsjail backend is opt-in via config. It is Linux-only. On macOS or whe
 - **THEN** the path is not found (No such file or directory)
 - **AND** the host filesystem outside mounted paths is inaccessible
 
+### Requirement: Mount table is derived from PathPolicy and built once per session
+
+The jail mount table MUST be derived exclusively from the frozen PathPolicy: Tier 1 entries (workspace rw, downloads rw, `/tmp/<agent_name>` rw, `~/.<agent>/skills` r, `~/.<agent>/results` rw) plus Tier 2 operator `allowed_dirs` (rw), minus Tier 0 overlap. The generated nsjail config MUST be built once at session start and reused for every shell call in the session (no per-call rebuilds, no per-call store reads); only the per-call parts (command, `-E` env injection, `time_limit`) vary between calls. An allowed dir that contains a prohibited path MUST NOT be mounted (no partial bind mounts) — its file-plane behavior remains as configured, and the conflict is reported once at startup by PathPolicy validation.
+
+Feature: nsjail-shell-sandboxing
+Rule: One config per session. The mount table has a single auditable answer: "what can the jail see this session".
+
+#### Scenario: Config is generated once and reused
+- **GIVEN** the nsjail backend is active
+- **WHEN** two shell calls execute in the same session
+- **THEN** both run against the same generated nsjail config (mount section identical)
+- **AND** no per-call trusted-store reads occur
+
+#### Scenario: Allowed dir containing a prohibited path is not mounted
+- **GIVEN** `allowed_dirs = ["~/work"]` and `~/work/keys` is prohibited
+- **WHEN** the session's nsjail config is generated
+- **THEN** `~/work` does not appear in the mount table
+- **AND** a startup warning described the conflict (PathPolicy validation)
+- **AND** the jail still mounts all other Tier 1 entries (the jail is never silently reduced to no mounts beyond plumbing)
+
+#### Scenario: Skills and results mounts come from Tier 1
+- **GIVEN** the nsjail backend is active
+- **WHEN** the session config is generated
+- **THEN** `~/.<agent>/skills` is mounted `rw: false` and `~/.<agent>/results` is mounted `rw: true`, both at their real host paths
+
 ### Requirement: Trusted directories are mounted at their original host paths
 
-Trusted directories from `trusted_dirs.json` (managed by `/dir` commands) MUST be bind-mounted at their original host paths inside the jail. Directories with `mode: "rw"` are mounted read-write; directories with `mode: "r"` are mounted read-only. Paths under `/home` are accepted — the blanket `/home` block has been removed. Sensitive subdirs (`~/.ssh`, `~/.local`, `~/.config`, `~/.gnupg`) remain blocked by the targeted user-prefix blocklist.
+Operator extended directories from the static config `[security] allowed_dirs` MUST be bind-mounted at their original host paths inside the jail, read-write (rw-only — no mode syntax exists in config). Tier 1 agent-controlled directories are mounted per their hardcoded modes (skills read-only, results/workspace/downloads/tmp read-write). Paths whose classification is PROHIBITED are never mounted. The three user-prefix/system blocklist tuples are removed from the builder — their job moved to PathPolicy construction-time validation, so the builder performs no path filtering of its own beyond receiving the already-validated mount set.
 
 Feature: nsjail-shell-sandboxing
 
-#### Scenario: RW trusted dir is writable inside jail
-- **GIVEN** `/home/user/.cache` is a trusted directory with `mode: "rw"`
-- **WHEN** the agent runs `shell("echo data > /home/user/.cache/file.txt")` inside the jail
-- **THEN** the file is written to the host filesystem at `/home/user/.cache/file.txt`
+#### Scenario: RW allowed dir is writable inside jail
+- **GIVEN** `/home/user/projects` is in `[security] allowed_dirs`
+- **WHEN** the agent runs `shell("echo data > /home/user/projects/file.txt")` inside the jail
+- **THEN** the file is written to the host filesystem at `/home/user/projects/file.txt`
 
-#### Scenario: RO trusted dir is read-only inside jail
-- **GIVEN** `/srv/archive` is a trusted directory with `mode: "r"`
-- **WHEN** the agent runs `shell("echo data > /srv/archive/file.txt")` inside the jail
-- **THEN** the write fails with a permission error
-- **AND** no file is created on the host
+#### Scenario: Prohibited path is not mounted under any circumstances
+- **GIVEN** `~/.ssh` is a Tier 0 prohibited entry
+- **WHEN** the session nsjail config is generated
+- **THEN** no mount entry exposes `~/.ssh` inside the jail
+- **AND** no config field can cause it to be mounted
 
-#### Scenario: Trusted dir changes are reflected in jail config
-- **GIVEN** the operator adds `/new/dir` via `/dir add` during a session
-- **WHEN** the next shell call generates an nsjail config
-- **THEN** `/new/dir` appears as a mount entry in the config
-- **AND** the directory is accessible inside the jail at its original path
+#### Scenario: Config change requires a restart to affect mounts
+- **GIVEN** the operator edits `[security] allowed_dirs` while the agent is running
+- **WHEN** subsequent shell calls execute in the same session
+- **THEN** the mount table is unchanged (PathPolicy and the config are session-static)
+- **AND** the new dir becomes mounted after agent restart
 
 #### Scenario: Trusted dir under /home is accepted
-- **GIVEN** `/home/user/projects/myproject` is a trusted directory with `mode: "rw"`
-- **WHEN** the nsjail config is generated
+- **GIVEN** `/home/user/projects/myproject` is in `allowed_dirs`
+- **WHEN** the session nsjail config is generated
 - **THEN** the directory is mounted read-write inside the jail at its original path
-- **AND** no "restricted system path" warning is logged
-
-#### Scenario: Sensitive subdir under /home is rejected
-- **GIVEN** `~/.ssh` is listed in `trusted_dirs.json`
-- **WHEN** the nsjail config is generated
-- **THEN** the directory is NOT mounted inside the jail
-- **AND** a warning is logged that the path is a restricted user path
 
 ### Requirement: Per-session /tmp persists across nsjail invocations
 
@@ -85,7 +109,7 @@ A per-session temp directory (created at agent startup, cleaned up at agent shut
 
 ### Requirement: Agent's default temp directory is bind-mounted into the jail at its real host path
 
-The nsjail config MUST bind-mount `/tmp/{agent_name}` (`agent_name` = `app_cfg.agent.agent_name`, which always has a config default) read-write inside the jail at its real host path (`src == dst`, `is_bind: true`, `rw: true`, `mandatory: true`). There is no other way to configure this path — it is not derived from any separately-overridable setting. The mount MUST be emitted immediately after the existing per-session `/tmp` scratch mount, so it is not shadowed. This is a system mount, like the `session_logs_dir` mount — it does not require operator approval and is not validated against the trusted-directory blocklist. The directory is guaranteed to exist by agent startup (before the shell tool is ever invoked); `mandatory: true` means a shell call fails loudly if that guarantee is somehow violated, rather than silently degrading.
+The nsjail config MUST bind-mount `/tmp/{agent_name}` (`agent_name` = `app_cfg.agent.agent_name`, which always has a config default) read-write inside the jail at its real host path (`src == dst`, `is_bind: true`, `rw: true`, `mandatory: true`). There is no other way to configure this path — it is not derived from any separately-overridable setting. The mount MUST be emitted immediately after the existing per-session `/tmp` scratch mount, so it is not shadowed. This is a Tier 1 agent-controlled system mount (see `path-policy`) — it does not require operator approval and is not subject to any blocklist, because the mount table is derived from the already-validated PathPolicy tiers. The directory is guaranteed to exist by agent startup (before the shell tool is ever invoked); `mandatory: true` means a shell call fails loudly if that guarantee is somehow violated, rather than silently degrading.
 
 Feature: nsjail-shell-sandboxing
 Rule: The mount closes the stuck-loop bug where a sandboxed script writes results to the agent's default temp directory but the jail boundary makes them invisible to `file_read` outside.
@@ -114,22 +138,22 @@ Rule: The mount closes the stuck-loop bug where a sandboxed script writes result
 
 ### Requirement: nsjail config is generated dynamically per shell call
 
-The nsjail config MUST be generated as a tempfile per shell call, combining static parts (namespaces, system mounts, base envars) with dynamic parts (time_limit, cwd, trusted mounts, /tmp mount, command). The config MUST set `cwd` to `/tmp` (the session tmpdir). The tempfile MUST be deleted after the command completes.
+The static parts of the nsjail config (namespaces, system mounts, base envars, tier-derived mounts, limits) MUST be generated once per session and cached; the per-call parts (command as exec target, `time_limit`, `-E` env flags) MUST be supplied per shell call. The per-call parts MUST set `cwd` to `/tmp` (the session tmpdir). Any config tempfile created per call (for the per-call command block) MUST be deleted after the command completes.
 
-#### Scenario: Config includes per-call timeout and command
+#### Scenario: Per-call parts include timeout and command
 - **GIVEN** the nsjail backend is active
 - **WHEN** the agent calls `shell("make test", timeout=60)`
-- **THEN** the generated nsjail config contains `time_limit: 60`
-- **AND** the config contains the command as the exec target
+- **THEN** the per-call invocation uses `time_limit: 60` and the command as the exec target
+- **AND** the session-static mount section is identical to the previous call's
 
 #### Scenario: Config sets cwd to /tmp
 - **GIVEN** the nsjail backend is active
 - **WHEN** the agent calls `shell("pwd")`
 - **THEN** the output is `/tmp`
-- **AND** the generated nsjail config contains `cwd: "/tmp"`
+- **AND** the invocation uses `cwd: "/tmp"`
 
-#### Scenario: Config tempfile is cleaned up after execution
-- **GIVEN** the nsjail backend generates a config tempfile for a shell call
+#### Scenario: Per-call tempfile is cleaned up after execution
+- **GIVEN** the nsjail backend generates a per-call config tempfile
 - **WHEN** the shell command completes (success, failure, or timeout)
 - **THEN** the tempfile is deleted from the filesystem
 
@@ -235,38 +259,6 @@ The nsjail config MUST set `keep_env: false` — the shell does NOT inherit the 
 - **GIVEN** the agent has called `shell_env_set("TMPDIR", "/custom/tmp")`
 - **WHEN** the agent runs `shell("echo $TMPDIR")` inside the jail
 - **THEN** the output is `/custom/tmp` (the `-E` flag overrides the config `envar`, same as any other base envar)
-
-### Requirement: session_logs folder is mounted read-only inside the jail
-
-When the nsjail shell backend is active and a `session_logs_dir` is provided (non-empty and the directory exists), the active conversation's `session_logs` folder MUST be bind-mounted read-only inside the jail at the same host path (`src == dst`, `is_bind: true`, `rw: false`, `mandatory: false`). This is a system mount, not a trusted-directory mount — it is not subject to the trusted-directory blocklist and does not require operator approval. If `session_logs_dir` is empty or the directory does not exist, the mount is skipped (graceful degradation). The `NsjailConfigBuilder.build()` method receives `session_logs_dir` as a per-call kwarg; the builder remains stateless.
-
-Feature: nsjail-shell-sandboxing
-Rule: The agent writes outside the jail; sandboxed shell commands read inside the jail. Read-only — a sandboxed script cannot write to or fill disk in session_logs.
-
-#### Scenario: session_logs folder is mounted read-only at its host path
-- **GIVEN** the nsjail backend is active and `session_logs_dir` is `~/.local/state/myagent/session_logs/abc123def456`
-- **AND** the directory exists
-- **WHEN** the nsjail config is generated
-- **THEN** the config contains a mount entry with `src` and `dst` both set to the host path
-- **AND** `is_bind: true`, `rw: false`, `mandatory: false`
-
-#### Scenario: Shell can read a prior large output inside the jail
-- **GIVEN** the nsjail backend is active and the session_logs folder is mounted
-- **AND** a prior shell call saved a large output to `~/.local/state/myagent/session_logs/abc123def456/shell-xxx.log`
-- **WHEN** the agent runs `shell("cat ~/.local/state/myagent/session_logs/abc123def456/shell-xxx.log")` inside the jail
-- **THEN** the command succeeds and returns the saved output
-
-#### Scenario: Shell cannot write to session_logs inside the jail
-- **GIVEN** the nsjail backend is active and the session_logs folder is mounted read-only
-- **WHEN** the agent runs `shell("echo data > ~/.local/state/myagent/session_logs/abc123def456/evil.log")` inside the jail
-- **THEN** the write fails with a permission error
-- **AND** no file is created on the host
-
-#### Scenario: Empty session_logs_dir skips the mount
-- **GIVEN** the nsjail backend is active but `session_logs_dir` is an empty string
-- **WHEN** the nsjail config is generated
-- **THEN** no session_logs mount entry appears in the config
-- **AND** the jail starts normally
 
 ### Requirement: System CA certificate store is mounted read-only when networking is enabled
 

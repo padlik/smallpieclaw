@@ -8,53 +8,72 @@ Define how `skills_dir` is mounted inside the nsjail sandbox. `skills_dir` is an
 
 ### Requirement: skills_dir is mounted read-only inside the nsjail sandbox
 
-When the `skills_dir` directory exists on the host filesystem and is not a blocked sensitive **system** path, the nsjail config builder MUST emit a read-only bind-mount entry for it inside the sandbox. This makes skill scripts and binaries referenced in the system prompt's AVAILABLE SKILLS section accessible to shell commands running inside the jail. The `skills_dir` is an XDG-derived path `$XDG_STATE_HOME/<agent_name>/skills/`; it is not a user-configurable config field. The mount MUST be skipped silently (with a debug log) if the directory does not exist. The mount MUST be skipped with a warning log if the path is a blocked sensitive **system** path (`/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/usr`, `/root`, `/var`, `/run`). The mount is **exempt** from the user-home prefix blocklist (`~/.ssh`, `~/.local`, `~/.config`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.cache`) because `skills_dir` is mounted read-only (`rw: false`) and the blocklist was designed to prevent sensitive read-write trusted-dir mounts. This allows `skills_dir` under common XDG-style paths (e.g. `~/.local/state/piclaw/skills/`) to be mounted read-only inside the jail.
+When the skills directory exists on the host filesystem, the nsjail config builder MUST emit a read-only bind-mount entry for it inside the sandbox. The skills directory is `~/.<agent_name>/skills/` — a Tier 1 agent-controlled entry in PathPolicy (hardcoded, operator cannot modify, read-only). The mount MUST be skipped silently (with a debug log) if the directory does not exist. Because skills is a hardcoded Tier 1 entry whose path is fixed relative to the agent dot-home, no blocklist interaction exists: the path cannot collide with Tier 0 by construction, and no exemption logic is needed.
 
 Feature: skills-dir-sandbox-mount
-Rule: `skills_dir` uses the XDG-derived path `$XDG_STATE_HOME/<agent_name>/skills/`; it is not configurable.
+Rule: `skills_dir` is `~/.<agent_name>/skills/` — hardcoded Tier 1, read-only, outside the XDG homes. It is not configurable.
 
 #### Scenario: Skill script is executable inside the jail
-- **GIVEN** the agent has a `skills/` directory at `~/.local/state/piclaw/skills/` containing an executable script `deploy.sh`
-- **AND** `skills_dir` derives from XDG state: `$XDG_STATE_HOME/<agent_name>/skills/`
-- **WHEN** the agent runs `shell("~/.local/state/piclaw/skills/deploy.sh")` inside the nsjail sandbox
+- **GIVEN** the agent has a `skills/` directory at `~/.piclaw/skills/` containing an executable script `deploy.sh`
+- **WHEN** the agent runs `shell("~/.piclaw/skills/deploy.sh")` inside the nsjail sandbox
 - **THEN** the command executes successfully
 - **AND** the script output is returned to the agent
 
 #### Scenario: Skill directory is read-only inside the jail
-- **GIVEN** the `skills_dir` is mounted inside the nsjail sandbox
-- **WHEN** the agent runs `shell("echo hacked > /home/user/.agents/skills/deploy.sh")` inside the jail
+- **GIVEN** the skills dir is mounted inside the nsjail sandbox
+- **WHEN** the agent runs `shell("echo hacked > ~/.piclaw/skills/deploy.sh")` inside the jail
 - **THEN** the write fails with a permission error
 - **AND** the original file on the host is unchanged
 
 #### Scenario: Missing skills_dir is skipped gracefully
-- **GIVEN** the XDG-derived `skills_dir` does not exist on the host filesystem
-- **WHEN** the nsjail config is generated for a shell command
-- **THEN** no mount entry for `skills_dir` is emitted
+- **GIVEN** `~/.<agent>/skills/` does not exist on the host filesystem
+- **WHEN** the session nsjail config is generated
+- **THEN** no mount entry for skills is emitted
 - **AND** a debug log records that the directory was skipped
-- **AND** the shell command proceeds without error
+- **AND** shell commands proceed without error
 
-#### Scenario: skills_dir uses the XDG-derived path
-- **GIVEN** `agent_name` is `"piclaw"` and there is no `skills_dir` config parameter in `[paths]`
-- **AND** `$XDG_STATE_HOME` is `~/.local/state`
-- **WHEN** the nsjail config is generated
-- **THEN** the mount entry points to `~/.local/state/piclaw/skills/`
+#### Scenario: skills_dir uses the agent dot-home path
+- **GIVEN** `agent_name` is `"piclaw"` and there is no `skills_dir` config parameter
+- **WHEN** the session nsjail config is generated
+- **THEN** the mount entry points to `~/.piclaw/skills/`
 - **AND** the directory is accessible inside the jail at the same host path
 
+#### Scenario: skills_dir uses the XDG-derived path
+- **GIVEN** `agent_name` is `"piclaw"` and there is no `skills_dir` config parameter
+- **WHEN** the session nsjail config is generated
+- **THEN** the mount entry points to `~/.piclaw/skills/` (agent dot-home, not the XDG state home)
+- **AND** the legacy XDG-derived path `~/.local/state/piclaw/skills/` is NOT mounted directly
+
 #### Scenario: skills_dir under /home is accepted
-- **GIVEN** `skills_dir` resolves to `/home/user/.agents/skills`
-- **WHEN** the nsjail config is generated
+- **GIVEN** the agent dot-home skills dir resolves to `~/.piclaw/skills/` (under `/home/<user>`)
+- **WHEN** the session nsjail config is generated
 - **THEN** the directory is mounted read-only inside the jail
 - **AND** no "restricted system path" warning is logged
 
 #### Scenario: skills_dir on a blocked system path is rejected
-- **GIVEN** `skills_dir` resolves to `/etc/skills` (under a blocked system prefix)
-- **WHEN** the nsjail config is generated
-- **THEN** no mount entry for `skills_dir` is emitted
-- **AND** a warning is logged that the path is a restricted system path
+- **GIVEN** `skills_dir` is hardcoded to `~/.<agent>/skills/` which is always under the user home
+- **WHEN** the session nsjail config is generated
+- **THEN** the path is never on a blocked system prefix (e.g. `/etc`, `/usr`) by construction
+- **AND** no rejection or skip occurs for the skills mount
 
 #### Scenario: skills_dir under a blocked user-home prefix is accepted
-- **GIVEN** `skills_dir` resolves to `~/.local/share/agent/skills` (under a blocked user prefix)
-- **WHEN** the nsjail config is generated
-- **THEN** the directory is mounted read-only inside the jail
-- **AND** no "restricted path" warning is logged
+- **GIVEN** the skills dir at `~/.<agent>/skills/` is a hardcoded Tier 1 entry in PathPolicy
+- **WHEN** the session nsjail config is generated
+- **THEN** the directory is mounted read-only inside the jail regardless of XDG prefix overlap
 - **AND** the mount entry has `rw: false`
+
+### Requirement: Skills migrate one-time from the XDG state home on first run
+
+On startup, if `~/.<agent>/skills/` does not exist (or is empty) and the legacy XDG-derived skills directory (`$XDG_STATE_HOME/<agent_name>/skills/`) exists and is non-empty, the system MUST copy the legacy directory contents into `~/.<agent>/skills/` before PathPolicy construction and MUST leave the legacy directory untouched (copy, not move). The copy MUST be idempotent (subsequent startups skip it when the target is populated).
+
+#### Scenario: First run copies legacy skills
+- **GIVEN** `~/.local/state/piclaw/skills/` contains two skill folders and `~/.piclaw/skills/` does not exist
+- **WHEN** the agent starts
+- **THEN** `~/.piclaw/skills/` is created containing both skill folders
+- **AND** the legacy directory still exists unchanged
+
+#### Scenario: Populated target skips the copy
+- **GIVEN** `~/.piclaw/skills/` already contains a skill folder
+- **WHEN** the agent starts
+- **THEN** no migration copy runs (idempotent)
+- **AND** existing skills are untouched
