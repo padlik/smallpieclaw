@@ -23,10 +23,16 @@ def _make_policy(skill_dir: str) -> PathPolicy:
     """Create a PathPolicy that allows reads under *skill_dir*."""
     workspace = os.path.realpath(skill_dir)
     downloads = workspace
-    data_home = os.path.join(workspace, "xdg", "data", "test-agent")
-    state_home = os.path.join(workspace, "xdg", "state", "test-agent")
-    config_home = os.path.join(workspace, "xdg", "config", "test-agent")
-    vault = os.path.join(workspace, "vault.toml")
+    # Agent-internal (prohibited) dirs must live OUTSIDE the Tier 1 workspace —
+    # the Tier 1 conflict check fails policy construction on any overlap
+    # between a tier-1 dir and a prohibited path.
+    agent_root = os.path.realpath(
+        os.path.join(workspace, "..", f"agent-internal-{os.path.basename(workspace)}")
+    )
+    data_home = os.path.join(agent_root, "xdg", "data", "test-agent")
+    state_home = os.path.join(agent_root, "xdg", "state", "test-agent")
+    config_home = os.path.join(agent_root, "xdg", "config", "test-agent")
+    vault = os.path.join(agent_root, "vault.toml")
     config = os.path.join(config_home, "config.toml")
     results = os.path.join(workspace, "results")
     for d in (workspace, data_home, state_home, config_home, results):

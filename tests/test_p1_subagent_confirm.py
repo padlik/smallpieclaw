@@ -352,28 +352,6 @@ class TestHeadlessBridgePromptError:
 # Coordinator atomicity tests
 # ---------------------------------------------------------------------------
 
-def test_signal_headless_confirmation_atomic_approve_all():
-    """signal_headless_confirmation(approve_all=True) atomically adds to auto_approve_tools AND sets the event."""
-    coord = ConfirmationManager()
-    token = "test-token-1"
-    event = threading.Event()
-    coord._headless_confirm_events[token] = event
-    result = coord.signal_headless_confirmation(token, True, approve_all=True, tool_name="file_write")
-    assert result is True
-    assert "file_write" in coord.auto_approve_tools
-    assert event.is_set()
-
-
-def test_signal_headless_confirmation_expired_token_no_grant():
-    """signal_headless_confirmation(approve_all=True) on an expired token grants nothing."""
-    from confirmation import ConfirmationManager
-    coord = ConfirmationManager()
-    # No event registered for this token — it's expired/unknown
-    result = coord.signal_headless_confirmation("expired-token", True, approve_all=True, tool_name="file_write")
-    assert result is False
-    assert "file_write" not in coord.auto_approve_tools
-
-
 def test_headless_bridge_fail_closed_when_coordinator_none():
     """_headless_confirm_bridge returns fail-closed error when _coordinator is None (orphaned sub-agent)."""
     exe = BuiltinExecutor.__new__(BuiltinExecutor)

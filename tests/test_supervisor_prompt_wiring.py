@@ -92,7 +92,7 @@ class TestDepthGuardProtectsExecutorFields:
 
 
         executor = make_builtin_executor(data_dir=str(tmp_path))
-        sentinel_coordinator = SimpleNamespace(auto_approve_tools=set())
+        sentinel_coordinator = SimpleNamespace()
         executor._coordinator = sentinel_coordinator
         executor._current_prompt_id = "01JARYN6R0ABCDEFGHJKMNPQRS"
 

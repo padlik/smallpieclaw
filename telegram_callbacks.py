@@ -76,6 +76,7 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         if entry is not None:
             tool_name, _args = entry
         zone_path = builtin._zone_paths.get(token, "")
+        # single-key dict reads are GIL-atomic; staged entries are never re-keyed
 
     logger.info(
         "Confirmation callback: action=%s token=%s agent=%s",
@@ -386,6 +387,7 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
         try:
             entry = builtin._pending.get(token)
             tool_name = entry[0] if entry else ""
+            # single-key dict reads are GIL-atomic; staged entries are never re-keyed
             zone_path = builtin._zone_paths.get(token, "")
             if tool_name and zone_path:
                 from confirmation import GrantLifetime

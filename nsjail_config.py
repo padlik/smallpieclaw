@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -100,6 +101,7 @@ class NsjailConfigBuilder:
         # Cache for the session-static config text (without the per-call exec
         # block).  Populated lazily by the first build() call.
         self._static_config_path: Optional[str] = None
+        self._static_lock = threading.Lock()
 
     def _detect_system_mounts(self) -> list[str]:
         """Detect system mount layout and return nsjail mount config lines.
@@ -208,42 +210,48 @@ class NsjailConfigBuilder:
         ):
             return self._static_config_path
 
-        system_mounts = self._detect_system_mounts()
-        cgroup = self._cgroup_info
-        ns_lines = self._build_namespace_lines()
-        env_lines = self._build_env_lines()
-        dns_tls_lines, cafile, capath = self._build_dns_tls_lines(self.allow_net)
-        mount_lines = self._build_mount_lines(
-            system_mounts=system_mounts,
-            cafile=cafile,
-            capath=capath,
-        )
-        limits_lines = self._build_limits_lines(
-            cgroup["available"], cgroup.get("cgroupv2_mount")
-        )
+        with self._static_lock:
+            if self._static_config_path is not None and os.path.exists(
+                self._static_config_path
+            ):
+                return self._static_config_path
 
-        lines: list[str] = [
-            'name: "agent-shell"',
-            "mode: ONCE",
-            'hostname: "nsjail"',
-            "",
-        ]
-        lines.extend(ns_lines)
-        lines.extend(env_lines)
-        lines.extend(dns_tls_lines)
-        lines.extend(mount_lines)
-        lines.extend(limits_lines)
+            system_mounts = self._detect_system_mounts()
+            cgroup = self._cgroup_info
+            ns_lines = self._build_namespace_lines()
+            env_lines = self._build_env_lines()
+            dns_tls_lines, cafile, capath = self._build_dns_tls_lines(self.allow_net)
+            mount_lines = self._build_mount_lines(
+                system_mounts=system_mounts,
+                cafile=cafile,
+                capath=capath,
+            )
+            limits_lines = self._build_limits_lines(
+                cgroup["available"], cgroup.get("cgroupv2_mount")
+            )
 
-        os.makedirs(self.session_tmpdir, mode=0o700, exist_ok=True)
-        cfg_fd, cfg_path = tempfile.mkstemp(
-            suffix="-static.cfg", dir=self.session_tmpdir, text=True
-        )
-        with os.fdopen(cfg_fd, "w") as cfg_fh:
-            cfg_fh.write("\n".join(lines))
-            cfg_fh.write("\n")
+            lines: list[str] = [
+                'name: "agent-shell"',
+                "mode: ONCE",
+                'hostname: "nsjail"',
+                "",
+            ]
+            lines.extend(ns_lines)
+            lines.extend(env_lines)
+            lines.extend(dns_tls_lines)
+            lines.extend(mount_lines)
+            lines.extend(limits_lines)
 
-        self._static_config_path = cfg_path
-        return cfg_path
+            os.makedirs(self.session_tmpdir, mode=0o700, exist_ok=True)
+            cfg_fd, cfg_path = tempfile.mkstemp(
+                suffix="-static.cfg", dir=self.session_tmpdir, text=True
+            )
+            with os.fdopen(cfg_fd, "w") as cfg_fh:
+                cfg_fh.write("\n".join(lines))
+                cfg_fh.write("\n")
+
+            self._static_config_path = cfg_path
+            return cfg_path
 
     def _build_tier_mounts(self) -> list[str]:
         """Return bind-mount lines derived from the PathPolicy tiers.
@@ -266,8 +274,9 @@ class NsjailConfigBuilder:
                 continue
             # Avoid double-mounting tmp_dir — the dedicated /tmp/<agent> system
             # mount covers it and is emitted with mandatory: true right after
-            # the per-session /tmp scratch mount.
-            if mode == "rw" and tmp_dir_real and path == tmp_dir_real:
+            # the per-session /tmp scratch mount.  Skip any tier-1 entry whose
+            # path exactly matches tmp_dir, not just the read-write entry.
+            if tmp_dir_real and path == tmp_dir_real:
                 continue
             rw = "true" if mode == "rw" else "false"
             lines.append(
@@ -397,12 +406,10 @@ class NsjailConfigBuilder:
         )
         lines.append("")
 
-        tier_mounts = self._build_tier_mounts()
-        if tier_mounts:
-            lines.append("# Tier-derived mounts")
-            lines.extend(tier_mounts)
-            lines.append("")
-
+        # Session mounts first: the scratch /tmp remount and the tmp_dir system
+        # mount must precede any tier-derived bind whose destination lives
+        # under /tmp, or the remount would shadow the bind and nsjail's
+        # remountPt() would fail with statvfs ENOENT.
         lines.extend([
             "# Session mounts",
             f'mount: {{ src: {json.dumps(self.session_tmpdir)} dst: "/tmp" '
@@ -413,6 +420,12 @@ class NsjailConfigBuilder:
             f'is_bind: true rw: true mandatory: true }}',
             "",
         ])
+
+        tier_mounts = self._build_tier_mounts()
+        if tier_mounts:
+            lines.append("# Tier-derived mounts")
+            lines.extend(tier_mounts)
+            lines.append("")
 
         if self.allow_net and (cafile is not None or capath is not None):
             lines.append("# CA certificate store (read-only, allow_net=true)")

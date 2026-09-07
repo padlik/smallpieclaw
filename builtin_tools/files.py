@@ -87,15 +87,26 @@ class FileTools:
             "suggestion": "Restart the agent with a valid configuration so the path policy is initialised.",
         }
 
-    def _prohibited_error(self, reason: str) -> dict:
-        """Fail-closed error for a path classified as PROHIBITED."""
+    def _prohibited_error(self, reason: str, real_path: str = "") -> dict:
+        """Fail-closed error for a path classified as PROHIBITED.
+
+        Uses the policy's structured category when *real_path* is available,
+        otherwise falls back to the module-level ``prohibited_category`` seam.
+        """
+        from path_policy import ProhibitedCategory, prohibited_category
+
+        policy = self._policy
+        if policy is not None and real_path:
+            category = policy.prohibited_category(real_path)
+        else:
+            category = prohibited_category(reason)
         state_home = getattr(self._owner, "_state_home", "")
-        if state_home and reason.startswith("agent state home"):
+        if state_home and category == ProhibitedCategory.AGENT_STATE:
             suggestion = (
                 "Use the dedicated built-in tools (log_query, memory_*, secret_get, schedule) "
                 "instead of direct filesystem access to agent state."
             )
-        elif state_home and reason.startswith("agent "):
+        elif state_home and category == ProhibitedCategory.AGENT_INTERNAL:
             suggestion = "Use the dedicated built-in tools instead of direct filesystem access to agent internals."
         else:
             suggestion = (
@@ -165,7 +176,7 @@ class FileTools:
         assert policy is not None
         verdict, mode_or_reason = policy.classify(real_path, operation)
         if verdict == PathVerdict.PROHIBITED:
-            return self._prohibited_error(mode_or_reason)
+            return self._prohibited_error(mode_or_reason, real_path)
         if verdict == PathVerdict.UNRECOGNISED:
             if self._check_grant(tool_name, real_path, caller_depth, caller_tag):
                 return None
@@ -189,6 +200,10 @@ class FileTools:
         desc = f"Read file: <code>{path}</code>"
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
+        desc += (
+            f"\n📦 Scope: Confirm grants <code>{os.path.dirname(real_path)}</code> "
+            "(all files under it) for this prompt; Till /reset grants it for the whole session"
+        )
 
         policy = self._policy
         if policy is None:
@@ -264,6 +279,14 @@ class FileTools:
     # ---- file_diff ----
 
     def _exec_file_diff(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+        """Run the built-in file_diff tool, with per-path zone checks.
+
+        When both paths are distinct UNRECOGNISED directories, only a single
+        confirmation is staged at a time: zone_path prefers path_b so approval
+        grants one directory and the next attempt prompts for the other.  This is
+        a deliberate two-step approval that fails toward prompting rather than
+        asking for multiple unrelated directories at once.
+        """
         path_a = os.path.expanduser(str(args.get("path_a", "")).strip())
         path_b = os.path.expanduser(str(args.get("path_b", "")).strip())
         if not path_a or not path_b:
@@ -294,9 +317,9 @@ class FileTools:
         verdict_b, reason_b = policy.classify(real_path_b, "read")
 
         if verdict_a == PathVerdict.PROHIBITED:
-            return self._prohibited_error(reason_a)
+            return self._prohibited_error(reason_a, real_path_a)
         if verdict_b == PathVerdict.PROHIBITED:
-            return self._prohibited_error(reason_b)
+            return self._prohibited_error(reason_b, real_path_b)
 
         if verdict_a == PathVerdict.ALLOWED and verdict_b == PathVerdict.ALLOWED:
             return self._run_file_diff(args, caller_tag=caller_tag)
@@ -321,6 +344,10 @@ class FileTools:
             diff_desc += f"\n(→ <code>{real_path_a}</code>)"
         if real_path_b != path_b:
             diff_desc += f"\n(→ <code>{real_path_b}</code>)"
+        diff_desc += (
+            f"\n📦 Scope: Confirm grants <code>{os.path.dirname(unrecognised_path)}</code> "
+            "(all files under it) for this prompt; Till /reset grants it for the whole session"
+        )
         return self._owner._requires_confirmation(
             "file_diff", args, diff_desc,
             caller_depth=caller_depth, caller_tag=caller_tag,
@@ -382,6 +409,10 @@ class FileTools:
         args["_resolved_path"] = real_path
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
+        desc += (
+            f"\n📦 Scope: Confirm grants <code>{os.path.dirname(real_path)}</code> "
+            "(all files under it) for this prompt; Till /reset grants it for the whole session"
+        )
 
         policy = self._policy
         if policy is None:
@@ -475,6 +506,10 @@ class FileTools:
         )
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
+        desc += (
+            f"\n📦 Scope: Confirm grants <code>{os.path.dirname(real_path)}</code> "
+            "(all files under it) for this prompt; Till /reset grants it for the whole session"
+        )
 
         policy = self._policy
         if policy is None:
@@ -483,7 +518,7 @@ class FileTools:
 
         verdict, reason = policy.classify(real_path, "write")
         if verdict == PathVerdict.PROHIBITED:
-            return self._prohibited_error(reason)
+            return self._prohibited_error(reason, real_path)
         if verdict == PathVerdict.UNRECOGNISED:
             if not self._check_grant("file_patch", real_path, caller_depth, caller_tag):
                 # FIX 2: stage confirmation before any file read for UNRECOGNISED zone
@@ -563,6 +598,10 @@ class FileTools:
         desc = f"Send file: <code>{path}</code>"
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
+        desc += (
+            f"\n📦 Scope: Confirm grants <code>{os.path.dirname(real_path)}</code> "
+            "(all files under it) for this prompt; Till /reset grants it for the whole session"
+        )
 
         policy = self._policy
         if policy is None:

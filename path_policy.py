@@ -34,6 +34,75 @@ from exceptions import ConfigError
 logger = logging.getLogger(__name__)
 
 
+#: Prefix shared by agent-internal Tier 0 reason strings (data/state/config homes,
+#: vault file, config file).  Kept as a constant so classification helpers and
+#: reason-string construction stay in sync without changing emitted prose.
+_AGENT_INTERNAL_PREFIX = "agent "
+
+
+class ProhibitedCategory(str, Enum):
+    """Coarse provenance of a Tier 0 reason string."""
+
+    AGENT_STATE = "agent_state"      # agent state home → dedicated-tools suggestion
+    AGENT_INTERNAL = "agent_internal"  # other agent-internal entries
+    EXTERNAL = "external"            # hardcoded system / credential / config entries
+
+
+#: Agent-internal reason strings.  Kept as constants so the prose stays byte-
+#: identical between the policy builder and the module-level reverse map used by
+#: the public ``prohibited_category`` seam.
+_REASON_DATA_HOME = (
+    f"{_AGENT_INTERNAL_PREFIX}data home — use memory tools and the dedicated data directory instead"
+)
+_REASON_STATE_HOME = (
+    f"{_AGENT_INTERNAL_PREFIX}state home — use log_query, memory_*, or secret_get instead"
+)
+_REASON_CONFIG_HOME = (
+    f"{_AGENT_INTERNAL_PREFIX}config home — configuration is managed outside the agent"
+)
+_REASON_VAULT_FILE = f"{_AGENT_INTERNAL_PREFIX}vault file"
+_REASON_CONFIG_FILE = f"{_AGENT_INTERNAL_PREFIX}config file"
+_REASON_HARDLINK_ALIAS = "prohibited file alias (hardlink)"
+
+
+@dataclass(frozen=True)
+class ProhibitedEntry:
+    """Structured Tier 0 entry: human-readable reason + provenance category."""
+
+    reason: str
+    category: ProhibitedCategory
+
+
+#: Module-level reverse map from reason string → category.  Pre-populated with
+#: the hardcoded/agent-internal templates so the public ``prohibited_category``
+#: function can resolve known literal strings without a policy instance; each
+#: ``PathPolicy.create()`` adds its own resolved entries to the per-instance map.
+_REASON_CATEGORY: dict[str, ProhibitedCategory] = {
+    "system directory": ProhibitedCategory.EXTERNAL,
+    "SSH credentials": ProhibitedCategory.EXTERNAL,
+    "GPG keyring": ProhibitedCategory.EXTERNAL,
+    "AWS credentials": ProhibitedCategory.EXTERNAL,
+    "Kubernetes credentials": ProhibitedCategory.EXTERNAL,
+    "Docker credentials": ProhibitedCategory.EXTERNAL,
+    _REASON_DATA_HOME: ProhibitedCategory.AGENT_INTERNAL,
+    _REASON_STATE_HOME: ProhibitedCategory.AGENT_STATE,
+    _REASON_CONFIG_HOME: ProhibitedCategory.AGENT_INTERNAL,
+    _REASON_VAULT_FILE: ProhibitedCategory.AGENT_INTERNAL,
+    _REASON_CONFIG_FILE: ProhibitedCategory.AGENT_INTERNAL,
+    _REASON_HARDLINK_ALIAS: ProhibitedCategory.EXTERNAL,
+    "prohibited directory from config": ProhibitedCategory.EXTERNAL,
+}
+
+
+def prohibited_category(reason: str) -> ProhibitedCategory:
+    """Classify a prohibited-path reason string into a provenance category.
+
+    Looks up the exact reason string in the module-level reverse map.  This is
+    the historical public seam; the canonical source of truth for a given policy
+    is ``PathPolicy.prohibited_category``.
+    """
+    return _REASON_CATEGORY.get(reason, ProhibitedCategory.EXTERNAL)
+
 
 #: Hardcoded Tier 0 entries mapping absolute path → human-readable reason.
 _HARDCODED_PROHIBITED: dict[str, str] = {
@@ -115,12 +184,16 @@ def _realify_list(
     raw: object,
     label: str,
     logger: logging.Logger | None,
+    *,
+    require_exists: bool = True,
 ) -> list[str]:
     """Validate and resolve a config list of directory paths.
 
-    Each entry is expanded with ``~`` and realpath'd.  Nonexistent entries
-    produce a warning and are skipped; a non-list (or a list containing
-    non-string items) raises ``ConfigError``.
+    Each entry is expanded with ``~`` and realpath'd.  When *require_exists*
+    is True (default), nonexistent entries are skipped with a warning.  When
+    False the entry is retained so deny-list entries take effect as soon as
+    the path appears; a warning is still emitted.  A non-list (or a list
+    containing non-string items) raises ``ConfigError``.
     """
     if raw is None:
         return []
@@ -138,9 +211,13 @@ def _realify_list(
         if not os.path.exists(expanded):
             if logger is not None:
                 logger.warning(
-                    "%s entry does not exist, skipping: %s", label, item
+                    "%s entry does not exist%s: %s",
+                    label,
+                    "" if not require_exists else ", skipping",
+                    item,
                 )
-            continue
+            if require_exists:
+                continue
         resolved.append(expanded)
     return resolved
 
@@ -166,8 +243,10 @@ class PathPolicy:
         config_home: Absolute realpath of ``~/.config/<agent>``.
         vault_path: Absolute realpath of the vault file.
         config_path: Absolute realpath of the agent config file.
-        prohibited_dirs: Resolved config-appended prohibited directories.
-        allowed_dirs: Resolved config-appended allowed directories.
+        prohibited_dirs: Raw config-appended prohibited directories (resolved
+            entries live in the private ``_prohibited`` dict).
+        allowed_dirs: Raw config-appended allowed directories (resolved entries
+            live in the private ``_tier2`` tuple).
         conflict_skips: Allowed dirs that contain a prohibited path; the nsjail
             builder will skip mounting these.
         logger: Optional logger for construction warnings.
@@ -190,7 +269,7 @@ class PathPolicy:
     logger: logging.Logger | None
 
     # Internal derived state.  Kept private so callers only see the public API.
-    _prohibited: dict[str, str]
+    _prohibited: dict[str, ProhibitedEntry]
     _tier1: tuple[tuple[str, str], ...]
     _tier2: tuple[str, ...]
     _prohibited_inodes: frozenset[tuple[int, int]]
@@ -238,38 +317,53 @@ class PathPolicy:
         resolved_config_path = os.path.realpath(os.path.expanduser(config_path)) if config_path else ""
 
         # Tier 0: hardcoded system directories.
-        prohibited: dict[str, str] = dict(_HARDCODED_PROHIBITED)
+        prohibited: dict[str, ProhibitedEntry] = {
+            p: ProhibitedEntry(reason=reason, category=ProhibitedCategory.EXTERNAL)
+            for p, reason in _HARDCODED_PROHIBITED.items()
+        }
 
         # Tier 0: credential homes (resolve at construction).
         home = os.path.expanduser("~")
         for rel, reason in _CREDENTIAL_HOME_PATHS.items():
             expanded = os.path.realpath(os.path.join(home, rel))
-            prohibited[expanded] = reason
+            prohibited[expanded] = ProhibitedEntry(
+                reason=reason, category=ProhibitedCategory.EXTERNAL,
+            )
 
         # Tier 0: derived agent-internal directories.
         if resolved_data_home:
-            prohibited[resolved_data_home] = (
-                "agent data home — use memory tools and the dedicated data directory instead"
+            prohibited[resolved_data_home] = ProhibitedEntry(
+                reason=_REASON_DATA_HOME, category=ProhibitedCategory.AGENT_INTERNAL,
             )
         if resolved_state_home:
-            prohibited[resolved_state_home] = (
-                "agent state home — use log_query, memory_*, or secret_get instead"
+            prohibited[resolved_state_home] = ProhibitedEntry(
+                reason=_REASON_STATE_HOME, category=ProhibitedCategory.AGENT_STATE,
             )
         if resolved_config_home:
-            prohibited[resolved_config_home] = (
-                "agent config home — configuration is managed outside the agent"
+            prohibited[resolved_config_home] = ProhibitedEntry(
+                reason=_REASON_CONFIG_HOME, category=ProhibitedCategory.AGENT_INTERNAL,
             )
 
         # Tier 0: vault and config files.
         if resolved_vault:
-            prohibited[resolved_vault] = "agent vault file"
+            prohibited[resolved_vault] = ProhibitedEntry(
+                reason=_REASON_VAULT_FILE, category=ProhibitedCategory.AGENT_INTERNAL,
+            )
         if resolved_config_path:
-            prohibited[resolved_config_path] = "agent config file"
+            prohibited[resolved_config_path] = ProhibitedEntry(
+                reason=_REASON_CONFIG_FILE, category=ProhibitedCategory.AGENT_INTERNAL,
+            )
 
         # Tier 0: config-appended prohibited dirs.
-        config_prohibited = _realify_list(prohibited_dirs, "prohibited_dirs", logger)
+        config_prohibited = _realify_list(prohibited_dirs, "prohibited_dirs", logger, require_exists=False)
         for p in config_prohibited:
-            prohibited.setdefault(p, "prohibited directory from config")
+            prohibited.setdefault(
+                p,
+                ProhibitedEntry(
+                    reason="prohibited directory from config",
+                    category=ProhibitedCategory.EXTERNAL,
+                ),
+            )
 
         # Tier 1: agent-controlled directories.  Order matches the design doc:
         # workspace, downloads, tmp, skills (r), results.
@@ -306,9 +400,24 @@ class PathPolicy:
                             prohibited_path,
                             allowed,
                         )
-                    if is_contained(prohibited_path, allowed):
-                        conflict_skips.add(allowed)
+                    conflict_skips.add(allowed)
                     break
+
+        # Tier 1 conflict validation: fail-closed at startup.  Tier 1 directories
+        # are hardcoded/derived from the agent's own configuration; if one overlaps
+        # a prohibited entry the operator has misconfigured workspace/downloads/tmp
+        # directories and must correct the configuration.
+        for tier1_path, _mode in deduped_tier1:
+            for prohibited_path in prohibited:
+                if is_contained(prohibited_path, tier1_path) or is_contained(
+                    tier1_path, prohibited_path
+                ):
+                    raise ConfigError(
+                        f"PathPolicy conflict: Tier 1 directory {tier1_path} overlaps "
+                        f"prohibited path {prohibited_path}. "
+                        "Correct the agent configuration so workspace/downloads/tmp/skills/results "
+                        "do not sit under a prohibited directory."
+                    )
 
         # Inode-alias defense for prohibited files.
         prohibited_inodes = _collect_prohibited_inodes(
@@ -363,9 +472,9 @@ class PathPolicy:
                 pass
 
         # (b) Tier 0: prohibited directories (prefix wins first).
-        for prohibited_path, reason in self._prohibited.items():
+        for prohibited_path, entry in self._prohibited.items():
             if is_contained(realpath, prohibited_path):
-                return (PathVerdict.PROHIBITED, reason)
+                return (PathVerdict.PROHIBITED, entry.reason)
 
         # (c) Tier 1: agent-controlled directories.
         for zone, mode in self._tier1:
@@ -382,6 +491,17 @@ class PathPolicy:
         # (e) Fallback.
         return (PathVerdict.UNRECOGNISED, "")
 
+    def prohibited_category(self, realpath: str) -> ProhibitedCategory:
+        """Return the stored provenance category for a prohibited *realpath*.
+
+        The path must already be resolved.  This is the canonical replacement
+        for parsing the reason string.
+        """
+        for prohibited_path, entry in self._prohibited.items():
+            if is_contained(realpath, prohibited_path):
+                return entry.category
+        return ProhibitedCategory.EXTERNAL
+
     def tier1_entries(self) -> tuple[tuple[str, str], ...]:
         """Return the immutable Tier 1 entries as ``(path, mode)`` tuples."""
         return self._tier1
@@ -392,17 +512,22 @@ class PathPolicy:
 
 
 def _resolve_agent_dir(path: str, agent_name: str, kind: str) -> str:
-    """Resolve an XDG agent-scoped directory, falling back to ``~/.<agent>``.
+    """Resolve an XDG agent-scoped directory (data or state home).
 
     If *path* is provided it is used verbatim (expanded/realpath'd).  Otherwise
-    the directory is derived from the environment-specific XDG base path.
+    the directory is derived from the ``XDG_DATA_HOME``/``XDG_STATE_HOME``
+    environment base, falling back to the XDG default base (``~/.local/share``
+    / ``~/.local/state``) — mirroring ``xdg.py`` resolution.  The fallback
+    must NOT be the agent dot-home ``~/.<agent>``: Tier 1 skills/results live
+    there, and the Tier-1 conflict check (fail-closed on overlap with a
+    prohibited path) would reject the policy at construction.
     """
     if path:
         return os.path.realpath(os.path.expanduser(path))
+    default_base = "~/.local/share" if kind == "data" else "~/.local/state"
     xdg_base = os.environ.get(f"XDG_{kind.upper()}_HOME", "")
-    if xdg_base:
-        return os.path.realpath(os.path.join(os.path.expanduser(xdg_base), agent_name))
-    return os.path.realpath(os.path.expanduser(f"~/.{agent_name}"))
+    base = os.path.expanduser(xdg_base) if xdg_base else os.path.expanduser(default_base)
+    return os.path.realpath(os.path.join(base, agent_name))
 
 
 def _resolve_config_home(config_home: str, agent_name: str) -> str:

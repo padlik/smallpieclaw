@@ -680,9 +680,27 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
         }
 
     if verdict == PathVerdict.UNRECOGNISED:
+        # A standing operator grant may promote this UNRECOGNISED path to allowed.
+        # The Telegram Confirm callback adds the grant before resuming the agent,
+        # so a re-invoked vision_query after approval lands here and proceeds.
+        if ctx.confirmation is not None:
+            scope_owner: Optional[str] = None
+            scope_fn = getattr(builtin, "_scope_owner_from_caller_tag", None)
+            if scope_fn is not None:
+                scope_owner = scope_fn(ctx.depth, ctx.caller_tag)
+            grant_dir = os.path.dirname(real_path)
+            if ctx.confirmation.check_grant("vision_query", grant_dir, scope_owner=scope_owner):
+                verdict = PathVerdict.ALLOWED
+                mode_or_reason = "r"
+
+    if verdict == PathVerdict.UNRECOGNISED:
         desc = f"Vision query: <code>{path}</code>"
         if real_path != path:
             desc += f"\n(→ <code>{real_path}</code>)"
+        desc += (
+            f"\n📦 Scope: Confirm grants <code>{os.path.dirname(real_path)}</code> "
+            "(all files under it) for this prompt; Till /reset grants it for the whole session"
+        )
         desc += "\n⚠️ Reason for confirmation: Unrecognised zone"
         return builtin._requires_confirmation(
             "vision_query", args, desc,
@@ -692,6 +710,7 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
         )
 
     encoded = _encode_images([path])
+
     if not encoded:
         return {
             "success": False, "output": "",
@@ -706,6 +725,98 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "output": "", "error": f"vision_query LLM call failed: {exc}"}
     return {"success": True, "output": answer, "error": ""}
+
+
+def _run_vision_query(
+    ctx: ReactContext,
+    args: dict,
+    progress_cb: Callable[[str], None],
+) -> dict:
+    """Execute a vision_query, prompting the operator when required.
+
+    If ``_exec_vision_query`` stages a confirmation (UNRECOGNISED path), this
+    helper blocks for operator approval, then re-runs with the staged frozen
+    args.  The Telegram Confirm callback adds a standing grant for the parent
+    directory before resuming the agent, so the second pass is grant-covered
+    and proceeds.  On denial the staged entry is discarded and a cancelled
+    outcome is returned.
+
+    For sub-agents (depth>=1) the executor's headless bridge returns a
+    ``vision_reexecute`` sentinel carrying the frozen args; this helper
+    re-runs vision_query itself and refuses if the grant did not take effect.
+    """
+
+    def _take_token(token: str) -> None:
+        """Silently remove a staged token without emitting a cancellation log."""
+        builtin = ctx.builtin_executor
+        if builtin is not None:
+            builtin._pending_confirmations.take(token)
+
+    def _refusal_outcome() -> dict:
+        """Fail-closed outcome when re-run could not resolve the grant."""
+        return {
+            "success": False,
+            "output": "",
+            "error": (
+                "vision_query: confirmation did not produce a usable grant; "
+                "refusing to re-prompt."
+            ),
+            "error_type": "confirmation_failed",
+            "recoverable": False,
+        }
+
+    def _guard_re_run(outcome: dict, old_token: str | None = None) -> dict:
+        """Leak guard: a re-run must not stage another confirmation cycle."""
+        if outcome.get("requires_confirmation") or outcome.get("vision_reexecute"):
+            if old_token:
+                _take_token(old_token)
+            if outcome.get("token"):
+                _take_token(outcome["token"])
+            return _refusal_outcome()
+        return outcome
+
+    outcome = _exec_vision_query(ctx, args)
+
+    # Depth >= 1: the headless bridge already obtained approval and returns a
+    # re-execute sentinel.  Re-run once; the grant now covers the parent dir.
+    if outcome.get("vision_reexecute"):
+        return _guard_re_run(_exec_vision_query(ctx, outcome["args"]))
+
+    if not outcome.get("requires_confirmation"):
+        return outcome
+    if ctx.confirmation is None:
+        # Fail-closed staged dict when the confirmation infrastructure is absent.
+        return outcome
+
+    token = outcome["token"]
+    description = outcome.get("description", "vision_query")
+    confirmed = ctx.confirmation.request_confirmation(
+        token, "vision_query", description, progress_cb,
+    )
+    if confirmed:
+        progress_cb(f"✅ Confirmed — executing `vision_query`\n{fmt_tool_call('vision_query', args)}")
+        # Re-run with the staged frozen args, now covered by the operator grant.
+        builtin = ctx.builtin_executor
+        staged_args = args
+        if builtin is not None:
+            staged = builtin._pending.get(token)
+            if staged is not None:
+                staged_args = staged[1]
+        outcome = _guard_re_run(_exec_vision_query(ctx, staged_args), token)
+        # Execution completed (success or non-confirmation failure): silently
+        # discard the staged token so we do not emit a spurious cancellation log.
+        _take_token(token)
+    else:
+        if ctx.builtin_executor is not None:
+            ctx.builtin_executor.cancel(token)
+        outcome = fail_outcome(
+            "Operation cancelled by the operator. "
+            "Do not retry this operation via any other tool or method. "
+            "Respond with a finish action now.",
+        )
+        outcome["_operator_cancelled"] = True
+        progress_cb("❌ Cancelled by operator — stopping task.")
+    return outcome
 
 
 def _append_native_tool_result(messages: list[dict], tc: ToolCall, content: str) -> None:
@@ -1309,9 +1420,10 @@ def _dispatch_action(
         if args is not raw_args:
             action_obj = {**action_obj, "args": args}
         _t0 = time.time()
-        # vision_query needs LLM access — call directly, never through _dispatch_tool
+        # vision_query needs LLM access — call directly, never through _dispatch_tool,
+        # but still honour operator confirmation for UNRECOGNISED paths.
         if tool_name == "vision_query":
-            outcome = _exec_vision_query(ctx, args)
+            outcome = _run_vision_query(ctx, args, progress)
         else:
             outcome = _dispatch_tool(ctx, action_obj, progress)
         _duration_ms = (time.time() - _t0) * 1000
@@ -1890,9 +2002,9 @@ def _dispatch_tool(
     brief = fmt_tool_brief(tool_name, args, is_mcp=is_mcp, server_name=server_name)
     _progress(f"{_tool_icon(tool_name)} Running tool: `{tool_name}`\n{brief}")
 
-    # vision_query handled directly (needs LLM access)
+    # vision_query handled directly (needs LLM access), with confirmation support.
     if tool_name == "vision_query":
-        return _exec_vision_query(ctx, args)
+        return _run_vision_query(ctx, args, _progress)
 
     # Built-in tools
     if ctx.builtin_executor and ctx.builtin_executor.is_builtin(tool_name):
@@ -1927,27 +2039,22 @@ def _dispatch_tool(
             token = outcome["token"]
             description = outcome.get("description", tool_name)
 
-            if tool_name in ctx.confirmation.auto_approve_tools:
-                logger.info("Auto-approving '%s' (operator approved all %s)", tool_name, tool_name, )
-                outcome = ctx.builtin_executor.confirm(token, chunk_callback=chunk_callback)
-                _progress(f"✅ Auto-approved `{tool_name}` (approve-all active)")
-            else:
-                result_confirmed = ctx.confirmation.request_confirmation(
-                    token, tool_name, description, _progress,
-                )
+            result_confirmed = ctx.confirmation.request_confirmation(
+                token, tool_name, description, _progress,
+            )
 
-                if result_confirmed:
-                    outcome = ctx.builtin_executor.confirm(token, chunk_callback=chunk_callback)
-                    _progress(f"✅ Confirmed — executing `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
-                else:
-                    ctx.builtin_executor.cancel(token)
-                    outcome = fail_outcome(
-                        "Operation cancelled by the operator. "
-                        "Do not retry this operation via any other tool or method. "
-                        "Respond with a finish action now.",
-                    )
-                    outcome["_operator_cancelled"] = True
-                    _progress("❌ Cancelled by operator — stopping task.")
+            if result_confirmed:
+                outcome = ctx.builtin_executor.confirm(token, chunk_callback=chunk_callback)
+                _progress(f"✅ Confirmed — executing `{tool_name}`\n{fmt_tool_call(tool_name, args)}")
+            else:
+                ctx.builtin_executor.cancel(token)
+                outcome = fail_outcome(
+                    "Operation cancelled by the operator. "
+                    "Do not retry this operation via any other tool or method. "
+                    "Respond with a finish action now.",
+                )
+                outcome["_operator_cancelled"] = True
+                _progress("❌ Cancelled by operator — stopping task.")
         return outcome
 
     # MCP tools — wrap dispatch with TOOL_* lifecycle events so MCP calls are

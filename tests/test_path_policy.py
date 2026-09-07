@@ -12,8 +12,10 @@ from path_policy import (
     HARDCODED_SYSTEM_PREFIXES,
     PathPolicy,
     PathVerdict,
+    ProhibitedCategory,
     _CREDENTIAL_HOME_PATHS,
     is_contained,
+    prohibited_category,
 )
 
 
@@ -289,6 +291,16 @@ class TestConflictValidation:
         policy = _make_policy(str(tmp_path), allowed_dirs=[work], prohibited_dirs=[vaults])
         assert os.path.realpath(work) not in policy.tier2_entries()
 
+    def test_allowed_dir_inside_prohibited_skips_mount(self, tmp_path):
+        # C1 regression: allowed dir nested *under* a prohibited path must be
+        # excluded from conflict_skips and tier2_entries so nsjail never mounts it.
+        outer = os.path.join(str(tmp_path), "outer")
+        inner = os.path.join(outer, "inner")
+        os.makedirs(inner, exist_ok=True)
+        policy = _make_policy(str(tmp_path), allowed_dirs=[inner], prohibited_dirs=[outer])
+        assert os.path.realpath(inner) in policy.conflict_skips
+        assert os.path.realpath(inner) not in policy.tier2_entries()
+
 
 # ---------------------------------------------------------------------------
 # Config validation and warnings
@@ -300,7 +312,9 @@ class TestConfigValidation:
         caplog.set_level(logging.WARNING)
         missing = os.path.join(str(tmp_path), "missing")
         policy = _make_policy(str(tmp_path), prohibited_dirs=[missing])
-        assert missing not in policy._prohibited
+        # Nonexistent prohibited dirs are retained so the deny-list takes effect
+        # as soon as the path appears; only allowed_dirs are silently dropped.
+        assert os.path.realpath(missing) in policy._prohibited
         assert any("does not exist" in rec.message for rec in caplog.records)
 
     def test_nonexistent_allowed_dir_warns_no_raise(self, tmp_path, caplog):
@@ -321,6 +335,58 @@ class TestConfigValidation:
     def test_invalid_allowed_dirs_item_raises_config_error(self, tmp_path):
         with pytest.raises(ConfigError, match="allowed_dirs must be a list of strings"):
             _make_policy(str(tmp_path), allowed_dirs=["/ok", 123])
+
+
+class TestTier1ConflictValidation:
+    def test_workspace_under_prohibited_dir_raises_config_error(self, tmp_path, monkeypatch):
+        # On macOS /etc resolves to /private/etc, so neutralise realpath for this
+        # startup-failure test and assert the overlap detection itself.
+        monkeypatch.setattr(os.path, "realpath", lambda p: os.path.expanduser(p))
+        workspace = "/etc/test-agent-workspace"
+        downloads = os.path.join(str(tmp_path), "downloads")
+        os.makedirs(downloads, exist_ok=True)
+
+        with pytest.raises(ConfigError, match="Tier 1 directory .+ overlaps prohibited path /etc"):
+            PathPolicy.create(
+                agent_name="test-agent",
+                workspace_dir=workspace,
+                downloads_dir=downloads,
+            )
+
+    def test_default_tier1_paths_create_without_conflict(self, tmp_path):
+        """The usual temp-based Tier 1 set has no overlap with the hardcoded prohibited list."""
+        policy = _make_policy(str(tmp_path))
+        assert policy.workspace_dir.startswith(str(tmp_path))
+        assert policy.downloads_dir.startswith(str(tmp_path))
+        assert policy.results_dir.startswith(str(tmp_path))
+        assert policy.skills_dir.startswith(str(tmp_path))
+
+    def test_default_dot_home_skills_results_create_without_conflict(self, tmp_path, monkeypatch):
+        home = os.path.join(str(tmp_path), "home")
+        xdg_data = os.path.join(str(tmp_path), "xdg_data")
+        xdg_state = os.path.join(str(tmp_path), "xdg_state")
+        xdg_config = os.path.join(str(tmp_path), "xdg_config")
+        for d in (home, xdg_data, xdg_state, xdg_config):
+            os.makedirs(d, exist_ok=True)
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setenv("XDG_DATA_HOME", xdg_data)
+        monkeypatch.setenv("XDG_STATE_HOME", xdg_state)
+        monkeypatch.setenv("XDG_CONFIG_HOME", xdg_config)
+        workspace = os.path.join(str(tmp_path), "workspace")
+        downloads = os.path.join(str(tmp_path), "downloads")
+        os.makedirs(workspace, exist_ok=True)
+        os.makedirs(downloads, exist_ok=True)
+
+        policy = PathPolicy.create(
+            agent_name="test-agent",
+            workspace_dir=workspace,
+            downloads_dir=downloads,
+        )
+        assert policy.skills_dir == os.path.realpath(os.path.join(home, ".test-agent/skills"))
+        assert policy.results_dir == os.path.realpath(os.path.join(home, ".test-agent/results"))
+        assert policy.data_home == os.path.realpath(os.path.join(xdg_data, "test-agent"))
+        assert policy.state_home == os.path.realpath(os.path.join(xdg_state, "test-agent"))
+        assert policy.config_home == os.path.realpath(os.path.join(xdg_config, "test-agent"))
 
 
 # ---------------------------------------------------------------------------
@@ -374,3 +440,62 @@ class TestIsContained:
         if os.path.normcase("A") == "A":
             pytest.skip("normcase is a no-op on this filesystem")
         assert is_contained("/tmp/MyZone/file.txt", "/tmp/myzone") is True
+
+
+# ---------------------------------------------------------------------------
+# Prohibited-category classification
+# ---------------------------------------------------------------------------
+
+
+class TestProhibitedCategory:
+    def test_state_home_reason_is_agent_state(self, tmp_path):
+        policy = _make_policy(str(tmp_path))
+        target = os.path.realpath(os.path.join(policy.state_home, "logs.sqlite"))
+        verdict, reason = policy.classify(target, "read")
+        assert verdict == PathVerdict.PROHIBITED
+        assert prohibited_category(reason) == ProhibitedCategory.AGENT_STATE
+        assert policy.prohibited_category(target) == ProhibitedCategory.AGENT_STATE
+
+    def test_vault_file_reason_is_agent_internal(self, tmp_path):
+        """The literal vault-file reason string maps to the agent-internal category."""
+        reason = "agent vault file"
+        assert prohibited_category(reason) == ProhibitedCategory.AGENT_INTERNAL
+
+    def test_data_home_reason_is_agent_internal(self, tmp_path):
+        policy = _make_policy(str(tmp_path))
+        target = os.path.realpath(os.path.join(policy.data_home, "store.json"))
+        verdict, reason = policy.classify(target, "read")
+        assert verdict == PathVerdict.PROHIBITED
+        assert prohibited_category(reason) == ProhibitedCategory.AGENT_INTERNAL
+        assert policy.prohibited_category(target) == ProhibitedCategory.AGENT_INTERNAL
+
+    def test_config_home_reason_is_agent_internal(self, tmp_path):
+        policy = _make_policy(str(tmp_path))
+        target = os.path.realpath(os.path.join(policy.config_home, "settings.toml"))
+        verdict, reason = policy.classify(target, "read")
+        assert verdict == PathVerdict.PROHIBITED
+        assert prohibited_category(reason) == ProhibitedCategory.AGENT_INTERNAL
+        assert policy.prohibited_category(target) == ProhibitedCategory.AGENT_INTERNAL
+
+    def test_config_appended_reason_is_external(self, tmp_path):
+        external = os.path.join(str(tmp_path), "external")
+        os.makedirs(external, exist_ok=True)
+        policy = _make_policy(str(tmp_path), prohibited_dirs=[external])
+        target = os.path.realpath(os.path.join(external, "secret.txt"))
+        verdict, reason = policy.classify(target, "read")
+        assert verdict == PathVerdict.PROHIBITED
+        assert reason == "prohibited directory from config"
+        assert prohibited_category(reason) == ProhibitedCategory.EXTERNAL
+        assert policy.prohibited_category(target) == ProhibitedCategory.EXTERNAL
+
+    def test_hardcoded_system_reason_is_external(self, tmp_path):
+        """A hardcoded system reason string maps to the external category."""
+        reason = "system directory"
+        assert prohibited_category(reason) == ProhibitedCategory.EXTERNAL
+
+    def test_policy_prohibited_category_uses_stored_entry(self, tmp_path):
+        """The canonical seam looks up the stored ProhibitedEntry, not the reason string."""
+        policy = _make_policy(str(tmp_path))
+        target = os.path.realpath(os.path.join(policy.state_home, "x"))
+        assert policy.prohibited_category(target) == ProhibitedCategory.AGENT_STATE
+

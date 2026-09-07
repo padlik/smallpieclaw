@@ -725,6 +725,26 @@ class BuiltinExecutor:
             }
 
         logger.info("Headless sub-agent: operator approved %s (token=%s) — executing", tool_name, token[:8])
+        # vision_query is executed by the ReAct loop, not by this executor's
+        # run table.  Pop the staged frozen args and hand them back as a
+        # re-execute sentinel; the loop will run vision_query itself after the
+        # Telegram callback has added the standing grant.
+        if tool_name == "vision_query":
+            entry = self._pending_confirmations.take(token)
+            if entry is None:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": "vision_query: staged confirmation token expired or unknown.",
+                    "exit_code": -1,
+                }
+            return {
+                "vision_reexecute": True,
+                "args": entry[1],
+                "success": False,
+                "output": "",
+                "error": "",
+            }
         # The enclosing execute() call already owns this tool's lifecycle span,
         # so suppress confirm()'s own completion event to avoid double-logging.
         return self.confirm(token, _emit_lifecycle=False)
@@ -775,12 +795,35 @@ class BuiltinExecutor:
             trace_id=trace_id, options=options,
         )
 
+    def _wire_grant_scope_expiry(self, options: SupervisionOptions) -> None:
+        """Wire ``grant_scope_cb`` so the sub-agent's prompt grants expire with its run.
+
+        The callback closes over the depth-0 coordinator's grant ledger captured at
+        spawn time (the supervisor's terminal ``finally`` invokes it with the
+        sub-agent's agent_id). When no coordinator is wired (headless/test contexts,
+        scheduler firing outside a chat run) no grant can ever be created, so no
+        callback is needed — fail-closed by construction.
+        """
+        if options.grant_scope_cb is not None:
+            return
+        coordinator = self._coordinator
+        if coordinator is None:
+            return
+        ledger = coordinator.grant_ledger
+
+        def _expire_scope(agent_id: str) -> None:
+            ledger.clear_prompt_scope(agent_id)
+
+        options.grant_scope_cb = _expire_scope
+
     def spawn_agent(self, args: dict, options: Optional[SupervisionOptions] = None) -> dict:
         """Public entry point for spawning a sub-agent.
 
         Delegates to ``_exec_spawn_agent`` with default caller metadata.
         Used by the scheduler to avoid reaching into private methods.
         """
+        options = options or SupervisionOptions()
+        self._wire_grant_scope_expiry(options)
         return self._exec_spawn_agent(args, options=options)
 
     def _exec_get_agent_result(self, args: dict, caller_tag: str = "") -> dict:

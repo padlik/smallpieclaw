@@ -48,12 +48,12 @@
 
 ## 8. Deletions + cleanup
 
-- [ ] 8.1 Delete `builtin_tools/access_control.py` (`TrustedZoneChecker`, `GrantTracker`, trusted_dirs persistence) and all references; delete `auto_approve_tools` from `confirmation.py`; remove `/dir` from `AgentRuntime`/executor wiring
-- [ ] 8.2 Update `vulture_whitelist.py` for removed/new public symbols; run `ruff check .` and `vulture . vulture_whitelist.py --min-confidence 80` clean
-- [ ] 8.3 Update AGENTS.md module table (`access_control.py` → `path_policy.py`, confirmation/grant ledger roles) and Conventions gotchas
+- [x] 8.1 Delete `builtin_tools/access_control.py` (`TrustedZoneChecker`, `GrantTracker`, trusted_dirs persistence) and all references; delete `auto_approve_tools` from `confirmation.py`; remove `/dir` from `AgentRuntime`/executor wiring
+- [x] 8.2 Update `vulture_whitelist.py` for removed/new public symbols; run `ruff check .` and `vulture . vulture_whitelist.py --min-confidence 80` clean
+- [x] 8.3 Update AGENTS.md module table (`access_control.py` → `path_policy.py`, confirmation/grant ledger roles) and Conventions gotchas
 
 ## 9. Final verification
 
-- [ ] 9.1 Run full `make check` (lint + complete test suite) — fix all failures
-- [ ] 9.2 Run `openspec validate unify-access-control --type change --strict` — fix all validation errors
-- [ ] 9.3 Manual smoke (Linux + nsjail): prohibited path hard error, 3-button grant flow incl. `/reset` clearing, shell 2-button prompt, results artifact round-trip (shell write → file_read), jail mount table matches config
+- [x] 9.1 Run full `make check` (lint + complete test suite) — fix all failures
+- [x] 9.2 Run `openspec validate unify-access-control --type change --strict` — fix all validation errors
+- [x] 9.3 Manual smoke (Linux + nsjail): prohibited path hard error, 3-button grant flow incl. `/reset` clearing, shell 2-button prompt, results artifact round-trip (shell write → file_read), jail mount table matches config

@@ -220,6 +220,7 @@ class AgentTools:
         Sub-agents (depth ≥ 1) are not allowed to spawn further sub-agents.
         """
         options = options or SupervisionOptions()
+        self._owner._wire_grant_scope_expiry(options)
         # Propagate the active prompt id (if any) onto the supervision options
         # so the supervisor can bind it into the sub-agent's log context.
         if options.prompt_id is None:

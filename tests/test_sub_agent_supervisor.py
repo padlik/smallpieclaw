@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from confirmation import GrantLifetime
 from memory_store import ShortTermMemory
 from sub_agent_registry import SubAgentRegistry, get_registry
 from sub_agent_supervisor import (
@@ -51,6 +52,7 @@ class FakeRunner:
         self.saw_cancel = False
         self._result = result
         self._block = block
+        self._done_event = threading.Event()
 
     def run(self, task):
         if self._block:
@@ -65,6 +67,7 @@ class FakeRunner:
 
     def close(self):
         self.closed = True
+        self._done_event.set()
 
 
 def _seq_factory(runners):
@@ -461,3 +464,115 @@ def test_submission_request_direct_submit(tmp_path):
         assert runner.closed is True
     finally:
         supervisor.shutdown(graceful_timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# grant-scope expiry wiring
+# ---------------------------------------------------------------------------
+
+class TestGrantScopeExpiry:
+    """Sub-agent prompt grants expire when the run terminates."""
+
+    def test_executor_wires_grant_scope_cb_when_coordinator_present(self, make_builtin_executor, tmp_path):
+        from confirmation import ConfirmationManager
+
+        exc = make_builtin_executor(data_dir=str(tmp_path))
+        exc._coordinator = ConfirmationManager()
+        options = SupervisionOptions()
+        exc._wire_grant_scope_expiry(options)
+        assert options.grant_scope_cb is not None
+        assert callable(options.grant_scope_cb)
+
+    def test_executor_leaves_cb_none_without_coordinator(self, make_builtin_executor, tmp_path):
+        exc = make_builtin_executor(data_dir=str(tmp_path))
+        exc._coordinator = None
+        options = SupervisionOptions()
+        exc._wire_grant_scope_expiry(options)
+        assert options.grant_scope_cb is None
+
+    def test_executor_preserves_caller_supplied_grant_scope_cb(self, make_builtin_executor, tmp_path):
+        exc = make_builtin_executor(data_dir=str(tmp_path))
+        supplied = MagicMock()
+        options = SupervisionOptions(grant_scope_cb=supplied)
+        exc._wire_grant_scope_expiry(options)
+        assert options.grant_scope_cb is supplied
+
+    def test_spawn_agent_public_facade_wires_expiry(self, make_builtin_executor, tmp_path):
+        from confirmation import ConfirmationManager
+
+        runner = FakeRunner(agent_id="sa-facade")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        exc._coordinator = ConfirmationManager()
+        local_reg = SubAgentRegistry()
+        ledger = exc._coordinator.grant_ledger
+        ledger.add("file_write", str(tmp_path), GrantLifetime.PROMPT, scope_owner="sa-facade")
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit",
+                          side_effect=lambda fn, *a, **kw: fn()):
+            res = exc.spawn_agent({"task": "x"})
+
+        assert res["success"] is True
+        assert ledger.check("file_write", str(tmp_path / "f.txt"), scope_owner="sa-facade") is False
+
+    def test_spawn_agent_tool_path_wires_expiry(self, make_builtin_executor, tmp_path):
+        from confirmation import ConfirmationManager
+
+        runner = FakeRunner(agent_id="sa-tool")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        exc._coordinator = ConfirmationManager()
+        local_reg = SubAgentRegistry()
+        ledger = exc._coordinator.grant_ledger
+        ledger.add("file_write", str(tmp_path), GrantLifetime.PROMPT, scope_owner="sa-tool")
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit",
+                          side_effect=lambda fn, *a, **kw: fn()):
+            res = exc._exec_spawn_agent({"task": "x"}, caller_depth=0)
+
+        assert res["success"] is True
+        assert ledger.check("file_write", str(tmp_path / "f.txt"), scope_owner="sa-tool") is False
+
+    def test_supervisor_invokes_grant_scope_cb_on_terminal(self, tmp_path):
+        from builtin_executor import _save_context
+        from confirmation import ConfirmationManager, GrantLifetime
+
+        runner = FakeRunner(agent_id="sa-cb")
+        supervisor = SubAgentSupervisor(max_subagents=2)
+        cm = ConfirmationManager()
+        ledger = cm.grant_ledger
+        ledger.add("file_write", str(tmp_path), GrantLifetime.PROMPT, scope_owner="sa-cb")
+
+        def expire_scope(agent_id: str) -> None:
+            ledger.clear_prompt_scope(agent_id)
+
+        request = SubmissionRequest(
+            task="direct task",
+            response_format="text",
+            label="on-demand",
+            context_key=None,
+            factory=lambda **_k: runner,
+            factory_kwargs={},
+            data_dir=str(tmp_path),
+            notify_html_fn=None,
+            save_context=_save_context,
+        )
+        options = SupervisionOptions(notify=False, grant_scope_cb=expire_scope)
+
+        try:
+            res = supervisor.submit(request, options)
+            assert res["success"] is True
+            assert res["agent_id"] == "sa-cb"
+            # Wait for the background task to finish; it deregisters on terminal,
+            # so wait on the runner's own event and then verify the callback ran.
+            assert _wait_event(runner._done_event)
+            assert runner.closed is True
+            assert ledger.check("file_write", str(tmp_path / "f.txt"), scope_owner="sa-cb") is False
+        finally:
+            supervisor.shutdown(graceful_timeout=1.0)

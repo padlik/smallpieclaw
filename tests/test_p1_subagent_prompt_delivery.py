@@ -46,7 +46,8 @@ class TestSubagentPromptEscaping:
         description = (
             "Patch file: <code>/srv/app/config.xml</code>\n"
             "  - <setting name=\"debug\">false</setting>\n"
-            "  + <setting name=\"debug\">true</setting>"
+            "  + <setting name=\"debug\">true</setting>\n"
+            "📦 Scope: Confirm grants <code>/srv/app</code> (all files under it) for this prompt; Till /reset grants it for the whole session"
         )
         iface.send_subagent_confirmation_prompt("tok123", "file_patch", description)
 
@@ -58,7 +59,10 @@ class TestSubagentPromptEscaping:
 
     def test_ampersand_in_description_is_escaped(self):
         iface, bot = _make_iface()
-        description = "Read file: <code>/data/a&b&c.txt</code>"
+        description = (
+            "Read file: <code>/data/a&b&c.txt</code>\n"
+            "📦 Scope: Confirm grants <code>/data</code> (all files under it) for this prompt; Till /reset grants it for the whole session"
+        )
         iface.send_subagent_confirmation_prompt("tok", "file_read", description)
         text = _sent_text(bot)
         # A bare & would be rejected by Telegram's HTML parser.

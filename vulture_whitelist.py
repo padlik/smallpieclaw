@@ -60,27 +60,6 @@ MCPServerConfig
 OAuthConfig
 ExecutorPaths
 
-# builtin_tools/access_control.py — public API
-from builtin_tools.access_control import (  # noqa: E402
-    ZoneClassification,
-    TrustedDir,
-    TrustedZoneChecker,
-    GrantTracker,
-)
-ZoneClassification.TRUSTED
-ZoneClassification.REQUEST_GRANT
-ZoneClassification.UNRECOGNISED
-TrustedDir.path
-TrustedDir.added
-TrustedZoneChecker.classify
-TrustedZoneChecker.add_trusted
-TrustedZoneChecker.remove_trusted
-TrustedZoneChecker.list_user_trusted
-GrantTracker
-GrantTracker.add
-GrantTracker.reset
-GrantTracker.snapshot
-
 # mcp_oauth.py — public API for MCP OAuth 2.0 support
 from mcp_oauth import FileTokenStorage, CallbackServer, OAuthProviderFactory  # noqa: E402
 FileTokenStorage
@@ -238,7 +217,6 @@ _builtin_executor_type.conversation_id  # type: ignore[attr-defined]
 _builtin_executor_type._agent_name  # type: ignore[attr-defined]
 _builtin_executor_type._vault_secrets  # type: ignore[attr-defined]
 _builtin_executor_type._vault_secrets  # type: ignore[attr-defined]
-_builtin_executor_type.use_grant_tracker  # type: ignore[attr-defined]
 
 # config_schema.py — AgentConfig new retention field
 from config_schema import AgentConfig as _AgentConfig  # noqa: E402, F811

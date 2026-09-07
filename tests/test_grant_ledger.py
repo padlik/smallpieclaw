@@ -116,6 +116,36 @@ class TestSubAgentScope:
         ledger.clear_prompt_scope("sa-123")
         assert ledger.check("file_write", "/data/x.txt", scope_owner="sa-123") is True
 
+    def test_clear_prompt_scope_keeps_other_scopes_and_lifetimes(self, ledger: GrantLedger) -> None:
+        """clear_prompt_scope removes only the target scope's prompt grants."""
+        assert ledger.add(
+            "file_write", "/data", GrantLifetime.PROMPT, scope_owner="sa-abc"
+        ) is True
+        assert ledger.add(
+            "file_write", "/data2", GrantLifetime.PROMPT, scope_owner="sa-abc"
+        ) is True
+        assert ledger.add(
+            "file_write", "/data", GrantLifetime.PROMPT, scope_owner="sa-xyz"
+        ) is True
+        assert ledger.add(
+            "file_write", "/data", GrantLifetime.PROMPT, scope_owner=None
+        ) is True
+        assert ledger.add(
+            "file_write", "/data", GrantLifetime.SESSION, scope_owner=None
+        ) is True
+        ledger.clear_prompt_scope("sa-abc")
+        # sa-abc scoped prompt grants are gone.
+        assert ledger.check("file_write", "/data2/x.txt", scope_owner="sa-abc") is False
+        # sa-xyz scoped prompt grant survives.
+        assert ledger.check("file_write", "/data/x.txt", scope_owner="sa-xyz") is True
+        # The main-scoped prompt grant survives (different scope).
+        assert ledger.check("file_write", "/data/x.txt", scope_owner=None) is True
+        # The session-wide grant also survives prompt scope clearing.
+        assert any(
+            g.scope_owner is None and g.lifetime == GrantLifetime.SESSION
+            for g in ledger._grants
+        )
+
     def test_scope_free_session_grant_covers_every_scope(self, ledger: GrantLedger) -> None:
         # "Till /reset" consent is session-wide (approval-grants spec): a
         # scope-free SESSION grant covers the main agent and any sub-agent.

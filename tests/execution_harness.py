@@ -232,6 +232,13 @@ class _StubBuiltinExecutor:
     def __init__(self, executor: RecordingExecutor):
         self._executor = executor
 
+    @property
+    def path_policy(self):
+        # Delegate to the wrapped executor so tests can wire a PathPolicy via
+        # ``ex.path_policy = ...`` and have the gated built-ins (e.g. vision_query)
+        # see it through ctx.builtin_executor.
+        return getattr(self._executor, "path_policy", None)
+
     def is_builtin(self, tool_name: str) -> bool:
         # Treat every tool as a builtin so react_loop routes here instead of
         # returning "unknown tool" errors after hand-written-tool removal.

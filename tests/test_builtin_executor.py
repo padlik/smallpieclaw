@@ -245,6 +245,10 @@ class TestFileDiff:
         from path_policy import PathPolicy
 
         workspace = str(tmp_path)
+        # Agent-internal (prohibited) dirs must live OUTSIDE the Tier 1
+        # workspace — the Tier 1 conflict check fails policy construction on
+        # any overlap between a tier-1 dir and a prohibited path.
+        agent_root = os.path.join(tmp_path.parent, f"agent-internal-{tmp_path.name}")
         policy = PathPolicy.create(
             agent_name="test-agent",
             workspace_dir=workspace,
@@ -252,11 +256,11 @@ class TestFileDiff:
             tmp_dir="/tmp/test-agent",
             skills_dir=workspace,
             results_dir=os.path.join(workspace, "results"),
-            data_home=os.path.join(workspace, "xdg", "data", "test-agent"),
-            state_home=os.path.join(workspace, "xdg", "state", "test-agent"),
-            config_home=os.path.join(workspace, "xdg", "config", "test-agent"),
-            vault_path=os.path.join(workspace, "vault.toml"),
-            config_path=os.path.join(workspace, "xdg", "config", "test-agent", "config.toml"),
+            data_home=os.path.join(agent_root, "xdg", "data", "test-agent"),
+            state_home=os.path.join(agent_root, "xdg", "state", "test-agent"),
+            config_home=os.path.join(agent_root, "xdg", "config", "test-agent"),
+            vault_path=os.path.join(agent_root, "vault.toml"),
+            config_path=os.path.join(agent_root, "xdg", "config", "test-agent", "config.toml"),
         )
         return make_builtin_executor(path_policy=policy).execute("file_diff", args)
 

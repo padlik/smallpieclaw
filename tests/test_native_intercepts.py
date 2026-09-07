@@ -16,6 +16,7 @@ payload is nested under ``action_obj["plan"]``.
 
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 
 from interfaces import ChatResponse, ToolCall
@@ -122,7 +123,26 @@ class TestNativeVisionQueryIntercept:
             )]),
             ChatResponse(text='{"action": "finish", "result": "done"}'),
         ])
+        from path_policy import PathPolicy
+
         ex = RecordingExecutor()
+        # vision_query gates through PathPolicy; wire a minimal policy that allows
+        # the temp image path (/tmp/pic.png) so the handler proceeds.  Use temp
+        # agent-internal dirs so the default skills/results paths do not overlap
+        # a prohibited dot-home entry.
+        xdg_root = os.path.realpath(os.path.join(os.getcwd(), "tmp_xdg_vision"))
+        os.makedirs(xdg_root, exist_ok=True)
+        ex.path_policy = PathPolicy.create(
+            agent_name="test-agent",
+            workspace_dir="/tmp",
+            downloads_dir="/tmp",
+            tmp_dir="/tmp",
+            data_home=os.path.join(xdg_root, "data"),
+            state_home=os.path.join(xdg_root, "state"),
+            config_home=os.path.join(xdg_root, "config"),
+            skills_dir=os.path.join(xdg_root, "skills"),
+            results_dir=os.path.join(xdg_root, "results"),
+        )
 
         # The vision path asks the LLM to describe the encoded image. Capture the
         # messages it hands the model so we can assert the native path/question

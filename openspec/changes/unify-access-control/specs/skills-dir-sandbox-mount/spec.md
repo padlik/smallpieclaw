@@ -25,7 +25,7 @@ Rule: `skills_dir` is `~/.<agent_name>/skills/` — hardcoded Tier 1, read-only,
 - **THEN** the write fails with a permission error
 - **AND** the original file on the host is unchanged
 
-#### Scenario: Missing skills dir is skipped gracefully
+#### Scenario: Missing skills_dir is skipped gracefully
 - **GIVEN** `~/.<agent>/skills/` does not exist on the host filesystem
 - **WHEN** the session nsjail config is generated
 - **THEN** no mount entry for skills is emitted
@@ -37,6 +37,30 @@ Rule: `skills_dir` is `~/.<agent_name>/skills/` — hardcoded Tier 1, read-only,
 - **WHEN** the session nsjail config is generated
 - **THEN** the mount entry points to `~/.piclaw/skills/`
 - **AND** the directory is accessible inside the jail at the same host path
+
+#### Scenario: skills_dir uses the XDG-derived path
+- **GIVEN** `agent_name` is `"piclaw"` and there is no `skills_dir` config parameter
+- **WHEN** the session nsjail config is generated
+- **THEN** the mount entry points to `~/.piclaw/skills/` (agent dot-home, not the XDG state home)
+- **AND** the legacy XDG-derived path `~/.local/state/piclaw/skills/` is NOT mounted directly
+
+#### Scenario: skills_dir under /home is accepted
+- **GIVEN** the agent dot-home skills dir resolves to `~/.piclaw/skills/` (under `/home/<user>`)
+- **WHEN** the session nsjail config is generated
+- **THEN** the directory is mounted read-only inside the jail
+- **AND** no "restricted system path" warning is logged
+
+#### Scenario: skills_dir on a blocked system path is rejected
+- **GIVEN** `skills_dir` is hardcoded to `~/.<agent>/skills/` which is always under the user home
+- **WHEN** the session nsjail config is generated
+- **THEN** the path is never on a blocked system prefix (e.g. `/etc`, `/usr`) by construction
+- **AND** no rejection or skip occurs for the skills mount
+
+#### Scenario: skills_dir under a blocked user-home prefix is accepted
+- **GIVEN** the skills dir at `~/.<agent>/skills/` is a hardcoded Tier 1 entry in PathPolicy
+- **WHEN** the session nsjail config is generated
+- **THEN** the directory is mounted read-only inside the jail regardless of XDG prefix overlap
+- **AND** the mount entry has `rw: false`
 
 ## ADDED Requirements
 

@@ -69,6 +69,9 @@ def grant_covers(grant_dir: str, path: str) -> bool:
     case-insensitive filesystems on a best-effort basis; separator handling
     avoids false positives for path-prefix collisions (e.g. ``/data/reports``
     must not cover ``/data/repo``).
+
+    Callers must pass *grant_dir* already realpath-normalized (typically
+    ``os.path.dirname(real_path)``); *path* is normalized inside this function.
     """
     norm_zone = os.path.normcase(grant_dir)
     norm_path = os.path.normcase(os.path.realpath(os.path.expanduser(path)))
@@ -257,7 +260,12 @@ class ConfirmationManager:
         event = threading.Event()
         self._confirm_events[token] = event
         self._confirm_results[token] = False
-        progress_cb(f"{CONFIRM_PREFIX}:{token}:{tool_name}:{description}")
+        try:
+            progress_cb(f"{CONFIRM_PREFIX}:{token}:{tool_name}:{description}")
+        except Exception:
+            self._confirm_events.pop(token, None)
+            self._confirm_results.pop(token, None)
+            raise
         event.wait(timeout=300)
         confirmed = self._confirm_results.pop(token, False)
         self._confirm_events.pop(token, None)
@@ -296,7 +304,12 @@ class ConfirmationManager:
         event = threading.Event()
         self._extend_events[token] = event
         self._extend_results[token] = "no"
-        progress_cb(f"{EXTEND_PREFIX}:{token}:{max_steps}")
+        try:
+            progress_cb(f"{EXTEND_PREFIX}:{token}:{max_steps}")
+        except Exception:
+            self._extend_events.pop(token, None)
+            self._extend_results.pop(token, None)
+            raise
         event.wait(timeout=120)
         self._extend_events.pop(token, None)
         return self._extend_results.pop(token, "no")
@@ -333,7 +346,12 @@ class ConfirmationManager:
         event = threading.Event()
         self._retry_events[token] = event
         self._retry_results[token] = "timeout"
-        progress_cb(f"{RETRY_PREFIX}:{token}:{error_info_json}")
+        try:
+            progress_cb(f"{RETRY_PREFIX}:{token}:{error_info_json}")
+        except Exception:
+            self._retry_events.pop(token, None)
+            self._retry_results.pop(token, None)
+            raise
         event.wait(timeout=timeout_seconds)
         self._retry_events.pop(token, None)
         return self._retry_results.pop(token, "timeout")

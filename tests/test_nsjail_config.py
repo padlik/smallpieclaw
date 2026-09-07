@@ -384,6 +384,41 @@ class TestBuild:
         finally:
             os.unlink(cfg_path)
 
+    def test_every_tier1_entry_present_or_subsumed_by_session_mount(
+        self, tmp_path: str
+    ) -> None:
+        """Each Tier-1 entry is either emitted as a bind mount or, when it equals
+        tmp_dir, is covered by the dedicated tmp_dir system mount."""
+        policy = _make_policy(str(tmp_path))
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir=policy.tmp_dir,
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            for path, mode in policy.tier1_entries():
+                if path == builder.tmp_dir:
+                    assert (
+                        f"mount: {{ src: {json.dumps(builder.tmp_dir)} "
+                        f"dst: {json.dumps(builder.tmp_dir)} "
+                        f"is_bind: true rw: true mandatory: true }}"
+                    ) in content
+                    continue
+                if not os.path.isdir(path):
+                    continue
+                rw = "true" if mode == "rw" else "false"
+                assert (
+                    f"mount: {{ src: {json.dumps(path)} "
+                    f"dst: {json.dumps(path)} "
+                    f"is_bind: true rw: {rw} mandatory: true }}"
+                ) in content, f"missing Tier-1 mount for {path!r} mode={mode}"
+        finally:
+            os.unlink(cfg_path)
+
+
     def test_results_mount_is_rw(self, tmp_path: str) -> None:
         """results_dir is mounted read-write."""
         policy = _make_policy(str(tmp_path))
@@ -415,6 +450,45 @@ class TestBuild:
                 content = f.read()
             skills_escaped = json.dumps(policy.skills_dir).replace("\\", "\\\\")
             assert f"src: {skills_escaped} dst: {skills_escaped} is_bind: true rw: false" in content
+        finally:
+            os.unlink(cfg_path)
+
+    def test_tmp_dir_skipped_when_equal_to_skills_dir(self, tmp_path: str) -> None:
+        """A read-only tier-1 entry exactly matching tmp_dir is not double-mounted."""
+        shared_dir = os.path.join(str(tmp_path), "shared")
+        os.makedirs(shared_dir, exist_ok=True)
+        # Use the realpath of the shared dir as tmp_dir so macOS /tmp → /private/tmp
+        # handling does not introduce a mismatch.
+        shared_real = os.path.realpath(shared_dir)
+        policy = PathPolicy.create(
+            agent_name="test-agent",
+            workspace_dir=os.path.join(str(tmp_path), "workspace"),
+            downloads_dir=os.path.join(str(tmp_path), "downloads"),
+            tmp_dir=shared_real,
+            skills_dir=shared_real,
+            results_dir=os.path.join(str(tmp_path), "results"),
+            data_home=os.path.join(str(tmp_path), "xdg", "data", "test-agent"),
+            state_home=os.path.join(str(tmp_path), "xdg", "state", "test-agent"),
+            config_home=os.path.join(str(tmp_path), "xdg", "config", "test-agent"),
+            vault_path=os.path.join(str(tmp_path), "vault.toml"),
+            config_path=os.path.join(str(tmp_path), "xdg", "config", "test-agent", "config.toml"),
+            allowed_dirs=None,
+            prohibited_dirs=None,
+        )
+        builder = NsjailConfigBuilder(
+            session_tmpdir="/tmp/session",
+            tmp_dir=shared_real,
+            path_policy=policy,
+        )
+        cfg_path, _ = builder.build("ls", timeout=30)
+        try:
+            with open(cfg_path) as f:
+                content = f.read()
+            escaped = json.dumps(shared_real)
+            matches = content.count(f"src: {escaped} dst: {escaped}")
+            # Exactly one bind mount for the shared path (the dedicated /tmp/<agent>
+            # system mount covers it; the tier-1 read-only skills entry is skipped).
+            assert matches == 1
         finally:
             os.unlink(cfg_path)
 
