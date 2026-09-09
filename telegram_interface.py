@@ -51,7 +51,7 @@ from telegram_commands import (
     cmd_resume, cmd_context,
 )
 from telegram_callbacks import (
-    cb_confirm, cb_extend, cb_model_switch, cb_mode_switch,
+    cb_confirm, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
     cb_oauth_cancel, cb_llm_retry,
 )
@@ -167,7 +167,6 @@ class _ProgressPanel:
         self._step_n: int = 0
         self._progress_dispatch: dict[str, Callable[[str], None]] = {
             "__CONFIRM__:": self._handle_confirm_progress,
-            "__EXTEND__:": self._handle_extend_progress,
             "__LLM_ERROR__:": self._handle_llm_error_progress,
             "__FILE__": self._handle_file_progress,
             "__TOOL_END__:": self._handle_tool_end_progress,
@@ -273,6 +272,34 @@ class _ProgressPanel:
             self._loop,
         )
 
+    def milestone_notify(self, step: int) -> None:
+        """Send a non-blocking Telegram milestone notification.
+
+        Dispatched from the react loop worker thread onto the bot's asyncio
+        event loop via ``run_coroutine_threadsafe``. The returned Future is
+        discarded (fire-and-forget) so the agent never waits for delivery.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+
+        chat_id = self._chat_id
+
+        async def _send() -> None:
+            try:
+                await self._ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🐾 Step {step} — still running…",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        except Exception:
+            pass
+
     def _handle_confirm_progress(self, msg: str) -> None:
         """Handle ``__CONFIRM__:{token}:{tool_name}:{description}`` signals."""
         # Format: __CONFIRM__:{token}:{tool_name}:{description}
@@ -291,18 +318,6 @@ class _ProgressPanel:
                 tool_name,
                 description,
                 zone_path=zone_path,
-            ),
-            self._loop,
-        )
-
-    def _handle_extend_progress(self, msg: str) -> None:
-        """Handle ``__EXTEND__:{token}:{current_steps}`` signals."""
-        parts = msg.split(":", 2)
-        token = parts[1]
-        current_steps = parts[2] if len(parts) > 2 else "?"
-        asyncio.run_coroutine_threadsafe(
-            self._interface._send_extend_prompt(
-                self._update.effective_message, token, current_steps
             ),
             self._loop,
         )
@@ -677,7 +692,6 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(partial(cb_mode_switch, self), pattern=r"^mode:"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|till_reset):"))
-        app.add_handler(CallbackQueryHandler(partial(cb_extend, self), pattern=r"^extend_(yes|no|unlimited):"))
         app.add_handler(CallbackQueryHandler(partial(cb_llm_retry, self), pattern=r"^llm_retry:"))
         app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
         app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
@@ -895,6 +909,7 @@ class TelegramInterface:
                     prompt_id=prompt_record.prompt_id if prompt_record is not None else None,
                     trace_id=trace_id,
                     resume_from=resume_from,
+                    milestone_notify_fn=panel.milestone_notify,
                 ),
             )
             await self._safe_edit_html(status_msg, panel.build_panel())
@@ -1009,20 +1024,6 @@ class TelegramInterface:
             reply_markup=keyboard,
         )
 
-    async def _send_extend_prompt(self, message, token: str, current_steps: str) -> None:
-        """Send inline buttons asking whether to extend the agent step limit."""
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏩ Extend 10 more steps", callback_data=f"extend_yes:{token}"),
-            InlineKeyboardButton("♾️ Run until done",       callback_data=f"extend_unlimited:{token}"),
-            InlineKeyboardButton("❌ Cancel",               callback_data=f"extend_no:{token}"),
-        ]])
-        await message.reply_text(
-            f"⏱ <b>Max steps reached</b> ({current_steps} steps)\n\n"
-            "The agent hasn't finished yet. Extend by 10 more steps, run until done, or cancel?",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-        )
-
     async def _send_llm_error_prompt(self, message, token: str, error_info_json: str) -> None:
         """Send an inline-button error card for LLM errors with Retry/Cancel buttons."""
         import json as _json
@@ -1035,7 +1036,6 @@ class TelegramInterface:
         retryable = info.get("retryable", True)
         model = info.get("model", "?")
         step = info.get("step", "?")
-        max_steps = info.get("max_steps", "?")
         tool_results = info.get("tool_results_count", 0)
         detail = info.get("detail", "")
         if len(detail) > 200:
@@ -1046,7 +1046,7 @@ class TelegramInterface:
             f"⚠️ <b>LLM Error</b>\n\n"
             f"{html.escape(error_message)}\n\n"
             f"<b>Model:</b> {html.escape(str(model))}\n"
-            f"<b>Step:</b> {step}/{max_steps}\n"
+            f"<b>Step:</b> {step}\n"
             f"<b>Preserved tool results:</b> {tool_results}\n"
         )
         if detail:

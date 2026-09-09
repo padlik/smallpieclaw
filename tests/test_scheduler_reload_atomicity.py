@@ -19,6 +19,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from builtin_tools.schedule import exec_schedule
 from scheduler import Scheduler
 from xdg import XDGPaths
 
@@ -142,3 +143,74 @@ class TestReloadAtomicPublish:
         written = config_path.read_text()
         assert "[jobs.alpha]" in written
         assert "[jobs.beta]" in written
+
+
+class TestMaxIterationsBackwardCompat:
+    """max_iterations is no longer used at runtime but must not break legacy configs."""
+
+    def test_scheduler_toml_with_max_iterations_loads_and_round_trips(self, tmp_path):
+        """A legacy scheduler.toml containing max_iterations must still load and serialize."""
+        config_path = tmp_path / "scheduler.toml"
+        config_path.write_text("""
+[jobs.legacy]
+enabled = true
+schedule = "cron"
+cron = "0 2 * * *"
+task = "legacy task"
+max_iterations = 99
+""")
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        sched = Scheduler(
+            config={"scheduler": {"enabled": False}, "agent": {"scheduled_max_iterations": 10}},
+            notify_fn=MagicMock(),
+            agent_fn=MagicMock(),
+            scheduler_config_path=str(config_path),
+            paths=_paths_for(data_dir),
+        )
+        assert "legacy" in sched._jobs_meta
+        assert sched._jobs_meta["legacy"].get("max_iterations") == 99
+        # Runtime path must NOT pass max_iterations into spawn_args
+        mock_executor = MagicMock()
+        mock_executor.spawn_agent = MagicMock(return_value={"success": True})
+        sched.builtin_executor = mock_executor
+        sched._run_job("legacy")
+        spawn_args = mock_executor.spawn_agent.call_args[0][0]
+        assert "max_iterations" not in spawn_args
+        # Round-trip serialization preserves the ignored field
+        sched._save_scheduler_toml()
+        written = config_path.read_text()
+        assert "max_iterations = 99" in written
+
+    def test_schedule_add_action_without_max_iterations_works(self):
+        """schedule add action with the modern parameter set succeeds."""
+        scheduler = MagicMock()
+        scheduler.add_job.return_value = {"success": True}
+        result = exec_schedule(
+            scheduler,
+            {
+                "action": "add",
+                "tag": "modern",
+                "task": "do work",
+                "cron": "0 3 * * *",
+            },
+        )
+        assert result["success"] is True
+        assert "max_iterations" not in scheduler.add_job.call_args.kwargs
+
+    def test_schedule_old_call_with_max_iterations_is_tolerated(self):
+        """An LLM or script that still passes max_iterations must not crash."""
+        scheduler = MagicMock()
+        scheduler.add_job.return_value = {"success": True}
+        result = exec_schedule(
+            scheduler,
+            {
+                "action": "add",
+                "tag": "legacy",
+                "task": "do work",
+                "cron": "0 4 * * *",
+                "max_iterations": 50,
+            },
+        )
+        assert result["success"] is True
+        assert "max_iterations" not in scheduler.add_job.call_args.kwargs

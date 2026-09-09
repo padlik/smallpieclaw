@@ -833,3 +833,103 @@ class TestUnchangedSubsystems:
         finally:
             asyncio.run_coroutine_threadsafe = original_run  # type: ignore[assignment]
         panel._interface._send_confirmation_prompt.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Milestone notification
+# ---------------------------------------------------------------------------
+
+
+class TestMilestoneNotify:
+    def test_milestone_notify_dispatches_fire_and_forget(self) -> None:
+        """milestone_notify schedules a non-blocking send_message on the bot loop."""
+        import asyncio
+        from typing import Coroutine
+        panel = _make_panel()
+        panel._loop.is_running.return_value = True  # type: ignore[union-attr]
+        panel._ctx.bot.send_message = MagicMock()  # type: ignore[union-attr]
+
+        original_run = asyncio.run_coroutine_threadsafe
+        captured: list[tuple[Coroutine, object]] = []
+
+        def _capture(coro, loop):
+            captured.append((coro, loop))
+            return MagicMock()
+
+        asyncio.run_coroutine_threadsafe = _capture  # type: ignore[assignment]
+        try:
+            panel.milestone_notify(30)
+        finally:
+            asyncio.run_coroutine_threadsafe = original_run  # type: ignore[assignment]
+
+        assert len(captured) == 1
+        coro, loop = captured[0]
+        assert loop is panel._loop
+        # Drive the coroutine in a fresh event loop to inspect the sent text.
+        fresh_loop = asyncio.new_event_loop()
+        try:
+            fresh_loop.run_until_complete(coro)
+        finally:
+            fresh_loop.close()
+        panel._ctx.bot.send_message.assert_called_once()
+        call_kwargs = panel._ctx.bot.send_message.call_args.kwargs
+        assert call_kwargs["chat_id"] == 123
+        assert "Step 30" in call_kwargs["text"]
+
+    def test_milestone_notify_noop_when_loop_not_running(self) -> None:
+        """If the bot event loop is not running, milestone_notify does nothing."""
+        import asyncio
+        panel = _make_panel()
+        panel._loop.is_running.return_value = False  # type: ignore[union-attr]
+        original_run = asyncio.run_coroutine_threadsafe
+        called = False
+
+        def _capture(coro, loop):
+            nonlocal called
+            called = True
+            return MagicMock()
+
+        asyncio.run_coroutine_threadsafe = _capture  # type: ignore[assignment]
+        try:
+            panel.milestone_notify(30)
+        finally:
+            asyncio.run_coroutine_threadsafe = original_run  # type: ignore[assignment]
+        assert not called
+
+    def test_milestone_notify_noop_when_loop_none(self) -> None:
+        """If the panel was torn down (loop is None), milestone_notify does nothing."""
+        import asyncio
+        panel = _make_panel()
+        panel._loop = None  # type: ignore[assignment]
+        original_run = asyncio.run_coroutine_threadsafe
+        called = False
+
+        def _capture(coro, loop):
+            nonlocal called
+            called = True
+            return MagicMock()
+
+        asyncio.run_coroutine_threadsafe = _capture  # type: ignore[assignment]
+        try:
+            panel.milestone_notify(30)
+        finally:
+            asyncio.run_coroutine_threadsafe = original_run  # type: ignore[assignment]
+        assert not called
+
+
+# ---------------------------------------------------------------------------
+# Extend flow removal
+# ---------------------------------------------------------------------------
+
+
+class TestExtendFlowRemoved:
+    def test_extend_dispatch_entry_removed(self) -> None:
+        """The __EXTEND__ progress signal handler no longer exists."""
+        panel = _make_panel()
+        assert "__EXTEND__:" not in panel._progress_dispatch
+
+    def test_extend_prompt_method_removed(self) -> None:
+        """TelegramInterface no longer has the extend-prompt helper."""
+        from telegram_interface import TelegramInterface
+        assert not hasattr(TelegramInterface, "_send_extend_prompt")
+        assert not hasattr(TelegramInterface, "_handle_extend_progress")

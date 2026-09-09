@@ -187,8 +187,9 @@ class ConfirmationManager:
        Used for shell / file_write (and any other builtin that returns
        ``requires_confirmation``).
 
-    2. **Step extension** — request_extension / signal_extension.  Prompted
-       when the agent reaches its ``max_iterations`` limit.
+    2. **Step extension** — request_extension / signal_extension.  Retained
+       as part of the ADR-0024 four-flow taxonomy but now dormant: the react
+       loop no longer enforces a step limit, so this flow has no active callers.
 
     3. **LLM error retry** — request_retry / signal_retry.  Prompted when an
        LLM call fails with a retriable error so the operator can decide whether

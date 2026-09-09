@@ -157,6 +157,10 @@ agent_name = "piclaw"
 # Agent home directory. Defaults to ~/<agent_name> when omitted or empty.
 # The vault path is independent and defaults to ~/.local/share/<agent_name>/secrets.toml.
 # agent_home = "~/piclaw"
+# DEPRECATED no-op (kept so existing config files keep loading): former interactive
+# step limit. The react loop no longer enforces a step gate — the agent runs until
+# the task completes, is stopped by the operator, or self-terminates after three
+# identical consecutive tool failures (doom-loop detection).
 max_iterations = 8
 tool_timeout   = 10
 # Maximum chars returned by the shell tool and registered tools per stream
@@ -189,9 +193,15 @@ diagnose_empty_responses = false
 max_subagents = 6
 # Timeout in seconds for get_agent_result tool when waiting for a sub-agent to finish. Default: 300.
 subagent_result_timeout = 300
-# Max steps for scheduled/background sub-agents (independent of max_iterations for chat sessions).
-# Set to 0 for no limit (capped internally at 500). Default: 100.
+# DEPRECATED no-op (kept so existing config files keep loading): former step cap
+# for scheduled/background sub-agents. Sub-agents now share the same unlimited
+# runtime as the main agent, bounded only by doom-loop detection (three identical
+# consecutive tool failures) and operator stop.
 scheduled_max_iterations = 100
+# Main-agent Telegram milestone ping: every N completed steps the agent sends a
+# fire-and-forget "still running" notification. 0 disables. Default: 30.
+# Sub-agents never send milestone notifications.
+step_notify_interval = 30
 # Warn in chat when a sub-agent has been running longer than this many minutes. 0 = disabled.
 long_run_warn_minutes = 30
 # Shell execution backend.

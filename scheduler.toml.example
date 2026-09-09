@@ -22,6 +22,8 @@
 #   preserve_context     = true/false    (keep ShortTermMemory between runs; default: false)
 #   context_max_messages = N             (sliding window size when preserve_context=true; default: 50)
 #   overlap_policy       = "skip"|"parallel"  (what to do if previous run is still active; default: skip)
+#   max_iterations       = N             (DEPRECATED: parsed but ignored — agents now run
+#                                         until they finish or hit a failure loop. Remove from existing jobs.)
 #   fallback_models      = ["<model>"]   (DEPRECATED: parsed but ignored — the LLM client
 #                                         is now single-model. Remove from existing jobs.)
 

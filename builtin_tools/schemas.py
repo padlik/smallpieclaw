@@ -360,10 +360,6 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "boolean",
                     "description": "Keep conversation history between runs (default: false).",
                 },
-                "max_iterations": {
-                    "type": "integer",
-                    "description": "Override step limit (0 = unlimited).",
-                },
             },
             "required": ["action"],
         },

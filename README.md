@@ -251,7 +251,7 @@ Agent-internal data is reachable only through dedicated tools — `log_query` fo
 
 Run results (oversized shell output, sub-agent handoffs) land in `~/.<agent_name>/results/<trace-id>/` — kept until manually deleted; there is no automatic cleanup.
 
-When the agent hits the interactive step limit (`max_iterations`, default 8), inline buttons offer **Extend 10**, **Unlimited**, or **Cancel**.
+There is no interactive step limit. The agent runs until the task completes, the operator stops it, or it self-terminates: when the same tool call fails with the same error three consecutive times, the agent stops with a doom-loop message instead of burning budget on the repeat. The main agent also sends a fire-and-forget Telegram ping every `step_notify_interval` steps (default 30, `0` disables) so long runs stay visible; sub-agents never send milestone pings. The old step caps (`max_iterations`, `scheduled_max_iterations`, `plan_max_iterations`) are deprecated no-ops — they still load from existing config files but have no effect.
 
 ---
 
@@ -445,7 +445,7 @@ notify  = true
 
 One-time reminders: `schedule = "once"` with `run_at = "HH:MM"` — auto-removed after execution.
 
-Per-job options: `model`, `preserve_context`, `context_max_messages`, `overlap_policy` (`skip`/`parallel`), `max_iterations`, `notify`.
+Per-job options: `model`, `preserve_context`, `context_max_messages`, `overlap_policy` (`skip`/`parallel`), `notify`. (A legacy `max_iterations` job key is still accepted and silently ignored.)
 
 Key features: hot-reload without restart (`/jobs reload`), automatic backups before each write (last 5 kept), ±5 min jitter on first cron run, run history in `data/scheduler_state.json`.
 
@@ -504,14 +504,13 @@ Key configuration:
 ```toml
 [agent]
 background_model           = "gpt-4o-mini"    # default model for sub-agents / scheduler
-max_iterations             = 8                # interactive step limit
-scheduled_max_iterations   = 100             # sub-agent / scheduler limit (0 = no limit)
+step_notify_interval        = 30              # main-agent Telegram ping every N steps (0 = off)
 long_run_warn_minutes      = 30              # Telegram notification threshold (0 = off)
 tool_timeout               = 10              # seconds per tool call
 ctx_max_tokens             = 90000
 ```
 
-Per-job overrides in `scheduler.toml`: `model`, `max_iterations`, `preserve_context`, `overlap_policy`.
+(The legacy `max_iterations` / `scheduled_max_iterations` / `plan_max_iterations` keys are still accepted in config files but ignored — the step gate is gone; see the security section above.)
 
 Manage sub-agents: `/agents` to list, `/agents cancel <id>` or `/agents cancel <job_tag>` to stop.
 

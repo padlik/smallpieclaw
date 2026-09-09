@@ -96,6 +96,7 @@ class ControllerDeps:
     checkpoint_enabled: bool = True
     retry_timeout_seconds: int = 120
     context_monitor: ContextMonitor | None = None
+    step_notify_interval: int = 0
 
 
 class RuntimeProfile(Enum):

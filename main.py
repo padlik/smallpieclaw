@@ -670,6 +670,7 @@ def _run(
         skill_registry=skills,
         mcp_manager=mcp_manager,
         context_monitor=context_monitor,
+        step_notify_interval=app_cfg.agent.step_notify_interval,
     )
 
     # Checkpoint store for LLM error recovery.
@@ -700,6 +701,7 @@ def _run(
 
     def agent_handler(
         user_id, text, progress_cb, images=None, *, prompt_id=None, trace_id=None, resume_from=None,
+        milestone_notify_fn=None,
     ):
         return agent.run(
             text,
@@ -708,6 +710,7 @@ def _run(
             prompt_id=prompt_id,
             trace_id=trace_id,
             resume_from=resume_from,
+            milestone_notify_fn=milestone_notify_fn,
         )
 
     # Build TelegramInterface first so notify() can reference it

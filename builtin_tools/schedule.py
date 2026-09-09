@@ -80,7 +80,6 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             cron=str(args.get("cron", "")) or None,
             model=str(args["model"]) if args.get("model") else None,
             preserve_context=bool(args.get("preserve_context", False)),
-            max_iterations=int(args["max_iterations"]) if args.get("max_iterations") is not None else None,
         )
         if result["success"]:
             return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}

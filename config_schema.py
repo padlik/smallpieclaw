@@ -365,6 +365,9 @@ class ProviderConfig:
 @dataclass(frozen=True)
 class AgentConfig:
     agent_name: str = "piclaw"
+    # DEPRECATED no-op step caps (react loop no longer enforces a step gate):
+    # read and discarded at load time so existing config files keep loading
+    # without errors. No deprecation warning is emitted.
     max_iterations: int = 8
     scheduled_max_iterations: int = 100
     tool_timeout: int = 10
@@ -419,11 +422,14 @@ class AgentConfig:
     session_logs_retention_days: int = 7
     # Creativity mode for prompt assembly — default/planner/explorer/resilient
     creativity_mode: str = "default"
-    # Maximum iterations for plan execution (higher than normal max_iterations
-    # to let multi-step plans complete without artificial interruption)
-    plan_max_iterations: int = 50
+    # Steps between fire-and-forget Telegram milestone notifications sent by the
+    # main agent (e.g., "step 30 — still running"). 0 disables notifications.
+    # Sub-agents never send milestone notifications.
+    step_notify_interval: int = 30
     # Minutes of inactivity before a soft "still working?" prompt is injected
     inactivity_warn_minutes: int = 15
+    # DEPRECATED no-op (see note at top of class): former plan-execution step cap.
+    plan_max_iterations: int = 50
 
 
 @dataclass(frozen=True)
@@ -725,6 +731,7 @@ def _parse_agent(raw: dict) -> AgentConfig:
         dns_nameserver=str(section.get("dns_nameserver", "8.8.8.8")),
         session_logs_retention_days=max(1, _parse_int(section.get("session_logs_retention_days"), 7, "agent.session_logs_retention_days")),
         creativity_mode=section.get("creativity_mode", "default"),
+        step_notify_interval=_parse_int(section.get("step_notify_interval"), 30, "agent.step_notify_interval"),
         plan_max_iterations=_parse_int(section.get("plan_max_iterations"), 50, "agent.plan_max_iterations"),
         inactivity_warn_minutes=_parse_int(section.get("inactivity_warn_minutes"), 15, "agent.inactivity_warn_minutes"),
     )

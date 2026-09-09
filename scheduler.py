@@ -450,7 +450,6 @@ class Scheduler:
         preserve_context: bool,
         context_max_messages: int,
         overlap_policy: str,
-        max_iterations,
     ) -> dict:
         """Build the meta dict for a new job."""
         meta = {
@@ -472,11 +471,6 @@ class Scheduler:
             meta["context_max_messages"] = context_max_messages
         if overlap_policy != "skip":
             meta["overlap_policy"] = overlap_policy
-        if max_iterations is not None:
-            try:
-                meta["max_iterations"] = int(max_iterations)
-            except (ValueError, TypeError):
-                pass
         return meta
 
     def add_job(
@@ -495,7 +489,6 @@ class Scheduler:
         preserve_context: bool = False,
         context_max_messages: int = 50,
         overlap_policy: str = "skip",
-        max_iterations: Optional[int] = None,
     ) -> dict:
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
         tag = _normalize_context_key(tag)
@@ -523,7 +516,7 @@ class Scheduler:
         meta = self._build_job_meta(
             tag, task, schedule_type, expr, effective_run_at, notify, source,
             model, preserve_context, context_max_messages,
-            overlap_policy, max_iterations,
+            overlap_policy,
         )
 
         with self._running_lock:
@@ -757,9 +750,6 @@ class Scheduler:
             spawn_args["model"] = job_model
         if context_key:
             spawn_args["context_key"] = context_key
-        # max_iterations: per-job override; None = factory uses scheduled_max_iterations
-        if "max_iterations" in meta:
-            spawn_args["max_iterations"] = meta["max_iterations"]
 
         # Internal supervision controls travel through per-submission options,
         # NOT through the model-facing spawn_args dict. Per-submission options

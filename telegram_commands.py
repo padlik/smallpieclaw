@@ -252,6 +252,12 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 
     mode = _current_mode(iface)
 
+    _step_interval = iface._config.get("agent", {}).get("step_notify_interval", 30)
+    if _step_interval:
+        milestone_line = f"\n⏱ Milestone notifications: every <code>{_step_interval}</code> steps"
+    else:
+        milestone_line = "\n⏱ Milestone notifications: disabled"
+
     await update.effective_message.reply_text(
         f"✅ <b>Agent Status</b>\n\n"
         f"🕐 Time: <code>{now_str}</code>\n"
@@ -264,6 +270,7 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         f"🔧 Tools: {tools_count} | 📚 Skills: {skills_count}"
         f"{agents_line}"
         f"{scheduler_line}"
+        f"{milestone_line}"
         f"{graph_memory_line}"
         f"{token_line}",
         parse_mode=ParseMode.HTML,
@@ -419,14 +426,13 @@ async def cmd_resume(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         for i, cp in enumerate(checkpoints, 1):
             goal = html.escape(cp.get("user_goal", "?")[:60])
             step = cp.get("step", "?")
-            max_steps = cp.get("max_steps", "?")
             error_type = cp.get("error_info", {}).get("type", "unknown")
             retryable = cp.get("error_info", {}).get("retryable", True)
             created = cp.get("created_at", "?")
             status_icon = "🔄" if retryable else "❌"
             lines.append(
                 f"{i}. {status_icon} <b>{goal}</b>\n"
-                f"   Step {step}/{max_steps} • Error: {error_type} • {created}\n"
+                f"   Step {step} • Error: {error_type} • {created}\n"
             )
         lines.append("\nUse <code>/resume N</code> to resume a specific checkpoint.")
         await update.effective_message.reply_text(
@@ -451,10 +457,9 @@ async def cmd_resume(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     goal = checkpoint.get("user_goal", "")
     trace_id = checkpoint.get("trace_id", "")
     step = checkpoint.get("step", 0)
-    max_steps = checkpoint.get("max_steps", 8)
 
     await update.effective_message.reply_text(
-        f"💾 Resuming: {html.escape(goal[:60])} (step {step}/{max_steps})",
+        f"💾 Resuming: {html.escape(goal[:60])} (step {step})",
         parse_mode=ParseMode.HTML,
     )
 
@@ -980,7 +985,7 @@ async def cmd_agents(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         lines.append(f"   Model:   <code>{html.escape(rec.model)}</code>")
         lines.append(f"   Task:    {html.escape(rec.task_preview)}{'…' if len(rec.task_preview) >= 80 else ''}")
         lines.append(f"   Started: {rec.elapsed_str()} ago")
-        lines.append(f"   Step:    {rec.iteration}/{rec.max_iterations}")
+        lines.append(f"   Step:    {rec.iteration}")
         if rec.is_cancelled:
             lines.append("   <i>⚠️ Cancellation requested…</i>")
         lines.append("")

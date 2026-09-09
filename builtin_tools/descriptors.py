@@ -71,8 +71,6 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "notify (bool, default true). "
             "model (str, optional — model identifier to use for this job's sub-agent, e.g. 'gpt-4o'). "
             "preserve_context (bool, default false — if true, conversation history is kept between runs). "
-            "max_iterations (int, optional — override the step limit for this job; "
-            "default: scheduled_max_iterations from config, 0 = unlimited). "
             "Always provide a non-empty task when adding any job."
         ),
     ),
