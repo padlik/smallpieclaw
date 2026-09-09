@@ -27,6 +27,7 @@
 - Protects against identical-error tight loops (most common stuck pattern).
 - Does NOT protect against varied-error loops or slow forward progress on genuinely bad goals. Accepted risk — doom-loop is a repetition detector, not a budget cap.
 - Truncating error text to 200 chars prevents key explosion on verbose errors.
+- `_last_tool_fail_key` and `_tool_fail_repeat` are NOT persisted in the checkpoint dict. On resume from checkpoint, both reset to initial values (fresh streak). This is intentional: a resumed run should not carry over a pre-interruption failure streak.
 
 ---
 

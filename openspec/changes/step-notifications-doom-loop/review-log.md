@@ -50,6 +50,25 @@
 
 ---
 
+## oracle final review — 2026-09-09
+
+### 🔴 Fixed
+- B1: D2/T2 placement corrected — doom-loop check moved to `_dispatch_action()` (where `outcome` is in scope); `_run_single_step()` never sees `success`/`error`; abort returned via existing `Optional[str]` channel; checkpoint-deletion side effect documented
+- B2: T4/D3 milestone call wrapped in `try/except Exception: logger.debug(...)` — prevents `RuntimeError` from closed bot loop killing healthy run
+
+### 🟡 Addressed
+- S1: Double-fire prevention added — `_last_notified_step: int = -1` field in `_LoopState`; guard updated in D3 and T4
+- S3: Post-loop shape spec added to D1 and T1 — `break` → operator-cancel return; max-steps fallback explicitly deleted; `_handle_step_limit_reached` lines 1594–1615 explicitly named for deletion
+- S4: `state.max_steps` mutation note added to D1 (plan action clamps to `_ABSOLUTE_PLAN_CEILING` — inert after gate removal, but logging will show jump from 10M)
+- S5: T5 updated — `vulture_whitelist.py` additions for `request_extension`/`EXTEND_PREFIX` + `confirmation.py` docstring update
+- S6: T10 item 5 added — enumerate and rewrite/delete max-step halt tests before running suite
+- S7: T2 and ADR-0026 document `_last_tool_fail_key`/`_tool_fail_repeat` non-persistence as stated decision
+
+### 🔴 Outstanding
+*(none — all artifacts frozen)*
+
+---
+
 ## tasks + adr Round 1 — 2026-09-09
 
 ### 🔴 Fixed

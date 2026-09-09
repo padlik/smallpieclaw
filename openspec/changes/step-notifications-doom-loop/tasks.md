@@ -4,22 +4,26 @@
 **File:** `react_loop.py`
 
 1. Define module-level sentinel: `_EFFECTIVELY_UNLIMITED_STEPS = 10_000_000` (retain existing value if already present; do not rename or delete).
-2. Replace the nested `while True: / while state.step < state.max_steps:` structure with a single `while True:` loop. Update `_LoopState.__init__` to always set `max_steps = _EFFECTIVELY_UNLIMITED_STEPS` regardless of agent type. Remove `_handle_step_limit_reached` and the step-gate `should_continue` path that returns it.
-3. Verify at apply time whether the `operator_cancelled` check between the outer and inner loops remains necessary after the inner loop is removed; delete it only after confirming every operator-cancel signal inside `_run_single_step` yields `early_return` or `should_continue = False` independently.
+2. Replace the nested `while True: / while state.step < state.max_steps:` structure with a single `while True:` loop. Update `_LoopState.__init__` to always set `max_steps = _EFFECTIVELY_UNLIMITED_STEPS` regardless of agent type.
+3. Delete `_handle_step_limit_reached()` (lines 1594–1615 in the current codebase) and its call site entirely.
+4. Delete the existing `"⚠️ Agent reached maximum steps. Operation cancelled."` post-loop fallback — it is dead code after gate removal. The post-loop return after `break` MUST be `"⚠️ Task stopped by operator."` (the operator-cancel message, since `break` is only set by the operator-cancel `should_continue=False` path).
+5. Verify at apply time: before removing the between-loop `operator_cancelled` check, confirm that every code path in `_run_single_step` that sets `state.operator_cancelled = True` also yields `result.early_return` (non-None) or `result.should_continue = False`. If any cancel path relies solely on the state flag, move the check inside the single loop rather than deleting it.
 
 **Acceptance:**
 - `grep -n "while state.step" react_loop.py` returns 0 matches.
 - `grep -n "_EFFECTIVELY_UNLIMITED_STEPS" react_loop.py` returns ≥ 1 match (definition retained).
-- If the between-loop operator-cancel check is removed: confirm via test or code inspection that operator cancellation still terminates the loop correctly.
+- `grep -n "_handle_step_limit_reached" react_loop.py` returns 0 matches.
+- `grep -n "reached maximum steps" react_loop.py` returns 0 matches.
+- Operator-cancel path verified to terminate the loop correctly (via test or code inspection).
 
 ---
 
-## T2 — Doom-loop detection in `_run_single_step`
+## T2 — Doom-loop detection in `_dispatch_action`
 **File:** `react_loop.py`
 
 1. Define module-level constant: `_DOOM_LOOP_LIMIT = 3` (mirrors `_JSON_FAIL_LIMIT = 3`).
-2. Add `_last_tool_fail_key: str = ""` and `_tool_fail_repeat: int = 0` to `_LoopState`.
-3. After tool dispatch returns an outcome and **before** returning `_StepResult`, check:
+2. Add `_last_tool_fail_key: str = ""`, `_tool_fail_repeat: int = 0`, and `_last_notified_step: int = -1` to `_LoopState`. (`_last_notified_step` is used by T4's milestone double-fire guard.)
+3. Place the doom-loop check **inside `_dispatch_action()`**, in the tool-dispatch branch after the tool outcome is obtained — this is the merge point covering both `vision_query` and normal-tool paths. The `outcome` dict is only in scope here; `_run_single_step()` never sees `success`/`error`.
 
 ```python
 if outcome.get("success") is False:
@@ -28,7 +32,8 @@ if outcome.get("success") is False:
     state._tool_fail_repeat = state._tool_fail_repeat + 1 if state._last_tool_fail_key == key else 1
     state._last_tool_fail_key = key
     if state._tool_fail_repeat >= _DOOM_LOOP_LIMIT:
-        # self-terminate: inject abort message and return early
+        # return abort string via existing Optional[str] channel
+        # (processed by _run_single_step's `if final is not None:` path → deletes checkpoint)
 else:
     state._tool_fail_repeat = 0
     state._last_tool_fail_key = ""
@@ -36,7 +41,11 @@ else:
 
 Mirror the existing `json_fail_streak` abort pattern for the termination message.
 
-**Acceptance:** Unit test: 3× identical `(tool_name, error)` → loop aborts with doom-loop message; 3× different errors → no abort; success resets `_tool_fail_repeat` to `0` and `_last_tool_fail_key` to `""`.
+4. **Checkpoint non-persistence (stated decision):** `_last_tool_fail_key` and `_tool_fail_repeat` are NOT persisted in the checkpoint dict. On resume, they default to `""`/`0` (fresh streak). This is intentional — a resumed run should not carry over a pre-resume failure streak.
+
+**Acceptance:**
+- Unit test: 3× identical `(tool_name, error)` → loop aborts with doom-loop message; 3× different errors → no abort; success resets `_tool_fail_repeat` to `0` and `_last_tool_fail_key` to `""`.
+- `grep -n "doom" react_loop.py` shows `_DOOM_LOOP_LIMIT` defined and `_dispatch_action` as the call site (not `_run_single_step`).
 
 ---
 
@@ -72,12 +81,22 @@ Remove or rewrite all `Step: X/max_steps` or `Step X of Y` displays. After gate 
    if (ctx.step_notify_interval
            and ctx.milestone_notify_fn
            and state.step > 0
+           and state.step != state._last_notified_step
            and state.step % ctx.step_notify_interval == 0):
-       ctx.milestone_notify_fn(state.step)
+       try:
+           ctx.milestone_notify_fn(state.step)
+           state._last_notified_step = state.step
+       except Exception:
+           logger.debug("milestone_notify failed", exc_info=True)
    ```
-   Use `asyncio.run_coroutine_threadsafe`; discard the returned `Future` (fire-and-forget).
+   - `state._last_notified_step` (added in T2) prevents double-fire on inactivity-warning iterations where `state.step` does not advance.
+   - The `try/except` guard is mandatory: `run_coroutine_threadsafe` raises `RuntimeError` synchronously if the bot event loop is closed or the panel is torn down; an uncaught exception kills an otherwise-healthy run. Mirror the `on_step` callback guard (`react_loop.py:1511-1515`).
+   - Use `asyncio.run_coroutine_threadsafe`; discard the returned `Future` (fire-and-forget).
 
-**Acceptance:** Smoke test: agent reaches step 30 → Telegram receives milestone notification. Sub-agents do not send notifications.
+**Acceptance:**
+- Smoke test: agent reaches step 30 → Telegram receives milestone notification. Sub-agents do not send notifications.
+- Unit test: `milestone_notify_fn` is not called twice for the same step number (double-fire guard).
+- Unit test: if `milestone_notify_fn` raises `RuntimeError`, the run continues without error.
 
 ---
 
@@ -92,7 +111,11 @@ Remove:
 
 Preserve all other dispatch entries and handlers (confirm, subagent confirm, etc.).
 
-**Acceptance:** `grep -rn "_handle_extend_progress\|_send_extend_prompt\|__EXTEND__\|cb_extend" telegram_interface.py telegram_callbacks.py` returns 0 matches.
+Update `vulture_whitelist.py`: `request_extension` and `EXTEND_PREFIX` in `confirmation.py` are deliberately retained (ADR-0024 taxonomy) but lose their only callers in this change — add them to the whitelist. Also update the `confirmation.py` docstring (lines 190–191) that still documents the step-extension flow to reflect it is now dormant.
+
+**Acceptance:**
+- `grep -rn "_handle_extend_progress\|_send_extend_prompt\|__EXTEND__\|cb_extend" telegram_interface.py telegram_callbacks.py` returns 0 matches.
+- `make lint` (ruff + vulture) passes — no new unused-symbol errors from retained dormant code.
 
 ---
 
@@ -150,4 +173,5 @@ Remove the `max_iterations` parameter from the `schedule` (add-action) tool:
 2. Doom-loop unit test: 3× identical `(tool_name, error)` → loop aborts with doom-loop message; success resets `_tool_fail_repeat` to `0` and `_last_tool_fail_key` to `""`; 3× different errors do not trigger doom. Include a scheduled-agent path: confirm doom-loop fires identically when the run originates from the scheduler (same `react_loop` code path, so structural coverage is sufficient).
 3. Milestone notification unit test: `milestone_notify_fn` called at step 30/60/90; NOT called at step 0; NOT called when `step_notify_interval = 0`.
 4. Operator-cancel regression: confirm that operator cancellation still terminates the loop correctly after loop collapse (either via existing test or a targeted inspection check).
-5. Regression: existing tests for confirm flow, headless confirm, `json_fail_streak`, and scheduled jobs pass unmodified.
+5. **Max-step test cleanup (S6):** Identify tests that assert the loop halts at `max_iterations` or produce the `"maximum steps"` return string — these are behavior-removal cases, not regressions to preserve. Rewrite or delete them as part of this task; do not make the code pass them artificially. Search: `grep -rn "maximum steps\|max_iterations" tests/`.
+6. Regression: existing tests for confirm flow, headless confirm, `json_fail_streak`, and scheduled jobs pass unmodified.

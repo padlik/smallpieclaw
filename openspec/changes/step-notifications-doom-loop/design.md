@@ -62,15 +62,24 @@ while True:
     if not result.should_continue:
         break
 
-    # milestone notification
+    # milestone notification (D3)
     if (ctx.step_notify_interval
             and ctx.milestone_notify_fn
             and state.step > 0
+            and state.step != state._last_notified_step
             and state.step % ctx.step_notify_interval == 0):
-        ctx.milestone_notify_fn(state.step)
+        try:
+            ctx.milestone_notify_fn(state.step)
+            state._last_notified_step = state.step
+        except Exception:
+            logger.debug("milestone_notify failed", exc_info=True)
+
+return "⚠️ Task stopped by operator."   # only reached via break (operator-cancel path)
 ```
 
-The between-loop `operator_cancelled` check and the `_handle_step_limit_reached()` call are removed; the operator-cancel path already produces `result.early_return` or `result.should_continue = False` inside `_run_single_step` (the outer check was only necessary because the inner loop could exit without an `early_return`). `_handle_step_limit_reached()` is deleted entirely.
+**Post-loop structure:** `break` is only set by the operator-cancel path (`should_continue = False`), so the post-loop return MUST be the operator-cancel message. The existing `"⚠️ Agent reached maximum steps. Operation cancelled."` fallback is deleted — it is dead code after gate removal. The explicit deletion of `_handle_step_limit_reached()` (lines 1594–1615 in the current codebase) is part of D1.
+
+The between-loop `operator_cancelled` check and the `_handle_step_limit_reached()` call are removed; the operator-cancel path already produces `result.early_return` or `result.should_continue = False` inside `_run_single_step` (the outer check was only necessary because the inner loop could exit without an `early_return`). `_handle_step_limit_reached()` (lines 1594–1615) is deleted entirely.
 
 **Apply-time verification required:** Before deleting the between-loop `operator_cancelled` check, confirm that every code path in `_run_single_step` that sets `state.operator_cancelled = True` also sets `result.early_return` to a non-None string or sets `result.should_continue = False`. If any cancel path relies solely on the state flag (without an early-return or should-continue signal), the between-loop check must be moved *inside* the single `while True:` loop rather than deleted.
 
@@ -88,7 +97,7 @@ The between-loop `operator_cancelled` check and the `_handle_step_limit_reached(
 
 **Key:** `key = f"{tool_name}:{error_text[:200]}"`. Composite key avoids false positives: a batch job calling `file_write` with different paths and different errors resets the counter each time.
 
-**Placement:** The check runs inside `_run_single_step()` after the tool dispatch, before returning `_StepResult`. On trigger, it sets `result.early_return` to the abort message. On success, it clears `state._last_tool_fail_key = ""` and `state._tool_fail_repeat = 0`.
+**Placement:** The check runs inside `_dispatch_action()`, in the tool-dispatch branch (after the `vision_query`/normal-tool merge point, covering both). The tool `outcome` dict (`success`, `error`) is only in scope at this location — `_run_single_step()` never sees it. State mutations (`state._last_tool_fail_key`, `state._tool_fail_repeat`) happen here. On trigger, `_dispatch_action` returns the abort string through its existing `Optional[str]` return channel. The existing `if final is not None:` check in `_run_single_step` processes it as a terminal result; this correctly deletes the checkpoint (same path as a `finish` action, which is the right behavior for a doom-loop abort). On success, clear `state._last_tool_fail_key = ""` and `state._tool_fail_repeat = 0`.
 
 **Mirrors:** `_handle_non_json` pattern exactly — module-level constant (`_DOOM_LOOP_LIMIT = 3`), two fields in `_LoopState` (`_last_tool_fail_key: str = ""`, `_tool_fail_repeat: int = 0`), early-return abort string.
 
@@ -104,7 +113,11 @@ For the main agent, `RunPanel` is always present at wiring time — no None-guar
 
 **Disabled-path guard:** `if ctx.step_notify_interval and ctx.milestone_notify_fn and state.step > 0 and state.step % ctx.step_notify_interval == 0`. The `step_notify_interval > 0` guard prevents `ZeroDivisionError`. The `state.step > 0` guard prevents a spurious "step 0" ping before any work completes.
 
+**Double-fire prevention (S1):** `state.step` is incremented inside `_run_single_step`, but inactivity-warning paths may return `should_continue=True` without incrementing the step, causing the same step number to appear on the next loop iteration. To prevent duplicate notifications, add `_last_notified_step: int = -1` to `_LoopState` and gate on `state.step != state._last_notified_step`; set `state._last_notified_step = state.step` immediately after dispatching. The full guard becomes: `if ctx.step_notify_interval and ctx.milestone_notify_fn and state.step > 0 and state.step != state._last_notified_step and state.step % ctx.step_notify_interval == 0`.
+
 **Fire-and-forget mechanism:** `RunPanel.milestone_notify(step)` must dispatch the Telegram send without blocking the react-loop thread. The bot runs on an asyncio event loop in a separate thread. The implementation uses `asyncio.run_coroutine_threadsafe(bot.send_message(...), loop)` and does **not** await the result. The returned `Future` is discarded. This is the same dispatch pattern used by other synchronous→async bridges in `telegram_interface.py` (e.g., the progress-callback dispatch path).
+
+**Exception guard:** The milestone call MUST be wrapped in `try/except Exception: logger.debug(...)`. If the bot event loop is closed or the panel is torn down, `run_coroutine_threadsafe` raises `RuntimeError` synchronously on the react thread. An uncaught exception here would kill an otherwise-healthy run. Mirror the `on_step` callback guard pattern (`react_loop.py:1511-1515`).
 
 **Alternative rejected:** Route through `ConfirmationManager` EXTEND_PREFIX path — blocks via `event.wait()`, solving nothing.
 **Alternative rejected:** Direct `ctx.telegram.send_message(...)` from react_loop — violates transport agnosticism; react_loop has no Telegram dependency today.
