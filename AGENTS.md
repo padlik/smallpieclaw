@@ -65,13 +65,15 @@ Failure to load `openspec-workflow` will result in missing critical workflow con
 ## Development discipline 
 
 - Never work directly on the main branch.
-- Before modifying code, inspect the current Git state and branch.
-- Use a feature/fix branch when a single agent is modifying code.
-- Use a Git workspace/worktree when multiple agents are modifying different tasks in parallel.
-- Keep parallel work isolated to prevent agents from modifying the same working tree.
-- Delegate independent, well-defined tasks to sub-agents where this improves correctness or efficiency.
-- Clearly define the scope and expected output when delegating work.
-- Review sub-agent results before incorporating them into the main implementation.
+-  Before modifying code, inspect the current Git state, branch, and any existing changes.
+- For a single-agent, isolated modification, use a dedicated feature/* or fix/* branch.
+- For multi-agent or parallel development, use a separate Git worktree/workspace for each independent task. Never allow parallel agents to modify the same working tree.
+- Prefer worktrees whenever the scope or impact of parallel changes is uncertain. Changes that appear independent may affect the same code, tests, fixtures, configuration, or integration points and can therefore cause conflicts.
+- Keep each worktree focused on one well-defined task and avoid sharing uncommitted changes between worktrees.
+- Delegate independent, well-defined tasks to sub-agents when this improves correctness or efficiency.
+- When delegating work, clearly define the task scope, constraints, and expected output.
+- Review sub-agent results before incorporating them into the primary implementation.
+- Before merging parallel work, run the relevant tests and resolve any conflicts or behavioural interactions between the changes.
 
 ## Git
 
