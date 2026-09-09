@@ -21,9 +21,7 @@
 
 **Context:** Without a step cap, agents can get stuck repeating the same failing tool call indefinitely. A safety backstop is needed that does not terminate agents doing legitimate long-running work.
 
-**Decision:** Track `doom_streak: int` and `doom_loop_key: Optional[str]` in `_LoopState`. After each tool failure, compute `key = f"{tool_name}:{(outcome.get('error','') or '').strip()[:200]}"`. If the same key appears 3 consecutive times, the loop self-terminates with an explanatory abort message. Any success or a different failure key resets the streak to 0.
-
-This mirrors the existing `json_fail_streak` / `_JSON_FAIL_LIMIT = 3` pattern exactly.
+**Decision:** Track `_tool_fail_repeat: int = 0` and `_last_tool_fail_key: str = ""` in `_LoopState` (field names chosen to mirror `json_fail_streak` / `_JSON_FAIL_LIMIT = 3`). Define `_DOOM_LOOP_LIMIT = 3` as a module-level constant. After each tool failure, compute `key = f"{tool_name}:{(outcome.get('error','') or '').strip()[:200]}"`. If the same key appears `_DOOM_LOOP_LIMIT` consecutive times, the loop self-terminates with an explanatory abort message. Any success or a different failure key resets `_tool_fail_repeat` to `0` and `_last_tool_fail_key` to `""`.
 
 **Consequences:**
 - Protects against identical-error tight loops (most common stuck pattern).
@@ -54,7 +52,7 @@ This mirrors the existing `json_fail_streak` / `_JSON_FAIL_LIMIT = 3` pattern ex
 
 **Context:** `ConfirmationManager.request_extension()` and the `__EXTEND__:` signal path implement a step-extension flow that is no longer needed after gate removal. ADR-0024 defines a four-flow taxonomy (tool confirm, headless confirm, extension, LLM retry). Deleting the extension flow coordination code would violate ADR-0024's taxonomy.
 
-**Decision:** `request_extension()` is made dormant — it remains in `ConfirmationManager` as an unreachable code path. The Telegram UI dead code (`_handle_extend_progress`, `_send_extend_prompt`, extend-button callbacks in `telegram_callbacks.py`) is deleted because it is presentation-layer, not coordination-layer. ADR-0024 remains in force; the extension coordination slot is reserved.
+**Decision:** `request_extension()` is made dormant — it remains in `ConfirmationManager` but is no longer called by the react loop. The Telegram UI dead code (`_handle_extend_progress`, `_send_extend_prompt`, extend-button callbacks in `telegram_callbacks.py`) is deleted because it is presentation-layer, not coordination-layer. ADR-0024 remains in force; the extension coordination slot is reserved.
 
 **Consequences:**
 - ADR-0024 taxonomy preserved.

@@ -50,6 +50,23 @@
 
 ---
 
+## tasks + adr Round 1 — 2026-09-09
+
+### 🔴 Fixed
+- T2/ADR-0026: field names aligned to frozen design/specs (`_tool_fail_repeat`, `_last_tool_fail_key`); reset value corrected to `""` (not `None`); `_DOOM_LOOP_LIMIT = 3` constant added
+- T6: "add deprecation warnings on load" option removed; silently-ignored-only per frozen proposal/explore-brief
+
+### 🟡 Addressed
+- T1: `_EFFECTIVELY_UNLIMITED_STEPS` definition step added; operator-cancel apply-time verification added to acceptance
+- T9: backward-compat acceptance added for `scheduler.toml` entries **with** `max_iterations`
+- T10: scheduled-agent doom-loop structural coverage note added; operator-cancel regression check added
+- ADR-0028: "unreachable code path" → "no longer called by the react loop" (consistent with explore-brief "other callers may exist")
+
+### 🔴 Outstanding
+*(none — tasks and adr frozen)*
+
+---
+
 ## proposal Round 1 — 2026-09-08
 
 ### 🔴 Outstanding (blockers — not yet fixed)

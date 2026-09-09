@@ -3,37 +3,40 @@
 ## T1 — Loop collapse + `_LoopState` init
 **File:** `react_loop.py`
 
-Replace the nested `while True: / while state.step < state.max_steps:` structure with a single `while True:` loop. Update `_LoopState.__init__` to always set `max_steps = _EFFECTIVELY_UNLIMITED_STEPS` regardless of agent type. Remove `_handle_step_limit_reached` and the step-gate `should_continue` path that returns it.
+1. Define module-level sentinel: `_EFFECTIVELY_UNLIMITED_STEPS = 10_000_000` (retain existing value if already present; do not rename or delete).
+2. Replace the nested `while True: / while state.step < state.max_steps:` structure with a single `while True:` loop. Update `_LoopState.__init__` to always set `max_steps = _EFFECTIVELY_UNLIMITED_STEPS` regardless of agent type. Remove `_handle_step_limit_reached` and the step-gate `should_continue` path that returns it.
+3. Verify at apply time whether the `operator_cancelled` check between the outer and inner loops remains necessary after the inner loop is removed; delete it only after confirming every operator-cancel signal inside `_run_single_step` yields `early_return` or `should_continue = False` independently.
 
-Verify at apply time whether the `operator_cancelled` check between the outer and inner loops remains necessary after the inner loop is removed; delete it if redundant.
-
-**Acceptance:** `grep -n "while state.step" react_loop.py` returns 0 matches.
+**Acceptance:**
+- `grep -n "while state.step" react_loop.py` returns 0 matches.
+- `grep -n "_EFFECTIVELY_UNLIMITED_STEPS" react_loop.py` returns ≥ 1 match (definition retained).
+- If the between-loop operator-cancel check is removed: confirm via test or code inspection that operator cancellation still terminates the loop correctly.
 
 ---
 
 ## T2 — Doom-loop detection in `_run_single_step`
 **File:** `react_loop.py`
 
-After tool dispatch returns an outcome and **before** returning `_StepResult`, check:
+1. Define module-level constant: `_DOOM_LOOP_LIMIT = 3` (mirrors `_JSON_FAIL_LIMIT = 3`).
+2. Add `_last_tool_fail_key: str = ""` and `_tool_fail_repeat: int = 0` to `_LoopState`.
+3. After tool dispatch returns an outcome and **before** returning `_StepResult`, check:
 
 ```python
 if outcome.get("success") is False:
     error_text = (outcome.get("error", "") or "").strip()
     key = f"{tool_name}:{error_text[:200]}"
-    state.doom_streak = state.doom_streak + 1 if state.doom_loop_key == key else 1
-    state.doom_loop_key = key
-    if state.doom_streak >= 3:
+    state._tool_fail_repeat = state._tool_fail_repeat + 1 if state._last_tool_fail_key == key else 1
+    state._last_tool_fail_key = key
+    if state._tool_fail_repeat >= _DOOM_LOOP_LIMIT:
         # self-terminate: inject abort message and return early
 else:
-    state.doom_streak = 0
-    state.doom_loop_key = None
+    state._tool_fail_repeat = 0
+    state._last_tool_fail_key = ""
 ```
-
-Add `doom_streak: int = 0` and `doom_loop_key: Optional[str] = None` to `_LoopState`.
 
 Mirror the existing `json_fail_streak` abort pattern for the termination message.
 
-**Acceptance:** Unit test: 3× identical `(tool_name, error)` → loop aborts with doom-loop message; 3× different errors → no abort; success resets streak.
+**Acceptance:** Unit test: 3× identical `(tool_name, error)` → loop aborts with doom-loop message; 3× different errors → no abort; success resets `_tool_fail_repeat` to `0` and `_last_tool_fail_key` to `""`.
 
 ---
 
@@ -98,7 +101,7 @@ Preserve all other dispatch entries and handlers (confirm, subagent confirm, etc
 
 1. Add `step_notify_interval: int = 30` to the appropriate config dataclass.
 
-2. Mark `max_iterations`, `scheduled_max_iterations`, and `plan_max_iterations` as deprecated — add deprecation warnings on load or annotate as silently ignored. Retain for backward compat so existing config files do not cause startup errors.
+2. Mark `max_iterations`, `scheduled_max_iterations`, and `plan_max_iterations` as silently ignored — read and discarded at load time, no deprecation warning emitted. Retain the fields for backward compat so existing config files do not cause startup errors.
 
 **Acceptance:** `make check` passes; existing config files with old fields do not cause startup errors.
 
@@ -134,7 +137,9 @@ Remove the `max_iterations` parameter from the `schedule` (add-action) tool:
 
 2. Update `scheduler.toml` documentation (comments or README section) to remove references to `max_iterations` as a job-level parameter.
 
-**Acceptance:** Scheduled jobs defined in `scheduler.toml` without `max_iterations` run without errors.
+**Acceptance:**
+- Scheduled jobs defined in `scheduler.toml` without `max_iterations` run without errors.
+- Scheduled jobs defined in `scheduler.toml` **with** `max_iterations` still load and run without errors (field read and discarded — backward compat guarantee).
 
 ---
 
@@ -142,6 +147,7 @@ Remove the `max_iterations` parameter from the `schedule` (add-action) tool:
 **Scope:** All modified files
 
 1. `make check` (ruff + vulture + pytest) passes clean.
-2. Doom-loop unit test: 3× identical `(tool_name, error)` → loop aborts with doom-loop message; success resets streak; different errors do not trigger doom.
+2. Doom-loop unit test: 3× identical `(tool_name, error)` → loop aborts with doom-loop message; success resets `_tool_fail_repeat` to `0` and `_last_tool_fail_key` to `""`; 3× different errors do not trigger doom. Include a scheduled-agent path: confirm doom-loop fires identically when the run originates from the scheduler (same `react_loop` code path, so structural coverage is sufficient).
 3. Milestone notification unit test: `milestone_notify_fn` called at step 30/60/90; NOT called at step 0; NOT called when `step_notify_interval = 0`.
-4. Regression: existing tests for confirm flow, headless confirm, `json_fail_streak`, and scheduled jobs pass unmodified.
+4. Operator-cancel regression: confirm that operator cancellation still terminates the loop correctly after loop collapse (either via existing test or a targeted inspection check).
+5. Regression: existing tests for confirm flow, headless confirm, `json_fail_streak`, and scheduled jobs pass unmodified.
