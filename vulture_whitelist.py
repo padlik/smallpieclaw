@@ -240,9 +240,18 @@ _LLMErrorInfoForWhitelist
 from confirmation import RETRY_PREFIX as _RetryPrefixForWhitelist  # noqa: E402
 _RetryPrefixForWhitelist
 
+from confirmation import EXTEND_PREFIX as _ExtendPrefixForWhitelist  # noqa: E402
+_ExtendPrefixForWhitelist
+
 from confirmation import ConfirmationManager as _ConfirmationManagerForRetry  # noqa: E402, F811
 _ConfirmationManagerForRetry.request_retry  # type: ignore[attr-defined]
 _ConfirmationManagerForRetry.signal_retry  # type: ignore[attr-defined]
+_ConfirmationManagerForRetry.request_extension  # type: ignore[attr-defined]
+_ConfirmationManagerForRetry.signal_extension  # type: ignore[attr-defined]
+
+# Step-extension flow is dormant (ADR-0028) but retained for the ADR-0024 taxonomy.
+# These symbols are intentionally not called by active code paths after removing
+# the step gate and extend Telegram callbacks.
 
 # tests/test_react_loop_error_recovery.py — lambda timeout_seconds parameter is required
 # by the patched ConfirmationManager.request_retry signature even when not used.

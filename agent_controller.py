@@ -120,6 +120,7 @@ class AgentController:
         trace_id=None,         # Optional[str] — propagate a parent run's trace; None => fresh per run
         checkpoint_store=None,  # Optional[CheckpointStore]
         context_monitor: ContextMonitor | None = None,
+        step_notify_interval: int = 0,
     ):
         self._agent_cfg = agent_cfg
         self._paths = paths
@@ -158,6 +159,8 @@ class AgentController:
         self._graph_memory = None          # Optional[GraphMemoryStore]
         self._graph_memory_writer = None   # Optional[GraphMemoryWriter]
         self._graph_memory_max_entries = 10
+        # Step milestone notification interval (main agent only; 0 disables)
+        self.step_notify_interval = step_notify_interval
         # ------------------------------------------------------------------
         # Cross-thread synchronisation for operator confirmation prompts.
         #
@@ -283,6 +286,7 @@ class AgentController:
             checkpoint_enabled=self._checkpoint_enabled,
             retry_timeout_seconds=self._retry_timeout_seconds,
             context_monitor=self.context_monitor,
+            step_notify_interval=self.step_notify_interval,
         )
 
     # ------------------------------------------------------------------
@@ -298,6 +302,7 @@ class AgentController:
         prompt_id: Optional[str] = None,
         trace_id: Optional[str] = None,
         resume_from: Optional[str] = None,
+        milestone_notify_fn: Optional[Callable[[int], None]] = None,
     ) -> str:
         """
         Process a user goal and return the final answer string.
@@ -380,6 +385,7 @@ class AgentController:
             else None
         )
         ctx = AgentRuntime.build_react_context(self, run_trace_id, cancel_event=run_cancel_event)
+        ctx.milestone_notify_fn = milestone_notify_fn
 
         loop_kwargs: dict = {}
         if initial_state is not None:
@@ -417,13 +423,6 @@ class AgentController:
     def resume(self, token: str, confirmed: bool) -> None:
         """Called by TelegramInterface when user responds to a file_write/shell confirmation."""
         self._confirmation.signal_confirmation(token, confirmed)
-
-    def resume_extend(self, token: str, response: str) -> None:
-        """Called by TelegramInterface when user responds to a max-steps extension prompt.
-
-        response: "yes" | "no" | "unlimited"
-        """
-        self._confirmation.signal_extension(token, response)
 
     def resume_llm_error(self, token: str, response: str) -> None:
         """Called by TelegramInterface when user responds to an LLM error retry prompt.

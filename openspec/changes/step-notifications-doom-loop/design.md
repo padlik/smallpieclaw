@@ -85,6 +85,8 @@ The between-loop `operator_cancelled` check and the `_handle_step_limit_reached(
 
 `state.max_steps` is initialized to `_EFFECTIVELY_UNLIMITED_STEPS` (10M). It is retained in `_LoopState` for two reasons: (a) the checkpoint schema (`state.max_steps` appears at lines 1013/1035) requires the field, and (b) `_run_plan()` may read and mutate it (harmlessly — 10M is larger than any practical plan, so the comparison branch in `_run_plan` that raises the budget is dead, but `_run_plan` may still write `state.max_steps` down to `_ABSOLUTE_PLAN_CEILING` after a plan runs; this mutation is acceptable). `state.max_steps` is no longer a gate.
 
+**Residual inert plumbing:** `agent_runtime.py` (`effective_max_iter` from `RuntimeOptions` / `_scheduled_max_iterations`) still threads `max_iterations` into the sub-agent `AgentConfig` at construction time. This is deliberately retained and runtime-inert: `react_loop()` initializes `max_steps = _EFFECTIVELY_UNLIMITED_STEPS` for every agent type (D1), so the construction-time value is never used as a gate. It may be pruned in a future cleanup change.
+
 **Alternative rejected:** Per-agent-type flag to selectively remove the gate. Rejected — it forces conditional logic in `_LoopState` or `ReactContext` with no safety benefit (doom-loop applies equally to all types).
 
 **Logging**: All format strings showing `state.step/state.max_steps` are updated to show step count only (e.g., `step {state.step}`), avoiding `X/10000000` in logs and Telegram UI. Affected locations include: logger format strings in `react_loop.py`, `Step: {step}/{max_steps}` in `telegram_interface.py:1049`, checkpoint/resume cards in `telegram_commands.py:422/429/457`, and `Completed {iteration}/{max_iterations} iterations` in `sub_agent_supervisor.py:457`.
@@ -106,7 +108,7 @@ The between-loop `operator_cancelled` check and the `_handle_step_limit_reached(
 ### D3 — Milestone notification via `milestone_notify_fn` and `step_notify_interval` in `ReactContext`
 
 Two new fields added to `ReactContext`:
-- `step_notify_interval: int = 30` — populated in `agent_controller.py` from `app_cfg.agent.step_notify_interval`; same wiring location as other config-derived context fields
+- `step_notify_interval: int = 0` (dataclass default) — populated in `agent_controller.py` from `app_cfg.agent.step_notify_interval` (config default 30); same wiring location as other config-derived context fields. The dataclass default is deliberately `0`, not `30`: sub-agent contexts bypass config wiring and rely on the dataclass default, so `0` keeps them notification-free by construction.
 - `milestone_notify_fn: Optional[Callable[[int], None]] = None` — wired in `agent_controller.py` to `run_panel.milestone_notify` for the main agent; remains `None` for all sub-agent types
 
 For the main agent, `RunPanel` is always present at wiring time — no None-guard required at the wiring site, but the loop guard `if ctx.milestone_notify_fn` covers the sub-agent case.
@@ -114,6 +116,8 @@ For the main agent, `RunPanel` is always present at wiring time — no None-guar
 **Disabled-path guard:** `if ctx.step_notify_interval and ctx.milestone_notify_fn and state.step > 0 and state.step % ctx.step_notify_interval == 0`. The `step_notify_interval > 0` guard prevents `ZeroDivisionError`. The `state.step > 0` guard prevents a spurious "step 0" ping before any work completes.
 
 **Double-fire prevention (S1):** `state.step` is incremented inside `_run_single_step`, but inactivity-warning paths may return `should_continue=True` without incrementing the step, causing the same step number to appear on the next loop iteration. To prevent duplicate notifications, add `_last_notified_step: int = -1` to `_LoopState` and gate on `state.step != state._last_notified_step`; set `state._last_notified_step = state.step` immediately after dispatching. The full guard becomes: `if ctx.step_notify_interval and ctx.milestone_notify_fn and state.step > 0 and state.step != state._last_notified_step and state.step % ctx.step_notify_interval == 0`.
+
+**Resume boundary (review finding, benign):** `_last_notified_step` is not persisted in checkpoints, so it resets to `-1` on resume. The checkpoint stores the already-incremented step, and the milestone check runs only after the *next* step completes, so a milestone landing exactly on a resume boundary is silently **skipped** — it can never double-fire. This is acceptable for liveness pings and intentional; do not mistake it for a bug.
 
 **Fire-and-forget mechanism:** `RunPanel.milestone_notify(step)` must dispatch the Telegram send without blocking the react-loop thread. The bot runs on an asyncio event loop in a separate thread. The implementation uses `asyncio.run_coroutine_threadsafe(bot.send_message(...), loop)` and does **not** await the result. The returned `Future` is discarded. This is the same dispatch pattern used by other synchronous→async bridges in `telegram_interface.py` (e.g., the progress-callback dispatch path).
 

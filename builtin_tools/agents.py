@@ -237,16 +237,6 @@ class AgentTools:
         # Internal supervision controls (job tag, callbacks, notify/expandable)
         # arrive via `options`, never through the model-facing `args` dict.
 
-        # Build the sub-agent via factory
-        max_iterations = args.get("max_iterations")  # None = use factory default (scheduled_max_iter)
-        if max_iterations is not None:
-            try:
-                max_iterations = int(max_iterations)
-                if max_iterations <= 0:
-                    max_iterations = None  # treat 0/negative as "use default"
-            except (ValueError, TypeError):
-                max_iterations = None
-
         # Construction profile travels through the internal factory channel only
         # (never through the model-facing ``args`` dict). Scheduled launches carry
         # source="scheduled" via SupervisionOptions and construct under the
@@ -264,7 +254,6 @@ class AgentTools:
             context_key=context_key,
             label=label,
             notify_fn=None,   # factory sets this from main notify_fn
-            max_iterations=max_iterations,
             max_tokens=overrides["max_tokens"],
             temperature=overrides["temperature"],
             top_p=overrides["top_p"],

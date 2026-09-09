@@ -454,7 +454,7 @@ class SubAgentSupervisor:
         runner.notify_fn(
             f"🛑 Sub-agent {runner.agent_id} cancelled\n"
             f"Job: **{label}**\n"
-            f"Completed {record.iteration}/{record.max_iterations} iterations before stop."
+            f"Completed {record.iteration} iterations before stop."
         )
 
     # ------------------------------------------------------------------

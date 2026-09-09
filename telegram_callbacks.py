@@ -125,41 +125,6 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 
 
 @_require_cb_auth
-async def cb_extend(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Extend / Unlimited / Cancel button presses for max-steps extension."""
-    query = update.callback_query
-    data = query.data  # "extend_yes:<token>" | "extend_unlimited:<token>" | "extend_no:<token>"
-
-    if data.startswith("extend_unlimited:"):
-        token = data.split(":", 1)[1]
-        response = "unlimited"
-        result_text = "♾️ Running until done…"
-    elif data.startswith("extend_yes:"):
-        token = data.split(":", 1)[1]
-        response = "yes"
-        result_text = "⏩ Extending…"
-    else:
-        token = data.split(":", 1)[1]
-        response = "no"
-        result_text = "❌ Cancelled."
-
-    if iface.agent:
-        iface.agent.resume_extend(token, response)
-    else:
-        logger.warning("_cb_extend: agent is None")
-
-    await _ack_query(query)
-
-    try:
-        await query.edit_message_text(
-            f"⏱ <b>Max steps</b>\n\n{result_text}",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as exc:
-        logger.debug("Could not edit extend message: %s", exc)
-
-
-@_require_cb_auth
 async def cb_llm_retry(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Retry / Cancel button presses for LLM error recovery."""
     query = update.callback_query
@@ -176,7 +141,7 @@ async def cb_llm_retry(iface: "TelegramInterface", update: Update, ctx: ContextT
         result_text = "❌ Cancelled."
 
     # Signal the agent thread via the public resume method (same pattern as
-    # cb_confirm → iface.agent.resume and cb_extend → iface.agent.resume_extend).
+    # cb_confirm → iface.agent.resume).
     if iface.agent and hasattr(iface.agent, 'resume_llm_error'):
         iface.agent.resume_llm_error(token, response)
     else:

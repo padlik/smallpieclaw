@@ -77,9 +77,10 @@ _TOOL_ICONS: dict[str, str] = {
 }
 _DEFAULT_TOOL_ICON = "🔧"
 
-# Safety ceiling used when the operator chooses an "unlimited" step extension.
-# It is not a real unlimited loop; it is large enough to be effectively
-# unlimited while still protecting against runaway execution.
+# Effectively-unlimited step sentinel. The step gate was removed (doom-loop
+# detection replaced it); this value now only initialises _LoopState.max_steps,
+# which is retained for the checkpoint schema and _run_plan compat and is never
+# enforced as a limit.
 _EFFECTIVELY_UNLIMITED_STEPS = 10_000_000
 _RE_PROMPT = "__re_prompt__"
 
@@ -246,6 +247,12 @@ class ReactContext:
 
     # Step callback
     on_step: Optional[Callable[[int], None]] = None
+
+    # Milestone notifications — fire-and-forget Telegram pings sent by the main
+    # agent at every `step_notify_interval` completed steps. 0 disables;
+    # sub-agent contexts leave milestone_notify_fn unset (None) by construction.
+    step_notify_interval: int = 0
+    milestone_notify_fn: Optional[Callable[[int], None]] = None
 
     # Tool trace callback — called after each tool dispatch with a ToolTrace record
     on_tool_trace: Optional[Callable] = None  # Optional[Callable[[ToolTrace], None]]
@@ -909,6 +916,10 @@ _BUILTIN_NAMES = frozenset({
 })
 
 _JSON_FAIL_LIMIT = 3
+# Consecutive identical tool-failure threshold for doom-loop self-termination.
+# Mirrors _JSON_FAIL_LIMIT: the loop aborts with a user-readable message when
+# the same (tool, error) pair repeats this many times in a row.
+_DOOM_LOOP_LIMIT = 3
 _ABSOLUTE_PLAN_CEILING = 200
 
 
@@ -923,6 +934,13 @@ class _LoopState:
     operator_cancelled: bool = False
     last_action_time: float = field(default_factory=time.time)
     warned_inactivity: bool = False
+    # Doom-loop detection (T2): last failure key + consecutive repeat count.
+    # Deliberately NOT persisted in checkpoints — a resumed run starts fresh.
+    _last_tool_fail_key: str = ""
+    _tool_fail_repeat: int = 0
+    # Milestone notification double-fire guard (T4): the step number last
+    # notified, so non-advancing iterations do not send duplicate pings.
+    _last_notified_step: int = -1
 
 
 @dataclass
@@ -1257,8 +1275,8 @@ def _handle_non_json(state: _LoopState, turn: _Turn) -> str:
     """
     state.json_fail_streak += 1
     logger.warning(
-        "LLM returned non-JSON (step %d/%d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
-        state.step, state.max_steps, state.json_fail_streak, len(turn.raw), turn.raw[:1000],
+        "LLM returned non-JSON (step %d, streak %d, ~%d chars):\n--- BEGIN ---\n%s\n--- END ---",
+        state.step, state.json_fail_streak, len(turn.raw), turn.raw[:1000],
     )
     if state.json_fail_streak >= _JSON_FAIL_LIMIT:
         logger.error("Non-JSON streak reached %d — aborting with protocol error", state.json_fail_streak)
@@ -1356,11 +1374,11 @@ def _request_turn(
                     linearized_messages, system=system, progress_cb=progress, json_mode=True,
                 )
             except LLMCancelledError:
-                logger.info("Agent LLM call cancelled at step %d/%d", state.step, state.max_steps)
+                logger.info("Agent LLM call cancelled at step %d", state.step)
                 return _Turn([], "", False, "[Cancelled]")
             except (LLMError, LLMEmptyResponseError, httpx.HTTPError) as exc:
                 error_info = _classify_llm_error(exc)
-                logger.warning("LLM error at step %d/%d: %s — %s", state.step, state.max_steps, error_info.type, error_info.detail)
+                logger.warning("LLM error at step %d: %s — %s", state.step, error_info.type, error_info.detail)
                 # Try to handle the error (checkpoint + retry prompt)
                 result = _handle_llm_error(ctx, state, error_info, progress, _get_user_goal(state))
                 if result is None:
@@ -1372,7 +1390,7 @@ def _request_turn(
             if raw.strip():
                 break
             if empty_retries < _MAX_EMPTY_RETRIES:
-                logger.warning("LLM returned empty response (step %d/%d), retrying (%d/%d)…", state.step, state.max_steps, empty_retries + 1, _MAX_EMPTY_RETRIES, )
+                logger.warning("LLM returned empty response (step %d), retrying (%d/%d)…", state.step, empty_retries + 1, _MAX_EMPTY_RETRIES, )
                 progress(f"⏳ Empty LLM response, retrying ({empty_retries + 1}/{_MAX_EMPTY_RETRIES})…")
                 empty_retries += 1
                 continue
@@ -1442,6 +1460,36 @@ def _dispatch_action(
         _end_status = "ok" if outcome.get("success") else "fail"
         progress(f"__TOOL_END__:{_end_status}:{tool_name}\n{fmt_tool_result_progress(tool_name, args, outcome)}")
         sink(tool_result)
+
+        # Doom-loop detection (T2): self-terminate when the same tool fails
+        # with the same error repeatedly. Runs at the vision_query/normal-tool
+        # merge point — the only place the outcome dict is in scope. Any
+        # success (or a different failure key) resets the streak.
+        if outcome.get("success") is False:
+            error_text = (outcome.get("error", "") or "").strip()
+            key = f"{tool_name}:{error_text[:200]}"
+            if state._last_tool_fail_key == key:
+                state._tool_fail_repeat += 1
+            else:
+                state._tool_fail_repeat = 1
+            state._last_tool_fail_key = key
+            if state._tool_fail_repeat >= _DOOM_LOOP_LIMIT:
+                logger.error(
+                    "Doom loop: tool '%s' failed identically %d times — aborting",
+                    tool_name, state._tool_fail_repeat,
+                )
+                abort_msg = (
+                    f"❌ Agent stuck: `{tool_name}` failed with the same error "
+                    f"{state._tool_fail_repeat} times in a row "
+                    "— stopping to avoid wasting budget. "
+                    f"Last error: {error_text[:200]}"
+                )
+                progress(abort_msg)
+                return abort_msg
+        else:
+            state._tool_fail_repeat = 0
+            state._last_tool_fail_key = ""
+
         if outcome.get("_operator_cancelled") or ctx.cancel_event.is_set():
             state.operator_cancelled = True
         return None
@@ -1476,11 +1524,11 @@ def _run_single_step(
     step counting/logging, tool-definition grouping, context compaction, the LLM
     turn request, action extraction/dispatch, and per-step context-snapshot
     publication. The helper mutates ``state`` (and possibly ``state.max_steps``
-    when a plan action is dispatched). It does **not** handle the step-extension
-    prompt; that remains in :func:`react_loop`.
+    when a plan action is dispatched; that mutation is not a gate — the loop no
+    longer enforces a step limit).
     """
     if ctx.cancel_event.is_set():
-        logger.warning("cancelled at step %d/%d", state.step, state.max_steps)
+        logger.warning("cancelled at step %d", state.step)
         return _StepResult(early_return="[Cancelled]")
 
     if not state.warned_inactivity and state.step > 1:
@@ -1505,7 +1553,7 @@ def _run_single_step(
     agent_logging.log_event(
         agent_logging.LogEvent.STEP_BEGIN, "step begin",
         level=logging.INFO, logger=slog, step=state.step,
-        model=active_model, max_steps=state.max_steps,
+        model=active_model,
     )
 
     if ctx.on_step:
@@ -1591,30 +1639,6 @@ def _run_single_step(
     return _StepResult(should_continue=True)
 
 
-def _handle_step_limit_reached(
-    ctx: ReactContext,
-    state: _LoopState,
-    progress: Callable[[str], None],
-) -> bool:
-    """Prompt the user when the step limit is reached and apply an extension.
-
-    Returns ``True`` if the outer loop should continue (the user granted an
-    extension), ``False`` if the loop should terminate.
-    """
-    ext_response = ctx.confirmation.request_extension(state.max_steps, progress)
-    if ext_response == "unlimited":
-        state.max_steps = _EFFECTIVELY_UNLIMITED_STEPS
-        logger.info("Agent steps set to effectively unlimited by user")
-        progress("♾️ Running until done (effectively unlimited, capped at 10M for safety)…")
-        return True
-    if ext_response == "yes":
-        state.max_steps += 10
-        logger.info("Agent steps extended to %d by user", state.max_steps)
-        progress(f"⏩ Extended — continuing to step {state.max_steps}…")
-        return True
-    return False
-
-
 def react_loop(
     ctx: ReactContext,
     user_goal: str,
@@ -1664,28 +1688,43 @@ def react_loop(
         if initial_state is not None:
             state = initial_state
         else:
-            state = _LoopState(messages=messages, goal_idx=goal_idx, max_steps=ctx.max_iterations)
+            # D1: the step gate is removed; max_steps is retained only for the
+            # checkpoint schema and _run_plan compat, so it starts effectively
+            # unlimited for every agent type.
+            state = _LoopState(
+                messages=messages, goal_idx=goal_idx,
+                max_steps=_EFFECTIVELY_UNLIMITED_STEPS,
+            )
 
         while True:
-            while state.step < state.max_steps:
-                result = _run_single_step(
-                    ctx, state, system, user_goal, run_start, _progress,
-                    supports_native_fallback=_supports_native_fallback,
-                )
-                if result.early_return is not None:
-                    return result.early_return
-                if not result.should_continue:
-                    break
-
-            if state.operator_cancelled:
-                ctx.memory.record_event("Task cancelled by operator")
-                return "⚠️ Task stopped by operator."
-
-            if not _handle_step_limit_reached(ctx, state, _progress):
+            result = _run_single_step(
+                ctx, state, system, user_goal, run_start, _progress,
+                supports_native_fallback=_supports_native_fallback,
+            )
+            if result.early_return is not None:
+                return result.early_return
+            if not result.should_continue:
                 break
 
-        ctx.memory.record_event("Agent hit max iterations")
-        return "⚠️ Agent reached maximum steps. Operation cancelled."
+            # Milestone notification (T4): fire-and-forget ping at each
+            # `step_notify_interval` completed steps. Only the main agent has
+            # milestone_notify_fn wired; sub-agents default to None. The
+            # _last_notified_step guard prevents double-fire on iterations
+            # that return without advancing state.step (inactivity warnings).
+            if (ctx.step_notify_interval
+                    and ctx.milestone_notify_fn
+                    and state.step > 0
+                    and state.step != state._last_notified_step
+                    and state.step % ctx.step_notify_interval == 0):
+                try:
+                    ctx.milestone_notify_fn(state.step)
+                    state._last_notified_step = state.step
+                except Exception:
+                    logger.debug("milestone_notify failed", exc_info=True)
+
+        # Only the operator-cancel path reaches this return (should_continue=False).
+        ctx.memory.record_event("Task cancelled by operator")
+        return "⚠️ Task stopped by operator."
     finally:
         if ctx.context_monitor is not None:
             try:
