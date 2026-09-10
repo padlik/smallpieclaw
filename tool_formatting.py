@@ -266,8 +266,8 @@ def format_tool_result(tool_name: str, outcome: dict) -> str:
         if outcome.get("error_type"):
             parts.append(f"error_type: {outcome['error_type']}")
             parts.append(f"recoverable: {bool(outcome.get('recoverable', False))}")
-        if outcome.get("suggestion"):
-            parts.append(f"suggestion: {outcome['suggestion']}")
+            if outcome.get("suggestion"):
+                parts.append(f"suggestion: {outcome['suggestion']}")
         return "\n".join(parts)
 
 
