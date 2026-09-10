@@ -176,7 +176,7 @@ class TestMcpAuthCommands:
 
     def test_mcp_auth_unknown_server(self):
         """/mcp auth <name> surfaces errors from start_oauth_flow."""
-        from telegram_commands import cmd_mcp
+        from telegram_mcp_commands import cmd_mcp
 
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
@@ -211,7 +211,7 @@ class TestMcpAuthCommands:
 
     def test_mcp_auth_no_oauth(self):
         """/mcp auth <name> reports missing OAuth configuration."""
-        from telegram_commands import cmd_mcp
+        from telegram_mcp_commands import cmd_mcp
 
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
@@ -246,7 +246,7 @@ class TestMcpAuthCommands:
 
     def test_mcp_auth_status_format(self):
         """/mcp auth status lists servers with OAuth details."""
-        from telegram_commands import cmd_mcp
+        from telegram_mcp_commands import cmd_mcp
 
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
@@ -286,7 +286,7 @@ class TestMcpAuthCommands:
 
     def test_mcp_auth_status_shows_expiry_and_refresh(self):
         """/mcp auth status shows token expiry and refresh-token availability."""
-        from telegram_commands import cmd_mcp
+        from telegram_mcp_commands import cmd_mcp
 
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
@@ -329,7 +329,7 @@ class TestMcpAuthCommands:
 
     def test_mcp_auth_revoke_deletes_token(self):
         """/mcp auth revoke <name> delegates to revoke_server and reports success."""
-        from telegram_commands import cmd_mcp
+        from telegram_mcp_commands import cmd_mcp
 
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
@@ -359,7 +359,7 @@ class TestMcpAuthCommands:
 
     def test_mcp_auth_cancel_success(self):
         """/mcp auth cancel requests cancellation of in-progress flow."""
-        from telegram_commands import cmd_mcp
+        from telegram_mcp_commands import cmd_mcp
 
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
@@ -393,7 +393,7 @@ class TestMcpAuthCommands:
 
     def test_mcp_auth_cancel_no_flow(self):
         """/mcp auth cancel when no flow is in progress reports error."""
-        from telegram_commands import cmd_mcp
+        from telegram_mcp_commands import cmd_mcp
 
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
@@ -427,7 +427,7 @@ class TestMcpAuthCommands:
 
     def test_mcp_auth_success_registers_tools(self):
         """After a successful OAuth flow, discovered tools are registered."""
-        from telegram_commands import cmd_mcp
+        from telegram_mcp_commands import cmd_mcp
 
         iface = _make_iface()
         iface.mcp_manager = MagicMock()
