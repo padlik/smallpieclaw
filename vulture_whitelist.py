@@ -125,18 +125,17 @@ SCHEMA_DDL
 INSERT_EVENT_SQL
 row_to_record
 
-# graph_memory.py — backfill public API
-from graph_memory import (  # noqa: E402
+# backfill engine — moved from graph_memory.py to backfill_graph_memory.py
+from backfill_graph_memory import (  # noqa: E402
     BackfillEntryResult,
     BackfillResult,
     backfill_longterm_to_graph,
-    build_extraction_llm_call,
 )
+from graph_memory import build_extraction_llm_call  # noqa: E402
 BackfillEntryResult
 BackfillResult
 backfill_longterm_to_graph
 build_extraction_llm_call
-backfill_longterm_to_graph
 
 # LongTermMemory.entries — safe snapshot API used by backfill CLI
 from memory_store import LongTermMemory  # noqa: E402

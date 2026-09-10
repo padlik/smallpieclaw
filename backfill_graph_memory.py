@@ -34,11 +34,24 @@ Prerequisites
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import shutil
 import sys
-from typing import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, Optional
+
+import httpx
+
+from graph_memory import (
+    EXTRACTION_PROMPT,
+    GraphMemoryStore,
+    parse_extraction,
+)
+from providers._errors import LLMError
 
 # ---------------------------------------------------------------------------
 # Bootstrap — ensure the repo root is on sys.path regardless of cwd
@@ -138,6 +151,312 @@ def _load_toml(path: str) -> dict:
         return tomli.load(f)
 
 
+# ---------------------------------------------------------------------------
+# LongTermMemory → Graph backfill service
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BackfillEntryResult:
+    """Outcome for a single LongTermMemory entry."""
+
+    entry_id: str
+    status: str           # "imported" | "skipped" | "no_extraction" | "failed"
+    entities: int = 0
+    facts: int = 0
+    episode_id: str = ""
+    error: str = ""
+
+
+@dataclass
+class BackfillResult:
+    """Summary of a complete backfill run."""
+
+    total: int = 0
+    imported: int = 0
+    skipped: int = 0
+    no_extraction: int = 0
+    failed: int = 0
+    total_entities: int = 0
+    total_facts: int = 0
+    entries: list[BackfillEntryResult] = field(default_factory=list)
+
+
+def _entry_checksum(entry: dict) -> str:
+    """Stable SHA-256 fingerprint for a LongTermMemory entry dict."""
+    sig = f"{entry.get('content', '')}|{entry.get('source', '')}|{entry.get('timestamp', '')}"
+    return "sha256:" + hashlib.sha256(sig.encode()).hexdigest()
+
+
+def _load_backfill_state(state_path: str) -> dict:
+    """Load the migration state JSON; return empty dict on missing/corrupt file."""
+    if not os.path.exists(state_path):
+        return {"version": 1, "imported": {}}
+    try:
+        with open(state_path) as f:
+            data = json.load(f)
+        if not isinstance(data.get("imported"), dict):
+            raise ValueError("malformed state file")
+        return data
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        logger.warning("Backfill state file unreadable (%s) — starting fresh", exc)
+        return {"version": 1, "imported": {}}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Backfill state file unreadable with unexpected error (%s) — starting fresh", exc)
+        return {"version": 1, "imported": {}}
+
+
+def _save_backfill_state(state_path: str, state: dict) -> None:
+    """Atomic write of the migration state JSON.
+
+    Raises OSError on failure so callers know idempotency state was not
+    persisted and can treat the entry as failed rather than silently
+    risking duplicate imports on the next run.
+    """
+    os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
+    tmp = f"{state_path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, state_path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def backfill_longterm_to_graph(
+    long_term_entries: list[tuple[str, dict]],
+    store: GraphMemoryStore,
+    llm_call_fn: Callable[[str], str],
+    state_path: str,
+    dry_run: bool = False,
+    limit: Optional[int] = None,
+    force: bool = False,
+    notify_fn: Optional[Callable[[int, int, "BackfillResult", "BackfillEntryResult"], None]] = None,
+) -> BackfillResult:
+    """Seed the graph store from a snapshot of LongTermMemory entries.
+
+    Parameters
+    ----------
+    long_term_entries : list of (entry_id, entry_dict) from LongTermMemory.entries()
+    store             : live GraphMemoryStore instance (must be open)
+    llm_call_fn       : callable(prompt) -> str — same signature as GraphMemoryWriter
+    state_path        : path to JSON state file tracking imported IDs
+    dry_run           : if True, count/preview only — no graph writes, no state update
+    limit             : stop after N entries (useful for incremental processing)
+    force             : ignore state file and reprocess all entries
+    notify_fn         : optional progress callback called after each entry is processed.
+                        Signature: notify_fn(current, total, result, entry_result)
+                        where current = number of entries processed so far (1-based).
+
+    Returns a BackfillResult with per-entry outcomes and aggregate counts.
+    """
+    state = {} if dry_run else _load_backfill_state(state_path)
+    imported_map: dict = state.get("imported", {})
+
+    result = BackfillResult(total=len(long_term_entries))
+    processed = 0
+
+    def _notify(er: BackfillEntryResult) -> None:
+        if notify_fn is not None:
+            notify_fn(len(result.entries), result.total, result, er)
+
+    for entry_id, entry in long_term_entries:
+        if limit is not None and processed >= limit:
+            break
+
+        checksum = _entry_checksum(entry)
+
+        # Skip if already imported with the same checksum
+        if not force and entry_id in imported_map:
+            existing = imported_map[entry_id]
+            if existing.get("checksum") == checksum:
+                result.skipped += 1
+                er = BackfillEntryResult(entry_id=entry_id, status="skipped")
+                result.entries.append(er)
+                _notify(er)
+                continue
+
+        content = entry.get("content", "").strip()
+        source = entry.get("source", "manual")
+        timestamp = entry.get("timestamp", "")
+        processed += 1
+
+        if dry_run:
+            # In dry-run mode just count; don't call LLM or touch graph
+            result.imported += 1
+            er = BackfillEntryResult(entry_id=entry_id, status="imported (dry-run)")
+            result.entries.append(er)
+            _notify(er)
+            continue
+
+        # Format a stable migration text block that the extraction prompt can parse
+        migration_text = (
+            f"Long-term memory entry {entry_id}\n"
+            f"Source: {source}\n"
+            f"Timestamp: {timestamp}\n\n"
+            f"{content}"
+        )
+
+        prompt = EXTRACTION_PROMPT + migration_text
+        try:
+            response = llm_call_fn(prompt)
+        except (LLMError, httpx.HTTPError, httpx.TimeoutException) as exc:
+            result.failed += 1
+            er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.entries.append(er)
+            logger.warning("Backfill LLM extraction failed for %s: %s", entry_id, exc)
+            _notify(er)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            result.failed += 1
+            er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.entries.append(er)
+            logger.warning("Backfill LLM extraction failed unexpectedly for %s: %s", entry_id, exc)
+            _notify(er)
+            continue
+
+        extraction = parse_extraction(response)
+        if not extraction:
+            # No entities/facts found — still write episode for raw-text retrieval
+            try:
+                ep_id = store.add_episode(content[:2000], user_id="backfill", source="longterm_memory_backfill")
+            except (KeyError, ValueError, RuntimeError) as exc:
+                result.failed += 1
+                er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+                result.entries.append(er)
+                logger.warning("Backfill add_episode failed for %s: %s", entry_id, exc)
+                _notify(er)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                result.failed += 1
+                er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+                result.entries.append(er)
+                logger.warning("Backfill add_episode failed unexpectedly for %s: %s", entry_id, exc)
+                _notify(er)
+                continue
+            result.no_extraction += 1
+            entry_result = BackfillEntryResult(
+                entry_id=entry_id, status="no_extraction", episode_id=ep_id
+            )
+            result.entries.append(entry_result)
+            prev_state_ne = imported_map.get(entry_id)
+            imported_map[entry_id] = {
+                "checksum": checksum,
+                "episode_id": ep_id,
+                "imported_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                _save_backfill_state(state_path, {"version": 1, "imported": imported_map})
+            except OSError as exc:
+                logger.error("Backfill state save failed for %s — skipping state update: %s", entry_id, exc)
+                if prev_state_ne is not None:
+                    imported_map[entry_id] = prev_state_ne
+                else:
+                    imported_map.pop(entry_id, None)
+                result.no_extraction -= 1
+                result.entries[-1] = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+                result.failed += 1
+            _notify(result.entries[-1])
+            continue
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        entity_ids: dict[str, str] = {}
+        entities_written = 0
+        facts_written = 0
+
+        for entity in extraction.entities:
+            try:
+                eid = store.upsert_entity(entity.name, entity.entity_type, ts)
+                entity_ids[entity.name.lower()] = eid
+                entities_written += 1
+            except (KeyError, ValueError, RuntimeError) as exc:
+                logger.debug("Backfill upsert_entity failed for '%s': %s", entity.name, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Backfill upsert_entity failed unexpectedly for '%s': %s", entity.name, exc)
+
+        for fact in extraction.facts:
+            src_key = fact.source.lower()
+            tgt_key = fact.target.lower()
+            src_id = entity_ids.get(src_key)
+            tgt_id = entity_ids.get(tgt_key)
+            try:
+                if src_id is None:
+                    src_id = store.upsert_entity(fact.source, "other", ts)
+                    entity_ids[src_key] = src_id
+                if tgt_id is None:
+                    tgt_id = store.upsert_entity(fact.target, "other", ts)
+                    entity_ids[tgt_key] = tgt_id
+                store.add_relation(src_id, tgt_id, fact.relation_type, fact.fact, ts)
+                facts_written += 1
+            except (KeyError, ValueError, RuntimeError) as exc:
+                logger.debug("Backfill add_relation failed: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Backfill add_relation failed unexpectedly: %s", exc)
+
+        try:
+            ep_id = store.add_episode(content[:2000], user_id="backfill", source="longterm_memory_backfill")
+        except (KeyError, ValueError, RuntimeError) as exc:
+            result.failed += 1
+            er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.entries.append(er)
+            logger.warning("Backfill add_episode failed for %s: %s", entry_id, exc)
+            _notify(er)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            result.failed += 1
+            er = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.entries.append(er)
+            logger.warning("Backfill add_episode failed unexpectedly for %s: %s", entry_id, exc)
+            _notify(er)
+            continue
+
+        result.imported += 1
+        result.total_entities += entities_written
+        result.total_facts += facts_written
+        entry_result = BackfillEntryResult(
+            entry_id=entry_id,
+            status="imported",
+            entities=entities_written,
+            facts=facts_written,
+            episode_id=ep_id,
+        )
+        result.entries.append(entry_result)
+        logger.debug(
+            "Backfill: %s → %d entities, %d facts, ep=%s",
+            entry_id,
+            entities_written,
+            facts_written,
+            ep_id,
+        )
+
+        prev_state_main = imported_map.get(entry_id)
+        imported_map[entry_id] = {
+            "checksum": checksum,
+            "episode_id": ep_id,
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            _save_backfill_state(state_path, {"version": 1, "imported": imported_map})
+        except OSError as exc:
+            logger.error("Backfill state save failed for %s — skipping state update: %s", entry_id, exc)
+            if prev_state_main is not None:
+                imported_map[entry_id] = prev_state_main
+            else:
+                imported_map.pop(entry_id, None)
+            result.imported -= 1
+            result.total_entities -= entities_written
+            result.total_facts -= facts_written
+            result.entries[-1] = BackfillEntryResult(entry_id=entry_id, status="failed", error=str(exc))
+            result.failed += 1
+        _notify(result.entries[-1])
+
+    return result
+
+
 def _build_llm_call(cfg: dict, app_cfg, all_models: list) -> "Callable[[str], str]":
     """Build a one-shot LLM callable that uses the extraction model.
 
@@ -145,6 +464,7 @@ def _build_llm_call(cfg: dict, app_cfg, all_models: list) -> "Callable[[str], st
     so that both the backfill CLI and the live main-process path use identical logic.
     """
     from graph_memory import build_extraction_llm_call
+
     return build_extraction_llm_call(cfg, app_cfg, all_models, caller_tag="backfill")
 
 
@@ -278,12 +598,6 @@ def main() -> None:
     # calling embeddings, or making LLM calls.
     # ------------------------------------------------------------------
     if args.dry_run:
-        from graph_memory import (
-            BackfillResult,
-            BackfillEntryResult,
-            _load_backfill_state,
-            _entry_checksum,
-        )
         logger.info("DRY-RUN — counting entries only; no DB, embeddings, or LLM calls.")
         state = _load_backfill_state(state_file)
         imported_map = state.get("imported", {})
@@ -319,11 +633,6 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Build graph store
     # ------------------------------------------------------------------
-    from graph_memory import (
-        GraphMemoryStore,
-        backfill_longterm_to_graph,
-    )
-
     logger.info("Opening graph store at %s", db_path)
     try:
         embedding_dim = len(llm.embed("test"))
