@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from graph_memory import (
+from backfill_graph_memory import (
     _entry_checksum,
     _load_backfill_state,
     _save_backfill_state,
@@ -515,7 +515,6 @@ class TestBackfillFailures:
         assert result.failed == 1
         assert result.imported == 0
         # State file must NOT record this entry
-        from graph_memory import _load_backfill_state
         state = _load_backfill_state(state_path)
         assert "entry-001" not in state.get("imported", {})
 
@@ -533,7 +532,6 @@ class TestBackfillFailures:
 
         assert result.failed == 1
         assert result.no_extraction == 0
-        from graph_memory import _load_backfill_state
         state = _load_backfill_state(state_path)
         assert "entry-001" not in state.get("imported", {})
 
@@ -543,7 +541,7 @@ class TestBackfillFailures:
         from unittest.mock import patch
         state_path = str(tmp_path / "state.json")
 
-        with patch("graph_memory._save_backfill_state", side_effect=OSError("disk full")):
+        with patch("backfill_graph_memory._save_backfill_state", side_effect=OSError("disk full")):
             result = backfill_longterm_to_graph(
                 long_term_entries=_make_entries(),
                 store=mock_store,
@@ -589,7 +587,7 @@ class TestBackfillFailures:
                 raise OSError("disk full")
             real_save(path, state)
 
-        with patch("graph_memory._save_backfill_state", side_effect=patched_save):
+        with patch("backfill_graph_memory._save_backfill_state", side_effect=patched_save):
             result = backfill_longterm_to_graph(
                 long_term_entries=[(entry1_id, entry1), (entry2_id, entry2)],
                 store=mock_store,
@@ -636,7 +634,7 @@ class TestBackfillFailures:
                 raise OSError("disk full")
             real_save(path, state)
 
-        with patch("graph_memory._save_backfill_state", side_effect=patched_save):
+        with patch("backfill_graph_memory._save_backfill_state", side_effect=patched_save):
             result = backfill_longterm_to_graph(
                 long_term_entries=[(entry1_id, entry1), (entry2_id, entry2)],
                 store=mock_store,

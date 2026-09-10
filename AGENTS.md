@@ -165,6 +165,9 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `builtin_executor.py` | Dispatcher/facade for built-in tools; confirmation-token management and error-classification contract; imports from `builtin_tools/` |
 | `builtin_tools/` | Built-in tool subpackage: `shell.py`, `files.py`, `memory.py`, `agents.py`, `schedule.py`, `context_io.py`, `descriptors.py` (registry), `schemas.py`, `patterns.py`, `logquery_helpers.py`, `secrets_log.py`, `text_utils.py` |
 | `agent_logging.py` | structlog-based dual-sink logging; `LogEvent` enum (TOOL_START/END/FAILED, LLM_CALL/FAILED, STEP_BEGIN/END, RUN_BEGIN/END, ERROR); `setup_logging()`, `log_event()`, `bind_run_context()`; structured sink wired to `sqlite_log.py` |
+| `react_loop.py` | Canonical ReAct loop logic; receives a `ReactContext` dataclass with all deps and mutable state; emits structured lifecycle events |
+| `tool_formatting.py` | Pure presentation helpers for tool calls/results (icons, brief/call/result formatters, compact args repr); extracted from `react_loop.py`, re-exported there for backward compat |
+| `native_turns.py` | OpenAI native tool-call wire-shape helpers (append tool-result messages, linearize native turns); extracted from `react_loop.py`, re-exported there |
 | `sqlite_log.py` | SQLite WAL structured log store; schema/indexes, single-writer queue ingestion (`SQLiteQueueHandler` → bounded queue → `SqliteLogWriter` thread, batched INSERT), 30-day time-based DELETE retention, graceful degradation to prose-only |
 | `backfill_log_store.py` | One-time CLI to import legacy `agent.jsonl` + `agent.jsonl.*.gz` archives into `agent_logs.sqlite` |
 | `agent_runtime.py` | Construction-time policy via `RuntimeProfile` enum (ON_DEMAND_SUBAGENT, SCHEDULED_AGENT, PLAN_STEP_AGENT, DIAGNOSTIC_AGENT) for sub-agents; `AgentRuntime.create` builds `SubAgentRunner` products |
@@ -174,13 +177,14 @@ Run a single test: `pytest tests/test_react_loop.py::TestExtractJsonCandidates::
 | `tool_index.py` | Semantic tool search via embedding cosine similarity; persists to `data/tool_index.json` |
 | `memory_store.py` | `MemoryStore` (KV), `ShortTermMemory`, `WorkingMemory`, `ResultsMemory`, `LongTermMemory` |
 | `graph_memory.py` | Opt-in LadybugDB entity/relationship store; `GraphMemoryStore` + `GraphMemoryWriter` |
-| `backfill_graph_memory.py` | One-time CLI to seed graph from `data/longterm_memory.json` |
+| `backfill_graph_memory.py` | One-time CLI **and backfill engine** — imports `data/longterm_memory.json` into the graph store (`BackfillResult`, `backfill_longterm_to_graph` live here) |
 | `scheduler.py` | Cron jobs via `scheduler.toml` (single source of truth); uses `croniter` |
 | `mcp_client.py` | MCP server client — stdio (subprocess) and http transports |
 | `skill_registry.py` | Discovers Agent Skills from `skills/<name>/SKILL.md` |
 | `telegram_interface.py` | Telegram bot with allowlist/pairing security, streaming, inline confirmations |
 | `telegram_formatter.py` | Pure formatting: md→html, message splitting, job list formatting |
 | `telegram_commands.py` | All `/` command handlers |
+| `telegram_mcp_commands.py` | `/mcp` Telegram subcommand family (status/on/off/info/list/auth, tool-defs snapshot refresh); split from `telegram_commands.py` |
 | `telegram_callbacks.py` | Inline-button callback handlers (split from `telegram_commands.py`) |
 | `prompt_builder.py` | System prompt assembly; re-exports `estimate_tokens` from `token_estimator.py` for backward compat |
 | `token_estimator.py` | Two-layer token counting: tiktoken (OpenAI models) + conservative heuristic fallback |

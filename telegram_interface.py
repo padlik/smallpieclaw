@@ -45,11 +45,12 @@ from telegram_formatter import (
 )
 from telegram_commands import (
     cmd_start, cmd_help, cmd_status, cmd_stop, cmd_reset, cmd_compress,
-    cmd_verbose, cmd_jobs, cmd_agents, cmd_prompts, cmd_tools, cmd_skills, cmd_mcp,
+    cmd_verbose, cmd_jobs, cmd_agents, cmd_prompts, cmd_tools, cmd_skills,
     cmd_reindex, cmd_pair, cmd_unpair, cmd_myid,
     cmd_show_ctx, cmd_show_env, cmd_memory, cmd_models, cmd_mode,
     cmd_resume, cmd_context,
 )
+from telegram_mcp_commands import cmd_mcp
 from telegram_callbacks import (
     cb_confirm, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,

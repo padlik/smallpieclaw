@@ -125,18 +125,17 @@ SCHEMA_DDL
 INSERT_EVENT_SQL
 row_to_record
 
-# graph_memory.py — backfill public API
-from graph_memory import (  # noqa: E402
+# backfill engine — moved from graph_memory.py to backfill_graph_memory.py
+from backfill_graph_memory import (  # noqa: E402
     BackfillEntryResult,
     BackfillResult,
     backfill_longterm_to_graph,
-    build_extraction_llm_call,
 )
+from graph_memory import build_extraction_llm_call  # noqa: E402
 BackfillEntryResult
 BackfillResult
 backfill_longterm_to_graph
 build_extraction_llm_call
-backfill_longterm_to_graph
 
 # LongTermMemory.entries — safe snapshot API used by backfill CLI
 from memory_store import LongTermMemory  # noqa: E402
@@ -279,4 +278,14 @@ _BuiltinExecutorForContextMonitor._context_monitor  # type: ignore[attr-defined]
 
 from react_loop import ReactContext as _ReactContextForContextMonitor  # noqa: E402
 _ReactContextForContextMonitor.context_monitor
+
+# react_loop.py — formatting helpers re-exported from tool_formatting.py
+from react_loop import (  # noqa: E402
+    _strip_shell_wrapper,
+    _truncate_brief,
+    fmt_tool_result_progress,
+)
+_strip_shell_wrapper
+_truncate_brief
+fmt_tool_result_progress
 

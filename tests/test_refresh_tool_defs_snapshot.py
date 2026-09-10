@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from context_monitor import ContextSnapshot, compute_danger_level, compute_headroom_real
-from telegram_commands import _refresh_tool_defs_snapshot
+from telegram_mcp_commands import _refresh_tool_defs_snapshot
 
 
 def _make_iface(last_snapshot: ContextSnapshot | None) -> MagicMock:

@@ -631,6 +631,31 @@ class TestFormatToolResultRecoveryFields:
         assert "error_type:" not in msg
         assert "recoverable:" not in msg
 
+    def test_suggestion_suppressed_without_error_type(self):
+        from react_loop import format_tool_result
+
+        msg = format_tool_result("shell", {
+            "success": False,
+            "output": "",
+            "error": "boom",
+            "exit_code": 1,
+            "suggestion": "do this",
+        })
+        assert "suggestion:" not in msg
+
+    def test_suggestion_emitted_with_error_type(self):
+        from react_loop import format_tool_result
+
+        msg = format_tool_result("shell", {
+            "success": False,
+            "output": "",
+            "error": "boom",
+            "exit_code": 1,
+            "error_type": "tool_error",
+            "suggestion": "do this",
+        })
+        assert "suggestion: do this" in msg
+
 
 class TestCompactionGoalAnchoring:
     """react_loop-level regression: the goal survives repeated in-loop compaction.
