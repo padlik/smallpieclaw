@@ -280,3 +280,13 @@ _BuiltinExecutorForContextMonitor._context_monitor  # type: ignore[attr-defined]
 from react_loop import ReactContext as _ReactContextForContextMonitor  # noqa: E402
 _ReactContextForContextMonitor.context_monitor
 
+# react_loop.py — formatting helpers re-exported from tool_formatting.py
+from react_loop import (  # noqa: E402
+    _strip_shell_wrapper,
+    _truncate_brief,
+    fmt_tool_result_progress,
+)
+_strip_shell_wrapper
+_truncate_brief
+fmt_tool_result_progress
+
