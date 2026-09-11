@@ -132,6 +132,7 @@ def _format_schedule(tool_name: str, args: dict) -> str:
         return f"{tool_name} list"
     if action == "add":
         return f'{tool_name} add "{_truncate_brief(tag, 30)}" {cron}'
+    # show/modify and the other tag-bearing actions render as action + tag.
     return f'{tool_name} {action} "{_truncate_brief(tag, 30)}"'
 
 
