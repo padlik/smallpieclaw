@@ -1,50 +1,116 @@
-"""The ``schedule`` built-in tool (list/add/remove/pause/resume/run_now).
+"""The ``schedule`` built-in tool (list/show/add/remove/pause/resume/modify/run_now).
 
 Leaf module: reads exactly one collaborator (``scheduler``), passed in as a
 plain parameter rather than via an owner back-reference — no state to own.
+
+Actions:
+  • list   — compact overview of all jobs (read-only, available at every depth)
+  • show   — full metadata for a single job (read-only, available at every depth)
+  • add    — create a new job (mutating, main-agent only)
+  • remove — delete a job (mutating, main-agent only)
+  • pause  — disable a job (mutating, main-agent only)
+  • resume — re-enable a job (mutating, main-agent only)
+  • modify — partial-patch an existing job (mutating, main-agent only)
+  • run_now — trigger a job immediately through the standard scheduled-run
+              machinery (mutating, main-agent only)
+
+Sub-agents (caller_depth >= 1) may only use the read-only actions ``list`` and
+``show``. All mutating actions are hard-blocked for sub-agents.
 """
 
 from __future__ import annotations
+
+
+# Valid overlap-policy values, enforced at the tool layer before reaching the
+# Scheduler (which stays permissive for operator-authored scheduler.toml).
+_OVERLAP_POLICIES = ("skip", "parallel")
+
+
+def _coerce_bool(value: object, field: str, action: str) -> bool:
+    """Parse a boolean-like value from LLM input.
+
+    Real booleans pass through. Strings are interpreted case-insensitively:
+    "true" / "1" / "yes" → True; "false" / "0" / "no" → False. Any other
+    value raises ``ValueError`` with a user-facing message so the caller can
+    return a validation error.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+    raise ValueError(f"schedule {action}: {field} must be a boolean.")
+
+
+def _coerce_context_max_messages(value: object, action: str) -> int:
+    """Parse context_max_messages as a positive integer.
+
+    Accepts an int directly or a string that parses as int. Rejects values
+    below 1 and any non-integer input with ``ValueError`` and a user-facing
+    message.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"schedule {action}: context_max_messages must be an integer >= 1.")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"schedule {action}: context_max_messages must be an integer >= 1."
+            ) from exc
+    else:
+        raise ValueError(f"schedule {action}: context_max_messages must be an integer >= 1.")
+    if parsed < 1:
+        raise ValueError(f"schedule {action}: context_max_messages must be an integer >= 1.")
+    return parsed
 
 
 def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
     """Run the ``schedule`` built-in tool's ``action`` against *scheduler*.
 
     ``args["action"]`` selects the operation (default ``"list"``):
-    ``list`` (enumerate jobs), ``add`` (requires ``tag``; see ``Scheduler.add_job``
-    for the remaining fields), ``remove``/``pause``/``resume``/``run_now``
-    (each requires ``tag``). Returns the standard built-in result dict; an
+    ``list`` (enumerate jobs), ``show`` (full metadata for ``tag``),
+    ``add`` (requires ``tag``; see ``Scheduler.add_job`` for the remaining
+    fields), ``remove``/``pause``/``resume``/``modify``/``run_now`` (each
+    requires ``tag``). Returns the standard built-in result dict; an
     unrecognized action or a missing ``scheduler`` both return
     ``success=False`` with a descriptive ``error``.
 
     ``caller_depth`` is the depth of the invoking AgentController (0 = main
-    agent, 1 = sub-agent). Mutating actions (``add``/``remove``/``pause``/
-    ``resume``/``run_now``) are blocked at ``caller_depth >= 1`` so sub-agents
-    cannot create, delete, or alter scheduled jobs that persist beyond the
-    sub-agent's lifetime. The read-only ``list`` action remains available.
+    agent, 1 = sub-agent). The read-only actions ``list`` and ``show`` are
+    available at every depth; all mutating actions (``add``/``remove``/
+    ``pause``/``resume``/``modify``/``run_now``) are blocked at
+    ``caller_depth >= 1`` so sub-agents cannot create, delete, or alter
+    scheduled jobs that persist beyond the sub-agent's lifetime.
     """
     if not scheduler:
         return {"success": False, "output": "", "error": "Scheduler not available.", "exit_code": -1}
     action = str(args.get("action", "list")).lower()
     tag = str(args.get("tag", "")).strip()
 
-    # Depth guard — sub-agents cannot manipulate scheduled jobs. The read-only
-    # ``list`` action is allowed; all mutating actions are hard-blocked.
-    if caller_depth >= 1 and action != "list":
+    # Depth guard — sub-agents may only inspect scheduled jobs. The read-only
+    # ``list`` and ``show`` actions are allowed; all other actions are
+    # hard-blocked with a non-recoverable error.
+    if caller_depth >= 1 and action not in ("list", "show"):
         return {
             "success": False,
             "output": "",
             "error": (
                 f"schedule: sub-agents cannot modify scheduled jobs "
                 f"(action '{action}' blocked at depth {caller_depth}). "
-                f"Only 'list' is available to sub-agents."
+                f"Only 'list' and 'show' are available to sub-agents."
             ),
             "exit_code": -1,
             "error_type": "fundamentally_wrong_approach",
             "recoverable": False,
             "suggestion": (
                 "Ask the parent agent to modify scheduled jobs; sub-agents may "
-                "only list them."
+                "only list or show them."
             ),
         }
 
@@ -65,21 +131,113 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             )
         return {"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}
 
+    if action == "show":
+        if not tag:
+            return {"success": False, "output": "", "error": "tag is required for show", "exit_code": -1}
+        job = scheduler.show_job(tag)
+        if not job:
+            known = ", ".join(entry["tag"] for entry in scheduler.list_jobs()) or "none"
+            return {"success": False, "output": "", "error": f"Job '{tag}' not found. Known jobs: {known}", "exit_code": -1}
+        lines = [
+            f"tag: {job['tag']}",
+            f"task: {job['task']}",
+            f"schedule: {job['schedule']}",
+        ]
+        if job.get("cron"):
+            lines.append(f"cron: {job['cron']}")
+        if job.get("run_at"):
+            lines.append(f"run_at: {job['run_at']}")
+        lines.extend([
+            f"schedule_type: {job['schedule_type']}",
+            f"next_run: {job['next_run'] or 'not scheduled'}",
+            f"enabled: {job['enabled']}",
+            f"is_running: {job['is_running']}",
+            f"source: {job['source']}",
+            f"notify: {job['notify']}",
+            f"model: {job['model'] or 'default'}",
+            f"preserve_context: {job['preserve_context']}",
+            f"context_max_messages: {job['context_max_messages']}",
+            f"overlap_policy: {job['overlap_policy']}",
+            f"last_run: {job['last_run'] or 'never'}",
+            f"last_error: {job['last_error'] or 'none'}",
+            f"created_at: {job['created_at'] or 'unknown'}",
+        ])
+        return {"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}
+
     if action == "add":
         if not tag:
             return {"success": False, "output": "", "error": "tag is required for add", "exit_code": -1}
+        overlap_policy = str(args.get("overlap_policy", "skip")).lower()
+        if args.get("overlap_policy") is not None and overlap_policy not in _OVERLAP_POLICIES:
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"schedule add: overlap_policy must be one of: "
+                    f"{', '.join(_OVERLAP_POLICIES)}."
+                ),
+                "exit_code": -1,
+                "error_type": "validation_error",
+                "recoverable": True,
+                "suggestion": "Set overlap_policy to 'skip' or 'parallel'.",
+            }
+        if args.get("context_max_messages") is not None:
+            try:
+                context_max_messages = _coerce_context_max_messages(args["context_max_messages"], "add")
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": str(exc),
+                    "exit_code": -1,
+                    "error_type": "validation_error",
+                    "recoverable": True,
+                    "suggestion": "Provide context_max_messages as an integer >= 1, e.g. 50.",
+                }
+        else:
+            context_max_messages = 50
+        notify = True
+        if args.get("notify") is not None:
+            try:
+                notify = _coerce_bool(args["notify"], "notify", "add")
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": str(exc),
+                    "exit_code": -1,
+                    "error_type": "validation_error",
+                    "recoverable": True,
+                    "suggestion": "Provide notify as a boolean (true/false).",
+                }
+        preserve_context = False
+        if args.get("preserve_context") is not None:
+            try:
+                preserve_context = _coerce_bool(args["preserve_context"], "preserve_context", "add")
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": str(exc),
+                    "exit_code": -1,
+                    "error_type": "validation_error",
+                    "recoverable": True,
+                    "suggestion": "Provide preserve_context as a boolean (true/false).",
+                }
         result = scheduler.add_job(
             tag=tag,
             schedule_type=str(args.get("schedule_type", args.get("schedule", "cron"))),
             task=str(args.get("task", "")),
-            notify=bool(args.get("notify", True)),
+            notify=notify,
             hours=int(args["hours"]) if args.get("hours") is not None else None,
             minutes=int(args["minutes"]) if args.get("minutes") is not None else None,
             time_str=str(args.get("time", "")) or None,
             run_at=str(args.get("run_at", "")) or None,
             cron=str(args.get("cron", "")) or None,
             model=str(args["model"]) if args.get("model") else None,
-            preserve_context=bool(args.get("preserve_context", False)),
+            preserve_context=preserve_context,
+            context_max_messages=context_max_messages,
+            overlap_policy=overlap_policy,
         )
         if result["success"]:
             return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}
@@ -103,10 +261,131 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             return {"success": True, "output": f"Job '{tag}' resumed.", "error": "", "exit_code": 0}
         return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
 
-    if action == "run_now":
-        result = scheduler.run_now(tag)
-        if result["success"]:
-            return {"success": True, "output": f"Job '{tag}' triggered.", "error": "", "exit_code": 0}
-        return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
+    if action == "modify":
+        if not tag:
+            return {"success": False, "output": "", "error": "tag is required for modify", "exit_code": -1}
+        updates: dict = {}
+        for field in (
+            "task",
+            "cron",
+            "schedule_type",
+            "run_at",
+            "notify",
+            "model",
+            "preserve_context",
+            "context_max_messages",
+            "overlap_policy",
+        ):
+            if field in args and args[field] is not None:
+                updates[field] = args[field]
+        # Forward 'enabled' so Scheduler.modify_job returns the explicit
+        # pause/resume-directed error instead of silently dropping it.
+        if args.get("enabled") is not None:
+            updates["enabled"] = args["enabled"]
+        if "context_max_messages" in updates:
+            try:
+                updates["context_max_messages"] = _coerce_context_max_messages(updates["context_max_messages"], "modify")
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": str(exc),
+                    "exit_code": -1,
+                    "error_type": "validation_error",
+                    "recoverable": True,
+                    "suggestion": "Provide context_max_messages as an integer >= 1, e.g. 50.",
+                }
+        if "overlap_policy" in updates:
+            updates["overlap_policy"] = str(updates["overlap_policy"]).lower()
+            if updates["overlap_policy"] not in _OVERLAP_POLICIES:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": (
+                        f"schedule modify: overlap_policy must be one of: "
+                        f"{', '.join(_OVERLAP_POLICIES)}."
+                    ),
+                    "exit_code": -1,
+                    "error_type": "validation_error",
+                    "recoverable": True,
+                    "suggestion": "Set overlap_policy to 'skip' or 'parallel'.",
+                }
+        if "notify" in updates:
+            try:
+                updates["notify"] = _coerce_bool(updates["notify"], "notify", "modify")
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": str(exc),
+                    "exit_code": -1,
+                    "error_type": "validation_error",
+                    "recoverable": True,
+                    "suggestion": "Provide notify as a boolean (true/false).",
+                }
+        if "preserve_context" in updates:
+            try:
+                updates["preserve_context"] = _coerce_bool(updates["preserve_context"], "preserve_context", "modify")
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": str(exc),
+                    "exit_code": -1,
+                    "error_type": "validation_error",
+                    "recoverable": True,
+                    "suggestion": "Provide preserve_context as a boolean (true/false).",
+                }
+        if "model" in updates:
+            updates["model"] = str(updates["model"]) if updates["model"] else None
 
-    return {"success": False, "output": "", "error": f"Unknown action '{action}'. Use: list, add, remove, pause, resume, run_now", "exit_code": -1}
+        result = scheduler.modify_job(tag, updates)
+        if result["success"]:
+            return {"success": True, "output": f"Job '{tag}' modified.", "error": "", "exit_code": 0}
+        return {
+            "success": False,
+            "output": "",
+            "error": result["error"],
+            "exit_code": -1,
+            "error_type": "validation_error",
+            "recoverable": True,
+            "suggestion": "Check the error message and retry with valid, updatable fields.",
+        }
+
+    if action == "run_now":
+        if not tag:
+            return {"success": False, "output": "", "error": "tag is required for run_now", "exit_code": -1}
+        # Snapshot before triggering: a fast once-job can complete and
+        # self-remove before the result-building read-back runs.
+        job = scheduler.show_job(tag)
+        result = scheduler.run_now(tag)
+        if not result["success"]:
+            return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
+
+        enabled = bool(job.get("enabled", True)) if job else True
+        schedule_type = job.get("schedule_type", "cron") if job else "cron"
+        overlap_policy = job.get("overlap_policy", "skip") if job else "skip"
+
+        notes = [
+            f"Job '{tag}' triggered to run now through the standard scheduled-run "
+            "machinery as a supervised scheduled-run sub-agent.",
+            "The result is delivered per the job's notify setting; it does not return here.",
+            f"This trigger is subject to the job's overlap_policy ({overlap_policy}); "
+            "if a run is already in progress and the policy is 'skip', the trigger is skipped.",
+            f"Follow the outcome with 'schedule show {tag}'.",
+        ]
+        if not enabled:
+            notes.append("The job remains paused (enabled=false); scheduled firings will still skip it.")
+        if schedule_type == "once":
+            notes.append("This is a once job: it will be removed after the run completes.")
+        return {"success": True, "output": "\n".join(notes), "error": "", "exit_code": 0}
+
+    return {
+        "success": False,
+        "output": "",
+        "error": (
+            f"Unknown action '{action}'. "
+            "Use: list, show, add, remove, pause, resume, modify, run_now"
+        ),
+        "exit_code": -1,
+    }

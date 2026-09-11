@@ -571,8 +571,174 @@ class Scheduler:
             # Build a helpful error listing known tags
             known = ", ".join(self._jobs_meta.keys()) or "none"
             return {"success": False, "error": f"Job '{tag}' not found. Known jobs: {known}"}
-        threading.Thread(target=self._run_job, kwargs={"tag": resolved}, daemon=True).start()
+        threading.Thread(
+            target=self._run_job, kwargs={"tag": resolved, "manual": True}, daemon=True
+        ).start()
         logger.info("Job '%s' triggered manually (run_now)", resolved)
+        return {"success": True}
+
+    def show_job(self, tag: str) -> Optional[dict]:
+        """Return full metadata for a single job, or None when unknown.
+
+        The returned dict contains the complete job field set used by the
+        ``show`` tool action: ``tag``, ``task``, ``schedule`` (prose),
+        ``cron`` (raw), ``schedule_type``, ``run_at``, ``next_run``,
+        ``last_run``, ``last_error``, ``notify``, ``model``,
+        ``preserve_context``, ``context_max_messages``, ``overlap_policy``,
+        ``source``, ``enabled``, ``is_running``, and ``created_at``.
+        """
+        canonical = self._resolve_tag(tag)
+        if not canonical:
+            return None
+        with self._running_lock:
+            running = set(self._running_jobs)
+        # A once-job may self-remove between _resolve_tag and this read.
+        meta = self._jobs_meta.get(canonical)
+        if meta is None:
+            return None
+        return {
+            "tag": canonical,
+            "task": meta.get("task", ""),
+            "schedule": self._describe_schedule(meta),
+            "schedule_type": meta.get("schedule_type", "cron"),
+            "cron": meta.get("cron"),
+            "run_at": meta.get("run_at") if meta.get("schedule_type") == "once" else None,
+            "next_run": meta.get("_next_run"),
+            "last_run": meta.get("last_run"),
+            "last_error": meta.get("last_error"),
+            "notify": meta.get("notify", True),
+            "model": meta.get("model"),
+            "preserve_context": meta.get("preserve_context", False),
+            "context_max_messages": meta.get("context_max_messages", 50),
+            "overlap_policy": meta.get("overlap_policy", "skip"),
+            "source": meta.get("source", "config"),
+            "enabled": meta.get("enabled", True),
+            "is_running": canonical in running,
+            "created_at": meta.get("created_at"),
+        }
+
+    def modify_job(self, tag: str, updates: dict) -> dict:
+        """Partial-patch an existing job under the running lock.
+
+        Only the following updatable fields are merged when provided:
+        ``task``, ``cron``, ``schedule_type`` + ``run_at``, ``notify``,
+        ``model``, ``preserve_context``, ``context_max_messages``, and
+        ``overlap_policy``. ``created_at``, ``last_run``, ``last_error``,
+        ``source``, and run history are never modified. Schedule changes are
+        re-validated through ``_resolve_schedule`` and re-registered. The
+        ``tag`` is immutable and ``enabled`` is rejected (use ``pause_job`` /
+        ``resume_job`` instead).
+
+        Returns a result dict matching the convention used by ``add_job``.
+        """
+        canonical = self._resolve_tag(tag) or tag
+        with self._running_lock:
+            if canonical not in self._jobs_meta:
+                known = ", ".join(self._jobs_meta.keys()) or "none"
+                return {"success": False, "error": f"Job '{tag}' not found. Known jobs: {known}"}
+
+            if "enabled" in updates:
+                return {
+                    "success": False,
+                    "error": (
+                        "schedule modify: 'enabled' is controlled by the pause and resume "
+                        "actions, not modify. Use pause_job or resume_job instead."
+                    ),
+                }
+
+            updatable_fields = {
+                "task",
+                "cron",
+                "schedule_type",
+                "run_at",
+                "notify",
+                "model",
+                "preserve_context",
+                "context_max_messages",
+                "overlap_policy",
+            }
+            provided = {k for k in updates if k in updatable_fields and updates[k] is not None}
+            if not provided:
+                return {
+                    "success": False,
+                    "error": (
+                        "schedule modify: no updatable fields provided. "
+                        "Updatable fields: task, cron, schedule_type, run_at, notify, "
+                        "model, preserve_context, context_max_messages, overlap_policy."
+                    ),
+                }
+
+            meta = self._jobs_meta[canonical]
+            schedule_fields = {"cron", "schedule_type", "run_at"}
+            schedule_changed = bool(provided & schedule_fields)
+
+            # Build merged schedule values for validation when schedule fields
+            # are touched. Otherwise keep current values.
+            merged_schedule_type = updates.get("schedule_type", meta.get("schedule_type", "cron"))
+            merged_cron = updates.get("cron", meta.get("cron"))
+            merged_run_at = updates.get("run_at", meta.get("run_at"))
+
+            if schedule_changed:
+                try:
+                    expr, schedule_type, effective_run_at = self._resolve_schedule(
+                        schedule_type=merged_schedule_type,
+                        cron=merged_cron,
+                        time_str=None,
+                        hours=None,
+                        minutes=None,
+                        run_at=merged_run_at,
+                    )
+                except ValueError as exc:
+                    return {"success": False, "error": str(exc)}
+                if "schedule_type" in updates and updates["schedule_type"] != schedule_type:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"schedule modify: cannot set schedule_type to "
+                            f"'{updates['schedule_type']}' while the job keeps its "
+                            f"'{merged_cron}' cron expression. Converting a cron job "
+                            f"to a once job requires remove + add."
+                        ),
+                    }
+                # Commit the validated canonical schedule triple so stored meta
+                # and the re-registration stay consistent even when the caller
+                # provided only part of the triple (e.g. a new cron on a once
+                # job flips the type to 'cron' and clears run_at).
+                updates = dict(updates)
+                updates["cron"] = expr
+                updates["schedule_type"] = schedule_type
+                updates["run_at"] = effective_run_at if schedule_type == "once" else None
+                provided |= {"cron", "schedule_type", "run_at"}
+
+            for field in provided:
+                value = updates[field]
+                if field == "context_max_messages":
+                    try:
+                        value = int(value)
+                    except (ValueError, TypeError):
+                        value = 50
+                elif field == "overlap_policy":
+                    value = str(value) if value else "skip"
+                elif field == "preserve_context":
+                    value = bool(value)
+                meta[field] = value
+
+            # Enforce the invariant that context_max_messages is only stored
+            # when preserve_context is truthy (mirrors _build_job_meta).
+            if not meta.get("preserve_context"):
+                meta.pop("context_max_messages", None)
+
+            # Re-register only when schedule fields changed AND the job is
+            # enabled. pause_job clears the schedule-library registration; a
+            # schedule patch on a paused job must not silently re-add it with a
+            # fresh _next_run. resume_job remains the path back into the
+            # registered state and re-registers with the already-patched meta.
+            if schedule_changed and meta.get("enabled", True):
+                self._register_job(canonical, meta)
+
+        self._save_state()
+        self._save_scheduler_toml()
+        logger.info("Job modified: %s", canonical)
         return {"success": True}
 
     def list_jobs(self) -> list:
@@ -683,13 +849,17 @@ class Scheduler:
         self._save_state()
         self._save_scheduler_toml()
 
-    def _run_job(self, tag: str) -> None:
+    def _run_job(self, tag: str, manual: bool = False) -> None:
         """Dispatch a scheduled job execution.
 
         Thin dispatcher: overlap check → route to the appropriate strategy.
+        When ``manual`` is True the enabled check is skipped so run_now can
+        fire paused jobs; scheduled firings continue to respect enabled.
         """
         meta = self._jobs_meta.get(tag)
-        if not meta or not meta.get("enabled", True):
+        if not meta:
+            return
+        if not manual and not meta.get("enabled", True):
             return
 
         # Overlap detection

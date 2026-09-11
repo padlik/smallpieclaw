@@ -146,6 +146,18 @@ class TestFmtToolBriefSchedule:
         brief = fmt_tool_brief("schedule", {"action": "run_now", "tag": "x"})
         assert brief == 'schedule run_now "x"'
 
+    def test_modify(self) -> None:
+        brief = fmt_tool_brief(
+            "schedule",
+            {"action": "modify", "tag": "daily-report", "task": "updated report task"},
+        )
+        assert brief == 'schedule modify "daily-report"'
+        assert "updated report task" not in brief
+
+    def test_show(self) -> None:
+        brief = fmt_tool_brief("schedule", {"action": "show", "tag": "daily-report"})
+        assert brief == 'schedule show "daily-report"'
+
 
 class TestFmtToolBriefAgentIds:
     def test_get_agent_result(self) -> None:

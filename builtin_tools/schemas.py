@@ -324,8 +324,8 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Operation: list, add, remove, pause, resume, or run_now.",
-                    "enum": ["list", "add", "remove", "pause", "resume", "run_now"],
+                    "description": "Operation: list, show, add, remove, pause, resume, modify, or run_now.",
+                    "enum": ["list", "show", "add", "remove", "pause", "resume", "modify", "run_now"],
                 },
                 "tag": {
                     "type": "string",
@@ -359,6 +359,15 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "preserve_context": {
                     "type": "boolean",
                     "description": "Keep conversation history between runs (default: false).",
+                },
+                "context_max_messages": {
+                    "type": "integer",
+                    "description": "Maximum messages to retain when preserve_context is true (default: 50).",
+                },
+                "overlap_policy": {
+                    "type": "string",
+                    "description": "Behavior when a run is already in progress: 'skip' (default) or 'parallel'.",
+                    "enum": ["skip", "parallel"],
                 },
             },
             "required": ["action"],
