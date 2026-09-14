@@ -886,7 +886,14 @@ class MCPManager:
         )
         tools = wrapper.connect()
         with self._lock:
+            old = self._wrappers.get(name)
+            if old is not None:
+                old.close()
             self._wrappers[name] = wrapper
+            for tool_name in [
+                k for k, v in self._tool_to_server.items() if v == name
+            ]:
+                del self._tool_to_server[tool_name]
             for tool in tools:
                 if tool.name in self._tool_to_server:
                     logger.warning(
@@ -1804,14 +1811,21 @@ class MCPManager:
         """Register a wrapper's tools in the manager registry.
 
         Replaces any existing wrapper for ``name`` and maps each tool name to
-        the server, warning on conflicts. Existing wrapper is closed before
-        replacement.
+        the server, warning on conflicts. The server's previous tool-map
+        entries are purged before the new tools are inserted (mirroring
+        ``revoke_server``'s cleanup), so re-registration is atomic: tools
+        claimed by the same server on both sides never warn. Existing
+        wrapper is closed before replacement.
         """
         with self._lock:
             old = self._wrappers.get(name)
             if old is not None:
                 old.close()
             self._wrappers[name] = wrapper
+            for tool_name in [
+                k for k, v in self._tool_to_server.items() if v == name
+            ]:
+                del self._tool_to_server[tool_name]
             for tool in wrapper.tools:
                 if tool.name in self._tool_to_server:
                     logger.warning(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1195,6 +1196,139 @@ class TestMCPManager:
 
         assert result is True
         assert connect_calls == []
+
+
+# ---------------------------------------------------------------------------
+# TestAtomicRegistration — re-registration replaces state without leftovers
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicRegistration:
+    """Re-registration must atomically replace the previous registration.
+
+    Covers the production re-auth defect: every ``/mcp auth`` re-registered
+    a server whose tool names were already in ``_tool_to_server``, producing
+    ~14 duplicate "tool name conflict" warnings per flow, and re-connecting
+    an already-registered server leaked the replaced wrapper's session task.
+    """
+
+    def test_register_wrapper_same_server_reregistration_no_conflicts(self, caplog):
+        """Re-registering a server's own tools must not warn or duplicate."""
+        mgr = MCPManager([{"name": "srv", "transport": "stdio", "command": ["x"]}])
+        # Simulate the 14-tool google-workspace re-auth: the server's tools
+        # are already mapped from a previous registration.
+        tool_names = [f"tool_{i:02d}" for i in range(14)]
+        for tool_name in tool_names:
+            mgr._tool_to_server[tool_name] = "srv"
+
+        new_wrapper = MagicMock()
+        new_wrapper.tools = _sdk_tools_to_registry("srv", [_sdk_tool(n) for n in tool_names])
+
+        with caplog.at_level(logging.WARNING, logger="mcp_client"):
+            mgr._register_wrapper("srv", new_wrapper)
+
+        conflict_warnings = [
+            r for r in caplog.records if "tool name conflict" in r.message
+        ]
+        assert conflict_warnings == []
+        assert set(mgr._tool_to_server) == set(tool_names)
+        assert all(v == "srv" for v in mgr._tool_to_server.values())
+        assert mgr._wrappers["srv"] is new_wrapper
+
+    def test_register_wrapper_closes_replaced_wrapper(self):
+        """The previous wrapper for the name must be closed on replacement."""
+        mgr = MCPManager([{"name": "srv", "transport": "stdio", "command": ["x"]}])
+        old_wrapper = MagicMock()
+        mgr._wrappers["srv"] = old_wrapper
+
+        new_wrapper = MagicMock()
+        new_wrapper.tools = []
+        mgr._register_wrapper("srv", new_wrapper)
+
+        old_wrapper.close.assert_called_once()
+        assert mgr._wrappers["srv"] is new_wrapper
+
+    def test_register_wrapper_different_server_conflict_still_warns(self, caplog):
+        """A tool name claimed by a different server must still warn."""
+        mgr = MCPManager(
+            [
+                {"name": "a", "transport": "stdio", "command": ["x"]},
+                {"name": "b", "transport": "stdio", "command": ["y"]},
+            ]
+        )
+        mgr._tool_to_server["shared_tool"] = "a"
+
+        new_wrapper = MagicMock()
+        new_wrapper.tools = _sdk_tools_to_registry("b", [_sdk_tool("shared_tool")])
+
+        with caplog.at_level(logging.WARNING, logger="mcp_client"):
+            mgr._register_wrapper("b", new_wrapper)
+
+        conflict_warnings = [
+            r for r in caplog.records if "tool name conflict" in r.message
+        ]
+        assert len(conflict_warnings) == 1
+        assert "shared_tool" in conflict_warnings[0].getMessage()
+        # First server keeps the claim.
+        assert mgr._tool_to_server["shared_tool"] == "a"
+
+    def test_connect_server_same_server_reregistration_no_conflicts(self, caplog):
+        """Reconnecting an already-mapped server must not warn or duplicate."""
+        cfg = {"name": "srv", "transport": "stdio", "command": ["echo", "hi"]}
+        mgr = MCPManager([cfg])
+        mgr._start_loop()
+        try:
+            # The server's tools are already mapped from a previous
+            # registration (e.g. needs_auth session death left them behind).
+            tool_names = [f"tool_{i:02d}" for i in range(14)]
+            for tool_name in tool_names:
+                mgr._tool_to_server[tool_name] = "srv"
+            stale_wrapper = MagicMock()
+            mgr._wrappers["srv"] = stale_wrapper
+
+            session = _make_mock_session(
+                tools=[_sdk_tool(n) for n in tool_names]
+            )
+            stdio_cm, session_cm = _make_stdio_patches(session)
+
+            with caplog.at_level(logging.WARNING, logger="mcp_client"):
+                with patch("mcp_client.stdio_client", return_value=stdio_cm):
+                    with patch("mcp_client.ClientSession", return_value=session_cm):
+                        mgr._connect_server("srv", cfg)
+
+            conflict_warnings = [
+                r for r in caplog.records if "tool name conflict" in r.message
+            ]
+            assert conflict_warnings == []
+            assert set(mgr._tool_to_server) == set(tool_names)
+            assert all(v == "srv" for v in mgr._tool_to_server.values())
+            assert mgr._wrappers["srv"] is not stale_wrapper
+        finally:
+            mgr.close_all()
+
+    def test_connect_server_closes_replaced_wrapper(self):
+        """_connect_server must close the wrapper it replaces (no task leak)."""
+        cfg = {"name": "srv", "transport": "stdio", "command": ["echo", "hi"]}
+        mgr = MCPManager([cfg])
+        mgr._start_loop()
+        try:
+            old_wrapper = MagicMock()
+            mgr._wrappers["srv"] = old_wrapper
+
+            sdk_tool = _sdk_tool("tool1", "Tool 1")
+            session = _make_mock_session(tools=[sdk_tool])
+            stdio_cm, session_cm = _make_stdio_patches(session)
+
+            with patch("mcp_client.stdio_client", return_value=stdio_cm):
+                with patch("mcp_client.ClientSession", return_value=session_cm):
+                    mgr._connect_server("srv", cfg)
+
+            old_wrapper.close.assert_called_once()
+            assert mgr._wrappers["srv"] is not old_wrapper
+            assert mgr._wrappers["srv"].connected is True
+            assert mgr._tool_to_server["tool1"] == "srv"
+        finally:
+            mgr.close_all()
 
 
 # ---------------------------------------------------------------------------
