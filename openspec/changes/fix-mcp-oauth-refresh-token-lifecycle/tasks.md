@@ -25,9 +25,9 @@
 
 ## 5. Atomic re-registration (design D5)
 
-- [ ] 5.1 Add failing tests in `tests/test_mcp_client.py`: `_register_wrapper` with pre-existing same-server map entries produces NO conflict warnings and no duplicate entries (simulate the 14-tool re-auth); `_connect_server` closes the replaced wrapper; a tool name claimed by a DIFFERENT server still logs a conflict warning
-- [ ] 5.2 Implement: purge the server's `_tool_to_server` entries under the lock before inserting new tools in `_register_wrapper` (`mcp_client.py:1810-1824`, mirror `revoke_server`'s cleanup at `:822-823`); close the replaced wrapper in `_connect_server` (`mcp_client.py:888-899`) as `_register_wrapper` already does
-- [ ] 5.3 Run `pytest tests/test_mcp_client.py -v`
+- [x] 5.1 Add failing tests in `tests/test_mcp_client.py`: `_register_wrapper` with pre-existing same-server map entries produces NO conflict warnings and no duplicate entries (simulate the 14-tool re-auth); `_connect_server` closes the replaced wrapper; a tool name claimed by a DIFFERENT server still logs a conflict warning
+- [x] 5.2 Implement: purge the server's `_tool_to_server` entries under the lock before inserting new tools in `_register_wrapper` (`mcp_client.py:1810-1824`, mirror `revoke_server`'s cleanup at `:822-823`); close the replaced wrapper in `_connect_server` (`mcp_client.py:888-899`) as `_register_wrapper` already does
+- [x] 5.3 Run `pytest tests/test_mcp_client.py -v`
 
 ## 6. End-to-end verification
 
