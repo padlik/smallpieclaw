@@ -7,7 +7,10 @@ import json
 import logging
 import ssl
 import threading
+import time
 from pathlib import Path
+
+import httpx
 import pytest
 
 from mcp.client.auth import OAuthClientProvider
@@ -197,6 +200,87 @@ class TestFileTokenStorage:
         loaded = asyncio.run(storage.get_tokens())
         assert loaded is not None
         assert loaded.access_token == "second"
+
+    def test_refresh_grant_preserves_stored_refresh_token(self, tmp_path: Path):
+        """A refresh-grant response (no refresh_token) must not wipe the stored one.
+
+        Google-style refresh grants omit ``refresh_token`` from the response
+        body. Asserting on the raw JSON (not ``get_tokens()``) pins the exact
+        disk contract: the token object keeps ``refresh_token`` while
+        ``access_token``/``expires_in``/``scope``/``issued_at`` all take the new
+        grant's values.
+        """
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        asyncio.run(
+            storage.set_tokens(
+                OAuthToken(
+                    access_token="A1",
+                    refresh_token="R1",
+                    scope="scope-old",
+                    expires_in=3600,
+                )
+            )
+        )
+        first_issued_at = json.loads(
+            (tmp_path / "srv.json").read_text(encoding="utf-8")
+        )["token"]["issued_at"]
+
+        time.sleep(0.01)  # guarantee issued_at moves forward between writes
+        asyncio.run(
+            storage.set_tokens(
+                OAuthToken(
+                    access_token="A2",
+                    token_type="Bearer",
+                    # refresh_token deliberately omitted — refresh-grant shape
+                    scope="scope-new",
+                    expires_in=1800,
+                )
+            )
+        )
+
+        token = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))["token"]
+        assert token["refresh_token"] == "R1", (
+            "refresh-grant persistence must retain the stored refresh_token"
+        )
+        assert token["access_token"] == "A2"
+        assert token["scope"] == "scope-new"
+        assert token["expires_in"] == 1800
+        assert token["issued_at"] > first_issued_at
+
+    def test_incoming_refresh_token_overwrites_stored_one(self, tmp_path: Path):
+        """Real rotation / full re-auth replaces the stored refresh_token."""
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        asyncio.run(
+            storage.set_tokens(OAuthToken(access_token="A1", refresh_token="R1"))
+        )
+        asyncio.run(
+            storage.set_tokens(OAuthToken(access_token="A2", refresh_token="R2"))
+        )
+        token = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))["token"]
+        assert token["refresh_token"] == "R2"
+
+    def test_no_stored_refresh_token_and_none_granted_stays_absent(self, tmp_path: Path):
+        """Merge-preserve never invents a refresh_token that was never stored."""
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        asyncio.run(storage.set_tokens(OAuthToken(access_token="A1")))
+        asyncio.run(storage.set_tokens(OAuthToken(access_token="A2")))
+        token = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))["token"]
+        assert "refresh_token" not in token
 
     def test_token_storage_preserves_client_info(self, tmp_path: Path):
         """A persisted client_info block survives a later token write and is reused.
@@ -728,6 +812,210 @@ class TestOAuthProviderFactory:
 
         assert "on_non_interactive callback raised" in caplog.text
         assert cb_server._server is None
+
+
+# ---------------------------------------------------------------------------
+# RefreshPreservingOAuthProvider (refresh-token lifecycle contract)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshPreservingOAuthProvider:
+    """Contract tests for the SDK refresh-response hook.
+
+    The SDK (mcp 1.29.1, ``oauth2.py:_handle_refresh_response``) replaces
+    ``context.current_tokens`` wholesale after a successful refresh grant, so a
+    refresh response that omits ``refresh_token`` (as Google's do) makes
+    ``can_refresh_token()`` false after the first refresh. These tests drive
+    the provider's ``_handle_refresh_response`` directly with constructed
+    ``httpx.Response`` objects — no network — on a provider built via the
+    factory with a real ``FileTokenStorage`` rooted at ``tmp_path``.
+    """
+
+    def _build_provider(
+        self, tmp_path: Path, server_name: str = "srv"
+    ) -> OAuthClientProvider:
+        """Build a provider the same way TestOAuthProviderFactory.build does.
+
+        ``build`` is synchronous, so no loop is needed here; tests that drive
+        async hooks create and close their own loop in a ``finally``.
+        """
+        cert_path, key_path = _make_self_signed_cert(tmp_path)
+        server_cfg = {
+            "name": server_name,
+            "url": "https://mcp.example.com/sse",
+            "oauth": {
+                "client_id": "cid",
+                "client_secret": "csec",
+                "redirect_uri": "https://localhost/callback",
+                "scope": "read",
+                "cert_path": cert_path,
+                "key_path": key_path,
+                "callback_port": 8123,
+                "callback_bind": "127.0.0.1",
+            },
+        }
+        cb_server = CallbackServer(
+            port=server_cfg["oauth"]["callback_port"],
+            bind=server_cfg["oauth"]["callback_bind"],
+            cert_path=cert_path,
+            key_path=key_path,
+            loop=asyncio.new_event_loop(),
+        )
+        mcp_tokens_dir = tmp_path / "tokens"
+        # Production creates the tokens dir at startup (_create_xdg_dirs in
+        # main.py) before any provider exists; mirror that so seeded writes land.
+        mcp_tokens_dir.mkdir(parents=True, exist_ok=True)
+
+        return OAuthProviderFactory.build(server_cfg, mcp_tokens_dir, cb_server)
+
+    def _seed_tokens(self, provider: OAuthClientProvider, tmp_path: Path) -> None:
+        """Load context.client_info and an RT-bearing token via the public API.
+
+        ``async_auth_flow`` would do this on first use; driving the hook
+        directly needs it seeded up front. Seeding through ``_initialize``
+        exercises the real storage round trip.
+        """
+        storage = provider.context.storage
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                storage.set_tokens(
+                    OAuthToken(
+                        access_token="A1",
+                        refresh_token="R1",
+                        scope="read",
+                        expires_in=3600,
+                    )
+                )
+            )
+            loop.run_until_complete(provider._initialize())
+        finally:
+            loop.close()
+
+    def test_successful_refresh_reattaches_refresh_token(self, tmp_path: Path):
+        """A 200 RT-less refresh response must leave the RT re-attached in memory.
+
+        ``can_refresh_token()`` must stay true after the refresh so the *next*
+        expiry refreshes silently instead of falling back to a full
+        authorization flow (defect B).
+        """
+        provider = self._build_provider(tmp_path)
+        self._seed_tokens(provider, tmp_path)
+        assert provider.context.current_tokens is not None
+        captured_rt = provider.context.current_tokens.refresh_token
+        assert captured_rt == "R1", "fixture: seed must carry a refresh token"
+        assert provider.context.can_refresh_token() is True
+
+        response = httpx.Response(
+            200,
+            json={
+                "access_token": "A2",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "read",
+            },
+        )
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                provider._handle_refresh_response(response)
+            )
+        finally:
+            loop.close()
+
+        assert result is True, "successful refresh must return True unchanged"
+        current = provider.context.current_tokens
+        assert current is not None
+        assert current.refresh_token == "R1", (
+            "in-memory refresh_token must survive an RT-less refresh grant"
+        )
+        assert current.access_token == "A2", "new access token must take effect"
+        assert provider.context.can_refresh_token() is True, (
+            "provider must stay refreshable after an RT-less refresh grant"
+        )
+
+    def test_failed_refresh_keeps_cleared_state(self, tmp_path: Path):
+        """A non-200 refresh response clears tokens and the override must not re-attach.
+
+        A revoked RT failing the grant is the *correct* moment to clear; the
+        failure path is a strict no-op for the re-attachment logic (otherwise
+        a revoked RT would be resurrected and re-arm a doomed refresh loop).
+        """
+        provider = self._build_provider(tmp_path)
+        self._seed_tokens(provider, tmp_path)
+
+        response = httpx.Response(400, json={"error": "invalid_grant"})
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                provider._handle_refresh_response(response)
+            )
+        finally:
+            loop.close()
+
+        assert result is False, "failed refresh must return False unchanged"
+        assert provider.context.current_tokens is None, (
+            "cleared state must be preserved — no resurrection of a dead RT"
+        )
+        assert provider.context.can_refresh_token() is False
+
+    def test_successive_refreshes_keep_rt_on_disk_and_in_memory(self, tmp_path: Path):
+        """Two consecutive RT-less refresh cycles never lose the refresh token.
+
+        Mirrors the delta scenario's 6h-cadence case: expiry → silent refresh →
+        expiry → silent refresh. The RT must survive on disk (via the storage
+        merge) and in memory (via the re-attachment) after BOTH cycles.
+        """
+        provider = self._build_provider(tmp_path)
+        self._seed_tokens(provider, tmp_path)
+        token_file = tmp_path / "tokens" / "srv.json"
+
+        def _read_file_rt() -> str | None:
+            payload = json.loads(token_file.read_text(encoding="utf-8"))
+            return payload["token"].get("refresh_token")
+
+        assert _read_file_rt() == "R1", "fixture: seeded RT must be on disk"
+
+        for expected_access in ("A2", "A3"):
+            response = httpx.Response(
+                200,
+                json={
+                    "access_token": expected_access,
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "read",
+                },
+            )
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(
+                    provider._handle_refresh_response(response)
+                )
+            finally:
+                loop.close()
+
+            assert result is True
+            current = provider.context.current_tokens
+            assert current is not None
+            assert current.refresh_token == "R1", (
+                f"in-memory RT lost after refresh to {expected_access}"
+            )
+            assert current.access_token == expected_access
+            assert _read_file_rt() == "R1", (
+                f"disk RT lost after refresh to {expected_access}"
+            )
+            assert provider.context.can_refresh_token() is True
+
+    def test_factory_builds_refresh_preserving_subclass(self, tmp_path: Path):
+        """Both interactive and non-interactive sites get the preserving subclass."""
+        from mcp_oauth import RefreshPreservingOAuthProvider
+
+        provider = self._build_provider(tmp_path)
+        assert isinstance(provider, RefreshPreservingOAuthProvider), (
+            "OAuthProviderFactory.build must construct RefreshPreservingOAuthProvider"
+        )
 
 
 # ---------------------------------------------------------------------------
