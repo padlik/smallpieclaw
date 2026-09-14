@@ -516,6 +516,38 @@ class TestSdkClientWrapper:
         assert result["success"] is False
         assert "not connected" in result["error"]
 
+    def test_needs_auth_call_tool_fast_fails_before_connected_check(self):
+        """needs_auth=True returns auth error before the generic not-connected error."""
+        wrapper = self._make_wrapper()
+        wrapper.needs_auth = True
+        # connected is False — the generic not-connected check would fire if the
+        # needs_auth check were absent; we verify it fires first.
+        result = wrapper.call_tool("tool1", {})
+        assert result["success"] is False
+        assert "needs authorization" in result["error"]
+        assert "not connected" not in result["error"]
+        assert "/mcp auth test" in result["error"]
+
+    def test_background_tool_call_never_delivers_auth_buttons(self):
+        """Dead-RT E2E (D4): needs_auth wrapper fast-fails call_tool and never
+        invokes the Telegram send_oauth_prompt callback — background agents
+        cannot trigger interactive auth flows after token expiry."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_tg = MagicMock()
+        mock_tg.send_oauth_prompt = AsyncMock()
+
+        wrapper = self._make_wrapper()
+        wrapper._tg_iface = mock_tg
+        wrapper.needs_auth = True
+
+        result = wrapper.call_tool("any_tool", {})
+
+        assert result["success"] is False
+        assert "needs authorization" in result["error"]
+        # Telegram prompt must never be invoked regardless of tg_iface being set.
+        mock_tg.send_oauth_prompt.assert_not_called()
+
     def test_paginated_list_tools(self):
         """list_tools with nextCursor must collect all pages."""
         tool_a = _sdk_tool("tool_a")

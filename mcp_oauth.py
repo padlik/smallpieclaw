@@ -588,7 +588,7 @@ def make_redirect_handler(
                     logger.debug("MCP [%s] cb_server stop after non-interactive redirect", server_name)
                 raise RuntimeError(
                     f"MCP [{server_name}] non-interactive OAuth redirect — "
-                    f"needs manual authorization"
+                    f"token expired, needs manual authorization"
                 )
             # Backward-compatible path: log the manual-authorize fallback and
             # return without raising. The SDK will continue to wait for a

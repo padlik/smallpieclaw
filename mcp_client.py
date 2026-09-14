@@ -417,6 +417,11 @@ class _SdkClientWrapper:
 
     def call_tool(self, tool_name: str, args: dict) -> dict:
         """Enqueue a tool call request; block until result or timeout."""
+        if self.needs_auth:
+            return _tool_outcome(
+                error=f"MCP server '{self.name}' needs authorization. Run /mcp auth {self.name}.",
+                success=False,
+            )
         if not self.connected or self._queue is None:
             return _tool_outcome(
                 error=f"MCP server '{self.name}' not connected", success=False
