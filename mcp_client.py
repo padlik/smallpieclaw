@@ -1824,11 +1824,17 @@ class MCPManager:
                     self._tool_to_server[tool.name] = name
 
     async def _run_oauth_flow(self, name: str, cfg: dict, oauth_cfg: dict) -> dict:
-        """Run the interactive OAuth flow by connecting a real session with auth=provider.
+        """Run the interactive OAuth flow then hand off to a non-interactive session.
 
-        The SDK's ``async_auth_flow`` generator drives the full handshake
-        (discovery → redirect_handler → callback_handler → token exchange →
-        set_tokens → retry) as a side effect of the HTTP request hitting a 401.
+        Phase 1 (interactive): the SDK's ``async_auth_flow`` generator drives the
+        full handshake (discovery → redirect_handler → callback_handler → token
+        exchange → set_tokens → retry) through a chat-bound provider.
+
+        Phase 2 (non-interactive, D3): once the token is verified, the interactive
+        wrapper is closed and a fresh wrapper is brought up with a non-interactive
+        provider (no chat binding).  Only the fresh wrapper is registered.  The
+        ``finally`` block cancels any tasks that were NOT handed off, so the live
+        non-interactive session is never cancelled on success.
         """
         logger.info("MCP [%s] interactive OAuth flow starting", name)
         cb_server = mcp_oauth.CallbackServer(
@@ -1838,7 +1844,8 @@ class MCPManager:
             key_path=oauth_cfg["key_path"],
             loop=asyncio.get_running_loop(),
         )
-        session_task: asyncio.Task | None = None
+        session_task: asyncio.Task | None = None  # interactive flow task
+        fresh_task: asyncio.Task | None = None  # long-lived non-interactive task
         try:
             await cb_server.start()
 
@@ -1863,7 +1870,7 @@ class MCPManager:
                     "error": "Cancelled by operator",
                 }
 
-            # --- Session connection ---
+            # --- Interactive session connection ---
             # Create a wrapper that will connect with the OAuth provider.
             # The SDK's async_auth_flow fires when session.initialize() hits a 401,
             # driving the full handshake: redirect → callback → token exchange →
@@ -1905,14 +1912,48 @@ class MCPManager:
             if token_error is not None:
                 return token_error
 
-            wrapper.connected = True
-            # Hand off the session task to the wrapper so it owns its
-            # lifecycle (close_all, close, set_enabled).  Null out the
-            # local so the ``finally`` block does NOT cancel the live
-            # session runner — it must keep running to serve tool calls.
-            wrapper.set_task(session_task)
-            session_task = None
-            self._register_wrapper(name, wrapper)
+            # --- Transition to non-interactive long-lived session (D3) ---
+            # Close the interactive wrapper; session_task stays non-None so the
+            # finally block will cancel+gather it as an abandoned task.
+            wrapper.close()
+
+            fresh = _SdkClientWrapper(cfg, self._loop)
+            fresh.configure(
+                mcp_tokens_dir=self._mcp_tokens_dir,
+                tg_iface=self._tg_iface,
+            )
+            # Do NOT call set_oauth — the non-interactive path in _session_runner
+            # calls _prepare_oauth_provider, which builds the non-interactive
+            # provider (chat_id=None, on_non_interactive callback) itself.
+
+            fresh_task = fresh.create_session_runner()
+            cancelled, ready_error = await self._await_session_ready(fresh)
+            if cancelled:
+                return {"success": False, "error": "Cancelled by operator"}
+            if ready_error is not None:
+                logger.warning(
+                    "MCP [%s] non-interactive session failed: %s",
+                    name,
+                    ready_error,
+                    exc_info=True,
+                )
+                return {"success": False, "error": ready_error}
+
+            if fresh.needs_auth:
+                logger.warning(
+                    "MCP [%s] fresh session needs auth after token was just verified",
+                    name,
+                )
+                return {
+                    "success": False,
+                    "error": "Server needs auth on non-interactive bring-up",
+                }
+
+            fresh.connected = True
+            fresh.set_task(fresh_task)
+            # Hand off: null out so the finally block does NOT cancel the live runner.
+            fresh_task = None
+            self._register_wrapper(name, fresh)
             return {"success": True}
         except Exception as exc:
             logger.warning(
@@ -1924,11 +1965,18 @@ class MCPManager:
             return {"success": False, "error": str(exc)}
         finally:
             self._oauth_cancel_requested = False
-            # Always cancel and await the session runner so its context
-            # managers (transport, ClientSession) finalize cleanly.
-            if session_task is not None and not session_task.done():
-                session_task.cancel()
-                await asyncio.gather(session_task, return_exceptions=True)
+            # Cancel and gather any tasks not handed off.  session_task is the
+            # interactive flow task (always cleaned up); fresh_task is non-None
+            # only on error paths where the non-interactive session started but
+            # was not registered.
+            tasks_to_await = []
+            for task in (session_task, fresh_task):
+                if task is not None:
+                    tasks_to_await.append(task)
+                    if not task.done():
+                        task.cancel()
+            if tasks_to_await:
+                await asyncio.gather(*tasks_to_await, return_exceptions=True)
             try:
                 await cb_server.stop()
             except Exception as exc:
