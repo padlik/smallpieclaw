@@ -135,9 +135,22 @@ class FileTokenStorage:
         return token
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        """Persist ``tokens`` to disk, preserving any existing ``client_info``."""
+        """Persist ``tokens`` to disk, preserving any existing ``client_info``.
+
+        When the incoming token omits ``refresh_token`` (the refresh-grant
+        response shape — e.g. Google omits it), the previously stored
+        ``refresh_token`` is carried into the new payload (merge-preserve), so
+        a silent refresh never wipes the stored refresh token. An incoming
+        ``refresh_token`` always overwrites the stored one, so full
+        re-authorization and real token rotation still replace the value.
+        """
         existing = self._read_file() or {}
         token_dict = tokens.model_dump(mode="json", exclude_none=True)
+        if token_dict.get("refresh_token") is None:
+            existing_token = existing.get("token") or {}
+            stored_refresh = existing_token.get("refresh_token")
+            if stored_refresh:
+                token_dict["refresh_token"] = stored_refresh
         token_dict["issued_at"] = time.time()
         payload: dict[str, Any] = {
             "token": token_dict,
@@ -145,7 +158,7 @@ class FileTokenStorage:
         if "client_info" in existing:
             payload["client_info"] = existing["client_info"]
         self._atomic_write(payload)
-        has_refresh = tokens.refresh_token is not None
+        has_refresh = token_dict.get("refresh_token") is not None
         scope = tokens.scope or "unknown"
         logger.info(
             "MCP [%s] tokens written to disk (scope=%s, has_refresh=%s)",

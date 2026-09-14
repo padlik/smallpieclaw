@@ -7,7 +7,9 @@ import json
 import logging
 import ssl
 import threading
+import time
 from pathlib import Path
+
 import pytest
 
 from mcp.client.auth import OAuthClientProvider
@@ -197,6 +199,87 @@ class TestFileTokenStorage:
         loaded = asyncio.run(storage.get_tokens())
         assert loaded is not None
         assert loaded.access_token == "second"
+
+    def test_refresh_grant_preserves_stored_refresh_token(self, tmp_path: Path):
+        """A refresh-grant response (no refresh_token) must not wipe the stored one.
+
+        Google-style refresh grants omit ``refresh_token`` from the response
+        body. Asserting on the raw JSON (not ``get_tokens()``) pins the exact
+        disk contract: the token object keeps ``refresh_token`` while
+        ``access_token``/``expires_in``/``scope``/``issued_at`` all take the new
+        grant's values.
+        """
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        asyncio.run(
+            storage.set_tokens(
+                OAuthToken(
+                    access_token="A1",
+                    refresh_token="R1",
+                    scope="scope-old",
+                    expires_in=3600,
+                )
+            )
+        )
+        first_issued_at = json.loads(
+            (tmp_path / "srv.json").read_text(encoding="utf-8")
+        )["token"]["issued_at"]
+
+        time.sleep(0.01)  # guarantee issued_at moves forward between writes
+        asyncio.run(
+            storage.set_tokens(
+                OAuthToken(
+                    access_token="A2",
+                    token_type="Bearer",
+                    # refresh_token deliberately omitted — refresh-grant shape
+                    scope="scope-new",
+                    expires_in=1800,
+                )
+            )
+        )
+
+        token = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))["token"]
+        assert token["refresh_token"] == "R1", (
+            "refresh-grant persistence must retain the stored refresh_token"
+        )
+        assert token["access_token"] == "A2"
+        assert token["scope"] == "scope-new"
+        assert token["expires_in"] == 1800
+        assert token["issued_at"] > first_issued_at
+
+    def test_incoming_refresh_token_overwrites_stored_one(self, tmp_path: Path):
+        """Real rotation / full re-auth replaces the stored refresh_token."""
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        asyncio.run(
+            storage.set_tokens(OAuthToken(access_token="A1", refresh_token="R1"))
+        )
+        asyncio.run(
+            storage.set_tokens(OAuthToken(access_token="A2", refresh_token="R2"))
+        )
+        token = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))["token"]
+        assert token["refresh_token"] == "R2"
+
+    def test_no_stored_refresh_token_and_none_granted_stays_absent(self, tmp_path: Path):
+        """Merge-preserve never invents a refresh_token that was never stored."""
+        storage = FileTokenStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        asyncio.run(storage.set_tokens(OAuthToken(access_token="A1")))
+        asyncio.run(storage.set_tokens(OAuthToken(access_token="A2")))
+        token = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))["token"]
+        assert "refresh_token" not in token
 
     def test_token_storage_preserves_client_info(self, tmp_path: Path):
         """A persisted client_info block survives a later token write and is reused.
