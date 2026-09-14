@@ -367,6 +367,30 @@ class TestMcpToolSpan:
         # Exactly one terminal event — no duplicate ERROR + TOOL_FAILED pair.
         assert events == [LogEvent.TOOL_START, LogEvent.TOOL_FAILED]
 
+    def test_needs_authorization_phrase_triggers_auth_failure(self):
+        """'needs authorization' phrase (D4 call_tool fast-fail) triggers auth failure for OAuth server."""
+        from agent_logging import LogEvent
+
+        ctx = self._make_ctx(
+            {"success": False, "output": "", "error": "MCP server 'srv' needs authorization. Run /mcp auth srv."}
+        )
+        outcome, events = self._dispatch(ctx)
+
+        ctx.mcp_manager.mark_needs_auth.assert_called_once_with("srv")
+        assert "/mcp auth srv" in outcome["error"]
+        assert events == [LogEvent.TOOL_START, LogEvent.TOOL_FAILED]
+
+    def test_needs_authorization_non_oauth_server_not_detected(self):
+        """'needs authorization' phrase on a non-OAuth server is left alone."""
+        ctx = self._make_ctx(
+            {"success": False, "output": "", "error": "MCP server 'srv' needs authorization. Run /mcp auth srv."},
+            has_oauth=False,
+        )
+        outcome, _events = self._dispatch(ctx)
+
+        ctx.mcp_manager.mark_needs_auth.assert_not_called()
+        assert "needs authorization" in outcome["error"]
+
 
 class TestCancelEventOwnership:
     """Verify react_loop only clears cancel events it owns (fix: a shared

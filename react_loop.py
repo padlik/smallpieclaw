@@ -118,7 +118,7 @@ def _is_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -> bo
     if not ctx.mcp_manager.server_has_oauth(server_name):  # type: ignore[attr-defined]
         return False
     error = (outcome.get("error", "") or "").lower()
-    indicators = ("401", "unauthorized", "token expired", "refresh failed", "invalid token", "access denied")
+    indicators = ("401", "unauthorized", "token expired", "refresh failed", "invalid token", "access denied", "needs authorization")
     return any(ind in error for ind in indicators)
 
 
