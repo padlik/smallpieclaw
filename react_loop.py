@@ -106,6 +106,13 @@ def _is_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -> bo
 
     Only triggers for servers that have OAuth configured — a non-OAuth server
     returning '401' in its error text is a normal tool error, not an auth failure.
+
+    Per-layer indicator coverage: the ``"needs authorization"`` indicator catches
+    the wrapper-level ``call_tool`` fast-fail ("MCP server '<name>' needs
+    authorization. Run /mcp auth <name>."). The non-interactive redirect abort
+    text ("...token expired, needs manual authorization") is covered by the
+    pre-existing ``"token expired"`` indicator, because ``"needs authorization"``
+    is not a substring of that message. Keep these two paths distinct.
     """
     if not isinstance(outcome, dict) or outcome.get("success") is not False:
         return False

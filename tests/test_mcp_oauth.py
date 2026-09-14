@@ -1017,6 +1017,27 @@ class TestRefreshPreservingOAuthProvider:
             "OAuthProviderFactory.build must construct RefreshPreservingOAuthProvider"
         )
 
+    def test_sdk_still_invokes_handle_refresh_response(self) -> None:
+        """Drift guard for the private-API coupling in RefreshPreservingOAuthProvider.
+
+        ``RefreshPreservingOAuthProvider._handle_refresh_response`` overrides an
+        underscore-prefixed internal of the installed MCP SDK
+        (``mcp.client.auth.oauth2``). The override is only reached if the SDK's
+        refresh flow still awaits ``self._handle_refresh_response(...)``. A future
+        SDK bump could rename or remove that method, and the override would then
+        silently stop being invoked. This test pins that call site in the SDK
+        source so an upgrade past the verified version (mcp 1.29.1) fails loudly
+        and forces a re-verification of the refresh-token lifecycle wiring
+        (design.md D2 risk note).
+        """
+        import mcp.client.auth.oauth2 as oauth2_module
+
+        sdk_source = Path(oauth2_module.__file__).read_text(encoding="utf-8")
+        assert "await self._handle_refresh_response(" in sdk_source, (
+            "SDK refresh flow no longer calls _handle_refresh_response; "
+            "RefreshPreservingOAuthProvider override is likely orphaned"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Extra auth params
