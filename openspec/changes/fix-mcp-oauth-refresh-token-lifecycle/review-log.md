@@ -144,3 +144,55 @@ Reviewer: openspec-reviewer (ope-1, same session).
 ### 🔴 Outstanding
 - (none — planning artifact review chain complete: proposal, design, adr+specs,
   tasks all PASS)
+
+## verify — 2026-09-15
+
+Reviewer: oracle (ora-1) for the code-vs-artifact review; orchestrator re-ran
+the suites and provenance checks. Baselines: all frozen artifacts + implemented
+code on branch fix/mcp-oauth-refresh-token-lifecycle.
+
+### Verdict: PASS — ready for archive after reconciliation below
+
+### Verified
+- D1–D5 all implemented and matching design intent, incl. the two highest-risk
+  details: D2's success-only re-attach gate (failure path strict no-op; no
+  revoked-RT resurrection) and D3's two-session `finally` (live non-interactive
+  runner never cancelled — asserted at tests/test_mcp_client.py:1930).
+- Scenario→test mapping complete across both delta specs (storage merge 3-case
+  set, two-cycle disk+memory RT survival, non-interactive handoff, background
+  dead-RT e2e with send_oauth_prompt.assert_not_called(), needs_auth fast-fail
+  before connected check, 14-tool re-registration with zero conflict warnings,
+  cross-server conflict still warns).
+- ADR-0029/0030 exist, house-conformant, and match the design decisions they
+  claim to record.
+- Suites re-run independently: test_mcp_oauth.py 43 passed; test_mcp_client.py
+  87 passed; test_react_loop.py + test_mcp_oauth_probe.py 136 passed;
+  `make check` 2249 passed, 2 skipped. Skip provenance checked: both skips
+  pre-date this branch (test_consent_scope_wording.py:187 from commit a694fbc
+  on main; test_path_policy.py platform normcase). No new skips vs baseline —
+  task 6.1 claim holds.
+- `openspec validate fix-mcp-oauth-refresh-token-lifecycle --type change
+  --strict` passes — task 6.2 claim holds.
+
+### 🟡 Addressed (verify-stage reconciliation)
+- W1: proposal.md scope said "no `mcp` SDK modification or pinning" /
+  out-of-scope "SDK patching or version pinning", but commit b9b3a24 added
+  `mcp>=1.29.1,<2.0` (requirements.txt:3) + SDK drift-guard test. Defensible
+  (design.md risk note "SDK pin review at upgrade time"; no SDK source
+  modified) but the frozen artifact contradicted the delivery. → proposal.md
+  scope lines amended declaratively (accuracy fix recording what shipped, no
+  decision content changed) and this entry records the reconciliation.
+
+### Open suggestions (non-blocking, recorded for future work)
+- S1: task 3.2's literal wording ("build the provider up front", "construct a
+  fresh wrapper with the non-interactive provider") is stale vs the implemented
+  mechanism (no set_oauth on the fresh wrapper; its _session_runner builds the
+  provider via _prepare_oauth_provider during bring-up — cleaner, reuses the
+  verified startup path, satisfies design D3). Task text left as-is since work
+  is complete; note kept here to prevent confusion during archive review.
+- S2: `cb_server.stop()` in the restructured two-task `finally` has no
+  dedicated assertion (covered implicitly by the probe/cancel suite). Consider a
+  focused teardown assertion as follow-up test hardening.
+
+### 🔴 Outstanding
+- (none)

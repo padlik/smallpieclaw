@@ -1,3 +1,9 @@
+## Purpose
+
+Defines the transport-level lifecycle for configured MCP servers — startup connection, runtime enable/disable via `/mcp on` and `/mcp off`, and graceful shutdown — plus operator-facing status reporting (`/mcp list`, `/mcp info`) and the display contracts that map transport modes and connection states to status labels, including the `needs_auth` state for OAuth-protected servers.
+
+## Requirements
+
 ### Requirement: MCP server connection lifecycle
 
 The system SHALL connect to configured MCP servers on startup and maintain connections for the agent's lifetime. Each server's connection state SHALL be independently tracked and queryable. For OAuth-protected servers, the system SHALL skip connection on boot when no valid token is available and report `needs_auth` instead of `error`.

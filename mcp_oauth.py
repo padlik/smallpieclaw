@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import httpx
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 
@@ -135,9 +136,22 @@ class FileTokenStorage:
         return token
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        """Persist ``tokens`` to disk, preserving any existing ``client_info``."""
+        """Persist ``tokens`` to disk, preserving any existing ``client_info``.
+
+        When the incoming token omits ``refresh_token`` (the refresh-grant
+        response shape — e.g. Google omits it), the previously stored
+        ``refresh_token`` is carried into the new payload (merge-preserve), so
+        a silent refresh never wipes the stored refresh token. An incoming
+        ``refresh_token`` always overwrites the stored one, so full
+        re-authorization and real token rotation still replace the value.
+        """
         existing = self._read_file() or {}
         token_dict = tokens.model_dump(mode="json", exclude_none=True)
+        if token_dict.get("refresh_token") is None:
+            existing_token = existing.get("token") or {}
+            stored_refresh = existing_token.get("refresh_token")
+            if stored_refresh:
+                token_dict["refresh_token"] = stored_refresh
         token_dict["issued_at"] = time.time()
         payload: dict[str, Any] = {
             "token": token_dict,
@@ -145,7 +159,7 @@ class FileTokenStorage:
         if "client_info" in existing:
             payload["client_info"] = existing["client_info"]
         self._atomic_write(payload)
-        has_refresh = tokens.refresh_token is not None
+        has_refresh = token_dict.get("refresh_token") is not None
         scope = tokens.scope or "unknown"
         logger.info(
             "MCP [%s] tokens written to disk (scope=%s, has_refresh=%s)",
@@ -232,6 +246,64 @@ class FileTokenStorage:
         existing = self._read_file() or {}
         existing["client_info"] = client_info.model_dump(mode="json", exclude_none=True)
         self._atomic_write(existing)
+
+
+class RefreshPreservingOAuthProvider(OAuthClientProvider):
+    """``OAuthClientProvider`` that keeps the refresh token across refresh grants.
+
+    The MCP SDK replaces ``context.current_tokens`` wholesale after a
+    successful refresh grant. Refresh-grant responses commonly omit
+    ``refresh_token`` (Google does), so after the first silent refresh
+    ``can_refresh_token()`` turns false and the *next* expiry falls back to a
+    full interactive authorization flow. This subclass re-attaches the
+    pre-refresh ``refresh_token`` in memory after a successful refresh whose
+    response omits one, so successive access-token expirations stay
+    refreshable while a valid refresh token exists.
+
+    On-disk persistence is handled separately by
+    :class:`FileTokenStorage`'s merge-preserve semantics: on the current
+    refresh cycle ``super()`` persists the RT-less token *before* this
+    override re-attaches in memory, so disk correctness this cycle comes from
+    the storage read-merge; the re-attached in-memory token only flows into a
+    later ``set_tokens`` write.
+    """
+
+    async def _handle_refresh_response(self, response: httpx.Response) -> bool:
+        """Handle a token refresh response, preserving the refresh token.
+
+        Mirrors the SDK contract exactly (non-200 → cleared tokens and
+        ``False``; 200 → new tokens stored and ``True``), with one addition:
+        when the refresh succeeded and the response omitted the refresh token,
+        the pre-refresh refresh token is re-attached to the in-memory token
+        set. The failure path is a strict no-op for the re-attachment — the
+        SDK clears tokens there, which is correct for a revoked refresh
+        token; re-attaching would resurrect it and re-arm a doomed refresh
+        loop.
+
+        Args:
+            response: The HTTP response from the token refresh request.
+
+        Returns:
+            The SDK's result unchanged: ``True`` on success, ``False`` on
+            failure.
+        """
+        current = self.context.current_tokens
+        captured_refresh_token = current.refresh_token if current else None
+
+        result = await super()._handle_refresh_response(response)
+
+        if (
+            result is True
+            and captured_refresh_token
+            and self.context.current_tokens is not None
+            and self.context.current_tokens.refresh_token is None
+        ):
+            self.context.current_tokens = (
+                self.context.current_tokens.model_copy(
+                    update={"refresh_token": captured_refresh_token}
+                )
+            )
+        return result
 
 
 class CallbackServer:
@@ -470,7 +542,7 @@ class OAuthProviderFactory:
         )
         callback_handler = make_callback_handler(cb_server, timeout=timeout)
 
-        return OAuthClientProvider(
+        return RefreshPreservingOAuthProvider(
             server_url=server_url,
             client_metadata=client_metadata,
             storage=storage,
@@ -588,7 +660,7 @@ def make_redirect_handler(
                     logger.debug("MCP [%s] cb_server stop after non-interactive redirect", server_name)
                 raise RuntimeError(
                     f"MCP [{server_name}] non-interactive OAuth redirect — "
-                    f"needs manual authorization"
+                    f"token expired, needs manual authorization"
                 )
             # Backward-compatible path: log the manual-authorize fallback and
             # return without raising. The SDK will continue to wait for a

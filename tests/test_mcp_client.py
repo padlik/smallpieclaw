@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -515,6 +516,38 @@ class TestSdkClientWrapper:
         result = wrapper.call_tool("tool1", {})
         assert result["success"] is False
         assert "not connected" in result["error"]
+
+    def test_needs_auth_call_tool_fast_fails_before_connected_check(self):
+        """needs_auth=True returns auth error before the generic not-connected error."""
+        wrapper = self._make_wrapper()
+        wrapper.needs_auth = True
+        # connected is False — the generic not-connected check would fire if the
+        # needs_auth check were absent; we verify it fires first.
+        result = wrapper.call_tool("tool1", {})
+        assert result["success"] is False
+        assert "needs authorization" in result["error"]
+        assert "not connected" not in result["error"]
+        assert "/mcp auth test" in result["error"]
+
+    def test_background_tool_call_never_delivers_auth_buttons(self):
+        """Dead-RT E2E (D4): needs_auth wrapper fast-fails call_tool and never
+        invokes the Telegram send_oauth_prompt callback — background agents
+        cannot trigger interactive auth flows after token expiry."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_tg = MagicMock()
+        mock_tg.send_oauth_prompt = AsyncMock()
+
+        wrapper = self._make_wrapper()
+        wrapper._tg_iface = mock_tg
+        wrapper.needs_auth = True
+
+        result = wrapper.call_tool("any_tool", {})
+
+        assert result["success"] is False
+        assert "needs authorization" in result["error"]
+        # Telegram prompt must never be invoked regardless of tg_iface being set.
+        mock_tg.send_oauth_prompt.assert_not_called()
 
     def test_paginated_list_tools(self):
         """list_tools with nextCursor must collect all pages."""
@@ -1198,6 +1231,139 @@ class TestMCPManager:
 
 
 # ---------------------------------------------------------------------------
+# TestAtomicRegistration — re-registration replaces state without leftovers
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicRegistration:
+    """Re-registration must atomically replace the previous registration.
+
+    Covers the production re-auth defect: every ``/mcp auth`` re-registered
+    a server whose tool names were already in ``_tool_to_server``, producing
+    ~14 duplicate "tool name conflict" warnings per flow, and re-connecting
+    an already-registered server leaked the replaced wrapper's session task.
+    """
+
+    def test_register_wrapper_same_server_reregistration_no_conflicts(self, caplog):
+        """Re-registering a server's own tools must not warn or duplicate."""
+        mgr = MCPManager([{"name": "srv", "transport": "stdio", "command": ["x"]}])
+        # Simulate the 14-tool google-workspace re-auth: the server's tools
+        # are already mapped from a previous registration.
+        tool_names = [f"tool_{i:02d}" for i in range(14)]
+        for tool_name in tool_names:
+            mgr._tool_to_server[tool_name] = "srv"
+
+        new_wrapper = MagicMock()
+        new_wrapper.tools = _sdk_tools_to_registry("srv", [_sdk_tool(n) for n in tool_names])
+
+        with caplog.at_level(logging.WARNING, logger="mcp_client"):
+            mgr._register_wrapper("srv", new_wrapper)
+
+        conflict_warnings = [
+            r for r in caplog.records if "tool name conflict" in r.message
+        ]
+        assert conflict_warnings == []
+        assert set(mgr._tool_to_server) == set(tool_names)
+        assert all(v == "srv" for v in mgr._tool_to_server.values())
+        assert mgr._wrappers["srv"] is new_wrapper
+
+    def test_register_wrapper_closes_replaced_wrapper(self):
+        """The previous wrapper for the name must be closed on replacement."""
+        mgr = MCPManager([{"name": "srv", "transport": "stdio", "command": ["x"]}])
+        old_wrapper = MagicMock()
+        mgr._wrappers["srv"] = old_wrapper
+
+        new_wrapper = MagicMock()
+        new_wrapper.tools = []
+        mgr._register_wrapper("srv", new_wrapper)
+
+        old_wrapper.close.assert_called_once()
+        assert mgr._wrappers["srv"] is new_wrapper
+
+    def test_register_wrapper_different_server_conflict_still_warns(self, caplog):
+        """A tool name claimed by a different server must still warn."""
+        mgr = MCPManager(
+            [
+                {"name": "a", "transport": "stdio", "command": ["x"]},
+                {"name": "b", "transport": "stdio", "command": ["y"]},
+            ]
+        )
+        mgr._tool_to_server["shared_tool"] = "a"
+
+        new_wrapper = MagicMock()
+        new_wrapper.tools = _sdk_tools_to_registry("b", [_sdk_tool("shared_tool")])
+
+        with caplog.at_level(logging.WARNING, logger="mcp_client"):
+            mgr._register_wrapper("b", new_wrapper)
+
+        conflict_warnings = [
+            r for r in caplog.records if "tool name conflict" in r.message
+        ]
+        assert len(conflict_warnings) == 1
+        assert "shared_tool" in conflict_warnings[0].getMessage()
+        # First server keeps the claim.
+        assert mgr._tool_to_server["shared_tool"] == "a"
+
+    def test_connect_server_same_server_reregistration_no_conflicts(self, caplog):
+        """Reconnecting an already-mapped server must not warn or duplicate."""
+        cfg = {"name": "srv", "transport": "stdio", "command": ["echo", "hi"]}
+        mgr = MCPManager([cfg])
+        mgr._start_loop()
+        try:
+            # The server's tools are already mapped from a previous
+            # registration (e.g. needs_auth session death left them behind).
+            tool_names = [f"tool_{i:02d}" for i in range(14)]
+            for tool_name in tool_names:
+                mgr._tool_to_server[tool_name] = "srv"
+            stale_wrapper = MagicMock()
+            mgr._wrappers["srv"] = stale_wrapper
+
+            session = _make_mock_session(
+                tools=[_sdk_tool(n) for n in tool_names]
+            )
+            stdio_cm, session_cm = _make_stdio_patches(session)
+
+            with caplog.at_level(logging.WARNING, logger="mcp_client"):
+                with patch("mcp_client.stdio_client", return_value=stdio_cm):
+                    with patch("mcp_client.ClientSession", return_value=session_cm):
+                        mgr._connect_server("srv", cfg)
+
+            conflict_warnings = [
+                r for r in caplog.records if "tool name conflict" in r.message
+            ]
+            assert conflict_warnings == []
+            assert set(mgr._tool_to_server) == set(tool_names)
+            assert all(v == "srv" for v in mgr._tool_to_server.values())
+            assert mgr._wrappers["srv"] is not stale_wrapper
+        finally:
+            mgr.close_all()
+
+    def test_connect_server_closes_replaced_wrapper(self):
+        """_connect_server must close the wrapper it replaces (no task leak)."""
+        cfg = {"name": "srv", "transport": "stdio", "command": ["echo", "hi"]}
+        mgr = MCPManager([cfg])
+        mgr._start_loop()
+        try:
+            old_wrapper = MagicMock()
+            mgr._wrappers["srv"] = old_wrapper
+
+            sdk_tool = _sdk_tool("tool1", "Tool 1")
+            session = _make_mock_session(tools=[sdk_tool])
+            stdio_cm, session_cm = _make_stdio_patches(session)
+
+            with patch("mcp_client.stdio_client", return_value=stdio_cm):
+                with patch("mcp_client.ClientSession", return_value=session_cm):
+                    mgr._connect_server("srv", cfg)
+
+            old_wrapper.close.assert_called_once()
+            assert mgr._wrappers["srv"] is not old_wrapper
+            assert mgr._wrappers["srv"].connected is True
+            assert mgr._tool_to_server["tool1"] == "srv"
+        finally:
+            mgr.close_all()
+
+
+# ---------------------------------------------------------------------------
 # Test MCP OAuth integration
 # ---------------------------------------------------------------------------
 
@@ -1579,3 +1745,140 @@ class TestMCPOAuthIntegration:
         assert not any(
             "google-workspace" in msg for msg in error_messages
         ), "needs_auth session must not produce ERROR logs for the server"
+
+    def test_oauth_success_registers_non_interactive_provider(self, tmp_path):
+        """D3: After OAuth flow, registered wrapper has non-interactive provider (no chat binding)."""
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        (mcp_tokens_dir / "oauth_srv.json").write_text(
+            '{"access_token": "tok", "token_type": "Bearer"}'
+        )
+        oauth = self._oauth_cfg(tmp_path)
+        cfgs = [
+            {
+                "name": "oauth_srv",
+                "transport": "http",
+                "url": "http://localhost:8080",
+                "timeout": 5,
+                "oauth": oauth,
+            },
+        ]
+
+        session = _make_mock_session(tools=[_sdk_tool("oauth_tool")])
+        read, write = AsyncMock(), AsyncMock()
+        http_cm = MagicMock()
+        http_cm.__aenter__ = AsyncMock(return_value=(read, write, None))
+        http_cm.__aexit__ = AsyncMock(return_value=None)
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mgr = MCPManager(cfgs, mcp_tokens_dir=mcp_tokens_dir)
+        mgr._start_loop()
+
+        interactive_provider = MagicMock(name="interactive_provider")
+        non_interactive_provider = MagicMock(name="non_interactive_provider")
+        build_calls: list[dict] = []
+
+        def _build_side_effect(*args, **kwargs):
+            build_calls.append(kwargs.copy())
+            return interactive_provider if "chat_id" in kwargs else non_interactive_provider
+
+        with patch.object(mcp_client, "streamablehttp_client", return_value=http_cm):
+            with patch("mcp_client.ClientSession", return_value=session_cm):
+                with patch("mcp_oauth.CallbackServer.start", new_callable=AsyncMock):
+                    with patch("mcp_oauth.CallbackServer.stop", new_callable=AsyncMock):
+                        with patch(
+                            "mcp_oauth.OAuthProviderFactory.build",
+                            side_effect=_build_side_effect,
+                        ):
+                            result = mgr.start_oauth_flow("oauth_srv", None)
+
+        assert result["success"] is True
+
+        # Two OAuthProviderFactory.build calls: interactive (chat_id kwarg present) and
+        # non-interactive (_prepare_oauth_provider path: on_non_interactive kwarg, no chat_id).
+        assert len(build_calls) == 2, f"Expected 2 build calls, got {len(build_calls)}"
+        assert "chat_id" in build_calls[0], "First build must be the interactive call (chat_id kwarg present)"
+        assert "on_non_interactive" in build_calls[1], "Second build must carry on_non_interactive callback"
+        assert "chat_id" not in build_calls[1], "Non-interactive build must not carry chat_id"
+
+        # Registered wrapper carries the non-interactive provider, not the chat-bound one.
+        wrapper = mgr._wrappers.get("oauth_srv")
+        assert wrapper is not None
+        assert wrapper._oauth_provider is non_interactive_provider
+        assert wrapper._interactive is False
+        assert wrapper.connected is True
+        assert wrapper._task is not None
+        assert not wrapper._task.done(), "Registered session task must remain alive after flow"
+
+        mgr.close_all()
+
+    def test_oauth_interactive_session_cancelled_fresh_session_alive(self, tmp_path):
+        """D3: Interactive session task is cancelled; fresh registered task stays alive."""
+        mcp_tokens_dir = tmp_path / "tokens"
+        mcp_tokens_dir.mkdir()
+        (mcp_tokens_dir / "oauth_srv.json").write_text(
+            '{"access_token": "tok", "token_type": "Bearer"}'
+        )
+        oauth = self._oauth_cfg(tmp_path)
+        cfgs = [
+            {
+                "name": "oauth_srv",
+                "transport": "http",
+                "url": "http://localhost:8080",
+                "timeout": 5,
+                "oauth": oauth,
+            },
+        ]
+
+        session = _make_mock_session(tools=[_sdk_tool("oauth_tool")])
+        read, write = AsyncMock(), AsyncMock()
+        http_cm = MagicMock()
+        http_cm.__aenter__ = AsyncMock(return_value=(read, write, None))
+        http_cm.__aexit__ = AsyncMock(return_value=None)
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        mgr = MCPManager(cfgs, mcp_tokens_dir=mcp_tokens_dir)
+        mgr._start_loop()
+
+        original_csr = _SdkClientWrapper.create_session_runner
+        created_tasks: list[tuple] = []
+
+        def _spy_csr(self_w: _SdkClientWrapper) -> asyncio.Task:
+            task = original_csr(self_w)
+            created_tasks.append((task, self_w._interactive))
+            return task
+
+        mock_provider = MagicMock()
+        with patch.object(_SdkClientWrapper, "create_session_runner", _spy_csr):
+            with patch.object(mcp_client, "streamablehttp_client", return_value=http_cm):
+                with patch("mcp_client.ClientSession", return_value=session_cm):
+                    with patch("mcp_oauth.CallbackServer.start", new_callable=AsyncMock):
+                        with patch("mcp_oauth.CallbackServer.stop", new_callable=AsyncMock):
+                            with patch(
+                                "mcp_oauth.OAuthProviderFactory.build",
+                                return_value=mock_provider,
+                            ):
+                                result = mgr.start_oauth_flow("oauth_srv", None)
+
+        assert result["success"] is True
+
+        # Two session runners must be created: interactive wrapper + fresh non-interactive wrapper.
+        assert len(created_tasks) == 2, f"Expected 2 session runners, got {len(created_tasks)}"
+
+        interactive_task, was_interactive = created_tasks[0]
+        fresh_task_ref, was_fresh_interactive = created_tasks[1]
+
+        assert was_interactive is True, "First runner must be the interactive wrapper"
+        assert was_fresh_interactive is False, "Second runner must be the fresh non-interactive wrapper"
+
+        # Interactive task is done (closed by flow before fresh wrapper is registered).
+        assert interactive_task.done(), "Interactive session task must be done after flow completes"
+
+        # Fresh task is alive — the finally block must NOT have cancelled it.
+        assert not fresh_task_ref.done(), "Fresh session task must not be cancelled by the finally block"
+
+        mgr.close_all()
