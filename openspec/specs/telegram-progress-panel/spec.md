@@ -8,7 +8,7 @@ Define the compact progress panel rendered in Telegram during agent runs, includ
 
 ### Requirement: Tool-call brief on Running line
 
-The progress panel SHALL display a short per-tool brief on the Running line so the operator can see what the tool is doing, not just the tool name. The brief SHALL be extracted from the tool's arguments by a per-tool formatter (`fmt_tool_brief`) that selects the semantically meaningful argument for each tool. The brief SHALL be truncated to approximately 35 characters with an ellipsis suffix when it exceeds that length.
+The progress panel SHALL display a short per-tool brief on the Running line so the operator can see what the tool is doing, not just the tool name. The brief SHALL be extracted from the tool's arguments by a per-tool formatter (`fmt_tool_brief`) that selects the semantically meaningful argument for each tool. The brief SHALL be truncated to approximately 35 characters with an ellipsis suffix when it exceeds that length. The `schedule` formatter SHALL render `modify` and `show` calls in the same `action + tag` style as the existing schedule actions.
 
 Feature: Telegram progress panel
 Rule: Every tool call shows a one-line brief of what it's doing, not just the tool name.
@@ -82,6 +82,17 @@ Rule: Every tool call shows a one-line brief of what it's doing, not just the to
 - **GIVEN** the agent calls `shell_env_list` with no arguments
 - **WHEN** the progress panel renders the Running line
 - **THEN** the line shows `shell_env_list list env vars`
+
+#### Scenario: schedule modify shows action and tag
+- **GIVEN** the agent calls `schedule` with `action = "modify"`, `tag = "daily-report"`, `task = "updated report task"`
+- **WHEN** the progress panel renders the Running line
+- **THEN** the line shows `schedule modify "daily-report"`
+- **AND** the task text is not displayed
+
+#### Scenario: schedule show shows action and tag
+- **GIVEN** the agent calls `schedule` with `action = "show"`, `tag = "daily-report"`
+- **WHEN** the progress panel renders the Running line
+- **THEN** the line shows `schedule show "daily-report"`
 
 ### Requirement: MCP tools marked with server name
 
