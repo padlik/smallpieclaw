@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 from mcp.client.auth import OAuthClientProvider
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthMetadata, OAuthToken
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +158,8 @@ class FileTokenStorage:
         }
         if "client_info" in existing:
             payload["client_info"] = existing["client_info"]
+        if "oauth_metadata" in existing:
+            payload["oauth_metadata"] = existing["oauth_metadata"]
         self._atomic_write(payload)
         has_refresh = token_dict.get("refresh_token") is not None
         scope = tokens.scope or "unknown"
@@ -204,6 +206,27 @@ class FileTokenStorage:
             "scope": token_data.get("scope"),
         }
 
+    def read_issued_at(self) -> float | None:
+        """Return the stored ``token.issued_at`` stamp, or ``None``.
+
+        Synchronous so a provider override can call it without an event loop
+        (mirrors ``read_status``). Returns ``None`` when the file, the
+        ``token`` block, or the ``issued_at`` key is absent, or when the value
+        is not a real number (``bool`` is treated as non-numeric).
+        """
+        data = self._read_file()
+        if data is None:
+            return None
+        token_data = data.get("token")
+        if not token_data:
+            return None
+        issued_at = token_data.get("issued_at")
+        if issued_at is None or isinstance(issued_at, bool):
+            return None
+        if not isinstance(issued_at, (int, float)):
+            return None
+        return float(issued_at)
+
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         """Return OAuth client information.
 
@@ -245,6 +268,37 @@ class FileTokenStorage:
         """Persist ``client_info`` to disk, merging with any existing token data."""
         existing = self._read_file() or {}
         existing["client_info"] = client_info.model_dump(mode="json", exclude_none=True)
+        self._atomic_write(existing)
+
+    async def get_oauth_metadata(self) -> OAuthMetadata | None:
+        """Return the stored authorization-server metadata, or ``None``.
+
+        Logs a warning naming the server and returns ``None`` on a malformed
+        block rather than raising — mirrors the ``client_info`` fallback
+        pattern so a corrupt or schema-drifted block never prevents connecting.
+        """
+        data = self._read_file()
+        if data is None or "oauth_metadata" not in data:
+            return None
+        try:
+            return OAuthMetadata.model_validate(data["oauth_metadata"])
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "MCP oauth_metadata for %s is malformed, ignoring: %s",
+                self.server_name,
+                exc,
+            )
+            return None
+
+    async def set_oauth_metadata(self, metadata: OAuthMetadata) -> None:
+        """Persist authorization-server ``metadata`` to disk.
+
+        Reads the existing file (or starts from ``{}``), sets the
+        ``oauth_metadata`` key, and writes via ``_atomic_write`` (0600,
+        tmp+rename) so a crash mid-write cannot corrupt the token file.
+        """
+        existing = self._read_file() or {}
+        existing["oauth_metadata"] = metadata.model_dump(mode="json", exclude_none=True)
         self._atomic_write(existing)
 
 
@@ -304,6 +358,80 @@ class RefreshPreservingOAuthProvider(OAuthClientProvider):
                 )
             )
         return result
+
+    async def _initialize(self) -> None:
+        """Extend SDK initialization to restore expiry and metadata (Gap A / Gap B fix).
+
+        SDK ``_initialize`` loads tokens from storage but never writes
+        ``context.token_expiry_time``, so ``is_token_valid()`` treats every
+        loaded token as perpetually valid and the proactive-refresh branch is
+        unreachable.  It also does not restore ``oauth_metadata``, so
+        ``_refresh_token`` falls back to the MCP-proxy endpoint instead of the
+        real authorization server.
+
+        This override: after the SDK has populated ``current_tokens``, reads
+        ``issued_at`` from storage (sync, no event-loop required) and recomputes
+        ``token_expiry_time``; then restores ``oauth_metadata`` so the correct
+        ``token_endpoint`` is used for refresh.  With no stored tokens there
+        is nothing to restore for — the 401 branch re-discovers metadata
+        anyway.  Both paths are guarded with ``getattr`` so foreign storage
+        implementations that lack these methods are silently skipped.
+        """
+        await super()._initialize()
+        tokens = self.context.current_tokens
+        if tokens is None:
+            return
+        if tokens.expires_in is not None:
+            read_issued_at = getattr(self.context.storage, "read_issued_at", None)
+            if read_issued_at is not None:
+                issued_at = read_issued_at()
+                if issued_at is not None:
+                    self.context.token_expiry_time = issued_at + tokens.expires_in
+                    logger.debug(
+                        "MCP restore: token_expiry_time=%.1f for %s",
+                        self.context.token_expiry_time,
+                        getattr(self.context.storage, "server_name", "?"),
+                    )
+        get_oauth_metadata = getattr(self.context.storage, "get_oauth_metadata", None)
+        if get_oauth_metadata is not None:
+            metadata = await get_oauth_metadata()
+            if metadata is not None:
+                self.context.oauth_metadata = metadata
+                logger.debug(
+                    "MCP restore: oauth_metadata.token_endpoint=%s for %s",
+                    metadata.token_endpoint,
+                    getattr(self.context.storage, "server_name", "?"),
+                )
+
+    async def _handle_token_response(self, response: httpx.Response) -> None:
+        """Persist ``oauth_metadata`` after each successful token exchange.
+
+        The SDK populates ``context.oauth_metadata`` during discovery (before
+        the code exchange) but never writes it to storage.  On the next
+        restart ``_initialize`` would find no metadata, forcing the refresh
+        endpoint fallback (Gap B).  This override persists the metadata
+        immediately after every successful exchange so restarts always find it.
+        """
+        await super()._handle_token_response(response)
+        if self.context.oauth_metadata is not None:
+            set_oauth_metadata = getattr(self.context.storage, "set_oauth_metadata", None)
+            if set_oauth_metadata is not None:
+                try:
+                    await set_oauth_metadata(self.context.oauth_metadata)
+                except Exception:  # noqa: BLE001 - see comment: must not fail the auth
+                    # The exchange has already succeeded and set_tokens has
+                    # persisted the new tokens, so a failed metadata write is
+                    # only a cosmetic degradation: the next session falls back
+                    # to the <server-base>/token endpoint until the next
+                    # /mcp auth. It must not surface as an auth failure to
+                    # the operator.
+                    logger.warning(
+                        "MCP [%s] failed to persist oauth_metadata; silent "
+                        "refresh will use the fallback endpoint until the "
+                        "next authorization",
+                        getattr(self.context.storage, "server_name", "?"),
+                        exc_info=True,
+                    )
 
 
 class CallbackServer:

@@ -391,8 +391,12 @@ extra_auth_params = { access_type = "offline", prompt = "consent" }
 
 **Token storage:**
 - Stored as `~/.local/state/<agent_name>/mcp_tokens/<server>.json` with `0600` permissions
-- Contains `access_token`, `refresh_token`, `expires_at`, `scope`, and `client_info`
+- Contains `access_token`, `refresh_token`, `scope`, `token_type`, and `client_info`
+- Stores token timing as `issued_at` + `expires_in` (relative seconds from issuance; absolute expiry = `issued_at` + `expires_in`)
+- May contain an optional top-level `oauth_metadata` block with authorization-server metadata discovered during the flow (e.g. `issuer`, `authorization_endpoint`, `token_endpoint`); persisted only after the token exchange completes, used by silent token refresh, and carried forward across token writes
 - Vault integration deferred — store client secrets in `secrets.toml` with `sec:` prefix, not plaintext
+
+**Migration:** after deploying this change, run `/mcp auth <server>` once per OAuth-configured server. The flow rewrites the token file with a fresh `issued_at` and persists `oauth_metadata`; token files written before the change load unchanged (restores are skipped for missing keys) and behave exactly as before until re-authenticated.
 
 **Troubleshooting:**
 

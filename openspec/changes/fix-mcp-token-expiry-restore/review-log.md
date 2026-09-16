@@ -250,3 +250,43 @@ verdict. Verdict: READY-WITH-CONDITIONS.
   Implementability mechanical; deferred watch-items are proper gates
   (2.3 apply-halting build-site assertion; drift guards 3.1(a)/(b) assert the
   SDK gaps still exist).
+
+## Apply — oracle code review + fix round — 2026-09-16
+
+Reviewer: oracle (ora-1). Scope: the uncommitted implementation (mcp_oauth.py,
+tests/test_mcp_oauth.py, vulture_whitelist.py, README.md) against frozen
+design.md D1–D5, delta specs, and ADR-0031.
+
+### Verdict: SHIP
+
+Override assumptions independently re-verified against installed SDK source
+(mcp 1.29.1): super() ordering, expiry math (`issued_at + expires_in` =
+`calculate_token_expiry` with the stored base), persist-only-after-successful
+exchange, ADR-0029 re-attach interaction, lock-held sequential writes (no
+races). Full frozen-scenario→test conformance table confirmed with no
+uncovered scenarios; E2E suite judged to close the defect-ships-green risk.
+
+### 🔴 Fixed
+- (none raised)
+
+### 🟡 Addressed (both red-green tested)
+- [ora-1 🟡#1] `_handle_token_response` metadata persist was unguarded — a
+  cosmetic `set_oauth_metadata` disk failure would abort an already-completed
+  interactive auth → wrapped in try/except + warning naming the server;
+  degradation is next-session fallback-endpoint behavior. Test:
+  `test_metadata_persist_failure_does_not_abort_completed_exchange`
+  (`_PersistFailsStorage` double).
+- [ora-1 🟢#3 promoted] `_initialize` restored metadata even with no stored
+  tokens → early-return when `current_tokens is None`; nothing to serve and
+  the 401 branch re-discovers anyway. Test:
+  `test_metadata_not_restored_without_tokens`.
+
+### 🟢 Accepted as-is (reviewer's own assessment)
+- 🟢#2 four tiny sync file reads per provider lifetime — negligible.
+- 🟢#4 drift-guard verbatim string pins — intentional fail-loud design (D5).
+- 🟢#5 pyright-strict `redirect_uris` str-vs-AnyUrl — matches existing file
+  patterns; pydantic coerces.
+
+### Verification (fresh)
+- `make check`: 2283 passed, 2 skipped (pre-change baseline 2249/2; +32
+  matrix, +2 review-fix tests; no new skips).

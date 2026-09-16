@@ -65,6 +65,9 @@ from mcp_oauth import FileTokenStorage, CallbackServer, OAuthProviderFactory  # 
 FileTokenStorage
 CallbackServer
 OAuthProviderFactory
+FileTokenStorage.read_issued_at
+FileTokenStorage.get_oauth_metadata
+FileTokenStorage.set_oauth_metadata
 
 # xdg.py — XDGPaths field exposed for MCP token storage
 from xdg import XDGPaths  # noqa: E402
