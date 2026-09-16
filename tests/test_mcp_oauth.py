@@ -3,20 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import ssl
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
 
 from mcp.client.auth import OAuthClientProvider
-from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from mcp.client.auth.exceptions import OAuthTokenError
+from mcp.shared.auth import (
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+    OAuthToken,
+)
 
-from mcp_oauth import CallbackServer, FileTokenStorage, OAuthProviderFactory, make_redirect_handler
+from mcp_oauth import (
+    CallbackServer,
+    FileTokenStorage,
+    OAuthProviderFactory,
+    RefreshPreservingOAuthProvider,
+    make_redirect_handler,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1307,4 +1321,822 @@ class TestExtraAuthParams:
         )
         assert "prompt=consent" in joined, (
             "factory must wire extra_auth_params — URL should contain prompt=consent"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SDK drift guards (b9b3a24 executable-assertion pattern; design D5)
+# ---------------------------------------------------------------------------
+
+
+class TestSdkDriftGuards:
+    """Pin the SDK couplings the restore overrides depend on (mcp 1.29.1).
+
+    ``RefreshPreservingOAuthProvider`` extends three private SDK internals.
+    If an SDK upgrade changes them, the overrides silently stop working —
+    these guards fail loudly instead, forcing a re-verification:
+
+    - (a) if upstream #1784 lands (``_initialize`` writing
+      ``token_expiry_time``), the D1 expiry restore becomes a double-write
+      and must be removed;
+    - (b) if upstream #2492/#2875 land (``_refresh_token`` no longer reading
+      ``oauth_metadata.token_endpoint`` with the ``/token`` fallback), the
+      metadata restore must be re-verified;
+    - (c) if the flow stops awaiting ``_handle_token_response``, the D3
+      metadata persist is orphaned.
+    """
+
+    def test_sdk_initialize_does_not_write_token_expiry_time(self) -> None:
+        """Guard (a): the upstream expiry-restore gap is still present."""
+        source = inspect.getsource(OAuthClientProvider._initialize)
+        assert "token_expiry_time" not in source, (
+            "SDK _initialize now writes token_expiry_time (upstream #1784?) — "
+            "remove the RefreshPreservingOAuthProvider expiry restore"
+        )
+
+    def test_sdk_refresh_token_still_reads_metadata_endpoint_with_fallback(self) -> None:
+        """Guard (b): refresh grants aim at oauth_metadata.token_endpoint."""
+        source = inspect.getsource(OAuthClientProvider._refresh_token)
+        assert "oauth_metadata.token_endpoint" in source, (
+            "SDK _refresh_token no longer reads oauth_metadata.token_endpoint "
+            "(upstream #2492/#2875?) — re-verify the metadata restore"
+        )
+        assert 'urljoin(auth_base_url, "/token")' in source, (
+            "SDK _refresh_token lost the <server-base>/token fallback — "
+            "re-verify the metadata restore and the pre-migration degradation"
+        )
+
+    def test_sdk_flow_still_invokes_handle_token_response(self) -> None:
+        """Guard (c): orphan-detection for the metadata-persist override."""
+        source = inspect.getsource(OAuthClientProvider.async_auth_flow)
+        assert "await self._handle_token_response(" in source, (
+            "SDK flow no longer calls _handle_token_response; the metadata "
+            "persist override is likely orphaned"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Storage: read_issued_at / oauth_metadata (tasks 3.2, 3.3)
+# ---------------------------------------------------------------------------
+
+
+class TestReadIssuedAt:
+    """Matrix for ``FileTokenStorage.read_issued_at`` (delta spec scenario
+    "issued_at readable for expiry restoration")."""
+
+    def _storage(self, tmp_path: Path) -> FileTokenStorage:
+        return FileTokenStorage(
+            server_name="srv", mcp_tokens_dir=tmp_path, client_id="cid", client_secret="csec"
+        )
+
+    def _write(self, tmp_path: Path, payload: dict) -> None:
+        (tmp_path / "srv.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_returns_stored_value(self, tmp_path: Path):
+        self._write(tmp_path, {"token": {"access_token": "A1", "issued_at": 1757985041.5}})
+        assert self._storage(tmp_path).read_issued_at() == 1757985041.5
+
+    def test_integer_stamp_is_coerced_to_float(self, tmp_path: Path):
+        self._write(tmp_path, {"token": {"access_token": "A1", "issued_at": 1757985041}})
+        assert self._storage(tmp_path).read_issued_at() == 1757985041.0
+
+    def test_no_file_returns_none(self, tmp_path: Path):
+        assert self._storage(tmp_path).read_issued_at() is None
+
+    def test_no_token_block_returns_none(self, tmp_path: Path):
+        self._write(tmp_path, {"client_info": {"client_id": "cid"}})
+        assert self._storage(tmp_path).read_issued_at() is None
+
+    def test_no_issued_at_key_returns_none(self, tmp_path: Path):
+        self._write(tmp_path, {"token": {"access_token": "A1"}})
+        assert self._storage(tmp_path).read_issued_at() is None
+
+    def test_non_numeric_string_returns_none(self, tmp_path: Path):
+        self._write(tmp_path, {"token": {"access_token": "A1", "issued_at": "yesterday"}})
+        assert self._storage(tmp_path).read_issued_at() is None
+
+    def test_bool_stamp_returns_none(self, tmp_path: Path):
+        self._write(tmp_path, {"token": {"access_token": "A1", "issued_at": True}})
+        assert self._storage(tmp_path).read_issued_at() is None
+
+    def test_synchronous_no_event_loop_required(self, tmp_path: Path):
+        """Mirrors read_status: a plain call must not need an event loop."""
+        self._write(tmp_path, {"token": {"access_token": "A1", "issued_at": 1757985041.5}})
+        storage = self._storage(tmp_path)
+        assert inspect.iscoroutinefunction(storage.read_issued_at) is False
+        # The direct call itself is the proof: no get_event_loop anywhere.
+        assert storage.read_issued_at() == 1757985041.5
+
+
+class TestOAuthMetadataStorage:
+    """``get_oauth_metadata`` / ``set_oauth_metadata`` (delta spec scenarios
+    "OAuth metadata persisted after a completed authorization" and
+    "Malformed oauth metadata block falls back to None")."""
+
+    _METADATA = {
+        "issuer": "https://accounts.example.test/",
+        "authorization_endpoint": "https://accounts.example.test/authorize",
+        "token_endpoint": "https://tokens.example.test/token",
+        "response_types_supported": ["code"],
+    }
+
+    def _storage(self, tmp_path: Path) -> FileTokenStorage:
+        return FileTokenStorage(
+            server_name="srv", mcp_tokens_dir=tmp_path, client_id="cid", client_secret="csec"
+        )
+
+    def _make_metadata(self) -> OAuthMetadata:
+        return OAuthMetadata.model_validate(dict(self._METADATA))
+
+    def test_round_trip(self, tmp_path: Path):
+        storage = self._storage(tmp_path)
+        asyncio.run(storage.set_oauth_metadata(self._make_metadata()))
+        loaded = asyncio.run(storage.get_oauth_metadata())
+        assert loaded == self._make_metadata()
+
+    def test_set_merges_into_existing_token_file(self, tmp_path: Path):
+        """set_oauth_metadata must not clobber the token block (atomic merge)."""
+        storage = self._storage(tmp_path)
+        asyncio.run(
+            storage.set_tokens(
+                OAuthToken(access_token="A1", refresh_token="R1", scope="read", expires_in=3600)
+            )
+        )
+        asyncio.run(storage.set_oauth_metadata(self._make_metadata()))
+        payload = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert payload["token"]["access_token"] == "A1", "merge clobbered the token block"
+        assert payload["oauth_metadata"]["token_endpoint"] == self._METADATA["token_endpoint"]
+
+    def test_malformed_block_warns_and_returns_none(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        storage = self._storage(tmp_path)
+        (tmp_path / "srv.json").write_text(
+            json.dumps({"token": {"access_token": "A1"}, "oauth_metadata": {"issuer": "not-a-url"}}),
+            encoding="utf-8",
+        )
+        with caplog.at_level(logging.WARNING, logger="mcp_oauth"):
+            loaded = asyncio.run(storage.get_oauth_metadata())
+        assert loaded is None, "malformed oauth_metadata must not raise"
+        assert "srv" in caplog.text, "the warning must name the server"
+        assert "oauth_metadata" in caplog.text
+
+    def test_malformed_block_of_wrong_type_returns_none(self, tmp_path: Path):
+        """A schema-drifted non-dict block degrades to None, not an exception."""
+        storage = self._storage(tmp_path)
+        (tmp_path / "srv.json").write_text(
+            json.dumps({"token": {"access_token": "A1"}, "oauth_metadata": "flat-string"}),
+            encoding="utf-8",
+        )
+        assert asyncio.run(storage.get_oauth_metadata()) is None
+
+    def test_missing_block_returns_none_without_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        storage = self._storage(tmp_path)
+        asyncio.run(storage.set_tokens(OAuthToken(access_token="A1")))
+        with caplog.at_level(logging.WARNING, logger="mcp_oauth"):
+            loaded = asyncio.run(storage.get_oauth_metadata())
+        assert loaded is None
+        assert "malformed" not in caplog.text, (
+            "a merely-absent block must not be reported as malformed"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures for the restore-contract tests (ADR-0031)
+# ---------------------------------------------------------------------------
+
+_OAUTH_METADATA = {
+    "issuer": "https://accounts.example.test/",
+    "authorization_endpoint": "https://accounts.example.test/authorize",
+    "token_endpoint": "https://tokens.example.test/token",
+    "response_types_supported": ["code"],
+}
+
+
+def _make_storage(tmp_path: Path) -> FileTokenStorage:
+    """A FileTokenStorage rooted at tmp_path, like the factory builds."""
+    return FileTokenStorage(
+        server_name="srv", mcp_tokens_dir=tmp_path, client_id="cid", client_secret="csec"
+    )
+
+
+def _make_test_provider(storage: FileTokenStorage) -> RefreshPreservingOAuthProvider:
+    """Build a provider directly (no factory, no certs) with aborting handlers.
+
+    The redirect handler raises like the non-interactive session abort
+    (ADR-0030), so a degradation that falls back to the full authorization
+    flow surfaces as RuntimeError instead of hanging on a callback.
+    """
+
+    async def _redirect(url: str) -> None:
+        raise RuntimeError("non-interactive abort")
+
+    async def _callback() -> tuple[str, str | None]:
+        raise AssertionError("callback handler must not run in this flow")
+
+    return RefreshPreservingOAuthProvider(
+        server_url="https://mcp.example.com/sse",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=["https://localhost/callback"],
+            grant_types=["authorization_code", "refresh_token"],
+            token_endpoint_auth_method="client_secret_basic",
+            scope="read",
+            client_name="smallpieclaw",
+        ),
+        storage=storage,
+        redirect_handler=_redirect,
+        callback_handler=_callback,
+        timeout=5.0,
+    )
+
+
+def _seed_token_file(
+    tmp_path: Path, token: dict, metadata: dict | None = None
+) -> dict:
+    """Write a raw token file (as a pre-change deploy would have on disk)."""
+    payload: dict = {"token": token}
+    if metadata is not None:
+        payload["oauth_metadata"] = metadata
+    (tmp_path / "srv.json").write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+class _RecordingStorage(FileTokenStorage):
+    """FileTokenStorage that records the order of persist calls."""
+
+    def __init__(
+        self, server_name: str, mcp_tokens_dir: Path, client_id: str, client_secret: str
+    ) -> None:
+        super().__init__(server_name, mcp_tokens_dir, client_id, client_secret)
+        self.calls: list[str] = []
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        self.calls.append("set_tokens")
+        await super().set_tokens(tokens)
+
+    async def set_oauth_metadata(self, metadata: OAuthMetadata) -> None:
+        self.calls.append("set_oauth_metadata")
+        await super().set_oauth_metadata(metadata)
+
+
+class _PersistFailsStorage(FileTokenStorage):
+    """FileTokenStorage whose metadata persist always fails (disk-error double)."""
+
+    async def set_oauth_metadata(self, metadata: OAuthMetadata) -> None:
+        raise OSError("simulated disk failure")
+
+
+# ---------------------------------------------------------------------------
+# Storage: set_tokens carry-forward (task 3.4b — ADR-0031 on-disk contract)
+# ---------------------------------------------------------------------------
+
+
+class TestSetTokensCarryForward:
+    """``set_tokens`` carries ``oauth_metadata`` forward alongside ``client_info``.
+
+    The ADR-0029 merge-preserve lesson generalized to the new key: a block
+    present on disk before a token write survives it, so the first silent
+    refresh never wipes the persisted metadata (delta scenario "Silent
+    refresh preserves the stored oauth metadata").
+    """
+
+    def test_silent_refresh_carries_metadata_and_client_info(self, tmp_path: Path):
+        storage = _make_storage(tmp_path)
+        _seed_token_file(
+            tmp_path,
+            token={
+                "access_token": "A1",
+                "refresh_token": "R1",
+                "expires_in": 3600,
+                "issued_at": 1000.0,
+            },
+            metadata=dict(_OAUTH_METADATA),
+        )
+        # A persisted client_info block rides along the same path.
+        payload_path = tmp_path / "srv.json"
+        with payload_path.open(encoding="utf-8") as fh:
+            seeded = json.load(fh)
+        seeded["client_info"] = {
+            "client_id": "dcr-cid",
+            "client_secret": "csec",
+            "redirect_uris": ["https://localhost:8765/callback"],
+        }
+        payload_path.write_text(json.dumps(seeded), encoding="utf-8")
+
+        # Refresh-grant shape: new access token, no incoming refresh_token.
+        asyncio.run(storage.set_tokens(OAuthToken(access_token="A2", expires_in=1800)))
+
+        after = json.loads(payload_path.read_text(encoding="utf-8"))
+        assert after["token"]["access_token"] == "A2"
+        assert after["token"]["refresh_token"] == "R1", "ADR-0029 merge-preserve"
+        assert after["token"]["issued_at"] > 1000.0, "issued_at must re-stamp"
+        assert after["client_info"]["client_id"] == "dcr-cid"
+        assert (
+            after["oauth_metadata"]["token_endpoint"]
+            == "https://tokens.example.test/token"
+        ), "oauth_metadata block must survive a silent-refresh write"
+
+    def test_metadata_survives_when_no_client_info_exists(self, tmp_path: Path):
+        """Carry-forward never invents a client_info block either."""
+        storage = _make_storage(tmp_path)
+        _seed_token_file(
+            tmp_path,
+            token={"access_token": "A1", "expires_in": 3600, "issued_at": 1000.0},
+            metadata=dict(_OAUTH_METADATA),
+        )
+
+        asyncio.run(storage.set_tokens(OAuthToken(access_token="A2", expires_in=1800)))
+
+        after = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert "client_info" not in after, "no client_info block was stored"
+        assert after["oauth_metadata"]["token_endpoint"] == (
+            "https://tokens.example.test/token"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Provider: _initialize restore matrix (task 3.5 — design D1/D2)
+# ---------------------------------------------------------------------------
+
+
+class TestInitializeRestore:
+    """Matrix for the ``_initialize`` override over a real FileTokenStorage.
+
+    Pins the restore contract and the pre-migration skips: a file written
+    before this change (missing ``issued_at`` or ``oauth_metadata``) loads
+    exactly as before.
+    """
+
+    def test_expiry_restored_from_issued_at_plus_expires_in(self, tmp_path: Path):
+        storage = _make_storage(tmp_path)
+        _seed_token_file(
+            tmp_path,
+            token={"access_token": "A1", "expires_in": 3600, "issued_at": 1000.0},
+        )
+        provider = _make_test_provider(storage)
+
+        asyncio.run(provider._initialize())
+
+        assert provider.context.current_tokens is not None
+        assert provider.context.current_tokens.access_token == "A1"
+        assert provider.context.token_expiry_time == 1000.0 + 3600, (
+            "expiry must be restored from the stored stamp, not from now()"
+        )
+
+    def test_missing_issued_at_leaves_expiry_unset(self, tmp_path: Path):
+        storage = _make_storage(tmp_path)
+        _seed_token_file(tmp_path, token={"access_token": "A1", "expires_in": 3600})
+        provider = _make_test_provider(storage)
+
+        asyncio.run(provider._initialize())
+
+        assert provider.context.current_tokens is not None
+        assert provider.context.token_expiry_time is None, (
+            "a pre-migration file without issued_at must not restore an expiry"
+        )
+
+    def test_missing_expires_in_leaves_expiry_unset(self, tmp_path: Path):
+        storage = _make_storage(tmp_path)
+        _seed_token_file(tmp_path, token={"access_token": "A1", "issued_at": 1000.0})
+        provider = _make_test_provider(storage)
+
+        asyncio.run(provider._initialize())
+
+        assert provider.context.current_tokens is not None
+        assert provider.context.token_expiry_time is None
+
+    def test_no_token_file_is_a_no_op(self, tmp_path: Path):
+        provider = _make_test_provider(_make_storage(tmp_path))
+
+        asyncio.run(provider._initialize())
+
+        assert provider.context.current_tokens is None
+        assert provider.context.token_expiry_time is None
+        assert provider.context.oauth_metadata is None
+
+    def test_metadata_restored_when_present(self, tmp_path: Path):
+        storage = _make_storage(tmp_path)
+        _seed_token_file(
+            tmp_path,
+            token={"access_token": "A1", "expires_in": 3600, "issued_at": 1000.0},
+            metadata=dict(_OAUTH_METADATA),
+        )
+        provider = _make_test_provider(storage)
+
+        asyncio.run(provider._initialize())
+
+        assert provider.context.oauth_metadata is not None
+        assert str(provider.context.oauth_metadata.token_endpoint) == (
+            "https://tokens.example.test/token"
+        )
+
+    def test_malformed_metadata_restores_none(self, tmp_path: Path):
+        """Malformed block degrades to None — the value, not 'unchanged'."""
+        storage = _make_storage(tmp_path)
+        _seed_token_file(
+            tmp_path,
+            token={"access_token": "A1", "expires_in": 3600, "issued_at": 1000.0},
+            metadata={"issuer": "not-a-url"},
+        )
+        provider = _make_test_provider(storage)
+
+        asyncio.run(provider._initialize())
+
+        assert provider.context.oauth_metadata is None, (
+            "a fresh provider with malformed metadata must start without it"
+        )
+        assert provider.context.token_expiry_time == 1000.0 + 3600, (
+            "the expiry restore is independent of the metadata block"
+        )
+
+    def test_metadata_not_restored_without_tokens(self, tmp_path: Path):
+        """With no token block there is nothing to restore for.
+
+        A provider reconstructed from persisted *tokens* is the restore
+        contract's scope (ADR-0031); a metadata-only file is unreachable via
+        the public flow (design D4). The early return skips the metadata
+        restore there — the 401 branch re-discovers metadata anyway.
+        """
+        storage = _make_storage(tmp_path)
+        (tmp_path / "srv.json").write_text(
+            json.dumps({"oauth_metadata": dict(_OAUTH_METADATA)}), encoding="utf-8"
+        )
+        provider = _make_test_provider(storage)
+
+        asyncio.run(provider._initialize())
+
+        assert provider.context.current_tokens is None
+        assert provider.context.token_expiry_time is None
+        assert provider.context.oauth_metadata is None, (
+            "no persisted tokens means no restore — nothing to serve"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Provider: _handle_token_response metadata-persist path (task 3.6 — design D3)
+# ---------------------------------------------------------------------------
+
+
+class TestHandleTokenResponseMetadataPersist:
+    """The metadata-persist ordering (delta scenario "OAuth metadata
+    persisted after a completed authorization").
+
+    A persist bug here would ship the exact production defect this change
+    fixes with the suite green, so both clauses are pinned: the block is
+    written only after a completed exchange, and a failed exchange writes
+    nothing.
+    """
+
+    def _make_provider(
+        self, tmp_path: Path, *, with_metadata: bool = True
+    ) -> tuple[RefreshPreservingOAuthProvider, _RecordingStorage]:
+        storage = _RecordingStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        provider = _make_test_provider(storage)
+        if with_metadata:
+            provider.context.oauth_metadata = OAuthMetadata.model_validate(
+                dict(_OAUTH_METADATA)
+            )
+        return provider, storage
+
+    def test_successful_exchange_persists_metadata_after_tokens(
+        self, tmp_path: Path
+    ):
+        provider, storage = self._make_provider(tmp_path)
+        response = httpx.Response(
+            200,
+            json={
+                "access_token": "A2",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "read",
+            },
+        )
+
+        asyncio.run(provider._handle_token_response(response))
+
+        assert storage.calls == ["set_tokens", "set_oauth_metadata"], (
+            "metadata must be persisted strictly after the exchange completed"
+        )
+        payload = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert set(payload) == {"token", "oauth_metadata"}, (
+            "a metadata-only file state is unreachable: set_tokens ran first"
+        )
+        assert (
+            payload["oauth_metadata"]["token_endpoint"]
+            == "https://tokens.example.test/token"
+        )
+        assert "issued_at" in payload["token"], "set_tokens must stamp issued_at"
+
+    def test_failed_exchange_writes_no_metadata(self, tmp_path: Path):
+        provider, storage = self._make_provider(tmp_path)
+        response = httpx.Response(400, json={"error": "invalid_grant"})
+
+        with pytest.raises(OAuthTokenError):
+            asyncio.run(provider._handle_token_response(response))
+
+        assert storage.calls == [], "a failed exchange must persist nothing"
+        assert not (tmp_path / "srv.json").exists()
+
+    def test_metadata_persist_failure_does_not_abort_completed_exchange(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """A cosmetic metadata-write failure must not fail a completed auth.
+
+        The exchange has already succeeded and ``set_tokens`` has persisted
+        the new tokens; a subsequent ``set_oauth_metadata`` disk error
+        (full disk, permission flip) must degrade to a warning — next
+        session falls back to the ``/token`` endpoint until re-auth —
+        rather than surfacing as an auth failure to the operator.
+        """
+        storage = _PersistFailsStorage(
+            server_name="srv",
+            mcp_tokens_dir=tmp_path,
+            client_id="cid",
+            client_secret="csec",
+        )
+        provider = _make_test_provider(storage)
+        provider.context.oauth_metadata = OAuthMetadata.model_validate(
+            dict(_OAUTH_METADATA)
+        )
+        response = httpx.Response(
+            200,
+            json={
+                "access_token": "A2",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "read",
+            },
+        )
+
+        with caplog.at_level(logging.WARNING, logger="mcp_oauth"):
+            asyncio.run(provider._handle_token_response(response))
+
+        payload = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert payload["token"]["access_token"] == "A2", (
+            "the completed exchange's tokens must be on disk"
+        )
+        assert provider.context.current_tokens is not None
+        assert provider.context.current_tokens.access_token == "A2"
+        assert "srv" in caplog.text, "the warning must name the server"
+
+    def test_exchange_without_metadata_persists_no_metadata_block(
+        self, tmp_path: Path
+    ):
+        """No discovery metadata in context → the override is a passthrough."""
+        provider, storage = self._make_provider(tmp_path, with_metadata=False)
+        response = httpx.Response(
+            200, json={"access_token": "A2", "token_type": "Bearer", "expires_in": 3600}
+        )
+
+        asyncio.run(provider._handle_token_response(response))
+
+        assert storage.calls == ["set_tokens"]
+        payload = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert set(payload) == {"token"}
+
+
+# ---------------------------------------------------------------------------
+# Provider: end-to-end reconstructed-provider silent refresh (tasks 4.1–4.5)
+# ---------------------------------------------------------------------------
+
+
+class TestE2EReconstructedProviderRefresh:
+    """Silent refresh through the real SDK flow for a provider reconstructed
+    from disk.
+
+    Fresh, UN-INITIALIZED providers over a real ``FileTokenStorage`` — the
+    SDK calls ``_initialize`` only when ``not self._initialized``
+    (oauth2.py:494), so these drives exercise the restore overrides for
+    real; a pre-initialized provider would pass vacuously. The generator
+    harness feeds scripted ``httpx`` responses; the redirect handler raises,
+    mirroring the non-interactive session abort (ADR-0030) that any
+    degradation must fall back to.
+    """
+
+    def _make_provider(
+        self,
+        tmp_path: Path,
+        *,
+        issued_at: float | None = None,
+        include_issued_at: bool = True,
+        with_metadata: bool = True,
+    ) -> RefreshPreservingOAuthProvider:
+        storage = _make_storage(tmp_path)
+        token: dict = {
+            "access_token": "A1",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "R1",
+        }
+        if include_issued_at:
+            # Default: issued two hours ago → long expired for expires_in=3600.
+            token["issued_at"] = time.time() - 7200.0 if issued_at is None else issued_at
+        _seed_token_file(
+            tmp_path, token=token, metadata=dict(_OAUTH_METADATA) if with_metadata else None
+        )
+        return _make_test_provider(storage)
+
+    def _drive(
+        self, provider: RefreshPreservingOAuthProvider, responses: list[httpx.Response]
+    ) -> tuple[list[httpx.Request], Exception | None]:
+        """Drive async_auth_flow with scripted responses; return (requests, exc)."""
+
+        async def _run() -> tuple[list[httpx.Request], Exception | None]:
+            flow = provider.async_auth_flow(
+                httpx.Request("GET", "https://mcp.example.com/sse")
+            )
+            seen: list[httpx.Request] = []
+            response: httpx.Response | None = None
+            exc: Exception | None = None
+            try:
+                while True:
+                    try:
+                        request = await flow.asend(response)
+                    except StopAsyncIteration:
+                        break
+                    seen.append(request)
+                    response = responses[min(len(seen), len(responses)) - 1]
+            except Exception as caught:  # harness reports; assertions decide
+                exc = caught
+            finally:
+                await flow.aclose()
+            return seen, exc
+
+        return asyncio.run(_run())
+
+    @staticmethod
+    def _refresh_ok() -> httpx.Response:
+        """A Google-shaped refresh grant: 200, no refresh_token in the body."""
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "A2",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "read",
+            },
+        )
+
+    @staticmethod
+    def _not_found() -> httpx.Response:
+        return httpx.Response(404)
+
+    def test_expired_token_refreshes_proactively_to_restored_endpoint(
+        self, tmp_path: Path
+    ):
+        """The FIRST yielded request is a refresh POST to the restored endpoint.
+
+        Not ``<server-base>/token`` (the SDK fallback), and not an on-401
+        refresh — the refresh fires before any request carries the stale
+        access token (delta scenario "Silent token refresh on restored
+        expiry").
+        """
+        provider = self._make_provider(tmp_path)
+
+        seen, exc = self._drive(provider, [self._refresh_ok(), httpx.Response(200)])
+
+        assert exc is None
+        assert len(seen) == 2, f"expected refresh + retry, got {seen}"
+        refresh = seen[0]
+        assert refresh.method == "POST"
+        assert str(refresh.url) == "https://tokens.example.test/token", (
+            "the refresh grant must aim at the restored token endpoint"
+        )
+        assert str(refresh.url) != "https://mcp.example.com/token", (
+            "the SDK <server-base>/token fallback must not be used"
+        )
+        body = parse_qs(refresh.content.decode("utf-8"))
+        assert body["grant_type"] == ["refresh_token"]
+        assert body["refresh_token"] == ["R1"]
+
+    def test_successful_rtless_refresh_persists_and_retries_with_new_bearer(
+        self, tmp_path: Path
+    ):
+        """A 200 RT-less refresh (Google shape) keeps the RT on disk and in
+        memory, carries the metadata forward, and the retried request
+        carries the new Bearer token (delta scenario "Successive silent
+        refreshes never lose the refresh token")."""
+        provider = self._make_provider(tmp_path)
+        seeded = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+
+        seen, exc = self._drive(provider, [self._refresh_ok(), httpx.Response(200)])
+
+        assert exc is None
+        retried = seen[1]
+        assert str(retried.url) == "https://mcp.example.com/sse"
+        assert retried.headers.get("Authorization") == "Bearer A2", (
+            "the server never received the stale access token"
+        )
+        after = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert after["token"]["access_token"] == "A2"
+        assert after["token"]["refresh_token"] == "R1", (
+            "ADR-0029: the refresh token must be merge-preserved on disk"
+        )
+        assert after["token"]["issued_at"] > seeded["token"]["issued_at"]
+        assert after["oauth_metadata"] == seeded["oauth_metadata"], (
+            "task 1.3: the metadata block must be carried forward across the refresh write"
+        )
+        assert provider.context.current_tokens is not None
+        assert provider.context.current_tokens.refresh_token == "R1", (
+            "ADR-0029: the in-memory RT must be re-attached for the next expiry"
+        )
+
+    def test_pre_migration_file_degrades_to_fallback_endpoint(
+        self, tmp_path: Path
+    ):
+        """No oauth_metadata block → refresh POSTs to ``<server-base>/token``,
+        the non-200 clears in-memory tokens only, and the on-disk RT
+        survives (delta scenario "Pre-migration token file degrades to
+        today's behavior")."""
+        provider = self._make_provider(tmp_path, with_metadata=False)
+        before = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        responses = [
+            httpx.Response(400, json={"error": "invalid_grant"}),
+            httpx.Response(401),
+            *[self._not_found() for _ in range(6)],
+        ]
+
+        seen, exc = self._drive(provider, responses)
+
+        assert isinstance(exc, RuntimeError), (
+            "degradation must end in the non-interactive abort, not a crash"
+        )
+        assert str(seen[0].url) == "https://mcp.example.com/token", (
+            "without restored metadata the SDK fallback endpoint is used"
+        )
+        body = parse_qs(seen[0].content.decode("utf-8"))
+        assert body["grant_type"] == ["refresh_token"]
+        assert provider.context.current_tokens is None, (
+            "the failed refresh clears in-memory tokens only"
+        )
+        after = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert after["token"]["refresh_token"] == "R1", (
+            "the on-disk refresh token must survive the degradation"
+        )
+        assert after["token"]["issued_at"] == before["token"]["issued_at"]
+        assert "oauth_metadata" not in after, (
+            "the degradation path must never invent a metadata block"
+        )
+
+    def test_pre_migration_file_without_issued_at_skips_restore(self, tmp_path: Path):
+        """No issued_at stamp → expiry restore skipped → the stale token goes
+        out as-is, the 401 runs the full flow, and the abort degrades
+        exactly as before this change (delta scenario "Token file without
+        issued_at degrades to today's behavior")."""
+        provider = self._make_provider(tmp_path, include_issued_at=False)
+
+        seen, exc = self._drive(
+            provider, [httpx.Response(401), *[self._not_found() for _ in range(6)]]
+        )
+
+        assert isinstance(exc, RuntimeError)
+        assert seen[0].method == "GET", (
+            "without a restored expiry the SDK treats the token as valid — "
+            "the first request is the original call, not a refresh"
+        )
+        assert seen[0].headers.get("Authorization") == "Bearer A1"
+        assert not any(request.method == "POST" for request in seen), (
+            "no refresh grant may be attempted without a restored expiry"
+        )
+
+    def test_server_side_401_does_not_refresh_and_leaves_disk_untouched(
+        self, tmp_path: Path
+    ):
+        """Clock-valid token rejected server-side → no refresh grant, the
+        next request is discovery, and the abort leaves the on-disk file
+        untouched (delta scenario "Silent token refresh on 401", rewritten
+        post-freeze)."""
+        provider = self._make_provider(tmp_path, issued_at=time.time() - 60.0)
+        before = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        responses = [httpx.Response(401), *[self._not_found() for _ in range(6)]]
+
+        seen, exc = self._drive(provider, responses)
+
+        assert isinstance(exc, RuntimeError), (
+            "degradation must end in the non-interactive abort"
+        )
+        assert seen[0].headers.get("Authorization") == "Bearer A1", (
+            "the clock-valid token went out and the server rejected it"
+        )
+        assert not any(request.method == "POST" for request in seen), (
+            "the SDK's 401 branch must not attempt a refresh grant"
+        )
+        first_after_401 = seen[1]
+        assert first_after_401.method == "GET"
+        assert "/.well-known/" in str(first_after_401.url), (
+            "the request after the 401 is metadata discovery, not a refresh"
+        )
+        after = json.loads((tmp_path / "srv.json").read_text(encoding="utf-8"))
+        assert after["token"]["refresh_token"] == before["token"]["refresh_token"]
+        assert after["token"]["issued_at"] == before["token"]["issued_at"]
+        assert after == before, (
+            "clear_tokens() clears only in-memory context — the disk file "
+            "must be byte-for-byte untouched"
         )
