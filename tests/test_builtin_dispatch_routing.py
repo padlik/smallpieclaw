@@ -4,8 +4,8 @@ Change: split-builtin-executor-modules. These white-box tests guard the
 dispatch *framework* against table drift as tool bodies move into the
 ``builtin_tools`` package across later phases:
 
-  * the frozen 21-tool built-in set,
-  * the 20-entry ``_exec_table`` (every tool except ``vision_query``),
+  * the frozen 23-tool built-in set,
+  * the 22-entry ``_exec_table`` (every tool except ``vision_query``),
   * the confirmation-capable ``_run_table`` (shell/file/graph/secret),
   * the ``vision_query`` seam (declared built-in, no dispatch handler), and
   * total dispatch: an unknown tool name yields an error result, never raises.
@@ -33,6 +33,7 @@ _FROZEN_TOOLS = frozenset({
     "memory_graph_search",
     "memory_graph_store",
     "log_query",
+    "log_detail",
     "shell_env_set",
     "shell_env_unset",
     "shell_env_list",
@@ -57,15 +58,15 @@ def _executor(make_builtin_executor) -> BuiltinExecutor:
     return make_builtin_executor()
 
 
-def test_builtin_set_is_frozen_twenty_two(make_builtin_executor):
-    assert len(_FROZEN_TOOLS) == 22
+def test_builtin_set_is_frozen_twenty_three(make_builtin_executor):
+    assert len(_FROZEN_TOOLS) == 23
     assert set(BUILTIN_TOOLS) == set(_FROZEN_TOOLS)
 
 
 def test_exec_table_covers_every_non_vision_tool(make_builtin_executor):
     ex = _executor(make_builtin_executor)
     assert set(ex._exec_table) == set(_FROZEN_TOOLS) - {"vision_query"}
-    assert len(ex._exec_table) == 21
+    assert len(ex._exec_table) == 22
 
 
 def test_run_table_contains_only_confirmation_capable_tools(make_builtin_executor):
@@ -74,6 +75,18 @@ def test_run_table_contains_only_confirmation_capable_tools(make_builtin_executo
     # The two new sub-agent control tools are explicitly not confirmation-gated.
     assert "wait_for_any_agent" not in ex._run_table
     assert "cancel_agent" not in ex._run_table
+    # log_detail is read-only and not confirmation-capable.
+    assert "log_detail" not in ex._run_table
+
+
+def test_log_detail_routes_to_handler(make_builtin_executor):
+    ex = _executor(make_builtin_executor)
+    assert "log_detail" in ex._exec_table
+    # Dispatch through execute() so the public _CallContext path is exercised.
+    result = ex.execute("log_detail", {"id": 0})
+    assert result["success"] is True
+    payload = result["output"]
+    assert "\"found\": false" in payload or '"found": false' in payload
 
 
 def test_vision_query_is_declared_but_has_no_dispatch_handler(make_builtin_executor):

@@ -247,6 +247,7 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "  tool        (str) — exact tool name to match (e.g. 'shell', 'file_read'). "
             "  since       (str) — ISO timestamp; only include records at or after this time. "
             "  limit       (int, default 50, max 500) — max records to return (the most recent are kept if more match; values above 500 are clamped to 500). "
+            "  before_id   (int) — only records with id < before_id; anchor the next page on the smallest id seen (walk match sets larger than one page newest→oldest). "
             "  prompt_id   (str) — exact ULID prompt id to match (e.g. '01JARYN6R0ABCDEFGHJKMNPQRS'). "
             "                      When prompt_id is given without an explicit trace, the scope is "
             "                      automatically widened to ALL traces so records for that prompt are "
@@ -266,11 +267,37 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "When neither level, event_type, nor text/query is given, a high-signal default view "
             "is returned: warnings/errors plus TOOL_START/TOOL_END/LLM_CALL events (routine "
             "STEP_* events are omitted). "
+            "Every returned record carries its immutable store id (the SQLite primary key). "
             "Returns a JSON object with 'records', 'count', 'truncated', and 'total_matched'. "
             "'total_matched' is an EXACT count across the full 30-day retention window; there are "
             "no window-saturation or scanned-line counters. "
+            "The number of returned records may also be reduced by the per-call output size cap, "
+            "so raising 'limit' alone does not return more records when the size cap binds. "
+            "Use 'limit: 1' as a COUNT-probe to get an exact total_matched count of any filter combination. "
+            "Walk-then-drill: use before_id paging to enumerate a match set larger than one page, "
+            "then call log_detail(id) for per-record full-fidelity inspection. "
+            "A walk ends when a page returns no records (exhaustion), NOT when retrieved counts reach total_matched, "
+            "because total_matched can grow on a live store. Scope exhaustive walks by prompt_id or an explicit trace; "
+            "text-only queries auto-widen to ALL traces over the full 30-day retention window. "
             "Examples: {\"tool\": \"shell\", \"limit\": 20}, "
-            "{\"text\": \"GraphMemoryStore\", \"limit\": 10}"
+            "{\"text\": \"GraphMemoryStore\", \"limit\": 10}, "
+            "{\"event_type\": \"TOOL_FAILED\", \"before_id\": 3104, \"limit\": 20}"
+        ),
+    ),
+    "log_detail": BuiltinTool(
+        name="log_detail",
+        description=(
+            "Read one full log record by its store id at full fidelity (no per-field truncation). "
+            "Args: "
+            "  id (int, REQUIRED) — the SQLite primary key of the record, as returned in each log_query record. "
+            "The serialized record is subject to a hard cap of 65536 characters. Records at or below the cap "
+            "are returned complete. Oversized records are dumped to the run-scoped results directory "
+            "(~/.<agent>/results/<trace-id>/log-detail-<id>.json) and the response returns a truncated "
+            "preview plus dump_path. The dump is redacted with the same pass used for shell artifacts. "
+            "On not-found id, missing/unreadable store, or invalid id the response is a well-formed "
+            "{\"found\": false, \"record\": null, \"dumped\": false, \"dump_path\": null} result. "
+            "Read-only with respect to the log store. "
+            "Example: {\"id\": 3108}"
         ),
     ),
     "shell_env_set": BuiltinTool(

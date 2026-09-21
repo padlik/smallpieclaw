@@ -91,7 +91,8 @@ class LogQueryFilters:
     Carries the normalized values used to build a SQL WHERE clause. All
     string filters are stored as plain strings; callers are responsible for
     resolving trace scope and the ``text`` alias before constructing the
-    object.
+    object. The optional ``before_id`` parameter restricts matches to rows
+    with ``id < before_id`` and composes with every other filter part.
     """
 
     def __init__(  # noqa: PLR0913
@@ -107,6 +108,7 @@ class LogQueryFilters:
         prompt_id: object = None,
         text: str = "",
         use_default_view: bool = False,
+        before_id: int | None = None,
     ) -> None:
         self.trace = trace
         self.all_traces = all_traces
@@ -118,6 +120,7 @@ class LogQueryFilters:
         self.prompt_id = prompt_id
         self.text = text
         self.use_default_view = use_default_view
+        self.before_id = before_id
 
     @property
     def text_folded(self) -> str:
@@ -150,6 +153,8 @@ def _log_query_compile_where(filters: LogQueryFilters) -> tuple[str, list]:
       equivalence the same way the legacy ``str(a) == str(b)`` check did.
     * ``use_default_view``: adds the Option C clause
       ``event_type IN (six events) OR level IN ('warning','error','critical')``.
+    * ``before_id``: ``id < ?`` (primary-key range scan) when set; omitted when
+      ``None`` or non-positive. Composes with all other parts.
     """
     parts: list[str] = []
     params: list = []
@@ -197,6 +202,10 @@ def _log_query_compile_where(filters: LogQueryFilters) -> tuple[str, list]:
         )
         params.extend(_LOG_QUERY_DEFAULT_EVENTS)
         params.extend(level_names)
+
+    if filters.before_id is not None and filters.before_id > 0:
+        parts.append("id < ?")
+        params.append(filters.before_id)
 
     where = " AND ".join(parts) if parts else "1"
     return where, params

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import sqlite3
 from typing import TYPE_CHECKING
 
@@ -28,12 +30,26 @@ from builtin_tools.logquery_helpers import (
     _log_query_project,
     _LOG_QUERY_MAX_LIMIT,
 )
+from builtin_tools.text_utils import redact_vault_secrets
 from sqlite_log import connect_store, row_to_record
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
 
 logger = logging.getLogger(__name__)
+
+# Hard cap on the serialized size of a single log_detail record. Records above
+# this limit dump to the results directory and return only a preview + pointer.
+_LOG_DETAIL_MAX_CHARS: int = 65536
+
+# SQLite INTEGER is a signed 64-bit value; ids/before_id above this bound
+# cannot exist in the store and would raise OverflowError at bind time.
+_SQLITE_INT64_MAX: int = 2**63 - 1
+
+# Valid trace-id format used to sanitise a stored record's trace before using it
+# as a results-directory path component. Stored content is untrusted; malformed
+# values fall back to the current run's trace context.
+_TRACE_ID_RE = re.compile(r"r-[0-9a-f]{8}")
 
 
 class SecretsTools:
@@ -167,7 +183,8 @@ class LogQueryTools:
         full 30-day retention window using indexed SQL filters. Supports
         trace/level/event_type/tool/since/text/prompt_id filters, a useful
         default view (Option C) when neither level, event_type, nor text is
-        supplied, and most-recent-N truncation via ``limit``.
+        supplied, most-recent-N truncation via ``limit``, and ``before_id``
+        paging for gapless newest→oldest enumeration.
 
         The ``text`` argument (alias: ``query``) performs a Unicode-aware
         case-insensitive (casefold) substring search against the compact JSON
@@ -187,18 +204,43 @@ class LogQueryTools:
         without the caller needing to know the current run's trace. Passing an
         explicit ``trace`` always overrides this auto-widening.
 
+        ``before_id`` restricts the page to records with ``id < before_id``
+        while leaving ``total_matched`` as the count of the entire match set.
+        Pages are always ordered by ``id`` (newest id first, re-ascended for
+        output), so consecutive ``before_id`` pages are gapless even when
+        emit-time ``ts`` order and drain-order ``id`` diverge.
+
         A missing/empty store path or an unreadable store file yields a
         well-formed EMPTY result rather than an error. ``caller_depth`` and
         ``caller_tag`` are accepted for dispatch symmetry with peer handlers.
         """
         # limit (most-recent-N kept); fall back to the default on bad input.
+        # OverflowError covers non-finite floats (JSON 1e999 → inf), whose
+        # int() coercion raises OverflowError, not ValueError.
         try:
             limit = int(args.get("limit", 50))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             limit = 50
         if limit <= 0:
             limit = 50
         limit = min(limit, _LOG_QUERY_MAX_LIMIT)
+
+        # before_id: primary-key page anchor. JSON null/absent/non-int/<=0 —
+        # and non-finite floats, whose int() coercion raises OverflowError —
+        # omit the filter, mirroring the graceful limit fallback. Values above
+        # the SQLite signed-64-bit bound also omit the filter (they cannot
+        # match any real row id and would raise OverflowError at bind time).
+        before_id_raw = args.get("before_id")
+        before_id: int | None = None
+        if before_id_raw is not None and not isinstance(before_id_raw, bool):
+            try:
+                before_id = int(before_id_raw)
+            except (TypeError, ValueError, OverflowError):
+                before_id = None
+        if before_id is not None and before_id <= 0:
+            before_id = None
+        if before_id is not None and before_id > _SQLITE_INT64_MAX:
+            before_id = None
 
         level_arg = args.get("level") or ""
         event_type_arg = args.get("event_type") or ""
@@ -235,10 +277,11 @@ class LogQueryTools:
 
         logger.info(
             "log_query: trace=%s level=%s event_type=%s tool=%s since=%s text=%s "
-            "prompt_id=%s limit=%d",
+            "prompt_id=%s limit=%d before_id=%s",
             trace or "<all>", level_arg or "-", event_type_arg or "-",
             tool_arg or "-", since_arg or "-", text_arg or "-",
             prompt_id_arg or "-", limit,
+            before_id if before_id is not None else "-",
         )
 
         path = self._owner._log_store_path
@@ -263,19 +306,34 @@ class LogQueryTools:
             prompt_id=prompt_id_arg,
             text=text_arg,
             use_default_view=use_default_view,
+            before_id=before_id,
         )
         where, params = _log_query_compile_where(filters)
+        # COUNT(*) reports the whole match set, excluding the before_id anchor.
+        count_filters = LogQueryFilters(
+            trace=trace,
+            all_traces=all_traces,
+            level=level_arg,
+            min_level=min_level,
+            event_type=event_type_arg,
+            tool=tool_arg,
+            since=since_arg,
+            prompt_id=prompt_id_arg,
+            text=text_arg,
+            use_default_view=use_default_view,
+        )
+        where_count, params_count = _log_query_compile_where(count_filters)
 
         try:
             total_matched = conn.execute(
-                f"SELECT COUNT(*) FROM events WHERE {where}", params
+                f"SELECT COUNT(*) FROM events WHERE {where_count}", params_count
             ).fetchone()[0]
             rows = conn.execute(
                 f"""
                 SELECT * FROM (
                     SELECT * FROM events WHERE {where}
-                    ORDER BY ts DESC, id DESC LIMIT ?
-                ) ORDER BY ts ASC, id ASC
+                    ORDER BY id DESC LIMIT ?
+                ) ORDER BY id ASC
                 """,
                 params + [limit],
             ).fetchall()
@@ -289,6 +347,14 @@ class LogQueryTools:
                 pass
 
         records = [row_to_record(row) for row in rows]
+        if before_id is not None:
+            for rec in records:
+                rec_id = rec.get("id")
+                if not isinstance(rec_id, int) or rec_id >= before_id:
+                    logger.warning(
+                        "log_query: returned record id=%s violates before_id=%s",
+                        rec_id, before_id,
+                    )
         truncated = total_matched > limit
         return self._log_query_result(records, total_matched, truncated)
 
@@ -332,5 +398,234 @@ class LogQueryTools:
             "error_type": "",
             "recoverable": True,
         }
+
+    def _log_detail_empty(self) -> dict:
+        """Return the well-formed EMPTY log_detail payload in the peer convention."""
+        return {
+            "success": True,
+            "output": json.dumps(
+                {"found": False, "record": None, "dumped": False, "dump_path": None},
+                ensure_ascii=False,
+            ),
+            "error": "",
+            "exit_code": 0,
+            "error_type": "",
+            "recoverable": True,
+        }
+
+    def _log_detail_result(
+        self,
+        record: dict,
+        dumped: bool,
+        dump_path: str | None,
+        note: str | None = None,
+    ) -> dict:
+        """Render a log_detail payload using the peer result-dict convention."""
+        payload: dict = {
+            "found": True,
+            "record": record,
+            "dumped": dumped,
+            "dump_path": dump_path,
+        }
+        if note is not None:
+            payload["note"] = note
+        return {
+            "success": True,
+            "output": json.dumps(payload, ensure_ascii=False),
+            "error": "",
+            "exit_code": 0,
+            "error_type": "",
+            "recoverable": True,
+        }
+
+    def _exec_log_detail(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+        """Return one full log record by its store ``id`` at full fidelity.
+
+        Read-only with respect to the SQLite log store; the oversized path may
+        write one redacted artifact to the run-scoped results directory. The
+        returned record is the same wide-column + extra projection produced by
+        :func:`sqlite_log.row_to_record`, including the top-level ``id`` field,
+        and is *not* passed through ``_log_query_project`` when it fits within
+        the 65536-char cap.
+
+        Args:
+            args: Tool arguments; ``id`` (int, required) is the store primary key.
+            caller_depth: Accepted for dispatch symmetry with peer handlers.
+            caller_tag: Accepted for dispatch symmetry with peer handlers.
+
+        Returns:
+            A standard result dict whose ``output`` is a JSON object:
+            * found, in cap: ``{"found": True, "record": {...}, "dumped": False,
+              "dump_path": None}``
+            * found, oversized, dumped: ``{"found": True, "record": <preview>,
+              "dumped": True, "dump_path": "..."}``
+            * not-found / unreadable store / invalid or out-of-range id:
+              ``{"found": False, "record": None, "dumped": False,
+              "dump_path": None}``
+        """
+        raw_id = args.get("id")
+        if (
+            isinstance(raw_id, bool)
+            or not isinstance(raw_id, int)
+            or raw_id <= 0
+            or raw_id > _SQLITE_INT64_MAX
+        ):
+            return self._log_detail_empty()
+
+        path = self._owner._log_store_path
+        if not path:
+            return self._log_detail_empty()
+
+        try:
+            conn = connect_store(path)
+            conn.execute("PRAGMA busy_timeout = 3000")
+        except (OSError, sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            logger.warning("log_detail: cannot open log store %s: %s", path, exc)
+            return self._log_detail_empty()
+
+        try:
+            row = conn.execute("SELECT * FROM events WHERE id = ?", (raw_id,)).fetchone()
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning("log_detail: query failed for store %s: %s", path, exc)
+            return self._log_detail_empty()
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+        if row is None:
+            return self._log_detail_empty()
+
+        record = row_to_record(row)
+        # The 65536-char gate measures the compact serialization; the emitted
+        # payload uses default (spaced) separators, so a record just under the
+        # gate serializes slightly larger in the tool output. The cap is a
+        # fidelity threshold, not an output budget.
+        serialized = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        if len(serialized) <= _LOG_DETAIL_MAX_CHARS:
+            # Trust model (design D5): structured records are vault-redacted at
+            # ingestion by the shared structlog chain (agent_logging), so the
+            # returned record is not re-redacted here; the oversized-dump path
+            # below re-applies the pass as idempotent defense-in-depth for the
+            # on-disk artifact (the spec anchors that pass: MUST NOT be weaker
+            # than the shell path's).
+            return self._log_detail_result(record, dumped=False, dump_path=None)
+
+        # Oversized: project a preview, dump the full record to results dir.
+        preview = _log_query_project(record)
+        results_dir = getattr(self._owner._paths, "results_dir", "")
+        if not results_dir:
+            note = (
+                "Full record exceeds the 65536-character cap but no results "
+                "directory is configured; returning a projected preview only."
+            )
+            return self._log_detail_result(
+                preview, dumped=False, dump_path=None, note=note
+            )
+
+        # Trace selection: prefer the record's own trace if it matches the
+        # canonical trace-id format; otherwise fall back to the current run's
+        # trace context; if that also fails, generate a fresh trace id.
+        trace_val = record.get("trace")
+        trace_id = ""
+        if isinstance(trace_val, str) and _TRACE_ID_RE.fullmatch(trace_val):
+            trace_id = trace_val
+        if not trace_id:
+            trace_id = str(structlog.contextvars.get_contextvars().get("trace", "") or "")
+        if not _TRACE_ID_RE.fullmatch(trace_id):
+            # Local import mirrors the project pattern for trace helpers.
+            from trace_context import new_trace_id
+            trace_id = new_trace_id()
+
+        dest_dir = os.path.join(results_dir, trace_id)
+
+        # Containment check: the resolved destination must stay within results_dir
+        # before any filesystem mutation.
+        resolved = os.path.realpath(dest_dir)
+        results_real = os.path.realpath(results_dir)
+        sep = os.sep
+        if not (resolved == results_real or resolved.startswith(results_real + sep)):
+            logger.warning(
+                "log_detail: dump directory %r is not contained within results_dir %r",
+                resolved, results_real,
+            )
+            note = (
+                "Full record exceeds the 65536-character cap but the dump "
+                "path is outside the results directory; returning a projected "
+                "preview only."
+            )
+            return self._log_detail_result(
+                preview, dumped=False, dump_path=None, note=note
+            )
+
+        try:
+            os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+            os.chmod(dest_dir, 0o700)
+        except OSError as exc:
+            logger.warning("log_detail: cannot create dump directory %s: %s", dest_dir, exc)
+            note = (
+                f"Full record exceeds the 65536-character cap but the dump "
+                f"directory could not be created ({exc}); returning a "
+                f"projected preview only."
+            )
+            return self._log_detail_result(
+                preview, dumped=False, dump_path=None, note=note
+            )
+
+        # Redaction pass over the serialized record, via the same shared routine
+        # used by the shell oversized-output path so neither path can drift.
+        secrets_list = getattr(self._owner, "_vault_secrets", []) or []
+        serialized = redact_vault_secrets(serialized, secrets_list)
+
+        base_path = os.path.join(dest_dir, f"log-detail-{raw_id}.json")
+
+        # Records are immutable (append-only store), so a repeated call for the
+        # same id produces byte-identical content. Reuse the existing artifact
+        # instead of allocating an unbounded collision suffix per call; divergent
+        # content (e.g. a changed vault-secrets list) still falls through to the
+        # collision-counter path and never clobbers.
+        if os.path.exists(base_path):
+            try:
+                with open(base_path, encoding="utf-8") as fh:
+                    if fh.read() == serialized:
+                        return self._log_detail_result(
+                            preview, dumped=True, dump_path=os.path.abspath(base_path)
+                        )
+            except OSError:
+                pass  # unreadable existing artifact — fall through and rewrite via suffix
+
+        final_path = base_path
+        counter = 1
+        while os.path.exists(final_path):
+            base, ext = os.path.splitext(base_path)
+            final_path = f"{base}-{counter}{ext}"
+            counter += 1
+
+        tmp_path = f"{final_path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(serialized)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, final_path)
+            abs_path = os.path.abspath(final_path)
+            return self._log_detail_result(preview, dumped=True, dump_path=abs_path)
+        except OSError as exc:
+            logger.warning("log_detail: cannot write dump %s: %s", final_path, exc)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            note = (
+                f"Full record exceeds the 65536-character cap but the dump "
+                f"could not be written ({exc}); returning a projected preview only."
+            )
+            return self._log_detail_result(
+                preview, dumped=False, dump_path=None, note=note
+            )
 
 

@@ -274,11 +274,12 @@ def test_exact_total_matched_across_large_match_set(make_builtin_executor, tmp_p
     assert payload["total_matched"] == 120
     assert payload["count"] == 50
     assert payload["truncated"] is True
-    # Returned records are the most recent 50, re-ascended.  Because the
-    # artificial timestamps use a fixed hour prefix, lexical sorting on the
-    # formatted minute suffix returns minutes 50-99 (the last 50 inserted).
+    # The page query is always ordered by id (newest id first, re-ascended for
+    # output), so the 50 returned records are those with the highest ids.
+    returned_ids = [r["id"] for r in payload["records"]]
+    assert returned_ids == list(range(71, 121))
     assert [r["ts"] for r in payload["records"]] == [
-        f"2026-07-05T12:{i:02d}:00" for i in range(50, 100)
+        f"2026-07-05T12:{i:02d}:00" for i in range(70, 120)
     ]
 
 
@@ -596,3 +597,334 @@ def test_max_output_size_cap(make_builtin_executor, tmp_path):
     assert payload["count"] >= 1
     assert payload["truncated"] is True
     assert payload["total_matched"] == 2
+
+
+# ---------------------------------------------------------------------------
+# id exposure and before_id paging (spec 5.1-5.4)
+# ---------------------------------------------------------------------------
+
+def _insert_records_with_id(path: str, records: list[dict]) -> None:
+    """Create schema and insert records with explicit integer ids.
+
+    The id is prepended to the row tuple produced by ``record_to_row``.
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_DDL)
+    if records:
+        for rec in records:
+            rec_id = rec["id"]
+            base_row = record_to_row({k: v for k, v in rec.items() if k != "id"})
+            row = (rec_id,) + base_row
+            conn.execute(
+                """
+                INSERT INTO events
+                (id, ts, level, logger, agent, trace, prompt_id, event_type, msg, extra, search_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                row,
+            )
+    conn.commit()
+    conn.close()
+
+
+def test_every_record_carries_store_id(make_builtin_executor, tmp_path):
+    """Every log_query record includes its immutable SQLite primary key."""
+    records = [
+        {"id": 10, "ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_START"},
+        {"id": 20, "ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_END"},
+        {"id": 30, "ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "info",
+         "event_type": "LLM_CALL"},
+    ]
+    path = str(tmp_path / "ids.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path)
+
+    payload = _query(exc, trace=TRACE_A, level="DEBUG")
+    returned_ids = [r["id"] for r in payload["records"]]
+    assert returned_ids == [10, 20, 30]
+    # Direct SQLite cross-check.
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute("SELECT id FROM events ORDER BY id")
+        db_ids = [row["id"] for row in cur.fetchall()]
+    finally:
+        conn.close()
+    assert returned_ids == db_ids
+
+
+def test_before_id_pages_newest_to_oldest_gapless(make_builtin_executor, tmp_path):
+    """120 records ids 801..920: two pages, no overlap, total_matched constant."""
+    records = [
+        {"id": 800 + i, "ts": f"2026-07-05T12:{i:02d}:00", "trace": TRACE_A,
+         "level": "info", "event_type": "TOOL_END", "tool": "shell"}
+        for i in range(1, 121)
+    ]
+    path = str(tmp_path / "paging.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path, max_output=1_000_000)
+
+    # Page 1: newest 50 ids (920 down to 871), re-ascended for output.
+    p1 = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=50)
+    ids1 = [r["id"] for r in p1["records"]]
+    assert ids1 == list(range(871, 921))
+    assert p1["total_matched"] == 120
+    assert p1["truncated"] is True
+
+    # Page 2: anchored on the smallest id seen.
+    before = min(ids1)
+    p2 = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=50, before_id=before)
+    ids2 = [r["id"] for r in p2["records"]]
+    assert ids2 == list(range(821, 871))
+    assert p2["total_matched"] == 120
+    assert p2["truncated"] is True
+    assert not set(ids1) & set(ids2)
+
+    # Walk to exhaustion.
+    all_ids = set(ids1) | set(ids2)
+    while True:
+        page_ids = [r["id"] for r in p2["records"]]
+        if not page_ids:
+            break
+        before = min(page_ids)
+        p2 = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=50, before_id=before)
+        new_ids = [r["id"] for r in p2["records"]]
+        assert not all_ids & set(new_ids), "walk produced duplicate ids"
+        all_ids.update(new_ids)
+
+    assert sorted(all_ids) == list(range(801, 921))
+
+
+def test_before_id_walk_while_appending(make_builtin_executor, tmp_path):
+    """Live appends between pages: no duplicates, total_matched grows, ends on empty page."""
+    records = [
+        {"id": i, "ts": f"2026-07-05T12:{i:02d}:00", "trace": TRACE_A,
+         "level": "info", "event_type": "TOOL_END", "tool": "shell"}
+        for i in range(1, 61)
+    ]
+    path = str(tmp_path / "live.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path, max_output=1_000_000)
+
+    p1 = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=25)
+    ids1 = [r["id"] for r in p1["records"]]
+    assert p1["total_matched"] == 60
+
+    # Append new matching rows with higher ids between pages.
+    conn = sqlite3.connect(path)
+    try:
+        for i in range(61, 81):
+            rec = {"id": i, "ts": f"2026-07-05T12:{i:02d}:00", "trace": TRACE_A,
+                   "level": "info", "event_type": "TOOL_END", "tool": "shell"}
+            base_row = record_to_row({k: v for k, v in rec.items() if k != "id"})
+            row = (i,) + base_row
+            conn.execute(
+                """
+                INSERT INTO events
+                (id, ts, level, logger, agent, trace, prompt_id, event_type, msg, extra, search_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                row,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    before = min(ids1)
+    p2 = _query(exc, trace=TRACE_A, event_type="TOOL_END", limit=25, before_id=before)
+    ids2 = [r["id"] for r in p2["records"]]
+    assert p2["total_matched"] == 80, "total_matched must grow after live appends"
+    assert not set(ids1) & set(ids2), "page ids must never repeat"
+
+    all_ids = set(ids1) | set(ids2)
+    current = p2
+    while True:
+        page_ids = [r["id"] for r in current["records"]]
+        if not page_ids:
+            break
+        before = min(page_ids)
+        current = _query(
+            exc, trace=TRACE_A, event_type="TOOL_END", limit=25, before_id=before
+        )
+        new_ids = [r["id"] for r in current["records"]]
+        assert not all_ids & set(new_ids)
+        all_ids.update(new_ids)
+
+    # The walk covers the original 60 records exactly; new appends have higher
+    # ids than every page anchor and are correctly outside the walk.
+    assert sorted(all_ids) == list(range(1, 61))
+
+
+def test_before_id_gapless_under_ts_id_inversion_count_truncated(
+    make_builtin_executor, tmp_path,
+):
+    """Older-ts records have higher ids; count-truncated walk is still gapless."""
+    # Newest ts first, older ts second → ids increase opposite to ts order.
+    records = [
+        {"id": 1, "ts": "2026-07-05T10:00:06", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "newest"},
+        {"id": 2, "ts": "2026-07-05T10:00:05", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "old"},
+        {"id": 3, "ts": "2026-07-05T10:00:04", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "older"},
+        {"id": 4, "ts": "2026-07-05T10:00:03", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "oldest"},
+        {"id": 5, "ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "very oldest"},
+        {"id": 6, "ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "ancient"},
+    ]
+    path = str(tmp_path / "inversion.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path, max_output=10_000)
+
+    all_ids: set[int] = set()
+    before = None
+    for _ in range(5):
+        args = {"trace": TRACE_A, "event_type": "TOOL_FAILED", "limit": 3}
+        if before is not None:
+            args["before_id"] = before
+        payload = _query(exc, **args)
+        page_ids = [r["id"] for r in payload["records"]]
+        if not page_ids:
+            break
+        assert not all_ids & set(page_ids)
+        all_ids.update(page_ids)
+        before = min(page_ids)
+
+    assert sorted(all_ids) == [1, 2, 3, 4, 5, 6]
+
+
+def test_before_id_gapless_under_ts_id_inversion_size_trimmed(
+    make_builtin_executor, tmp_path,
+):
+    """Inversion + max_output trim: kept ids are the highest, walk stays gapless."""
+    records = [
+        {"id": 1, "ts": "2026-07-05T10:00:04", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "x" * 2000},
+        {"id": 2, "ts": "2026-07-05T10:00:03", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "x" * 2000},
+        {"id": 3, "ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "x" * 2000},
+        {"id": 4, "ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "err": "x" * 2000},
+    ]
+    path = str(tmp_path / "inversion_size.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path, max_output=120)
+
+    # First page: should be trimmed to the highest ids only.
+    p1 = _query(exc, trace=TRACE_A, event_type="TOOL_FAILED", limit=50)
+    kept_ids = [r["id"] for r in p1["records"]]
+    assert p1["truncated"] is True
+    assert kept_ids == sorted(kept_ids), "output is re-ascended"
+    assert 4 in kept_ids, "size-trim must keep the highest ids"
+
+    all_ids = set(kept_ids)
+    before = min(kept_ids)
+    while True:
+        p = _query(exc, trace=TRACE_A, event_type="TOOL_FAILED", limit=50, before_id=before)
+        page_ids = [r["id"] for r in p["records"]]
+        if not page_ids:
+            break
+        assert not all_ids & set(page_ids)
+        all_ids.update(page_ids)
+        before = min(page_ids)
+
+    assert sorted(all_ids) == [1, 2, 3, 4]
+
+
+def test_before_id_composes_with_other_filters(make_builtin_executor, tmp_path):
+    """before_id works with event_type, prompt_id, and text filters."""
+    records = [
+        {"id": 10, "ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "tool": "shell", "prompt_id": "01PROMPTAAAA",
+         "err": "alpha timeout"},
+        {"id": 20, "ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_END", "tool": "shell", "prompt_id": "01PROMPTAAAA"},
+        {"id": 30, "ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "tool": "file_read", "prompt_id": "01PROMPTBBBB",
+         "err": "beta timeout"},
+        {"id": 40, "ts": "2026-07-05T10:00:03", "trace": TRACE_A, "level": "info",
+         "event_type": "TOOL_FAILED", "tool": "shell", "prompt_id": "01PROMPTAAAA",
+         "err": "gamma timeout"},
+    ]
+    path = str(tmp_path / "compose.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path)
+
+    # before_id + event_type.
+    p = _query(exc, trace=TRACE_A, event_type="TOOL_FAILED", before_id=35)
+    assert [r["id"] for r in p["records"]] == [10, 30]
+
+    # before_id + prompt_id.
+    p = _query(exc, trace=TRACE_A, prompt_id="01PROMPTAAAA", before_id=40)
+    assert [r["id"] for r in p["records"]] == [10, 20]
+
+    # before_id + text.
+    p = _query(exc, trace=TRACE_A, text="timeout", before_id=40)
+    assert [r["id"] for r in p["records"]] == [10, 30]
+
+
+def test_invalid_before_id_omits_filter_returns_newest_page(make_builtin_executor, tmp_path):
+    """null, non-int, <=0, and out-of-range before_id values are ignored.
+
+    ``float("inf")`` pins the coercion-overflow boundary: JSON ``1e999``
+    parses to inf, and ``int(inf)`` raises OverflowError — the handler must
+    degrade to the newest page, never raise.
+    """
+    records = [
+        {"id": i, "ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A,
+         "level": "info", "event_type": "TOOL_START"}
+        for i in range(1, 11)
+    ]
+    path = str(tmp_path / "invalid.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path)
+
+    baseline = _query(exc, trace=TRACE_A, event_type="TOOL_START", limit=5)
+    baseline_ids = [r["id"] for r in baseline["records"]]
+
+    for bad in (None, "abc", 0, -5, 2**63, float("inf"), float("nan")):
+        payload = _query(
+            exc, trace=TRACE_A, event_type="TOOL_START", limit=5, before_id=bad
+        )
+        assert [r["id"] for r in payload["records"]] == baseline_ids
+
+
+def test_infinite_limit_falls_back_to_default(make_builtin_executor, tmp_path):
+    """A limit of inf (JSON 1e999) degrades to the default, never raises."""
+    records = [
+        {"id": i, "ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A,
+         "level": "info", "event_type": "TOOL_START"}
+        for i in range(1, 11)
+    ]
+    path = str(tmp_path / "inf_limit.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path)
+
+    payload = _query(exc, trace=TRACE_A, event_type="TOOL_START",
+                     limit=float("inf"))
+    assert payload["count"] == 10  # default limit 50 covers the whole set
+
+
+def test_all_result_pages_are_id_ordered(make_builtin_executor, tmp_path):
+    """Every returned page is id-ascending in output (always-id-DESC rule)."""
+    records = [
+        {"id": i, "ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A,
+         "level": "info", "event_type": "TOOL_START"}
+        for i in range(1, 21)
+    ]
+    path = str(tmp_path / "ordered.sqlite")
+    _insert_records_with_id(path, records)
+    exc = make_builtin_executor(log_store_path=path)
+
+    p1 = _query(exc, trace=TRACE_A, event_type="TOOL_START", limit=7)
+    assert [r["id"] for r in p1["records"]] == sorted(r["id"] for r in p1["records"])
+
+    before = min(r["id"] for r in p1["records"])
+    p2 = _query(exc, trace=TRACE_A, event_type="TOOL_START", limit=7, before_id=before)
+    assert [r["id"] for r in p2["records"]] == sorted(r["id"] for r in p2["records"])
+

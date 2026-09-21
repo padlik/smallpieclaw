@@ -1,4 +1,4 @@
-"""Output truncation helpers for built-in tools.
+"""Output truncation and redaction helpers for built-in tools.
 
 Stateless leaf module: no imports back into ``builtin_executor`` or any handler
 module, so it is safe to import eagerly.
@@ -35,3 +35,21 @@ def _truncate_tail(tail: str, total_chars: int, limit: int) -> str:
     omitted = total_chars - limit
     kept = tail[-limit:]
     return f"[...{omitted} chars omitted, showing last {limit} chars...]\n{kept}"
+
+
+_REDACTED_PLACEHOLDER = "[REDACTED]"
+
+
+def redact_vault_secrets(text: str, secrets: "list[str] | tuple[str, ...]") -> str:
+    """Replace every non-empty entry of *secrets* in *text* with [REDACTED].
+
+    Shared redaction core for retained tool artifacts: the shell oversized
+    output path (``_finalize_shell_log``) and the log_detail oversized-record
+    dump both route through this single routine so neither path's redaction
+    can silently weaken relative to the other. Idempotent (already-redacted
+    text is unchanged).
+    """
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, _REDACTED_PLACEHOLDER)
+    return text

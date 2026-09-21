@@ -1,0 +1,396 @@
+"""Tests for the ``log_detail`` built-in tool.
+
+Covers full-fidelity reads, identity against ``log_query`` previews, EMPTY
+payloads for missing/unreadable/invalid cases, and the oversized-record dump
+path with trace validation, redaction, and degraded fallback behavior.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from pathlib import Path
+
+import pytest
+import structlog
+
+from builtin_tools.descriptors import BUILTIN_TOOLS
+from builtin_tools.schemas import BUILTIN_TOOL_SCHEMAS
+from config_schema import ExecutorPaths
+from sqlite_log import SCHEMA_DDL, record_to_row
+
+TRACE_A = "r-aaaaaaaa"
+TRACE_VALID = "r-1a2b3c4d"
+TRACE_CURRENT = "r-c0ffee01"
+
+
+@pytest.fixture(autouse=True)
+def _clear_contextvars():
+    """Keep structlog contextvars isolated between tests."""
+    structlog.contextvars.clear_contextvars()
+    yield
+    structlog.contextvars.clear_contextvars()
+
+
+def _insert_records(path: str, records: list[dict]) -> None:
+    """Create schema and insert records using the standard row layout."""
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_DDL)
+    if records:
+        rows = [record_to_row(rec) for rec in records]
+        conn.executemany(
+            """
+            INSERT INTO events
+            (ts, level, logger, agent, trace, prompt_id, event_type, msg, extra, search_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    conn.commit()
+    conn.close()
+
+
+def _detail(exc, record_id: int) -> dict:
+    """Call log_detail through public execute() and parse the payload."""
+    result = exc.execute("log_detail", {"id": record_id})
+    assert result["success"] is True
+    assert result["exit_code"] == 0
+    return json.loads(result["output"])
+
+
+# ---------------------------------------------------------------------------
+# 5.5 — full fidelity + identity
+# ---------------------------------------------------------------------------
+
+class TestLogDetailFullFidelity:
+    def test_full_err_returned_untruncated(self, make_builtin_executor, tmp_path):
+        """log_detail returns a >500-char err field verbatim."""
+        err_text = "E" * 600
+        records = [
+            {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+             "event_type": "TOOL_FAILED", "tool": "shell", "err": err_text},
+        ]
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, records)
+        exc = make_builtin_executor(log_store_path=path)
+
+        payload = _detail(exc, 1)
+        assert payload["found"] is True
+        assert payload["dumped"] is False
+        assert payload["dump_path"] is None
+        assert payload["record"]["err"] == err_text
+        assert "…[" not in payload["record"]["err"]
+
+    def test_identity_against_log_query_preview(self, make_builtin_executor, tmp_path):
+        """log_detail's record is the same row as log_query's preview."""
+        err_text = "X" * 600
+        records = [
+            {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+             "event_type": "TOOL_FAILED", "tool": "shell", "err": err_text},
+        ]
+        path = str(tmp_path / "identity.sqlite")
+        _insert_records(path, records)
+        exc = make_builtin_executor(log_store_path=path)
+
+        q = json.loads(exc.execute("log_query", {
+            "trace": TRACE_A, "level": "DEBUG",
+        })["output"])
+        preview = q["records"][0]
+        detail = _detail(exc, preview["id"])
+        record = detail["record"]
+
+        assert record["id"] == preview["id"]
+        assert record["trace"] == preview["trace"] == TRACE_A
+        assert record["event_type"] == preview["event_type"] == "TOOL_FAILED"
+        assert record["ts"] == preview["ts"]
+        assert preview["err"].endswith(" chars]")
+        assert record["err"] == err_text
+        assert record["err"].startswith(preview["err"][:20])
+
+
+# ---------------------------------------------------------------------------
+# 5.6 — EMPTY payloads
+# ---------------------------------------------------------------------------
+
+class TestLogDetailEmpty:
+    EMPTY = {"found": False, "record": None, "dumped": False, "dump_path": None}
+
+    def _assert_empty(self, payload: dict) -> None:
+        keys = {"found", "record", "dumped", "dump_path"}
+        assert {k: payload[k] for k in keys} == self.EMPTY
+
+    def test_not_found_id(self, make_builtin_executor, tmp_path):
+        path = str(tmp_path / "empty.sqlite")
+        _insert_records(path, [])
+        exc = make_builtin_executor(log_store_path=path)
+        self._assert_empty(_detail(exc, 999999))
+
+    def test_missing_store_path(self, make_builtin_executor, tmp_path):
+        """An empty log_store_path yields an EMPTY payload."""
+        exc = make_builtin_executor(log_store_path="")
+        self._assert_empty(_detail(exc, 1))
+
+    def test_unreadable_store_file(self, make_builtin_executor, tmp_path):
+        path = str(tmp_path / "notadb.sqlite")
+        Path(path).write_bytes(b"this is not a database")
+        exc = make_builtin_executor(log_store_path=path)
+        self._assert_empty(_detail(exc, 1))
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        ["abc", True, False, 0, -1, [], {}, 2**63, 2**64],
+    )
+    def test_invalid_id(self, make_builtin_executor, tmp_path, bad_id):
+        path = str(tmp_path / "invalid.sqlite")
+        _insert_records(path, [])
+        exc = make_builtin_executor(log_store_path=path)
+        self._assert_empty(_detail(exc, bad_id))
+
+
+# ---------------------------------------------------------------------------
+# 5.7 — oversized dump
+# ---------------------------------------------------------------------------
+
+class TestLogDetailOversized:
+    def _make_executor(self, make_builtin_executor, tmp_path, results_dir: str, **extra):
+        path = str(tmp_path / "detail.sqlite")
+        return make_builtin_executor(
+            max_output=4000,
+            paths=ExecutorPaths(log_store_path=path, results_dir=results_dir, **extra),
+        )
+
+    def _oversized_record(self, trace: str | None = TRACE_VALID) -> dict:
+        rec: dict = {
+            "ts": "2026-07-05T10:00:00",
+            "level": "error",
+            "event_type": "TOOL_FAILED",
+            "tool": "shell",
+            "err": "E" * 70000,
+        }
+        if trace is not None:
+            rec["trace"] = trace
+        return rec
+
+    def test_oversized_dumped_with_record_trace(self, make_builtin_executor, tmp_path):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(TRACE_VALID)])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+
+        payload = _detail(exc, 1)
+        assert payload["found"] is True
+        assert payload["dumped"] is True
+        assert payload["dump_path"]
+        assert payload["dump_path"].startswith(os.path.abspath(results_dir))
+        assert "log-detail-1.json" in payload["dump_path"]
+        assert payload["record"]["err"].endswith(" chars]")
+
+        with open(payload["dump_path"], encoding="utf-8") as fh:
+            dumped = json.load(fh)
+        assert dumped["err"] == "E" * 70000
+        assert dumped["trace"] == TRACE_VALID
+
+    def test_oversized_no_trace_uses_current_trace(self, make_builtin_executor, tmp_path):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(trace=None)])
+        structlog.contextvars.bind_contextvars(trace=TRACE_CURRENT)
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+
+        try:
+            payload = _detail(exc, 1)
+        finally:
+            structlog.contextvars.clear_contextvars()
+
+        assert payload["found"] is True
+        assert payload["dumped"] is True
+        expected_dir = os.path.join(results_dir, TRACE_CURRENT)
+        assert payload["dump_path"].startswith(os.path.abspath(expected_dir))
+        assert os.path.isdir(expected_dir)
+
+    def test_malformed_trace_falls_back_to_current(self, make_builtin_executor, tmp_path):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(trace="../../evil")])
+        structlog.contextvars.bind_contextvars(trace=TRACE_CURRENT)
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+
+        try:
+            payload = _detail(exc, 1)
+        finally:
+            structlog.contextvars.clear_contextvars()
+
+        assert payload["found"] is True
+        assert payload["dumped"] is True
+        assert payload["dump_path"].startswith(os.path.abspath(results_dir))
+        subdirs = [n for n in os.listdir(results_dir) if os.path.isdir(os.path.join(results_dir, n))]
+        assert subdirs == [TRACE_CURRENT]
+
+    def test_redaction_preserved_in_dump(self, make_builtin_executor, tmp_path):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        secret = "supersecret"
+        rec = self._oversized_record(TRACE_VALID)
+        rec["err"] = ("A" * 1000) + secret + ("B" * 66000)
+        _insert_records(path, [rec])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(
+                results_dir=results_dir, log_store_path=path, vault_secrets=[secret]
+            ),
+        )
+
+        payload = _detail(exc, 1)
+        assert payload["dumped"] is True
+        with open(payload["dump_path"], encoding="utf-8") as fh:
+            dumped_text = fh.read()
+        assert secret not in dumped_text
+        assert "[REDACTED]" in dumped_text
+
+    def test_dump_permissions_owner_only(self, make_builtin_executor, tmp_path):
+        """The dump artifact is 0600 inside a 0700 trace directory (POSIX)."""
+        if os.name == "nt":
+            return
+        import stat
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(TRACE_VALID)])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+
+        payload = _detail(exc, 1)
+        assert payload["dumped"] is True
+        file_mode = stat.S_IMODE(os.stat(payload["dump_path"]).st_mode)
+        dir_mode = stat.S_IMODE(os.stat(os.path.dirname(payload["dump_path"])).st_mode)
+        assert file_mode == 0o600
+        assert dir_mode == 0o700
+
+    def test_dump_collision_counter_never_overwrites(self, make_builtin_executor, tmp_path):
+        """A pre-existing log-detail-<id>.json shifts the dump to the -1 suffix
+        and leaves the pre-existing file untouched."""
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(TRACE_VALID)])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+        trace_dir = os.path.join(results_dir, TRACE_VALID)
+        os.makedirs(trace_dir, exist_ok=True)
+        preexisting = os.path.join(trace_dir, "log-detail-1.json")
+        Path(preexisting).write_text("pre-existing artifact")
+
+        payload = _detail(exc, 1)
+        assert payload["dumped"] is True
+        assert payload["dump_path"].endswith("log-detail-1-1.json")
+        # The pre-existing file is never overwritten.
+        with open(preexisting, encoding="utf-8") as fh:
+            assert fh.read() == "pre-existing artifact"
+
+    def test_dump_dedup_reuses_identical_artifact(self, make_builtin_executor, tmp_path):
+        """A second call for the same oversized record reuses the existing dump.
+
+        Records are immutable, so a repeat call produces byte-identical
+        content: the returned dump_path must be the base name (no collision
+        suffix) and the artifact content must match the record.
+        """
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(TRACE_VALID)])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+
+        first = _detail(exc, 1)
+        assert first["dumped"] is True
+        assert first["dump_path"].endswith("log-detail-1.json")
+
+        second = _detail(exc, 1)
+        assert second["dumped"] is True
+        assert second["dump_path"] == first["dump_path"]
+        assert not second["dump_path"].endswith("log-detail-1-1.json")
+
+        with open(second["dump_path"], encoding="utf-8") as fh:
+            dumped = json.load(fh)
+        assert dumped["err"] == "E" * 70000
+        # No collision-suffixed sibling was created.
+        trace_dir = os.path.join(results_dir, TRACE_VALID)
+        assert sorted(os.listdir(trace_dir)) == ["log-detail-1.json"]
+
+    def test_results_dir_unset_returns_preview_note(self, make_builtin_executor, tmp_path):
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(TRACE_VALID)])
+        exc = make_builtin_executor(log_store_path=path)
+        # Default ExecutorPaths has empty results_dir.
+        assert not exc._paths.results_dir
+
+        payload = _detail(exc, 1)
+        assert payload["found"] is True
+        assert payload["dumped"] is False
+        assert payload["dump_path"] is None
+        assert payload["record"]["err"].endswith(" chars]")
+        assert payload.get("note")
+        assert "65536" in payload["note"]
+
+    def test_dump_write_failure_returns_preview_note(self, make_builtin_executor, tmp_path):
+        results_dir = str(tmp_path / "afile" / "results")
+        Path(tmp_path / "afile").write_text("I am a file, not a directory")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(TRACE_VALID)])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+
+        payload = _detail(exc, 1)
+        assert payload["found"] is True
+        assert payload["dumped"] is False
+        assert payload["dump_path"] is None
+        assert payload["record"]["err"].endswith(" chars]")
+        assert payload.get("note")
+
+
+# ---------------------------------------------------------------------------
+# 5.10 — descriptor / schema content assertions
+# ---------------------------------------------------------------------------
+
+class TestLogDetailDescriptorSchema:
+    def test_log_query_descriptor_teaches_budget_interplay(self):
+        desc = BUILTIN_TOOLS["log_query"].description
+        assert "raising 'limit' alone does not return more records" in desc
+        assert "limit: 1" in desc
+        assert "COUNT-probe" in desc
+        assert "before_id paging" in desc
+        assert "log_detail" in desc
+        assert "ends when a page returns no records" in desc
+        assert "NOT when retrieved counts reach total_matched" in desc
+        assert "prompt_id or an explicit trace" in desc
+        assert "auto-widen to ALL traces" in desc
+
+    def test_log_detail_descriptor_covers_behavior(self):
+        desc = BUILTIN_TOOLS["log_detail"].description
+        assert "65536" in desc
+        assert "dump_path" in desc
+        # The descriptor uses typographic double quotes around the EMPTY example.
+        assert "found" in desc and "false" in desc
+        assert '{"id": 3108}' in desc
+
+    def test_log_detail_schema_requires_id_integer(self):
+        schema = BUILTIN_TOOL_SCHEMAS["log_detail"]
+        props = schema["parameters"]["properties"]
+        assert schema["parameters"]["required"] == ["id"]
+        assert props["id"]["type"] == "integer"
+
+    def test_log_query_schema_has_before_id_integer(self):
+        props = BUILTIN_TOOL_SCHEMAS["log_query"]["parameters"]["properties"]
+        assert "before_id" in props
+        assert props["before_id"]["type"] == "integer"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

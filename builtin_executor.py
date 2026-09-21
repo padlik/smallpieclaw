@@ -343,6 +343,9 @@ class BuiltinExecutor:
             "log_query": lambda a, ctx: self._logquery._exec_log_query(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
             ),
+            "log_detail": lambda a, ctx: self._logquery._exec_log_detail(
+                a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
+            ),
             "shell_env_set": lambda a, ctx: self._shell_env_tools.shell_env_set(a),
             "shell_env_unset": lambda a, ctx: self._shell_env_tools.shell_env_unset(a),
             "shell_env_list": lambda a, ctx: self._shell_env_tools.shell_env_list(a),

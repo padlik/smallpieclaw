@@ -246,7 +246,9 @@ def row_to_record(row: sqlite3.Row) -> dict:
     Wide columns are merged first (only non-NULL values are included), then the
     parsed ``extra`` JSON is layered on top so that keys such as ``tool``,
     ``exit``, ``dur_ms``, ``err``, and ``model`` appear at the top level exactly
-    as they did in the original JSONL records.
+    as they did in the original JSONL records. The row's integer ``id``
+    (SQLite primary key) is also exposed as a top-level ``id`` field so every
+    reader shares one stable record reference.
     """
     record: dict = {}
     for col in WIDE_COLUMNS:
@@ -257,6 +259,9 @@ def row_to_record(row: sqlite3.Row) -> dict:
     if extra_json:
         extra = json.loads(extra_json)
         record.update(extra)
+    # Injected last so the immutable row PK always wins even if a stored
+    # record's extra JSON happened to carry an "id" key.
+    record["id"] = row["id"]
     return record
 
 

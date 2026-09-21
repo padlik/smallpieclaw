@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from builtin_tools.patterns import _is_dangerous_shell
 from builtin_tools.text_utils import _truncate_tail
+from builtin_tools.text_utils import redact_vault_secrets
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
@@ -571,9 +572,7 @@ class ShellTools:
             try:
                 with open(path, 'r', encoding='utf-8', errors='replace') as _f:
                     _content = _f.read()
-                for _s in _secrets:
-                    if _s:
-                        _content = _content.replace(_s, '[REDACTED]')
+                _content = redact_vault_secrets(_content, _secrets)
                 with open(_tmp, 'w', encoding='utf-8') as _f:
                     _f.write(_content)
                 try:

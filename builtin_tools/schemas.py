@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Built-in tool schemas (21 tools, matching BUILTIN_TOOLS in descriptors.py)
+# Built-in tool schemas (22 tools + vision_query pseudo-schema, matching BUILTIN_TOOLS in descriptors.py)
 # ---------------------------------------------------------------------------
 
 BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -411,8 +411,25 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "description": "Filter records by the operator-facing prompt ID (globally-unique ULID string).",
                 },
+                "before_id": {
+                    "type": "integer",
+                    "description": "Only return records with id < before_id (paging anchor for newest→oldest walks).",
+                },
             },
             "required": [],
+        },
+    },
+    "log_detail": {
+        "description": "Read one full log record by its SQLite store id at full fidelity (no per-field truncation). Oversized records are dumped to the results directory; a preview and dump_path are returned.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "The SQLite primary key of the record, as returned by log_query.",
+                },
+            },
+            "required": ["id"],
         },
     },
     "vision_query": {
