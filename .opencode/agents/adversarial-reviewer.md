@@ -2,9 +2,13 @@
 description: Reviews adversarial-authoring drafts.
 mode: subagent
 model: openai/gpt-5.5
-permission:
-  edit: allow
-  bash: deny
+permissions:
+- action: edit
+  resource: '*'
+  effect: allow
+- action: shell
+  resource: '*'
+  effect: deny
 ---
 
 You are the reviewer in an adversarial authoring workflow.

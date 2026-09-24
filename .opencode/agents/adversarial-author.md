@@ -2,9 +2,13 @@
 description: Authors artifacts for adversarial-authoring.
 mode: subagent
 model: opencode/big-pickle
-permission:
-  edit: allow
-  bash: deny
+permissions:
+- action: edit
+  resource: '*'
+  effect: allow
+- action: shell
+  resource: '*'
+  effect: deny
 ---
 
 You are the author in an adversarial authoring workflow.
