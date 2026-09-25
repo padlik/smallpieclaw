@@ -69,3 +69,32 @@ Rule: A healthy, probed Linux nsjail is the only shell backend; lack of confinem
 - **WHEN** the agent runs a command that accesses a path not explicitly mounted in the jail config
 - **THEN** the path is not found (No such file or directory)
 - **AND** the host filesystem outside mounted paths is inaccessible
+
+### Requirement: nsjail configuration is host-private and immutable to jailed commands
+
+The system MUST store generated session-static and per-call nsjail configuration files in a verified owner-only host-private location that is not mounted into the jail. The resolved location MUST NOT be equal to, inside, or an ancestor of any jail-writable mount source, and MUST NOT be reachable through a read-write bind alias. This includes the writable host directories mounted as jail `/tmp` and `/tmp/<agent>`. A jailed command MUST NOT be able to rewrite configuration used by a subsequent shell launch or startup re-probe. If the location cannot be created with safe permissions or its non-overlap with writable mounts cannot be verified, shell MUST be unavailable with an actionable reason; the system MUST NOT fall back to a writable temporary location or to host subprocess/PTY execution.
+
+Feature: nsjail-shell-sandboxing
+Rule: Configuration controlling nsjail runs is host-private; failure to establish its integrity disables shell without fallback.
+
+#### Scenario: Generated configs are outside every writable jail mount
+- **GIVEN** the Linux nsjail backend is being initialized
+- **WHEN** the system selects the host-private config location
+- **THEN** the resolved directory and both session-static and per-call config files are owner-only
+- **AND** the directory is not mounted into the jail and is not equal to, inside, or an ancestor of any jail-writable mount source
+- **AND** no read-write bind alias exposes the config directory to jailed commands
+
+#### Scenario: Unsafe config location disables shell without fallback
+- **GIVEN** the config location is unavailable, has unsafe permissions, or overlaps a jail-writable mount source
+- **WHEN** startup or a later shell launch needs to create or use nsjail config
+- **THEN** shell is unavailable with an actionable reason
+- **AND** no config is written to `/tmp`, `/tmp/<agent>`, or another jail-writable location
+- **AND** no command executes through host subprocess or PTY
+- **AND** non-shell agent functionality remains available
+
+#### Scenario: Linux Lima proves jailed config writes cannot affect later runs
+- **GIVEN** the Linux Lima nsjail smoke environment has created the static and per-call configs in the verified host-private location
+- **WHEN** a jailed command attempts to locate and overwrite the config location, and the host then checks the config files and performs another probe and confined shell launch
+- **THEN** the config location is absent from the jail mount table and the jailed write attempt is denied
+- **AND** the host-side config bytes remain unchanged
+- **AND** the subsequent startup-style probe and confined shell command succeed using intact configuration

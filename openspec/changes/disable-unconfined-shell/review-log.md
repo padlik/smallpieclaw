@@ -181,3 +181,97 @@
 ### 🔴 Outstanding
 
 - None.
+
+## proposal Round 4 — 2026-09-25
+
+### 🔴 Fixed
+
+- None. This round's changes are proposal-scope clarification only; downstream design, specs, and tasks remain frozen pending their required unfreeze/review sequence.
+
+### 🟡 Addressed
+
+- The `nsjail-shell-sandboxing` Modified Capabilities entry now explicitly maps config-file integrity outside jail-writable mounts and the Linux Lima proof. Proposal Impact/What Changes language records the boundary and test intent, preserving ADR-0015 and the no-host-fallback decision.
+
+### 🟡 Outstanding
+
+- The downstream design/specs/tasks unfreeze and review chain is still required before the implementation contract/checklist can be considered updated.
+- The concrete relocation of static and per-call config files must be specified downstream, including resolving config paths currently under jail-writable `/tmp`, and the Linux regression must verify those exact paths cannot be modified by jailed commands. This has not been implemented or validated in this proposal-only round.
+
+### 🔴 Outstanding
+
+- None.
+
+## proposal Round 5 — 2026-09-25
+
+### 🔴 Fixed
+
+- None. The reviewer reported no serious proposal finding outstanding; the proposal batch is frozen after this round.
+
+### 🟡 Addressed
+
+- The approved config-integrity decision is explicitly mapped under `nsjail-shell-sandboxing`: generated static and per-call configs stay outside jail-writable mounts, and Linux Lima coverage proves jailed commands cannot alter config used by later launches.
+
+### 🟡 Outstanding
+
+- Later batches must unfreeze and review the design/spec/tasks in sequence. The design must name a concrete host-private config location, account for current static config under the writable session `/tmp` and per-call config in default system temp, fail closed if the location is unsafe, and define Lima coverage for hostile writes plus a subsequent launch/re-probe. This design batch now records that decision, but still requires its own review; specs, tasks, and implementation remain downstream obligations and are not claimed complete here.
+
+### 🔴 Outstanding
+
+- None.
+
+## design Round 2 — 2026-09-25
+
+### 🔴 Fixed
+
+- None. The design reviewer found no serious design finding outstanding; the design batch is frozen after this round.
+
+### 🟡 Addressed
+
+- The design now resolves static and per-call nsjail configs to a dedicated owner-only host-private XDG state directory, distinct from session scratch and outside writable mount sources and aliases. It specifies fail-closed behavior when that location cannot be verified and a Lima hostile-write/subsequent-launch/re-probe validation strategy.
+
+### 🟡 Outstanding
+
+- The spec batch must carry this as a normative integrity requirement and observable scenarios; the current spec delta records that contract and awaits its own review. The tasks batch and implementation still need their ordered unfreeze/review steps, with tests for safe-path selection, unsafe-path refusal, jail non-mounting, denied tampering, and successful later launches/re-probes. These downstream items are not claimed implemented or validated by the design review.
+
+### 🔴 Outstanding
+
+- None.
+
+## specs Round 3 — 2026-09-25
+
+### 🔴 Fixed
+
+- None. The reviewer found no serious spec issue outstanding; the shell sandboxing requirement and scenarios preserve the existing backend-availability, loss, nonzero-exit, and timeout contract.
+
+### 🟡 Addressed
+
+- The spec now normatively requires owner-only static and per-call nsjail configs in a verified host-private path outside every jail-writable mount source and read-write alias; unsafe storage disables shell without writable-temp or host-shell fallback.
+- Linux Lima observables cover config-directory non-mounting, denied jailed overwrite attempts, unchanged host config, and a successful subsequent probe and confined command.
+
+### 🟡 Outstanding
+
+- The tasks batch must provide separately reviewable safe-path/overlap tests, fail-closed implementation and integration work, and the dedicated Lima adversarial smoke task. The checklist now includes these as unchecked tasks; implementation and smoke validation remain outstanding. Preserve the existing timeout contract explicitly: nsjail `time_limit` returns exit 137 with a timeout message and does not mark capability lost.
+
+### 🔴 Outstanding
+
+- None.
+
+## tasks Round 2 — 2026-09-25
+
+### 🔴 Fixed
+
+- None. The reviewer found no serious tasks issue outstanding; the task batch is ready for parent review.
+
+### 🟡 Addressed
+
+- Added separate unchecked tasks 1.8/1.9 for host-private nsjail config path/overlap tests and fail-closed implementation/integration, plus task 5.4 for the Linux Lima non-mounting, hostile-write, unchanged-config, and subsequent-probe/command smoke checks.
+- Clarified task 5.2 to retain the existing `time_limit` contract: exit 137 with a timeout message and capability remains available.
+- The reviewer's recommendation to include `tests/test_nsjail_config.py` in the task 6.1 focused regression command was addressed in this same pass. No tests were run as part of this documentation-only edit, and none are claimed to pass.
+
+### 🟡 Outstanding
+
+- Implementation and test execution remain unchecked downstream work; strict change validation and integrated tests are for the parent validation lane.
+
+### 🔴 Outstanding
+
+- None.
