@@ -1,4 +1,10 @@
-## ADDED Requirements
+# native-tool-calling Specification
+
+## Purpose
+
+Define the ReAct loop's native tool-calling path, JSON fallback, tool definition assembly, special-case dispatch, and provider integrations.
+
+## Requirements
 
 ### Requirement: Native tool calling path
 
@@ -156,11 +162,3 @@ Each supported provider SHALL have a native tool calling implementation that sen
 - **WHEN** `_ollama_chat_with_tools()` is called
 - **THEN** the request SHALL pass `tools` to the Ollama client
 - **AND** the request SHALL NOT set `tool_choice` — the Ollama SDK/API exposes no such parameter; tool selection is implicitly auto (the model decides)
-
-## MODIFIED Requirements
-
-<!-- No existing spec-level behavior changes. The ReAct loop's iteration order changes (native-before-text), but this is an implementation detail of the new capability, not a modification to an existing spec. -->
-
-## REMOVED Requirements
-
-<!-- No requirements removed. -->
