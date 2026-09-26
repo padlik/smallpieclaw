@@ -44,9 +44,9 @@ Rule: A healthy, probed Linux nsjail is the only shell backend; lack of confinem
 - **THEN** shell is unavailable and the agent and non-shell tools remain available
 - **AND** no host command executes through subprocess or PTY
 
-#### Scenario: Runtime backend loss latches unavailable
+#### Scenario: Runtime launch failure or failed trusted re-probe latches unavailable
 - **GIVEN** shell is available after a successful Linux nsjail probe
-- **WHEN** an nsjail backend launch fails or a backend re-probe fails
+- **WHEN** nsjail launch raises an `OSError` or a trusted backend re-probe fails after setup/launch failure
 - **THEN** the failing call reports `shell_unavailable` rather than executing on the host
 - **AND** shell remains unavailable until the agent process restarts
 - **AND** the agent and non-shell tools continue running
@@ -98,3 +98,58 @@ Rule: Configuration controlling nsjail runs is host-private; failure to establis
 - **THEN** the config location is absent from the jail mount table and the jailed write attempt is denied
 - **AND** the host-side config bytes remain unchanged
 - **AND** the subsequent startup-style probe and confined shell command succeed using intact configuration
+
+### Requirement: nsjail session scratch source is isolated from other writable mounts
+
+The host directory mounted as the jail's session `/tmp` source MUST reside beneath an owner-only host-private `state_home/nsjail-session` parent and outside every *other* writable jail mount source. The agent MUST NOT place it under a system temporary directory or another jail-writable mount source. The system MUST verify the pinned real directory and its ownership and mode whenever it builds nsjail configuration. If the source is unsafe, changed, or unverifiable, shell MUST become unavailable with an actionable reason; the system MUST NOT substitute another writable source or fall back to host subprocess/PTY execution. A jailed command MUST NOT be able to rename or replace the source with a symlink to an arbitrary host directory that a subsequent launch will mount as session `/tmp`.
+
+Feature: nsjail-shell-sandboxing
+Rule: Session scratch is writable only within its isolated source; unsafe source identity or layout disables shell without fallback.
+
+#### Scenario: Session scratch source is private and disjoint from other writable mounts
+- **GIVEN** the nsjail configuration builder is preparing a jail with a writable session `/tmp` mount
+- **WHEN** it validates the session mount source
+- **THEN** the source resolves to the pinned real directory beneath an owner-only host-private parent
+- **AND** it is not equal to, nested beneath, or an ancestor of any other writable jail mount source
+- **AND** the source and parent are not placed under a system temporary directory or another jail-writable mount
+
+#### Scenario: Changed or unsafe session source disables shell without fallback
+- **GIVEN** the session `/tmp` source is unsafe, has changed identity or ownership/mode, or cannot be verified
+- **WHEN** the system builds nsjail configuration for a shell launch
+- **THEN** shell becomes unavailable with an actionable reason
+- **AND** no replacement writable source is used
+- **AND** no command executes through host subprocess or PTY
+
+#### Scenario: Linux Lima denies session-source rename and symlink substitution
+- **GIVEN** the Linux Lima nsjail smoke environment has mounted the verified session source as jail `/tmp`
+- **WHEN** a jailed command attempts to rename or replace the source with a symlink to an arbitrary host directory and a subsequent launch is attempted
+- **THEN** the source cannot be replaced or the builder rejects the changed source before constructing the subsequent jail
+- **AND** the arbitrary host directory is not mounted as `/tmp` and remains unchanged
+- **AND** no host subprocess or PTY fallback occurs
+
+### Requirement: nsjail supervisor diagnostics are private and distinct from child output
+
+The system MUST capture each nsjail invocation's supervisor diagnostics in a separate per-call host-private log file in the verified configuration directory. Each log MUST be mode `0600`, outside jail-writable mount sources and aliases, and unavailable for jailed commands to write or forge. Startup MUST use a real jail probe to verify the installed nsjail supports and can open the requested log destination; if the log is absent or unusable, including when nsjail falls back to stderr, the probe MUST fail and shell MUST remain unavailable. The system MUST treat child stdout and stderr solely as child output: stderr text, including text resembling nsjail diagnostics such as `[E][`, MUST NOT by itself indicate backend loss. Ordinary child nonzero exit and timeout MUST NOT cause backend loss. A genuine nsjail setup/launch failure MUST lead to a trusted re-probe; a failed trusted re-probe or launch `OSError` follows the existing one-way runtime-loss latch. No minimum nsjail version is required; the real probe determines whether the installed binary provides the needed log behavior.
+
+Feature: nsjail-shell-sandboxing
+Rule: Only private nsjail supervisor diagnostics and trusted probe/launch failures inform backend health; child output does not.
+
+#### Scenario: Startup probe requires separate usable supervisor log
+- **GIVEN** the system is probing the installed nsjail binary for shell availability
+- **WHEN** the requested per-call supervisor log cannot be opened or nsjail writes diagnostics to stderr instead
+- **THEN** the real probe fails and shell remains unavailable
+- **AND** stderr is not accepted as a substitute supervisor log
+- **AND** no host subprocess or PTY fallback occurs
+
+#### Scenario: Linux Lima prevents jailed writes to or forgery of supervisor logs
+- **GIVEN** the Linux Lima nsjail smoke environment has created a mode-`0600` per-call supervisor log in the verified host-private configuration directory
+- **WHEN** a jailed command attempts to discover, overwrite, or forge that log and the host performs a subsequent probe and confined launch
+- **THEN** the log directory is absent from jail mounts and the jailed write/forgery attempt is denied
+- **AND** the host-side supervisor log remains unchanged
+- **AND** the subsequent probe and confined command use separate valid supervisor logs
+
+#### Scenario: Child stderr resembling nsjail diagnostics remains child output
+- **GIVEN** shell is available and the nsjail backend launch succeeds
+- **WHEN** a child writes text such as `[E][` to stderr and exits nonzero
+- **THEN** the shell tool returns the child's stderr and exit status as ordinary command output
+- **AND** shell remains available

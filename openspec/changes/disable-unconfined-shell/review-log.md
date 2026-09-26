@@ -275,3 +275,99 @@
 ### 🔴 Outstanding
 
 - None.
+
+## proposal Round 6 — 2026-09-26
+
+### 🔴 Fixed
+
+- None. Proposal Round 6 passed review and is frozen; this design amendment records the approved N1 session-scratch hardening and stderr/loss-classification clarifications without reopening or editing the proposal.
+
+### 🟡 Addressed
+
+- The proposal commits to a host-private session `/tmp` source outside other jail-writable mounts, an adversarial Linux Lima rename-plus-symlink-swap regression, and preserving the existing config-integrity and no-host-fallback boundaries.
+- The proposal maps `main.py` session-source placement, the `nsjail_config.py` mount invariant, and Lima proof under `nsjail-shell-sandboxing`; ordinary child stderr is not backend-loss evidence.
+
+### 🟡 Outstanding
+
+- The design now carries the approved invariant and diagnostic/loss distinction and must receive its own review before downstream specs/tasks are unfrozen. Implementation and adversarial Lima validation remain later obligations; this proposal review does not claim them complete.
+
+### 🔴 Outstanding
+
+- None.
+
+## design Round 3 — 2026-09-26
+
+### 🔴 Fixed
+
+- The reviewer identified should-fix gaps in treating nsjail supervisor diagnostics as trusted evidence, relying on an unsupported minimum-version claim for `--log`, and proving child isolation from log artifacts.
+
+### 🟡 Addressed
+
+- Decision 2 now includes a third host-private artifact class: per-call supervisor diagnostic logs, mode `0600`, co-located in the verified agent-scoped `state_home/nsjail-config` directory and subject to the same ownership, non-jail-mount, and alias checks.
+- Decision 8 now uses the installed binary's actual `--log FILE` flag and real startup probe rather than claiming a minimum nsjail version; it distinguishes nsjail diagnostics from untrusted child stdout/stderr and specifies log-open/fallback probe behavior and loss classification tests.
+- Risks and validation plans now require Lima log-write/forge denial with unchanged host logs, log-open-failure/fallback probing, and the separate child-output versus backend-loss cases. The proposal received only a declarative artifact-set note; its frozen decisions were not changed.
+
+### 🟡 Outstanding
+
+- Design Round 3 awaits reviewer re-review. Frozen specs, tasks, ADRs, and implementation remain downstream work; no implementation or Lima result is claimed complete.
+
+### 🔴 Outstanding
+
+- None.
+
+## specs Round 4 — 2026-09-27
+
+### 🔴 Fixed
+
+- None. Specs Round 4 passed review and is frozen.
+
+### 🟡 Addressed
+
+- The nsjail-shell-sandboxing delta now normatively covers isolated session scratch placement and per-build rejection of unsafe/changed sources, including the adversarial rename-plus-symlink swap and subsequent-launch Lima proof.
+- Added the separate private per-call supervisor-log contract and probe failure on unavailable log separation/stderr fallback; specified child stderr (including `[E][`-like text), nonzero exits, and timeout as non-loss, while retaining trusted setup/launch/re-probe loss handling and timeout exit 137.
+
+### 🟡 Outstanding
+
+- The task batch must provide test-first implementation work and separate Lima adversarial tasks for scratch-source swapping and supervisor-log forging/fallback. Implementation and Linux Lima results remain outstanding; none are claimed complete.
+
+### 🔴 Outstanding
+
+- None.
+
+## design Round 4 — 2026-09-27
+
+### 🔴 Fixed
+
+- None. Design Round 4 passed review and is frozen.
+
+### 🟡 Addressed
+
+- The approved design contract keeps session scratch separate from other writable mount sources and adds per-call supervisor diagnostics as a third host-private artifact class; installed nsjail support is established by the real probe rather than a version-floor assumption.
+- This specs batch carries those decisions into normative requirements and testable scenarios for unsafe/changed scratch sources, rename-plus-symlink swap denial and subsequent launch, private `0600` supervisor logs, log-open/fallback probe failure, child stderr/nonzero/timeout as non-loss, and trusted runtime loss classification.
+
+### 🟡 Outstanding
+
+- The spec batch awaits its own review. Tasks, implementation, and Linux Lima adversarial validation remain downstream work; none are claimed complete by this documentation update.
+
+### 🔴 Outstanding
+
+- None.
+
+## tasks Round 3 — 2026-09-27
+
+### 🔴 Fixed
+
+- None. The reviewer passed the tasks batch with no serious outstanding findings.
+
+### 🟡 Addressed
+
+- Tasks 1.10–1.13 and 5.5–5.6 cover test-first work for session-source isolation and private supervisor logs, including separate Lima adversarial tests; the original 5.2/5.4 tasks remain intact.
+- Task 6.1 includes `tests/test_main.py` in the focused regression command.
+
+### 🟡 Outstanding
+
+- Optional granularity note: task 1.13 may be split during implementation if its scope proves too broad. Implementation and Lima validation remain pending.
+
+### 🔴 Outstanding
+
+- None.
