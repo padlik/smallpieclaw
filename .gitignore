@@ -252,9 +252,7 @@ openspec-worktrees/
 opencode.json
 
 #Opencode custom agents and commands 
-.opencode/agent/*
-.opencode/commands/*
-.opencode/skills/*
+.opencode
 
 .DS_Store
 .venv_test/
