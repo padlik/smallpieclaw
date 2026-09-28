@@ -238,6 +238,13 @@ set_*.sh
 # OPTIONAL: Ignore team config overrides if they conflict with your global setup
 # .opencode/opencode.jsonc
 
+# Local generated plans and runtime scratch directories
+/docs/superpowers/plans/
+/nsjail-session/
+/relative-state/
+/tmp_xdg_vision/
+/.openspec/tmp/reviewer-council-issues-2026-09-24.md
+
 # ==============================================================================
 # OpenSpec Rules
 # ==============================================================================
