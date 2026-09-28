@@ -471,6 +471,7 @@ class TelegramInterface:
         self._config = config
         self.token: str = tg_cfg["bot_token"]
         self.security_mode: str = tg_cfg.get("security_mode", "allowlist")
+        self._pairing_timeout: float = float(tg_cfg.get("pairing_timeout", 300))
         self.allowed_ids: set[int] = {int(uid) for uid in tg_cfg.get("allowed_user_ids", [])}
         self.agent_handler = agent_handler
         self.agent_reset_fn = agent_reset_fn
@@ -487,8 +488,8 @@ class TelegramInterface:
         self._prompt_registry = None  # Optional[PromptRegistry] — wired by main.py
         self._start_time = time.time()
 
-        # Pairing state: {token: user_id}
-        self._pending_pairs: dict[str, int] = {}
+        # Pairing state: {token: (issuer_user_id, monotonic_expiry)}
+        self._pending_pairs: dict[str, tuple[int, float]] = {}
 
         # Per-user interactive agent lock + deferred-message state.
         # At most one interactive agent run per user at a time.  If a second

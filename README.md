@@ -79,7 +79,7 @@ security_mode    = "allowlist"    # or "pairing"
 allowed_user_ids = []             # add your numeric Telegram user ID
 ```
 
-> **Pairing mode:** run `/pair` in the bot to generate a single-use token; share it with another user who runs `/pair <token>` to gain access.
+> **Pairing mode:** run `/pair` in the bot to generate a single-use token (expires after `telegram.pairing_timeout`, default 300 seconds); share it with another user who runs `/pair <token>` to gain access. The issuer must remain authorized until redemption. `/unpair <id>` also revokes outstanding tokens issued by that user.
 
 ### One model (minimum)
 
