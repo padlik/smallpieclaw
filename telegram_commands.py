@@ -461,33 +461,61 @@ async def cmd_resume(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 
 @_require_auth
 async def cmd_reset(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    args = ctx.args or []
-    discard = "discard" in [a.lower() for a in args]
-
-    status_msg = await update.effective_message.reply_text(
-        "🗑️ Discarding task context…" if discard else "💾 Saving task context…"
-    )
-
-    if iface.agent_reset_fn:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, lambda: iface.agent_reset_fn(save=not discard)
+    lock = iface._get_agent_lock(update.effective_user.id)
+    if lock.locked():
+        await update.effective_message.reply_text(
+            "⚠️ Agent is busy. Wait for the current operation to finish."
         )
-        await iface._safe_edit(status_msg, result)
-    else:
-        await iface._safe_edit(status_msg, "✅ Context cleared.")
+        return
+    try:
+        async with lock:
+            args = ctx.args or []
+            discard = "discard" in [a.lower() for a in args]
+
+            status_msg = await update.effective_message.reply_text(
+                "🗑️ Discarding task context…" if discard else "💾 Saving task context…"
+            )
+
+            if iface.agent_reset_fn:
+                loop = asyncio.get_running_loop()
+                try:
+                    result = await loop.run_in_executor(
+                        None, lambda: iface.agent_reset_fn(save=not discard)
+                    )
+                except Exception:
+                    await iface._safe_edit(status_msg, "❌ Reset failed.")
+                    raise
+                await iface._safe_edit(status_msg, result)
+            else:
+                await iface._safe_edit(status_msg, "✅ Context cleared.")
+    finally:
+        await iface._offer_pending_deferred_prompt(update.effective_user.id)
 
 
 @_require_auth
 async def cmd_compress(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    status_msg = await update.effective_message.reply_text("🗜️ Compressing context…")
+    lock = iface._get_agent_lock(update.effective_user.id)
+    if lock.locked():
+        await update.effective_message.reply_text(
+            "⚠️ Agent is busy. Wait for the current operation to finish."
+        )
+        return
+    try:
+        async with lock:
+            status_msg = await update.effective_message.reply_text("🗜️ Compressing context…")
 
-    if iface.agent_compress_fn:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, iface.agent_compress_fn)
-        await iface._safe_edit(status_msg, result)
-    else:
-        await iface._safe_edit(status_msg, "ℹ️ Compress not available.")
+            if iface.agent_compress_fn:
+                loop = asyncio.get_running_loop()
+                try:
+                    result = await loop.run_in_executor(None, iface.agent_compress_fn)
+                except Exception:
+                    await iface._safe_edit(status_msg, "❌ Compression failed.")
+                    raise
+                await iface._safe_edit(status_msg, result)
+            else:
+                await iface._safe_edit(status_msg, "ℹ️ Compress not available.")
+    finally:
+        await iface._offer_pending_deferred_prompt(update.effective_user.id)
 
 
 @_require_auth

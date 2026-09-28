@@ -189,6 +189,11 @@ systemctl --user enable --now telegram-agent
 
 Hidden diagnostic commands (not in menu, available to authorised users): `/show_ctx`, `/show_env`, `/memory`, `/compress`.
 
+`/reset` and `/compress` are rejected while the agent is busy running a task —
+wait for it to finish or `/stop` it first. A message you send while one of these
+commands is running is not run automatically; it is saved and offered back with
+Run / Discard controls once the command finishes.
+
 ### Natural-language interaction
 
 Send any message to start a task:

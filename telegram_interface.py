@@ -870,11 +870,21 @@ class TelegramInterface:
         async with lock:
             await self._run_agent_task_locked(update, ctx, task_text, images, user_id)
 
-        # After releasing the lock, check if a deferred message is waiting.
-        # Use _current_deferred_token to find the latest deferred entry for
-        # this user.  The entry itself remains in _deferred_messages until the
-        # operator presses Run or Discard — the callback is the sole owner of
-        # the pop.
+        # After releasing the lock, offer any message that was deferred while
+        # this run held the lock.  Session commands (/reset, /compress) reuse
+        # the same handoff so a message arriving during a command is not
+        # stranded.
+        await self._offer_pending_deferred_prompt(user_id)
+
+    async def _offer_pending_deferred_prompt(self, user_id: int) -> None:
+        """Offer the latest deferred message once a session operation has ended.
+
+        Called after the per-user lock is released by ``_run_agent_task`` and by
+        the ``/reset`` / ``/compress`` commands.  Uses ``_current_deferred_token``
+        to find the latest deferred entry for this user.  The entry itself
+        remains in ``_deferred_messages`` until the operator presses Run or
+        Discard — the callback is the sole owner of that pop.
+        """
         pending_token = self._current_deferred_token.pop(user_id, None)
         if pending_token:
             deferred = self._deferred_messages.get(pending_token)
