@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
 from typing import TYPE_CHECKING
 
 import structlog
@@ -602,24 +603,23 @@ class LogQueryTools:
             final_path = f"{base}-{counter}{ext}"
             counter += 1
 
-        tmp_path = f"{final_path}.tmp"
+        fd: int | None = None
+        tmp_path: str | None = None
         try:
-            with open(tmp_path, "w", encoding="utf-8") as fh:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=dest_dir,
+                prefix=f".{os.path.basename(final_path)}.",
+                suffix=".tmp",
+                text=True,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fd = None
                 fh.write(serialized)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass
             os.replace(tmp_path, final_path)
             abs_path = os.path.abspath(final_path)
             return self._log_detail_result(preview, dumped=True, dump_path=abs_path)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("log_detail: cannot write dump %s: %s", final_path, exc)
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
             note = (
                 f"Full record exceeds the 65536-character cap but the dump "
                 f"could not be written ({exc}); returning a projected preview only."
@@ -627,5 +627,11 @@ class LogQueryTools:
             return self._log_detail_result(
                 preview, dumped=False, dump_path=None, note=note
             )
-
-
+        finally:
+            try:
+                if fd is not None:
+                    os.close(fd)
+                if tmp_path is not None and os.path.lexists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass

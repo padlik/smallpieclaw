@@ -135,6 +135,62 @@ class TestProcessorChain:
         assert "TOPSECRET" not in obj.get("msg", "")
         assert "TOPSECRET" not in _read(log_file)
 
+    def test_nested_secret_redacted_through_log_introspection(
+        self, make_builtin_executor, tmp_path
+    ):
+        secret = "NESTEDSECRET"
+        log_file = str(tmp_path / "agent.log")
+        db_path = al.setup_logging(log_file, secret_values=[secret])
+        al.bind_run_context(trace="r-a1b2c3d4", agent="main")
+        al.log_event(
+            al.LogEvent.TOOL_FAILED,
+            "request failed",
+            request={
+                "headers": {"authorization": f"Bearer {secret}"},
+                "steps": [secret, {"token": secret}],
+            },
+        )
+        _flush()
+
+        stored = _last_row(db_path)
+        executor = make_builtin_executor(log_store_path=db_path)
+        query = json.loads(
+            executor.execute(
+                "log_query", {"trace": "r-a1b2c3d4", "level": "DEBUG"}
+            )["output"]
+        )
+        detail = json.loads(
+            executor.execute("log_detail", {"id": query["records"][0]["id"]})[
+                "output"
+            ]
+        )
+
+        expected = {
+            "headers": {"authorization": "Bearer ***REDACTED***"},
+            "steps": ["***REDACTED***", {"token": "***REDACTED***"}],
+        }
+        assert stored["request"] == expected
+        assert query["records"][0]["request"] == expected
+        assert detail["record"]["request"] == expected
+        assert secret not in _read(log_file)
+        assert secret not in json.dumps(stored)
+        assert secret not in json.dumps(query)
+        assert secret not in json.dumps(detail)
+
+    def test_tuple_shape_preserved_during_redaction(self):
+        redact = al._make_redactor(frozenset({"NESTEDSECRET"}))
+
+        redacted = redact(
+            None,
+            "info",
+            {"items": ("NESTEDSECRET", {"token": "NESTEDSECRET"})},
+        )
+
+        assert redacted["items"] == (
+            "***REDACTED***",
+            {"token": "***REDACTED***"},
+        )
+
     def test_foreign_record_gets_identity(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
         db_path = al.setup_logging(log_file)

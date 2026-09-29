@@ -78,6 +78,21 @@ class LogEvent(str, enum.Enum):
 # ---------------------------------------------------------------------------
 # Secret redaction processor (Option A: exact vault-value match)
 # ---------------------------------------------------------------------------
+def _redact_value(value: Any, needles: frozenset[str]) -> Any:
+    """Recursively scrub known secrets while preserving container shapes."""
+    if isinstance(value, str):
+        for secret in needles:
+            value = value.replace(secret, _REDACTION_PLACEHOLDER)
+        return value
+    if isinstance(value, dict):
+        return {key: _redact_value(item, needles) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item, needles) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(item, needles) for item in value)
+    return value
+
+
 def _make_redactor(secret_values: frozenset[str]):
     """Return a structlog processor that scrubs known secret values.
 
@@ -87,19 +102,14 @@ def _make_redactor(secret_values: frozenset[str]):
     structured fields by convention.
     """
 
-    # Only values long enough to be genuine secrets are used as needles; scans
-    # only top-level string fields (defense-in-depth, not a guarantee).
+    # Only values long enough to be genuine secrets are used as needles.
     needles = frozenset(s for s in secret_values if len(s) >= _MIN_REDACTION_LEN)
 
     def redact(_logger: WrappedLogger, _name: str, event_dict: EventDict) -> EventDict:
         if not needles:
             return event_dict
         for key, value in list(event_dict.items()):
-            if isinstance(value, str) and value:
-                for secret in needles:
-                    if secret in value:
-                        value = value.replace(secret, _REDACTION_PLACEHOLDER)
-                event_dict[key] = value
+            event_dict[key] = _redact_value(value, needles)
         return event_dict
 
     return redact

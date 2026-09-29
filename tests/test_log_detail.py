@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,14 @@ def _detail(exc, record_id: int) -> dict:
     assert result["success"] is True
     assert result["exit_code"] == 0
     return json.loads(result["output"])
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    """Create a symlink or skip where the runtime does not permit symlinks."""
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +302,69 @@ class TestLogDetailOversized:
         with open(preexisting, encoding="utf-8") as fh:
             assert fh.read() == "pre-existing artifact"
 
+    def test_dump_temp_symlink_never_alters_outside_target(
+        self, make_builtin_executor, tmp_path
+    ):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(TRACE_VALID)])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+        trace_dir = Path(results_dir) / TRACE_VALID
+        trace_dir.mkdir(parents=True)
+        sentinel = tmp_path / "outside-sentinel"
+        sentinel.write_text("outside remains unchanged", encoding="utf-8")
+        sentinel_mode = stat.S_IMODE(sentinel.stat().st_mode)
+        tmp_link = trace_dir / "log-detail-1.json.tmp"
+        _symlink_or_skip(tmp_link, sentinel)
+
+        payload = _detail(exc, 1)
+
+        expected_path = trace_dir / "log-detail-1.json"
+        assert payload["dumped"] is True
+        assert payload["dump_path"] == str(expected_path.resolve())
+        assert json.loads(expected_path.read_text(encoding="utf-8")) == {
+            **self._oversized_record(TRACE_VALID),
+            "id": 1,
+        }
+        assert sentinel.read_text(encoding="utf-8") == "outside remains unchanged"
+        assert stat.S_IMODE(sentinel.stat().st_mode) == sentinel_mode
+        assert tmp_link.is_symlink()
+        assert tmp_link.readlink() == sentinel
+        assert not expected_path.is_symlink()
+        assert list(trace_dir.glob(".log-detail-*.tmp")) == []
+
+    def test_dump_ignores_dangling_temp_symlink(
+        self, make_builtin_executor, tmp_path
+    ):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [self._oversized_record(TRACE_VALID)])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+        trace_dir = Path(results_dir) / TRACE_VALID
+        trace_dir.mkdir(parents=True)
+        outside_target = tmp_path / "missing-outside-target"
+        tmp_link = trace_dir / "log-detail-1.json.tmp"
+        _symlink_or_skip(tmp_link, outside_target)
+
+        payload = _detail(exc, 1)
+
+        expected_path = trace_dir / "log-detail-1.json"
+        assert payload["dumped"] is True
+        assert payload["dump_path"] == str(expected_path.resolve())
+        assert json.loads(expected_path.read_text(encoding="utf-8")) == {
+            **self._oversized_record(TRACE_VALID),
+            "id": 1,
+        }
+        assert not outside_target.exists()
+        assert tmp_link.is_symlink()
+        assert tmp_link.readlink() == outside_target
+        assert not expected_path.is_symlink()
+        assert list(trace_dir.glob(".log-detail-*.tmp")) == []
+
     def test_dump_dedup_reuses_identical_artifact(self, make_builtin_executor, tmp_path):
         """A second call for the same oversized record reuses the existing dump.
 
@@ -353,6 +425,58 @@ class TestLogDetailOversized:
         assert payload["dump_path"] is None
         assert payload["record"]["err"].endswith(" chars]")
         assert payload.get("note")
+
+    def test_dump_encoding_failure_cleans_temporary_file(
+        self, make_builtin_executor, tmp_path
+    ):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        conn = sqlite3.connect(path)
+        conn.executescript(SCHEMA_DDL)
+        extra = json.dumps(
+            {"tool": "shell", "err": "E" * 70000, "invalid": "\ud800"}
+        )
+        conn.execute(
+            """
+            INSERT INTO events
+            (ts, level, logger, agent, trace, prompt_id, event_type, msg, extra, search_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-07-05T10:00:00",
+                "error",
+                None,
+                None,
+                TRACE_VALID,
+                None,
+                "TOOL_FAILED",
+                None,
+                extra,
+                "oversized surrogate record",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(results_dir=results_dir, log_store_path=path),
+        )
+        trace_dir = Path(results_dir) / TRACE_VALID
+        trace_dir.mkdir(parents=True)
+        sentinel = tmp_path / "outside-encoding-sentinel"
+        sentinel.write_text("outside remains unchanged", encoding="utf-8")
+        tmp_link = trace_dir / "log-detail-1.json.tmp"
+        _symlink_or_skip(tmp_link, sentinel)
+
+        payload = _detail(exc, 1)
+
+        assert payload["found"] is True
+        assert payload["dumped"] is False
+        assert payload["dump_path"] is None
+        assert payload.get("note")
+        assert sentinel.read_text(encoding="utf-8") == "outside remains unchanged"
+        assert tmp_link.is_symlink()
+        assert tmp_link.readlink() == sentinel
+        assert list(trace_dir.glob(".log-detail-*.tmp")) == []
 
 
 # ---------------------------------------------------------------------------
