@@ -148,7 +148,8 @@ class TestConsentScopeWording:
         assert result.get("requires_confirmation") is True
         desc = owner._requires_confirmation.call_args.args[2]
         assert f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>" in desc
-        assert _scope_line(real_path_b) in desc
+        assert f"<code>{os.path.dirname(real_path_b)}</code>" in desc
+        assert f"<code>{os.path.dirname(os.path.realpath(path_a))}</code>" in desc
 
     def test_file_diff_scope_line_falls_back_to_path_a(self, tmp_path):
         policy = _make_policy(str(tmp_path))
@@ -163,7 +164,7 @@ class TestConsentScopeWording:
 
         assert result.get("requires_confirmation") is True
         desc = owner._requires_confirmation.call_args.args[2]
-        assert _scope_line(real_path_a) in desc
+        assert f"<code>{os.path.dirname(real_path_a)}</code>" in desc
 
 
 class TestConsentScopeRoundTrip:

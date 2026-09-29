@@ -281,11 +281,8 @@ class FileTools:
     def _exec_file_diff(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         """Run the built-in file_diff tool, with per-path zone checks.
 
-        When both paths are distinct UNRECOGNISED directories, only a single
-        confirmation is staged at a time: zone_path prefers path_b so approval
-        grants one directory and the next attempt prompts for the other.  This is
-        a deliberate two-step approval that fails toward prompting rather than
-        asking for multiple unrelated directories at once.
+        When either path needs consent, one confirmation lists every distinct
+        unrecognised directory that is not already covered by a standing grant.
         """
         path_a = os.path.expanduser(str(args.get("path_a", "")).strip())
         path_b = os.path.expanduser(str(args.get("path_b", "")).strip())
@@ -322,39 +319,48 @@ class FileTools:
             return self._prohibited_error(reason_b, real_path_b)
 
         if verdict_a == PathVerdict.ALLOWED and verdict_b == PathVerdict.ALLOWED:
-            return self._run_file_diff(args, caller_tag=caller_tag)
+            return self._run_file_diff(
+                args, caller_tag=caller_tag,
+                scope_owner=self._owner._scope_owner_from_caller_tag(caller_depth, caller_tag),
+            )
 
-        # One or both paths are UNRECOGNISED.  Need a grant for every
-        # unrecognised side; if all are granted, proceed.  Otherwise stage one
-        # confirmation (prefer path_b for zone_path) that, on approval, grants
-        # the missing directory.
+        # Need consent for every distinct unrecognised directory lacking grant.
         unrecognised_paths = [
             p for p, v in ((real_path_a, verdict_a), (real_path_b, verdict_b))
             if v == PathVerdict.UNRECOGNISED
         ]
-        if all(
-            self._check_grant("file_diff", p, caller_depth, caller_tag)
-            for p in unrecognised_paths
-        ):
-            return self._run_file_diff(args, caller_tag=caller_tag)
-
-        unrecognised_path = real_path_b if verdict_b == PathVerdict.UNRECOGNISED else real_path_a
+        missing_dirs = list(dict.fromkeys(
+            os.path.dirname(p) for p in reversed(unrecognised_paths)
+            if not self._check_grant("file_diff", p, caller_depth, caller_tag)
+        ))
+        if not missing_dirs:
+            return self._run_file_diff(
+                args, caller_tag=caller_tag,
+                scope_owner=self._owner._scope_owner_from_caller_tag(caller_depth, caller_tag),
+            )
+        # Primary remains compatible with consumers expecting one zone_path.
+        missing_paths = [p for p in reversed(unrecognised_paths)
+                         if os.path.dirname(p) in missing_dirs]
+        primary_path = missing_paths[0]
         diff_desc = f"Diff files: <code>{path_a}</code> ↔ <code>{path_b}</code>"
         if real_path_a != path_a:
             diff_desc += f"\n(→ <code>{real_path_a}</code>)"
         if real_path_b != path_b:
             diff_desc += f"\n(→ <code>{real_path_b}</code>)"
-        diff_desc += (
-            f"\n📦 Scope: Confirm grants <code>{os.path.dirname(unrecognised_path)}</code> "
-            "(all files under it) for this prompt; Till /reset grants it for the whole session"
-        )
+        diff_desc += "\n📦 Scope: confirmation grants " + ", ".join(
+            f"<code>{directory}</code>" for directory in missing_dirs
+        ) + " (all files under each) for this prompt; Till /reset grants them for the whole session."
         return self._owner._requires_confirmation(
             "file_diff", args, diff_desc,
             caller_depth=caller_depth, caller_tag=caller_tag,
-            zone_path=unrecognised_path,
+            zone_path=primary_path,
+            extra_zone_paths=tuple(missing_paths[1:]),
         )
 
-    def _run_file_diff(self, args: dict, caller_tag: str = "") -> dict:
+    def _run_file_diff(
+        self, args: dict, caller_tag: str = "", *, approved_zone_paths: tuple[str, ...] = (),
+        scope_owner: str | None = None,
+    ) -> dict:
         """Execute file_diff after zone gate has passed."""
         path_a = args.get("_resolved_path_a") or os.path.expanduser(str(args.get("path_a", "")).strip())
         path_b = args.get("_resolved_path_b") or os.path.expanduser(str(args.get("path_b", "")).strip())
@@ -364,6 +370,28 @@ class FileTools:
             context_lines = 3
         if context_lines < 0:
             context_lines = 0
+        policy = self._policy
+        if policy is None:
+            return self._policy_none_error()
+        # These paths are already realpath-resolved when confirmation is staged;
+        # retain their frozen parent rather than following a changed symlink.
+        approved_dirs = {os.path.dirname(p) for p in approved_zone_paths}
+        coordinator = getattr(self._owner, "_coordinator", None)
+        ledger = getattr(coordinator, "grant_ledger", None)
+        paths = [
+            os.path.realpath(os.path.expanduser(str(args.get(key, "")).strip()))
+            for key in ("path_a", "path_b")
+        ]
+        for path in paths:
+            verdict, reason = policy.classify(path, "read")
+            if verdict == PathVerdict.PROHIBITED:
+                return self._prohibited_error(reason, path)
+            has_grant = bool(ledger and ledger.check(
+                "file_diff", os.path.dirname(path), scope_owner=scope_owner,
+            ))
+            if verdict == PathVerdict.UNRECOGNISED and not (has_grant or os.path.dirname(path) in approved_dirs):
+                return {"success": False, "output": "", "error": "file_diff authorization changed; refusing to read either file.", "exit_code": 1}
+        path_a, path_b = paths
         try:
             max_bytes = int(args.get("max_bytes", 200_000))
         except (TypeError, ValueError):

@@ -91,6 +91,7 @@ class PendingConfirmations:
         self._lock = threading.Lock()
         self._pending: dict[str, tuple[str, dict]] = {}
         self._zone_paths: dict[str, str] = {}
+        self._extra_zone_paths: dict[str, tuple[str, ...]] = {}
         self._scope: dict[str, Optional[str]] = {}
 
     def stage(
@@ -99,6 +100,7 @@ class PendingConfirmations:
         tool_name: str,
         args: dict,
         zone_path: str = "",
+        extra_zone_paths: tuple[str, ...] = (),
         scope_owner: Optional[str] = None,
     ) -> None:
         """Atomically stage a pending confirmation and its associated metadata."""
@@ -106,6 +108,8 @@ class PendingConfirmations:
             self._pending[token] = (tool_name, args)
             if zone_path:
                 self._zone_paths[token] = zone_path
+            if extra_zone_paths:
+                self._extra_zone_paths[token] = tuple(extra_zone_paths)
             if scope_owner is not None:
                 self._scope[token] = scope_owner
 
@@ -114,6 +118,7 @@ class PendingConfirmations:
         with self._lock:
             entry = self._pending.pop(token, None)
             self._zone_paths.pop(token, None)
+            self._extra_zone_paths.pop(token, None)
             self._scope.pop(token, None)
             return entry
 
@@ -123,6 +128,7 @@ class PendingConfirmations:
             existed = token in self._pending
             self._pending.pop(token, None)
             self._zone_paths.pop(token, None)
+            self._extra_zone_paths.pop(token, None)
             self._scope.pop(token, None)
             return existed
 
@@ -130,6 +136,12 @@ class PendingConfirmations:
         """Return the stored zone path for *token*, or ''."""
         with self._lock:
             return self._zone_paths.get(token, "")
+
+    def zone_paths(self, token: str) -> tuple[str, ...]:
+        """Return primary and additional authorized paths atomically."""
+        with self._lock:
+            primary = self._zone_paths.get(token, "")
+            return ((primary,) if primary else ()) + self._extra_zone_paths.get(token, ())
 
     def scope(self, token: str) -> Optional[str]:
         """Return the stored scope_owner for *token*, or None."""
@@ -141,6 +153,7 @@ class PendingConfirmations:
         with self._lock:
             self._pending.clear()
             self._zone_paths.clear()
+            self._extra_zone_paths.clear()
             self._scope.clear()
 
 
@@ -571,6 +584,8 @@ class BuiltinExecutor:
         headless bridge, whose own execute() wrapper still owns the span and
         would otherwise double-log the completion.
         """
+        approved_zone_paths = self._pending_confirmations.zone_paths(token)
+        scope_owner = self._pending_confirmations.scope(token)
         entry = self._pending_confirmations.take(token)
         if entry is None:
             return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
@@ -578,7 +593,12 @@ class BuiltinExecutor:
         logger.info("Executing confirmed built-in '%s' (token %s)", tool_name, token[:8])
         start = time.perf_counter()
         try:
-            result = self._run(tool_name, args, chunk_callback=chunk_callback)
+            if tool_name == "file_diff":
+                result = self._files._run_file_diff(
+                    args, approved_zone_paths=approved_zone_paths, scope_owner=scope_owner,
+                )
+            else:
+                result = self._run(tool_name, args, chunk_callback=chunk_callback)
         except Exception as exc:
             if _emit_lifecycle:
                 dur_ms = int((time.perf_counter() - start) * 1000)
@@ -615,7 +635,7 @@ class BuiltinExecutor:
 
     def _requires_confirmation(self, tool_name: str, args: dict, description: str,
                                caller_depth: int = 0, caller_tag: str = "",
-                               zone_path: str = "") -> dict:
+                               zone_path: str = "", extra_zone_paths: tuple[str, ...] = ()) -> dict:
         # In headless mode (sub-agents, caller_depth >= 1):
         #   shell/dangerous → always deny (too risky to run destructive commands unattended)
         #   file_read/sensitive, file_write, file_patch → require operator confirmation via Telegram
@@ -637,12 +657,13 @@ class BuiltinExecutor:
                     "exit_code": -1,
                 }
             # Non-shell (sensitive file_read, file_write, file_patch): bridge to Telegram
-            return self._headless_confirm_bridge(tool_name, args, description, caller_tag=caller_tag)
+            return self._headless_confirm_bridge(tool_name, args, description, caller_tag=caller_tag,
+                                                 zone_path=zone_path, extra_zone_paths=extra_zone_paths)
 
         token = secrets.token_hex(12)
         self._pending_confirmations.stage(
             token, tool_name, args,
-            zone_path=zone_path, scope_owner=scope_owner,
+            zone_path=zone_path, extra_zone_paths=extra_zone_paths, scope_owner=scope_owner,
         )
         logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
         return {
@@ -652,7 +673,8 @@ class BuiltinExecutor:
         }
 
     def _headless_confirm_bridge(self, tool_name: str, args: dict, description: str,
-                                 caller_tag: str = "") -> dict:
+                                 caller_tag: str = "", zone_path: str = "",
+                                 extra_zone_paths: tuple[str, ...] = ()) -> dict:
         """Block the sub-agent thread until the operator approves or denies via Telegram.
 
         If the prompt callback is not wired (bot not ready) or times out, fails closed.
@@ -689,7 +711,8 @@ class BuiltinExecutor:
             }
 
         token = secrets.token_hex(12)
-        self._pending_confirmations.stage(token, tool_name, args, scope_owner=scope_owner)
+        self._pending_confirmations.stage(token, tool_name, args, zone_path=zone_path,
+                                          extra_zone_paths=extra_zone_paths, scope_owner=scope_owner)
 
         logger.info(
             "Headless sub-agent: sending Telegram confirmation prompt for %s (token=%s)",

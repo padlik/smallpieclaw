@@ -70,12 +70,12 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
 
     builtin = getattr(getattr(iface, "agent", None), "builtin_executor", None)
     tool_name = ""
-    zone_path = ""
+    zone_paths = ()
     if builtin is not None:
         entry = builtin._pending.get(token)
         if entry is not None:
             tool_name, _args = entry
-        zone_path = builtin._zone_paths.get(token, "")
+        zone_paths = builtin._pending_confirmations.zone_paths(token)
         # single-key dict reads are GIL-atomic; staged entries are never re-keyed
 
     logger.info(
@@ -84,14 +84,14 @@ async def cb_confirm(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     )
 
     # Grant bookkeeping before resume, but never let grant failure lose the op.
-    if confirmed and iface.agent and tool_name and zone_path:
+    if confirmed and iface.agent and tool_name and zone_paths:
         try:
             from confirmation import GrantLifetime
 
             ledger = iface.agent._confirmation.grant_ledger
-            grant_dir = os.path.dirname(os.path.realpath(zone_path))
             lifetime = GrantLifetime.SESSION if is_session else GrantLifetime.PROMPT
-            ledger.add(tool_name, grant_dir, lifetime, scope_owner=None)
+            for approved_path in zone_paths:
+                ledger.add(tool_name, os.path.dirname(approved_path), lifetime, scope_owner=None)
         except Exception as exc:
             logger.warning(
                 "cb_confirm: grant bookkeeping failed for token=%s: %s",
@@ -353,11 +353,10 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
             entry = builtin._pending.get(token)
             tool_name = entry[0] if entry else ""
             # single-key dict reads are GIL-atomic; staged entries are never re-keyed
-            zone_path = builtin._zone_paths.get(token, "")
-            if tool_name and zone_path:
+            zone_paths = builtin._pending_confirmations.zone_paths(token)
+            if tool_name and zone_paths:
                 from confirmation import GrantLifetime
 
-                grant_dir = os.path.dirname(os.path.realpath(zone_path))
                 lifetime = GrantLifetime.SESSION if is_session else GrantLifetime.PROMPT
                 # Session grants are created scope-free: per the approval-grants
                 # spec, "Till /reset" consent is session-wide (covers the main
@@ -366,9 +365,11 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
                 scope_owner = (
                     None if is_session else builtin._pending_confirmations.scope(token)
                 )
-                coordinator.grant_ledger.add(
-                    tool_name, grant_dir, lifetime, scope_owner=scope_owner,
-                )
+                for zone_path in zone_paths:
+                    coordinator.grant_ledger.add(
+                        tool_name, os.path.dirname(zone_path), lifetime,
+                        scope_owner=scope_owner,
+                    )
         except Exception as exc:
             logger.warning(
                 "cb_subagent_confirm: grant bookkeeping failed for token=%s: %s",
