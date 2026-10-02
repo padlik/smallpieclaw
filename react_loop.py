@@ -41,6 +41,7 @@ from llm_client import LLMClient, LLMCancelledError, LLMEmptyResponseError, LLME
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from outcome_utils import fail_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
+from trace_context import new_trace_id
 
 from tool_formatting import (
     _compact_args_repr,
@@ -234,6 +235,14 @@ class ReactContext:
     # confirmation log lines. Defaulted so test/standalone constructors that omit
     # it still work; AgentController.run() assigns a fresh ID per run.
     trace_id: str = ""
+
+    # Immutable identity for result ownership during one interactive run. It is
+    # deliberately independent of trace_id because resumed runs reuse traces.
+    turn_id: str = field(default_factory=new_trace_id)
+
+    # Immutable operator prompt identity for this run. This travels with
+    # on-demand child admission rather than being inferred from executor state.
+    prompt_id: Optional[str] = None
 
     # Memory layers
     short_term: object = None   # Optional ShortTermMemory
@@ -1116,6 +1125,19 @@ def _dispatch_action(
     action = action_obj.get("action", "")
 
     if action == "finish":
+        supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+        if ctx.depth == 0 and supervisor is not None:
+            children = supervisor.unaccounted_children(ctx.turn_id)
+            if children:
+                details = ", ".join(
+                    f"{agent_id} ({status})" for agent_id, status in children
+                )
+                sink(
+                    "Cannot finish while turn-owned children are unaccounted: "
+                    f"{details}. Call get_agent_result for completed children, "
+                    "wait for running children, or call cancel_agent."
+                )
+                return None
         return _finish_run(ctx, action_obj, user_goal)
 
     if action == "tool":
@@ -1147,6 +1169,18 @@ def _dispatch_action(
         _end_status = "ok" if outcome.get("success") else "fail"
         progress(f"__TOOL_END__:{_end_status}:{tool_name}\n{fmt_tool_result_progress(tool_name, args, outcome)}")
         sink(tool_result)
+
+        if tool_name in ("get_agent_result", "wait_for_any_agent"):
+            status = outcome.get("status")
+            agent_id = outcome.get("agent_id")
+            supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+            if (
+                ctx.depth == 0
+                and supervisor is not None
+                and status in ("done", "failed", "cancelled")
+                and agent_id
+            ):
+                supervisor.mark_result_retrieved(ctx.turn_id, str(agent_id))
 
         # Doom-loop detection (T2): self-terminate when the same tool fails
         # with the same error repeatedly. Runs at the vision_query/normal-tool
@@ -1413,6 +1447,31 @@ def react_loop(
         ctx.memory.record_event("Task cancelled by operator")
         return "⚠️ Task stopped by operator."
     finally:
+        supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+        if ctx.depth == 0 and supervisor is not None:
+            draining = supervisor.draining_children(ctx.turn_id)
+            if draining:
+                try:
+                    _progress(
+                        "__DRAINING__:"
+                        + ",".join(agent_id for agent_id, _status in draining)
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("draining progress publication failed", exc_info=True)
+            try:
+                drain_errors = supervisor.drain_owned_children(
+                    ctx.turn_id, cancel=True
+                )
+            except Exception as drain_exc:  # noqa: BLE001
+                drain_errors = [f"turn drain failed: {drain_exc}"]
+            for drain_error in drain_errors:
+                logger.error("sub-agent lifecycle cleanup failed: %s", drain_error)
+                try:
+                    _progress(f"__DRAIN_ERROR__:{drain_error}")
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "drain error progress publication failed", exc_info=True
+                    )
         if ctx.context_monitor is not None:
             try:
                 last = ctx.context_monitor.read()
@@ -1538,7 +1597,7 @@ def _finish_run(
         ctx.short_term.add("assistant", result)
     summary = ""
     tools_used: list[str] = []
-    if ctx.results and ctx.working and ctx.working.has_content():
+    if ctx.depth == 0 and ctx.results and ctx.working and ctx.working.has_content():
         tools_used = list(filter(None, extract_tools_used(ctx.working.steps)))
         summary = _summarize_result(
             ctx.llm,
@@ -1722,6 +1781,18 @@ def _dispatch_tool(
 
     # Built-in tools
     if ctx.builtin_executor and ctx.builtin_executor.is_builtin(tool_name):
+        if tool_name in {
+            "spawn_agent",
+            "get_agent_result",
+            "wait_for_any_agent",
+            "cancel_agent",
+        }:
+            args = {**args, "_operator_turn_id": ctx.turn_id}
+        if tool_name == "spawn_agent":
+            args = {
+                **args,
+                "_operator_prompt_id": ctx.prompt_id,
+            }
         # For shell tool with streaming enabled, create a live-chunk callback.
         chunk_callback: Optional[Callable[[str], None]] = None
         if (tool_name == "shell"

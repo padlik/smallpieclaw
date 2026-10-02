@@ -465,3 +465,48 @@ class TestRuntimeProfileThreading:
         captured = self._capture_factory_kwargs(make_builtin_executor, args={"runtime_profile": "attempted-injection"})
         # Injection through model args is ignored; the internal derivation wins.
         assert captured.get("runtime_profile") == RuntimeProfile.ON_DEMAND_SUBAGENT
+
+
+class TestExecutionOwnershipAdmission:
+    """Spawn admission derives ownership from trusted call metadata."""
+
+    def test_on_demand_spawn_carries_calling_turn_identity(self, make_builtin_executor):
+        runner = _make_runner("sa-owned")
+        exc = _make_executor(make_builtin_executor, factory=MagicMock(return_value=runner))
+        captured = {}
+
+        def capture_submit(request, options):
+            captured["request"] = request
+            captured["options"] = options
+            return {"success": True, "agent_id": runner.agent_id}
+
+        with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
+             patch.object(exc._supervisor, "submit", side_effect=capture_submit):
+            result = exc._exec_spawn_agent(
+                {"task": "owned work", "owner_turn_id": "model-injection"},
+                caller_depth=0,
+                trace_id="r-owner123",
+            )
+
+        assert result["success"] is True
+        ownership = captured["request"].ownership
+        assert ownership.origin == "on-demand"
+        assert ownership.owner_turn_id == "r-owner123"
+
+    def test_spawn_without_turn_identity_is_unowned(self, make_builtin_executor):
+        captured = []
+        exc = _make_executor(
+            make_builtin_executor,
+            factory=MagicMock(return_value=_make_runner("sa-owned")),
+        )
+
+        def capture_submit(request, _options):
+            captured.append(request.ownership.owner_turn_id)
+            return {"success": True, "agent_id": "sa-owned"}
+
+        with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
+             patch.object(exc._supervisor, "submit", side_effect=capture_submit):
+            exc._exec_spawn_agent({"task": "first"}, trace_id="")
+            exc._exec_spawn_agent({"task": "second"}, trace_id="")
+
+        assert captured == [None, None]

@@ -4,11 +4,202 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from contextlib import nullcontext
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent_logging import LogEvent
 from react_loop import extract_json_candidates, parse_json
+
+
+class TestTurnOwnedResultPublication:
+    """A turn-owned child returns through join tools, not operator recall."""
+
+    def test_turn_owned_finish_does_not_publish_to_results_memory(self):
+        from react_loop import _finish_run
+
+        ctx = MagicMock()
+        ctx.depth = 1
+        ctx.memory = MagicMock()
+        ctx.short_term = None
+        ctx.results = MagicMock()
+        ctx.working = MagicMock()
+        ctx.working.has_content.return_value = True
+        ctx.graph_memory_writer = None
+        ctx.strategy_memory = None
+
+        with patch("react_loop._summarize_result", return_value="summary"), \
+             patch("react_loop.save_task_outcome") as save_task_outcome:
+            result = _finish_run(
+                ctx,
+                {"action": "finish", "result": "child outcome"},
+                "delegated task",
+            )
+
+        assert result == "child outcome"
+        save_task_outcome.assert_not_called()
+
+
+class TestTurnOwnedFinishGate:
+    """Normal finish remains inside the turn while child work is unaccounted."""
+
+    @pytest.mark.parametrize("status", ["running", "done"])
+    def test_finish_is_refused_for_unaccounted_child(self, status):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import react_loop
+
+        llm = ScriptedLLM([
+            '{"action":"finish","result":"premature"}',
+            '{"action":"finish","result":"complete"}',
+        ])
+        ctx = build_context(llm, RecordingExecutor())
+        supervisor = MagicMock()
+        supervisor.unaccounted_children.side_effect = [
+            [("sa-child", status)],
+            [],
+        ]
+        ctx.builtin_executor._supervisor = supervisor
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)):
+            result = react_loop(ctx, "delegate work")
+
+        assert result == "complete"
+        assert len(llm.calls) == 2
+        feedback = "\n".join(
+            str(message.get("content", ""))
+            for message in llm.calls[1].messages
+        )
+        assert "sa-child" in feedback
+        assert "get_agent_result" in feedback
+        assert "cancel_agent" in feedback
+
+    def test_wait_timeout_keeps_child_finish_obligation(self):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context, make_outcome
+        from react_loop import react_loop
+
+        llm = ScriptedLLM([
+            '{"action":"tool","tool":"get_agent_result","args":{"agent_id":"sa-child","timeout":0,"cancel_on_timeout":false}}',
+            '{"action":"finish","result":"premature"}',
+            '{"action":"tool","tool":"cancel_agent","args":{"agent_id":"sa-child"}}',
+            '{"action":"finish","result":"complete"}',
+        ])
+        executor = RecordingExecutor({
+            "get_agent_result": make_outcome(output="timed out") | {
+                "success": False,
+                "status": "timeout",
+                "agent_id": "sa-child",
+            },
+            "cancel_agent": make_outcome(output="cancelled"),
+        })
+        ctx = build_context(llm, executor)
+        supervisor = MagicMock()
+        supervisor.unaccounted_children.side_effect = [
+            [("sa-child", "running")],
+            [],
+        ]
+        ctx.builtin_executor._supervisor = supervisor
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)):
+            result = react_loop(ctx, "delegate work")
+
+        assert result == "complete"
+        supervisor.mark_result_retrieved.assert_not_called()
+
+
+class TestTurnOwnedDrain:
+    """Every abnormal turn exit drains owned children before returning."""
+
+    @pytest.mark.parametrize("exit_path", ["stop", "error", "budget"])
+    def test_abnormal_exit_drains_owned_children(self, exit_path):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import _StepResult, react_loop
+
+        llm = ScriptedLLM(['{"action":"finish","result":"unused"}'])
+        ctx = build_context(llm, RecordingExecutor())
+        supervisor = MagicMock()
+        ctx.builtin_executor._supervisor = supervisor
+
+        if exit_path == "stop":
+            ctx.cancel_event.set()
+            ctx.owns_cancel_event = False
+            step_patch = nullcontext()
+        elif exit_path == "error":
+            step_patch = patch(
+                "react_loop._run_single_step",
+                side_effect=RuntimeError("loop failure"),
+            )
+        else:
+            step_patch = patch(
+                "react_loop._run_single_step",
+                return_value=_StepResult(early_return="budget exhausted"),
+            )
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)), step_patch:
+            if exit_path == "error":
+                with pytest.raises(RuntimeError, match="loop failure"):
+                    react_loop(ctx, "delegate work")
+            else:
+                react_loop(ctx, "delegate work")
+
+        supervisor.drain_owned_children.assert_called_once_with(
+            ctx.turn_id, cancel=True
+        )
+
+    def test_drain_is_exposed_to_progress_before_waiting(self):
+        from sub_agent_registry import SubAgentRecord
+        from sub_agent_supervisor import (
+            ExecutionOwnership,
+            SubAgentSupervisor,
+            _OwnedChildState,
+        )
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import react_loop
+
+        ctx = build_context(
+            ScriptedLLM(['{"action":"finish","result":"unused"}']),
+            RecordingExecutor(),
+        )
+        ctx.cancel_event.set()
+        ctx.owns_cancel_event = False
+        supervisor = SubAgentSupervisor()
+        record = SubAgentRecord(
+            agent_id="sa-draining",
+            label="on-demand",
+            model="test-model",
+            task_preview="work",
+            started_at=0.0,
+            source="on-demand",
+        )
+        record.ownership = ExecutionOwnership("on-demand", ctx.turn_id)
+        state = _OwnedChildState(record)
+        supervisor._owned_children[record.agent_id] = state
+        ctx.builtin_executor._supervisor = supervisor
+        progress_messages = []
+        drain_visible = threading.Event()
+        results = []
+
+        def progress(message):
+            progress_messages.append(message)
+            if message.startswith("__DRAINING__:"):
+                drain_visible.set()
+
+        run_thread = threading.Thread(
+            target=lambda: results.append(
+                react_loop(ctx, "delegate work", progress_callback=progress)
+            )
+        )
+        run_thread.start()
+        try:
+            visible_before_cleanup = drain_visible.wait(timeout=0.3)
+        finally:
+            state.cleanup_event.set()
+            run_thread.join(timeout=5.0)
+
+        assert visible_before_cleanup is True
+        assert progress_messages[-1] == "__DRAINING__:sa-draining"
+        assert results == ["[Cancelled]"]
 
 
 class TestExtractJsonCandidates:
@@ -622,6 +813,81 @@ class TestAgentControllerCancelRegistryWiring:
         ctrl = self._make_controller(cancel_event=ev)
         ctrl.cancel()
         assert ev.is_set() is True
+
+
+class TestAgentControllerTurnOwnership:
+    """Interactive ownership is unique even when correlation traces are reused."""
+
+    @staticmethod
+    def _make_controller():
+        from agent_controller import AgentController
+        from config_schema import AgentConfig, ExecutorPaths
+
+        return AgentController(
+            agent_cfg=AgentConfig(),
+            paths=ExecutorPaths(),
+            llm=MagicMock(),
+            tool_index=MagicMock(),
+            memory=MagicMock(),
+        )
+
+    def test_reused_trace_receives_distinct_turn_owners(self):
+        ctrl = self._make_controller()
+        seen = []
+
+        with patch(
+            "agent_controller.react_loop",
+            side_effect=lambda ctx, *_args, **_kwargs: seen.append(
+                (ctx.trace_id, ctx.turn_id)
+            ) or "ok",
+        ):
+            ctrl.run("first", trace_id="r-reused")
+            ctrl.run("second", trace_id="r-reused")
+
+        assert [trace for trace, _owner in seen] == ["r-reused", "r-reused"]
+        assert seen[0][1]
+        assert seen[0][1] != seen[1][1]
+
+    def test_resume_reuses_checkpoint_trace_but_not_turn_owner(self):
+        ctrl = self._make_controller()
+        ctrl.checkpoint_store = MagicMock()
+        ctrl.checkpoint_store.load.return_value = {
+            "messages": [],
+            "goal_idx": 0,
+            "max_steps": 8,
+            "step": 0,
+            "json_fail_streak": 0,
+            "trace_id": "r-checkpoint",
+            "user_goal": "resumed goal",
+        }
+        seen = []
+
+        with patch(
+            "agent_controller.react_loop",
+            side_effect=lambda ctx, *_args, **_kwargs: seen.append(
+                (ctx.trace_id, ctx.turn_id)
+            ) or "ok",
+        ):
+            ctrl.run("ignored", resume_from="r-checkpoint")
+            ctrl.run("ignored", resume_from="r-checkpoint")
+
+        assert [trace for trace, _owner in seen] == [
+            "r-checkpoint",
+            "r-checkpoint",
+        ]
+        assert seen[0][1] != seen[1][1]
+
+    def test_empty_react_context_trace_still_has_turn_owner(self):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+
+        response = '{"action":"finish","result":"done"}'
+        first = build_context(ScriptedLLM([response]), RecordingExecutor())
+        second = build_context(ScriptedLLM([response]), RecordingExecutor())
+        first.trace_id = ""
+        second.trace_id = ""
+
+        assert first.turn_id
+        assert first.turn_id != second.turn_id
 
 
 class TestFormatToolResultRecoveryFields:

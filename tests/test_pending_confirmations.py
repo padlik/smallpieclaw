@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from builtin_executor import PendingConfirmations
+from confirmation import ConfirmationManager
 from sub_agent_supervisor import SubAgentSupervisor, SupervisionOptions
 
 
@@ -71,6 +73,45 @@ class TestPendingConfirmationsConcurrency:
         wins = [r for r in results if r is not None]
         assert len(wins) == 1
         assert wins[0] == ("file_write", {"path": "/tmp/x"})
+
+
+class TestHeadlessConfirmationCancellation:
+    def test_cancel_event_denies_and_invalidates_pending_decision(self) -> None:
+        manager = ConfirmationManager()
+        cancel_event = threading.Event()
+        prompted = threading.Event()
+        token = "cancel-race"
+        decisions = []
+        errors = []
+
+        def request_confirmation() -> None:
+            try:
+                decisions.append(
+                    manager.request_headless_confirmation(
+                        token,
+                        "file_write",
+                        "write a file",
+                        prompt_fn=lambda *_args: prompted.set(),
+                        caller_tag="sa-cancel-race",
+                        cancel_event=cancel_event,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - captured for red-phase evidence
+                errors.append(exc)
+
+        request_thread = threading.Thread(
+            target=request_confirmation
+        )
+        request_thread.start()
+        assert prompted.wait(timeout=1.0)
+
+        cancel_event.set()
+        request_thread.join(timeout=0.5)
+
+        assert request_thread.is_alive() is False
+        assert errors == []
+        assert decisions == [False]
+        assert manager.signal_headless_confirmation(token, True) is False
 
 
 class TestExecutorCompatShims:
@@ -150,6 +191,62 @@ class TestRunScopedPendingReset:
                     ctrl.run("hello")
 
         assert executor._pending_confirmations.take("t1") is None
+
+    def test_pending_reset_waits_for_owned_child_drain(
+        self, make_agent_controller, make_builtin_executor
+    ) -> None:
+        drain_entered = threading.Event()
+        release_drain = threading.Event()
+
+        class BlockingSupervisor:
+            def drain_owned_children(self, owner_turn_id: str, *, cancel: bool) -> None:
+                assert owner_turn_id.startswith("r-")
+                assert cancel is True
+                drain_entered.set()
+                release_drain.wait(timeout=5.0)
+
+        executor = make_builtin_executor()
+        executor._supervisor = BlockingSupervisor()
+        ctrl = make_agent_controller(builtin_executor=executor)
+        executor._pending_confirmations.stage(
+            "pending-token",
+            "file_write",
+            {"path": "/tmp/x"},
+        )
+        confirmation_event = threading.Event()
+        ctrl._confirmation._confirm_events["confirm-token"] = confirmation_event
+        results = []
+
+        try:
+            with patch("agent_controller.react_loop", return_value="done"), \
+                 patch("agent_controller.AgentRuntime.build_react_context", return_value=MagicMock()), \
+                 patch("agent_controller.bind_run_context"):
+                run_thread = threading.Thread(
+                    target=lambda: results.append(ctrl.run("hello"))
+                )
+                run_thread.start()
+                assert drain_entered.wait(timeout=1.0)
+
+                assert executor._pending_confirmations.scope("pending-token") is None
+                assert executor._pending_confirmations.take("pending-token") == (
+                    "file_write",
+                    {"path": "/tmp/x"},
+                )
+                executor._pending_confirmations.stage(
+                    "pending-token",
+                    "file_write",
+                    {"path": "/tmp/x"},
+                )
+                ctrl.resume("confirm-token", True)
+                assert confirmation_event.wait(timeout=0.5)
+
+                release_drain.set()
+                run_thread.join(timeout=5.0)
+        finally:
+            release_drain.set()
+
+        assert results == ["done"]
+        assert executor._pending_confirmations.take("pending-token") is None
 
 
 class TestSubAgentGrantScopeCallback:

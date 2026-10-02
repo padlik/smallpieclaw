@@ -200,3 +200,154 @@ The operator approved read-only `/jobs history <tag>` and `/jobs result <executi
 
 ### 🔴 Outstanding
 - None.
+## design Reopened Round 1 — 2026-10-01
+
+### 🔴 Outstanding
+- The design goals still describe every cancellation interface as unchanged; distinguish model-facing `cancel_agent` from operator `/agents` and `/stop`.
+- Canonical `sub-agent-council-control` also defines cancellation scope. The operator approved reopening the proposal to declare that capability and adding a corresponding delta spec before freezing the revised design.
+
+### 🟡 Addressed in follow-up
+- Clarify the `managed`/`all` model aliases, completed-child accounting, cancellation-response non-disclosure, and the operator-only route for stopping scheduled work.
+## proposal Reopened Round 1 — 2026-10-01
+
+### 🔴 Outstanding
+- The newly declared `sub-agent-council-control` modification names model cancellation but omits that `wait_for_any_agent` becomes owning-turn-only; expand its capability description.
+
+### 🟡 Addressed in follow-up
+- Keep operator `/agents` and `/stop` as preserved context, call scheduled work a **scheduled run**, clarify `managed`/`all` model aliases and the model-facing compatibility impact, and retain existing glossary terminology.
+## proposal Reopened Round 2 — 2026-10-01
+
+### 🔴 Fixed
+- Reviewer confirmed `sub-agent-council-control` now declares the owning-turn restriction for `wait_for_any_agent` and model-facing cancellation.
+
+### 🟡 Addressed
+- Clarified that existing `/agents` cancellation includes, but is not limited to, on-demand and scheduled runs; model-facing `managed`/`all` and compatibility impact remain explicit.
+
+### 🔴 Outstanding
+- None; revised proposal frozen before updating design and dependent artifacts.
+## design Reopened Round 2 — 2026-10-01
+
+### 🔴 Fixed
+- Reviewer confirmed the goals now separate preserved operator cancellation from deliberately narrowed model-facing cancellation, and proposal now declares `sub-agent-council-control`.
+
+### 🟡 Addressed in follow-up
+- Clarify managed/all counts, finished-child cancellation and accounting, `wait_for_any_agent` accounting, operator cancellation, resumed-turn behavior, and scheduled capacity risk before freezing the design.
+
+### 🔴 Outstanding
+- None in this round; an explicit accounting clarification will receive a further review because it can change implementation behavior.
+## design Reopened Round 3 — 2026-10-01
+
+### 🔴 Fixed
+- Reviewer confirmed the completed-child discard, current-turn alias counts, operator cancellation accounting, resumed-turn separation, and scheduled capacity trade-off are consistent with the proposal and existing capabilities.
+
+### 🟡 Addressed in follow-up
+- Make alias responses unambiguous, distinguish timeout cancellation from a bare wait timeout, define lookup after an owned result is discarded, and require owned-record lookup after registry eviction.
+
+### 🔴 Outstanding
+- None; final declarative response-shape clarifications will be rechecked before downstream specs.
+## design Reopened Round 4 — 2026-10-01
+
+### 🔴 Fixed
+- Reviewer confirmed alias count/non-disclosure, timeout-cancel accounting, discarded-result response, and per-turn owned-record lifetime after registry eviction; revised design frozen.
+
+### 🟡 Addressed downstream
+- Specify discarded-ID behavior for `wait_for_any_agent` consistently with `get_agent_result` in the council-control delta; no further design-level decision remains.
+
+### 🔴 Outstanding
+- None.
+## specs Reopened Round 1 — 2026-10-01
+
+### 🔴 Outstanding
+- A MODIFIED council-control requirement replaces its canonical scenarios; reintroduce failed/cancelled own-child completion and cancellation-without-confirmation examples.
+
+### 🟡 Addressed in follow-up
+- Cover scheduled-run survival under `managed`/`all`, completed unread children in alias counts, mixed-ID wait failure, and TTL-independent wording; keep user-visible discarded status explicit without introducing an unnecessary glossary term.
+## specs Reopened Round 2 — 2026-10-01
+
+### 🔴 Fixed
+- Reviewer confirmed the MODIFIED council-control requirements retain failed/cancelled child results and cancellation without an approval prompt; specs batch frozen.
+
+### 🟡 Addressed
+- Added mixed-ID whole-call rejection, own-child-only alias counts including discarded completed results, scheduled-run survival, and registry-expiry-independent wording.
+
+### 🔴 Outstanding
+- None. Mixed-list error wording can explicitly name inaccessible IDs as a declarative clarification if needed by tests.
+## adr Reopened Round 1 — 2026-10-01
+
+### 🔴 Outstanding
+- Accepted ADR-0033's new history note points to an original cancellation sentence that was replaced in place; quote the old wording and record the deliberate narrowing decision explicitly.
+
+### 🟡 Addressed in follow-up
+- Clarify the unchanged operator-only ADR-0006 capacity cancellation, separate model-facing amendment from unchanged contracts, and note the scheduled capacity trade-off.
+## adr Reopened Round 2 — 2026-10-01
+
+### 🔴 Fixed
+- Reviewer confirmed ADR-0033 quotes its replaced managed-source assertion and records the deliberate model-facing cancellation narrowing while preserving `/agents` and `/stop`; ADR amendment frozen.
+
+### 🟡 Addressed
+- Labelled the dated note an amendment and placed the scheduled capacity limitation in Consequences.
+
+### 🔴 Outstanding
+- None.
+## tasks Reopened Round 1 — 2026-10-02
+
+### 🔴 Outstanding
+- Task 1.7's full scheduled-memory assertion depends on Part 2 tasks 2.1/2.2, and checked task 1.8 still claims to make 1.7 pass. The operator approved only the minimum Part 2 work needed to complete 1.7; preserve the full requirement and keep completion honest.
+
+### 🟡 Addressed in follow-up
+- Cover mixed-ID waits, resumed-turn separation, owned-record expiry, operator cancellation, and assign prompt-association rollback to one test/implementation pair.
+## tasks Reopened Round 2 — 2026-10-02
+
+### 🔴 Fixed
+- Reviewer confirmed 1.7 remains pending real-trigger and runtime-memory proof, while checked 1.8 covers only verified context-payload suppression; the operator authorised 2.1/2.2 as the sole Part 2 dependency. Section 1 task batch frozen.
+
+## Part 1 implementation completion — 2026-10-02
+
+### Completed
+- 1.1–1.6, 1.8–1.11 via specialist lanes with focused suites, ruff, and vulture green; 1.11 verified on integrated drain suite (270 passed) plus Telegram progress-dispatch tests.
+- 1.12–1.13 implemented directly by the orchestrator after both specialist lanes (senior-dev, fixer) errored on provider usage limits; red phase confirmed (2 failing rollback tests), then green: prompt-registry association failure and worker-pool submit failure now roll back registration, owned-child state, and prompt association (new `remove_sub_agent`). Gates: 44 focused + 351 Part 1 regression passed, ruff + vulture + `git diff --check` clean.
+
+### Open
+- 1.7 remains unchecked pending the operator-approved minimal Part 2 work (2.1/2.2) for real cron/once/`run_now` trigger routes and runtime memory-isolation proof.
+
+## Part 1 completion reviews — 2026-10-02
+
+### OpenSpec compliance review (clean: no Critical/High)
+- All seven Part 1 fix claims verified in code; 1.1–1.13 and 2.1–2.2 checkboxes honest.
+- 🔴 To fix before Part 2: SPEC-01 residual `_current_prompt_id` fallback (`builtin_tools/agents.py:263-266`) vs "MUST NOT infer from mutable ambient executor fields"; DRIFT-01 stale test asserting the old ambient behavior (`tests/test_supervisor_prompt_wiring.py:59-65`).
+
+### Oracle risk review
+- 🔴 To fix before Part 2: H1 unbounded drain wait on a non-cooperative child holds the operator lock; M2 legacy direct spawns mint a random owner (never-drained `_owned_children` entry + caller cannot read result — should be unowned legacy); M3 Telegram "Till /reset" in the ~50ms cancel window stores a session-wide grant for a cancelled operation (`telegram_callbacks.py:351-372`).
+- 🟡 Deferred minors (recorded, non-blocking): L1 cancel-after-approval micro-race; L2 stale headless result leak; L3 `remove_sub_agent` replay branch; L4 prompt-registry OSError aborting spawn; L5 rollback skips `runner.close()`; L6 wait aborts on first discarded ID; L7 cancel reports success when nothing changed; L8 raw drain markers reach non-Telegram frontends.
+- Confirmed OK: turn identity, non-disclosure, ownership locking, scheduled isolation wiring, callback responsiveness, `/stop` accounting. Scheduled memory/confirmation sharing is open scope (tasks 2.3–2.8), not a regression.
+
+### 🔴 Outstanding
+- H1, M2, M3, SPEC-01, DRIFT-01 fixes approved by the operator as Part 1 follow-ups; Part 2 proper (2.3+) remains paused pending explicit approval.
+
+## Part 1 review fixes — 2026-10-02
+
+### 🔴 Fixed
+- **M2**: on-demand spawns with no turn ID and no trace ID are now unowned legacy (no `_owned_children` entry; result readable by an ownerless caller; random-owner minting removed; stale `test_empty_trace_spawns_receive_distinct_nonempty_turn_owners` replaced with `test_spawn_without_turn_identity_is_unowned`).
+- **M3**: `signal_headless_confirmation` returns False for an already-cancelled waiter; Telegram grant recording moved into an `on_approved` callback that runs only for a live waiter — "Till /reset" after cancel stores no session grant and no write executes.
+- **H1**: `drain_owned_children` bounded at `OWNED_CHILD_DRAIN_TIMEOUT_S=180s` (120s headless wait + margin); expiry reports the stuck child via the existing `__DRAIN_ERROR__` channel, keeps the entry with `drain_expired=True` (no repeat waits), and late self-cleanup removes it.
+- **SPEC-01**: `_current_prompt_id` ambient fallback removed; only the explicit prompt ID is used.
+- **DRIFT-01**: stale ambient-behavior test rewritten to assert the explicit-prompt contract (`test_spawn_without_explicit_prompt_ignores_ambient_prompt`).
+
+### 🟡 Accepted residuals (recorded)
+- M3 micro-window: a grant can be recorded if cancel lands microseconds after a live waiter accepts; the operation still never executes (post-wake cancel check). Left as-is per design intent.
+- L1–L8 deferred minors from the oracle review remain recorded above; L1's micro-race is documented rather than spec-claimed.
+
+### Verification
+- Gate suite 418 passed; full suite **2465 passed, 2 skipped** (baseline-matching skips); ruff + vulture + `git diff --check` clean.
+
+### 🔴 Outstanding
+- None for Part 1. Part 2 proper (2.3–2.12) and Parts 3–5 remain paused pending operator approval.
+
+### 🔴 Outstanding
+- None.
+
+### 🟡 Addressed
+- Mixed-ID and terminal-result regressions, resumed-turn separation, owned-record expiry, operator cancellation accounting, and prompt/submission rollback each have a single test/implementation owner.
+
+### 🔴 Outstanding
+- None.

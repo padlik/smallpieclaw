@@ -32,7 +32,14 @@ An on-demand sub-agent spawned by the operator is a **turn-owned child**. Its pa
 A **scheduled run** (cron, once, or `run_now`) is owned by its job, not by the current operator turn. It uses its job task and optional job-preserved conversation as **job-owned context**, without operator KV, graph memory, result recall, live working memory, or automatic job-history injection. It never borrows operator grants or asks for a new approval: an action needing one fails closed even while the operator is active. Default permitted tool/file effects and depth-1 shell restrictions remain. Its complete outcome is a bounded **job execution record**; Telegram and `/jobs` present that record without injecting it into operator context.
 
 Execution origin and owner are immutable admission data passed through supervision and construction, not inferred from a mutable shared executor field or from the registry's source label. `SubAgentSupervisor` retains submission, lifecycle, callback, and notification initiation; `AgentRuntime` retains construction. This ADR does not redefine the existing `/agents`, `/stop`, schedule, path-policy, or grant-ledger contracts.
-The model-facing `get_agent_result` and `wait_for_any_agent` deliver only the active turn's own child results; `cancel_agent` and the operator's `/agents` controls keep their existing managed-source cancellation scope, including scheduled runs. This amends ADR-0005's presentation timing and removes independent on-demand completion messages without superseding its supervisor-owned delivery callback. It restricts which execution origins may consult ADR-0027's ledger without changing grant mechanics, vetoes, or classification-before-grant ordering.
+
+The model-facing `get_agent_result` and `wait_for_any_agent` expose only on-demand children owned by the caller's current operator turn. Model-facing `cancel_agent`, including its `managed`/`all` aliases, is likewise limited to that turn's on-demand children and cannot cancel scheduled runs or another turn's children. This deliberately narrows the model-facing cancellation scope; it does not let the model free globally counted scheduled capacity.
+
+Operator `/agents cancel managed` remains ADR-0006's cross-source visibility/capacity path for scheduled and on-demand runs, while `/stop` remains broad. This amends ADR-0005's presentation timing and removes independent on-demand completion messages without superseding its supervisor-owned delivery callback. It restricts which execution origins may consult ADR-0027's ledger without changing grant mechanics, vetoes, or classification-before-grant ordering.
+
+### Amendment — 2026-10-01
+
+Part 1 implementation review found the accepted ADR's prior assertion inaccurate: “`cancel_agent` and the operator's `/agents` controls keep their existing managed-source cancellation scope, including scheduled runs.” This correction records the deliberate architectural narrowing of model-facing `cancel_agent` to the caller's own turn-owned on-demand children, while `/agents` and `/stop` remain unchanged; it is not merely an editorial clarification or a claim that no architectural decision was made.
 
 ## Consequences
 
@@ -40,4 +47,5 @@ The model-facing `get_agent_result` and `wait_for_any_agent` deliver only the ac
 - Good: the existing scheduler/supervisor/runtime boundaries remain useful, with no detachable operator mode or per-job capability schema.
 - Bad: origin-aware tool enforcement, result history, and turn-draining behavior span several modules and require race/confirmation regression tests.
 - Bad: an uncooperative child can keep its parent turn draining until cleanup, and a best-effort Telegram notice can be lost while the job record remains available.
+- Bad: scheduled runs still consume global sub-agent capacity, but only the operator can cancel them through `/agents` or `/stop`; the model cannot free that capacity.
 - Neutral: shared default-allowed file/tool effects, `log_query`/`log_detail`, and the published `parallel` overlap option remain; this is not a full sandbox or a fix for preserved-context last-writer-wins behavior.

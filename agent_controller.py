@@ -385,6 +385,7 @@ class AgentController:
             else None
         )
         ctx = AgentRuntime.build_react_context(self, run_trace_id, cancel_event=run_cancel_event)
+        ctx.prompt_id = prompt_id
         ctx.milestone_notify_fn = milestone_notify_fn
 
         loop_kwargs: dict = {}
@@ -397,11 +398,24 @@ class AgentController:
             if hasattr(self.llm, "set_trace_id"):
                 self.llm.set_trace_id(_prev_trace)
             if self.builtin_executor is not None and self._depth == 0:
-                self.builtin_executor._coordinator = None
-                self.builtin_executor._current_prompt_id = None
-                # Run-scoped cleanup: abandoned staged confirmation tokens from this
-                # run must not leak into the next interactive run.
-                self.builtin_executor._pending_confirmations.reset()
+                try:
+                    drain_errors = (
+                        self.builtin_executor._supervisor.drain_owned_children(
+                            ctx.turn_id, cancel=True
+                        )
+                    )
+                    for drain_error in drain_errors or []:
+                        logger.error(
+                            "sub-agent lifecycle cleanup failed: %s", drain_error
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.error("sub-agent turn drain failed", exc_info=True)
+                finally:
+                    self.builtin_executor._coordinator = None
+                    self.builtin_executor._current_prompt_id = None
+                    # Run-scoped cleanup: abandoned staged confirmation tokens from this
+                    # run must not leak into the next interactive run.
+                    self.builtin_executor._pending_confirmations.reset()
             if self._cancel_registry is not None and run_cancel_event is not None:
                 self._cancel_registry.release(run_cancel_event)
 

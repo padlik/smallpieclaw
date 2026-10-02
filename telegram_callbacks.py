@@ -347,8 +347,8 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
             pass
         return
 
-    # Grant bookkeeping for sub-agent confirmations before the signal.
-    if approved:
+    def _record_grants() -> None:
+        """Record approval grants; run only when a live waiter consumes the approval."""
         try:
             entry = builtin._pending.get(token)
             tool_name = entry[0] if entry else ""
@@ -377,8 +377,12 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
             )
 
     # Atomically signal the coordinator. Returns False if the token was already
-    # resolved or expired (double-press / stale button).
-    signalled = coordinator.signal_headless_confirmation(token, approved)
+    # resolved or expired (double-press / stale button) or the waiting child was
+    # cancelled. Grants are recorded before the waiter is released (the woken
+    # operation may rely on them) and never for a cancelled operation.
+    signalled = coordinator.signal_headless_confirmation(
+        token, approved, on_approved=_record_grants,
+    )
 
     await _ack_query(query)
 

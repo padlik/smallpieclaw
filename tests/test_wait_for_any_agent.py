@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from sub_agent_registry import SOURCE_ON_DEMAND, SubAgentRecord, SubAgentRegistry
+from sub_agent_registry import SOURCE_ON_DEMAND, SOURCE_SCHEDULED, SubAgentRecord, SubAgentRegistry
+from sub_agent_supervisor import ExecutionOwnership, _OwnedChildState
 from builtin_tools import agents as agents_mod
 
 
@@ -20,6 +21,10 @@ def _make_record(agent_id: str, source: str = SOURCE_ON_DEMAND, status: str = "r
         started_at=time.time(),
         source=source,
         status=status,
+    )
+    rec.ownership = ExecutionOwnership(
+        origin=source,
+        owner_turn_id="r-owner" if source == SOURCE_ON_DEMAND else None,
     )
     return rec
 
@@ -49,7 +54,8 @@ class TestWaitForAnyAgent:
 
         with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
             result = executor._agents._exec_wait_for_any_agent(
-                {"agent_ids": ["sa-a", "sa-b", "sa-c"], "timeout": 5}
+                {"agent_ids": ["sa-a", "sa-b", "sa-c"], "timeout": 5},
+                caller_tag="main r-owner",
             )
         assert result["status"] == "done"
         assert result["agent_id"] == "sa-b"
@@ -65,14 +71,18 @@ class TestWaitForAnyAgent:
 
         with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
             result = executor._agents._exec_wait_for_any_agent(
-                {"agent_ids": ["sa-a", "sa-b"], "timeout": 5}
+                {"agent_ids": ["sa-a", "sa-b"], "timeout": 5},
+                caller_tag="main r-owner",
             )
         assert result["status"] == "done"
         assert result["agent_id"] == "sa-a"
 
-    def test_failed_or_cancelled_returned_as_completed(self, executor, local_registry):
-        a = _make_record("sa-a", status="failed")
-        a.result = "A-crashed"
+    @pytest.mark.parametrize("status", ["failed", "cancelled"])
+    def test_failed_or_cancelled_returned_as_completed(
+        self, executor, local_registry, status
+    ):
+        a = _make_record("sa-a", status=status)
+        a.result = f"A-{status}"
         a._result_event.set()
         b = _make_record("sa-b")
         local_registry.register(a)
@@ -80,11 +90,12 @@ class TestWaitForAnyAgent:
 
         with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
             result = executor._agents._exec_wait_for_any_agent(
-                {"agent_ids": ["sa-a", "sa-b"], "timeout": 5}
+                {"agent_ids": ["sa-a", "sa-b"], "timeout": 5},
+                caller_tag="main r-owner",
             )
-        assert result["status"] == "failed"
+        assert result["status"] == status
         assert result["agent_id"] == "sa-a"
-        assert result["error"] == "A-crashed"
+        assert result["result"] == f"A-{status}"
         assert result["success"] is False
 
     def test_timeout_returns_no_result(self, executor, local_registry):
@@ -95,7 +106,8 @@ class TestWaitForAnyAgent:
 
         with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
             result = executor._agents._exec_wait_for_any_agent(
-                {"agent_ids": ["sa-a", "sa-b"], "timeout": 5}
+                {"agent_ids": ["sa-a", "sa-b"], "timeout": 5},
+                caller_tag="main r-owner",
             )
         assert result["status"] == "timeout"
         assert result["success"] is False
@@ -107,11 +119,97 @@ class TestWaitForAnyAgent:
 
         with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
             result = executor._agents._exec_wait_for_any_agent(
-                {"agent_ids": ["sa-a", "sa-missing"], "timeout": 5}
+                {"agent_ids": ["sa-a", "sa-missing"], "timeout": 5},
+                caller_tag="main r-owner",
             )
         assert result["success"] is False
         assert result["status"] == "not_found"
         assert "sa-missing" in result["error"]
+        assert "no child accessible in this turn" in result["error"]
+
+    @pytest.mark.parametrize(
+        ("source", "owner_turn_id"),
+        [
+            (SOURCE_ON_DEMAND, "r-other"),
+            (SOURCE_SCHEDULED, None),
+        ],
+    )
+    def test_get_agent_result_rejects_non_owned_id_without_waiting(
+        self, executor, local_registry, source, owner_turn_id
+    ):
+        record = _make_record("sa-private", source=source)
+        record.ownership = ExecutionOwnership(source, owner_turn_id)
+        record._result_event.wait = MagicMock(side_effect=AssertionError("must not wait"))
+        local_registry.register(record)
+
+        with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
+            result = executor._agents._exec_get_agent_result(
+                {"agent_id": "sa-private", "timeout": 30},
+                caller_tag="main r-owner",
+            )
+
+        assert result["success"] is False
+        assert result["status"] == "not_found"
+        assert "sa-private" in result["error"]
+        assert "no child accessible in this turn" in result["error"]
+
+    def test_wait_for_any_rejects_non_owned_id_without_waiting(
+        self, executor, local_registry
+    ):
+        owned = _make_record("sa-owned")
+        private = _make_record("sa-private")
+        private.ownership = ExecutionOwnership(SOURCE_ON_DEMAND, "r-other")
+        local_registry.register(owned)
+        local_registry.register(private)
+
+        with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry), \
+             patch.object(agents_mod.time, "sleep", side_effect=AssertionError("must not wait")):
+            result = executor._agents._exec_wait_for_any_agent(
+                {"agent_ids": ["sa-owned", "sa-private"], "timeout": 30},
+                caller_tag="main r-owner",
+            )
+
+        assert result["success"] is False
+        assert result["status"] == "not_found"
+        assert "sa-private" in result["error"]
+        assert "no child accessible in this turn" in result["error"]
+
+    def test_mixed_wait_error_names_every_inaccessible_supplied_id(
+        self, executor, local_registry
+    ):
+        owned = _make_record("sa-owned")
+        other = _make_record("sa-other")
+        other.ownership = ExecutionOwnership(SOURCE_ON_DEMAND, "r-other")
+        scheduled = _make_record("sa-scheduled", source=SOURCE_SCHEDULED)
+        for record in (owned, other, scheduled):
+            local_registry.register(record)
+
+        with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry), \
+             patch.object(agents_mod.time, "sleep", side_effect=AssertionError("must not wait")):
+            result = executor._agents._exec_wait_for_any_agent(
+                {"agent_ids": ["sa-owned", "sa-other", "sa-scheduled"]},
+                caller_tag="main r-owner",
+            )
+
+        assert "sa-other" in result["error"]
+        assert "sa-scheduled" in result["error"]
+
+    def test_owned_result_resolves_after_registry_completed_ttl(
+        self, executor, local_registry
+    ):
+        record = _make_record("sa-expired", status="done")
+        record.result = "retained by turn"
+        record._result_event.set()
+        executor._supervisor._owned_children[record.agent_id] = _OwnedChildState(record)
+
+        with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
+            result = executor._agents._exec_get_agent_result(
+                {"agent_id": record.agent_id},
+                caller_tag="main r-owner",
+            )
+
+        assert result["status"] == "done"
+        assert result["result"] == "retained by turn"
 
     def test_empty_agent_ids_rejected(self, executor, local_registry):
         with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):

@@ -2,7 +2,7 @@
 
 ### Requirement: Operator turn owns on-demand child results and lifetime
 
-An on-demand sub-agent spawned by the operator SHALL be associated with the active **operator turn** at admission as a **turn-owned child**. Only that turn SHALL consume its result through `get_agent_result` or `wait_for_any_agent`; no independent child-completion Telegram message or automatic operator result-recall entry SHALL be created. At normal finish the operator SHALL retrieve or cancel all its admitted children before the turn ends. On stop, error, or exhausted run budget, outstanding children SHALL be cancelled and the turn SHALL remain active until their lifecycle cleanup completes; confirmation callbacks and `/stop` MUST remain responsive throughout.
+An on-demand sub-agent spawned by the operator SHALL be associated with a unique immutable **operator turn** identity at admission as a **turn-owned child**. Only that turn SHALL consume its result through `get_agent_result` or `wait_for_any_agent`; no independent child-completion Telegram message or automatic operator result-recall entry SHALL be created. A resumed run SHALL receive a new turn identity even when reusing a checkpoint trace; it SHALL NOT inherit prior-turn children or their outcomes. At normal finish the operator SHALL retrieve or cancel all its admitted children before the turn ends. Owned records SHALL remain available to their turn beyond registry expiry for retrieval/accounting. On stop, error, or exhausted run budget, outstanding children SHALL be cancelled and the turn SHALL remain active until their lifecycle cleanup completes; confirmation callbacks and `/stop` MUST remain responsive throughout.
 
 #### Scenario: Parent consumes its own completed child
 - **GIVEN** an operator turn spawned on-demand child A
@@ -22,6 +22,24 @@ An on-demand sub-agent spawned by the operator SHALL be associated with the acti
 - **THEN** the still-running child remains that turn's responsibility
 - **AND** the finish is refused until the child completes or is cancelled
 
+#### Scenario: Result timeout cancellation accounts for the child
+- **GIVEN** an operator turn waits for its own child with `get_agent_result` and `cancel_on_timeout=true`
+- **WHEN** the wait times out and cancellation is actually requested
+- **THEN** the child is accounted for without retrieving its result
+- **AND** the turn remains draining until lifecycle cleanup completes
+
+#### Scenario: Non-cancelling timeout leaves the child outstanding
+- **GIVEN** an operator turn waits with `get_agent_result` and `cancel_on_timeout=false`, or uses `wait_for_any_agent`
+- **WHEN** the wait times out
+- **THEN** the child remains unaccounted and owned by that turn
+- **AND** normal finish is refused until its outcome is retrieved or it is cancelled
+
+#### Scenario: Resumed run receives a new owner
+- **GIVEN** a run resumes a prior checkpoint trace after an earlier turn spawned child A
+- **WHEN** the resumed run is admitted as an operator turn
+- **THEN** it receives a unique owner distinct from the earlier turn
+- **AND** it neither inherits A nor receives A's outcome in its context
+
 #### Scenario: Stop drains children without blocking control callbacks
 - **GIVEN** an operator turn has two running children, one awaiting operator confirmation
 - **WHEN** the operator sends `/stop`
@@ -34,11 +52,17 @@ An on-demand sub-agent spawned by the operator SHALL be associated with the acti
 - **THEN** it returns an error naming the supplied ID and saying no child is accessible in this turn, without waiting
 - **AND** it does not disclose whether a non-owned run exists or reveal its result
 
-#### Scenario: Managed cancellation remains broad
-- **GIVEN** on-demand and scheduled agents are active
-- **WHEN** the operator agent calls `cancel_agent` with a matching ID or `managed`
-- **THEN** existing managed-source cancellation behavior is preserved, including scheduled agents
-- **AND** cancelling a scheduled agent does not put its result in the operator's tool response
+#### Scenario: Operator cancellation accounts for its turn-owned child
+- **GIVEN** a turn-owned child has not been accounted for
+- **WHEN** the operator cancels it through `/agents`
+- **THEN** the child is accounted for in that turn
+- **AND** the turn remains draining until lifecycle cleanup completes
+
+#### Scenario: Owned result remains retrievable beyond completed-record expiry
+- **GIVEN** a turn-owned child record has passed registry expiry
+- **WHEN** its owning turn retrieves or accounts for the child
+- **THEN** the supervisor's per-turn owned record remains available to complete that operation
+- **AND** registry expiry alone cannot permanently prevent the turn from finishing
 
 ### Requirement: Only turn-owned children may use interactive confirmation
 
@@ -77,7 +101,7 @@ The system SHALL supervise on-demand and scheduled sub-agent runs through an int
 
 ### Requirement: Existing spawn supervision behavior is preserved
 
-The supervision boundary SHALL preserve model-facing spawn validation and response behavior, capacity policy, context persistence, cancellation, and graph-memory non-admission. `get_agent_result` and `wait_for_any_agent` SHALL expose results only to the owning **operator turn**; a non-owned, scheduled, or unknown ID SHALL return an error naming the supplied ID and stating that no child is accessible in this turn, without waiting or revealing whether another run exists. Timeout cancellation SHALL suppress a later stale notice only for a timeout-cancelled scheduled run; turn-owned children never send independent completion notices. When an operator turn attempts normal finish with any unaccounted child, completed-but-unretrieved children included, finish SHALL be refused until each result is retrieved or the child is cancelled. Existing broad managed cancellation remains unchanged.
+The supervision boundary SHALL preserve model-facing spawn validation and response behavior, capacity policy, context persistence, cancellation, and graph-memory non-admission. `get_agent_result` and `wait_for_any_agent` SHALL expose results only to the owning **operator turn**; a non-owned, scheduled, or unknown ID SHALL return an error naming the supplied ID and stating that no child is accessible in this turn, without waiting or revealing whether another run exists. Timeout cancellation SHALL suppress a later stale notice only for a timeout-cancelled scheduled run; turn-owned children never send independent completion notices. When an operator turn attempts normal finish with any unaccounted child, completed-but-unretrieved children included, finish SHALL be refused until each result is retrieved or the child is cancelled. A resumed run has a new unique turn owner even if its checkpoint trace is reused. Turn-owned records remain available for retrieval/accounting beyond registry TTL. Cross-source cancellation remains an operator `/agents` and `/stop` capability, not a model-facing capability.
 
 #### Scenario: Model-facing spawn validation remains compatible
 - **GIVEN** a caller uses the model-facing `spawn_agent` tool contract
@@ -112,6 +136,12 @@ The supervision boundary SHALL preserve model-facing spawn validation and respon
 - **GIVEN** a turn-owned child has completed but its result has not been retrieved or cancelled
 - **WHEN** the operator agent attempts normal finish
 - **THEN** the finish is refused with actionable feedback to retrieve or cancel the child
+
+#### Scenario: Cancel-on-timeout accounts only after cancellation request
+- **GIVEN** a turn-owned child is awaited through `get_agent_result` with timeout and `cancel_on_timeout=true`
+- **WHEN** timeout expires before completion and cancellation is requested
+- **THEN** the child is accounted for, but cleanup must finish before the turn closes
+- **AND** without an actual cancellation request, timeout alone leaves it unaccounted
 
 ### Requirement: Source-aware supervised runs
 

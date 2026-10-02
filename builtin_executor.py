@@ -714,6 +714,29 @@ class BuiltinExecutor:
         self._pending_confirmations.stage(token, tool_name, args, zone_path=zone_path,
                                           extra_zone_paths=extra_zone_paths, scope_owner=scope_owner)
 
+        cancel_event = None
+        if scope_owner:
+            from sub_agent_registry import get_registry
+
+            record = get_registry().get(scope_owner)
+            if record is not None:
+                cancel_event = record.cancel_event
+
+        def _cancelled_result() -> dict:
+            self._pending_confirmations.discard(token)
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"Sub-agent sensitive operation cancelled before approval "
+                    f"('{tool_name}')."
+                ),
+                "exit_code": -1,
+            }
+
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_result()
+
         logger.info(
             "Headless sub-agent: sending Telegram confirmation prompt for %s (token=%s)",
             tool_name, token[:8],
@@ -723,6 +746,7 @@ class BuiltinExecutor:
                 token, tool_name, description,
                 prompt_fn=self._subagent_confirm_prompt_fn,
                 caller_tag=caller_tag,
+                cancel_event=cancel_event,
             )
         except Exception as exc:
             logger.error(
@@ -736,6 +760,9 @@ class BuiltinExecutor:
                 "error": f"Sub-agent sensitive operation blocked: could not send Telegram prompt ({exc}).",
                 "exit_code": -1,
             }
+
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_result()
 
         if not approved:
             self._pending_confirmations.discard(token)

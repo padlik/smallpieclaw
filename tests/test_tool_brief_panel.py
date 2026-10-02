@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import time
+import threading
 from unittest.mock import MagicMock
 
 from react_loop import fmt_tool_brief, _strip_shell_wrapper, _truncate_brief
@@ -450,6 +451,102 @@ class TestProgressPanelToolEndMerge:
         assert len(panel._steps) == 2  # TOOL_RUNNING + THINKING, no new step
         assert "✅" in panel._steps[0].html  # TOOL_RUNNING updated
         assert "Thinking" in panel._steps[1].html  # THINKING untouched
+
+
+class TestProgressPanelDrainMarkers:
+    def test_react_drain_renders_safe_persistent_operator_status(self) -> None:
+        from sub_agent_registry import SubAgentRecord
+        from sub_agent_supervisor import (
+            ExecutionOwnership,
+            SubAgentSupervisor,
+            _OwnedChildState,
+        )
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import react_loop
+
+        panel = _make_panel()
+        ctx = build_context(
+            ScriptedLLM(['{"action":"finish","result":"unused"}']),
+            RecordingExecutor(),
+        )
+        ctx.cancel_event.set()
+        ctx.owns_cancel_event = False
+        supervisor = SubAgentSupervisor()
+        record = SubAgentRecord(
+            agent_id="sa-private-id",
+            label="on-demand",
+            model="test-model",
+            task_preview="work",
+            started_at=0.0,
+            source="on-demand",
+        )
+        record.ownership = ExecutionOwnership("on-demand", ctx.turn_id)
+        state = _OwnedChildState(record)
+        supervisor._owned_children[record.agent_id] = state
+        ctx.builtin_executor._supervisor = supervisor
+        drain_rendered = threading.Event()
+        results = []
+
+        def progress(message: str) -> None:
+            panel.dispatch_progress(message)
+            if message.startswith("__DRAINING__:"):
+                drain_rendered.set()
+
+        run_thread = threading.Thread(
+            target=lambda: results.append(
+                react_loop(ctx, "delegate work", progress_callback=progress)
+            )
+        )
+        run_thread.start()
+        try:
+            assert drain_rendered.wait(timeout=1.0)
+            rendered = panel.build_panel()
+            assert "Stopping sub-agents…" in rendered
+            assert "sa-private-id" not in rendered
+            assert "__DRAINING__" not in rendered
+            assert run_thread.is_alive()
+        finally:
+            state.cleanup_event.set()
+            run_thread.join(timeout=5.0)
+
+        assert results == ["[Cancelled]"]
+
+    def test_draining_marker_shows_persistent_operator_status_without_ids(self) -> None:
+        panel = _make_panel()
+        panel.dispatch_progress("__DRAINING__:sa-one,sa-two")
+
+        rendered = panel.build_panel()
+        assert "Stopping sub-agents…" in rendered
+        assert "sa-one" not in rendered
+        assert "sa-two" not in rendered
+        assert "__DRAINING__" not in rendered
+
+        panel.dispatch_progress("⚙️ Thinking… (step 1)")
+        assert "Stopping sub-agents…" in panel.build_panel()
+
+    def test_drain_error_replaces_pending_status_without_internal_details(self) -> None:
+        panel = _make_panel()
+        panel.dispatch_progress("__DRAINING__:sa-one")
+        panel.dispatch_progress("__DRAIN_ERROR__:RuntimeError: private detail")
+
+        rendered = panel.build_panel()
+        assert "Sub-agent cleanup failed" in rendered
+        assert "Stopping sub-agents…" not in rendered
+        assert "private detail" not in rendered
+        assert "__DRAIN_ERROR__" not in rendered
+
+    def test_normal_tool_progress_remains_visible_alongside_drain_status(self) -> None:
+        panel = _make_panel()
+        panel.dispatch_progress("__DRAINING__:sa-one")
+        panel.dispatch_progress("🖥️ Running tool: `file_read`\nfile_read config.yaml")
+        panel.dispatch_progress(
+            "__TOOL_END__:ok:file_read\n📄 **file_read** ✅\n```\nread\n```"
+        )
+
+        rendered = panel.build_panel()
+        assert "Stopping sub-agents…" in rendered
+        assert "file_read" in rendered
+        assert "✅" in rendered
 
 
 # ---------------------------------------------------------------------------

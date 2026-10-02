@@ -11,9 +11,16 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 from memory_store import ShortTermMemory
-from sub_agent_supervisor import SupervisionOptions
+from sub_agent_supervisor import (
+    ExecutionOwnership,
+    SubmissionRequest,
+    SubAgentSupervisor,
+    SupervisionOptions,
+)
 from react_loop import (
     ReactContext,
     _format_parent_context,
@@ -206,6 +213,134 @@ class TestSpawnAgentContextPayload:
         assert "must not persist" not in saved
         assert "context_payload" not in saved
         assert "secret" not in saved
+
+    @pytest.mark.parametrize("trigger", ["cron", "once", "run_now"])
+    def test_scheduled_trigger_receives_no_automatic_operator_context(
+        self, make_builtin_executor, trigger
+    ):
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return _make_runner(f"sa-{trigger}")
+
+        working = MagicMock()
+        working.steps = [
+            {"action": "tool", "details": {"tool": "shell", "success": True}},
+            {"action": "tool", "details": {"tool": "file_read", "success": True}},
+        ]
+        memory = MagicMock()
+        memory.as_prompt_text.return_value = "operator KV memory"
+        results = MagicMock()
+        results.as_prompt_text.return_value = "operator result recall"
+        graph_memory = MagicMock()
+        graph_memory.format_for_prompt.return_value = "operator graph memory"
+        exc = make_builtin_executor(
+            sub_agent_factory=factory,
+            working=working,
+            memory=memory,
+            results=results,
+        )
+        exc._graph_memory = graph_memory
+
+        with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
+            exc._exec_spawn_agent(
+                {"task": f"{trigger} job task"},
+                options=SupervisionOptions(
+                    source="scheduled",
+                    job_tag=f"job-{trigger}",
+                    notify=False,
+                ),
+            )
+
+        assert captured["context_payload"] == {}
+        memory.as_prompt_text.assert_not_called()
+        results.as_prompt_text.assert_not_called()
+        graph_memory.format_for_prompt.assert_not_called()
+
+    def test_scheduled_supervisor_boundary_discards_ambient_parent_payload(self, tmp_path):
+        captured = {}
+        runner = _make_runner("sa-boundary")
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return runner
+
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        request = SubmissionRequest(
+            task="scheduled task",
+            response_format="text",
+            label="nightly",
+            context_key=None,
+            factory=factory,
+            factory_kwargs={
+                "context_payload": {
+                    "parent_goal": "operator goal",
+                    "tool_result_1": "operator tool result",
+                    "relevant_memory": "operator KV memory",
+                    "relevant_results": "operator recall",
+                    "relevant_graph": "operator graph memory",
+                }
+            },
+            data_dir=str(tmp_path),
+            ownership=ExecutionOwnership("scheduled"),
+        )
+
+        try:
+            with patch.object(supervisor._pool, "submit", return_value=MagicMock()):
+                result = supervisor.submit(
+                    request,
+                    SupervisionOptions(source="scheduled", notify=False),
+                )
+        finally:
+            supervisor.shutdown(graceful_timeout=0.1)
+
+        assert result["success"] is True
+        assert captured["context_payload"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Real scheduled trigger routes (cron, once, run_now) through admission
+# ---------------------------------------------------------------------------
+
+_OPERATOR_MARKERS = (
+    "operator goal",
+    "operator tool result 1",
+    "operator tool result 2",
+    "operator KV memory",
+    "operator result recall",
+    "operator graph memory",
+)
+
+
+@pytest.mark.parametrize("trigger", ["cron", "once", "run_now"])
+class TestScheduledTriggerContext:
+    """Scheduler-fired runs reach the runtime with no operator context."""
+
+    def test_no_parent_context_payload(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        from tests.test_agent_runtime_characterization import drive_scheduled_trigger
+
+        ctx, _operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+        )
+        assert ctx._context_payload == {}
+        assert _format_parent_context(ctx) == ""
+
+    def test_system_prompt_excludes_operator_context(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        from react_loop import _assemble_system_prompt
+        from tests.test_agent_runtime_characterization import drive_scheduled_trigger
+
+        ctx, _operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+        )
+        system = _assemble_system_prompt(ctx, "compile the nightly report")
+        leaked = [marker for marker in _OPERATOR_MARKERS if marker in system]
+        assert leaked == []
 
 
 # ---------------------------------------------------------------------------

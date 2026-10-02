@@ -166,11 +166,14 @@ class _ProgressPanel:
         self._task_start = time.monotonic()
         self._last_edit_ts: float = 0.0
         self._step_n: int = 0
+        self._drain_status: Step | None = None
         self._progress_dispatch: dict[str, Callable[[str], None]] = {
             "__CONFIRM__:": self._handle_confirm_progress,
             "__LLM_ERROR__:": self._handle_llm_error_progress,
             "__FILE__": self._handle_file_progress,
             "__TOOL_END__:": self._handle_tool_end_progress,
+            "__DRAINING__:": self._handle_drain_progress,
+            "__DRAIN_ERROR__:": self._handle_drain_error_progress,
         }
 
     async def typing_loop(self) -> None:
@@ -251,6 +254,11 @@ class _ProgressPanel:
         visible = self._steps[-self._MAX_STEPS:]
         lines: list[str] = []
         for step in visible:
+            sm, ss = divmod(int(step.elapsed), 60)
+            ts = f"{sm}:{ss:02d}" if sm else f"0:{ss:02d}"
+            lines.append(f"<code>[{ts}]</code> {step.html}")
+        if self._drain_status is not None:
+            step = self._drain_status
             sm, ss = divmod(int(step.elapsed), 60)
             ts = f"{sm}:{ss:02d}" if sm else f"0:{ss:02d}"
             lines.append(f"<code>[{ts}]</code> {step.html}")
@@ -384,6 +392,26 @@ class _ProgressPanel:
                 self._loop,
             )
         self.flush_panel()
+
+    def _handle_drain_progress(self, msg: str) -> None:
+        """Show a persistent operator-facing status while child cleanup runs."""
+        del msg  # Agent IDs are internal and intentionally not shown in Telegram.
+        elapsed = time.monotonic() - self._task_start
+        self._drain_status = Step(
+            elapsed, "⏳ <i>Stopping sub-agents…</i>", None
+        )
+        self.flush_panel(force=True)
+
+    def _handle_drain_error_progress(self, msg: str) -> None:
+        """Replace the drain status with a safe cleanup-failure summary."""
+        del msg  # Exception details are internal and may contain sensitive data.
+        elapsed = time.monotonic() - self._task_start
+        self._drain_status = Step(
+            elapsed,
+            "⚠️ <i>Sub-agent cleanup failed; the run may still be draining.</i>",
+            None,
+        )
+        self.flush_panel(force=True)
 
     def _handle_verbose_event(self, msg: str) -> None:
         """Forward verbose progress prefixes as separate events."""

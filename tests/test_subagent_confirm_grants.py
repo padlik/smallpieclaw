@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from confirmation import ConfirmationManager, GrantLifetime
+from sub_agent_registry import SOURCE_ON_DEMAND, SubAgentRecord, SubAgentRegistry
 from telegram_callbacks import cb_confirm, cb_subagent_confirm
 
 
@@ -334,6 +335,223 @@ class TestSubAgentGrantCallbacks:
         assert result["success"] is True
         repeated = executor.execute("file_diff", {"path_a": str(path_a), "path_b": str(path_b)})
         assert repeated["success"] is True
+
+
+class TestTurnDrainGrantCleanup:
+    """Turn confirmation state remains live until owned child cleanup completes."""
+
+    def test_prompt_grant_cleanup_waits_for_child_lifecycle(
+        self, make_agent_controller, make_builtin_executor, tmp_path
+    ):
+        from types import SimpleNamespace
+
+        from sub_agent_registry import SubAgentRegistry
+
+        allow_result = threading.Event()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+
+        class BlockingCloseRunner:
+            agent_id = "sa-drain-grant"
+            _model_id = "test-model"
+            model_id = "test-model"
+            _cancel_event = threading.Event()
+            _llm = MagicMock()
+            _agent = SimpleNamespace(max_iterations=8, _on_step=None)
+            short_term = MagicMock()
+            trace_id = None
+            notify_fn = staticmethod(lambda _message: None)
+
+            def run(self, _task):
+                allow_result.wait(timeout=5.0)
+                return "done"
+
+            def close(self):
+                close_entered.set()
+                release_close.wait(timeout=5.0)
+
+        runner = BlockingCloseRunner()
+        executor = make_builtin_executor(
+            sub_agent_factory=lambda **_kwargs: runner,
+            data_dir=str(tmp_path),
+        )
+        controller = make_agent_controller(builtin_executor=executor)
+        local_registry = SubAgentRegistry()
+        run_result = []
+
+        def fake_loop(ctx, *_args, **_kwargs):
+            ctx.turn_id = "r-owner"
+            spawned = executor._exec_spawn_agent(
+                {"task": "child work", "_operator_turn_id": ctx.turn_id},
+                trace_id="r-owner",
+            )
+            assert spawned["success"] is True
+            controller._confirmation.add_grant(
+                "file_write",
+                str(tmp_path),
+                GrantLifetime.PROMPT,
+                scope_owner=runner.agent_id,
+            )
+            allow_result.set()
+            record = local_registry.get(runner.agent_id)
+            assert record is not None
+            assert record._result_event.wait(timeout=5.0)
+            return "done"
+
+        confirmation_event = threading.Event()
+        controller._confirmation._confirm_events["confirm-token"] = confirmation_event
+
+        try:
+            with patch("sub_agent_registry.get_registry", return_value=local_registry), \
+                 patch("agent_controller.react_loop", side_effect=fake_loop), \
+                 patch("agent_controller.AgentRuntime.build_react_context", return_value=MagicMock()), \
+                patch("agent_controller.bind_run_context"):
+                run_thread = threading.Thread(
+                    target=lambda: run_result.append(
+                        controller.run("operator task", trace_id="r-owner")
+                    )
+                )
+                run_thread.start()
+                assert close_entered.wait(timeout=5.0)
+
+                assert run_thread.is_alive()
+                assert executor._coordinator is controller._confirmation
+                assert controller._confirmation.check_grant(
+                    "file_write",
+                    str(tmp_path / "out.txt"),
+                    scope_owner=runner.agent_id,
+                ) is True
+
+                controller.resume("confirm-token", True)
+                assert confirmation_event.wait(timeout=0.5)
+
+                release_close.set()
+                run_thread.join(timeout=5.0)
+        finally:
+            release_close.set()
+
+        assert run_result == ["done"]
+        assert executor._coordinator is None
+        assert controller._confirmation.check_grant(
+            "file_write",
+            str(tmp_path / "out.txt"),
+            scope_owner=runner.agent_id,
+        ) is False
+
+
+class TestCancellationApprovalRace:
+    @pytest.mark.asyncio
+    async def test_cancel_before_stale_approval_cannot_execute_file_write(
+        self, executor, iface, tmp_path
+    ):
+        coordinator = iface.agent._confirmation
+        executor._coordinator = coordinator
+        target = tmp_path / "cancelled-write.txt"
+        prompted = threading.Event()
+        token_holder = []
+        result_holder = []
+        local_registry = SubAgentRegistry()
+        record = SubAgentRecord(
+            agent_id="sa-cancel-race",
+            label="on-demand",
+            model="test-model",
+            task_preview="write",
+            started_at=0.0,
+            source=SOURCE_ON_DEMAND,
+        )
+        local_registry.register(record)
+
+        def prompt(token, _tool, _description, _caller_tag):
+            token_holder.append(token)
+            prompted.set()
+
+        executor._subagent_confirm_prompt_fn = prompt
+
+        with patch("sub_agent_registry.get_registry", return_value=local_registry):
+            bridge_thread = threading.Thread(
+                target=lambda: result_holder.append(
+                    executor._headless_confirm_bridge(
+                        "file_write",
+                        {
+                            "path": str(target),
+                            "content": "must not exist",
+                            "mode": "w",
+                        },
+                        "write cancelled file",
+                        caller_tag=record.agent_id,
+                        zone_path=str(target),
+                    )
+                )
+            )
+            bridge_thread.start()
+            assert prompted.wait(timeout=1.0)
+
+            record.cancel()
+            bridge_thread.join(timeout=0.3)
+            completed_after_cancel = not bridge_thread.is_alive()
+            if bridge_thread.is_alive():
+                coordinator.signal_headless_confirmation(token_holder[0], False)
+                bridge_thread.join(timeout=2.0)
+
+            query = _MockQuery(f"subconfirm_yes:{token_holder[0]}")
+            await cb_subagent_confirm(iface, _FakeUpdate(query), MagicMock())
+
+        assert completed_after_cancel is True
+        assert result_holder[0]["success"] is False
+        assert executor._pending_confirmations.take(token_holder[0]) is None
+        assert target.exists() is False
+        assert coordinator.grant_ledger.check(
+            "file_write", str(tmp_path), scope_owner=record.agent_id
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_till_reset_pressed_after_child_cancel_records_no_session_grant(
+        self, executor, iface, tmp_path
+    ):
+        coordinator = iface.agent._confirmation
+        executor._coordinator = coordinator
+        target = tmp_path / "cancelled-session-write.txt"
+        local_registry = SubAgentRegistry()
+        record = SubAgentRecord(
+            agent_id="sa-cancel-session",
+            label="on-demand",
+            model="test-model",
+            task_preview="write",
+            started_at=0.0,
+            source=SOURCE_ON_DEMAND,
+        )
+        local_registry.register(record)
+        loop = asyncio.get_running_loop()
+        queries = []
+
+        def prompt(token, _tool, _description, _caller_tag):
+            # Cancel lands, then the operator presses "Till /reset" before the
+            # waiting child observes the cancellation.
+            record.cancel()
+            query = _MockQuery(f"subconfirm_till_reset:{token}")
+            queries.append(query)
+            asyncio.run_coroutine_threadsafe(
+                cb_subagent_confirm(iface, _FakeUpdate(query), MagicMock()), loop,
+            ).result(timeout=2.0)
+
+        executor._subagent_confirm_prompt_fn = prompt
+
+        with patch("sub_agent_registry.get_registry", return_value=local_registry):
+            result = await asyncio.to_thread(
+                executor._headless_confirm_bridge,
+                "file_write",
+                {"path": str(target), "content": "must not exist", "mode": "w"},
+                "write cancelled file",
+                caller_tag=record.agent_id,
+                zone_path=str(target),
+            )
+
+        assert result["success"] is False
+        assert target.exists() is False
+        assert coordinator.grant_ledger.check(
+            "file_write", str(target), scope_owner=None
+        ) is False
+        assert "already resolved" in html.unescape(queries[0].edited_text or "")
 
 
 
