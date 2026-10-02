@@ -343,6 +343,35 @@ The operator approved read-only `/jobs history <tag>` and `/jobs result <executi
 ### 🔴 Outstanding
 - None for Part 1. Part 2 proper (2.3–2.12) and Parts 3–5 remain paused pending operator approval.
 
+## Part 3 completion reviews — 2026-10-03
+
+### Reviewer findings (compliance `ope-2` + risk `ora-3`)
+- 🔴 To fix before merge: **CHANGE-01/H1** — a spawn that raises (pool.submit RuntimeError, non-ValueError factory error) is never released or recorded: tag stuck `is_running=true`, skip-policy jobs dead until restart; violates the failed-launch record contract. **STATE-01/M1** — admission split across two lock sections; a parallel run's registration can race a concurrent finish, leaving `is_running=false` while a run is active.
+- 🟡 Should fix: **M2** — record()/marker set-clear not atomic (parallel lost-write can be silently cleared); **M3** — `_load()` OSError treated as empty log; a transient read error plus rewrite wipes all history.
+- 🟡 Deferred/observations: L1 no fsync before os.replace; L2 `format_for_prompt` lacks expiry limits (resolved by pending 2.11–2.12); L3 large-output cost measurement noted by implementer (~44ms full log, kept JSONL rewrite); L4 retention boundary notes; L5 `next_run` can serialize as string "None"; marker-vs-real-error precedence reading to confirm.
+- Confirmed clean: run-ID minting, complete untruncated results, fail-closed fallback (no operator-agent invocation), legacy/partial honesty, read-time expiry, marker overwrite/recovery, per-run release idempotence, run_now async, show contract; test honesty verified incl. real red-phase evidence.
+
+### 🔴 Outstanding
+- Operator-approved fix round: CHANGE-01/H1, STATE-01/M1, M2, M3 (M2/M3 via minimal atomic locking), L5 cosmetic. Then checkpoint commit, then pause before Part 2 proper/Part 4.
+
+## Part 3 review fixes — 2026-10-03
+
+### 🔴 Fixed
+- **CHANGE-01/H1**: spawn exceptions caught in `_run_via_spawn_agent`, handled as failed launch (record + alert + own-run release); skip-policy jobs recover.
+- **STATE-01/M1**: overlap check, run-ID mint, `_running_jobs.add`, and run registration now one locked block; deterministic interleave test proves `is_running` stays true while a run is active.
+- **M2**: `_history_lock` covers record-plus-marker set/clear; `_set_job_last_error` serialized under `_running_lock`→`_save_lock`; concurrent failed write's marker survives an earlier success's recovery; no mid-save dict mutation.
+- **M3**: `_read_entries()` distinguishes missing file (empty) from read error (None); read error skips rewrite and returns False so the marker fires; existing file bytes untouched (chmod-000 test, root-skipped).
+- **L5**: `_next_run_label()` returns "unknown" instead of string "None".
+
+### Verification
+- Focused suites green; full suite **2519 passed, 2 skipped** (baseline); ruff + vulture + `git diff --check` clean. Reviewer-flagged test-honesty issues fixed by the implementer before coding.
+
+### 🟡 Deferred/observations (recorded, non-blocking)
+- L1 no fsync before os.replace; L2 `format_for_prompt` expiry inconsistency resolves with pending 2.11–2.12; L3 full-JSONL rewrite cost measured acceptable (~44ms); L4 retention boundary/clock-skew notes; marker-vs-real-error precedence reading noted.
+
+### 🔴 Outstanding
+- None for Part 3. Awaiting operator approval for the Part 3 checkpoint commit and for Part 2 proper/Part 4.
+
 ### 🔴 Outstanding
 - None.
 
