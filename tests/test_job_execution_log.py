@@ -1051,3 +1051,39 @@ def test_failed_run_with_unset_next_run_records_unknown(tmp_path, monkeypatch):
     _finish(captured[0], "❌ connection refused", False)
 
     assert s.execution_log.read_recent()[0]["next_run"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Operator prompt wiring (isolate-job-execution, design decision 2)
+# ---------------------------------------------------------------------------
+
+
+def test_format_for_prompt_keeps_exact_line_format(log):
+    """format_for_prompt() keeps its formatting contract after operator wiring removal."""
+    log.record("nightly", "task", "All good", success=True)
+    entry = log.read_recent()[-1]
+
+    result = log.format_for_prompt()
+
+    model_part = f" [{entry['model']}]" if entry.get("model") else ""
+    assert result.splitlines() == [
+        "SCHEDULED JOB EXECUTION HISTORY (most recent first):",
+        f"  ✅ {entry['ts']} | nightly{model_part} ({entry.get('elapsed_s', 0)}s)",
+        "     → All good",
+    ]
+
+
+def test_main_does_not_wire_job_history_into_operator_prompt():
+    """main._run must not hand scheduled history to the operator agent (formerly main.py:817).
+
+    ``_run`` is the composition root and cannot be executed without the full
+    runtime (Telegram, LLM, MCP), so this guards the wiring at source level.
+    """
+    import inspect
+
+    import main
+
+    source = inspect.getsource(main._run)
+
+    assert "_job_history_fn" not in source
+    assert "execution_log.format_for_prompt" not in source

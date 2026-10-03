@@ -82,7 +82,6 @@ class ControllerDeps:
     owns_cancel_event: bool = True
     on_step: Optional[Callable[[int], None]] = None
     on_tool_trace: Optional[Callable] = None
-    job_history_fn: Optional[Callable[[], str]] = None
     graph_memory: Optional[object] = None
     graph_memory_writer: Optional[object] = None
     graph_memory_max_entries: int = 10
@@ -333,13 +332,22 @@ class AgentRuntime:
             # Job-owned context only (isolate-job-execution, design decision 2):
             # a private per-run memory and no operator result recall. Working
             # memory, graph memory, and job history stay runner-local/None.
+            # Tool dispatch carries the immutable scheduled policy explicitly.
+            from builtin_executor import ScheduledToolDispatch
+
+            scheduled_tools = (
+                ScheduledToolDispatch(self._builtin_executor)
+                if self._builtin_executor is not None else None
+            )
             return self._create_sub_agent(
                 options, notify_fn=notify_fn, on_tool_trace=on_tool_trace,
                 base_memory=_ScheduledRunMemory(), results=None,
+                builtin_executor=scheduled_tools,
             )
         return self._create_sub_agent(
             options, notify_fn=notify_fn, on_tool_trace=on_tool_trace,
             base_memory=self._base_memory, results=self._results,
+            builtin_executor=self._builtin_executor,
         )
 
     def _create_sub_agent(
@@ -350,13 +358,14 @@ class AgentRuntime:
         on_tool_trace: object = None,
         base_memory: object = None,
         results: object = None,
+        builtin_executor: object = None,
     ) -> "SubAgentRunner":
         """Build a ``SubAgentRunner`` mirroring the legacy ``sub_agent_factory``.
 
         Preserves model resolution, per-call LLM override shallow-copy,
         scheduled ``max_iterations`` default, context preloading, depth=1, and
-        the runner-shaped product surface. ``base_memory`` and ``results`` are
-        the profile-selected memory collaborators.
+        the runner-shaped product surface. ``base_memory``, ``results``, and
+        ``builtin_executor`` are the profile-selected collaborators.
         """
         # Local imports avoid import cycles at module load (agent_controller and
         # builtin_executor both sit above this construction boundary).
@@ -417,7 +426,7 @@ class AgentRuntime:
             paths=self._paths,
             tool_index=self._tool_index,
             base_memory=base_memory,
-            builtin_executor=self._builtin_executor,
+            builtin_executor=builtin_executor,
             skill_registry=self._skill_registry,
             mcp_manager=self._mcp_manager,
             results=results,

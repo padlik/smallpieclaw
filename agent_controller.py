@@ -116,7 +116,6 @@ class AgentController:
         label: str = "main",   # identifies this agent in log lines
         on_step=None,          # Optional[Callable[[int], None]] — called after each step
         on_tool_trace=None,    # Optional[Callable[[ToolTrace], None]] — called after each tool call
-        job_history_fn=None,   # Optional[Callable[[], str]] — returns job execution history for prompt
         trace_id=None,         # Optional[str] — propagate a parent run's trace; None => fresh per run
         checkpoint_store=None,  # Optional[CheckpointStore]
         context_monitor: ContextMonitor | None = None,
@@ -146,7 +145,6 @@ class AgentController:
         self.label = label
         self._on_step = on_step
         self._on_tool_trace = on_tool_trace
-        self._job_history_fn = job_history_fn
         self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
         # Optional parent trace to propagate; when None each run() gets a fresh ID.
         self._trace_id = trace_id
@@ -268,7 +266,6 @@ class AgentController:
             owns_cancel_event=self._owns_cancel_event,
             on_step=self._on_step,
             on_tool_trace=self._on_tool_trace,
-            job_history_fn=self._job_history_fn,
             graph_memory=self._graph_memory,
             graph_memory_writer=self._graph_memory_writer,
             graph_memory_max_entries=self._graph_memory_max_entries,

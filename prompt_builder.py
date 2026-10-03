@@ -231,7 +231,6 @@ def build_system_prompt(
     log_backup_count: int,
     top_tools: int,
     user_goal: str = "(context snapshot)",
-    job_history_section: str = "",
     graph_context_section: str = "",
     results_top_k: int = 2,
 ) -> tuple[str, int]:
@@ -280,10 +279,4 @@ def build_system_prompt(
         log_section=log_section,
         graph_context_section=graph_ctx_block,
     )
-    # Inject job history only when it has content (avoids wasting tokens on blank lines)
-    if job_history_section:
-        prompt = prompt.replace(
-            "RESPONSE FORMAT — CRITICAL:",
-            f"{job_history_section}\n\nRESPONSE FORMAT — CRITICAL:",
-        )
     return prompt, estimate_tokens(prompt)

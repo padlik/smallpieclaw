@@ -159,6 +159,7 @@ class FileTools:
     def _gate(
         self, real_path: str, operation: str, tool_name: str,
         args: dict, desc: str, *, caller_depth: int, caller_tag: str,
+        scheduled: bool = False,
     ) -> dict | None:
         """Path-policy gate for a single-path file operation.
 
@@ -167,7 +168,8 @@ class FileTools:
         * ``PROHIBITED`` -> returns a fail-closed error dict.
         * ``ALLOWED``     -> returns ``None`` so the caller proceeds.
         * ``UNRECOGNISED`` -> stages a confirmation request (``zone_path`` set
-          to *real_path*) and returns the confirmation dict.
+          to *real_path*) and returns the confirmation dict. A *scheduled* call
+          skips the grant ledger and gets the seam's noninteractive denial.
 
         The caller must handle ``path_policy is None`` before calling this
         helper.
@@ -178,18 +180,19 @@ class FileTools:
         if verdict == PathVerdict.PROHIBITED:
             return self._prohibited_error(mode_or_reason, real_path)
         if verdict == PathVerdict.UNRECOGNISED:
-            if self._check_grant(tool_name, real_path, caller_depth, caller_tag):
+            if not scheduled and self._check_grant(tool_name, real_path, caller_depth, caller_tag):
                 return None
             return self._owner._requires_confirmation(
                 tool_name, args, desc,
                 caller_depth=caller_depth, caller_tag=caller_tag,
-                zone_path=real_path,
+                zone_path=real_path, scheduled=scheduled,
             )
         return None
 
     # ---- file_read ----
 
-    def _exec_file_read(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_file_read(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                        scheduled: bool = False) -> dict:
         path = str(args.get("path", "")).strip()
         if not path:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
@@ -212,7 +215,7 @@ class FileTools:
 
         gated = self._gate(
             real_path, "read", "file_read", args, desc,
-            caller_depth=caller_depth, caller_tag=caller_tag,
+            caller_depth=caller_depth, caller_tag=caller_tag, scheduled=scheduled,
         )
         if gated is not None:
             return gated
@@ -278,7 +281,8 @@ class FileTools:
 
     # ---- file_diff ----
 
-    def _exec_file_diff(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_file_diff(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                        scheduled: bool = False) -> dict:
         """Run the built-in file_diff tool, with per-path zone checks.
 
         When either path needs consent, one confirmation lists every distinct
@@ -329,6 +333,12 @@ class FileTools:
             p for p, v in ((real_path_a, verdict_a), (real_path_b, verdict_b))
             if v == PathVerdict.UNRECOGNISED
         ]
+        if scheduled:
+            # Never consult the operator grant ledger for a scheduled run.
+            return self._owner._requires_confirmation(
+                "file_diff", args, "", caller_depth=caller_depth, caller_tag=caller_tag,
+                scheduled=True,
+            )
         missing_dirs = list(dict.fromkeys(
             os.path.dirname(p) for p in reversed(unrecognised_paths)
             if not self._check_grant("file_diff", p, caller_depth, caller_tag)
@@ -386,10 +396,12 @@ class FileTools:
             verdict, reason = policy.classify(path, "read")
             if verdict == PathVerdict.PROHIBITED:
                 return self._prohibited_error(reason, path)
+            if verdict != PathVerdict.UNRECOGNISED:
+                continue
             has_grant = bool(ledger and ledger.check(
                 "file_diff", os.path.dirname(path), scope_owner=scope_owner,
             ))
-            if verdict == PathVerdict.UNRECOGNISED and not (has_grant or os.path.dirname(path) in approved_dirs):
+            if not (has_grant or os.path.dirname(path) in approved_dirs):
                 return {"success": False, "output": "", "error": "file_diff authorization changed; refusing to read either file.", "exit_code": 1}
         path_a, path_b = paths
         try:
@@ -421,7 +433,8 @@ class FileTools:
 
     # ---- file_write ----
 
-    def _exec_file_write(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_file_write(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                         scheduled: bool = False) -> dict:
         path = str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
         mode = str(args.get("mode", "w"))
@@ -449,7 +462,7 @@ class FileTools:
 
         gated = self._gate(
             real_path, "write", "file_write", args, desc,
-            caller_depth=caller_depth, caller_tag=caller_tag,
+            caller_depth=caller_depth, caller_tag=caller_tag, scheduled=scheduled,
         )
         if gated is not None:
             return gated
@@ -498,7 +511,8 @@ class FileTools:
 
     # ---- file_patch ----
 
-    def _exec_file_patch(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_file_patch(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                         scheduled: bool = False) -> dict:
         path = str(args.get("path", "")).strip()
         old_str = str(args.get("old_str", ""))
         new_str = str(args.get("new_str", ""))
@@ -548,12 +562,12 @@ class FileTools:
         if verdict == PathVerdict.PROHIBITED:
             return self._prohibited_error(reason, real_path)
         if verdict == PathVerdict.UNRECOGNISED:
-            if not self._check_grant("file_patch", real_path, caller_depth, caller_tag):
+            if scheduled or not self._check_grant("file_patch", real_path, caller_depth, caller_tag):
                 # FIX 2: stage confirmation before any file read for UNRECOGNISED zone
                 return self._owner._requires_confirmation(
                     "file_patch", args, desc,
                     caller_depth=caller_depth, caller_tag=caller_tag,
-                    zone_path=real_path,
+                    zone_path=real_path, scheduled=scheduled,
                 )
 
         # ALLOWED or grant-covered: check existence, then patch
@@ -615,7 +629,8 @@ class FileTools:
 
     # ---- file_send ----
 
-    def _exec_file_send(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_file_send(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                        scheduled: bool = False) -> dict:
         path = os.path.expanduser(str(args.get("path", "")).strip())
         if not path:
             return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
@@ -638,7 +653,7 @@ class FileTools:
 
         gated = self._gate(
             real_path, "read", "file_send", args, desc,
-            caller_depth=caller_depth, caller_tag=caller_tag,
+            caller_depth=caller_depth, caller_tag=caller_tag, scheduled=scheduled,
         )
         if gated is not None:
             return gated

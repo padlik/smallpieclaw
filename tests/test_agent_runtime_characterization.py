@@ -240,20 +240,31 @@ class TestAgentControllerReactContextAssembly:
     def test_callbacks_and_context_payload_propagated(self):
         on_step = MagicMock()
         on_tool_trace = MagicMock()
-        job_history_fn = MagicMock()
         ctrl = _make_controller(
             on_step=on_step,
             on_tool_trace=on_tool_trace,
-            job_history_fn=job_history_fn,
         )
         ctrl._context_payload = {"parent": "ctx"}
         ctrl._prompt_variant = "sub-agent"
         ctx, _ = _run_capture(ctrl)
         assert ctx.on_step is on_step
         assert ctx.on_tool_trace is on_tool_trace
-        assert ctx.job_history_fn is job_history_fn
         assert ctx._context_payload == {"parent": "ctx"}
         assert ctx._prompt_variant == "sub-agent"
+
+    def test_controller_rejects_removed_job_history_fn(self):
+        """The dormant operator job-history seam is gone (isolate-job-execution DRIFT-01)."""
+        with pytest.raises(TypeError):
+            _make_controller(job_history_fn=MagicMock())
+
+    def test_react_context_has_no_job_history_field(self):
+        from dataclasses import fields as dc_fields
+
+        from agent_runtime import ControllerDeps
+        from react_loop import ReactContext
+
+        names = {f.name for f in dc_fields(ReactContext)} | {f.name for f in dc_fields(ControllerDeps)}
+        assert "job_history_fn" not in names
 
 
 # ===========================================================================
@@ -796,7 +807,7 @@ class TestScheduledRunJobOwnedContext:
         ctx, _operator = drive_scheduled_trigger(
             trigger, make_builtin_executor, tmp_path, monkeypatch,
         )
-        assert ctx.job_history_fn is None
+        assert not hasattr(ctx, "job_history_fn")
 
     def test_preserve_context_retains_only_job_conversation(
         self, trigger, make_builtin_executor, tmp_path, monkeypatch,

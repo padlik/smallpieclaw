@@ -1367,3 +1367,141 @@ class TestStructuredRunFields:
         assert run_end[0]["model"] == "test-model"
         assert isinstance(run_end[0]["steps"], int) and run_end[0]["steps"] >= 1
         assert isinstance(run_end[0]["dur_ms"], int)
+
+
+class TestScheduledVisionDispatch:
+    """Scheduled vision_query dispatch never reaches the interactive coordinator."""
+
+    def test_scheduled_vision_dispatch_never_calls_interactive_coordinator(self, tmp_path):
+        import os
+
+        import react_loop
+        from builtin_executor import ScheduledToolDispatch
+        from path_policy import PathPolicy
+        from react_loop import ReactContext
+
+        dirs = {name: os.path.join(str(tmp_path), name) for name in (
+            "workspace", "downloads", "results", "skills", "data", "state", "config",
+        )}
+        for directory in dirs.values():
+            os.makedirs(directory, exist_ok=True)
+        policy = PathPolicy.create(
+            agent_name="test-agent", workspace_dir=dirs["workspace"],
+            downloads_dir=dirs["downloads"], tmp_dir="/tmp/test-agent",
+            skills_dir=dirs["skills"], results_dir=dirs["results"],
+            data_home=dirs["data"], state_home=dirs["state"], config_home=dirs["config"],
+        )
+        shared = MagicMock(name="shared_executor")
+        shared.path_policy = policy
+        confirmation = MagicMock(name="interactive_coordinator")
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(),
+            builtin_executor=ScheduledToolDispatch(shared), mcp_manager=None,
+            skill_registry=None, cancel_event=threading.Event(),
+            depth=1, label="sa-job01", confirmation=confirmation,
+        )
+
+        with patch("react_loop._encode_images", return_value=["<b64>"]):
+            react_loop._dispatch_tool(
+                ctx, {"tool": "vision_query", "args": {"path": "/unrecognised/pic.png"}},
+                lambda _m: None,
+            )
+
+        assert confirmation.method_calls == []
+        shared._requires_confirmation.assert_not_called()
+
+
+class TestOperatorPromptExcludesScheduledHistory:
+    """The operator's system prompt never automatically includes scheduled-job history."""
+
+    def _operator_ctx(self):
+        from react_loop import ReactContext
+
+        memory = MagicMock()
+        memory.as_prompt_text.return_value = "No persistent memory entries."
+        tool_index = MagicMock()
+        tool_index.search.return_value = []
+        skills = MagicMock()
+        skills.all.return_value = []
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=tool_index, memory=memory,
+            builtin_executor=None, mcp_manager=None, skill_registry=skills,
+            cancel_event=threading.Event(),
+        )
+        return ctx
+
+    def test_operator_prompt_omits_scheduled_history_section(self):
+        from react_loop import _assemble_system_prompt
+
+        system = _assemble_system_prompt(self._operator_ctx(), "what is on my calendar?")
+
+        assert "SCHEDULED JOB EXECUTION HISTORY" not in system
+
+
+class TestScheduledPlanRefused:
+    """A scheduled run cannot use the plan action to escape its tool policy."""
+
+    _PLAN = {"action": "plan", "plan": {"description": "write memory", "steps": [
+        {"id": "s1", "tool": "memory_write", "args": {"action": "set", "key": "k", "value": "v"}},
+    ]}}
+
+    def _dispatch(self, builtin_executor, plan_executor=None):
+        """Run one plan action through _dispatch_action; return (sink messages, result)."""
+        from react_loop import ReactContext, _LoopState, _dispatch_action
+
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(),
+            builtin_executor=builtin_executor, mcp_manager=None, skill_registry=None,
+            cancel_event=threading.Event(), depth=1, label="sa-job01",
+        )
+        state = _LoopState(messages=[], goal_idx=0, max_steps=8)
+        sunk: list[str] = []
+        patcher = (
+            patch("execution_plan.PlanExecutor", plan_executor)
+            if plan_executor is not None else nullcontext()
+        )
+        with patcher:
+            result = _dispatch_action(
+                ctx, dict(self._PLAN), sunk.append, state, "goal", 0.0, lambda _m: None,
+            )
+        return sunk, result
+
+    def test_scheduled_plan_action_is_refused(self):
+        from builtin_executor import ScheduledToolDispatch
+
+        sunk, result = self._dispatch(ScheduledToolDispatch(MagicMock()), MagicMock())
+
+        assert result is None
+        assert len(sunk) == 1
+        assert "plan is not available for scheduled jobs" in sunk[0]
+
+    def test_scheduled_plan_action_never_invokes_plan_executor(self):
+        from builtin_executor import ScheduledToolDispatch
+
+        plan_executor = MagicMock(name="PlanExecutor")
+        self._dispatch(ScheduledToolDispatch(MagicMock()), plan_executor)
+
+        plan_executor.assert_not_called()
+
+    def test_scheduled_plan_never_reaches_a_plan_step(self, make_builtin_executor, tmp_path):
+        """Reviewer repro: scheduled → plan → memory_write never builds a step agent."""
+        from builtin_executor import ScheduledToolDispatch
+
+        memory = MagicMock(name="operator_kv")
+        factory = MagicMock(name="sub_agent_factory")
+        shared = make_builtin_executor(memory=memory, sub_agent_factory=factory,
+                                       data_dir=str(tmp_path))
+
+        self._dispatch(ScheduledToolDispatch(shared))
+
+        factory.assert_not_called()
+        assert memory.method_calls == []
+
+    def test_on_demand_plan_action_still_runs_plan_executor(self):
+        plan_executor = MagicMock(name="PlanExecutor")
+        plan_executor.return_value.execute.return_value = {"results": {"s1": "ok"}}
+
+        sunk, _result = self._dispatch(MagicMock(name="shared_executor"), plan_executor)
+
+        plan_executor.return_value.execute.assert_called_once()
+        assert sunk[0].startswith("Plan execution results:")

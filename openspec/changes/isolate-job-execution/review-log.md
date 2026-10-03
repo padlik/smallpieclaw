@@ -372,6 +372,35 @@ The operator approved read-only `/jobs history <tag>` and `/jobs result <executi
 ### 🔴 Outstanding
 - None for Part 3. Awaiting operator approval for the Part 3 checkpoint commit and for Part 2 proper/Part 4.
 
+## Part 2 completion reviews — 2026-10-04
+
+### Reviewer findings (compliance `ope-3` + risk `ora-4`)
+- 🔴 To fix: **REQ-01/H1** — scheduled runs can emit the `plan` action (`react_loop.py:1222`, advertised in the full system prompt); `PlanExecutor._get_factory` reads the shared `_sub_agent_factory` through `ScheduledToolDispatch.__getattr__`, so plan steps and diagnostics are built as `PLAN_STEP_AGENT` with the plain executor, operator base memory, ResultsMemory, and the headless confirmation bridge — a complete scheduled-policy escape. Tasks 2.4/2.5/2.7 contracts hold only on direct dispatch routes until this closes.
+- 🟡 Cleanup: **DRIFT-01** — dormant `job_history_fn`/`job_history_section` plumbing (ReactContext, ControllerDeps, AgentController, prompt_loader, prompt_builder, `05-response-format.md` slot); behavior requirement met; remove before archive.
+- 🟡 Out of scope per design decision 2's own text: **M1** — `log_query`/`log_detail` remain a shared observability surface; the design explicitly makes no new isolation claim about them. Recorded, no fix.
+- 🟡 Accepted observations: **L1** dangerous shell in scheduled runs hits the depth-1 block first (generic headless error, by design); **L2** wrapper immutability is by convention (`__setattr__` refusal), no production path writes it.
+- Confirmed clean: ScheduledToolDispatch propagation and immutability; memory guards before any store access; classification-before-grant preserved on every scheduled short-circuit (`_gate`, `file_patch`, `file_diff`, vision); depth-1 shell block and shell/secret vetoes unchanged; no MCP confirmation invented; history wiring removed with `format_for_prompt()` contract intact; no on-demand regression; no new shared mutable state.
+
+### 🔴 Outstanding
+- Operator-approved Part 2 cycle fix round: refuse the `plan` action for scheduled origin (design non-goal preserves plan-step ownership, so the hard refusal is the minimal spec-compliant fix), plus DRIFT-01 plumbing removal. Then report Part 2 results and wait for operator feedback.
+
+## Part 2 review fixes — 2026-10-04
+
+### 🔴 Fixed
+- **REQ-01/H1 (plan escape)**: `_dispatch_action` refuses the `plan` action when the executor is scheduled ("plan is not available for scheduled jobs. Run the steps directly as individual tool calls"); covers both JSON-action and native tool-call routes; PlanExecutor never constructed, no factory called, operator memory untouched. On-demand `plan` regression guard passes. Plan advertisement left in the shared prompt — refusal is the fix; origin-aware templating judged non-trivial and unnecessary.
+- **DRIFT-01**: dormant `job_history_fn`/`job_history_section` plumbing fully removed (ReactContext, ControllerDeps, AgentController, prompt_loader, prompt_builder, `05-response-format.md` slot; template frontmatter `variables: []`). `format_for_prompt()` in scheduler.py untouched with its tested contract.
+
+### Verification
+- Red phases: 3 plan-refusal failures + reviewers' repro (scheduled→plan→memory_write reached PLAN_STEP_AGENT) confirmed; 5 plumbing-removal failures confirmed. Green: six-file gate 322 passed; focused re-verification 181 passed; full suite **2563 passed, 2 skipped** (baseline); ruff + vulture + `git diff --check` clean.
+
+### 🟡 Recorded, no fix
+- **M1**: `log_query`/`log_detail` remain shared observability; design decision 2 explicitly makes no new isolation claim about them.
+- **L1**: dangerous scheduled shell commands hit the depth-1 block first (generic headless error) — by design.
+- **L2**: `ScheduledToolDispatch` immutability is by convention (`__setattr__` refusal); no production path writes it.
+
+### 🔴 Outstanding
+- None for Part 2. Awaiting operator feedback; Part 4 and Part 5 remain paused.
+
 ### 🔴 Outstanding
 - None.
 

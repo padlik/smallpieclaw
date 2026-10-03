@@ -378,7 +378,6 @@ def build_system_prompt(
     log_backup_count: int,
     top_tools: int,
     user_goal: str = "(context snapshot)",
-    job_history_section: str = "",
     graph_context_section: str = "",
     strategies_section: str = "",
     results_top_k: int = 2,
@@ -422,7 +421,6 @@ def build_system_prompt(
             log_backup_count=log_backup_count,
             top_tools=top_tools,
             user_goal=user_goal,
-            job_history_section=job_history_section,
             graph_context_section=graph_context_section,
             results_top_k=results_top_k,
             parent_context_section=parent_context_section,
@@ -483,7 +481,6 @@ def build_system_prompt(
         "file_storage": file_storage,
         "log_section": log_section,
         "graph_context_section": graph_ctx_block,
-        "job_history_section": job_history_section,
         "user_goal": user_goal,
         # Sub-agent prompt variant uses {{task}} for the delegated task text,
         # which is the sub-agent's user_goal.
@@ -497,13 +494,6 @@ def build_system_prompt(
     loader_variant.validate(sections, provided_vars, expected_sections=expected)
 
     prompt = loader_variant.render(sections, variables)
-
-    # Backwards-compatible injection of job history into the rendered prompt.
-    if job_history_section and "RESPONSE FORMAT" in prompt:
-        prompt = prompt.replace(
-            "RESPONSE FORMAT — CRITICAL:",
-            f"{job_history_section}\n\nRESPONSE FORMAT — CRITICAL:",
-        )
 
     return prompt, estimate_tokens(prompt)
 
@@ -618,7 +608,6 @@ def _legacy_build_system_prompt(
     log_backup_count: int,
     top_tools: int,
     user_goal: str = "(context snapshot)",
-    job_history_section: str = "",
     graph_context_section: str = "",
     results_top_k: int = 2,
     parent_context_section: str = "",
@@ -678,11 +667,5 @@ def _legacy_build_system_prompt(
 
     if parent_context_section:
         prompt = _inject_parent_context_legacy(prompt, parent_context_section)
-
-    if job_history_section:
-        prompt = prompt.replace(
-            "RESPONSE FORMAT — CRITICAL:",
-            f"{job_history_section}\n\nRESPONSE FORMAT — CRITICAL:",
-        )
 
     return prompt, estimate_tokens(prompt)

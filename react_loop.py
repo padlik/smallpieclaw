@@ -270,9 +270,6 @@ class ReactContext:
     # Tool trace callback — called after each tool dispatch with a ToolTrace record
     on_tool_trace: Optional[Callable] = None  # Optional[Callable[[ToolTrace], None]]
 
-    # Scheduled job history — called to get a formatted string for the system prompt
-    job_history_fn: Optional[Callable[[], str]] = None
-
     # Graph memory — Optional[GraphMemoryStore]; None when feature is disabled
     graph_memory: Optional[object] = None
 
@@ -461,6 +458,13 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
             "recoverable": False,
             "suggestion": "Use an allowed directory for image files.",
         }
+
+    if verdict == PathVerdict.UNRECOGNISED and getattr(builtin, "scheduled", False) is True:
+        # Scheduled dispatch (ScheduledToolDispatch) never borrows grants or
+        # reaches the interactive confirmation path.
+        from builtin_executor import scheduled_approval_denied
+
+        return scheduled_approval_denied("vision_query")
 
     if verdict == PathVerdict.UNRECOGNISED:
         # A standing operator grant may promote this UNRECOGNISED path to allowed.
@@ -845,14 +849,11 @@ def _publish_context_snapshot(
 
 
 def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
-    """Assemble the full system prompt string for a run."""
-    _job_history_section = ""
-    if ctx.job_history_fn:
-        try:
-            _job_history_section = ctx.job_history_fn() or ""
-        except Exception as _jh_exc:
-            logger.warning("Failed to get job history: %s", _jh_exc)
+    """Assemble the full system prompt string for a run.
 
+    Scheduled-job history is never injected: it is job-owned, not operator
+    context (isolate-job-execution, design decision 2).
+    """
     _graph_context_section = ""
     if ctx.graph_memory is not None:
         try:
@@ -892,7 +893,6 @@ def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
         log_backup_count=ctx.log_backup_count,
         top_tools=ctx.top_tools,
         user_goal=user_goal,
-        job_history_section=_job_history_section,
         graph_context_section=_graph_context_section,
         strategies_section=strategies_section,
         # Suppress ResultsMemory recall when graph memory already supplied
@@ -1216,6 +1216,16 @@ def _dispatch_action(
         return None
 
     if action == "plan":
+        if getattr(ctx.builtin_executor, "scheduled", False) is True:
+            # Plan steps are built as plan-step agents on the shared executor,
+            # outside the scheduled tool policy — refuse before any step exists.
+            logger.warning("%splan refused for scheduled run", ctx.log_prefix)
+            sink(
+                "Error: plan is not available for scheduled jobs. "
+                'Run the steps directly as individual {"action": "tool"} calls, '
+                "one at a time."
+            )
+            return None
         plan_data = action_obj.get("plan", {})
         result_msg, new_max_steps, _ = _run_plan(ctx, plan_data, state.max_steps, progress)
         if new_max_steps is not None:

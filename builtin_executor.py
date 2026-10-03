@@ -75,6 +75,31 @@ slog = agent_logging.get_logger(__name__)
 
 logger = logging.getLogger(__name__)
 
+
+def scheduled_approval_denied(tool_name: str) -> dict:
+    """Noninteractive denial for a scheduled operation that would need operator approval.
+
+    Returned before any grant lookup, token staging, or confirmation prompt
+    (isolate-job-execution, design decision 2).
+    """
+    return {
+        "success": False,
+        "output": "",
+        "error": (
+            f"{tool_name}: scheduled_approval_denied — this operation needs operator "
+            "approval, which a scheduled job cannot request."
+        ),
+        "exit_code": -1,
+        "error_type": "scheduled_approval_denied",
+        "recoverable": False,
+        "suggestion": (
+            "Use a default-allowed directory (workspace, downloads, results) or a "
+            "non-destructive alternative; otherwise ask the operator to run this step "
+            "interactively or add the directory to allowed_dirs."
+        ),
+    }
+
+
 @dataclass
 class PendingConfirmations:
     """Locked staging area for pending confirmation tokens.
@@ -170,6 +195,8 @@ class _CallContext:
     caller_tag: str = ""
     chunk_callback: Optional[Callable[[str], None]] = None
     trace_id: str = ""
+    # Scheduled execution policy: no operator memory and no interactive approval.
+    scheduled: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -324,15 +351,20 @@ class BuiltinExecutor:
         return {
             "shell": lambda a, ctx: self._shell._exec_shell(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
-                chunk_callback=ctx.chunk_callback,
+                chunk_callback=ctx.chunk_callback, scheduled=ctx.scheduled,
             ),
             "file_read": lambda a, ctx: self._files._exec_file_read(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
+                scheduled=ctx.scheduled,
             ),
             "file_write": lambda a, ctx: self._files._exec_file_write(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
+                scheduled=ctx.scheduled,
             ),
-            "file_send": lambda a, ctx: self._files._exec_file_send(a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag),
+            "file_send": lambda a, ctx: self._files._exec_file_send(
+                a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
+                scheduled=ctx.scheduled,
+            ),
             "schedule": lambda a, ctx: self._exec_schedule(a, caller_depth=ctx.caller_depth),
             "spawn_agent": lambda a, ctx: self._exec_spawn_agent(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
@@ -341,17 +373,27 @@ class BuiltinExecutor:
             "get_agent_result": lambda a, ctx: self._exec_get_agent_result(a, caller_tag=ctx.caller_tag),
             "wait_for_any_agent": lambda a, ctx: self._agents._exec_wait_for_any_agent(a, caller_tag=ctx.caller_tag),
             "cancel_agent": lambda a, ctx: self._agents._exec_cancel_agent(a, caller_tag=ctx.caller_tag),
-            "memory_write": lambda a, ctx: self._memory_tools._exec_memory_write(a, caller_tag=ctx.caller_tag),
+            "memory_write": lambda a, ctx: self._memory_tools._exec_memory_write(
+                a, caller_tag=ctx.caller_tag, scheduled=ctx.scheduled,
+            ),
             "file_patch": lambda a, ctx: self._files._exec_file_patch(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
+                scheduled=ctx.scheduled,
             ),
-            "file_diff": lambda a, ctx: self._files._exec_file_diff(a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag),
-            "memory_graph_search": lambda a, ctx: self._memory_tools._exec_memory_graph_search(a, caller_tag=ctx.caller_tag),
+            "file_diff": lambda a, ctx: self._files._exec_file_diff(
+                a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
+                scheduled=ctx.scheduled,
+            ),
+            "memory_graph_search": lambda a, ctx: self._memory_tools._exec_memory_graph_search(
+                a, caller_tag=ctx.caller_tag, scheduled=ctx.scheduled,
+            ),
             "memory_graph_store": lambda a, ctx: self._memory_tools._exec_memory_graph_store(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
+                scheduled=ctx.scheduled,
             ),
             "secret_get": lambda a, ctx: self._secrets._exec_secret_get(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
+                scheduled=ctx.scheduled,
             ),
             "log_query": lambda a, ctx: self._logquery._exec_log_query(
                 a, caller_depth=ctx.caller_depth, caller_tag=ctx.caller_tag,
@@ -465,7 +507,8 @@ class BuiltinExecutor:
         return list(BUILTIN_TOOLS.values())
 
     def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "",
-                chunk_callback: Optional[Callable[[str], None]] = None, trace_id: str = "") -> dict:
+                chunk_callback: Optional[Callable[[str], None]] = None, trace_id: str = "",
+                *, scheduled: bool = False) -> dict:
         """
         Execute a built-in tool. Returns standard result dict, or a
         requires_confirmation dict if the operation needs user approval.
@@ -477,6 +520,8 @@ class BuiltinExecutor:
         shell execution (only when shell_streaming=True). Ignored for other tools.
         trace_id is the request-scoped trace of the invoking run; it is propagated to
         spawned sub-agents so their logs correlate with the parent request.
+        scheduled marks a scheduled-run dispatch (see :class:`ScheduledToolDispatch`):
+        operator memory tools are unavailable and approval is never requested.
 
         Emits TOOL_START before dispatch and TOOL_END/TOOL_FAILED afterwards
         (TOOL_FAILED on an unexpected exception). These lifecycle events wrap the
@@ -496,7 +541,7 @@ class BuiltinExecutor:
         try:
             result = self._dispatch(
                 tool_name, args, caller_depth=caller_depth, caller_tag=caller_tag,
-                chunk_callback=chunk_callback, trace_id=trace_id,
+                chunk_callback=chunk_callback, trace_id=trace_id, scheduled=scheduled,
             )
         except Exception as exc:
             dur_ms = int((time.perf_counter() - start) * 1000)
@@ -559,14 +604,15 @@ class BuiltinExecutor:
         )
 
     def _dispatch(self, tool_name: str, args: dict, caller_depth: int = 0, caller_tag: str = "",
-                  chunk_callback: Optional[Callable[[str], None]] = None, trace_id: str = "") -> dict:
+                  chunk_callback: Optional[Callable[[str], None]] = None, trace_id: str = "",
+                  scheduled: bool = False) -> dict:
         """Route a built-in tool call to its handler (no lifecycle logging)."""
         handler = self._exec_table.get(tool_name)
         if handler is None:
             return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
         ctx = _CallContext(
             caller_depth=caller_depth, caller_tag=caller_tag,
-            chunk_callback=chunk_callback, trace_id=trace_id,
+            chunk_callback=chunk_callback, trace_id=trace_id, scheduled=scheduled,
         )
         return handler(args, ctx)
 
@@ -635,27 +681,33 @@ class BuiltinExecutor:
 
     def _requires_confirmation(self, tool_name: str, args: dict, description: str,
                                caller_depth: int = 0, caller_tag: str = "",
-                               zone_path: str = "", extra_zone_paths: tuple[str, ...] = ()) -> dict:
+                               zone_path: str = "", extra_zone_paths: tuple[str, ...] = (),
+                               scheduled: bool = False) -> dict:
         # In headless mode (sub-agents, caller_depth >= 1):
         #   shell/dangerous → always deny (too risky to run destructive commands unattended)
         #   file_read/sensitive, file_write, file_patch → require operator confirmation via Telegram
+        # Scheduled runs keep the depth-1 shell block, then fail closed for every
+        # other approval before any token is staged or prompt is sent.
         scope_owner = self._scope_owner_from_caller_tag(caller_depth, caller_tag)
+        if caller_depth >= 1 and tool_name == "shell":
+            command = args.get("command", "")
+            logger.warning(
+                "Headless sub-agent: dangerous shell command blocked (requires confirmation): %s",
+                command[:120],
+            )
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    f"Command blocked in headless mode (would require confirmation): {command[:200]}\n"
+                    "Tip: use a safer alternative, or break the command into non-destructive steps."
+                ),
+                "exit_code": -1,
+            }
+        if scheduled:
+            logger.info("Scheduled run: '%s' needs operator approval — denied noninteractively", tool_name)
+            return scheduled_approval_denied(tool_name)
         if caller_depth >= 1:
-            if tool_name == "shell":
-                command = args.get("command", "")
-                logger.warning(
-                    "Headless sub-agent: dangerous shell command blocked (requires confirmation): %s",
-                    command[:120],
-                )
-                return {
-                    "success": False,
-                    "output": "",
-                    "error": (
-                        f"Command blocked in headless mode (would require confirmation): {command[:200]}\n"
-                        "Tip: use a safer alternative, or break the command into non-destructive steps."
-                    ),
-                    "exit_code": -1,
-                }
             # Non-shell (sensitive file_read, file_write, file_patch): bridge to Telegram
             return self._headless_confirm_bridge(tool_name, args, description, caller_tag=caller_tag,
                                                  zone_path=zone_path, extra_zone_paths=extra_zone_paths)
@@ -886,3 +938,36 @@ class BuiltinExecutor:
         tests call it directly. The body lives in ``AgentTools``.
         """
         return self._agents._exec_get_agent_result(args, caller_tag=caller_tag)
+
+
+class ScheduledToolDispatch:
+    """Immutable scheduled-origin tool view over a shared :class:`BuiltinExecutor`.
+
+    ``AgentRuntime`` gives each scheduled runner this view instead of the
+    shared executor, so every dispatch carries the scheduled execution policy
+    explicitly rather than inferring origin from the executor's ambient
+    coordinator or prompt ID (isolate-job-execution, design decision 2). Only
+    :meth:`execute` differs; every other attribute reads through to the shared
+    executor, and the view itself cannot be mutated.
+    """
+
+    scheduled = True
+
+    def __init__(self, executor: BuiltinExecutor) -> None:
+        object.__setattr__(self, "_executor", executor)
+
+    def __getattr__(self, name: str):
+        """Read every non-policy attribute through to the shared executor."""
+        return getattr(self._executor, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Reject mutation: the scheduled policy is fixed at construction."""
+        raise AttributeError(f"ScheduledToolDispatch is immutable (cannot set {name!r})")
+
+    def execute(self, tool_name: str, args: Optional[dict] = None, caller_depth: int = 0, caller_tag: str = "",
+                chunk_callback: Optional[Callable[[str], None]] = None, trace_id: str = "") -> dict:
+        """Execute *tool_name* on the shared executor under the scheduled policy."""
+        return self._executor.execute(
+            tool_name, args, caller_depth=caller_depth, caller_tag=caller_tag,
+            chunk_callback=chunk_callback, trace_id=trace_id, scheduled=True,
+        )
