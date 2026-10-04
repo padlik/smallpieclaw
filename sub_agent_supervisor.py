@@ -17,7 +17,6 @@ and other internal supervision controls flow through :class:`SupervisionOptions`
 
 from __future__ import annotations
 
-import html as _html_mod
 import inspect
 import logging
 import threading
@@ -75,6 +74,22 @@ class _OwnedChildState:
     drain_expired: bool = False  # turn released before this child's cleanup completed
 
 
+@dataclass(frozen=True)
+class RunCompletion:
+    """Terminal outcome of one supervised run, handed to the presentation owner.
+
+    The supervisor signals completion; deciding when and how to show it is the
+    owner's job (ADR-0005), so this carries data only.
+    """
+
+    tag: str            # job tag / label of the run
+    status: str         # "done" | "failed" | "cancelled"
+    result: str         # complete result text ("[Cancelled]" when cancelled)
+    elapsed_s: int      # wall-clock seconds
+    model: str          # model id the run used
+    agent_id: str       # sub-agent id (diagnostic only; not an execution ID)
+
+
 @dataclass
 class SupervisionOptions:
     """Per-submission internal supervision controls.
@@ -88,8 +103,8 @@ class SupervisionOptions:
     job_tag: Optional[str] = None                       # scheduler job tag
     finish_cb: Optional[Callable[[str], None]] = None   # called with finish tag on terminal
     result_log_cb: Optional[Callable[..., None]] = None  # scheduler execution-log recorder
+    completion_cb: Optional[Callable[["RunCompletion"], None]] = None  # owner-side terminal handoff
     notify: bool = True                                 # deliver Telegram notification
-    expandable: bool = True                             # wrap result in expandable blockquote
     source: str = SOURCE_ON_DEMAND                      # registry source category (internal only)
     prompt_id: Optional[str] = None                     # parent prompt id for log correlation
     grant_scope_cb: Optional[Callable[[str], None]] = None  # called with agent_id on terminal so the depth-0 grant ledger can expire that sub-agent's prompt grants
@@ -426,21 +441,8 @@ class SubAgentSupervisor:
         notify_result = (
             options.notify and request.ownership.origin == ORIGIN_SCHEDULED
         )
-        expandable = options.expandable
-        notify_html = request.notify_html_fn
+        completion_cb = options.completion_cb
         context_save_attempted = False
-
-        def _send_result_html(header_html: str, body: str) -> None:
-            """Send header + body, optionally wrapped in an expandable blockquote."""
-            escaped = _html_mod.escape(body)
-            if expandable:
-                msg = f"{header_html}\n<blockquote expandable>{escaped}</blockquote>"
-            else:
-                msg = f"{header_html}\n\n{escaped}"
-            if notify_html:
-                notify_html(msg)
-            else:
-                runner.notify_fn(msg)
 
         def _save_context_before_completion() -> None:
             """Persist context before exposing completion to get_agent_result callers."""
@@ -497,9 +499,7 @@ class SubAgentSupervisor:
                     model=runner.model_id,
                     result_log_cb=result_log_cb,
                     notify=notify_result,
-                    notify_cb=lambda: self._send_cancelled_text(
-                        runner, record, label
-                    ),
+                    completion_cb=completion_cb,
                     save_context_cb=_save_context_before_completion,
                     result_log_result=CANCELLED_SENTINEL,
                     result_log_success=False,
@@ -521,12 +521,7 @@ class SubAgentSupervisor:
                     model=runner.model_id,
                     result_log_cb=result_log_cb,
                     notify=notify_result,
-                    notify_cb=lambda: _send_result_html(
-                        self._result_header(
-                            "✅", "finished", runner, label, task, elapsed
-                        ),
-                        result,
-                    ),
+                    completion_cb=completion_cb,
                     save_context_cb=_save_context_before_completion,
                     result_log_result=result,
                     result_log_success=True,
@@ -551,12 +546,7 @@ class SubAgentSupervisor:
                 model=runner.model_id,
                 result_log_cb=result_log_cb,
                 notify=notify_result,
-                notify_cb=lambda: _send_result_html(
-                    self._result_header(
-                        "❌", "failed", runner, label, task, elapsed
-                    ),
-                    error_text,
-                ),
+                completion_cb=completion_cb,
                 save_context_cb=_save_context_before_completion,
                 result_log_result=error_text,
                 result_log_success=False,
@@ -637,7 +627,7 @@ class SubAgentSupervisor:
         model: str,
         result_log_cb: Optional[Callable[..., None]],
         notify: bool,
-        notify_cb: Callable[[], None],
+        completion_cb: Optional[Callable[[RunCompletion], None]],
         save_context_cb: Callable[[], None],
         result_log_result: str,
         result_log_success: bool,
@@ -651,7 +641,8 @@ class SubAgentSupervisor:
 
         Sets the record status/result, persists context, signals completion,
         logs the outcome, invokes the scheduler result callback safely, and
-        delivers any branch-specific notification.
+        hands the terminal outcome to the presentation owner. The supervisor
+        never sends result notices itself.
         """
         record.status = status
         record.result = result
@@ -671,15 +662,20 @@ class SubAgentSupervisor:
             elapsed_s=elapsed,
             model=model,
         )
-        if not notify:
+        if not notify or completion_cb is None:
             return
         if status == "cancelled" and record.timeout_cancelled:
             return
         try:
-            notify_cb()
+            completion_cb(
+                RunCompletion(
+                    tag=label, status=status, result=result_log_result,
+                    elapsed_s=elapsed, model=model, agent_id=runner.agent_id,
+                )
+            )
         except Exception as notify_exc:  # noqa: BLE001
             logger.warning(
-                "spawn_agent: [%s] notify failed (%s): %s",
+                "spawn_agent: [%s] completion handoff failed (%s): %s",
                 label, icon_verb[1], notify_exc,
             )
 
@@ -711,37 +707,6 @@ class SubAgentSupervisor:
                 "spawn_agent: [%s] result_log_cb failed (%s): %s",
                 tag, "success" if success else "terminal", log_exc,
             )
-
-    def _result_header(
-        self,
-        icon: str,
-        verb: str,
-        runner: SubAgentRunner,
-        label: str,
-        task: str,
-        elapsed: int,
-    ) -> str:
-        """Build the common HTML header for a sub-agent result notification."""
-        return (
-            f"{icon} <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
-            f" {verb} ({elapsed}s)\n"
-            f"<b>Job:</b> {_html_mod.escape(label)}"
-            f" | <b>Model:</b> <code>{_html_mod.escape(runner.model_id)}</code>\n"
-            f"<b>Task:</b> {_html_mod.escape(task[:120])}"
-        )
-
-    def _send_cancelled_text(
-        self,
-        runner: SubAgentRunner,
-        record: SubAgentRecord,
-        label: str,
-    ) -> None:
-        """Send the plain-text notification for a cancelled sub-agent run."""
-        runner.notify_fn(
-            f"🛑 Sub-agent {runner.agent_id} cancelled\n"
-            f"Job: **{label}**\n"
-            f"Completed {record.iteration} iterations before stop."
-        )
 
     # ------------------------------------------------------------------
     # Shutdown

@@ -12,6 +12,8 @@ import asyncio
 import logging
 import sys
 import os
+import threading
+from collections import deque
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -62,6 +64,10 @@ def _make_iface():
     iface._verbose = False
     iface._app = None
     iface._loop = None
+    iface._notice_queue = deque()
+    iface._notice_gate = asyncio.Lock()
+    iface._active_turns = 0
+    iface._flush_tasks = set()
     return iface
 
 
@@ -649,3 +655,776 @@ class TestCmdHelpOutput:
         assert "/reset" in text, (
             "cmd_help must still list /reset"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: scheduled-result Details callback
+# ---------------------------------------------------------------------------
+
+_DETAILS_RUN_ID = "run-" + "ab12cd34" * 4
+
+
+def _details_iface(record: dict | None):
+    """Interface whose scheduler retains ``record`` and whose agent side is spied."""
+    iface = _make_iface()
+    iface.scheduler = MagicMock(spec=["execution_log"])
+    iface.scheduler.execution_log = MagicMock()
+    iface.scheduler.execution_log.get_result = MagicMock(return_value=record)
+    iface.agent = MagicMock()
+    iface._run_agent_task = AsyncMock()
+    return iface
+
+
+def _press_details(iface, data: str, user_id: int = 42):
+    """Drive cb_job_details with a button press; return (query, message)."""
+    from telegram_callbacks import cb_job_details
+
+    message = MagicMock()
+    message.reply_text = AsyncMock()
+    message.reply_document = AsyncMock()
+
+    query = MagicMock()
+    query.data = data
+    query.from_user = MagicMock()
+    query.from_user.id = user_id
+    query.message = message
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+
+    update = MagicMock()
+    update.callback_query = query
+    asyncio.run(cb_job_details(iface, update, MagicMock()))
+    return query, message
+
+
+def _record(result: str) -> dict:
+    return {
+        "run_id": _DETAILS_RUN_ID,
+        "tag": "nightly",
+        "status": "done",
+        "ts": "2026-10-05T01:00:00",
+        "result": result,
+    }
+
+
+def _alert_text(query) -> str:
+    return " ".join(str(c.args[0]) for c in query.answer.call_args_list if c.args)
+
+
+class TestJobDetailsAuthorization:
+    def test_unauthenticated_user_is_denied(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("secret result"))
+        query, _message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID), user_id=999)
+        assert "Not authorized" in _alert_text(query)
+
+    def test_unauthenticated_user_gets_no_result_lookup(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("secret result"))
+        _press_details(iface, details_callback_data(_DETAILS_RUN_ID), user_id=999)
+        iface.scheduler.execution_log.get_result.assert_not_called()
+
+    def test_unauthenticated_user_receives_no_message_or_document(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("secret result"))
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID), user_id=999)
+        message.reply_text.assert_not_called()
+        message.reply_document.assert_not_called()
+
+
+class TestJobDetailsRealScheduler:
+    def test_retained_result_is_returned_from_real_execution_log(self, tmp_path):
+        from telegram_formatter import details_callback_data
+
+        iface = _jobs_iface(tmp_path, [_complete_entry("nightly", _DETAILS_RUN_ID, result="all good")])
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        assert message.reply_text.call_args.args[0] == "all good"
+
+    def test_scheduler_without_execution_log_reports_unavailable(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(None)
+        iface.scheduler = MagicMock(spec=[])
+        query, _message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        assert "unavailable" in _alert_text(query).lower()
+
+
+class TestJobDetailsExpiry:
+    def test_unknown_or_expired_result_reports_unavailable(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(None)
+        query, _message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        assert "unavailable" in _alert_text(query).lower()
+
+    def test_unavailable_result_sends_no_message_or_document(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(None)
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        message.reply_text.assert_not_called()
+        message.reply_document.assert_not_called()
+
+    def test_lookup_uses_execution_id_from_callback_data(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(None)
+        _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        iface.scheduler.execution_log.get_result.assert_called_once_with(_DETAILS_RUN_ID)
+
+    def test_missing_scheduler_reports_unavailable(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(None)
+        iface.scheduler = None
+        query, _message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        assert "unavailable" in _alert_text(query).lower()
+
+    def test_empty_execution_id_reports_unavailable(self):
+        iface = _details_iface(_record("anything"))
+        query, _message = _press_details(iface, "jobdetails:")
+        assert "unavailable" in _alert_text(query).lower()
+        iface.scheduler.execution_log.get_result.assert_not_called()
+
+
+class TestJobDetailsDelivery:
+    def test_short_result_is_sent_complete_as_text(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("all <b>good</b> & done"))
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        assert message.reply_text.call_args.args[0] == "all <b>good</b> & done"
+
+    def test_short_result_is_not_sent_as_document(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("all good"))
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        message.reply_document.assert_not_called()
+
+    def test_oversized_result_is_sent_as_complete_utf8_document(self):
+        from telegram_formatter import details_callback_data, format_result_document
+
+        result = "日本語🙂" * 3000
+        record = _record(result)
+        iface = _details_iface(record)
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        document = message.reply_document.call_args.kwargs["document"]
+        assert document.read() == format_result_document(record)
+
+    def test_oversized_result_document_contains_untruncated_result(self):
+        from telegram_formatter import details_callback_data
+
+        result = "line\n" * 5000 + "END-MARKER"
+        iface = _details_iface(_record(result))
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        document = message.reply_document.call_args.kwargs["document"]
+        assert document.read().decode("utf-8").endswith("END-MARKER")
+
+    def test_oversized_result_document_is_named_after_execution_id(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("x" * 10_000))
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        assert message.reply_document.call_args.kwargs["filename"] == f"{_DETAILS_RUN_ID}.txt"
+
+    def test_oversized_result_is_not_sent_as_text(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("x" * 10_000))
+        _query, message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        message.reply_text.assert_not_called()
+
+    def test_button_press_is_acknowledged(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("ok"))
+        query, _message = _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        query.answer.assert_called()
+
+
+class TestJobDetailsIsolation:
+    @pytest.mark.parametrize("result", ["short result", "x" * 10_000], ids=["short", "oversized"])
+    def test_agent_handler_is_never_invoked(self, result):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record(result))
+        _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        iface.agent_handler.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "record",
+        [None, _record("short result"), _record("x" * 10_000)],
+        ids=["expired", "short", "oversized"],
+    )
+    def test_agent_and_memory_are_never_touched(self, record):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(record)
+        _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        assert iface.agent.mock_calls == []
+
+    def test_no_agent_task_is_started(self):
+        from telegram_formatter import details_callback_data
+
+        iface = _details_iface(_record("short result"))
+        _press_details(iface, details_callback_data(_DETAILS_RUN_ID))
+        iface._run_agent_task.assert_not_called()
+
+
+class TestJobDetailsRegistration:
+    def _registered_callback_patterns(self) -> list[str]:
+        from telegram.ext import CallbackQueryHandler
+
+        patterns: list[str] = []
+
+        def _fake_add_handler(handler):
+            if isinstance(handler, CallbackQueryHandler):
+                patterns.append(handler.pattern.pattern)
+
+        iface = _make_iface()
+        mock_app = MagicMock()
+        mock_app.add_handler = _fake_add_handler
+        mock_app.add_error_handler = MagicMock()
+        iface._app = mock_app
+        iface._register_handlers()
+        return patterns
+
+    def test_details_callback_handler_is_registered(self):
+        from telegram_formatter import details_callback_data
+
+        data = details_callback_data(_DETAILS_RUN_ID)
+        import re
+
+        assert any(re.search(p, data) for p in self._registered_callback_patterns())
+
+    def test_details_callback_data_fits_telegram_limit(self):
+        from telegram_formatter import CALLBACK_DATA_LIMIT, details_callback_data
+
+        assert len(details_callback_data(_DETAILS_RUN_ID).encode("utf-8")) <= CALLBACK_DATA_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Tests: /jobs history <tag> and existing /jobs subcommands
+# ---------------------------------------------------------------------------
+
+def _hours_ago_ts(hours: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    moment = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_id(char: str) -> str:
+    return "run-" + char * 32
+
+
+def _complete_entry(tag: str, run_id: str, hours_ago: float = 1.0, status: str = "done",
+                    result: str = "full result") -> dict:
+    return {
+        "ts": _hours_ago_ts(hours_ago), "tag": tag, "task": "t", "result": result,
+        "success": status == "done", "elapsed_s": 1, "model": "",
+        "run_id": run_id, "status": status,
+    }
+
+
+def _legacy_entry(tag: str, success: bool, hours_ago: float = 1.0) -> dict:
+    return {
+        "ts": _hours_ago_ts(hours_ago), "tag": tag, "task": "t", "result": "trunc" * 10,
+        "success": success, "elapsed_s": 1, "model": "",
+    }
+
+
+def _jobs_iface(tmp_path, entries: list[dict], active_tags: tuple[str, ...] = ("nightly",)):
+    """Interface backed by a real execution log; only the scheduler shell is a double."""
+    import json
+
+    from scheduler import JobExecutionLog
+
+    log = JobExecutionLog(str(tmp_path / "job_execution_log.jsonl"))
+    with open(log._log_file, "w", encoding="utf-8") as fh:
+        for entry in entries:
+            fh.write(json.dumps(entry) + "\n")
+
+    iface = _make_iface()
+    iface.scheduler = MagicMock()
+    iface.scheduler.execution_log = log
+    iface.scheduler.list_jobs = MagicMock(return_value=[
+        {"tag": t, "schedule": "daily at 02:00", "enabled": True} for t in active_tags
+    ])
+    iface.agent = MagicMock()
+    iface._run_agent_task = AsyncMock()
+    return iface
+
+
+def _run_jobs(iface, args: list[str], user_id: int = 42):
+    """Drive cmd_jobs; return the message whose replies were captured."""
+    from telegram_commands import cmd_jobs
+
+    message = MagicMock()
+    message.reply_text = AsyncMock()
+    message.reply_document = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user = MagicMock()
+    update.effective_user.id = user_id
+    update.effective_message = message
+
+    ctx = MagicMock()
+    ctx.args = args
+    asyncio.run(cmd_jobs(iface, update, ctx))
+    return message
+
+
+def _reply_text(message) -> str:
+    return "\n".join(str(c.args[0]) for c in message.reply_text.call_args_list if c.args)
+
+
+class TestJobsHistoryListing:
+    def test_lists_every_retained_execution_id(self, tmp_path):
+        entries = [_complete_entry("nightly", _run_id("1"), 3), _complete_entry("nightly", _run_id("2"), 2)]
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, entries), ["history", "nightly"]))
+        assert _run_id("1") in text and _run_id("2") in text
+
+    def test_lists_each_status(self, tmp_path):
+        entries = [
+            _complete_entry("nightly", _run_id("1"), 3, status="cancelled"),
+            _complete_entry("nightly", _run_id("2"), 2, status="failed"),
+        ]
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, entries), ["history", "nightly"]))
+        assert "cancelled" in text and "failed" in text
+
+    def test_lists_each_timestamp(self, tmp_path):
+        entry = _complete_entry("nightly", _run_id("1"), 3)
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, [entry]), ["history", "nightly"]))
+        assert entry["ts"] in text
+
+    def test_lists_newest_run_first(self, tmp_path):
+        entries = [_complete_entry("nightly", _run_id("1"), 3), _complete_entry("nightly", _run_id("2"), 2)]
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, entries), ["history", "nightly"]))
+        assert text.index(_run_id("2")) < text.index(_run_id("1"))
+
+    def test_omits_other_tags_runs(self, tmp_path):
+        entries = [_complete_entry("nightly", _run_id("1")), _complete_entry("hourly", _run_id("9"))]
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, entries, ("nightly", "hourly")), ["history", "nightly"]))
+        assert _run_id("9") not in text
+
+
+class TestJobsHistoryRemovedOnceJob:
+    def test_removed_job_with_retained_runs_is_listed(self, tmp_path):
+        entries = [_complete_entry("once-report", _run_id("3"), status="failed")]
+        iface = _jobs_iface(tmp_path, entries, active_tags=())
+        text = _reply_text(_run_jobs(iface, ["history", "once-report"]))
+        assert _run_id("3") in text and "failed" in text
+
+    def test_removed_job_with_retained_runs_is_not_reported_unknown(self, tmp_path):
+        entries = [_complete_entry("once-report", _run_id("3"))]
+        iface = _jobs_iface(tmp_path, entries, active_tags=())
+        assert "unknown" not in _reply_text(_run_jobs(iface, ["history", "once-report"])).lower()
+
+
+class TestJobsHistoryLegacy:
+    def test_legacy_record_is_identified_as_legacy(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_legacy_entry("nightly", True)])
+        assert "legacy" in _reply_text(_run_jobs(iface, ["history", "nightly"])).lower()
+
+    def test_legacy_record_is_identified_as_partial(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_legacy_entry("nightly", True)])
+        assert "partial" in _reply_text(_run_jobs(iface, ["history", "nightly"])).lower()
+
+    @pytest.mark.parametrize(("success", "status"), [(True, "done"), (False, "failed")])
+    def test_legacy_record_shows_mapped_status(self, tmp_path, success, status):
+        iface = _jobs_iface(tmp_path, [_legacy_entry("nightly", success)])
+        assert status in _reply_text(_run_jobs(iface, ["history", "nightly"]))
+
+    def test_legacy_record_shows_its_timestamp(self, tmp_path):
+        entry = _legacy_entry("nightly", True)
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, [entry]), ["history", "nightly"]))
+        assert entry["ts"] in text
+
+    def test_legacy_record_gets_no_fabricated_execution_id(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_legacy_entry("nightly", True)])
+        assert "run-" not in _reply_text(_run_jobs(iface, ["history", "nightly"]))
+
+    def test_legacy_record_does_not_expose_truncated_output(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_legacy_entry("nightly", True)])
+        assert "trunctrunc" not in _reply_text(_run_jobs(iface, ["history", "nightly"]))
+
+
+class TestJobsHistoryUnknownVersusEmpty:
+    def test_tag_without_definition_or_runs_is_reported_unknown(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [], active_tags=("nightly",))
+        assert "unknown" in _reply_text(_run_jobs(iface, ["history", "ghost"])).lower()
+
+    def test_unknown_tag_is_not_reported_as_empty_history(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [], active_tags=("nightly",))
+        assert "no retained runs" not in _reply_text(_run_jobs(iface, ["history", "ghost"])).lower()
+
+    def test_active_job_without_runs_is_reported_as_empty_history(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [], active_tags=("nightly",))
+        assert "no retained runs" in _reply_text(_run_jobs(iface, ["history", "nightly"])).lower()
+
+    def test_empty_history_is_not_reported_unknown(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [], active_tags=("nightly",))
+        assert "unknown" not in _reply_text(_run_jobs(iface, ["history", "nightly"])).lower()
+
+    def test_expired_runs_of_removed_job_make_the_tag_unknown(self, tmp_path):
+        entries = [_complete_entry("once-report", _run_id("3"), hours_ago=500)]
+        iface = _jobs_iface(tmp_path, entries, active_tags=())
+        assert "unknown" in _reply_text(_run_jobs(iface, ["history", "once-report"])).lower()
+
+
+class TestJobsHistoryUsage:
+    def test_missing_tag_returns_history_usage(self, tmp_path):
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, []), ["history"]))
+        assert "/jobs history" in text and "usage" in text.lower()
+
+    def test_missing_tag_performs_no_lookup(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_complete_entry("nightly", _run_id("1"))])
+        _run_jobs(iface, ["history"])
+        iface.scheduler.list_jobs.assert_not_called()
+
+
+class TestJobsHistoryAuthentication:
+    def test_unauthenticated_user_sees_no_run_ids(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_complete_entry("nightly", _run_id("1"))])
+        message = _run_jobs(iface, ["history", "nightly"], user_id=999)
+        assert _run_id("1") not in _reply_text(message)
+
+    def test_unauthenticated_user_triggers_no_scheduler_lookup(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_complete_entry("nightly", _run_id("1"))])
+        _run_jobs(iface, ["history", "nightly"], user_id=999)
+        iface.scheduler.list_jobs.assert_not_called()
+
+
+class TestJobsHistoryIsolation:
+    def test_agent_handler_is_never_invoked(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_complete_entry("nightly", _run_id("1"))])
+        _run_jobs(iface, ["history", "nightly"])
+        iface.agent_handler.assert_not_called()
+
+    @pytest.mark.parametrize("tag", ["nightly", "ghost"], ids=["known", "unknown"])
+    def test_agent_and_memory_are_never_touched(self, tmp_path, tag):
+        iface = _jobs_iface(tmp_path, [_complete_entry("nightly", _run_id("1"))])
+        _run_jobs(iface, ["history", tag])
+        assert iface.agent.mock_calls == []
+
+    def test_no_agent_task_is_started(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_complete_entry("nightly", _run_id("1"))])
+        _run_jobs(iface, ["history", "nightly"])
+        iface._run_agent_task.assert_not_called()
+
+
+class TestExistingJobsSubcommandsUnchanged:
+    def _iface(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [])
+        iface.scheduler.list_jobs = MagicMock(return_value=[])
+        iface.scheduler.reload = MagicMock(return_value={"reloaded": 3, "failed": 1})
+        iface.scheduler.remove_job = MagicMock(return_value=True)
+        iface.scheduler.pause_job = MagicMock(return_value=True)
+        iface.scheduler.resume_job = MagicMock(return_value=True)
+        return iface
+
+    def test_bare_jobs_lists_jobs(self, tmp_path):
+        iface = self._iface(tmp_path)
+        _run_jobs(iface, [])
+        iface.scheduler.list_jobs.assert_called_once_with()
+
+    def test_reload_reloads_and_reports_counts(self, tmp_path):
+        iface = self._iface(tmp_path)
+        text = _reply_text(_run_jobs(iface, ["reload"]))
+        iface.scheduler.reload.assert_called_once_with()
+        assert "Scheduler reloaded" in text and "<b>3</b>" in text and "<b>1</b>" in text
+
+    @pytest.mark.parametrize(
+        ("sub", "method", "confirmation"),
+        [("pause", "pause_job", "paused"), ("resume", "resume_job", "resumed"), ("remove", "remove_job", "removed")],
+    )
+    def test_mutating_subcommand_acts_on_tag_and_confirms(self, tmp_path, sub, method, confirmation):
+        iface = self._iface(tmp_path)
+        text = _reply_text(_run_jobs(iface, [sub, "nightly"]))
+        getattr(iface.scheduler, method).assert_called_once_with("nightly")
+        assert confirmation in text
+
+    @pytest.mark.parametrize(
+        ("sub", "method"), [("pause", "pause_job"), ("resume", "resume_job"), ("remove", "remove_job")]
+    )
+    def test_mutating_subcommand_reports_not_found(self, tmp_path, sub, method):
+        iface = self._iface(tmp_path)
+        getattr(iface.scheduler, method).return_value = False
+        assert "not found" in _reply_text(_run_jobs(iface, [sub, "ghost"]))
+
+    @pytest.mark.parametrize("sub", ["pause", "resume", "remove"])
+    def test_mutating_subcommand_without_tag_returns_usage(self, tmp_path, sub):
+        iface = self._iface(tmp_path)
+        text = _reply_text(_run_jobs(iface, [sub]))
+        assert f"/jobs {sub}" in text and "Usage" in text
+
+    def test_unavailable_scheduler_is_reported(self, tmp_path):
+        iface = self._iface(tmp_path)
+        iface.scheduler = None
+        assert "Scheduler not available" in _reply_text(_run_jobs(iface, []))
+
+
+# ---------------------------------------------------------------------------
+# Tests: /jobs result <execution-id>
+# ---------------------------------------------------------------------------
+
+def _result_iface(tmp_path, result: str, run_id: str = _DETAILS_RUN_ID):
+    return _jobs_iface(tmp_path, [_complete_entry("nightly", run_id, result=result)])
+
+
+class TestJobsResultShort:
+    def test_short_result_is_returned_complete(self, tmp_path):
+        iface = _result_iface(tmp_path, "all good")
+        message = _run_jobs(iface, ["result", _DETAILS_RUN_ID])
+        assert message.reply_text.call_args.args[0] == "all good"
+
+    def test_result_at_message_limit_is_returned_untruncated(self, tmp_path):
+        from telegram_formatter import TELEGRAM_RENDERED_LIMIT
+
+        result = "x" * TELEGRAM_RENDERED_LIMIT
+        message = _run_jobs(_result_iface(tmp_path, result), ["result", _DETAILS_RUN_ID])
+        assert message.reply_text.call_args.args[0] == result
+
+    def test_result_markup_is_sent_without_html_parsing(self, tmp_path):
+        iface = _result_iface(tmp_path, "a <b>bold</b> & <unclosed")
+        message = _run_jobs(iface, ["result", _DETAILS_RUN_ID])
+        assert message.reply_text.call_args.args[0] == "a <b>bold</b> & <unclosed"
+        assert "parse_mode" not in message.reply_text.call_args.kwargs
+
+    def test_short_result_is_not_sent_as_document(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, "all good"), ["result", _DETAILS_RUN_ID])
+        message.reply_document.assert_not_called()
+
+    def test_empty_result_still_gets_a_non_empty_reply(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, ""), ["result", _DETAILS_RUN_ID])
+        assert message.reply_text.call_args.args[0].strip()
+
+
+class TestJobsResultDocument:
+    def test_oversized_result_is_sent_as_complete_utf8_document(self, tmp_path):
+        from telegram_formatter import format_result_document
+
+        result = "日本語🙂" * 3000
+        iface = _result_iface(tmp_path, result)
+        message = _run_jobs(iface, ["result", _DETAILS_RUN_ID])
+        record = iface.scheduler.execution_log.get_result(_DETAILS_RUN_ID)
+        assert message.reply_document.call_args.kwargs["document"].read() == format_result_document(record)
+
+    def test_oversized_result_document_is_untruncated(self, tmp_path):
+        iface = _result_iface(tmp_path, "line\n" * 5000 + "END-MARKER")
+        message = _run_jobs(iface, ["result", _DETAILS_RUN_ID])
+        document = message.reply_document.call_args.kwargs["document"]
+        assert document.read().decode("utf-8").endswith("END-MARKER")
+
+    def test_oversized_result_document_is_named_after_execution_id(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, "x" * 10_000), ["result", _DETAILS_RUN_ID])
+        assert message.reply_document.call_args.kwargs["filename"] == f"{_DETAILS_RUN_ID}.txt"
+
+    def test_result_just_over_the_limit_is_sent_as_document(self, tmp_path):
+        from telegram_formatter import TELEGRAM_RENDERED_LIMIT
+
+        result = "x" * (TELEGRAM_RENDERED_LIMIT + 1)
+        message = _run_jobs(_result_iface(tmp_path, result), ["result", _DETAILS_RUN_ID])
+        message.reply_document.assert_called_once()
+
+    def test_oversized_result_is_not_sent_as_text(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, "x" * 10_000), ["result", _DETAILS_RUN_ID])
+        message.reply_text.assert_not_called()
+
+
+class TestJobsResultUnavailable:
+    def test_unknown_execution_id_reports_unavailable(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, "r"), ["result", _run_id("f")])
+        assert "unavailable" in _reply_text(message).lower()
+
+    def test_expired_execution_id_reports_unavailable(self, tmp_path):
+        iface = _jobs_iface(tmp_path, [_complete_entry("nightly", _DETAILS_RUN_ID, hours_ago=500)])
+        message = _run_jobs(iface, ["result", _DETAILS_RUN_ID])
+        assert "unavailable" in _reply_text(message).lower()
+
+    def test_unavailable_result_sends_no_document(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, "r"), ["result", _run_id("f")])
+        message.reply_document.assert_not_called()
+
+    def test_unavailable_reply_does_not_disclose_other_results(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, "SECRET-BODY"), ["result", _run_id("f")])
+        assert "SECRET-BODY" not in _reply_text(message)
+
+
+class TestJobsResultUsage:
+    def test_missing_execution_id_returns_result_usage(self, tmp_path):
+        text = _reply_text(_run_jobs(_result_iface(tmp_path, "r"), ["result"]))
+        assert "/jobs result" in text and "Usage" in text
+
+    def test_missing_execution_id_performs_no_lookup(self, tmp_path):
+        from unittest.mock import patch
+
+        iface = _result_iface(tmp_path, "r")
+        with patch.object(iface.scheduler.execution_log, "get_result") as lookup:
+            _run_jobs(iface, ["result"])
+        lookup.assert_not_called()
+
+
+class TestJobsResultAuthentication:
+    def test_unauthenticated_user_receives_no_result_text(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, "SECRET-BODY"), ["result", _DETAILS_RUN_ID], user_id=999)
+        assert "SECRET-BODY" not in _reply_text(message)
+
+    def test_unauthenticated_user_receives_no_document(self, tmp_path):
+        message = _run_jobs(_result_iface(tmp_path, "x" * 10_000), ["result", _DETAILS_RUN_ID], user_id=999)
+        message.reply_document.assert_not_called()
+
+    def test_unauthenticated_user_triggers_no_lookup(self, tmp_path):
+        from unittest.mock import patch
+
+        iface = _result_iface(tmp_path, "r")
+        with patch.object(iface.scheduler.execution_log, "get_result") as lookup:
+            _run_jobs(iface, ["result", _DETAILS_RUN_ID], user_id=999)
+        lookup.assert_not_called()
+
+
+class TestJobsResultIsolation:
+    @pytest.mark.parametrize("result", ["short result", "x" * 10_000], ids=["short", "oversized"])
+    def test_agent_handler_is_never_invoked(self, tmp_path, result):
+        iface = _result_iface(tmp_path, result)
+        _run_jobs(iface, ["result", _DETAILS_RUN_ID])
+        iface.agent_handler.assert_not_called()
+
+    @pytest.mark.parametrize("run_id", [_DETAILS_RUN_ID, _run_id("f")], ids=["found", "unavailable"])
+    def test_agent_and_memory_are_never_touched(self, tmp_path, run_id):
+        iface = _result_iface(tmp_path, "short result")
+        _run_jobs(iface, ["result", run_id])
+        assert iface.agent.mock_calls == []
+
+    def test_no_agent_task_is_started(self, tmp_path):
+        iface = _result_iface(tmp_path, "short result")
+        _run_jobs(iface, ["result", _DETAILS_RUN_ID])
+        iface._run_agent_task.assert_not_called()
+
+
+class TestJobLookupsDoNotBlockTheEventLoop:
+    """Execution-log reads take a threading lock, so they must leave the loop thread."""
+
+    @staticmethod
+    def _recording_log(lookup_threads: list[int], *, record: dict | None = None):
+        from types import SimpleNamespace
+
+        def history(_tag: str) -> list:
+            lookup_threads.append(threading.get_ident())
+            return []
+
+        def get_result(_run_id: str) -> dict | None:
+            lookup_threads.append(threading.get_ident())
+            return record
+
+        return SimpleNamespace(history=history, get_result=get_result)
+
+    def test_jobs_history_lookup_runs_off_the_loop_thread(self):
+        threads: list[int] = []
+        iface = _make_iface()
+        iface.scheduler = MagicMock()
+        iface.scheduler.execution_log = self._recording_log(threads)
+        iface.scheduler.list_jobs = MagicMock(return_value=[])
+
+        _run_jobs(iface, ["history", "nightly"])
+
+        assert threads and threads[0] != threading.get_ident()
+
+    def test_jobs_result_lookup_runs_off_the_loop_thread(self):
+        threads: list[int] = []
+        iface = _make_iface()
+        iface.scheduler = MagicMock()
+        iface.scheduler.execution_log = self._recording_log(threads, record=_record("short"))
+
+        _run_jobs(iface, ["result", _DETAILS_RUN_ID])
+
+        assert threads and threads[0] != threading.get_ident()
+
+    def test_details_lookup_runs_off_the_loop_thread(self):
+        threads: list[int] = []
+        iface = _details_iface(None)
+        iface.scheduler.execution_log = self._recording_log(threads, record=_record("short"))
+
+        _press_details(iface, f"jobdetails:{_DETAILS_RUN_ID}")
+
+        assert threads and threads[0] != threading.get_ident()
+
+    def test_loop_stays_responsive_while_a_result_lookup_blocks(self):
+        from types import SimpleNamespace
+
+        release = threading.Event()
+        entered = threading.Event()
+
+        def blocking_get_result(_run_id: str) -> dict:
+            entered.set()
+            release.wait(timeout=5)
+            return _record("short")
+
+        iface = _make_iface()
+        iface.scheduler = MagicMock()
+        iface.scheduler.execution_log = SimpleNamespace(get_result=blocking_get_result)
+
+        async def scenario() -> bool:
+            from telegram_commands import cmd_jobs
+
+            message = MagicMock()
+            message.reply_text = AsyncMock()
+            update = MagicMock()
+            update.effective_user.id = 42
+            update.effective_message = message
+            ctx = MagicMock()
+            ctx.args = ["result", _DETAILS_RUN_ID]
+            handler = asyncio.ensure_future(cmd_jobs(iface, update, ctx))
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            responsive = False
+            try:
+                await asyncio.wait_for(asyncio.sleep(0), timeout=0.5)
+                responsive = entered.is_set() and not handler.done()
+            finally:
+                release.set()
+                await handler
+            return responsive
+
+        assert asyncio.run(scenario()) is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: help discovery of the history and result views
+# ---------------------------------------------------------------------------
+
+class TestJobsHelpDiscovery:
+    def test_help_documents_history_view(self):
+        assert "/jobs history" in _get_help_text(_make_iface())
+
+    def test_help_documents_result_view(self):
+        assert "/jobs result" in _get_help_text(_make_iface())
+
+    def test_help_describes_the_views_as_read_only(self):
+        assert "read-only" in _get_help_text(_make_iface())
+
+    def test_help_says_scheduled_run_notices_are_deferred_and_silent(self):
+        text = _get_help_text(_make_iface())
+        assert "deferred" in text and "silent" in text
+
+    def test_help_keeps_existing_jobs_guidance(self):
+        assert "list scheduled jobs" in _get_help_text(_make_iface())
+
+    def test_jobs_usage_documents_history_view(self, tmp_path):
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, []), []))
+        assert "/jobs history" in text
+
+    def test_jobs_usage_documents_result_view(self, tmp_path):
+        text = _reply_text(_run_jobs(_jobs_iface(tmp_path, []), []))
+        assert "/jobs result" in text
+
+    @pytest.mark.parametrize("hint", ["/jobs reload", "/jobs remove", "/jobs pause", "/jobs resume"])
+    def test_jobs_usage_keeps_existing_management_hints(self, tmp_path, hint):
+        assert hint in _reply_text(_run_jobs(_jobs_iface(tmp_path, []), []))

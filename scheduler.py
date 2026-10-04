@@ -36,7 +36,8 @@ import schedule
 from croniter import croniter, CroniterBadCronError
 
 from sub_agent_registry import SOURCE_SCHEDULED
-from sub_agent_supervisor import CANCELLED_SENTINEL, SupervisionOptions
+from sub_agent_supervisor import CANCELLED_SENTINEL, RunCompletion, SupervisionOptions
+from telegram_formatter import ResultNotice, bound_display_text, format_result_notice
 
 if TYPE_CHECKING:
     from xdg import XDGPaths
@@ -69,6 +70,67 @@ def _classify_job_failure(result: str) -> str:
     if "context" in lower and ("overflow" in lower or "too long" in lower):
         return "context"
     return "unknown"
+
+
+def _classify_outcome(result: str, success: bool, meta: dict) -> tuple[str, str, str]:
+    """Return ``(status, error_type, next_run)`` for a scheduled run's outcome.
+
+    A supervisor "done" result that starts with ``❌`` is a failure; any other
+    unsuccessful result is classified as if it carried the sentinel. Failures
+    carry the error type and next scheduled run; success and cancellation do not.
+    """
+    text = result or ""
+    if success and not text.startswith(_ERROR_SENTINEL):
+        return "done", "", ""
+    if not success and text == CANCELLED_SENTINEL:
+        return "cancelled", "", ""
+    error_type = _classify_job_failure(
+        text if text.startswith(_ERROR_SENTINEL) else f"{_ERROR_SENTINEL} {text}"
+    )
+    return "failed", error_type, _next_run_label(meta)
+
+
+def _build_result_notice(
+    tag: str, status: str, result: str, error_type: str, next_run: str, run_id: str,
+) -> ResultNotice:
+    """Build the run-result notice for a scheduled run's terminal outcome.
+
+    The summary stays outside an expandable quote holding the result; a result
+    too long for one message is replaced by the execution ID and a Details button.
+    """
+    summary = _result_summary(tag, status, error_type, next_run)
+    if status == "cancelled":
+        return ResultNotice(summary)
+    return format_result_notice(summary, result, run_id)
+
+
+def _result_summary(tag: str, status: str, error_type: str, next_run: str) -> str:
+    """Return the Telegram-HTML outcome summary for a run, with the tag bounded."""
+    safe_tag = _html.escape(bound_display_text(tag))
+    if status == "failed":
+        return (
+            f"<b>⚠️ Scheduled job failed: {safe_tag}</b>\n"
+            f"Error type: {_html.escape(error_type)}\n"
+            f"Next run: {_html.escape(next_run)}"
+        )
+    if status == "cancelled":
+        return f"<b>🛑 Scheduled job cancelled: {safe_tag}</b>"
+    return f"<b>✅ Scheduled job finished: {safe_tag}</b>"
+
+
+def _build_unretained_notice(
+    tag: str, status: str, error_type: str, next_run: str,
+) -> ResultNotice:
+    """Build the notice for a run whose outcome could not be saved to job history.
+
+    It carries the real outcome summary plus an honest note that the result was
+    not retained; it has no Details control because no record exists.
+    """
+    summary = _result_summary(tag, status, error_type, next_run)
+    return ResultNotice(
+        f"{summary}\n\nThe result was not retained in job history. "
+        "Details are unavailable."
+    )
 
 
 def _normalize_tag(s: str) -> str:
@@ -404,6 +466,8 @@ class Scheduler:
         agent_cfg = config.get("agent", {})
         self.enabled: bool = sched_cfg.get("enabled", True)
         self.notify = notify_fn
+        self._result_notice_sink: Optional[Callable[[ResultNotice], None]] = None
+        self._unretained_run_ids: set[str] = set()
         self.agent = agent_fn
         self.builtin_executor = builtin_executor  # Optional[BuiltinExecutor]
         self._scheduler_config_path = scheduler_config_path
@@ -947,6 +1011,8 @@ class Scheduler:
         which never hold an admitted run. Releasing an already-released run is
         a no-op, so a duplicate finish signal cannot release another run.
         """
+        if run_id is not None:
+            self._unretained_run_ids.discard(run_id)
         with self._running_lock:
             runs = self._active_runs.get(tag, set())
             if run_id is not None:
@@ -1027,35 +1093,74 @@ class Scheduler:
             *, tag: str, task: str, result: str, success: bool,
             elapsed_s: int = 0, model: str = "",
         ) -> None:
-            if success:
-                status, error_type, next_run = "done", "", ""
-            elif result == CANCELLED_SENTINEL:
-                status, error_type, next_run = "cancelled", "", ""
-            else:
-                status = "failed"
-                text = result or ""
-                error_type = _classify_job_failure(
-                    text if text.startswith(_ERROR_SENTINEL)
-                    else f"{_ERROR_SENTINEL} {text}"
-                )
-                next_run = _next_run_label(meta)
+            status, error_type, next_run = _classify_outcome(result, success, meta)
             self._record_execution(
                 meta,
-                tag=tag, task=task, result=result, success=success,
+                tag=tag, task=task, result=result, success=status == "done",
                 elapsed_s=elapsed_s, model=model, error_type=error_type,
                 run_id=run_id, status=status, next_run=next_run,
             )
 
         return record
 
+    def set_result_notice_sink(self, sink: Optional[Callable[[ResultNotice], None]]) -> None:
+        """Route scheduled run-result notices to ``sink`` instead of ``notify``.
+
+        The Telegram adapter installs its idle queue here. Direct alerts
+        (launch failures, empty-task reminders, long-running warnings) never
+        use the sink. ``None`` restores direct delivery.
+        """
+        self._result_notice_sink = sink
+
+    def _deliver_result_notice(self, notice: ResultNotice) -> None:
+        """Hand a run-result notice to the sink, or its HTML to ``notify`` when none is set."""
+        sink = self._result_notice_sink
+        try:
+            if sink is not None:
+                sink(notice)
+            else:
+                self.notify(notice.text)
+        except Exception as exc:  # noqa: BLE001 - best-effort delivery; history is authoritative
+            logger.warning("Could not deliver scheduled run-result notice: %s", exc)
+
+    def _run_completion_handler(
+        self, run_id: str, meta: dict,
+    ) -> Callable[[RunCompletion], None]:
+        """Return the per-run handler that turns a terminal outcome into a notice.
+
+        The supervisor invokes this only for notifying runs that are not
+        timeout-cancelled. A run whose outcome could not be persisted gets its
+        real outcome summary plus a truthful "not retained" note instead of the
+        result and a Details control.
+        """
+
+        def complete(completion: RunCompletion) -> None:
+            status, error_type, next_run = _classify_outcome(
+                completion.result, completion.status == "done", meta,
+            )
+            if run_id in self._unretained_run_ids:
+                self._unretained_run_ids.discard(run_id)
+                notice = _build_unretained_notice(
+                    completion.tag, status, error_type, next_run,
+                )
+            else:
+                notice = _build_result_notice(
+                    completion.tag, status, completion.result, error_type, next_run, run_id,
+                )
+            self._deliver_result_notice(notice)
+
+        return complete
+
     def _record_execution(self, meta: dict, **record_kwargs) -> None:
         """Persist one execution record, applying write-failure precedence.
 
         A failed write always logs the real run outcome, sets the job's
         ``last_error`` to the history-persistence marker (overwriting any prior
-        value) and, only when ``notify`` is true, sends a notice that the result
-        was not retained. A successful write clears ``last_error`` only while it
-        still holds that marker.
+        value) and, when ``notify`` is true, flags the run so its completion
+        handler sends the real outcome with a "not retained" note. Nothing is
+        queued here, so timeout-cancel suppression and direct launch-failure
+        alerts stay in charge. A successful write clears ``last_error`` only
+        while it still holds that marker.
         """
         tag = record_kwargs["tag"]
         run_id = record_kwargs.get("run_id", "")
@@ -1073,12 +1178,8 @@ class Scheduler:
                 tag, marker, status, record_kwargs.get("result", ""),
             )
             self._set_job_last_error(tag, meta, marker)
-        if meta.get("notify", True):
-            self.notify(
-                f"⚠️ <b>Scheduled: {_html.escape(tag)}</b> finished "
-                f"({_html.escape(status or 'unknown')}), but its result was not "
-                "retained in job history. Details are unavailable."
-            )
+        if run_id and meta.get("notify", True):
+            self._unretained_run_ids.add(run_id)
 
     def _set_job_last_error(self, tag: str, meta: dict, value: Optional[str]) -> None:
         """Set ``last_error`` on the active job (if any) and retained history.
@@ -1143,11 +1244,10 @@ class Scheduler:
             # per-run execution-log recorder so the supervisor logs the
             # complete job result under this run's execution ID
             result_log_cb=self._run_result_recorder(run_id, meta),
+            # terminal handoff: classified run-result notice for the presentation owner
+            completion_cb=self._run_completion_handler(run_id, meta),
             # honour the job's notify setting — False suppresses Telegram output
             notify=meta.get("notify", True),
-            # scheduled results are shown as plain text, not collapsed in an
-            # expandable blockquote (which hides the result by default)
-            expandable=False,
             # tag the registry record as a scheduled run (internal channel,
             # never a model-facing spawn_agent arg); still capacity-counted.
             source=SOURCE_SCHEDULED,
@@ -1214,24 +1314,26 @@ class Scheduler:
         The admitted run's failed execution record carries its run ID and the
         launch error, with failure classification and next-run metadata.
         """
-        meta["last_error"] = error_message
-        self._run_history.setdefault(tag, {})["last_error"] = error_message
-        self._save_state()
-        error_type = _classify_job_failure(_ERROR_SENTINEL + " " + error_message)
-        next_run = _next_run_label(meta)
-        self._record_execution(
-            meta,
-            tag=tag, task=task, result=error_message, success=False,
-            model=model, error_type=error_type, run_id=run_id,
-            status="failed", next_run=next_run,
-        )
-        self.notify(
-            f"⚠️ <b>Job {_html.escape(tag)} {headline}</b>"
-            f" ({_html.escape(error_type)})\n"
-            f"Next run: {_html.escape(next_run)}\n"
-            f"{_html.escape(error_message)}"
-        )
-        self._release_run(tag, run_id)
+        try:
+            meta["last_error"] = error_message
+            self._run_history.setdefault(tag, {})["last_error"] = error_message
+            self._save_state()
+            error_type = _classify_job_failure(_ERROR_SENTINEL + " " + error_message)
+            next_run = _next_run_label(meta)
+            self._record_execution(
+                meta,
+                tag=tag, task=task, result=error_message, success=False,
+                model=model, error_type=error_type, run_id=run_id,
+                status="failed", next_run=next_run,
+            )
+            self.notify(
+                f"⚠️ <b>Job {_html.escape(tag)} {headline}</b>"
+                f" ({_html.escape(error_type)})\n"
+                f"Next run: {_html.escape(next_run)}\n"
+                f"{_html.escape(error_message)}"
+            )
+        finally:
+            self._release_run(tag, run_id)
 
     def _process_pending_commands(self) -> None:
         if not os.path.exists(self._commands_file):

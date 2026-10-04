@@ -60,6 +60,11 @@ def _make_iface():
     iface._verbose = False
     iface._app = None
     iface._loop = None
+    from collections import deque
+    iface._notice_queue = deque()
+    iface._notice_gate = asyncio.Lock()
+    iface._active_turns = 0
+    iface._flush_tasks = set()
     return iface
 
 

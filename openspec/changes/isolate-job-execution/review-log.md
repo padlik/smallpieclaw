@@ -401,6 +401,35 @@ The operator approved read-only `/jobs history <tag>` and `/jobs result <executi
 ### 🔴 Outstanding
 - None for Part 2. Awaiting operator feedback; Part 4 and Part 5 remain paused.
 
+## Part 4 completion reviews — 2026-10-05
+
+### Reviewer findings (compliance `ope-4` + risk `ora-5`)
+- 🔴 To fix: **REQ-01** (Medium) — on a failed history write, the "not retained" notice is the only notice and drops the run outcome (no error type/next-run/⚠️ header per llm-error-recovery). **ORA-1** (Medium) — startup-enqueued notices never flush until an unrelated turn ends. **ORA-2** (Medium) — /jobs history/result and Details read the JSONL under a threading lock inside async handlers, blocking the Telegram event loop. **ORA-3** (Medium) — a raising notice sink escapes `_fail_launch` before the direct alert and run release (skip-policy jobs stuck). **ERROR-01** (Low) — "not retained" notice ignores timeout-cancel suppression and launch-failure direct-alert rule; `_unretained_run_ids` never cleaned.
+- 🟡 Address together: **DOC-01** — stale README line "written to long-term memory" contradicts new behavior; **LIFECYCLE-01** — /help lacks the deferred-notice wording (README covers it; add to help for task-text honesty); **ORA-4/AMBIGUITY-01** — compact fallback and non-BMP length unit not bounded (bound summary fields; note UTF-16 unit ambiguity); **AMBIGUITY-02** — Details text path sends raw result without header (align with document path or leave; prefer consistency).
+- Confirmed clean: failure classification, idle/typing deferral, soundless one-message delivery, notify=false, direct alert/reminder/warning paths, supervisor-never-sends, /stop responsiveness, restart semantics, presentation shapes, Details auth/guards (real execution_log wiring fixed pre-review), /jobs read-only + unknown/empty/legacy honesty, checkbox honesty (4.15 modulo LIFECYCLE-01).
+
+### 🔴 Outstanding
+- Operator-approved Part 4 fix round: REQ-01, ORA-1, ORA-2, ORA-3, ERROR-01, DOC-01, LIFECYCLE-01, ORA-4. Then report Part 4 results and await operator feedback before the checkpoint commit and Part 5.
+
+## Part 4 review fixes — 2026-10-05
+
+### 🔴 Fixed
+- **REQ-01**: not-retained notices now carry the real outcome (⚠️ header + error type + next run for failures; ✅ summary for success) plus the truthful "Details are unavailable" line, no Details button; notice built in the completion handler so supervisor notify/timeout-cancel gating applies.
+- **ORA-1**: `_post_init` schedules a startup flush that waits out any active turn.
+- **ORA-2**: history/result/Details lookups run via `asyncio.to_thread`; sends stay on the loop.
+- **ORA-3**: `_fail_launch` releases the run in `finally`; sink/notify exceptions isolated — direct alert still sent, skip-policy retriggers work.
+- **ERROR-01**: timeout-cancelled + failed write queues no notice; launch failure with failed write sends only the direct alert; `_unretained_run_ids` cleaned.
+- **ORA-4/AMBIGUITY-01**: `bound_display_text` (tags ellipsized at 100 chars) + `ensure_notice_fits` re-validates rendered length pre-send; code-point vs UTF-16 unit note added.
+- **DOC-01**: stale README "long-term memory" line rewritten to actual behavior.
+- **LIFECYCLE-01**: /help now mentions deferred silent notices.
+- **AMBIGUITY-02**: ruled raw text stays on the short-result path (spec: "one complete retained outcome"; existing tests pin it); document path keeps its header. Ruling recorded: consistent-with-tests reading; costs nothing if a future spec wants headers on short results.
+
+### Verification
+- Red phases confirmed per fix; 7-file gate 395 passed; full suite **2746 passed, 2 skipped** (baseline); ruff + vulture + `git diff --check` clean. One flaky supervisor test observed once during a broken-fixture window; passed in isolation, three reruns, and every later run — no action.
+
+### 🔴 Outstanding
+- None for Part 4. Awaiting operator feedback on the Part 4 report; Part 5 remains paused.
+
 ### 🔴 Outstanding
 - None.
 

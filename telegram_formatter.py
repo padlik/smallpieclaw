@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -190,7 +191,8 @@ def format_jobs_list(jobs: list) -> str:
             lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
         lines.append(f"   {task_label}: {task_display}\n")
     lines.append(
-        "<i>Tip: /jobs reload · /jobs remove &lt;tag&gt; · /jobs pause &lt;tag&gt; · /jobs resume &lt;tag&gt;</i>"
+        "<i>Tip: /jobs reload · /jobs remove &lt;tag&gt; · /jobs pause &lt;tag&gt; · /jobs resume &lt;tag&gt;\n"
+        "Read-only: /jobs history &lt;tag&gt; · /jobs result &lt;execution-id&gt;</i>"
     )
     return "\n".join(lines)
 
@@ -273,3 +275,129 @@ def md_to_html(text: str) -> str:
         text = text.replace(f"\x00BLOCK{i}\x00", block)
 
     return sanitize_html(text)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled run-result presentation
+# ---------------------------------------------------------------------------
+
+#: Telegram's limit on a message's text *after* entity parsing.
+TELEGRAM_RENDERED_LIMIT = 4096
+
+#: Telegram's limit on inline-button ``callback_data``, in bytes.
+CALLBACK_DATA_LIMIT = 64
+
+#: Prefix of the callback data carried by a result notice's Details button.
+DETAILS_CALLBACK_PREFIX = "jobdetails:"
+
+_ANY_TAG_RE = re.compile(r"<[^>]*>")
+
+
+@dataclass(frozen=True)
+class ResultNotice:
+    """A formatted run-result notice.
+
+    ``details_run_id`` is non-empty only when the full result is held behind a
+    Details control (the notice itself is compact); it is the retained
+    execution ID the control must resolve.
+    """
+
+    text: str
+    details_run_id: str = ""
+
+
+def rendered_length(html_text: str) -> int:
+    """Return the length Telegram counts for ``html_text`` after entity parsing."""
+    # Counts code points; Telegram may count UTF-16 units, so non-BMP characters
+    # (e.g. emoji) can weigh more there. Fit checks are kept on code points.
+    return len(html.unescape(_ANY_TAG_RE.sub("", html_text)))
+
+
+def bound_display_text(text: str, limit: int = 100) -> str:
+    """Return ``text`` ellipsized to at most ``limit`` characters (for summary fields)."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def ensure_notice_fits(notice: ResultNotice) -> ResultNotice:
+    """Return ``notice`` if it fits Telegram's rendered limit, else a short fallback.
+
+    The fallback keeps the Details execution (if any) so the retained result
+    stays reachable.
+    """
+    if rendered_length(notice.text) <= TELEGRAM_RENDERED_LIMIT:
+        return notice
+    if not notice.details_run_id:
+        return ResultNotice(
+            "⚠️ A scheduled job notice was too long to display; "
+            "see job history for the outcome."
+        )
+    safe_id = html.escape(notice.details_run_id)
+    return ResultNotice(
+        "⚠️ A scheduled job notice was too long to display.\n"
+        f"Execution ID: <code>{safe_id}</code>\n"
+        f"Tap Details or send <code>/jobs result {safe_id}</code> to get it.",
+        details_run_id=notice.details_run_id,
+    )
+
+
+def format_result_notice(summary_html: str, result: str, run_id: str = "") -> ResultNotice:
+    """Format a run result as an expandable quote, or a compact notice if too long.
+
+    ``summary_html`` is trusted Telegram HTML (the caller escapes its parts);
+    ``result`` is untrusted plain text and is always escaped.  The summary stays
+    outside an ``<blockquote expandable>`` holding the result.  Fit is decided
+    on the *rendered* length, so HTML escaping never widens the allowance.  When
+    the message would exceed Telegram's limit, only the summary and the
+    execution ID are shown; the complete result stays in retained history.
+    """
+    if not result:
+        return ResultNotice(summary_html)
+    expandable = (
+        f"{summary_html}\n\n"
+        f"<blockquote expandable>{html.escape(result)}</blockquote>"
+    )
+    if rendered_length(expandable) <= TELEGRAM_RENDERED_LIMIT:
+        return ResultNotice(expandable)
+    size = f"{len(result):,} characters"
+    if not run_id:
+        return ResultNotice(
+            f"{summary_html}\n\nThe result ({size}) is too long to display and "
+            "is not available in job history."
+        )
+    safe_id = html.escape(run_id)
+    return ResultNotice(
+        f"{summary_html}\n\nThe result ({size}) is too long to display here.\n"
+        f"Execution ID: <code>{safe_id}</code>\n"
+        f"Tap Details or send <code>/jobs result {safe_id}</code> to get it.",
+        details_run_id=run_id,
+    )
+
+
+def format_result_document(record: dict) -> bytes:
+    """Render a retained execution record as a complete UTF-8 text document.
+
+    The result is appended verbatim after a short plain-text header; it is
+    neither escaped nor truncated.
+    """
+    header = (
+        f"Execution ID: {record.get('run_id', '')}\n"
+        f"Job: {record.get('tag', '')}\n"
+        f"Status: {record.get('status', '')}\n"
+        f"Finished: {record.get('ts', '')}\n\n"
+    )
+    return (header + (record.get("result") or "")).encode("utf-8")
+
+
+def details_callback_data(run_id: str) -> str:
+    """Return Details-button callback data for ``run_id``.
+
+    Raises ``ValueError`` if the data would exceed Telegram's 64-byte limit.
+    """
+    data = f"{DETAILS_CALLBACK_PREFIX}{run_id}"
+    if len(data.encode("utf-8")) > CALLBACK_DATA_LIMIT:
+        raise ValueError(
+            f"Details callback data for {run_id!r} exceeds {CALLBACK_DATA_LIMIT} bytes"
+        )
+    return data

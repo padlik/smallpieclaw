@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import html
+import io
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -410,6 +412,57 @@ async def cb_subagent_confirm(iface: "TelegramInterface", update: Update, ctx: C
         )
     except Exception:
         pass
+
+
+@_require_cb_auth
+async def cb_job_details(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deliver a retained scheduled-run result requested via a Details button.
+
+    Callback data is ``jobdetails:<execution-id>``.  The result is read straight
+    from the scheduler's retained history and sent as plain text when it fits in
+    one Telegram message, otherwise as a complete UTF-8 document.  The operator
+    agent, its prompts and its memory are never involved.  Unknown, expired or
+    legacy IDs get an "unavailable" alert.
+    """
+    from telegram_formatter import (
+        DETAILS_CALLBACK_PREFIX,
+        TELEGRAM_RENDERED_LIMIT,
+        format_result_document,
+    )
+
+    query = update.callback_query
+    run_id = (query.data or "").removeprefix(DETAILS_CALLBACK_PREFIX)
+    scheduler = getattr(iface, "scheduler", None)
+    execution_log = getattr(scheduler, "execution_log", None)
+    record = (
+        await asyncio.to_thread(execution_log.get_result, run_id)
+        if execution_log is not None and run_id
+        else None
+    )
+
+    if record is None:
+        try:
+            await query.answer(
+                "⚠️ Result unavailable — it has expired or was not retained.",
+                show_alert=True,
+            )
+        except Exception as exc:
+            logger.warning("query.answer() failed: %s", exc)
+        return
+
+    await _ack_query(query)
+    result = record.get("result") or ""
+    if len(result) <= TELEGRAM_RENDERED_LIMIT:
+        await query.message.reply_text(result)
+        return
+
+    buf = io.BytesIO(format_result_document(record))
+    buf.name = f"{run_id}.txt"
+    await query.message.reply_document(
+        document=buf,
+        filename=buf.name,
+        caption=f"Full result for {run_id}",
+    )
 
 
 @_require_cb_auth

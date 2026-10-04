@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass
 from functools import partial
 from concurrent.futures import Future
@@ -39,6 +40,9 @@ from telegram.ext import (
 )
 
 from telegram_formatter import (
+    ResultNotice,
+    details_callback_data,
+    ensure_notice_fits,
     split_message as _split_message_impl,
     format_jobs_list as _format_jobs_list_impl,
     md_to_html as _md_to_html,
@@ -54,7 +58,7 @@ from telegram_mcp_commands import cmd_mcp
 from telegram_callbacks import (
     cb_confirm, cb_model_switch, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
-    cb_oauth_cancel, cb_llm_retry,
+    cb_oauth_cancel, cb_llm_retry, cb_job_details,
 )
 
 logger = logging.getLogger(__name__)
@@ -544,6 +548,17 @@ class TelegramInterface:
         # Saved when run() starts — used by send_message_to_users() from threads
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Scheduled run-result notices wait here, in memory only, until no
+        # operator turn is active.  Delivery is best-effort: a restart drops the
+        # queue and retained job history stays authoritative.  The gate
+        # serializes the idle check + send against new turn admission.
+        self._notice_queue: deque[ResultNotice] = deque()
+        self._notice_gate = asyncio.Lock()
+        self._active_turns = 0
+        self._flush_tasks: set[asyncio.Task] = set()
+        if scheduler is not None:
+            scheduler.set_result_notice_sink(self.enqueue_scheduled_notice)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -686,6 +701,10 @@ class TelegramInterface:
             logger.info("Bot commands registered with Telegram.")
         except Exception as exc:
             logger.warning("Could not register bot commands: %s", exc)
+        # Notices enqueued before the loop ran had nothing to flush them.
+        task = asyncio.get_running_loop().create_task(self._flush_scheduled_notices())
+        self._flush_tasks.add(task)
+        task.add_done_callback(self._flush_tasks.discard)
 
     # ------------------------------------------------------------------
     # Handlers
@@ -726,6 +745,7 @@ class TelegramInterface:
         app.add_handler(CallbackQueryHandler(partial(cb_deferred, self), pattern=r"^deferred_"))
         app.add_handler(CallbackQueryHandler(partial(cb_subagent_confirm, self), pattern=r"^subconfirm_"))
         app.add_handler(CallbackQueryHandler(partial(cb_oauth_cancel, self), pattern=r"^oauth_cancel:"))
+        app.add_handler(CallbackQueryHandler(partial(cb_job_details, self), pattern=r"^jobdetails:"))
         # File upload handlers (document, photo, audio, video, voice)
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_file))
         app.add_handler(MessageHandler(filters.PHOTO, self._on_file))
@@ -896,7 +916,11 @@ class TelegramInterface:
             return
 
         async with lock:
-            await self._run_agent_task_locked(update, ctx, task_text, images, user_id)
+            await self._begin_turn()
+            try:
+                await self._run_agent_task_locked(update, ctx, task_text, images, user_id)
+            finally:
+                await self._end_turn()
 
         # After releasing the lock, offer any message that was deferred while
         # this run held the lock.  Session commands (/reset, /compress) reuse
@@ -964,6 +988,7 @@ class TelegramInterface:
             await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
+            await asyncio.gather(typing_task, return_exceptions=True)
             if self._prompt_registry is not None and prompt_record is not None:
                 self._prompt_registry.finish(prompt_record.prompt_id, final_status)
 
@@ -1209,6 +1234,71 @@ class TelegramInterface:
     def _split_message(text: str, limit: int = 4000) -> list[str]:
         """Split text into chunks ≤ limit chars with balanced HTML tags."""
         return _split_message_impl(text, limit)
+
+    def enqueue_scheduled_notice(self, notice: ResultNotice) -> None:
+        """Queue a scheduled run-result notice (Telegram HTML) for idle delivery.
+
+        A notice carrying ``details_run_id`` is sent with a Details button.
+
+        Safe to call from any thread.  The notice is sent silently once no
+        operator turn is active; it is never persisted, so a restart drops it.
+        """
+        self._notice_queue.append(notice)
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._flush_scheduled_notices(), loop)
+        else:
+            logger.info("Scheduled notice queued; no running event loop to flush it yet")
+
+    async def _begin_turn(self) -> None:
+        """Mark an operator turn active, serialized against in-flight notice sends."""
+        async with self._notice_gate:
+            self._active_turns += 1
+
+    async def _end_turn(self) -> None:
+        """Mark an operator turn idle and flush queued notices in the background.
+
+        Call only after the final response is sent and typing has stopped.
+        """
+        async with self._notice_gate:
+            self._active_turns -= 1
+        task = asyncio.get_running_loop().create_task(self._flush_scheduled_notices())
+        self._flush_tasks.add(task)
+        task.add_done_callback(self._flush_tasks.discard)
+
+    async def _flush_scheduled_notices(self) -> None:
+        """Send queued notices one at a time, re-checking idleness before each."""
+        while True:
+            async with self._notice_gate:
+                if self._active_turns > 0 or not self._notice_queue:
+                    return
+                notice = self._notice_queue.popleft()
+                await self._send_scheduled_notice(notice)
+
+    async def _send_scheduled_notice(self, notice: ResultNotice) -> None:
+        """Send one notice to every allowed user without sound; log, don't retry, on failure.
+
+        The text is sent as a single message: ``format_result_notice`` already
+        sized it to Telegram's rendered limit, and splitting would break the
+        expandable quote.
+        """
+        bot = self._app.bot
+        notice = ensure_notice_fits(notice)
+        extra: dict = {}
+        if notice.details_run_id:
+            extra["reply_markup"] = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "Details", callback_data=details_callback_data(notice.details_run_id),
+                ),
+            ]])
+        for uid in list(self.allowed_ids):
+            try:
+                await bot.send_message(
+                    chat_id=uid, text=notice.text, parse_mode=ParseMode.HTML,
+                    disable_notification=True, **extra,
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort delivery; history is authoritative
+                logger.warning("Could not send scheduled notice to %d: %s", uid, exc)
 
     def send_message_to_users(self, text: str) -> None:
         """

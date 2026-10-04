@@ -117,7 +117,8 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  /models  — list and switch LLM models\n"
         "  /mode    — set creativity mode (default / planner / explorer / resilient)\n"
         "  /mcp     — manage MCP servers (list / on / off / info)\n"
-        "  /jobs    — list scheduled jobs\n"
+        "  /jobs    — list scheduled jobs; read-only views: <code>/jobs history &lt;tag&gt;</code>, <code>/jobs result &lt;execution-id&gt;</code>. "
+        "Run results of jobs with notify on arrive as deferred, silent notices once the current turn is idle\n"
         "  /prompts — list recent prompts, or /prompts search &lt;query&gt; [Nd/Nh] [--status=&lt;S&gt;] [--trace=&lt;T&gt;] [--since=&lt;ISO&gt;] [--until=&lt;ISO&gt;] [--page=&lt;N&gt;], or /prompts show &lt;id&gt;\n"
         "  /reset   — save and clear task context (<code>/reset discard</code> to skip saving); also clears session grants\n"
         "  /resume  — resume an interrupted run from a saved checkpoint\n"
@@ -874,6 +875,77 @@ async def _reply_jobs_list(iface: "TelegramInterface", message) -> None:
         await message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
+async def _reply_job_history(iface: "TelegramInterface", message, tag: str) -> None:
+    """Reply with the retained execution history of ``tag`` (read-only, no agent)."""
+    if not tag:
+        await message.reply_text(
+            "Usage: <code>/jobs history &lt;tag&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    safe_tag = html.escape(tag)
+    runs = await asyncio.to_thread(iface.scheduler.execution_log.history, tag)
+    if not runs:
+        defined = any(job.get("tag") == tag for job in iface.scheduler.list_jobs())
+        text = (
+            f"📜 Job <code>{safe_tag}</code> has no retained runs."
+            if defined
+            else f"❌ Unknown job <code>{safe_tag}</code>: it has no definition and no history."
+        )
+        await message.reply_text(text, parse_mode=ParseMode.HTML)
+        return
+
+    lines = [f"📜 <b>History for</b> <code>{safe_tag}</code> ({len(runs)} retained, newest first)\n"]
+    for run in runs:
+        status = html.escape(str(run["status"]))
+        ts = html.escape(str(run["ts"]))
+        if run["legacy"]:
+            lines.append(f"• <i>legacy/partial — no execution ID</i> — {status} — {ts}")
+        else:
+            lines.append(f"• <code>{html.escape(run['run_id'])}</code> — {status} — {ts}")
+    for chunk in iface._split_message("\n".join(lines)):
+        await message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+
+async def _reply_job_result(iface: "TelegramInterface", message, run_id: str) -> None:
+    """Reply with one complete retained scheduled-run result (read-only, no agent).
+
+    A result that fits in one Telegram message is sent as plain text, otherwise
+    as a complete UTF-8 document named ``<run_id>.txt``.
+    """
+    from telegram_formatter import TELEGRAM_RENDERED_LIMIT, format_result_document
+
+    if not run_id:
+        await message.reply_text(
+            "Usage: <code>/jobs result &lt;execution-id&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    record = await asyncio.to_thread(iface.scheduler.execution_log.get_result, run_id)
+    if record is None:
+        await message.reply_text(
+            f"⚠️ Result unavailable for <code>{html.escape(run_id)}</code>: "
+            "it is unknown, has expired, or was not retained.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    result = record.get("result") or ""
+    if len(result) <= TELEGRAM_RENDERED_LIMIT:
+        await message.reply_text(result or "(the run produced no output)")
+        return
+
+    buf = io.BytesIO(format_result_document(record))
+    buf.name = f"{run_id}.txt"
+    await message.reply_document(
+        document=buf,
+        filename=buf.name,
+        caption=f"Full result for {run_id}",
+    )
+
+
 @_require_auth
 async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not iface.scheduler:
@@ -883,6 +955,16 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     args = ctx.args or []
     sub = args[0].lower() if args else ""
     tag = args[1] if len(args) > 1 else ""
+
+    # /jobs history <tag> — read-only retained execution history
+    if sub == "history":
+        await _reply_job_history(iface, update.effective_message, tag)
+        return
+
+    # /jobs result <execution-id> — read-only complete retained result
+    if sub == "result":
+        await _reply_job_result(iface, update.effective_message, tag)
+        return
 
     # /jobs reload — hot-reload scheduler.toml from disk
     if sub == "reload":

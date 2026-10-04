@@ -177,7 +177,7 @@ class TestCallbackIsolation:
             caller_depth=0,
             options=SupervisionOptions(
                 job_tag="job-a", finish_cb=finish_cb, result_log_cb=result_log,
-                notify=False, expandable=False,
+                notify=False,
             ),
         )
         res_b = exc._exec_spawn_agent(
@@ -185,7 +185,7 @@ class TestCallbackIsolation:
             caller_depth=0,
             options=SupervisionOptions(
                 job_tag="job-b", finish_cb=finish_cb, result_log_cb=result_log,
-                notify=False, expandable=False,
+                notify=False,
             ),
         )
 
@@ -758,7 +758,6 @@ class TestChannelSeparation:
                     finish_cb=lambda _t: None,
                     result_log_cb=lambda **_k: None,
                     notify=False,
-                    expandable=False,
                 ),
             )
 

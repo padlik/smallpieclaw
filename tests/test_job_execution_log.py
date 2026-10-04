@@ -295,8 +295,8 @@ def test_scheduler_spawn_path_passes_result_log_cb(tmp_path, monkeypatch):
     assert options.job_tag == "spawn_job"
     assert callable(options.result_log_cb)
     assert callable(options.finish_cb)
+    assert callable(options.completion_cb)
     assert options.notify is False
-    assert options.expandable is False
 
 
 # ---------------------------------------------------------------------------
@@ -690,11 +690,11 @@ def test_persistence_failure_notice_only_with_notify_true(
     s._run_job("report")
     _break_history_writes(s)
 
-    _finish(captured[0], "complete output", True)
-
     if not notify:
+        _finish(captured[0], "complete output", True)
         s.notify.assert_not_called()
         return
+    _complete_with_notice(captured[0], "complete output", True)
     s.notify.assert_called_once()
     notice = s.notify.call_args.args[0]
     assert "not retained" in notice
@@ -1087,3 +1087,245 @@ def test_main_does_not_wire_job_history_into_operator_prompt():
 
     assert "_job_history_fn" not in source
     assert "execution_log.format_for_prompt" not in source
+
+
+# ---------------------------------------------------------------------------
+# Notice queue interplay: truthful persistence-failure notices, restart loss
+# ---------------------------------------------------------------------------
+
+
+def _complete_with_notice(options, result, success):
+    """Record then hand off the terminal outcome exactly as the supervisor does."""
+    from sub_agent_supervisor import RunCompletion
+
+    _finish(options, result, success)
+    options.completion_cb(
+        RunCompletion(
+            tag=options.job_tag, status="done" if success else "failed",
+            result=result, elapsed_s=3, model="m", agent_id="sa-1",
+        )
+    )
+
+
+def test_persistence_failure_notice_is_queued_not_sent_directly(tmp_path, monkeypatch):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    sink = MagicMock()
+    s.set_result_notice_sink(sink)
+    s._run_job("report")
+    _break_history_writes(s)
+
+    _complete_with_notice(captured[0], "complete output", True)
+
+    s.notify.assert_not_called()
+    sink.assert_called_once()
+    notice = sink.call_args.args[0].text
+    assert "not retained" in notice
+    assert "Details are unavailable" in notice
+
+
+def test_persistence_failure_notice_has_no_details_button(tmp_path, monkeypatch):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    sink = MagicMock()
+    s.set_result_notice_sink(sink)
+    s._run_job("report")
+    _break_history_writes(s)
+
+    _complete_with_notice(captured[0], "complete output", True)
+
+    assert sink.call_args.args[0].details_run_id == ""
+
+
+def test_persistence_failure_run_sends_one_truthful_notice_without_details_claim(
+    tmp_path, monkeypatch
+):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    sink = MagicMock()
+    s.set_result_notice_sink(sink)
+    s._run_job("report")
+    _break_history_writes(s)
+
+    _complete_with_notice(captured[0], "complete output", True)
+
+    assert sink.call_count == 1
+    notice = sink.call_args.args[0].text
+    assert "Details are unavailable" in notice
+    assert "complete output" not in notice
+    assert s.execution_log.read_recent() == []
+
+
+def test_persistence_failure_notice_for_success_carries_outcome_summary(
+    tmp_path, monkeypatch
+):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    sink = MagicMock()
+    s.set_result_notice_sink(sink)
+    s._run_job("report")
+    _break_history_writes(s)
+
+    _complete_with_notice(captured[0], "complete output", True)
+
+    notice = sink.call_args.args[0].text
+    assert "✅ Scheduled job finished: report" in notice
+    assert "not retained" in notice
+
+
+def test_persistence_failure_notice_for_failed_run_keeps_failure_header_error_type_and_next_run(
+    tmp_path, monkeypatch
+):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    sink = MagicMock()
+    s.set_result_notice_sink(sink)
+    s._run_job("report")
+    _break_history_writes(s)
+
+    _complete_with_notice(captured[0], "❌ connection refused by upstream", False)
+
+    notice = sink.call_args.args[0]
+    assert "⚠️ Scheduled job failed: report" in notice.text
+    assert "Error type: connection" in notice.text
+    assert "Next run: 2026-10-03T09:00:00" in notice.text
+    assert "not retained" in notice.text
+    assert "Details are unavailable" in notice.text
+    assert notice.details_run_id == ""
+
+
+def test_unretained_run_ids_are_empty_after_the_notice_is_queued(tmp_path, monkeypatch):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    s.set_result_notice_sink(MagicMock())
+    s._run_job("report")
+    _break_history_writes(s)
+
+    _complete_with_notice(captured[0], "complete output", True)
+    captured[0].finish_cb("report")
+
+    assert s._unretained_run_ids == set()
+
+
+def test_unretained_run_ids_are_empty_when_no_notice_is_ever_requested(
+    tmp_path, monkeypatch
+):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    s.set_result_notice_sink(MagicMock())
+    s._run_job("report")
+    _break_history_writes(s)
+
+    _finish(captured[0], "complete output", True)
+    captured[0].finish_cb("report")
+
+    assert s._unretained_run_ids == set()
+
+
+def _failing_spawn_sched(tmp_path, monkeypatch, *, notify=True):
+    """Scheduler whose spawn_agent always fails, with a notifying skip-policy job."""
+    s = _sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"] = {
+        "task": "write report", "enabled": True, "notify": notify,
+        "overlap_policy": "skip", "_next_run": "2026-10-03T09:00:00",
+    }
+    executor = MagicMock()
+    executor.spawn_agent = MagicMock(
+        return_value={"success": False, "error": "spawn_agent: ConnectError: refused"}
+    )
+    s.builtin_executor = executor
+    return s
+
+
+def test_launch_failure_with_unwritable_history_sends_only_the_direct_alert(
+    tmp_path, monkeypatch
+):
+    s = _failing_spawn_sched(tmp_path, monkeypatch)
+    sink = MagicMock()
+    s.set_result_notice_sink(sink)
+    _break_history_writes(s)
+
+    s._run_job("report")
+
+    s.notify.assert_called_once()
+    assert "failed to spawn" in s.notify.call_args.args[0]
+    sink.assert_not_called()
+    assert s._unretained_run_ids == set()
+
+
+def test_raising_sink_with_unwritable_history_still_alerts_and_releases_the_run(
+    tmp_path, monkeypatch
+):
+    s = _failing_spawn_sched(tmp_path, monkeypatch)
+    s.set_result_notice_sink(MagicMock(side_effect=RuntimeError("sink down")))
+    _break_history_writes(s)
+
+    s._run_job("report")
+
+    s.notify.assert_called_once()
+    assert "failed to spawn" in s.notify.call_args.args[0]
+    assert "report" not in s._running_jobs
+    assert "report" not in s._active_runs
+
+
+def test_skip_policy_job_fires_again_after_a_launch_failure_with_raising_sink(
+    tmp_path, monkeypatch
+):
+    s = _failing_spawn_sched(tmp_path, monkeypatch)
+    s.set_result_notice_sink(MagicMock(side_effect=RuntimeError("sink down")))
+    _break_history_writes(s)
+
+    s._run_job("report")
+    s._run_job("report")
+
+    assert s.builtin_executor.spawn_agent.call_count == 2
+
+
+def test_launch_failure_releases_the_run_when_the_direct_alert_raises(
+    tmp_path, monkeypatch
+):
+    s = _failing_spawn_sched(tmp_path, monkeypatch)
+    s.notify.side_effect = RuntimeError("telegram down")
+
+    with pytest.raises(RuntimeError, match="telegram down"):
+        s._run_job("report")
+
+    assert "report" not in s._running_jobs
+    assert "report" not in s._active_runs
+
+
+def test_persistence_failure_with_notify_false_queues_nothing(tmp_path, monkeypatch):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    sink = MagicMock()
+    s.set_result_notice_sink(sink)
+    s._run_job("report")
+    _break_history_writes(s)
+
+    _finish(captured[0], "complete output", True)
+
+    sink.assert_not_called()
+    s.notify.assert_not_called()
+    assert _PERSIST_MARKER in s._run_history["report"]["last_error"]
+
+
+def test_restart_loses_queued_notice_but_retains_outcome(tmp_path, monkeypatch):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    undelivered = MagicMock()
+    s.set_result_notice_sink(undelivered)
+    s._run_job("report")
+    full = "line\n" * 500 + "TAIL"
+
+    _complete_with_notice(captured[0], full, True)
+    undelivered.assert_called_once()
+    run_id = s.execution_log.read_recent()[0]["run_id"]
+
+    restarted = _sched(tmp_path, monkeypatch)
+    fresh_sink = MagicMock()
+    restarted.set_result_notice_sink(fresh_sink)
+
+    fresh_sink.assert_not_called()
+    entries = restarted.execution_log.read_recent()
+    assert [(e["run_id"], e["result"], e["status"]) for e in entries] == [
+        (run_id, full, "done")
+    ]
