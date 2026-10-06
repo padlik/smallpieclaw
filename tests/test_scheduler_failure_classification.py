@@ -569,13 +569,16 @@ def test_unwritable_history_run_queues_one_outcome_notice_and_clears_tracking(
 @pytest.mark.parametrize("status", ["done", "failed"])
 def test_compact_notice_with_a_huge_tag_still_fits_the_message_limit(status: str) -> None:
     """A very long job tag is bounded in every summary so the notice fits 4096."""
-    from scheduler import _build_result_notice
-    from telegram_formatter import TELEGRAM_RENDERED_LIMIT, rendered_length
+    from telegram_formatter import (
+        TELEGRAM_RENDERED_LIMIT,
+        build_run_result_notice,
+        rendered_length,
+    )
 
     tag = "t" * 4000
     run_id = "run-" + "a" * 32
 
-    notice = _build_result_notice(
+    notice = build_run_result_notice(
         tag, status, "line\n" * 5000, "timeout" if status == "failed" else "",
         "2026-10-04T02:00:00" if status == "failed" else "", run_id,
     )
@@ -586,10 +589,13 @@ def test_compact_notice_with_a_huge_tag_still_fits_the_message_limit(status: str
 
 def test_empty_result_notice_with_a_huge_tag_still_fits_the_message_limit() -> None:
     """An empty-result summary bounds the tag rendering too."""
-    from scheduler import _build_result_notice
-    from telegram_formatter import TELEGRAM_RENDERED_LIMIT, rendered_length
+    from telegram_formatter import (
+        TELEGRAM_RENDERED_LIMIT,
+        build_run_result_notice,
+        rendered_length,
+    )
 
-    notice = _build_result_notice("t" * 6000, "done", "", "", "", "run-" + "a" * 32)
+    notice = build_run_result_notice("t" * 6000, "done", "", "", "", "run-" + "a" * 32)
 
     assert rendered_length(notice.text) <= TELEGRAM_RENDERED_LIMIT
 

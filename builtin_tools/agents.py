@@ -42,7 +42,12 @@ logger = logging.getLogger(__name__)
 
 
 def _turn_id_from_caller_tag(caller_tag: str) -> Optional[str]:
-    """Extract the immutable request trace used as the operator-turn identity."""
+    """Extract the immutable request trace used as the operator-turn identity.
+
+    Accepted legacy fallback: direct non-loop callers reuse the trace as a
+    legacy owner identity; the ReAct path always injects an explicit per-turn
+    owner (_operator_turn_id), which takes precedence at every call site.
+    """
     candidate = caller_tag.rsplit(" ", 1)[-1] if caller_tag else ""
     return candidate if candidate.startswith("r-") else None
 
@@ -300,6 +305,9 @@ class AgentTools:
             ),
             # A direct submission with no turn identity is legacy/unowned: it
             # creates no turn obligation and stays readable by unowned callers.
+            # Accepted legacy fallback: direct non-loop callers reuse the trace
+            # as a legacy owner identity; the ReAct path always injects an
+            # explicit per-turn owner (_operator_turn_id).
             owner_turn_id=(
                 None
                 if options.source == SOURCE_SCHEDULED

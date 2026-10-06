@@ -1393,6 +1393,9 @@ def react_loop(
 
     state = None
     try:
+        _turn_supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+        if ctx.depth == 0 and _turn_supervisor is not None:
+            _turn_supervisor.register_active_turn(ctx.turn_id)
         ctx._tool_defs = None
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
@@ -1457,31 +1460,40 @@ def react_loop(
         ctx.memory.record_event("Task cancelled by operator")
         return "⚠️ Task stopped by operator."
     finally:
+        # Canonical turn-drain boundary: the depth-0 turn cancels and awaits its
+        # owned on-demand children here, publishing drain progress. Grants and
+        # staged tokens are cleared by the caller only after this returns, and
+        # the confirmation coordinator stays wired throughout so confirmation
+        # callbacks remain processable. AgentController.run repeats the drain
+        # as an idempotent fallback (see there); it must stay a no-op after this.
         supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
         if ctx.depth == 0 and supervisor is not None:
-            draining = supervisor.draining_children(ctx.turn_id)
-            if draining:
-                try:
-                    _progress(
-                        "__DRAINING__:"
-                        + ",".join(agent_id for agent_id, _status in draining)
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning("draining progress publication failed", exc_info=True)
             try:
-                drain_errors = supervisor.drain_owned_children(
-                    ctx.turn_id, cancel=True
-                )
-            except Exception as drain_exc:  # noqa: BLE001
-                drain_errors = [f"turn drain failed: {drain_exc}"]
-            for drain_error in drain_errors:
-                logger.error("sub-agent lifecycle cleanup failed: %s", drain_error)
+                draining = supervisor.draining_children(ctx.turn_id)
+                if draining:
+                    try:
+                        _progress(
+                            "__DRAINING__:"
+                            + ",".join(agent_id for agent_id, _status in draining)
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning("draining progress publication failed", exc_info=True)
                 try:
-                    _progress(f"__DRAIN_ERROR__:{drain_error}")
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "drain error progress publication failed", exc_info=True
+                    drain_errors = supervisor.drain_owned_children(
+                        ctx.turn_id, cancel=True
                     )
+                except Exception as drain_exc:  # noqa: BLE001
+                    drain_errors = [f"turn drain failed: {drain_exc}"]
+                for drain_error in drain_errors:
+                    logger.error("sub-agent lifecycle cleanup failed: %s", drain_error)
+                    try:
+                        _progress(f"__DRAIN_ERROR__:{drain_error}")
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "drain error progress publication failed", exc_info=True
+                        )
+            finally:
+                supervisor.unregister_active_turn(ctx.turn_id)
         if ctx.context_monitor is not None:
             try:
                 last = ctx.context_monitor.read()
@@ -1856,6 +1868,9 @@ def _dispatch_tool(
     # visible to log_query. They bypass both executors (which emit these events
     # themselves), so without this wrapping MCP tools never appear as TOOL_*
     # events. Field conventions match the builtin/tool executors.
+    # MCP dispatch performs no interactive confirmation (auth-failure
+    # translation only), so a scheduled-origin call can never reach the
+    # operator's confirmation channel — denial is structural, not a check.
     if ctx.mcp_manager and ctx.mcp_manager.has_tool(tool_name):
         with _tool_span(tool_name, mcp_auth=(ctx, tool_name)) as span:
             span.record(ctx.mcp_manager.call_tool(tool_name, args))

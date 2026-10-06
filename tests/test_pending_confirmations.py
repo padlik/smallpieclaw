@@ -249,6 +249,49 @@ class TestRunScopedPendingReset:
         assert executor._pending_confirmations.take("pending-token") is None
 
 
+class TestStopDrainKeepsConfirmationCallbacksLive:
+    def test_stop_during_drain_still_resolves_confirmation_callbacks(
+        self, make_agent_controller, make_builtin_executor
+    ) -> None:
+        drain_entered = threading.Event()
+        release_drain = threading.Event()
+
+        class BlockingSupervisor:
+            def drain_owned_children(self, owner_turn_id: str, *, cancel: bool) -> None:
+                drain_entered.set()
+                release_drain.wait(timeout=5.0)
+
+        executor = make_builtin_executor()
+        executor._supervisor = BlockingSupervisor()
+        ctrl = make_agent_controller(builtin_executor=executor)
+        confirmation_event = threading.Event()
+        ctrl._confirmation._confirm_events["child-token"] = confirmation_event
+        results = []
+
+        try:
+            with patch("agent_controller.react_loop", return_value="done"), \
+                 patch("agent_controller.AgentRuntime.build_react_context", return_value=MagicMock()), \
+                 patch("agent_controller.bind_run_context"):
+                run_thread = threading.Thread(
+                    target=lambda: results.append(ctrl.run("hello"))
+                )
+                run_thread.start()
+                assert drain_entered.wait(timeout=1.0)
+
+                ctrl.cancel()
+                assert executor._coordinator is ctrl._confirmation
+                ctrl.resume("child-token", True)
+                assert confirmation_event.wait(timeout=0.5)
+
+                release_drain.set()
+                run_thread.join(timeout=5.0)
+        finally:
+            release_drain.set()
+
+        assert results == ["done"]
+        assert executor._coordinator is None
+
+
 class TestSubAgentGrantScopeCallback:
     def test_supervision_options_accepts_grant_scope_cb(self) -> None:
         called_with: list[str] = []

@@ -137,12 +137,21 @@ class FileTools:
             skill_dir = skill.path  # skill DIRECTORY (not skill_md_path)
         return _expand_skill_paths(content, skill_dir)
 
+    def _scope_may_use_grants(self, scope_owner: str | None) -> bool:
+        """Return False for a child that is cancelled, drain-expired, or owned by a non-active turn."""
+        supervisor = getattr(self._owner, "_supervisor", None)
+        if scope_owner is None or supervisor is None:
+            return True
+        return bool(supervisor.child_may_use_turn_grants(scope_owner))
+
     def _check_grant(self, tool_name: str, real_path: str, caller_depth: int, caller_tag: str) -> bool:
         """Return True when a standing GrantLedger grant covers this path.
 
         The ledger is owned by the depth-0 ConfirmationManager wired as the
         executor's ``_coordinator``.  When no coordinator is wired (tests,
-        ad-hoc callers) we conservatively report no grant.
+        ad-hoc callers) we conservatively report no grant. A sub-agent that is
+        cancelled, drain-expired, or owned by a turn other than the active one
+        never reaches the ledger.
         """
         coordinator = getattr(self._owner, "_coordinator", None)
         if coordinator is None:
@@ -151,6 +160,8 @@ class FileTools:
         if ledger is None:
             return False
         scope_owner = self._owner._scope_owner_from_caller_tag(caller_depth, caller_tag)
+        if not self._scope_may_use_grants(scope_owner):
+            return False
         grant_dir = os.path.dirname(real_path)
         return ledger.check(tool_name, grant_dir, scope_owner=scope_owner)
 
@@ -408,9 +419,11 @@ class FileTools:
                 return self._owner._requires_confirmation(
                     "file_diff", args, "", scheduled=True,
                 )
-            has_grant = bool(ledger and ledger.check(
-                "file_diff", os.path.dirname(path), scope_owner=scope_owner,
-            ))
+            has_grant = bool(
+                ledger
+                and self._scope_may_use_grants(scope_owner)
+                and ledger.check("file_diff", os.path.dirname(path), scope_owner=scope_owner)
+            )
             if not (has_grant or os.path.dirname(path) in approved_dirs):
                 return {"success": False, "output": "", "error": "file_diff authorization changed; refusing to read either file.", "exit_code": 1}
         path_a, path_b = paths

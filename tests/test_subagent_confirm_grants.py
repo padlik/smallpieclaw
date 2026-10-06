@@ -439,6 +439,239 @@ class TestTurnDrainGrantCleanup:
         ) is False
 
 
+class TestGrantSinkOwningTurnBinding:
+    """A child consults the grant ledger only while its owning turn is an active turn."""
+
+    def _stage_child(
+        self, executor, tmp_path, *, owner_turn, active_turns=(), drain_expired=False,
+    ):
+        from sub_agent_supervisor import ExecutionOwnership, _OwnedChildState
+        from tests.test_file_tools_zone import _make_policy
+
+        coordinator = ConfirmationManager()
+        executor._coordinator = coordinator
+        executor.path_policy = _make_policy(str(tmp_path))
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        coordinator.add_grant("file_write", str(outside), GrantLifetime.SESSION)
+        record = SubAgentRecord(
+            agent_id="sa-bound", label="on-demand", model="test-model",
+            task_preview="write", started_at=0.0, source=SOURCE_ON_DEMAND,
+        )
+        record.ownership = ExecutionOwnership("on-demand", owner_turn)
+        state = _OwnedChildState(record)
+        state.drain_expired = drain_expired
+        executor._supervisor._owned_children[record.agent_id] = state
+        for turn_id in active_turns:
+            executor._supervisor.register_active_turn(turn_id)
+        return record, outside / "out.txt", coordinator
+
+    def _write(self, executor, target):
+        return executor.execute(
+            "file_write", {"path": str(target), "content": "x"},
+            caller_depth=1, caller_tag="sa-bound",
+        )
+
+    def _assert_denied_without_ledger(self, executor, target, coordinator):
+        with patch.object(coordinator.grant_ledger, "check", wraps=coordinator.grant_ledger.check) as check:
+            result = self._write(executor, target)
+        check.assert_not_called()
+        assert result["success"] is False
+        assert target.exists() is False
+
+    def test_live_child_of_prior_turn_does_not_consult_ledger(self, executor, tmp_path):
+        _record, target, coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-old", active_turns=("r-new",),
+        )
+        self._assert_denied_without_ledger(executor, target, coordinator)
+
+    def test_drain_expired_child_does_not_consult_ledger(self, executor, tmp_path):
+        _record, target, coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-live", active_turns=("r-live",),
+            drain_expired=True,
+        )
+        self._assert_denied_without_ledger(executor, target, coordinator)
+
+    def test_cancelled_child_does_not_consult_ledger(self, executor, tmp_path):
+        record, target, coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-live", active_turns=("r-live",),
+        )
+        record.cancel()
+        self._assert_denied_without_ledger(executor, target, coordinator)
+
+    def test_cancelled_child_with_no_active_turn_does_not_consult_ledger(self, executor, tmp_path):
+        record, target, coordinator = self._stage_child(executor, tmp_path, owner_turn="r-gone")
+        record.cancel()
+        self._assert_denied_without_ledger(executor, target, coordinator)
+
+    def test_drain_expired_child_with_no_active_turn_does_not_consult_ledger(self, executor, tmp_path):
+        _record, target, coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-gone", drain_expired=True,
+        )
+        self._assert_denied_without_ledger(executor, target, coordinator)
+
+    def test_stuck_child_is_denied_in_gap_after_its_turn_unregisters(self, executor, tmp_path):
+        _record, target, coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-a", active_turns=("r-a",),
+        )
+        executor._supervisor.unregister_active_turn("r-a")
+        self._assert_denied_without_ledger(executor, target, coordinator)
+
+    def test_stuck_child_is_denied_when_next_turn_registers(self, executor, tmp_path):
+        _record, target, coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-a", active_turns=("r-a",),
+        )
+        executor._supervisor.unregister_active_turn("r-a")
+        executor._supervisor.register_active_turn("r-b")
+        self._assert_denied_without_ledger(executor, target, coordinator)
+
+    def test_live_child_of_active_turn_uses_matching_grant(self, executor, tmp_path):
+        _record, target, _coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-live", active_turns=("r-live",),
+        )
+        result = self._write(executor, target)
+        assert result["success"] is True
+        assert target.read_text() == "x"
+
+    def test_live_child_stays_valid_while_overlapping_turn_registers(self, executor, tmp_path):
+        _record, target, _coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-a", active_turns=("r-a", "r-b"),
+        )
+        assert self._write(executor, target)["success"] is True
+
+    def test_live_child_stays_valid_after_overlapping_turn_unregisters(self, executor, tmp_path):
+        _record, target, _coordinator = self._stage_child(
+            executor, tmp_path, owner_turn="r-a", active_turns=("r-a", "r-b"),
+        )
+        executor._supervisor.unregister_active_turn("r-b")
+        assert self._write(executor, target)["success"] is True
+
+
+class TestChildMayUseTurnGrants:
+    """Pure supervisor-level contract of the grant-gate predicate."""
+
+    def _supervisor_with_child(self, *, owner_turn, cancelled=False, drain_expired=False):
+        from sub_agent_supervisor import ExecutionOwnership, SubAgentSupervisor, _OwnedChildState
+
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        record = SubAgentRecord(
+            agent_id="sa-x", label="on-demand", model="test-model",
+            task_preview="t", started_at=0.0, source=SOURCE_ON_DEMAND,
+        )
+        record.ownership = ExecutionOwnership("on-demand", owner_turn)
+        if cancelled:
+            record.cancel()
+        state = _OwnedChildState(record)
+        state.drain_expired = drain_expired
+        supervisor._owned_children["sa-x"] = state
+        return supervisor
+
+    def test_unknown_child_keeps_legacy_true_with_no_active_turn(self):
+        from sub_agent_supervisor import SubAgentSupervisor
+
+        assert SubAgentSupervisor(max_subagents=1).child_may_use_turn_grants("sa-unowned") is True
+
+    def test_unknown_child_keeps_legacy_true_with_active_turn(self):
+        from sub_agent_supervisor import SubAgentSupervisor
+
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        supervisor.register_active_turn("r-a")
+        assert supervisor.child_may_use_turn_grants("sa-unowned") is True
+
+    def test_known_child_with_no_active_turn_is_denied(self):
+        supervisor = self._supervisor_with_child(owner_turn="r-a")
+        assert supervisor.child_may_use_turn_grants("sa-x") is False
+
+    def test_unregister_removes_only_the_given_turn(self):
+        supervisor = self._supervisor_with_child(owner_turn="r-a")
+        supervisor.register_active_turn("r-a")
+        supervisor.register_active_turn("r-b")
+        supervisor.unregister_active_turn("r-b")
+        assert supervisor.child_may_use_turn_grants("sa-x") is True
+
+    def test_unregister_of_unknown_turn_is_noop(self):
+        supervisor = self._supervisor_with_child(owner_turn="r-a")
+        supervisor.register_active_turn("r-a")
+        supervisor.unregister_active_turn("r-never")
+        assert supervisor.child_may_use_turn_grants("sa-x") is True
+
+    def test_cancelled_child_of_active_turn_is_denied(self):
+        supervisor = self._supervisor_with_child(owner_turn="r-a", cancelled=True)
+        supervisor.register_active_turn("r-a")
+        assert supervisor.child_may_use_turn_grants("sa-x") is False
+
+
+class TestReactLoopActiveTurnRegistration:
+    """The depth-0 loop registers its turn on entry and always unregisters it."""
+
+    def _ctx_with_child(self):
+        from sub_agent_supervisor import ExecutionOwnership, SubAgentSupervisor, _OwnedChildState
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+
+        ctx = build_context(
+            ScriptedLLM(['{"action":"finish","result":"done"}']), RecordingExecutor(),
+        )
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        record = SubAgentRecord(
+            agent_id="sa-loop", label="on-demand", model="test-model",
+            task_preview="t", started_at=0.0, source=SOURCE_ON_DEMAND,
+        )
+        record.ownership = ExecutionOwnership("on-demand", ctx.turn_id)
+        state = _OwnedChildState(record)
+        state.cleanup_event.set()
+        supervisor._owned_children[record.agent_id] = state
+        ctx.builtin_executor._supervisor = supervisor
+        return ctx, supervisor
+
+    @staticmethod
+    def _restage_child(supervisor, owner_turn):
+        from sub_agent_supervisor import ExecutionOwnership, _OwnedChildState
+
+        record = SubAgentRecord(
+            agent_id="sa-loop", label="on-demand", model="test-model",
+            task_preview="t", started_at=0.0, source=SOURCE_ON_DEMAND,
+        )
+        record.ownership = ExecutionOwnership("on-demand", owner_turn)
+        supervisor._owned_children["sa-loop"] = _OwnedChildState(record)
+
+    def test_turn_is_registered_while_loop_runs(self):
+        from react_loop import _StepResult, react_loop
+
+        ctx, supervisor = self._ctx_with_child()
+        seen = []
+
+        def step(*_args, **_kwargs):
+            seen.append(supervisor.child_may_use_turn_grants("sa-loop"))
+            return _StepResult(early_return="done")
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)), \
+             patch("react_loop._run_single_step", side_effect=step):
+            react_loop(ctx, "task")
+        assert seen == [True]
+
+    def test_turn_is_unregistered_after_loop_returns(self):
+        from react_loop import _StepResult, react_loop
+
+        ctx, supervisor = self._ctx_with_child()
+        with patch("react_loop._build_system_prompt", return_value=("system", None)), \
+             patch("react_loop._run_single_step", return_value=_StepResult(early_return="done")):
+            react_loop(ctx, "task")
+        self._restage_child(supervisor, ctx.turn_id)
+        assert supervisor.child_may_use_turn_grants("sa-loop") is False
+
+    def test_turn_is_unregistered_when_drain_bookkeeping_raises(self):
+        from react_loop import _StepResult, react_loop
+
+        ctx, supervisor = self._ctx_with_child()
+        with patch("react_loop._build_system_prompt", return_value=("system", None)), \
+             patch("react_loop._run_single_step", return_value=_StepResult(early_return="done")), \
+             patch.object(supervisor, "draining_children", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                react_loop(ctx, "task")
+        self._restage_child(supervisor, ctx.turn_id)
+        assert supervisor.child_may_use_turn_grants("sa-loop") is False
+
+
 class TestCancellationApprovalRace:
     @pytest.mark.asyncio
     async def test_cancel_before_stale_approval_cannot_execute_file_write(

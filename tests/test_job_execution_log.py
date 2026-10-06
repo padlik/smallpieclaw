@@ -1194,6 +1194,29 @@ def test_persistence_failure_notice_for_failed_run_keeps_failure_header_error_ty
     assert notice.details_run_id == ""
 
 
+def test_timeout_failure_records_and_queues_one_notice_with_header_error_type_and_next_run(
+    tmp_path, monkeypatch
+):
+    s, captured = _spawn_sched(tmp_path, monkeypatch)
+    s._jobs_meta["report"]["notify"] = True
+    sink = MagicMock()
+    s.set_result_notice_sink(sink)
+    s._run_job("report")
+
+    _complete_with_notice(captured[0], "❌ LLM error: TimeoutException: timed out", False)
+
+    entry = s.execution_log.read_recent()[0]
+    assert entry["status"] == "failed"
+    assert entry["error_type"] == "timeout"
+    assert entry["next_run"] == "2026-10-03T09:00:00"
+    s.notify.assert_not_called()
+    sink.assert_called_once()
+    notice = sink.call_args.args[0]
+    assert "⚠️ Scheduled job failed: report" in notice.text
+    assert "Error type: timeout" in notice.text
+    assert "Next run: 2026-10-03T09:00:00" in notice.text
+
+
 def test_unretained_run_ids_are_empty_after_the_notice_is_queued(tmp_path, monkeypatch):
     s, captured = _spawn_sched(tmp_path, monkeypatch)
     s._jobs_meta["report"]["notify"] = True

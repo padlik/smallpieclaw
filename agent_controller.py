@@ -395,6 +395,12 @@ class AgentController:
             if hasattr(self.llm, "set_trace_id"):
                 self.llm.set_trace_id(_prev_trace)
             if self.builtin_executor is not None and self._depth == 0:
+                # Idempotent fallback only: react_loop's finally is the canonical
+                # turn drain (with progress). Repeating it here is a no-op once
+                # the children are released and covers a loop that exited before
+                # reaching its own drain. Ordering is load-bearing: the
+                # coordinator, prompt id and staged tokens are cleared only
+                # after the drain, so confirmation callbacks stay live during it.
                 try:
                     drain_errors = (
                         self.builtin_executor._supervisor.drain_owned_children(

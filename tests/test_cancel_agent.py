@@ -100,6 +100,27 @@ class TestCancelAgent:
         assert "discard" in discarded["output"].lower()
         assert "discard me" not in str(discarded)
 
+    def test_cancel_completed_unread_child_by_id_discards_result(
+        self, executor, local_registry
+    ):
+        done = _make_record("sa-done", status="done")
+        done.result = "unread secret result"
+        done._result_event.set()
+        local_registry.register(done)
+        executor._supervisor._owned_children[done.agent_id] = _OwnedChildState(done)
+
+        with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
+            cancelled = executor._agents._exec_cancel_agent(
+                {"agent_id": "sa-done"}, caller_tag="main r-owner"
+            )
+            fetched = executor._agents._exec_get_agent_result(
+                {"agent_id": "sa-done"}, caller_tag="main r-owner"
+            )
+
+        assert cancelled["success"] is True
+        assert fetched["status"] == "cancelled"
+        assert "unread secret result" not in str(fetched)
+
     @pytest.mark.parametrize(
         ("agent_id", "record"),
         [

@@ -37,7 +37,11 @@ from croniter import croniter, CroniterBadCronError
 
 from sub_agent_registry import SOURCE_SCHEDULED
 from sub_agent_supervisor import CANCELLED_SENTINEL, RunCompletion, SupervisionOptions
-from telegram_formatter import ResultNotice, bound_display_text, format_result_notice
+from telegram_formatter import (
+    ResultNotice,
+    build_run_result_notice,
+    build_unretained_notice,
+)
 
 if TYPE_CHECKING:
     from xdg import XDGPaths
@@ -88,49 +92,6 @@ def _classify_outcome(result: str, success: bool, meta: dict) -> tuple[str, str,
         text if text.startswith(_ERROR_SENTINEL) else f"{_ERROR_SENTINEL} {text}"
     )
     return "failed", error_type, _next_run_label(meta)
-
-
-def _build_result_notice(
-    tag: str, status: str, result: str, error_type: str, next_run: str, run_id: str,
-) -> ResultNotice:
-    """Build the run-result notice for a scheduled run's terminal outcome.
-
-    The summary stays outside an expandable quote holding the result; a result
-    too long for one message is replaced by the execution ID and a Details button.
-    """
-    summary = _result_summary(tag, status, error_type, next_run)
-    if status == "cancelled":
-        return ResultNotice(summary)
-    return format_result_notice(summary, result, run_id)
-
-
-def _result_summary(tag: str, status: str, error_type: str, next_run: str) -> str:
-    """Return the Telegram-HTML outcome summary for a run, with the tag bounded."""
-    safe_tag = _html.escape(bound_display_text(tag))
-    if status == "failed":
-        return (
-            f"<b>⚠️ Scheduled job failed: {safe_tag}</b>\n"
-            f"Error type: {_html.escape(error_type)}\n"
-            f"Next run: {_html.escape(next_run)}"
-        )
-    if status == "cancelled":
-        return f"<b>🛑 Scheduled job cancelled: {safe_tag}</b>"
-    return f"<b>✅ Scheduled job finished: {safe_tag}</b>"
-
-
-def _build_unretained_notice(
-    tag: str, status: str, error_type: str, next_run: str,
-) -> ResultNotice:
-    """Build the notice for a run whose outcome could not be saved to job history.
-
-    It carries the real outcome summary plus an honest note that the result was
-    not retained; it has no Details control because no record exists.
-    """
-    summary = _result_summary(tag, status, error_type, next_run)
-    return ResultNotice(
-        f"{summary}\n\nThe result was not retained in job history. "
-        "Details are unavailable."
-    )
 
 
 def _normalize_tag(s: str) -> str:
@@ -1140,11 +1101,11 @@ class Scheduler:
             )
             if run_id in self._unretained_run_ids:
                 self._unretained_run_ids.discard(run_id)
-                notice = _build_unretained_notice(
+                notice = build_unretained_notice(
                     completion.tag, status, error_type, next_run,
                 )
             else:
-                notice = _build_result_notice(
+                notice = build_run_result_notice(
                     completion.tag, status, completion.result, error_type, next_run, run_id,
                 )
             self._deliver_result_notice(notice)

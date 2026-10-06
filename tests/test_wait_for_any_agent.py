@@ -174,6 +174,27 @@ class TestWaitForAnyAgent:
         assert "sa-private" in result["error"]
         assert "no child accessible in this turn" in result["error"]
 
+    def test_discarded_child_reports_cancelled_without_result_text(
+        self, executor, local_registry
+    ):
+        done = _make_record("sa-done", status="done")
+        done.result = "unread secret result"
+        done._result_event.set()
+        local_registry.register(done)
+        executor._supervisor._owned_children[done.agent_id] = _OwnedChildState(done)
+
+        with patch.object(agents_mod, "_get_agent_registry", return_value=local_registry):
+            executor._agents._exec_cancel_agent(
+                {"agent_id": "sa-done"}, caller_tag="main r-owner"
+            )
+            result = executor._agents._exec_wait_for_any_agent(
+                {"agent_ids": ["sa-done"], "timeout": 5}, caller_tag="main r-owner",
+            )
+
+        assert result["status"] == "cancelled"
+        assert result["success"] is False
+        assert "unread secret result" not in str(result)
+
     def test_mixed_wait_error_names_every_inaccessible_supplied_id(
         self, executor, local_registry
     ):

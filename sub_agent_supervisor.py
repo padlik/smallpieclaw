@@ -143,6 +143,34 @@ class SubAgentSupervisor:
         )
         self._owned_lock = threading.Lock()
         self._owned_children: dict[str, _OwnedChildState] = {}
+        self._active_turn_ids: set[str] = set()
+
+    def register_active_turn(self, turn_id: str) -> None:
+        """Mark *turn_id* as an operator turn whose confirmation channel is live."""
+        with self._owned_lock:
+            self._active_turn_ids.add(turn_id)
+
+    def unregister_active_turn(self, turn_id: str) -> None:
+        """Remove only *turn_id* from the active set; unknown ids are a no-op."""
+        with self._owned_lock:
+            self._active_turn_ids.discard(turn_id)
+
+    def child_may_use_turn_grants(self, agent_id: str) -> bool:
+        """Return whether *agent_id* may consult its owning turn's session grants.
+
+        A child unknown to the supervisor is not turn-owned, so the legacy
+        ledger path stays unchanged for it. A known child that is cancelled or
+        drain-expired is always denied, whether or not any turn is active.
+        Otherwise only a child whose immutable owner is one of the currently
+        active operator turns may; every other known child is denied.
+        """
+        with self._owned_lock:
+            state = self._owned_children.get(agent_id)
+            if state is None:
+                return True
+            if state.drain_expired or state.record.is_cancelled:
+                return False
+            return state.record.ownership.owner_turn_id in self._active_turn_ids
 
     @staticmethod
     def turn_can_access_result(record: SubAgentRecord, owner_turn_id: Optional[str]) -> bool:

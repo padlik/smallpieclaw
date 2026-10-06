@@ -834,6 +834,40 @@ class TestScheduledRunJobOwnedContext:
         assert ctx.short_term.get_messages() == []
 
 
+class TestScheduledTriggerRoutesAgree:
+    """Cron, once, and run_now produce the same job-owned isolation outcome."""
+
+    def test_all_trigger_routes_yield_identical_isolation(
+        self, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        outcomes = {}
+        for trigger in _SCHEDULED_TRIGGERS:
+            run_dir = tmp_path / trigger
+            run_dir.mkdir()
+            ctx, operator = drive_scheduled_trigger(
+                trigger, make_builtin_executor, run_dir, monkeypatch,
+                preserve_context=True,
+            )
+            outcomes[trigger] = {
+                "own_kv_memory": ctx.memory is not operator["memory"],
+                "own_working_memory": ctx.working is not operator["working"],
+                "no_result_recall": ctx.results is None,
+                "no_graph_memory": ctx.graph_memory is None
+                and ctx.graph_memory_writer is None,
+                "job_messages": [m["content"] for m in ctx.short_term.get_messages()],
+            }
+
+        assert set(outcomes) == set(_SCHEDULED_TRIGGERS)
+        assert outcomes["cron"] == outcomes["once"] == outcomes["run_now"]
+        assert outcomes["cron"] == {
+            "own_kv_memory": True,
+            "own_working_memory": True,
+            "no_result_recall": True,
+            "no_graph_memory": True,
+            "job_messages": ["job-owned earlier request", "job-owned earlier answer"],
+        }
+
+
 class TestScheduledMemoryIsolatedPerRun:
     """Scheduled memory objects are private to one run, never shared across runs."""
 

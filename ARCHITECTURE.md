@@ -11,7 +11,7 @@ The agent uses a hybrid async/threaded architecture:
 │  │  python-telegram-bot Application                     │    │
 │  │  • All Telegram handlers (async)                    │    │
 │  │  • Message dispatch → run_in_executor(agent.run)    │    │
-│  │  • Callback queries (confirm/extend/approve-all)    │    │
+│  │  • Callback queries (confirm/till-reset/deny, retry)│    │
 │  └─────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
          │                    ▲

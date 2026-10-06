@@ -800,6 +800,27 @@ class TestGraphMemoryNonAdmission:
         assert exc._graph_memory.mock_calls == []
         assert exc._graph_memory_writer.mock_calls == []
 
+    def test_scheduled_completion_not_admitted_to_graph(self, make_builtin_executor, tmp_path):
+        runner = FakeRunner(agent_id="sa-graph-sched", result="a fact worth remembering")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        exc._graph_memory = MagicMock()  # type: ignore[attr-defined]
+        exc._graph_memory_writer = MagicMock()  # type: ignore[attr-defined]
+
+        with patch.object(exc._supervisor._pool, "submit",
+                          side_effect=lambda fn, *a, **kw: fn()):
+            res = exc._exec_spawn_agent(
+                {"task": "produce a fact"},
+                caller_depth=0,
+                options=SupervisionOptions(source="scheduled", job_tag="nightly", notify=False),
+            )
+
+        assert res["success"]
+        assert exc._graph_memory.mock_calls == []
+        assert exc._graph_memory_writer.mock_calls == []
+
 
 # ---------------------------------------------------------------------------
 # 1.2 — capacity + SubAgentRecord.source preservation

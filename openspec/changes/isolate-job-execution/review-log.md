@@ -475,6 +475,37 @@ The operator approved read-only `/jobs history <tag>` and `/jobs result <executi
 ### 🔴 Outstanding
 - None. All panel REQUIRED_FIXES are closed (both code Criticals fixed and adversarially confirmed; drain wording reconciled declaratively, strict validation valid). Branch is ready for the operator's merge + archive decision.
 
+## /opsx-verify report + fix round — 2026-10-06
+
+### Verification findings (Completeness 52/52 tasks, 20/20 reqs, 92 scenarios; both REMOVED reqs confirmed gone)
+- WARNING 1: grant sink bound only to child ID — a drain-released/earlier-turn child could consult a later turn's session grants (files.py `_check_grant`). **Fixed**: active-turn tracking in the supervisor (set at depth-0 entry, cleared after drain); `child_may_use_turn_grants` checked before `ledger.check` in both `_check_grant` and the file_diff revalidation; red→green for prior-turn and cancelled-child cases; live-child path unchanged.
+- WARNING 2: MCP leg of scheduled denial unverified. **Fixed structurally**: comment at MCP dispatch (no confirmation route exists); new TestScheduledMcpDispatch asserts scheduled dispatch never reaches the coordinator.
+- WARNING 3: stale approve-all text in prompt_builder.py:161 and ARCHITECTURE.md:14. **Fixed**: rewritten to the actual scoped-grant model (Till-/reset session grants scope-free; plain Confirm per-requester only; scheduled runs never granted).
+- WARNING 4: trace-ID turn fallback for direct callers. **Ruled accepted-legacy**: precise comments at both fallback sites; behavior unchanged (ReAct path always injects an explicit owner).
+- WARNING 5: six partial-coverage scenarios. **Fixed**: six focused tests added (stop-drain callback responsiveness; discarded status via wait; cancel-completed-child by ID; scheduled graph non-admission; cron/once/run_now side-by-side isolation; timeout notice end-to-end). No code changes needed; all pass.
+- SUGGESTION 1: Telegram rendering in scheduler. **Done**: run_result_summary/build_run_result_notice/build_unretained_notice moved to telegram_formatter as pure functions; scheduler keeps classification/eligibility.
+- SUGGESTION 2: duplicated drain orchestration. **Done**: react_loop finally documented as canonical drain; agent_controller call documented as idempotent ordering fallback; behavior unchanged.
+- Note for archive: canonical openspec/specs/sub-agent-supervision/spec.md still carries the approve-all requirements until archive syncs the REMOVED deltas — expected.
+
+### Verification
+- Full suite after fix round: **2783 passed, 2 skipped** (baseline only, zero new skips); ruff + vulture + `git diff --check` clean; strict `openspec validate`: valid.
+
+### 🔴 Outstanding
+- None from verification. Awaiting operator approval to commit this round, then merge → archive.
+
+## Final panel review (all 5 task groups + fixes) — 2026-10-06
+
+### Round 1 verdict: REQUEST_CHANGES (architect FAIL, implementer FAIL, sentinel FAIL — all converged on one defect)
+- **Critical (judge-verified)**: the verification round's grant gate short-circuited `active is None → True` before the cancelled/drain-expired checks — the idle steady state between turns let a known abandoned child consult the live GrantLedger (scope-free session grants); scalar active-turn field also clobbered under supported concurrent operator runs (per-user Telegram locks; agent_controller documents concurrent multi-user runs).
+- Fix: per-turn active ownership (`_active_turn_ids` set under `_owned_lock`; register at depth-0 entry, unregister in `finally` wrapping the drain so a failed drain cannot leak); gate reordered — unknown child → True (legacy preserved), cancelled/drain-expired → False unconditionally, owner in active set → True, else False; docstring updated; 9 new regression tests (idle stale child both variants, both transition windows, overlapping turns both directions, unknown-child legacy, owner-binding split from drain expiry). Red phase: 15 failures pre-fix; finally-placement verified by revert-and-rerun.
+
+### Round 2 verdicts (scoped re-review): architect PASS, implementer PASS (gate ordering/locks/try-finally verified, no missed call sites, no live-path regression), sentinel PASS (repros denied, transition windows closed, overlap isolated, fresh resume turn ids, no caller-ID spoofing) → judge: **APPROVE**.
+- Independent verification: full suite **2799 passed, 2 baseline skips** (zero new), ruff + vulture + `git diff --check` clean.
+- Advisory (non-blocking, post-merge): investigate the one flaky timeout test; this log entry serves as the per-turn-tracking hardening note.
+
+### 🔴 Outstanding
+- None. Branch (committed checkpoints + uncommitted verification/panel-fix round) is approved for commit → merge → archive.
+
 ### 🔴 Outstanding
 - None.
 

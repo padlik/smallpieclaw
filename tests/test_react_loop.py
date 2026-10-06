@@ -1411,6 +1411,38 @@ class TestScheduledVisionDispatch:
         shared._requires_confirmation.assert_not_called()
 
 
+class TestScheduledMcpDispatch:
+    """Scheduled MCP dispatch has no interactive confirmation route."""
+
+    def test_scheduled_mcp_call_never_calls_interactive_coordinator(self):
+        import react_loop
+        from builtin_executor import ScheduledToolDispatch
+        from react_loop import ReactContext
+
+        shared = MagicMock(name="shared_executor")
+        shared.is_builtin.return_value = False
+        mcp = MagicMock()
+        mcp.has_tool.return_value = True
+        mcp.server_name_for_tool.return_value = "srv"
+        mcp.call_tool.return_value = {"success": True, "output": "ok", "exit_code": 0}
+        confirmation = MagicMock(name="interactive_coordinator")
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(),
+            builtin_executor=ScheduledToolDispatch(shared), mcp_manager=mcp,
+            skill_registry=None, cancel_event=threading.Event(),
+            depth=1, label="sa-job01", confirmation=confirmation,
+        )
+
+        outcome = react_loop._dispatch_tool(
+            ctx, {"tool": "mcp_tool", "args": {}}, lambda _m: None,
+        )
+
+        mcp.call_tool.assert_called_once_with("mcp_tool", {})
+        assert outcome["success"] is True
+        assert confirmation.method_calls == []
+        shared._requires_confirmation.assert_not_called()
+
+
 class TestOperatorPromptExcludesScheduledHistory:
     """The operator's system prompt never automatically includes scheduled-job history."""
 

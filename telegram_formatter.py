@@ -375,6 +375,49 @@ def format_result_notice(summary_html: str, result: str, run_id: str = "") -> Re
     )
 
 
+def run_result_summary(tag: str, status: str, error_type: str, next_run: str) -> str:
+    """Return the Telegram-HTML outcome summary for a scheduled run, with the tag bounded."""
+    safe_tag = html.escape(bound_display_text(tag))
+    if status == "failed":
+        return (
+            f"<b>⚠️ Scheduled job failed: {safe_tag}</b>\n"
+            f"Error type: {html.escape(error_type)}\n"
+            f"Next run: {html.escape(next_run)}"
+        )
+    if status == "cancelled":
+        return f"<b>🛑 Scheduled job cancelled: {safe_tag}</b>"
+    return f"<b>✅ Scheduled job finished: {safe_tag}</b>"
+
+
+def build_run_result_notice(
+    tag: str, status: str, result: str, error_type: str, next_run: str, run_id: str,
+) -> ResultNotice:
+    """Build the run-result notice for a scheduled run's terminal outcome.
+
+    The summary stays outside an expandable quote holding the result; a result
+    too long for one message is replaced by the execution ID and a Details button.
+    """
+    summary = run_result_summary(tag, status, error_type, next_run)
+    if status == "cancelled":
+        return ResultNotice(summary)
+    return format_result_notice(summary, result, run_id)
+
+
+def build_unretained_notice(
+    tag: str, status: str, error_type: str, next_run: str,
+) -> ResultNotice:
+    """Build the notice for a run whose outcome could not be saved to job history.
+
+    It carries the real outcome summary plus an honest note that the result was
+    not retained; it has no Details control because no record exists.
+    """
+    summary = run_result_summary(tag, status, error_type, next_run)
+    return ResultNotice(
+        f"{summary}\n\nThe result was not retained in job history. "
+        "Details are unavailable."
+    )
+
+
 def format_result_document(record: dict) -> bytes:
     """Render a retained execution record as a complete UTF-8 text document.
 
