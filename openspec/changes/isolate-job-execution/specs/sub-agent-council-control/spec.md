@@ -7,13 +7,13 @@ The system SHALL provide `wait_for_any_agent` for the caller's own on-demand chi
 Feature: Sub-agent council control
 Rule: The model-facing result consumer is the operator turn that admitted the child; each turn consumes only its own results.
 
-#### Scenario: First completed own child is returned
+#### Scenario: First completed sub-agent is returned
 - **GIVEN** own-turn children A, B, and C are running in parallel and B finishes first
 - **WHEN** the operator turn calls `wait_for_any_agent` with `agent_ids=[A, B, C]`
 - **THEN** it returns B's `agent_id`, result, and status
 - **AND** A and C continue running unaffected
 
-#### Scenario: Already-finished own child returns immediately
+#### Scenario: Already-finished agents return immediately
 - **GIVEN** own-turn child B has finished while A is still running
 - **WHEN** the operator turn calls `wait_for_any_agent` with `agent_ids=[A, B]`
 - **THEN** it returns B's result immediately without waiting
@@ -24,17 +24,23 @@ Rule: The model-facing result consumer is the operator turn that admitted the ch
 - **THEN** the tool returns an error naming the supplied ID and saying no child is accessible in this turn
 - **AND** it does not wait on any ID or disclose whether the non-owned run exists
 
-#### Scenario: Failed or cancelled own child is returned as completed
+#### Scenario: Failed or cancelled agents are returned as completed
 - **GIVEN** own-turn child A has terminal status `"failed"` or `"cancelled"` and its result was not explicitly discarded
 - **WHEN** the operator turn calls `wait_for_any_agent` with A and another own-turn child B
 - **THEN** A is returned immediately with its terminal status and result
 - **AND** the operator turn can decide whether to proceed or cancel B
 
-#### Scenario: Timed-out wait leaves children running
+#### Scenario: Timeout returns no result
 - **GIVEN** none of the specified own-turn children finish before the timeout
 - **WHEN** the caller invokes `wait_for_any_agent`
 - **THEN** it returns `status="timeout"` and the still-pending own-turn IDs
 - **AND** no child is cancelled
+
+#### Scenario: Unknown agent ID is rejected
+- **GIVEN** the caller supplies an unknown agent ID
+- **WHEN** the operator turn calls `wait_for_any_agent` with that ID
+- **THEN** the tool returns an error naming the supplied ID and stating no child is accessible in this turn
+- **AND** it does not wait or disclose whether such a run exists
 
 #### Scenario: Discarded result immediately returns cancelled status
 - **GIVEN** the caller explicitly cancelled a completed but unread own-turn child
@@ -49,13 +55,13 @@ The system SHALL provide `cancel_agent` without operator confirmation, but model
 Feature: Sub-agent council control
 Rule: Model cancellation is limited to the caller's own admitted workers; operator controls remain cross-source.
 
-#### Scenario: Cancel a specific own child
+#### Scenario: Cancel a specific sub-agent
 - **GIVEN** own-turn child A is running and no longer needed
 - **WHEN** the operator turn calls `cancel_agent` with A's `agent_id`
 - **THEN** A's cancel event is set and its in-flight LLM request is interrupted
 - **AND** its run terminates with `status="cancelled"`
 
-#### Scenario: Managed alias cancels own children but leaves scheduled run running
+#### Scenario: Cancel all managed sub-agents
 - **GIVEN** own-turn children A and B are cancellable and scheduled run S is active
 - **WHEN** the operator turn calls `cancel_agent` with `agent_id="managed"` or `"all"`
 - **THEN** A and B are cancelled and the count reflects only own children newly cancelled or discarded
@@ -74,7 +80,7 @@ Rule: Model cancellation is limited to the caller's own admitted workers; operat
 - **THEN** A is marked accounted for and its unread result is discarded
 - **AND** later result-tool calls return cancelled/discarded status without its result text
 
-#### Scenario: Cancellation is not confirmation-gated
+#### Scenario: Cancel is not confirmation-gated
 - **GIVEN** an own-turn child is running, including while it has a pending confirmation
 - **WHEN** the operator turn calls `cancel_agent` for that child
 - **THEN** no additional operator confirmation prompt is sent

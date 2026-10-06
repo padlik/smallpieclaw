@@ -430,6 +430,15 @@ The operator approved read-only `/jobs history <tag>` and `/jobs result <executi
 ### 🔴 Outstanding
 - None for Part 4. Awaiting operator feedback on the Part 4 report; Part 5 remains paused.
 
+## Part 5 final verification — 2026-10-06
+
+### Verification
+- **5.1**: the 16-file focused regression sweep passed first run — **690 passed, 0 failures** — no test-first remediation needed.
+- **5.2**: `make check` green — **2746 passed, 2 skipped** (baseline skips only), ruff + vulture clean. `openspec validate isolate-job-execution --type change --strict` initially failed: the council-control MODIFIED blocks renamed canonical scenario titles ("First completed sub-agent is returned" etc.), which a MODIFIED requirement must preserve. Titles restored to the canonical names with the new own-turn content intact (declarative fix, no semantic change; an "Unknown agent ID is rejected" scenario was added to mirror the canonical set). Re-run: **"Change 'isolate-job-execution' is valid"**.
+
+### 🔴 Outstanding
+- None. All 52/52 tasks complete; implementation and artifacts validate clean. The change is eligible for archive (archive requires merge to main first, per git discipline).
+
 ### 🔴 Outstanding
 - None.
 
