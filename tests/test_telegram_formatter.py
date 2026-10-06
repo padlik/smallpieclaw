@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
-from telegram_formatter import format_jobs_list, md_to_html, sanitize_html, split_message
+import html as _html
+import re as _re
+
+import pytest
+
+from telegram_formatter import (
+    ResultNotice,
+    bound_display_text,
+    details_callback_data,
+    ensure_notice_fits,
+    format_jobs_list,
+    format_result_document,
+    format_result_notice,
+    md_to_html,
+    rendered_length,
+    sanitize_html,
+    split_message,
+)
 
 
 class TestSanitizeHtml:
@@ -219,3 +236,169 @@ class TestMdToHtml:
         result = md_to_html("```\nif x < 3 && y > 0:\n```")
         assert "&lt;" in result
         assert "&amp;&amp;" in result
+
+
+# ---------------------------------------------------------------------------
+# Scheduled result presentation: expandable, compact, and document shapes
+# ---------------------------------------------------------------------------
+
+_RUN_ID = "run-" + "ab12cd34" * 4
+_SUMMARY = "<b>✅ Scheduled job finished: nightly</b>"
+
+
+class TestRenderedLength:
+    def test_tags_are_not_counted(self):
+        assert rendered_length("<b>hi</b>") == 2
+
+    def test_entities_count_as_one_character(self):
+        assert rendered_length("a &lt; b &amp; c") == len("a < b & c")
+
+    def test_blockquote_expandable_tag_is_not_counted(self):
+        assert rendered_length("<blockquote expandable>xy</blockquote>") == 2
+
+
+class TestFormatResultNoticeShort:
+    def test_summary_is_outside_expandable_quote_containing_result(self):
+        notice = format_result_notice(_SUMMARY, "all good", _RUN_ID)
+        assert notice.text.startswith(_SUMMARY)
+        match = _re.search(
+            r"<blockquote expandable>(.*)</blockquote>", notice.text, _re.DOTALL,
+        )
+        assert match is not None
+        assert match.group(1) == "all good"
+        assert _SUMMARY not in match.group(1)
+
+    def test_short_result_offers_no_details(self):
+        notice = format_result_notice(_SUMMARY, "all good", _RUN_ID)
+        assert notice.details_run_id == ""
+
+    def test_untrusted_result_html_is_escaped(self):
+        notice = format_result_notice(_SUMMARY, "<script>x</script> & <b>y", _RUN_ID)
+        assert "<script>" not in notice.text
+        assert "&lt;script&gt;" in notice.text
+        assert "&amp;" in notice.text
+
+    def test_empty_result_has_no_quote(self):
+        notice = format_result_notice(_SUMMARY, "", _RUN_ID)
+        assert notice.text == _SUMMARY
+        assert "blockquote" not in notice.text
+
+    def test_result_exactly_at_limit_stays_expandable(self):
+        room = 4096 - rendered_length(_SUMMARY + "\n\n")
+        notice = format_result_notice(_SUMMARY, "x" * room, _RUN_ID)
+        assert rendered_length(notice.text) == 4096
+        assert "<blockquote expandable>" in notice.text
+        assert notice.details_run_id == ""
+
+
+class TestFormatResultNoticeOversized:
+    def test_one_character_over_limit_becomes_compact(self):
+        room = 4096 - rendered_length(_SUMMARY + "\n\n")
+        notice = format_result_notice(_SUMMARY, "x" * (room + 1), _RUN_ID)
+        assert "blockquote" not in notice.text
+        assert rendered_length(notice.text) < 1000
+
+    def test_compact_notice_names_execution_id_and_offers_details(self):
+        notice = format_result_notice(_SUMMARY, "y" * 10_000, _RUN_ID)
+        assert _SUMMARY in notice.text
+        assert _RUN_ID in notice.text
+        assert "/jobs result" in notice.text
+        assert notice.details_run_id == _RUN_ID
+        assert "y" * 100 not in notice.text
+
+    def test_escaped_html_does_not_widen_the_allowance(self):
+        # 3,000 "&" render as 3,000 chars (fits) even though raw HTML is 15,000.
+        fits = format_result_notice(_SUMMARY, "&" * 3000, _RUN_ID)
+        assert "<blockquote expandable>" in fits.text
+        assert len(fits.text) > 4096
+        assert rendered_length(fits.text) <= 4096
+        # 4,200 "&" exceed the rendered limit and must go compact.
+        over = format_result_notice(_SUMMARY, "&" * 4200, _RUN_ID)
+        assert "blockquote" not in over.text
+        assert over.details_run_id == _RUN_ID
+
+    def test_header_counts_toward_the_limit(self):
+        header = "<b>" + "H" * 500 + "</b>"
+        notice = format_result_notice(header, "z" * 3800, _RUN_ID)
+        assert "blockquote" not in notice.text
+
+    def test_multibyte_text_is_measured_in_characters(self):
+        notice = format_result_notice(_SUMMARY, "日本語" * 1000, _RUN_ID)
+        assert "<blockquote expandable>" in notice.text
+
+    def test_oversized_without_run_id_states_unavailable_and_offers_no_details(self):
+        notice = format_result_notice(_SUMMARY, "y" * 10_000, "")
+        assert notice.details_run_id == ""
+        assert "blockquote" not in notice.text
+        assert "not available" in notice.text.lower()
+
+
+class TestBoundDisplayText:
+    def test_short_text_is_unchanged(self):
+        assert bound_display_text("nightly", 100) == "nightly"
+
+    def test_long_text_is_ellipsized_to_the_limit(self):
+        bounded = bound_display_text("t" * 4000, 100)
+        assert len(bounded) == 100
+        assert bounded.endswith("…")
+
+
+class TestEnsureNoticeFits:
+    def test_fitting_notice_is_returned_unchanged(self):
+        notice = ResultNotice("<b>ok</b>")
+        assert ensure_notice_fits(notice) is notice
+
+    def test_oversized_notice_is_replaced_by_a_fitting_fallback(self):
+        fallback = ensure_notice_fits(ResultNotice("<b>" + "x" * 5000 + "</b>"))
+        assert rendered_length(fallback.text) <= 4096
+
+    def test_oversized_notice_keeps_its_details_execution(self):
+        fallback = ensure_notice_fits(
+            ResultNotice("x" * 5000, details_run_id=_RUN_ID)
+        )
+        assert fallback.details_run_id == _RUN_ID
+        assert _RUN_ID in fallback.text
+
+
+class TestFormatResultDocument:
+    def test_document_is_utf8_bytes_with_complete_result(self):
+        result = ("日本語 ünïcode 🚀\n" + "line\n" * 5000)
+        record = {
+            "run_id": _RUN_ID, "tag": "nightly", "status": "done",
+            "ts": "2026-10-04T01:00:00Z", "result": result,
+        }
+        data = format_result_document(record)
+        assert isinstance(data, bytes)
+        text = data.decode("utf-8")
+        assert text.endswith(result)
+        assert _RUN_ID in text
+        assert "nightly" in text
+        assert "done" in text
+
+    def test_document_does_not_html_escape_the_result(self):
+        record = {
+            "run_id": _RUN_ID, "tag": "t", "status": "failed",
+            "ts": "2026-10-04T01:00:00Z", "result": "<b>a</b> & b",
+        }
+        text = format_result_document(record).decode("utf-8")
+        assert text.endswith("<b>a</b> & b")
+        assert _html.escape("<b>") not in text
+
+    def test_document_is_not_truncated_beyond_message_limit(self):
+        record = {
+            "run_id": _RUN_ID, "tag": "t", "status": "done",
+            "ts": "2026-10-04T01:00:00Z", "result": "q" * 200_000,
+        }
+        text = format_result_document(record).decode("utf-8")
+        assert text.count("q") == 200_000
+
+
+class TestDetailsCallbackData:
+    def test_round_trips_run_id_within_telegram_limit(self):
+        data = details_callback_data(_RUN_ID)
+        assert data.endswith(_RUN_ID)
+        assert len(data.encode("utf-8")) <= 64
+
+    def test_overlong_run_id_is_rejected(self):
+        with pytest.raises(ValueError):
+            details_callback_data("run-" + "f" * 80)

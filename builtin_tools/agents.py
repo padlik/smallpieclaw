@@ -23,16 +23,53 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
-from sub_agent_supervisor import SubmissionRequest, SupervisionOptions
+from sub_agent_supervisor import (
+    ORIGIN_ON_DEMAND,
+    ORIGIN_SCHEDULED,
+    ExecutionOwnership,
+    SubmissionRequest,
+    SupervisionOptions,
+)
 
 from builtin_tools import context_io
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
 
-from sub_agent_registry import SOURCE_ON_DEMAND, get_registry as _get_agent_registry
+from sub_agent_registry import SOURCE_SCHEDULED, get_registry as _get_agent_registry
 
 logger = logging.getLogger(__name__)
+
+
+def _turn_id_from_caller_tag(caller_tag: str) -> Optional[str]:
+    """Extract the immutable request trace used as the operator-turn identity.
+
+    Accepted legacy fallback: direct non-loop callers reuse the trace as a
+    legacy owner identity; the ReAct path always injects an explicit per-turn
+    owner (_operator_turn_id), which takes precedence at every call site.
+    """
+    candidate = caller_tag.rsplit(" ", 1)[-1] if caller_tag else ""
+    return candidate if candidate.startswith("r-") else None
+
+
+def _inaccessible_child_result(tool_name: str, agent_ids: str | list[str]) -> dict:
+    """Return the indistinguishable unknown/non-owned child error contract."""
+    if isinstance(agent_ids, str):
+        supplied = f"id '{agent_ids}'"
+    else:
+        supplied = "ids " + ", ".join(f"'{agent_id}'" for agent_id in agent_ids)
+    return {
+        "success": False,
+        "output": "",
+        "error": (
+            f"{tool_name}: no child accessible in this turn with {supplied}."
+        ),
+        "exit_code": -1,
+        "status": "not_found",
+        "error_type": "file_not_found",
+        "recoverable": False,
+        "suggestion": "Use an agent_id spawned by this operator turn.",
+    }
 
 
 def _validate_spawn_args(
@@ -126,7 +163,12 @@ def _validate_spawn_args(
 
     model = args.get("model") or None
     context_key = args.get("context_key") or None
-    if context_key:
+    if context_key and options.source == SOURCE_SCHEDULED:
+        # The scheduler's truthy context_key is only a preserve_context marker.
+        # The persisted key is derived from the job identity in an origin-scoped
+        # namespace; no model-facing value ever reaches it.
+        context_key = context_io.scheduled_context_key(options.job_tag or "")
+    elif context_key:
         try:
             context_key = context_io._validate_context_key(str(context_key))
         except ValueError as exc:
@@ -221,17 +263,25 @@ class AgentTools:
         """
         options = options or SupervisionOptions()
         self._owner._wire_grant_scope_expiry(options)
-        # Propagate the active prompt id (if any) onto the supervision options
-        # so the supervisor can bind it into the sub-agent's log context.
-        if options.prompt_id is None:
-            options.prompt_id = getattr(self._owner, "_current_prompt_id", None)
+        explicit_prompt_id = args.pop("_operator_prompt_id", None)
+        explicit_turn_id = args.pop("_operator_turn_id", None)
+        if options.source == SOURCE_SCHEDULED:
+            options.prompt_id = None
+        elif explicit_prompt_id is not None:
+            options.prompt_id = str(explicit_prompt_id)
+        # Otherwise only an explicit ``options.prompt_id`` is used; the prompt
+        # is never inferred from mutable ambient executor fields.
 
         validation = _validate_spawn_args(self._owner, args, caller_depth, options)
         if isinstance(validation, dict):
             return validation
         task, response_format, model, context_key, label = validation
 
-        context_payload = _build_context_payload(task, args, self._owner)
+        context_payload = (
+            {}
+            if options.source == SOURCE_SCHEDULED
+            else _build_context_payload(task, args, self._owner)
+        )
         overrides = _coerce_overrides(args)
 
         # Internal supervision controls (job tag, callbacks, notify/expandable)
@@ -242,11 +292,29 @@ class AgentTools:
         # source="scheduled" via SupervisionOptions and construct under the
         # SCHEDULED_AGENT profile; model-facing spawns use ON_DEMAND_SUBAGENT.
         from agent_runtime import RuntimeProfile
-        from sub_agent_registry import SOURCE_SCHEDULED
         runtime_profile = (
             RuntimeProfile.SCHEDULED_AGENT
             if options.source == SOURCE_SCHEDULED
             else RuntimeProfile.ON_DEMAND_SUBAGENT
+        )
+        ownership = ExecutionOwnership(
+            origin=(
+                ORIGIN_SCHEDULED
+                if options.source == SOURCE_SCHEDULED
+                else ORIGIN_ON_DEMAND
+            ),
+            # A direct submission with no turn identity is legacy/unowned: it
+            # creates no turn obligation and stays readable by unowned callers.
+            # Accepted legacy fallback: direct non-loop callers reuse the trace
+            # as a legacy owner identity; the ReAct path always injects an
+            # explicit per-turn owner (_operator_turn_id).
+            owner_turn_id=(
+                None
+                if options.source == SOURCE_SCHEDULED
+                or not (explicit_turn_id or trace_id)
+                else str(explicit_turn_id or trace_id)
+            ),
+            prompt_id=options.prompt_id,
         )
 
         factory_kwargs = dict(
@@ -271,18 +339,13 @@ class AgentTools:
             data_dir=self._owner._data_dir,
             notify_html_fn=self._owner._notify_html_fn,
             save_context=context_io._save_context,
+            ownership=ownership,
+            prompt_registry=getattr(self._owner, "_prompt_registry", None),
         )
         # Accepted run — the supervisor owns registration, background execution,
         # result signalling, context persistence, notification, scheduler
         # callbacks, and cleanup.
         result = self._owner._supervisor.submit(request, options)
-
-        # Record the spawned sub-agent against the active prompt, if any.
-        if result.get("success") and "agent_id" in result:
-            registry = getattr(self._owner, "_prompt_registry", None)
-            prompt_id = getattr(self._owner, "_current_prompt_id", None)
-            if registry is not None and prompt_id is not None:
-                registry.add_sub_agent(prompt_id, result["agent_id"])
 
         return result
 
@@ -315,29 +378,37 @@ class AgentTools:
             timeout = self._owner._subagent_result_timeout
 
         records = []
+        owner_turn_id = args.pop(
+            "_operator_turn_id", None
+        ) or _turn_id_from_caller_tag(caller_tag)
+        inaccessible = []
         for raw_id in agent_ids:
             aid = str(raw_id).strip()
-            record = get_agent_registry().get(aid)
+            record = self._owner._supervisor.get_owned_record(owner_turn_id, aid)
+            if record is None:
+                record = get_agent_registry().get(aid)
             if record is None:
                 record = get_agent_registry().get_completed(aid)
-            if record is None:
-                return {
-                    "success": False,
-                    "output": "",
-                    "error": f"wait_for_any_agent: no active sub-agent with id '{aid}'.",
-                    "exit_code": -1,
-                    "status": "not_found",
-                    "error_type": "file_not_found",
-                    "recoverable": False,
-                    "suggestion": "Check /agents or recent notifications for valid IDs.",
-                }
+            if record is None or not self._owner._supervisor.turn_can_access_result(
+                record, owner_turn_id
+            ):
+                inaccessible.append(aid)
+                continue
             records.append(record)
+        if inaccessible:
+            return _inaccessible_child_result("wait_for_any_agent", inaccessible)
+
+        for record in records:
+            if self._owner._supervisor.result_was_discarded(
+                owner_turn_id, record.agent_id
+            ):
+                return self._discarded_result("wait_for_any_agent", record.agent_id)
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for record in records:
                 if record._result_event.is_set() and record.status in ("done", "failed", "cancelled"):
-                    return {
+                    result = {
                         "success": record.status == "done",
                         "output": record.result or "",
                         "error": record.result if record.status == "failed" else "",
@@ -347,6 +418,10 @@ class AgentTools:
                         "result": record.result,
                         "result_type": record.result_type,
                     }
+                    self._owner._supervisor.mark_result_retrieved(
+                        owner_turn_id, record.agent_id
+                    )
+                    return result
             time.sleep(0.2)
 
         return {
@@ -378,49 +453,33 @@ class AgentTools:
                 "suggestion": "Provide a sub-agent id, or use 'managed'/'all' to cancel all managed agents.",
             }
 
+        owner_turn_id = args.pop(
+            "_operator_turn_id", None
+        ) or _turn_id_from_caller_tag(caller_tag)
         if agent_id in ("managed", "all"):
-            # The model-facing cancel_agent tool cancels only sub-agents the LLM
-            # itself spawned (on-demand). Scheduled jobs are operator-owned and
-            # must be cancelled via /agents or /jobs commands, not by a sub-agent.
-            targets = [
-                r for r in get_agent_registry().list_active()
-                if r.source == SOURCE_ON_DEMAND
-            ]
-            for r in targets:
-                r.cancel()
-            n = len(targets)
+            n = self._owner._supervisor.cancel_all_owned_children(owner_turn_id)
             return {
                 "success": True,
-                "output": f"Cancelled {n} managed sub-agent(s).",
+                "output": f"Cancelled {n} turn-owned sub-agent(s).",
                 "error": "",
                 "exit_code": 0,
             }
 
-        record = get_agent_registry().get(agent_id)
+        record = self._owner._supervisor.get_owned_record(owner_turn_id, agent_id)
         if record is None:
-            return {
-                "success": False,
-                "output": "",
-                "error": f"cancel_agent: no active sub-agent with id '{agent_id}'.",
-                "exit_code": -1,
-                "error_type": "file_not_found",
-                "recoverable": False,
-                "suggestion": "The agent may have already finished; check /agents or recent notifications.",
-            }
-        if record.source != SOURCE_ON_DEMAND:
-            return {
-                "success": False,
-                "output": "",
-                "error": (
-                    f"cancel_agent: sub-agent '{agent_id}' is a '{record.source}' agent "
-                    "and cannot be cancelled by the LLM. Use /agents cancel or /stop."
-                ),
-                "exit_code": -1,
-                "error_type": "fundamentally_wrong_approach",
-                "recoverable": False,
-                "suggestion": "Only on-demand sub-agents can be cancelled via cancel_agent.",
-            }
-        record.cancel()
+            record = get_agent_registry().get(agent_id)
+        if record is None:
+            record = get_agent_registry().get_completed(agent_id)
+        if record is None:
+            return _inaccessible_child_result("cancel_agent", agent_id)
+        if not self._owner._supervisor.turn_can_access_result(record, owner_turn_id):
+            return _inaccessible_child_result("cancel_agent", agent_id)
+        cancelled = self._owner._supervisor.cancel_owned_child(
+            owner_turn_id, agent_id
+        )
+        if cancelled is None:
+            if record.status == "running" and not record.is_cancelled:
+                record.cancel()
         return {
             "success": True,
             "output": f"Cancelled sub-agent '{agent_id}'.",
@@ -454,18 +513,23 @@ class AgentTools:
         except (TypeError, ValueError):
             timeout = self._owner._subagent_result_timeout
 
-        record = get_agent_registry().get(agent_id)
+        owner_turn_id = args.pop(
+            "_operator_turn_id", None
+        ) or _turn_id_from_caller_tag(caller_tag)
+        registry = get_agent_registry()
+        record = self._owner._supervisor.get_owned_record(owner_turn_id, agent_id)
         if record is None:
-            return {
-                "success": False,
-                "output": "",
-                "error": f"get_agent_result: no active sub-agent with id '{agent_id}'.",
-                "exit_code": -1,
-                "status": "not_found",
-                "error_type": "file_not_found",
-                "recoverable": False,
-                "suggestion": "The agent may have already finished; check /agents or recent notifications.",
-            }
+            record = registry.get(agent_id)
+        if record is None:
+            record = registry.get_completed(agent_id)
+        if record is None or not self._owner._supervisor.turn_can_access_result(
+            record, owner_turn_id
+        ):
+            return _inaccessible_child_result("get_agent_result", agent_id)
+        if self._owner._supervisor.result_was_discarded(
+            owner_turn_id, agent_id
+        ):
+            return self._discarded_result("get_agent_result", agent_id)
 
         # If already finished (event already set), return immediately
         finished = record._result_event.wait(timeout=timeout)
@@ -476,7 +540,11 @@ class AgentTools:
             cancel_on_timeout = args.get("cancel_on_timeout", True)
             if cancel_on_timeout and not record._cancel_event.is_set():
                 record._timeout_cancelled = True
-                record.cancel()
+                cancelled = self._owner._supervisor.cancel_owned_child(
+                    owner_turn_id, agent_id
+                )
+                if cancelled is None:
+                    record.cancel()
                 logger.info(
                     "get_agent_result: timed out after %ds — auto-cancelled agent '%s'",
                     timeout, agent_id,
@@ -500,7 +568,7 @@ class AgentTools:
             error_type = "wrong_model_for_task"
             recoverable = False
             suggestion = "Consider using a different model or breaking the task into smaller steps."
-        return {
+        result = {
             "success": record.status == "done",
             "output": record.result or "",
             "error": record.result if record.status == "failed" else "",
@@ -512,4 +580,25 @@ class AgentTools:
             "error_type": error_type,
             "recoverable": recoverable,
             "suggestion": suggestion,
+        }
+        self._owner._supervisor.mark_result_retrieved(owner_turn_id, agent_id)
+        return result
+
+    @staticmethod
+    def _discarded_result(tool_name: str, agent_id: str) -> dict:
+        """Return an actionable terminal response without discarded result text."""
+        return {
+            "success": False,
+            "output": (
+                f"{tool_name}: child '{agent_id}' was cancelled and its unread "
+                "result was discarded."
+            ),
+            "error": "",
+            "exit_code": -1,
+            "status": "cancelled",
+            "agent_id": agent_id,
+            "result": None,
+            "error_type": "",
+            "recoverable": False,
+            "suggestion": "Spawn a new child if this work is still needed.",
         }

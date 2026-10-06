@@ -41,6 +41,7 @@ from llm_client import LLMClient, LLMCancelledError, LLMEmptyResponseError, LLME
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from outcome_utils import fail_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
+from trace_context import new_trace_id
 
 from tool_formatting import (
     _compact_args_repr,
@@ -235,6 +236,14 @@ class ReactContext:
     # it still work; AgentController.run() assigns a fresh ID per run.
     trace_id: str = ""
 
+    # Immutable identity for result ownership during one interactive run. It is
+    # deliberately independent of trace_id because resumed runs reuse traces.
+    turn_id: str = field(default_factory=new_trace_id)
+
+    # Immutable operator prompt identity for this run. This travels with
+    # on-demand child admission rather than being inferred from executor state.
+    prompt_id: Optional[str] = None
+
     # Memory layers
     short_term: object = None   # Optional ShortTermMemory
     working: object = None      # Optional WorkingMemory
@@ -260,9 +269,6 @@ class ReactContext:
 
     # Tool trace callback — called after each tool dispatch with a ToolTrace record
     on_tool_trace: Optional[Callable] = None  # Optional[Callable[[ToolTrace], None]]
-
-    # Scheduled job history — called to get a formatted string for the system prompt
-    job_history_fn: Optional[Callable[[], str]] = None
 
     # Graph memory — Optional[GraphMemoryStore]; None when feature is disabled
     graph_memory: Optional[object] = None
@@ -452,6 +458,13 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
             "recoverable": False,
             "suggestion": "Use an allowed directory for image files.",
         }
+
+    if verdict == PathVerdict.UNRECOGNISED and getattr(builtin, "scheduled", False) is True:
+        # Scheduled dispatch (ScheduledToolDispatch) never borrows grants or
+        # reaches the interactive confirmation path.
+        from builtin_executor import scheduled_approval_denied
+
+        return scheduled_approval_denied("vision_query")
 
     if verdict == PathVerdict.UNRECOGNISED:
         # A standing operator grant may promote this UNRECOGNISED path to allowed.
@@ -836,14 +849,11 @@ def _publish_context_snapshot(
 
 
 def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
-    """Assemble the full system prompt string for a run."""
-    _job_history_section = ""
-    if ctx.job_history_fn:
-        try:
-            _job_history_section = ctx.job_history_fn() or ""
-        except Exception as _jh_exc:
-            logger.warning("Failed to get job history: %s", _jh_exc)
+    """Assemble the full system prompt string for a run.
 
+    Scheduled-job history is never injected: it is job-owned, not operator
+    context (isolate-job-execution, design decision 2).
+    """
     _graph_context_section = ""
     if ctx.graph_memory is not None:
         try:
@@ -883,7 +893,6 @@ def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
         log_backup_count=ctx.log_backup_count,
         top_tools=ctx.top_tools,
         user_goal=user_goal,
-        job_history_section=_job_history_section,
         graph_context_section=_graph_context_section,
         strategies_section=strategies_section,
         # Suppress ResultsMemory recall when graph memory already supplied
@@ -1116,6 +1125,19 @@ def _dispatch_action(
     action = action_obj.get("action", "")
 
     if action == "finish":
+        supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+        if ctx.depth == 0 and supervisor is not None:
+            children = supervisor.unaccounted_children(ctx.turn_id)
+            if children:
+                details = ", ".join(
+                    f"{agent_id} ({status})" for agent_id, status in children
+                )
+                sink(
+                    "Cannot finish while turn-owned children are unaccounted: "
+                    f"{details}. Call get_agent_result for completed children, "
+                    "wait for running children, or call cancel_agent."
+                )
+                return None
         return _finish_run(ctx, action_obj, user_goal)
 
     if action == "tool":
@@ -1147,6 +1169,18 @@ def _dispatch_action(
         _end_status = "ok" if outcome.get("success") else "fail"
         progress(f"__TOOL_END__:{_end_status}:{tool_name}\n{fmt_tool_result_progress(tool_name, args, outcome)}")
         sink(tool_result)
+
+        if tool_name in ("get_agent_result", "wait_for_any_agent"):
+            status = outcome.get("status")
+            agent_id = outcome.get("agent_id")
+            supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+            if (
+                ctx.depth == 0
+                and supervisor is not None
+                and status in ("done", "failed", "cancelled")
+                and agent_id
+            ):
+                supervisor.mark_result_retrieved(ctx.turn_id, str(agent_id))
 
         # Doom-loop detection (T2): self-terminate when the same tool fails
         # with the same error repeatedly. Runs at the vision_query/normal-tool
@@ -1182,6 +1216,16 @@ def _dispatch_action(
         return None
 
     if action == "plan":
+        if getattr(ctx.builtin_executor, "scheduled", False) is True:
+            # Plan steps are built as plan-step agents on the shared executor,
+            # outside the scheduled tool policy — refuse before any step exists.
+            logger.warning("%splan refused for scheduled run", ctx.log_prefix)
+            sink(
+                "Error: plan is not available for scheduled jobs. "
+                'Run the steps directly as individual {"action": "tool"} calls, '
+                "one at a time."
+            )
+            return None
         plan_data = action_obj.get("plan", {})
         result_msg, new_max_steps, _ = _run_plan(ctx, plan_data, state.max_steps, progress)
         if new_max_steps is not None:
@@ -1349,6 +1393,9 @@ def react_loop(
 
     state = None
     try:
+        _turn_supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+        if ctx.depth == 0 and _turn_supervisor is not None:
+            _turn_supervisor.register_active_turn(ctx.turn_id)
         ctx._tool_defs = None
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
@@ -1413,6 +1460,40 @@ def react_loop(
         ctx.memory.record_event("Task cancelled by operator")
         return "⚠️ Task stopped by operator."
     finally:
+        # Canonical turn-drain boundary: the depth-0 turn cancels and awaits its
+        # owned on-demand children here, publishing drain progress. Grants and
+        # staged tokens are cleared by the caller only after this returns, and
+        # the confirmation coordinator stays wired throughout so confirmation
+        # callbacks remain processable. AgentController.run repeats the drain
+        # as an idempotent fallback (see there); it must stay a no-op after this.
+        supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+        if ctx.depth == 0 and supervisor is not None:
+            try:
+                draining = supervisor.draining_children(ctx.turn_id)
+                if draining:
+                    try:
+                        _progress(
+                            "__DRAINING__:"
+                            + ",".join(agent_id for agent_id, _status in draining)
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning("draining progress publication failed", exc_info=True)
+                try:
+                    drain_errors = supervisor.drain_owned_children(
+                        ctx.turn_id, cancel=True
+                    )
+                except Exception as drain_exc:  # noqa: BLE001
+                    drain_errors = [f"turn drain failed: {drain_exc}"]
+                for drain_error in drain_errors:
+                    logger.error("sub-agent lifecycle cleanup failed: %s", drain_error)
+                    try:
+                        _progress(f"__DRAIN_ERROR__:{drain_error}")
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "drain error progress publication failed", exc_info=True
+                        )
+            finally:
+                supervisor.unregister_active_turn(ctx.turn_id)
         if ctx.context_monitor is not None:
             try:
                 last = ctx.context_monitor.read()
@@ -1538,7 +1619,7 @@ def _finish_run(
         ctx.short_term.add("assistant", result)
     summary = ""
     tools_used: list[str] = []
-    if ctx.results and ctx.working and ctx.working.has_content():
+    if ctx.depth == 0 and ctx.results and ctx.working and ctx.working.has_content():
         tools_used = list(filter(None, extract_tools_used(ctx.working.steps)))
         summary = _summarize_result(
             ctx.llm,
@@ -1722,6 +1803,18 @@ def _dispatch_tool(
 
     # Built-in tools
     if ctx.builtin_executor and ctx.builtin_executor.is_builtin(tool_name):
+        if tool_name in {
+            "spawn_agent",
+            "get_agent_result",
+            "wait_for_any_agent",
+            "cancel_agent",
+        }:
+            args = {**args, "_operator_turn_id": ctx.turn_id}
+        if tool_name == "spawn_agent":
+            args = {
+                **args,
+                "_operator_prompt_id": ctx.prompt_id,
+            }
         # For shell tool with streaming enabled, create a live-chunk callback.
         chunk_callback: Optional[Callable[[str], None]] = None
         if (tool_name == "shell"
@@ -1775,6 +1868,9 @@ def _dispatch_tool(
     # visible to log_query. They bypass both executors (which emit these events
     # themselves), so without this wrapping MCP tools never appear as TOOL_*
     # events. Field conventions match the builtin/tool executors.
+    # MCP dispatch performs no interactive confirmation (auth-failure
+    # translation only), so a scheduled-origin call can never reach the
+    # operator's confirmation channel — denial is structural, not a check.
     if ctx.mcp_manager and ctx.mcp_manager.has_tool(tool_name):
         with _tool_span(tool_name, mcp_auth=(ctx, tool_name)) as span:
             span.record(ctx.mcp_manager.call_tool(tool_name, args))

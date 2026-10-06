@@ -20,14 +20,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _scheduled_memory_unavailable(tool_name: str) -> dict:
+    """Refuse an operator-memory tool for a scheduled run without touching any store."""
+    return {
+        "success": False,
+        "output": "",
+        "error": (
+            f"{tool_name}: scheduled_memory_unavailable — scheduled jobs cannot read or "
+            "write the operator's KV or graph memory."
+        ),
+        "exit_code": -1,
+        "error_type": "scheduled_memory_unavailable",
+        "recoverable": False,
+        "suggestion": (
+            "Keep job state in the job's own context (preserve_context) or its "
+            "returned result; do not retry this memory tool."
+        ),
+    }
+
+
 class MemoryTools:
     """Persistent-memory and graph-memory tool handlers."""
 
     def __init__(self, owner: BuiltinExecutor) -> None:
         self._owner = owner
 
-    def _exec_memory_write(self, args: dict, caller_tag: str = "") -> dict:
+    def _exec_memory_write(self, args: dict, caller_tag: str = "", scheduled: bool = False) -> dict:
         """Read or update persistent MemoryStore (data/memory.json)."""
+        if scheduled:
+            return _scheduled_memory_unavailable("memory_write")
         if self._owner._memory is None:
             return {
                 "success": False, "output": "",
@@ -118,7 +139,9 @@ class MemoryTools:
 
     # ---- memory_graph_search ----
 
-    def _exec_memory_graph_search(self, args: dict, caller_tag: str = "") -> dict:
+    def _exec_memory_graph_search(self, args: dict, caller_tag: str = "", scheduled: bool = False) -> dict:
+        if scheduled:
+            return _scheduled_memory_unavailable("memory_graph_search")
         if self._owner._graph_memory is None:
             return {
                 "success": False, "output": "",
@@ -175,7 +198,10 @@ class MemoryTools:
 
     # ---- memory_graph_store ----
 
-    def _exec_memory_graph_store(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_memory_graph_store(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                                 scheduled: bool = False) -> dict:
+        if scheduled:
+            return _scheduled_memory_unavailable("memory_graph_store")
         if self._owner._graph_memory is None:
             return {
                 "success": False, "output": "",

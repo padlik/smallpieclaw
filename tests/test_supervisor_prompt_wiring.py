@@ -49,22 +49,23 @@ def registry(tmp_path):
 
 
 class TestPromptRegistryWiring:
-    def test_spawned_sub_agent_recorded_against_active_prompt(self, make_builtin_executor, tmp_path, registry):
+    def test_spawn_without_explicit_prompt_ignores_ambient_prompt(
+        self, make_builtin_executor, tmp_path, registry
+    ):
         runner = FakeRunner(agent_id="sa-prompt")
         exc = make_builtin_executor(
             sub_agent_factory=_seq_factory([runner]),
             data_dir=str(tmp_path),
         )
         exc._prompt_registry = registry
-        exc._current_prompt_id = registry.start("r-active", "active task").prompt_id
+        ambient = registry.start("r-active", "active task")
+        exc._current_prompt_id = ambient.prompt_id
 
         res = exc._exec_spawn_agent({"task": "do work"}, caller_depth=0)
         assert res["success"] is True
         assert res["agent_id"] == "sa-prompt"
 
-        record = registry.get(exc._current_prompt_id)
-        assert record is not None
-        assert record.sub_agent_ids == ["sa-prompt"]
+        assert registry.get(ambient.prompt_id).sub_agent_ids == []
 
     def test_no_recording_when_current_prompt_id_is_none(self, make_builtin_executor, tmp_path, registry):
         runner = FakeRunner(agent_id="sa-no-prompt")

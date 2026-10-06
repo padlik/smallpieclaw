@@ -116,7 +116,6 @@ class AgentController:
         label: str = "main",   # identifies this agent in log lines
         on_step=None,          # Optional[Callable[[int], None]] — called after each step
         on_tool_trace=None,    # Optional[Callable[[ToolTrace], None]] — called after each tool call
-        job_history_fn=None,   # Optional[Callable[[], str]] — returns job execution history for prompt
         trace_id=None,         # Optional[str] — propagate a parent run's trace; None => fresh per run
         checkpoint_store=None,  # Optional[CheckpointStore]
         context_monitor: ContextMonitor | None = None,
@@ -146,7 +145,6 @@ class AgentController:
         self.label = label
         self._on_step = on_step
         self._on_tool_trace = on_tool_trace
-        self._job_history_fn = job_history_fn
         self._depth = depth  # 0 = main agent, 1 = sub-agent (spawn_agent blocked at depth ≥ 1)
         # Optional parent trace to propagate; when None each run() gets a fresh ID.
         self._trace_id = trace_id
@@ -268,7 +266,6 @@ class AgentController:
             owns_cancel_event=self._owns_cancel_event,
             on_step=self._on_step,
             on_tool_trace=self._on_tool_trace,
-            job_history_fn=self._job_history_fn,
             graph_memory=self._graph_memory,
             graph_memory_writer=self._graph_memory_writer,
             graph_memory_max_entries=self._graph_memory_max_entries,
@@ -385,6 +382,7 @@ class AgentController:
             else None
         )
         ctx = AgentRuntime.build_react_context(self, run_trace_id, cancel_event=run_cancel_event)
+        ctx.prompt_id = prompt_id
         ctx.milestone_notify_fn = milestone_notify_fn
 
         loop_kwargs: dict = {}
@@ -397,11 +395,30 @@ class AgentController:
             if hasattr(self.llm, "set_trace_id"):
                 self.llm.set_trace_id(_prev_trace)
             if self.builtin_executor is not None and self._depth == 0:
-                self.builtin_executor._coordinator = None
-                self.builtin_executor._current_prompt_id = None
-                # Run-scoped cleanup: abandoned staged confirmation tokens from this
-                # run must not leak into the next interactive run.
-                self.builtin_executor._pending_confirmations.reset()
+                # Idempotent fallback only: react_loop's finally is the canonical
+                # turn drain (with progress). Repeating it here is a no-op once
+                # the children are released and covers a loop that exited before
+                # reaching its own drain. Ordering is load-bearing: the
+                # coordinator, prompt id and staged tokens are cleared only
+                # after the drain, so confirmation callbacks stay live during it.
+                try:
+                    drain_errors = (
+                        self.builtin_executor._supervisor.drain_owned_children(
+                            ctx.turn_id, cancel=True
+                        )
+                    )
+                    for drain_error in drain_errors or []:
+                        logger.error(
+                            "sub-agent lifecycle cleanup failed: %s", drain_error
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.error("sub-agent turn drain failed", exc_info=True)
+                finally:
+                    self.builtin_executor._coordinator = None
+                    self.builtin_executor._current_prompt_id = None
+                    # Run-scoped cleanup: abandoned staged confirmation tokens from this
+                    # run must not leak into the next interactive run.
+                    self.builtin_executor._pending_confirmations.reset()
             if self._cancel_registry is not None and run_cancel_event is not None:
                 self._cancel_registry.release(run_cancel_event)
 

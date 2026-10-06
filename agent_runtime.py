@@ -82,7 +82,6 @@ class ControllerDeps:
     owns_cancel_event: bool = True
     on_step: Optional[Callable[[int], None]] = None
     on_tool_trace: Optional[Callable] = None
-    job_history_fn: Optional[Callable[[], str]] = None
     graph_memory: Optional[object] = None
     graph_memory_writer: Optional[object] = None
     graph_memory_max_entries: int = 10
@@ -126,6 +125,23 @@ _PROFILE_SOURCE: dict[RuntimeProfile, Optional[str]] = {
     RuntimeProfile.PLAN_STEP_AGENT: SOURCE_PLAN_STEP,
     RuntimeProfile.DIAGNOSTIC_AGENT: SOURCE_DIAGNOSTIC,
 }
+
+
+class _ScheduledRunMemory:
+    """Private, non-persistent event memory for one scheduled run.
+
+    Satisfies the ReAct loop's ``memory`` collaborator surface
+    (``record_event`` / ``as_prompt_text``) without exposing or writing the
+    operator's ``MemoryStore``. Lifetime is one runner, i.e. one scheduled run.
+    """
+
+    def record_event(self, event: str) -> None:
+        """Discard *event*: scheduled runs never write the operator event log."""
+        del event
+
+    def as_prompt_text(self) -> str:
+        """Scheduled runs expose no persistent memory entries to the prompt."""
+        return "No persistent memory entries."
 
 
 def profile_to_source(profile: RuntimeProfile) -> Optional[str]:
@@ -295,10 +311,12 @@ class AgentRuntime:
         All supported profiles (``ON_DEMAND_SUBAGENT``, ``SCHEDULED_AGENT``,
         ``PLAN_STEP_AGENT``, ``DIAGNOSTIC_AGENT``) build a ``SubAgentRunner``
         with the runner-shaped product surface consumed by ``SubAgentSupervisor``,
-        ``PlanExecutor``, and the registry helpers. Construction is uniform across
-        sub-agent profiles: they all run at depth 1 and differ only in the
-        visibility source assigned later by ``register_run`` (see
-        :func:`profile_to_source`), never in the built product itself.
+        ``PlanExecutor``, and the registry helpers. All sub-agent profiles run at
+        depth 1; the visibility source is assigned later by ``register_run``
+        (see :func:`profile_to_source`). ``SCHEDULED_AGENT`` differs only in its
+        memory wiring: it receives a private per-run memory and no operator
+        ``ResultsMemory`` so a scheduled run sees job-owned context only; the
+        other profiles share the operator memory and result recall.
 
         ``MAIN`` is not a supported profile; the main agent is wired directly in
         ``main.py``. Passing an unknown profile raises ``ValueError``.
@@ -310,8 +328,26 @@ class AgentRuntime:
         if profile not in _PROFILE_SOURCE:
             raise ValueError(f"Unknown runtime profile: {profile!r}")
 
+        if profile is RuntimeProfile.SCHEDULED_AGENT:
+            # Job-owned context only (isolate-job-execution, design decision 2):
+            # a private per-run memory and no operator result recall. Working
+            # memory, graph memory, and job history stay runner-local/None.
+            # Tool dispatch carries the immutable scheduled policy explicitly.
+            from builtin_executor import ScheduledToolDispatch
+
+            scheduled_tools = (
+                ScheduledToolDispatch(self._builtin_executor)
+                if self._builtin_executor is not None else None
+            )
+            return self._create_sub_agent(
+                options, notify_fn=notify_fn, on_tool_trace=on_tool_trace,
+                base_memory=_ScheduledRunMemory(), results=None,
+                builtin_executor=scheduled_tools,
+            )
         return self._create_sub_agent(
             options, notify_fn=notify_fn, on_tool_trace=on_tool_trace,
+            base_memory=self._base_memory, results=self._results,
+            builtin_executor=self._builtin_executor,
         )
 
     def _create_sub_agent(
@@ -320,12 +356,16 @@ class AgentRuntime:
         *,
         notify_fn: object = None,
         on_tool_trace: object = None,
+        base_memory: object = None,
+        results: object = None,
+        builtin_executor: object = None,
     ) -> "SubAgentRunner":
         """Build a ``SubAgentRunner`` mirroring the legacy ``sub_agent_factory``.
 
         Preserves model resolution, per-call LLM override shallow-copy,
         scheduled ``max_iterations`` default, context preloading, depth=1, and
-        the runner-shaped product surface.
+        the runner-shaped product surface. ``base_memory``, ``results``, and
+        ``builtin_executor`` are the profile-selected collaborators.
         """
         # Local imports avoid import cycles at module load (agent_controller and
         # builtin_executor both sit above this construction boundary).
@@ -385,11 +425,11 @@ class AgentRuntime:
             ),
             paths=self._paths,
             tool_index=self._tool_index,
-            base_memory=self._base_memory,
-            builtin_executor=self._builtin_executor,
+            base_memory=base_memory,
+            builtin_executor=builtin_executor,
             skill_registry=self._skill_registry,
             mcp_manager=self._mcp_manager,
-            results=self._results,
+            results=results,
             short_term=pre_loaded_ctx,
             notify_fn=notify_fn or self._notify_fn,
             context_key=options.context_key,

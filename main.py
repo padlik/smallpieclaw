@@ -813,8 +813,8 @@ def _run(
         builtin_executor=builtin,
     )
     builtin.scheduler = scheduler  # wire scheduler into built-in tool
-    # Give the main agent access to scheduled job execution history
-    agent._job_history_fn = scheduler.execution_log.format_for_prompt
+    # Scheduled job history is not operator context (isolate-job-execution,
+    # design decision 2): it stays in job-owned history, not the operator prompt.
 
     # Initialise graph memory (opt-in) and wire it into agent + executor.
     _embedder_fn = _build_embedder(llm)

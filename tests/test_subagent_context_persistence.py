@@ -218,3 +218,184 @@ def _make_reg(count: int = 0):
     reg = MagicMock()
     reg.count_managed.return_value = count
     return reg
+
+
+class TestScheduledContextOriginIsolation:
+    """Scheduled preserved context lives in a namespace on-demand keys cannot reach."""
+
+    def test_scheduled_round_trip_returns_own_conversation(self, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        key = scheduled_context_key("nightly")
+        _save_context(key, _stm([("user", "mine"), ("assistant", "yes")]), str(tmp_path))
+
+        loaded = _load_context(key, str(tmp_path))
+
+        assert [m["content"] for m in loaded.get_messages()] == ["mine", "yes"]
+
+    def test_scheduled_context_is_stored_in_scheduled_subdirectory(self, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        _save_context(scheduled_context_key("nightly"), _stm([("user", "x")]), str(tmp_path))
+
+        files = list((tmp_path / "job_contexts" / "scheduled").glob("*.json"))
+        assert len(files) == 1
+        assert list((tmp_path / "job_contexts").glob("*.json")) == []
+
+    def test_on_demand_key_equal_to_tag_cannot_read_scheduled_context(self, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        _save_context(scheduled_context_key("nightly"), _stm([("user", "secret job")]), str(tmp_path))
+
+        assert _load_context("nightly", str(tmp_path)).get_messages() == []
+
+    def test_on_demand_key_equal_to_tag_cannot_overwrite_scheduled_context(self, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        key = scheduled_context_key("nightly")
+        _save_context(key, _stm([("user", "job turn")]), str(tmp_path))
+
+        _save_context("nightly", _stm([("user", "on-demand turn")]), str(tmp_path))
+
+        assert _load_context(key, str(tmp_path)).get_messages()[0]["content"] == "job turn"
+
+    def test_scheduled_job_cannot_read_on_demand_context_with_same_name(self, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        _save_context("nightly", _stm([("user", "on-demand turn")]), str(tmp_path))
+
+        assert _load_context(scheduled_context_key("nightly"), str(tmp_path)).get_messages() == []
+
+    def test_scheduled_job_cannot_overwrite_on_demand_context_with_same_name(self, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        _save_context("nightly", _stm([("user", "on-demand turn")]), str(tmp_path))
+
+        _save_context(scheduled_context_key("nightly"), _stm([("user", "job turn")]), str(tmp_path))
+
+        assert _load_context("nightly", str(tmp_path)).get_messages()[0]["content"] == "on-demand turn"
+
+    def test_tags_that_normalize_identically_do_not_share_context(self, tmp_path):
+        from builtin_tools.context_io import _context_path, scheduled_context_key
+        from scheduler import _normalize_context_key
+
+        first, second = "Daily-Report", "daily report"
+        assert _normalize_context_key(first) == _normalize_context_key(second)
+
+        assert _context_path(scheduled_context_key(first), str(tmp_path)) != _context_path(
+            scheduled_context_key(second), str(tmp_path),
+        )
+
+    def test_scheduled_context_key_is_deterministic(self):
+        from builtin_tools.context_io import scheduled_context_key
+
+        assert scheduled_context_key("nightly") == scheduled_context_key("nightly")
+
+    def test_overlong_tag_still_yields_loadable_key(self, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        key = scheduled_context_key("t" * 500)
+        _save_context(key, _stm([("user", "long")]), str(tmp_path))
+
+        assert _load_context(key, str(tmp_path)).get_messages()[0]["content"] == "long"
+
+    def test_on_demand_validator_rejects_scheduled_key(self):
+        from builtin_tools.context_io import _validate_context_key, scheduled_context_key
+
+        with pytest.raises(ValueError):
+            _validate_context_key(scheduled_context_key("nightly"))
+
+    @pytest.mark.parametrize("bad", ["scheduled/../x", "scheduled/a/b", "scheduled/", "scheduled/UP-0123456789abcdef"])
+    def test_malformed_scheduled_keys_are_rejected(self, tmp_path, bad):
+        with pytest.raises(ValueError):
+            _load_context(bad, str(tmp_path))
+
+
+class TestScheduledSpawnUsesNamespacedKey:
+    """The scheduled spawn path ignores any model-supplied context_key value."""
+
+    def _spawn(self, make_builtin_executor, tmp_path, *, args, options):
+        from unittest.mock import MagicMock, patch
+
+        runner = MagicMock()
+        runner.agent_id = "sa-ns01"
+        runner.model_id = runner._model_id = "test-model"
+        runner._agent = MagicMock()
+        runner._agent.max_iterations = 8
+        runner._agent._trace_id = None
+        runner.trace_id = None
+        runner.short_term = _stm([("user", "job in flight")])
+        runner.run.return_value = "done"
+        factory = MagicMock(return_value=runner)
+        exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
+        with patch("sub_agent_registry.get_registry", return_value=_make_reg()), \
+             patch.object(exc._supervisor._pool, "submit",
+                          side_effect=lambda fn, *a, **kw: fn()):
+            exc._exec_spawn_agent(args, caller_depth=0, options=options)
+        return factory
+
+    def test_scheduled_spawn_passes_namespaced_key_to_factory(self, make_builtin_executor, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        factory = self._spawn(
+            make_builtin_executor, tmp_path,
+            args={"task": "t", "context_key": "nightly"},
+            options=SupervisionOptions(job_tag="nightly", source="scheduled", notify=False),
+        )
+
+        assert factory.call_args.kwargs["context_key"] == scheduled_context_key("nightly")
+
+    def test_scheduled_spawn_ignores_model_supplied_context_key(self, make_builtin_executor, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        factory = self._spawn(
+            make_builtin_executor, tmp_path,
+            args={"task": "t", "context_key": "victim-key"},
+            options=SupervisionOptions(job_tag="nightly", source="scheduled", notify=False),
+        )
+
+        assert factory.call_args.kwargs["context_key"] == scheduled_context_key("nightly")
+
+    def test_scheduled_spawn_saves_under_scheduled_namespace(self, make_builtin_executor, tmp_path):
+        self._spawn(
+            make_builtin_executor, tmp_path,
+            args={"task": "t", "context_key": "nightly"},
+            options=SupervisionOptions(job_tag="nightly", source="scheduled", notify=False),
+        )
+
+        assert len(list((tmp_path / "job_contexts" / "scheduled").glob("*.json"))) == 1
+        assert not (tmp_path / "job_contexts" / "nightly.json").exists()
+
+    def test_scheduled_spawn_without_marker_persists_nothing(self, make_builtin_executor, tmp_path):
+        factory = self._spawn(
+            make_builtin_executor, tmp_path,
+            args={"task": "t"},
+            options=SupervisionOptions(job_tag="nightly", source="scheduled", notify=False),
+        )
+
+        assert factory.call_args.kwargs["context_key"] is None
+
+    def test_on_demand_spawn_keeps_model_supplied_key(self, make_builtin_executor, tmp_path):
+        factory = self._spawn(
+            make_builtin_executor, tmp_path,
+            args={"task": "t", "context_key": "my-key"},
+            options=SupervisionOptions(notify=False),
+        )
+
+        assert factory.call_args.kwargs["context_key"] == "my-key"
+        assert (tmp_path / "job_contexts" / "my-key.json").exists()
+
+    def test_on_demand_spawn_cannot_name_a_scheduled_key(self, make_builtin_executor, tmp_path):
+        from builtin_tools.context_io import scheduled_context_key
+
+        result = {}
+        from unittest.mock import MagicMock, patch
+        exc = make_builtin_executor(sub_agent_factory=MagicMock(), data_dir=str(tmp_path))
+        with patch("sub_agent_registry.get_registry", return_value=_make_reg()):
+            result = exc._exec_spawn_agent(
+                {"task": "t", "context_key": scheduled_context_key("nightly")},
+                caller_depth=0, options=SupervisionOptions(notify=False),
+            )
+
+        assert result["success"] is False
+        assert "invalid context_key" in result["error"]

@@ -17,6 +17,7 @@ import logging
 import os
 import secrets
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -212,6 +213,7 @@ class ConfirmationManager:
         # --- Headless (sub-agent) confirmation ---
         self._headless_confirm_events: dict[str, threading.Event] = {}
         self._headless_confirm_results: dict[str, bool] = {}
+        self._headless_confirm_cancels: dict[str, threading.Event] = {}
         self.default_headless_timeout: int = 120
 
         # --- Grant ledger (depth-0 owned single ledger) ---
@@ -381,6 +383,7 @@ class ConfirmationManager:
         description: str,
         prompt_fn: Callable[[str, str, str, str], None],
         caller_tag: str = "",
+        cancel_event: Optional[threading.Event] = None,
     ) -> bool:
         """Block the calling sub-agent thread until the operator responds via Telegram.
 
@@ -392,32 +395,78 @@ class ConfirmationManager:
         event = threading.Event()
         self._headless_confirm_events[token] = event
         self._headless_confirm_results[token] = False
+        if cancel_event is not None:
+            self._headless_confirm_cancels[token] = cancel_event
+        try:
+            return self._await_headless_decision(
+                token, event, tool_name, description, prompt_fn, caller_tag,
+                cancel_event,
+            )
+        finally:
+            self._headless_confirm_cancels.pop(token, None)
+
+    def _await_headless_decision(
+        self,
+        token: str,
+        event: threading.Event,
+        tool_name: str,
+        description: str,
+        prompt_fn: Callable[[str, str, str, str], None],
+        caller_tag: str,
+        cancel_event: Optional[threading.Event],
+    ) -> bool:
+        """Send the headless prompt and poll for a decision or cancellation."""
         try:
             prompt_fn(token, tool_name, description, caller_tag)
         except Exception:
             self._headless_confirm_events.pop(token, None)
             self._headless_confirm_results.pop(token, None)
             raise
-        answered = event.wait(self.default_headless_timeout)
-        if not answered:
-            self._headless_confirm_events.pop(token, None)
-            self._headless_confirm_results.pop(token, None)
-            return False
-        return self._headless_confirm_results.pop(token, False)
+        deadline = time.monotonic() + self.default_headless_timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                self._headless_confirm_events.pop(token, None)
+                self._headless_confirm_results.pop(token, None)
+                event.set()
+                return False
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._headless_confirm_events.pop(token, None)
+                self._headless_confirm_results.pop(token, None)
+                return False
+
+            if event.wait(timeout=min(0.05, remaining)):
+                if cancel_event is not None and cancel_event.is_set():
+                    self._headless_confirm_events.pop(token, None)
+                    self._headless_confirm_results.pop(token, None)
+                    return False
+                self._headless_confirm_events.pop(token, None)
+                return self._headless_confirm_results.pop(token, False)
 
     def signal_headless_confirmation(
         self,
         token: str,
         approved: bool,
+        on_approved: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Atomically signal the outcome of a headless (sub-agent) confirmation prompt.
 
         Returns True if the token was found and signalled, False if it was
-        already expired/resolved (double-press / stale button).
+        already expired/resolved (double-press / stale button) or the waiting
+        child was cancelled. *on_approved* runs only for an approval consumed
+        by a live waiter, before the waiter is released, so approval side
+        effects (grant bookkeeping) never outlive a cancelled operation.
         """
         event = self._headless_confirm_events.pop(token, None)
         if event is None:
             return False
+        cancel_event = self._headless_confirm_cancels.get(token)
+        if cancel_event is not None and cancel_event.is_set():
+            # The waiter observes cancellation itself and cleans up its result.
+            return False
+        if approved and on_approved is not None:
+            on_approved()
         self._headless_confirm_results[token] = approved
         event.set()
         return True

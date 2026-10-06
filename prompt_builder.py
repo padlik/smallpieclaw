@@ -158,7 +158,7 @@ Write every task as a fully standalone brief using this template:
 - Choose the model deliberately: fast/cheap for data extraction, smarter for analysis.
 - Spawn sub-agents concurrently when their tasks are independent of each other.
 - Always follow spawn_agent with get_agent_result or wait_for_any_agent to collect results before finishing.
-- "Approve all" confirmation grants are per-prompt: they cover you and your sub-agents for the current task only, and expire when you present your final answer.
+- Confirmation grants are scoped to one tool and one directory. "Confirm" grants last for the current task and cover only the requester (you, or the specific sub-agent run that asked); "Till /reset" grants last for the session and cover you and your sub-agents. Scheduled runs never receive grants.
 
 
 AVAILABLE TOOLS:
@@ -231,7 +231,6 @@ def build_system_prompt(
     log_backup_count: int,
     top_tools: int,
     user_goal: str = "(context snapshot)",
-    job_history_section: str = "",
     graph_context_section: str = "",
     results_top_k: int = 2,
 ) -> tuple[str, int]:
@@ -280,10 +279,4 @@ def build_system_prompt(
         log_section=log_section,
         graph_context_section=graph_ctx_block,
     )
-    # Inject job history only when it has content (avoids wasting tokens on blank lines)
-    if job_history_section:
-        prompt = prompt.replace(
-            "RESPONSE FORMAT — CRITICAL:",
-            f"{job_history_section}\n\nRESPONSE FORMAT — CRITICAL:",
-        )
     return prompt, estimate_tokens(prompt)

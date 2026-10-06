@@ -3,11 +3,8 @@ section: response-format
 order: 5
 required: true
 mode: all
-variables:
-  - job_history_section
+variables: []
 ---
-
-{{job_history_section}}
 
 RESPONSE FORMAT — CRITICAL:
 - You MUST respond with ONLY a single valid JSON object. Nothing else.

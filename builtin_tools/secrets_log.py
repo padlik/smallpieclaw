@@ -59,7 +59,8 @@ class SecretsTools:
     def __init__(self, owner: BuiltinExecutor) -> None:
         self._owner = owner
 
-    def _exec_secret_get(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
+    def _exec_secret_get(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
+                         scheduled: bool = False) -> dict:
         """Stage a vault lookup for operator confirmation."""
         key = args.get("key", "")
         if not key:
@@ -70,6 +71,13 @@ class SecretsTools:
                 "exit_code": -1,
             }
         desc = f"Look up vault key '{key}'"
+        if scheduled:
+            # Scheduled runs never reach the Telegram bridge: the seam denies
+            # noninteractively before any token is staged.
+            return self._owner._requires_confirmation(
+                "secret_get", args, desc, caller_depth=caller_depth, caller_tag=caller_tag,
+                scheduled=True,
+            )
         if caller_depth == 0:
             return self._owner._requires_confirmation(
                 "secret_get", args, desc, caller_depth=caller_depth, caller_tag=caller_tag

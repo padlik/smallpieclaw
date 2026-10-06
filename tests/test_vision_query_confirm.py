@@ -353,3 +353,71 @@ class TestVisionQueryGrantCheck:
         assert outcome["output"] == "A cat."
         # No staging happened because the grant covered the path.
         assert ctx.builtin_executor._pending == {}
+
+
+class TestScheduledVisionQuery:
+    """A scheduled vision_query cannot borrow grants or reach the interactive confirmation path."""
+
+    def _scheduled_ctx(self, policy: PathPolicy, confirmation: _FakeConfirmationManager) -> ReactContext:
+        """A depth-1 context whose tool dispatch carries the scheduled policy."""
+        from builtin_executor import ScheduledToolDispatch
+
+        ctx = _build_ctx(policy, confirmation)
+        ctx.builtin_executor = ScheduledToolDispatch(ctx.builtin_executor)
+        ctx.depth = 1
+        ctx.label = "sa-job01"
+        return ctx
+
+    def test_scheduled_unrecognised_path_is_denied_noninteractively(self, tmp_path):
+        policy = _make_policy(str(tmp_path))
+        confirmation = _FakeConfirmationManager(approved=True, grant_dir="/unrecognised")
+        ctx = self._scheduled_ctx(policy, confirmation)
+
+        with patch("react_loop._encode_images", return_value=["<b64>"]):
+            outcome = _run_vision_query(
+                ctx, {"path": "/unrecognised/pic.png", "question": "What?"}, lambda _m: None,
+            )
+
+        assert outcome["success"] is False
+        assert outcome["error_type"] == "scheduled_approval_denied"
+        assert ctx.llm.vision_calls == []
+
+    def test_scheduled_vision_never_requests_confirmation(self, tmp_path):
+        policy = _make_policy(str(tmp_path))
+        confirmation = _FakeConfirmationManager(approved=True, grant_dir="/unrecognised")
+        ctx = self._scheduled_ctx(policy, confirmation)
+
+        with patch("react_loop._encode_images", return_value=["<b64>"]):
+            _run_vision_query(
+                ctx, {"path": "/unrecognised/pic.png", "question": "What?"}, lambda _m: None,
+            )
+
+        assert confirmation.last_call is None
+        assert ctx.builtin_executor._pending == {}
+
+    def test_scheduled_vision_cannot_borrow_existing_grant(self, tmp_path):
+        policy = _make_policy(str(tmp_path))
+        confirmation = _FakeConfirmationManager()
+        confirmation.grant_ledger.add("vision_query", "/unrecognised", GrantLifetime.SESSION)
+        ctx = self._scheduled_ctx(policy, confirmation)
+
+        with patch("react_loop._encode_images", return_value=["<b64>"]), \
+                patch.object(confirmation.grant_ledger, "check", wraps=confirmation.grant_ledger.check) as check:
+            outcome = _run_vision_query(
+                ctx, {"path": "/unrecognised/pic.png", "question": "What?"}, lambda _m: None,
+            )
+
+        assert outcome["success"] is False
+        check.assert_not_called()
+
+    def test_scheduled_allowed_path_still_runs(self, tmp_path):
+        policy = _make_policy(str(tmp_path))
+        confirmation = _FakeConfirmationManager()
+        ctx = self._scheduled_ctx(policy, confirmation)
+        image_path = os.path.join(policy.workspace_dir, "pic.png")
+
+        with patch("react_loop._encode_images", return_value=["<b64>"]):
+            outcome = _run_vision_query(ctx, {"path": image_path, "question": "What?"}, lambda _m: None)
+
+        assert outcome["success"] is True
+        assert outcome["output"] == "A cat."

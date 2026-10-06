@@ -28,6 +28,7 @@ import random
 import re
 import shutil
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -35,7 +36,12 @@ import schedule
 from croniter import croniter, CroniterBadCronError
 
 from sub_agent_registry import SOURCE_SCHEDULED
-from sub_agent_supervisor import SupervisionOptions
+from sub_agent_supervisor import CANCELLED_SENTINEL, RunCompletion, SupervisionOptions
+from telegram_formatter import (
+    ResultNotice,
+    build_run_result_notice,
+    build_unretained_notice,
+)
 
 if TYPE_CHECKING:
     from xdg import XDGPaths
@@ -68,6 +74,24 @@ def _classify_job_failure(result: str) -> str:
     if "context" in lower and ("overflow" in lower or "too long" in lower):
         return "context"
     return "unknown"
+
+
+def _classify_outcome(result: str, success: bool, meta: dict) -> tuple[str, str, str]:
+    """Return ``(status, error_type, next_run)`` for a scheduled run's outcome.
+
+    A supervisor "done" result that starts with ``❌`` is a failure; any other
+    unsuccessful result is classified as if it carried the sentinel. Failures
+    carry the error type and next scheduled run; success and cancellation do not.
+    """
+    text = result or ""
+    if success and not text.startswith(_ERROR_SENTINEL):
+        return "done", "", ""
+    if not success and text == CANCELLED_SENTINEL:
+        return "cancelled", "", ""
+    error_type = _classify_job_failure(
+        text if text.startswith(_ERROR_SENTINEL) else f"{_ERROR_SENTINEL} {text}"
+    )
+    return "failed", error_type, _next_run_label(meta)
 
 
 def _normalize_tag(s: str) -> str:
@@ -132,15 +156,29 @@ def _legacy_to_cron(stype: str, time_str: Optional[str] = None, hours=None, minu
 # JobExecutionLog
 # ---------------------------------------------------------------------------
 
-_RESULT_MAX_CHARS = 2000  # truncate result stored per entry
+_HISTORY_PERSIST_MARKER = "history persistence failure"  # dedicated last_error marker
+
+
+def _next_run_label(meta: dict) -> str:
+    """Return the job's next-run time for failure metadata, or "unknown" if unset."""
+    next_run = meta.get("_next_run")
+    return str(next_run) if next_run is not None else "unknown"
+
+
+def _new_run_id() -> str:
+    """Mint an independent scheduled execution ID (not an agent/prompt ID)."""
+    return f"run-{uuid.uuid4().hex}"
 
 
 class JobExecutionLog:
-    """Compact execution log for scheduled jobs, stored as JSONL.
+    """Execution log for scheduled jobs, stored as JSONL.
 
     Each entry:
         {"ts": ISO8601, "tag": str, "task": str, "result": str,
          "success": bool, "elapsed_s": int, "model": str}
+    New runs also carry ``run_id`` (``run-<uuid4 hex>``), terminal ``status``
+    (done/failed/cancelled) and, for failures, ``error_type``/``next_run``.
+    ``result`` is the complete returned text; no per-result size limit.
 
     Rotation (applied on every ``record()`` call):
     - Drop entries older than ``max_age_hours``
@@ -171,25 +209,46 @@ class JobExecutionLog:
         elapsed_s: int = 0,
         model: str = "",
         error_type: str = "",
-    ) -> None:
-        """Append a new entry and rotate old ones.  Thread-safe."""
+        run_id: str = "",
+        status: str = "",
+        next_run: str = "",
+    ) -> bool:
+        """Append a new entry and rotate old ones.  Thread-safe.
+
+        Returns True when the entry was persisted, False when the write failed.
+        """
         entry = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "tag": tag,
             "task": (task or "")[:200],
-            "result": (result or "")[:_RESULT_MAX_CHARS],
+            "result": result or "",
             "success": bool(success),
             "elapsed_s": int(elapsed_s),
             "model": model or "",
         }
+        if run_id:
+            entry["run_id"] = run_id
+        if status:
+            entry["status"] = status
         if error_type:
             entry["error_type"] = error_type
+        if next_run:
+            entry["next_run"] = next_run
         with self._lock:
-            entries = self._load()
-            entries.append(entry)
-            entries = self._rotate(entries)
-            self._write(entries)
-        logger.debug("JobExecutionLog: recorded entry for tag=%s success=%s", tag, success)
+            entries = self._read_entries()
+            if entries is None:
+                # Unreadable existing history: never rewrite it from an empty
+                # list; report the failure so the persistence marker fires.
+                persisted = False
+            else:
+                entries.append(entry)
+                entries = self._rotate(entries)
+                persisted = self._write(entries)
+        logger.debug(
+            "JobExecutionLog: recorded entry for tag=%s success=%s persisted=%s",
+            tag, success, persisted,
+        )
+        return persisted
 
     def format_for_prompt(self, max_entries: int = 20) -> str:
         """Return a compact human-readable summary for injection into the system prompt."""
@@ -216,17 +275,72 @@ class JobExecutionLog:
         return "\n".join(lines)
 
     def read_recent(self, n: int = 50) -> list[dict]:
-        """Return the most recent ``n`` entries (newest last)."""
+        """Return the most recent ``n`` retained entries (newest last)."""
+        return self._load_retained()[-n:]
+
+    def history(self, tag: str) -> list[dict]:
+        """Return retained execution summaries for ``tag``, newest first.
+
+        Each summary has ``run_id``, ``status``, ``ts``, ``tag`` and ``legacy``.
+        Pre-change records (boolean ``success``, no run ID) are legacy/partial:
+        their status maps success=true→done and success=false→failed, and no
+        run ID or result text is fabricated for them.
+        """
+        summaries = []
+        for entry in reversed(self._load_retained()):
+            if entry.get("tag") != tag:
+                continue
+            run_id = entry.get("run_id") or None
+            legacy = run_id is None
+            status = entry.get("status") if not legacy else None
+            if not status:
+                status = "done" if entry.get("success") else "failed"
+            summaries.append({
+                "run_id": run_id,
+                "status": status,
+                "ts": entry.get("ts", ""),
+                "tag": tag,
+                "legacy": legacy,
+            })
+        return summaries
+
+    def get_result(self, run_id: str) -> Optional[dict]:
+        """Return the complete retained record for ``run_id``, or None.
+
+        Expired, rotated-out, unknown and legacy (ID-less) records are all
+        unavailable; read-time retention applies even without a new write.
+        """
+        if not run_id:
+            return None
+        for entry in self._load_retained():
+            if entry.get("run_id") == run_id:
+                return dict(entry)
+        return None
+
+    def _load_retained(self) -> list[dict]:
+        """Load entries and apply age/per-tag retention at read time."""
         with self._lock:
             entries = self._load()
-        return entries[-n:]
+        return self._rotate(entries)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _load(self) -> list[dict]:
-        """Load all entries from the JSONL file.  Caller must hold self._lock."""
+        """Load all entries, treating an unreadable file as empty (reads only).
+
+        Caller must hold self._lock. Writers use ``_read_entries`` instead so a
+        read error never rewrites (and wipes) the existing history.
+        """
+        entries = self._read_entries()
+        return entries if entries is not None else []
+
+    def _read_entries(self) -> Optional[list[dict]]:
+        """Load all entries; [] when the file is missing, None on a read error.
+
+        Caller must hold self._lock.
+        """
         if not os.path.exists(self._log_file):
             return []
         entries = []
@@ -242,6 +356,7 @@ class JobExecutionLog:
                         pass
         except OSError as exc:
             logger.warning("JobExecutionLog: failed to read %s: %s", self._log_file, exc)
+            return None
         return entries
 
     def _rotate(self, entries: list[dict]) -> list[dict]:
@@ -264,8 +379,11 @@ class JobExecutionLog:
         kept.reverse()
         return kept
 
-    def _write(self, entries: list[dict]) -> None:
-        """Atomically write entries back to the JSONL file.  Caller must hold self._lock."""
+    def _write(self, entries: list[dict]) -> bool:
+        """Atomically write entries back to the JSONL file.  Caller must hold self._lock.
+
+        Returns False (after logging a warning) when the write failed.
+        """
         tmp_file = self._log_file + ".tmp"
         try:
             with open(tmp_file, "w", encoding="utf-8") as fh:
@@ -278,6 +396,8 @@ class JobExecutionLog:
                 os.unlink(tmp_file)
             except OSError:
                 pass
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +427,8 @@ class Scheduler:
         agent_cfg = config.get("agent", {})
         self.enabled: bool = sched_cfg.get("enabled", True)
         self.notify = notify_fn
+        self._result_notice_sink: Optional[Callable[[ResultNotice], None]] = None
+        self._unretained_run_ids: set[str] = set()
         self.agent = agent_fn
         self.builtin_executor = builtin_executor  # Optional[BuiltinExecutor]
         self._scheduler_config_path = scheduler_config_path
@@ -334,6 +456,9 @@ class Scheduler:
 
         # Overlap detection: tracks tags of currently executing jobs
         self._running_jobs: set = set()
+        # Admitted agentic runs per tag (run IDs); a tag stays running until
+        # every one of its runs has finished, so parallel runs are tracked.
+        self._active_runs: dict[str, set[str]] = {}
         # Reentrant lock: guards _running_jobs AND _jobs_meta AND schedule.* calls.
         # RLock needed because _register_job (which acquires) is called from
         # resume_job/reload which already hold the lock.
@@ -341,6 +466,10 @@ class Scheduler:
         # Serializes all writes to scheduler.toml and scheduler_state.json,
         # preventing race conditions when two jobs finish simultaneously.
         self._save_lock = threading.Lock()
+        # Makes "persist one execution record + set/clear its persistence
+        # marker" a single atomic step across concurrent run completions.
+        # Lock order: _history_lock → _running_lock → _save_lock.
+        self._history_lock = threading.RLock()
 
         paths.state_home.mkdir(parents=True, exist_ok=True)
         self._load_config_jobs(scheduler_config_path, sched_cfg)
@@ -836,9 +965,24 @@ class Scheduler:
         except (CroniterBadCronError, ValueError, TypeError) as exc:
             logger.warning("Could not compute next_run for job '%s' (%s): %s", tag, expr, exc)
 
-    def _mark_job_finished(self, tag: str) -> None:
-        """Called by sub-agent thread when a scheduled job's sub-agent completes."""
+    def _release_run(self, tag: str, run_id: Optional[str] = None) -> None:
+        """Release one run of ``tag``; the tag is idle only when no run remains.
+
+        ``run_id`` is None for non-agentic triggers (empty-task reminders),
+        which never hold an admitted run. Releasing an already-released run is
+        a no-op, so a duplicate finish signal cannot release another run.
+        """
+        if run_id is not None:
+            self._unretained_run_ids.discard(run_id)
         with self._running_lock:
+            runs = self._active_runs.get(tag, set())
+            if run_id is not None:
+                if run_id not in runs:
+                    return
+                runs.discard(run_id)
+            if runs:
+                return
+            self._active_runs.pop(tag, None)
             self._running_jobs.discard(tag)
 
     def _remove_once_job(self, tag: str) -> None:
@@ -862,8 +1006,14 @@ class Scheduler:
         if not manual and not meta.get("enabled", True):
             return
 
-        # Overlap detection
+        task = meta.get("task", "").strip()
+
+        # Overlap detection and admission happen in one locked step, so a
+        # finishing parallel sibling cannot mark the tag idle mid-admission.
+        # Admitted agentic runs mint their independent execution ID here;
+        # overlap skips and empty-task reminders never receive one.
         overlap_policy = meta.get("overlap_policy", "skip")
+        run_id: Optional[str] = None
         with self._running_lock:
             if tag in self._running_jobs:
                 if overlap_policy == "skip":
@@ -872,9 +1022,12 @@ class Scheduler:
                     )
                     return
                 # else: parallel — allow multiple instances
+            if task:
+                run_id = _new_run_id()
             self._running_jobs.add(tag)
+            if run_id is not None:
+                self._active_runs.setdefault(tag, set()).add(run_id)
 
-        task = meta.get("task", "").strip()
         job_model = meta.get("model") or None
         _log_extra = f" | model={job_model}" if job_model else ""
         logger.info("Running scheduled job %s%s", tag, _log_extra)
@@ -882,17 +1035,138 @@ class Scheduler:
         is_once = meta.get("schedule_type") == "once"
 
         # --- Empty task guard ---
-        if not task:
+        if run_id is None:
             self._handle_empty_task(tag, meta, now, is_once)
             return
 
         # Prefer spawn_agent via builtin_executor if available
         if self.builtin_executor is not None and hasattr(self.builtin_executor, 'spawn_agent'):
-            self._run_via_spawn_agent(tag, meta, task, job_model, now, is_once)
+            self._run_via_spawn_agent(tag, meta, task, job_model, now, is_once, run_id)
             return
 
         # Fallback: direct agent_fn call (legacy / no builtin_executor)
-        self._run_via_agent_fn(tag, meta, task, job_model, now, is_once)
+        self._run_via_agent_fn(tag, meta, task, job_model, now, is_once, run_id)
+
+    def _run_result_recorder(self, run_id: str, meta: dict) -> Callable[..., None]:
+        """Return a per-run result-log callback recording a complete terminal record."""
+
+        def record(
+            *, tag: str, task: str, result: str, success: bool,
+            elapsed_s: int = 0, model: str = "",
+        ) -> None:
+            status, error_type, next_run = _classify_outcome(result, success, meta)
+            self._record_execution(
+                meta,
+                tag=tag, task=task, result=result, success=status == "done",
+                elapsed_s=elapsed_s, model=model, error_type=error_type,
+                run_id=run_id, status=status, next_run=next_run,
+            )
+
+        return record
+
+    def set_result_notice_sink(self, sink: Optional[Callable[[ResultNotice], None]]) -> None:
+        """Route scheduled run-result notices to ``sink`` instead of ``notify``.
+
+        The Telegram adapter installs its idle queue here. Direct alerts
+        (launch failures, empty-task reminders, long-running warnings) never
+        use the sink. ``None`` restores direct delivery.
+        """
+        self._result_notice_sink = sink
+
+    def _deliver_result_notice(self, notice: ResultNotice) -> None:
+        """Hand a run-result notice to the sink, or its HTML to ``notify`` when none is set."""
+        sink = self._result_notice_sink
+        try:
+            if sink is not None:
+                sink(notice)
+            else:
+                self.notify(notice.text)
+        except Exception as exc:  # noqa: BLE001 - best-effort delivery; history is authoritative
+            logger.warning("Could not deliver scheduled run-result notice: %s", exc)
+
+    def _run_completion_handler(
+        self, run_id: str, meta: dict,
+    ) -> Callable[[RunCompletion], None]:
+        """Return the per-run handler that turns a terminal outcome into a notice.
+
+        The supervisor invokes this only for notifying runs that are not
+        timeout-cancelled. A run whose outcome could not be persisted gets its
+        real outcome summary plus a truthful "not retained" note instead of the
+        result and a Details control.
+        """
+
+        def complete(completion: RunCompletion) -> None:
+            status, error_type, next_run = _classify_outcome(
+                completion.result, completion.status == "done", meta,
+            )
+            if run_id in self._unretained_run_ids:
+                self._unretained_run_ids.discard(run_id)
+                notice = build_unretained_notice(
+                    completion.tag, status, error_type, next_run,
+                )
+            else:
+                notice = build_run_result_notice(
+                    completion.tag, status, completion.result, error_type, next_run, run_id,
+                )
+            self._deliver_result_notice(notice)
+
+        return complete
+
+    def _record_execution(self, meta: dict, **record_kwargs) -> None:
+        """Persist one execution record, applying write-failure precedence.
+
+        A failed write always logs the real run outcome, sets the job's
+        ``last_error`` to the history-persistence marker (overwriting any prior
+        value) and, when ``notify`` is true, flags the run so its completion
+        handler sends the real outcome with a "not retained" note. Nothing is
+        queued here, so timeout-cancel suppression and direct launch-failure
+        alerts stay in charge. A successful write clears ``last_error`` only
+        while it still holds that marker.
+        """
+        tag = record_kwargs["tag"]
+        run_id = record_kwargs.get("run_id", "")
+        status = record_kwargs.get("status", "")
+        with self._history_lock:
+            if self.execution_log.record(**record_kwargs):
+                self._clear_persistence_marker(tag, meta)
+                return
+            marker = (
+                f"{_HISTORY_PERSIST_MARKER}: outcome of run {run_id or 'unknown'} "
+                f"({status or 'unknown'}) was not retained; Details are unavailable."
+            )
+            logger.warning(
+                "Job %s: %s Run outcome: status=%s result=%s",
+                tag, marker, status, record_kwargs.get("result", ""),
+            )
+            self._set_job_last_error(tag, meta, marker)
+        if run_id and meta.get("notify", True):
+            self._unretained_run_ids.add(run_id)
+
+    def _set_job_last_error(self, tag: str, meta: dict, value: Optional[str]) -> None:
+        """Set ``last_error`` on the active job (if any) and retained history.
+
+        Mutations take ``_running_lock`` (guards ``_jobs_meta`` snapshots) and
+        ``_save_lock`` (guards serialization of ``_run_history``), in the
+        documented order, so they never race an in-progress state save.
+        """
+        with self._running_lock, self._save_lock:
+            targets = [meta]
+            active = self._jobs_meta.get(tag)
+            if active is not None and active is not meta:
+                targets.append(active)
+            for target in targets:
+                if value is None:
+                    target.pop("last_error", None)
+                else:
+                    target["last_error"] = value
+            self._run_history.setdefault(tag, {})["last_error"] = value
+        self._save_state()
+
+    def _clear_persistence_marker(self, tag: str, meta: dict) -> None:
+        """Clear ``last_error`` only if it still holds the persistence marker."""
+        current = self._run_history.get(tag, {}).get("last_error") or ""
+        if _HISTORY_PERSIST_MARKER in current:
+            self._set_job_last_error(tag, meta, None)
 
     def _handle_empty_task(self, tag: str, meta: dict, now: str, is_once: bool) -> None:
         """Send a direct notification for jobs with no task text."""
@@ -901,8 +1175,7 @@ class Scheduler:
         meta["last_run"] = now
         self._run_history[tag] = {"last_run": now, "last_error": None}
         self._save_state()
-        with self._running_lock:
-            self._running_jobs.discard(tag)
+        self._release_run(tag)
         if is_once:
             self._remove_once_job(tag)
         if meta.get("notify", True):
@@ -910,6 +1183,7 @@ class Scheduler:
 
     def _run_via_spawn_agent(
         self, tag: str, meta: dict, task: str, job_model: Optional[str], now: str, is_once: bool,
+        run_id: str,
     ) -> None:
         """Execute a job by spawning a sub-agent via builtin_executor."""
         preserve_ctx = meta.get("preserve_context", False)
@@ -919,6 +1193,8 @@ class Scheduler:
         if job_model:
             spawn_args["model"] = job_model
         if context_key:
+            # Marker only: the spawn path ignores this value for scheduled runs
+            # and derives an origin-scoped key from the job tag instead.
             spawn_args["context_key"] = context_key
 
         # Internal supervision controls travel through per-submission options,
@@ -926,15 +1202,15 @@ class Scheduler:
         # avoid the shared-attribute race when multiple jobs fire concurrently.
         options = SupervisionOptions(
             job_tag=tag,
-            # finish callback → cleans up _running_jobs when the sub-agent ends
-            finish_cb=self._mark_job_finished,
-            # execution-log recorder so the supervisor logs the job result
-            result_log_cb=self.execution_log.record,
+            # finish callback → releases this run when the sub-agent ends
+            finish_cb=lambda _finish_tag: self._release_run(tag, run_id),
+            # per-run execution-log recorder so the supervisor logs the
+            # complete job result under this run's execution ID
+            result_log_cb=self._run_result_recorder(run_id, meta),
+            # terminal handoff: classified run-result notice for the presentation owner
+            completion_cb=self._run_completion_handler(run_id, meta),
             # honour the job's notify setting — False suppresses Telegram output
             notify=meta.get("notify", True),
-            # scheduled results are shown as plain text, not collapsed in an
-            # expandable blockquote (which hides the result by default)
-            expandable=False,
             # tag the registry record as a scheduled run (internal channel,
             # never a model-facing spawn_agent arg); still capacity-counted.
             source=SOURCE_SCHEDULED,
@@ -945,107 +1221,82 @@ class Scheduler:
         self._run_history.setdefault(tag, {})["last_run"] = now
         self._save_state()
 
-        result = self.builtin_executor.spawn_agent(spawn_args, options=options)
+        try:
+            result = self.builtin_executor.spawn_agent(spawn_args, options=options)
+        except Exception as exc:  # noqa: BLE001 - any launch error must release the admitted run
+            logger.error("Job %s spawn raised: %s", tag, exc, exc_info=True)
+            result = {
+                "success": False,
+                "error": f"spawn_agent raised {type(exc).__name__}: {exc}",
+            }
         if not result.get("success"):
             logger.error("Job %s spawn failed: %s", tag, result.get("error"))
-            meta["last_error"] = result.get("error", "spawn failed")
-            self._run_history[tag]["last_error"] = meta["last_error"]
-            self._save_state()
-            # Always notify on error
-            error_message = str(meta["last_error"])
-            error_type = _classify_job_failure(_ERROR_SENTINEL + " " + error_message)
-            next_run = meta.get("_next_run", "unknown")
-            self.notify(
-                f"⚠️ <b>Job {_html.escape(tag)} failed to spawn</b>"
-                f" ({_html.escape(error_type)})\n"
-                f"Next run: {_html.escape(str(next_run))}\n"
-                f"{_html.escape(error_message)}"
+            self._fail_launch(
+                tag, meta, str(result.get("error", "spawn failed")), "failed to spawn",
+                task=task, model=job_model or "", run_id=run_id,
             )
-            with self._running_lock:
-                self._running_jobs.discard(tag)
         else:
-            # _running_jobs will be cleaned up by _mark_job_finished callback
+            # this run is released by its finish_cb when the sub-agent ends
             # Auto-remove once jobs (spawn_agent will still deliver result)
             if is_once:
                 self._remove_once_job(tag)
 
     def _run_via_agent_fn(
         self, tag: str, meta: dict, task: str, job_model: Optional[str], now: str, is_once: bool,
+        run_id: str,
     ) -> None:
-        """Execute a job via the legacy direct agent_fn callback."""
-        result = ""
-        error_occurred = False
-        try:
-            if self.agent:
-                result = self.agent(task)
-            else:
-                result = "Agent not available for task."
-            if result.startswith(_ERROR_SENTINEL):
-                error_occurred = True
-        except (OSError, RuntimeError, ValueError) as exc:
-            logger.error("Job %s failed: %s", tag, exc)
-            result = f"Job failed: {exc}"
-            error_occurred = True
-        finally:
-            with self._running_lock:
-                self._running_jobs.discard(tag)
+        """Fail closed when no scheduled-profile executor is available.
 
+        The legacy direct-agent fallback never invokes the singleton operator
+        agent for agentic scheduled work: that would run the job with operator
+        memory and confirmation authority. The run is reported as a launch
+        failure through the direct launch-failure alert policy instead.
+        """
+        logger.error(
+            "Job %s not run: scheduled executor unavailable (fail-closed)", tag,
+        )
         meta["last_run"] = now
-        if error_occurred:
-            meta["last_error"] = result
-        else:
-            meta.pop("last_error", None)
-
-        self._run_history[tag] = {
-            "last_run": meta["last_run"],
-            "last_error": meta.get("last_error"),
-        }
-        self._save_state()
-
-        error_type = _classify_job_failure(result)
-
-        # Record in execution log
-        self.execution_log.record(
-            tag=tag,
-            task=task,
-            result=result,
-            success=not error_occurred,
-            elapsed_s=0,
-            model=job_model or "",
-            error_type=error_type,
+        self._run_history.setdefault(tag, {})["last_run"] = now
+        self._fail_launch(
+            tag,
+            meta,
+            "Scheduled executor unavailable: the job was not run (fail-closed; "
+            "scheduled work never uses the operator agent). Check the agent's "
+            "startup log for executor wiring errors, restart it, then retry with "
+            "run_now.",
+            "failed to launch",
+            task=task, model=job_model or "", run_id=run_id,
         )
 
-        if error_occurred:
-            if meta.get("notify", True):
-                next_run = meta.get("_next_run", "unknown")
-                self.notify(
-                    f"⚠️ <b>Scheduled job failed:</b> <code>{_html.escape(tag)}</code>"
-                    f" ({_html.escape(error_type)})\n"
-                    f"Next run: {_html.escape(str(next_run))}\n\n"
-                    f"{_html.escape(result)}"
-                )
-            return
+    def _fail_launch(
+        self, tag: str, meta: dict, error_message: str, headline: str,
+        *, task: str, model: str, run_id: str,
+    ) -> None:
+        """Record a launch failure, alert directly (independent of notify), release the run.
 
-        if tag == "longterm_memory_update":
-            # P2 consolidation: the special longterm_memory_update job is
-            # deprecated. Runtime semantic recall is served by graph memory; JSON
-            # LongTermMemory is legacy/backfill-only and is no longer written at
-            # runtime. The job still runs and reports its result, but its output
-            # is not auto-persisted into any semantic store.
-            logger.warning(
-                "Job '%s' uses the deprecated longterm_memory_update tag: its result "
-                "is no longer auto-persisted. Use memory_graph_store (confirmed) to "
-                "remember facts.",
-                tag,
+        The admitted run's failed execution record carries its run ID and the
+        launch error, with failure classification and next-run metadata.
+        """
+        try:
+            meta["last_error"] = error_message
+            self._run_history.setdefault(tag, {})["last_error"] = error_message
+            self._save_state()
+            error_type = _classify_job_failure(_ERROR_SENTINEL + " " + error_message)
+            next_run = _next_run_label(meta)
+            self._record_execution(
+                meta,
+                tag=tag, task=task, result=error_message, success=False,
+                model=model, error_type=error_type, run_id=run_id,
+                status="failed", next_run=next_run,
             )
-
-        # Auto-remove once/reminder jobs after successful execution
-        if is_once:
-            logger.info("Once job completed — removing")
-            self._remove_once_job(tag)
-
-        if meta.get("notify", True):
-            self.notify(f"📅 <b>Scheduled: {_html.escape(tag)}</b>\n\n{_html.escape(result)}")
+            self.notify(
+                f"⚠️ <b>Job {_html.escape(tag)} {headline}</b>"
+                f" ({_html.escape(error_type)})\n"
+                f"Next run: {_html.escape(next_run)}\n"
+                f"{_html.escape(error_message)}"
+            )
+        finally:
+            self._release_run(tag, run_id)
 
     def _process_pending_commands(self) -> None:
         if not os.path.exists(self._commands_file):

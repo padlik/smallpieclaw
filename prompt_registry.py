@@ -306,7 +306,11 @@ class PromptRegistry:
             logger.info("Prompt %s finished (status=%s)", prompt_id, status)
 
     def add_sub_agent(self, prompt_id: str, agent_id: str) -> None:
-        """Record a spawned sub-agent against the originating prompt."""
+        """Backward-compatible alias for explicit child association."""
+        self.associate_sub_agent(prompt_id, agent_id)
+
+    def associate_sub_agent(self, prompt_id: str, agent_id: str) -> None:
+        """Associate an admitted child with its explicit owning prompt ID."""
         with self._lock:
             record = self._records.get(prompt_id)
             if record is None:
@@ -320,6 +324,26 @@ class PromptRegistry:
                 "agent_id": agent_id,
             })
             logger.info("Prompt %s recorded sub-agent %s", prompt_id, agent_id)
+
+    def remove_sub_agent(self, prompt_id: str, agent_id: str) -> None:
+        """Undo a child association after a failed admission.
+
+        Used by the supervisor's admission rollback so a submission failure
+        does not leave the agent ID recorded against the owning prompt.
+        """
+        with self._lock:
+            record = self._records.get(prompt_id)
+            if record is None:
+                logger.warning("remove_sub_agent called for unknown prompt_id %s", prompt_id)
+                return
+            if agent_id in record.sub_agent_ids:
+                record.sub_agent_ids.remove(agent_id)
+            self._append_line({
+                "prompt_id": prompt_id,
+                "action": "remove_sub_agent",
+                "agent_id": agent_id,
+            })
+            logger.info("Prompt %s removed sub-agent %s", prompt_id, agent_id)
 
     def get(self, prompt_id: str) -> Optional[PromptRecord]:
         """Return the prompt record by ID, or ``None`` if unknown."""

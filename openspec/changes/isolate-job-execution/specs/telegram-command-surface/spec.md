@@ -1,8 +1,8 @@
 ## ADDED Requirements
 
-### Requirement: Read-only scheduled job history and result commands
+### Requirement: Scheduled job history view is read-only and honest
 
-The authenticated Telegram `/jobs` command SHALL preserve its existing job-management surface and add read-only `/jobs history <tag>` and `/jobs result <execution-id>` views. These commands MUST read retained **job execution records** directly and MUST NOT invoke the operator agent, create an operator prompt, or read or modify operator memory. History SHALL show retained run IDs, statuses, and timestamps, including records for removed once-jobs. Legacy records without execution IDs SHALL be identified as legacy/partial and SHALL NOT be assigned fabricated IDs or represented as complete. Result lookup SHALL present one complete retained outcome; when it exceeds Telegram's message limit, it SHALL be delivered as a complete UTF-8 text document. Unknown or expired execution IDs SHALL report that the result is unavailable. Missing arguments SHALL return usage. For history, a tag with no active definition and no retained runs is unknown; an active job with no retained runs has empty history; a removed once-job with retained records remains known until those records expire. The commands are read-only and available only to the authenticated operator.
+The authenticated `/jobs history <tag>` view SHALL read retained **job execution records** directly and MUST NOT invoke the operator agent, create a prompt, or touch operator memory. It SHALL show retained run IDs, statuses, and timestamps, including removed once-jobs. Legacy records without execution IDs SHALL be identified as legacy/partial, with no fabricated IDs or completeness claim.
 
 #### Scenario: History lists retained runs directly
 - **GIVEN** an authenticated operator requests `/jobs history <tag>` for a tag with retained executions
@@ -20,6 +20,10 @@ The authenticated Telegram `/jobs` command SHALL preserve its existing job-manag
 - **WHEN** it appears in `/jobs history <tag>`
 - **THEN** it is identified as legacy/partial with its mapped status and timestamp
 - **AND** no execution ID or missing output is fabricated
+
+### Requirement: Scheduled job result view is read-only and complete
+
+The authenticated `/jobs result <execution-id>` command SHALL present one complete retained outcome directly from its **job execution record**, without invoking the operator agent, creating an operator prompt, or reading or modifying operator memory. A result exceeding Telegram's message limit SHALL be delivered as a complete UTF-8 text document. Unknown or expired execution IDs SHALL report that the result is unavailable.
 
 #### Scenario: Result command returns complete retained outcome
 - **GIVEN** an authenticated operator requests `/jobs result <execution-id>` for a retained record
@@ -39,6 +43,10 @@ The authenticated Telegram `/jobs` command SHALL preserve its existing job-manag
 - **THEN** it reports that the result is unavailable
 - **AND** it does not access operator memory or create a prompt
 
+### Requirement: Scheduled job history distinguishes unknown, empty, and removed tags
+
+For `/jobs history <tag>`, a tag with no active definition and no retained runs SHALL be reported unknown; an active job with no retained runs SHALL be reported as empty history; a removed once-job with retained records SHALL remain known until those records expire.
+
 #### Scenario: Unknown tag history is reported
 - **GIVEN** an authenticated operator requests history for a tag with no active definition and no retained runs
 - **WHEN** the command looks up the tag
@@ -48,6 +56,10 @@ The authenticated Telegram `/jobs` command SHALL preserve its existing job-manag
 - **GIVEN** an authenticated operator requests history for a tag with an active definition but no retained runs
 - **WHEN** the command looks up the tag
 - **THEN** the command reports empty history
+
+### Requirement: Job history and result commands are authenticated and discoverable
+
+`/jobs history` and `/jobs result` SHALL be available only to the authenticated operator and SHALL be documented as read-only views in `/help` and `/jobs` usage. A missing required argument SHALL return usage text without invoking the operator agent. Existing `/jobs`, `/agents`, and `/stop` contracts MUST remain unchanged.
 
 #### Scenario: Missing arguments show command usage
 - **GIVEN** an authenticated operator invokes `/jobs history` or `/jobs result` without its required argument

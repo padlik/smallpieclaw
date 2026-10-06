@@ -171,7 +171,7 @@ systemctl --user enable --now telegram-agent
 | `/tools` | List all built-in and MCP tools |
 | `/skills` | List available agent skills |
 | `/models` | List LLM models and switch active one (👁 = vision-capable) |
-| `/jobs` | Scheduled jobs; sub-commands: `reload`, `pause <tag>`, `resume <tag>`, `remove <tag>` |
+| `/jobs` | Scheduled jobs; sub-commands: `reload`, `pause <tag>`, `resume <tag>`, `remove <tag>`; read-only views: `history <tag>`, `result <execution-id>` |
 | `/agents` | Active sub-agents, scheduled jobs, and plan-step agents (with source category); `/agents cancel <id>` to stop one |
 | `/prompts` | Recent prompts with status and elapsed time; `/prompts search <query> [Nd/Nh] [--status=<S>] [--trace=<T>] [--since=<ISO>] [--until=<ISO>] [--page=<N>]` to search history; `/prompts show <id>` for full record |
 | `/mcp` | Manage MCP servers: `list`, `on <name>`, `off <name>`, `info <name>` |
@@ -458,6 +458,19 @@ Per-job options: `model`, `preserve_context`, `context_max_messages`, `overlap_p
 
 Key features: hot-reload without restart (`/jobs reload`), automatic backups before each write (last 5 kept), ±5 min jitter on first cron run, run history in `data/scheduler_state.json`.
 
+**Run results and notices.** Every scheduled run gets its own execution ID (`run-<32 hex>`) and a complete result record in `job_execution_log.jsonl` in the state directory. Records are kept for `[scheduler] execution_log_max_age_hours` (default 48) and at most `execution_log_max_per_job` (default 10) per job; older records expire and their results become unavailable. A scheduled run uses its own job context only — it does not read or write operator memory, and a run's result never enters your chat context.
+
+With `notify = true`, the result notice for a finished, failed, or cancelled run is held until your current reply has been sent and typing has stopped, then delivered **silently** (no sound). Failure notices include the error type and next run time. A result that fits in one message appears in an expandable quote under the summary; a longer one is replaced by a compact notice with the execution ID and a **Details** button that delivers the complete result (as a message or `.txt` document). If a run's result could not be saved, its notice still shows the run outcome (including the failure header, error type and next run time for a failed run), states that the result was not retained and Details are unavailable, and has no Details button. With `notify = false` no result notice is sent, but the run is still recorded. Notices are queued in memory only: if the bot restarts before a queued notice is sent, it is dropped, but the run stays available in history. Launch failures, empty-task reminders, and long-running-agent warnings are still sent immediately.
+
+Read-only history views (authorised operator only; they never start an agent turn or touch memory):
+
+| Command | Shows |
+|---------|-------|
+| `/jobs history <tag>` | Retained run IDs, statuses, and timestamps for a job, newest first. Removed `once` jobs stay listed until their records expire. Records written before this feature appear as `legacy/partial` (status and timestamp only, no execution ID or full output). A tag with no definition and no retained runs is reported as unknown; an active job with no retained runs reports no retained runs |
+| `/jobs result <execution-id>` | The complete result of one retained run: sent as a message if it fits in Telegram's 4,096-character limit, otherwise as a complete UTF-8 `<execution-id>.txt` document. Unknown or expired IDs report the result as unavailable |
+
+Both commands show usage if the `<tag>` or `<execution-id>` argument is missing.
+
 ### Memory architecture
 
 | Tier | Storage | Purpose |
@@ -506,7 +519,7 @@ Graph memory health is visible in `/status` and `/memory`. Health states: `activ
 
 ### Sub-agents
 
-Sub-agents are isolated background ReAct loops — non-blocking, own LLM context, result delivered via Telegram and written to long-term memory. Every scheduled job runs as a sub-agent.
+Sub-agents are isolated background ReAct loops — non-blocking, with their own LLM context. Every agentic scheduled job runs as a sub-agent with its own job context: its complete result is kept in job history under its execution ID, and nothing from a scheduled run enters operator memory or recall. For jobs with `notify` on, the run-result notice is deferred until your current turn is idle and arrives silently (an expandable quote, or a compact message with a Details button for long results); with `notify` off nothing is sent but the result is still recorded. See "Run results and notices" in the scheduler section.
 
 Key configuration:
 

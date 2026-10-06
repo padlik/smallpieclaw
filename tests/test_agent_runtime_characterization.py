@@ -240,20 +240,31 @@ class TestAgentControllerReactContextAssembly:
     def test_callbacks_and_context_payload_propagated(self):
         on_step = MagicMock()
         on_tool_trace = MagicMock()
-        job_history_fn = MagicMock()
         ctrl = _make_controller(
             on_step=on_step,
             on_tool_trace=on_tool_trace,
-            job_history_fn=job_history_fn,
         )
         ctrl._context_payload = {"parent": "ctx"}
         ctrl._prompt_variant = "sub-agent"
         ctx, _ = _run_capture(ctrl)
         assert ctx.on_step is on_step
         assert ctx.on_tool_trace is on_tool_trace
-        assert ctx.job_history_fn is job_history_fn
         assert ctx._context_payload == {"parent": "ctx"}
         assert ctx._prompt_variant == "sub-agent"
+
+    def test_controller_rejects_removed_job_history_fn(self):
+        """The dormant operator job-history seam is gone (isolate-job-execution DRIFT-01)."""
+        with pytest.raises(TypeError):
+            _make_controller(job_history_fn=MagicMock())
+
+    def test_react_context_has_no_job_history_field(self):
+        from dataclasses import fields as dc_fields
+
+        from agent_runtime import ControllerDeps
+        from react_loop import ReactContext
+
+        names = {f.name for f in dc_fields(ReactContext)} | {f.name for f in dc_fields(ControllerDeps)}
+        assert "job_history_fn" not in names
 
 
 # ===========================================================================
@@ -576,3 +587,316 @@ class TestMainActiveIndexRestore:
             with pytest.raises(RuntimeError):
                 ctrl.run("goal")
         assert llm._active_idx == 0
+
+
+# ===========================================================================
+# isolate-job-execution 2.1 — scheduled runs use only job-owned context
+# ===========================================================================
+
+_SCHEDULED_TRIGGERS = ("cron", "once", "run_now")
+_JOB_TAG = "nightly_report"
+
+
+def _operator_collaborators() -> dict:
+    """Operator-owned memory collaborators populated with recognisable content."""
+    memory = MagicMock(name="operator_memory")
+    memory.as_prompt_text.return_value = "operator KV memory"
+    results = MagicMock(name="operator_results")
+    results.as_prompt_text.return_value = "operator result recall"
+    working = WorkingMemory()
+    working.start_task("operator goal")
+    working.add_step("tool", {"tool": "shell", "output": "operator tool result 1"})
+    working.add_step("tool", {"tool": "file_read", "output": "operator tool result 2"})
+    graph_memory = MagicMock(name="operator_graph")
+    graph_memory.format_for_prompt.return_value = "operator graph memory"
+    return {
+        "memory": memory,
+        "results": results,
+        "working": working,
+        "graph_memory": graph_memory,
+    }
+
+
+def _runtime_factory(runtime: AgentRuntime):
+    """Mirror ``main.sub_agent_factory``: a thin frontend over ``create``."""
+    from agent_runtime import RuntimeOptions, RuntimeProfile
+
+    def factory(model=None, context_key=None, label="on-demand", notify_fn=None,
+                max_iterations=None, max_tokens=None, temperature=None,
+                top_p=None, on_tool_trace=None, cancel_event=None,
+                trace_id=None, context_payload=None, prompt_variant=None,
+                runtime_profile=RuntimeProfile.ON_DEMAND_SUBAGENT):
+        options = RuntimeOptions(
+            model=model, max_iterations=max_iterations, max_tokens=max_tokens,
+            temperature=temperature, top_p=top_p, context_key=context_key,
+            context_payload=context_payload, prompt_variant=prompt_variant,
+            trace_id=trace_id, cancel_event=cancel_event, label=label,
+        )
+        return runtime.create(
+            runtime_profile, options,
+            notify_fn=notify_fn, on_tool_trace=on_tool_trace,
+        )
+
+    return factory
+
+
+def _build_operator_stack(make_builtin_executor, tmp_path):
+    """Build a real executor + runtime wired to operator-owned collaborators."""
+    operator = _operator_collaborators()
+    executor = make_builtin_executor(
+        memory=operator["memory"],
+        results=operator["results"],
+        working=operator["working"],
+        data_dir=str(tmp_path),
+    )
+    executor._graph_memory = operator["graph_memory"]
+    runtime = AgentRuntime(
+        config=_cfg(),
+        all_models=_cfg()["models"],
+        background_model_cfg=_cfg()["models"][0],
+        tool_index=MagicMock(),
+        base_memory=operator["memory"],
+        builtin_executor=executor,
+        skill_registry=MagicMock(),
+        results=operator["results"],
+        data_dir=str(tmp_path),
+    )
+    executor._sub_agent_factory = _runtime_factory(runtime)
+    return executor, operator
+
+
+def _make_scheduler(tmp_path, monkeypatch, executor):
+    """A real Scheduler routing agentic jobs through ``executor.spawn_agent``."""
+    from scheduler import Scheduler
+    from xdg import xdg_paths
+
+    config_path = tmp_path / "scheduler.toml"
+    config_path.write_text("")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    return Scheduler(
+        config={"scheduler": {"enabled": True}, "agent": {"long_run_warn_minutes": 0}},
+        notify_fn=MagicMock(),
+        scheduler_config_path=str(config_path),
+        paths=xdg_paths("test-agent"),
+        builtin_executor=executor,
+    )
+
+
+def _fire_trigger(scheduler, trigger: str) -> None:
+    """Fire *trigger* through the scheduler's own route (loop or run_now)."""
+    import datetime as _dt
+
+    import schedule
+
+    if trigger == "run_now":
+        assert scheduler.run_now(_JOB_TAG)["success"] is True
+        return
+    scheduler._register_job(_JOB_TAG, scheduler._jobs_meta[_JOB_TAG])
+    past = _dt.datetime.now() - _dt.timedelta(seconds=5)
+    if trigger == "cron":
+        scheduler._jobs_meta[_JOB_TAG]["_next_run"] = past.isoformat()
+    else:
+        for job in schedule.get_jobs(_JOB_TAG):
+            job.next_run = past
+    loop = threading.Thread(target=scheduler._run_loop, daemon=True)
+    scheduler._thread = loop
+    loop.start()
+
+
+def drive_scheduled_trigger(
+    trigger: str, make_builtin_executor, tmp_path, monkeypatch,
+    *, preserve_context: bool = False, legacy_flat_context: bool = False,
+):
+    """Run one scheduled job via a real trigger route; return its ReactContext.
+
+    The job flows Scheduler -> ``BuiltinExecutor.spawn_agent`` -> supervisor
+    admission -> ``AgentRuntime.create`` -> ``SubAgentRunner.run``; only the
+    ReAct loop itself is replaced so the constructed context can be inspected.
+    Returns ``(ctx, operator_collaborators)``.
+    """
+    import schedule
+
+    from builtin_tools.context_io import _save_context, scheduled_context_key
+    from sub_agent_registry import get_registry
+
+    executor, operator = _build_operator_stack(make_builtin_executor, tmp_path)
+    scheduler = _make_scheduler(tmp_path, monkeypatch, executor)
+    schedule_kwargs = (
+        {"schedule_type": "once", "run_at": "23:59"}
+        if trigger == "once"
+        else {"schedule_type": "cron", "cron": "0 3 * * *"}
+    )
+    added = scheduler.add_job(
+        _JOB_TAG, task="compile the nightly report", notify=False,
+        preserve_context=preserve_context, **schedule_kwargs,
+    )
+    assert added["success"] is True
+    if preserve_context:
+        saved = ShortTermMemory(max_turns=50)
+        saved.add("user", "job-owned earlier request")
+        saved.add("assistant", "job-owned earlier answer")
+        _save_context(
+            _JOB_TAG if legacy_flat_context else scheduled_context_key(_JOB_TAG),
+            saved, str(tmp_path),
+        )
+
+    captured: dict = {}
+    ran = threading.Event()
+
+    def _fake_loop(ctx, goal, _progress, _images):
+        captured["ctx"] = ctx
+        captured["goal"] = goal
+        ran.set()
+        return "job done"
+
+    try:
+        with patch("agent_controller.react_loop", side_effect=_fake_loop):
+            _fire_trigger(scheduler, trigger)
+            assert ran.wait(timeout=10), f"{trigger} trigger never ran the job"
+    finally:
+        scheduler._stop_event.set()
+        if scheduler._thread is not None:
+            scheduler._thread.join(timeout=5)
+        schedule.clear(_JOB_TAG)
+        executor._supervisor.shutdown(graceful_timeout=2)
+        reg = get_registry()
+        for rec in reg.list_active():
+            reg.unregister(rec.agent_id)
+    return captured["ctx"], operator
+
+
+@pytest.mark.parametrize("trigger", _SCHEDULED_TRIGGERS)
+class TestScheduledRunJobOwnedContext:
+    """Each scheduled run constructs only job-owned context (design decision 2)."""
+
+    def test_operator_kv_memory_not_wired(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        ctx, operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+        )
+        assert ctx.memory is not operator["memory"]
+        assert "operator KV memory" not in ctx.memory.as_prompt_text()
+
+    def test_operator_result_recall_not_wired(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        ctx, _operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+        )
+        assert ctx.results is None
+
+    def test_operator_working_memory_not_wired(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        ctx, operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+        )
+        assert ctx.working is not operator["working"]
+        assert not ctx.working.has_content()
+
+    def test_graph_memory_references_remain_none(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        ctx, _operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+        )
+        assert ctx.graph_memory is None
+        assert ctx.graph_memory_writer is None
+
+    def test_cross_job_execution_history_not_wired(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        ctx, _operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+        )
+        assert not hasattr(ctx, "job_history_fn")
+
+    def test_preserve_context_retains_only_job_conversation(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        ctx, _operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+            preserve_context=True,
+        )
+        assert ctx.short_term.get_messages() == [
+            {"role": "user", "content": "job-owned earlier request"},
+            {"role": "assistant", "content": "job-owned earlier answer"},
+        ]
+
+    def test_legacy_flat_context_is_never_imported(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        ctx, _operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+            preserve_context=True, legacy_flat_context=True,
+        )
+        assert ctx.short_term.get_messages() == []
+
+
+class TestScheduledTriggerRoutesAgree:
+    """Cron, once, and run_now produce the same job-owned isolation outcome."""
+
+    def test_all_trigger_routes_yield_identical_isolation(
+        self, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        outcomes = {}
+        for trigger in _SCHEDULED_TRIGGERS:
+            run_dir = tmp_path / trigger
+            run_dir.mkdir()
+            ctx, operator = drive_scheduled_trigger(
+                trigger, make_builtin_executor, run_dir, monkeypatch,
+                preserve_context=True,
+            )
+            outcomes[trigger] = {
+                "own_kv_memory": ctx.memory is not operator["memory"],
+                "own_working_memory": ctx.working is not operator["working"],
+                "no_result_recall": ctx.results is None,
+                "no_graph_memory": ctx.graph_memory is None
+                and ctx.graph_memory_writer is None,
+                "job_messages": [m["content"] for m in ctx.short_term.get_messages()],
+            }
+
+        assert set(outcomes) == set(_SCHEDULED_TRIGGERS)
+        assert outcomes["cron"] == outcomes["once"] == outcomes["run_now"]
+        assert outcomes["cron"] == {
+            "own_kv_memory": True,
+            "own_working_memory": True,
+            "no_result_recall": True,
+            "no_graph_memory": True,
+            "job_messages": ["job-owned earlier request", "job-owned earlier answer"],
+        }
+
+
+class TestScheduledMemoryIsolatedPerRun:
+    """Scheduled memory objects are private to one run, never shared across runs."""
+
+    def test_each_scheduled_product_gets_distinct_memory(self):
+        from agent_runtime import RuntimeOptions, RuntimeProfile
+
+        runtime = AgentRuntime(
+            config=_cfg(), all_models=_cfg()["models"],
+            background_model_cfg=_cfg()["models"][0],
+            base_memory=MagicMock(name="operator_memory"),
+            builtin_executor=MagicMock(), results=MagicMock(),
+        )
+        first = runtime.create(RuntimeProfile.SCHEDULED_AGENT, RuntimeOptions())
+        second = runtime.create(RuntimeProfile.SCHEDULED_AGENT, RuntimeOptions())
+        assert first._agent.memory is not second._agent.memory
+
+
+class TestOnDemandMemoryWiringUnchanged:
+    """On-demand construction keeps sharing operator memory and result recall."""
+
+    def test_on_demand_keeps_operator_memory_wiring(self):
+        from agent_runtime import RuntimeOptions, RuntimeProfile
+
+        memory, results = MagicMock(name="operator_memory"), MagicMock()
+        runtime = AgentRuntime(
+            config=_cfg(), all_models=_cfg()["models"],
+            background_model_cfg=_cfg()["models"][0],
+            base_memory=memory, builtin_executor=MagicMock(), results=results,
+        )
+        runner = runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
+        assert runner._agent.memory is memory
+        assert runner._agent.results is results

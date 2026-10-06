@@ -4,11 +4,202 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from contextlib import nullcontext
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent_logging import LogEvent
 from react_loop import extract_json_candidates, parse_json
+
+
+class TestTurnOwnedResultPublication:
+    """A turn-owned child returns through join tools, not operator recall."""
+
+    def test_turn_owned_finish_does_not_publish_to_results_memory(self):
+        from react_loop import _finish_run
+
+        ctx = MagicMock()
+        ctx.depth = 1
+        ctx.memory = MagicMock()
+        ctx.short_term = None
+        ctx.results = MagicMock()
+        ctx.working = MagicMock()
+        ctx.working.has_content.return_value = True
+        ctx.graph_memory_writer = None
+        ctx.strategy_memory = None
+
+        with patch("react_loop._summarize_result", return_value="summary"), \
+             patch("react_loop.save_task_outcome") as save_task_outcome:
+            result = _finish_run(
+                ctx,
+                {"action": "finish", "result": "child outcome"},
+                "delegated task",
+            )
+
+        assert result == "child outcome"
+        save_task_outcome.assert_not_called()
+
+
+class TestTurnOwnedFinishGate:
+    """Normal finish remains inside the turn while child work is unaccounted."""
+
+    @pytest.mark.parametrize("status", ["running", "done"])
+    def test_finish_is_refused_for_unaccounted_child(self, status):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import react_loop
+
+        llm = ScriptedLLM([
+            '{"action":"finish","result":"premature"}',
+            '{"action":"finish","result":"complete"}',
+        ])
+        ctx = build_context(llm, RecordingExecutor())
+        supervisor = MagicMock()
+        supervisor.unaccounted_children.side_effect = [
+            [("sa-child", status)],
+            [],
+        ]
+        ctx.builtin_executor._supervisor = supervisor
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)):
+            result = react_loop(ctx, "delegate work")
+
+        assert result == "complete"
+        assert len(llm.calls) == 2
+        feedback = "\n".join(
+            str(message.get("content", ""))
+            for message in llm.calls[1].messages
+        )
+        assert "sa-child" in feedback
+        assert "get_agent_result" in feedback
+        assert "cancel_agent" in feedback
+
+    def test_wait_timeout_keeps_child_finish_obligation(self):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context, make_outcome
+        from react_loop import react_loop
+
+        llm = ScriptedLLM([
+            '{"action":"tool","tool":"get_agent_result","args":{"agent_id":"sa-child","timeout":0,"cancel_on_timeout":false}}',
+            '{"action":"finish","result":"premature"}',
+            '{"action":"tool","tool":"cancel_agent","args":{"agent_id":"sa-child"}}',
+            '{"action":"finish","result":"complete"}',
+        ])
+        executor = RecordingExecutor({
+            "get_agent_result": make_outcome(output="timed out") | {
+                "success": False,
+                "status": "timeout",
+                "agent_id": "sa-child",
+            },
+            "cancel_agent": make_outcome(output="cancelled"),
+        })
+        ctx = build_context(llm, executor)
+        supervisor = MagicMock()
+        supervisor.unaccounted_children.side_effect = [
+            [("sa-child", "running")],
+            [],
+        ]
+        ctx.builtin_executor._supervisor = supervisor
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)):
+            result = react_loop(ctx, "delegate work")
+
+        assert result == "complete"
+        supervisor.mark_result_retrieved.assert_not_called()
+
+
+class TestTurnOwnedDrain:
+    """Every abnormal turn exit drains owned children before returning."""
+
+    @pytest.mark.parametrize("exit_path", ["stop", "error", "budget"])
+    def test_abnormal_exit_drains_owned_children(self, exit_path):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import _StepResult, react_loop
+
+        llm = ScriptedLLM(['{"action":"finish","result":"unused"}'])
+        ctx = build_context(llm, RecordingExecutor())
+        supervisor = MagicMock()
+        ctx.builtin_executor._supervisor = supervisor
+
+        if exit_path == "stop":
+            ctx.cancel_event.set()
+            ctx.owns_cancel_event = False
+            step_patch = nullcontext()
+        elif exit_path == "error":
+            step_patch = patch(
+                "react_loop._run_single_step",
+                side_effect=RuntimeError("loop failure"),
+            )
+        else:
+            step_patch = patch(
+                "react_loop._run_single_step",
+                return_value=_StepResult(early_return="budget exhausted"),
+            )
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)), step_patch:
+            if exit_path == "error":
+                with pytest.raises(RuntimeError, match="loop failure"):
+                    react_loop(ctx, "delegate work")
+            else:
+                react_loop(ctx, "delegate work")
+
+        supervisor.drain_owned_children.assert_called_once_with(
+            ctx.turn_id, cancel=True
+        )
+
+    def test_drain_is_exposed_to_progress_before_waiting(self):
+        from sub_agent_registry import SubAgentRecord
+        from sub_agent_supervisor import (
+            ExecutionOwnership,
+            SubAgentSupervisor,
+            _OwnedChildState,
+        )
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import react_loop
+
+        ctx = build_context(
+            ScriptedLLM(['{"action":"finish","result":"unused"}']),
+            RecordingExecutor(),
+        )
+        ctx.cancel_event.set()
+        ctx.owns_cancel_event = False
+        supervisor = SubAgentSupervisor()
+        record = SubAgentRecord(
+            agent_id="sa-draining",
+            label="on-demand",
+            model="test-model",
+            task_preview="work",
+            started_at=0.0,
+            source="on-demand",
+        )
+        record.ownership = ExecutionOwnership("on-demand", ctx.turn_id)
+        state = _OwnedChildState(record)
+        supervisor._owned_children[record.agent_id] = state
+        ctx.builtin_executor._supervisor = supervisor
+        progress_messages = []
+        drain_visible = threading.Event()
+        results = []
+
+        def progress(message):
+            progress_messages.append(message)
+            if message.startswith("__DRAINING__:"):
+                drain_visible.set()
+
+        run_thread = threading.Thread(
+            target=lambda: results.append(
+                react_loop(ctx, "delegate work", progress_callback=progress)
+            )
+        )
+        run_thread.start()
+        try:
+            visible_before_cleanup = drain_visible.wait(timeout=0.3)
+        finally:
+            state.cleanup_event.set()
+            run_thread.join(timeout=5.0)
+
+        assert visible_before_cleanup is True
+        assert progress_messages[-1] == "__DRAINING__:sa-draining"
+        assert results == ["[Cancelled]"]
 
 
 class TestExtractJsonCandidates:
@@ -624,6 +815,81 @@ class TestAgentControllerCancelRegistryWiring:
         assert ev.is_set() is True
 
 
+class TestAgentControllerTurnOwnership:
+    """Interactive ownership is unique even when correlation traces are reused."""
+
+    @staticmethod
+    def _make_controller():
+        from agent_controller import AgentController
+        from config_schema import AgentConfig, ExecutorPaths
+
+        return AgentController(
+            agent_cfg=AgentConfig(),
+            paths=ExecutorPaths(),
+            llm=MagicMock(),
+            tool_index=MagicMock(),
+            memory=MagicMock(),
+        )
+
+    def test_reused_trace_receives_distinct_turn_owners(self):
+        ctrl = self._make_controller()
+        seen = []
+
+        with patch(
+            "agent_controller.react_loop",
+            side_effect=lambda ctx, *_args, **_kwargs: seen.append(
+                (ctx.trace_id, ctx.turn_id)
+            ) or "ok",
+        ):
+            ctrl.run("first", trace_id="r-reused")
+            ctrl.run("second", trace_id="r-reused")
+
+        assert [trace for trace, _owner in seen] == ["r-reused", "r-reused"]
+        assert seen[0][1]
+        assert seen[0][1] != seen[1][1]
+
+    def test_resume_reuses_checkpoint_trace_but_not_turn_owner(self):
+        ctrl = self._make_controller()
+        ctrl.checkpoint_store = MagicMock()
+        ctrl.checkpoint_store.load.return_value = {
+            "messages": [],
+            "goal_idx": 0,
+            "max_steps": 8,
+            "step": 0,
+            "json_fail_streak": 0,
+            "trace_id": "r-checkpoint",
+            "user_goal": "resumed goal",
+        }
+        seen = []
+
+        with patch(
+            "agent_controller.react_loop",
+            side_effect=lambda ctx, *_args, **_kwargs: seen.append(
+                (ctx.trace_id, ctx.turn_id)
+            ) or "ok",
+        ):
+            ctrl.run("ignored", resume_from="r-checkpoint")
+            ctrl.run("ignored", resume_from="r-checkpoint")
+
+        assert [trace for trace, _owner in seen] == [
+            "r-checkpoint",
+            "r-checkpoint",
+        ]
+        assert seen[0][1] != seen[1][1]
+
+    def test_empty_react_context_trace_still_has_turn_owner(self):
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+
+        response = '{"action":"finish","result":"done"}'
+        first = build_context(ScriptedLLM([response]), RecordingExecutor())
+        second = build_context(ScriptedLLM([response]), RecordingExecutor())
+        first.trace_id = ""
+        second.trace_id = ""
+
+        assert first.turn_id
+        assert first.turn_id != second.turn_id
+
+
 class TestFormatToolResultRecoveryFields:
     """format_tool_result must surface structured recovery metadata on failure."""
 
@@ -1101,3 +1367,173 @@ class TestStructuredRunFields:
         assert run_end[0]["model"] == "test-model"
         assert isinstance(run_end[0]["steps"], int) and run_end[0]["steps"] >= 1
         assert isinstance(run_end[0]["dur_ms"], int)
+
+
+class TestScheduledVisionDispatch:
+    """Scheduled vision_query dispatch never reaches the interactive coordinator."""
+
+    def test_scheduled_vision_dispatch_never_calls_interactive_coordinator(self, tmp_path):
+        import os
+
+        import react_loop
+        from builtin_executor import ScheduledToolDispatch
+        from path_policy import PathPolicy
+        from react_loop import ReactContext
+
+        dirs = {name: os.path.join(str(tmp_path), name) for name in (
+            "workspace", "downloads", "results", "skills", "data", "state", "config",
+        )}
+        for directory in dirs.values():
+            os.makedirs(directory, exist_ok=True)
+        policy = PathPolicy.create(
+            agent_name="test-agent", workspace_dir=dirs["workspace"],
+            downloads_dir=dirs["downloads"], tmp_dir="/tmp/test-agent",
+            skills_dir=dirs["skills"], results_dir=dirs["results"],
+            data_home=dirs["data"], state_home=dirs["state"], config_home=dirs["config"],
+        )
+        shared = MagicMock(name="shared_executor")
+        shared.path_policy = policy
+        confirmation = MagicMock(name="interactive_coordinator")
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(),
+            builtin_executor=ScheduledToolDispatch(shared), mcp_manager=None,
+            skill_registry=None, cancel_event=threading.Event(),
+            depth=1, label="sa-job01", confirmation=confirmation,
+        )
+
+        with patch("react_loop._encode_images", return_value=["<b64>"]):
+            react_loop._dispatch_tool(
+                ctx, {"tool": "vision_query", "args": {"path": "/unrecognised/pic.png"}},
+                lambda _m: None,
+            )
+
+        assert confirmation.method_calls == []
+        shared._requires_confirmation.assert_not_called()
+
+
+class TestScheduledMcpDispatch:
+    """Scheduled MCP dispatch has no interactive confirmation route."""
+
+    def test_scheduled_mcp_call_never_calls_interactive_coordinator(self):
+        import react_loop
+        from builtin_executor import ScheduledToolDispatch
+        from react_loop import ReactContext
+
+        shared = MagicMock(name="shared_executor")
+        shared.is_builtin.return_value = False
+        mcp = MagicMock()
+        mcp.has_tool.return_value = True
+        mcp.server_name_for_tool.return_value = "srv"
+        mcp.call_tool.return_value = {"success": True, "output": "ok", "exit_code": 0}
+        confirmation = MagicMock(name="interactive_coordinator")
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(),
+            builtin_executor=ScheduledToolDispatch(shared), mcp_manager=mcp,
+            skill_registry=None, cancel_event=threading.Event(),
+            depth=1, label="sa-job01", confirmation=confirmation,
+        )
+
+        outcome = react_loop._dispatch_tool(
+            ctx, {"tool": "mcp_tool", "args": {}}, lambda _m: None,
+        )
+
+        mcp.call_tool.assert_called_once_with("mcp_tool", {})
+        assert outcome["success"] is True
+        assert confirmation.method_calls == []
+        shared._requires_confirmation.assert_not_called()
+
+
+class TestOperatorPromptExcludesScheduledHistory:
+    """The operator's system prompt never automatically includes scheduled-job history."""
+
+    def _operator_ctx(self):
+        from react_loop import ReactContext
+
+        memory = MagicMock()
+        memory.as_prompt_text.return_value = "No persistent memory entries."
+        tool_index = MagicMock()
+        tool_index.search.return_value = []
+        skills = MagicMock()
+        skills.all.return_value = []
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=tool_index, memory=memory,
+            builtin_executor=None, mcp_manager=None, skill_registry=skills,
+            cancel_event=threading.Event(),
+        )
+        return ctx
+
+    def test_operator_prompt_omits_scheduled_history_section(self):
+        from react_loop import _assemble_system_prompt
+
+        system = _assemble_system_prompt(self._operator_ctx(), "what is on my calendar?")
+
+        assert "SCHEDULED JOB EXECUTION HISTORY" not in system
+
+
+class TestScheduledPlanRefused:
+    """A scheduled run cannot use the plan action to escape its tool policy."""
+
+    _PLAN = {"action": "plan", "plan": {"description": "write memory", "steps": [
+        {"id": "s1", "tool": "memory_write", "args": {"action": "set", "key": "k", "value": "v"}},
+    ]}}
+
+    def _dispatch(self, builtin_executor, plan_executor=None):
+        """Run one plan action through _dispatch_action; return (sink messages, result)."""
+        from react_loop import ReactContext, _LoopState, _dispatch_action
+
+        ctx = ReactContext(
+            llm=MagicMock(), tool_index=MagicMock(), memory=MagicMock(),
+            builtin_executor=builtin_executor, mcp_manager=None, skill_registry=None,
+            cancel_event=threading.Event(), depth=1, label="sa-job01",
+        )
+        state = _LoopState(messages=[], goal_idx=0, max_steps=8)
+        sunk: list[str] = []
+        patcher = (
+            patch("execution_plan.PlanExecutor", plan_executor)
+            if plan_executor is not None else nullcontext()
+        )
+        with patcher:
+            result = _dispatch_action(
+                ctx, dict(self._PLAN), sunk.append, state, "goal", 0.0, lambda _m: None,
+            )
+        return sunk, result
+
+    def test_scheduled_plan_action_is_refused(self):
+        from builtin_executor import ScheduledToolDispatch
+
+        sunk, result = self._dispatch(ScheduledToolDispatch(MagicMock()), MagicMock())
+
+        assert result is None
+        assert len(sunk) == 1
+        assert "plan is not available for scheduled jobs" in sunk[0]
+
+    def test_scheduled_plan_action_never_invokes_plan_executor(self):
+        from builtin_executor import ScheduledToolDispatch
+
+        plan_executor = MagicMock(name="PlanExecutor")
+        self._dispatch(ScheduledToolDispatch(MagicMock()), plan_executor)
+
+        plan_executor.assert_not_called()
+
+    def test_scheduled_plan_never_reaches_a_plan_step(self, make_builtin_executor, tmp_path):
+        """Reviewer repro: scheduled → plan → memory_write never builds a step agent."""
+        from builtin_executor import ScheduledToolDispatch
+
+        memory = MagicMock(name="operator_kv")
+        factory = MagicMock(name="sub_agent_factory")
+        shared = make_builtin_executor(memory=memory, sub_agent_factory=factory,
+                                       data_dir=str(tmp_path))
+
+        self._dispatch(ScheduledToolDispatch(shared))
+
+        factory.assert_not_called()
+        assert memory.method_calls == []
+
+    def test_on_demand_plan_action_still_runs_plan_executor(self):
+        plan_executor = MagicMock(name="PlanExecutor")
+        plan_executor.return_value.execute.return_value = {"results": {"s1": "ok"}}
+
+        sunk, _result = self._dispatch(MagicMock(name="shared_executor"), plan_executor)
+
+        plan_executor.return_value.execute.assert_called_once()
+        assert sunk[0].startswith("Plan execution results:")

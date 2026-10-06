@@ -441,7 +441,8 @@ class ShellTools:
         return True  # "always"
 
     def _exec_shell(self, args: dict, caller_depth: int = 0, caller_tag: str = "",
-                    chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
+                    chunk_callback: Optional[Callable[[str], None]] = None,
+                    scheduled: bool = False) -> dict:
         command = str(args.get("command", "")).strip()
         if not command:
             return {"success": False, "output": "", "error": "No command provided.", "exit_code": -1}
@@ -449,7 +450,10 @@ class ShellTools:
         dangerous, reason, category = _is_dangerous_shell(command)
         if dangerous and self._should_confirm(category):
             desc = f"Run shell command: <code>{command}</code>\n⚠️ Reason for confirmation: {reason}"
-            return self._owner._requires_confirmation("shell", args, desc, caller_depth=caller_depth, caller_tag=caller_tag)
+            return self._owner._requires_confirmation(
+                "shell", args, desc, caller_depth=caller_depth, caller_tag=caller_tag,
+                scheduled=scheduled,
+            )
 
         return self._run_shell(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
 

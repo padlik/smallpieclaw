@@ -14,6 +14,8 @@ Covers OpenSpec change ``extract-sub-agent-supervisor`` tasks 1.1-1.6:
 from __future__ import annotations
 
 import threading
+from contextlib import ExitStack
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,8 +23,10 @@ import pytest
 
 from confirmation import GrantLifetime
 from memory_store import ShortTermMemory
-from sub_agent_registry import SubAgentRegistry, get_registry
+from sub_agent_registry import SubAgentRecord, SubAgentRegistry, get_registry
 from sub_agent_supervisor import (
+    ORIGIN_ON_DEMAND,
+    ExecutionOwnership,
     SubAgentSupervisor,
     SubmissionRequest,
     SupervisionOptions,
@@ -173,7 +177,7 @@ class TestCallbackIsolation:
             caller_depth=0,
             options=SupervisionOptions(
                 job_tag="job-a", finish_cb=finish_cb, result_log_cb=result_log,
-                notify=False, expandable=False,
+                notify=False,
             ),
         )
         res_b = exc._exec_spawn_agent(
@@ -181,7 +185,7 @@ class TestCallbackIsolation:
             caller_depth=0,
             options=SupervisionOptions(
                 job_tag="job-b", finish_cb=finish_cb, result_log_cb=result_log,
-                notify=False, expandable=False,
+                notify=False,
             ),
         )
 
@@ -209,6 +213,7 @@ class TestStaleNotificationSuppression:
         res = exc._exec_spawn_agent(
             {"task": "long task", "context_payload": {"n": "x"}},
             caller_depth=0,
+            trace_id="r-owner",
         )
         assert res["success"]
         record = get_registry().get(res["agent_id"])
@@ -219,7 +224,10 @@ class TestStaleNotificationSuppression:
         exc, runner, record = self._spawn_blocking(make_builtin_executor, tmp_path, "sa-stale")
 
         # get_agent_result times out and auto-cancels the run.
-        out = exc._exec_get_agent_result({"agent_id": record.agent_id, "timeout": 0})
+        out = exc._exec_get_agent_result(
+            {"agent_id": record.agent_id, "timeout": 0},
+            caller_tag="main r-owner",
+        )
         assert out["status"] == "timeout"
         assert record._timeout_cancelled is True
 
@@ -228,8 +236,7 @@ class TestStaleNotificationSuppression:
         # The timed-out run must NOT emit a stale cancellation notification.
         assert runner.notify_calls == []
 
-    def test_manual_cancel_still_notifies(self, make_builtin_executor, tmp_path):
-        """Contrast: a non-timeout cancel is not suppressed (flag stays False)."""
+    def test_manual_cancel_does_not_notify_independently(self, make_builtin_executor, tmp_path):
         exc, runner, record = self._spawn_blocking(make_builtin_executor, tmp_path, "sa-manual")
 
         record.cancel()  # e.g. operator /agents cancel — not a get_agent_result timeout
@@ -237,8 +244,495 @@ class TestStaleNotificationSuppression:
 
         assert _wait_event(record._result_event)
         assert record.status == "cancelled"
-        assert len(runner.notify_calls) == 1
-        assert "cancelled" in runner.notify_calls[0].lower()
+        assert runner.notify_calls == []
+
+
+class TestOriginAwareTerminalDelivery:
+    """Terminal delivery differs for turn-owned and scheduled executions."""
+
+    @pytest.mark.parametrize("terminal", ["done", "failed", "cancelled", "timeout_cancelled"])
+    def test_turn_owned_terminal_outcome_never_notifies(
+        self, make_builtin_executor, tmp_path, terminal
+    ):
+        runner = FakeRunner(agent_id=f"sa-{terminal}", result="child result")
+        if terminal == "failed":
+            runner.run = MagicMock(side_effect=RuntimeError("child failed"))
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        local_reg = SubAgentRegistry()
+
+        def run_now(fn, *_args, **_kwargs):
+            record = local_reg.get(runner.agent_id)
+            assert record is not None
+            if terminal in ("cancelled", "timeout_cancelled"):
+                if terminal == "timeout_cancelled":
+                    record._timeout_cancelled = True
+                record.cancel()
+            fn()
+            return MagicMock()
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit", side_effect=run_now):
+            result = exc._exec_spawn_agent(
+                {"task": "child work", "context_payload": {"parent": "turn"}},
+                trace_id="r-owner",
+            )
+
+        assert result["success"] is True
+        assert runner.notify_calls == []
+
+    @pytest.mark.parametrize("terminal", ["done", "failed", "cancelled", "timeout_cancelled"])
+    def test_scheduled_terminal_outcome_runs_callbacks(
+        self, make_builtin_executor, tmp_path, terminal
+    ):
+        runner = FakeRunner(agent_id=f"sa-scheduled-{terminal}", result="job result")
+        if terminal == "failed":
+            runner.run = MagicMock(side_effect=RuntimeError("job failed"))
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        local_reg = SubAgentRegistry()
+        finish_calls = []
+        result_calls = []
+
+        def run_now(fn, *_args, **_kwargs):
+            record = local_reg.get(runner.agent_id)
+            assert record is not None
+            if terminal in ("cancelled", "timeout_cancelled"):
+                if terminal == "timeout_cancelled":
+                    record._timeout_cancelled = True
+                record.cancel()
+            fn()
+            return MagicMock()
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit", side_effect=run_now):
+            result = exc._exec_spawn_agent(
+                {"task": "job work"},
+                options=SupervisionOptions(
+                    source="scheduled",
+                    job_tag="nightly",
+                    notify=False,
+                    finish_cb=finish_calls.append,
+                    result_log_cb=lambda **kwargs: result_calls.append(kwargs),
+                ),
+            )
+
+        assert result["success"] is True
+        assert finish_calls == ["nightly"]
+        assert len(result_calls) == 1
+        assert result_calls[0]["tag"] == "nightly"
+
+
+class TestTurnOwnershipObligations:
+    """The supervisor retains turn obligations through result consumption."""
+
+    def test_completed_unretrieved_child_remains_an_obligation(
+        self, make_builtin_executor, tmp_path
+    ):
+        runner = FakeRunner(agent_id="sa-unread", result="ready")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+
+        with patch.object(
+            exc._supervisor._pool,
+            "submit",
+            side_effect=lambda fn, *_args, **_kwargs: fn(),
+        ):
+            result = exc._exec_spawn_agent(
+                {"task": "child work"},
+                trace_id="r-owner",
+            )
+
+        assert result["success"] is True
+        assert exc._supervisor.unaccounted_children("r-owner") == [
+            ("sa-unread", "done")
+        ]
+
+        exc._supervisor.mark_result_retrieved("r-owner", "sa-unread")
+
+        assert exc._supervisor.unaccounted_children("r-owner") == []
+
+    def test_ownerless_direct_spawn_result_is_readable_without_turn_obligation(
+        self, make_builtin_executor, tmp_path
+    ):
+        runner = FakeRunner(agent_id="sa-legacy", result="legacy ready")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+
+        with patch.object(
+            exc._supervisor._pool,
+            "submit",
+            side_effect=lambda fn, *_args, **_kwargs: fn(),
+        ):
+            spawned = exc._exec_spawn_agent({"task": "legacy work"})
+
+        outcome = exc._exec_get_agent_result(
+            {"agent_id": spawned["agent_id"], "timeout": 1}
+        )
+
+        assert outcome["success"] is True
+        assert outcome["result"] == "legacy ready"
+        assert exc._supervisor._owned_children == {}
+
+    def test_wait_timeout_without_cancel_keeps_running_obligation(
+        self, make_builtin_executor, tmp_path
+    ):
+        runner = FakeRunner(agent_id="sa-timeout-owned", block=True)
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        result = exc._exec_spawn_agent(
+            {"task": "long child work"},
+            trace_id="r-owner",
+        )
+
+        outcome = exc._exec_get_agent_result(
+            {
+                "agent_id": result["agent_id"],
+                "timeout": 0,
+                "cancel_on_timeout": False,
+            },
+            caller_tag="main r-owner",
+        )
+
+        assert outcome["status"] == "timeout"
+        assert exc._supervisor.unaccounted_children("r-owner") == [
+            ("sa-timeout-owned", "running")
+        ]
+        runner._cancel_event.set()
+        assert runner._done_event.wait(timeout=5.0)
+
+    def test_resumed_turn_cannot_access_prior_turn_record(self):
+        prior = SubAgentRecord(
+            agent_id="sa-prior",
+            label="on-demand",
+            model="test-model",
+            task_preview="prior work",
+            started_at=0.0,
+            source="on-demand",
+        )
+        prior.ownership = ExecutionOwnership(
+            origin="on-demand",
+            owner_turn_id="turn-before-resume",
+        )
+
+        assert SubAgentSupervisor.turn_can_access_result(
+            prior, "turn-after-resume"
+        ) is False
+
+    def test_timeout_cancellation_accounts_while_cleanup_is_pending(
+        self, make_builtin_executor, tmp_path
+    ):
+        runner = FakeRunner(agent_id="sa-timeout-draining", block=True)
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        result = exc._exec_spawn_agent(
+            {"task": "long child work"},
+            trace_id="r-owner",
+        )
+
+        outcome = exc._exec_get_agent_result(
+            {"agent_id": result["agent_id"], "timeout": 0},
+            caller_tag="main r-owner",
+        )
+
+        assert outcome["status"] == "timeout"
+        assert exc._supervisor.unaccounted_children("r-owner") == []
+        assert exc._supervisor.draining_children("r-owner") == [
+            (runner.agent_id, "running")
+        ]
+        assert runner._done_event.wait(timeout=5.0)
+
+    def test_operator_cancellation_accounts_child_before_cleanup(
+        self, make_builtin_executor, tmp_path
+    ):
+        runner = FakeRunner(agent_id="sa-operator-cancel", block=True)
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        result = exc._exec_spawn_agent(
+            {"task": "long child work"},
+            trace_id="r-owner",
+        )
+        record = get_registry().get(result["agent_id"])
+        assert record is not None
+
+        record.cancel()
+
+        assert exc._supervisor.unaccounted_children("r-owner") == []
+        assert runner._done_event.wait(timeout=5.0)
+
+
+class TestOwnedCleanupFailureIsolation:
+    """Every cleanup stage is attempted before the owned child is released."""
+
+    @pytest.mark.parametrize(
+        "failure_point",
+        ["deregister_run", "runner.close", "clear_run_context", "finish_cb"],
+    )
+    def test_cleanup_failure_is_reported_without_stranding_turn(
+        self, make_builtin_executor, tmp_path, failure_point
+    ):
+        runner = FakeRunner(agent_id=f"sa-cleanup-{failure_point}")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        options = SupervisionOptions(
+            finish_cb=(
+                MagicMock(side_effect=RuntimeError(failure_point))
+                if failure_point == "finish_cb"
+                else None
+            )
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    exc._supervisor._pool,
+                    "submit",
+                    side_effect=lambda fn, *_args, **_kwargs: fn(),
+                )
+            )
+            if failure_point == "deregister_run":
+                stack.enter_context(
+                    patch(
+                        "sub_agent_registry.deregister_run",
+                        side_effect=RuntimeError(failure_point),
+                    )
+                )
+            elif failure_point == "runner.close":
+                runner.close = MagicMock(side_effect=RuntimeError(failure_point))
+            elif failure_point == "clear_run_context":
+                stack.enter_context(
+                    patch(
+                        "sub_agent_supervisor.clear_run_context",
+                        side_effect=RuntimeError(failure_point),
+                    )
+                )
+
+            spawned = exc._exec_spawn_agent(
+                {"task": "child work"},
+                trace_id="r-owner",
+                options=options,
+            )
+
+        assert spawned["success"] is True
+        errors = exc._supervisor.drain_owned_children("r-owner", cancel=False)
+        assert any(failure_point in error for error in errors)
+
+
+class TestBoundedTurnDrain:
+    """A non-cooperative child cannot hold the operator turn forever."""
+
+    def _spawn_stuck(self, make_builtin_executor, tmp_path):
+        release_close = threading.Event()
+        runner = FakeRunner(agent_id="sa-stuck")
+        runner.close = lambda: release_close.wait(timeout=5.0)
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        spawned = exc._exec_spawn_agent({"task": "child work"}, trace_id="r-owner")
+        assert spawned["success"] is True
+        return exc, release_close
+
+    def test_drain_expiry_reports_stuck_child_within_bound(
+        self, make_builtin_executor, tmp_path
+    ):
+        import time
+
+        exc, release_close = self._spawn_stuck(make_builtin_executor, tmp_path)
+        try:
+            started = time.monotonic()
+            errors = exc._supervisor.drain_owned_children(
+                "r-owner", cancel=True, timeout=0.2
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            release_close.set()
+
+        assert elapsed < 2.0
+        assert any("sa-stuck" in error and "did not complete" in error for error in errors)
+
+    def test_late_cleanup_of_expired_child_releases_its_record(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc, release_close = self._spawn_stuck(make_builtin_executor, tmp_path)
+        try:
+            exc._supervisor.drain_owned_children("r-owner", cancel=True, timeout=0.2)
+            assert exc._supervisor.draining_children("r-owner") == [
+                ("sa-stuck", "done")
+            ]
+        finally:
+            release_close.set()
+
+        deadline = threading.Event()
+        for _ in range(50):
+            if not exc._supervisor._owned_children:
+                break
+            deadline.wait(0.05)
+        assert exc._supervisor._owned_children == {}
+
+
+class TestExplicitPromptAssociation:
+    """Prompt-child association follows immutable submission data."""
+
+    def test_on_demand_child_associates_with_explicit_prompt_id(
+        self, make_builtin_executor, tmp_path
+    ):
+        from prompt_registry import PromptRegistry
+
+        prompt_registry = PromptRegistry(data_dir=str(tmp_path / "prompts"))
+        explicit = prompt_registry.start("r-owner", "explicit prompt")
+        ambient = prompt_registry.start("r-ambient", "ambient prompt")
+        runner = FakeRunner(agent_id="sa-explicit-prompt")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        exc._prompt_registry = prompt_registry
+        exc._current_prompt_id = ambient.prompt_id
+        local_reg = SubAgentRegistry()
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
+            result = exc._exec_spawn_agent(
+                {"task": "child work"},
+                trace_id="r-owner",
+                options=SupervisionOptions(prompt_id=explicit.prompt_id),
+            )
+
+        assert result["success"] is True
+        assert prompt_registry.get(explicit.prompt_id).sub_agent_ids == [
+            runner.agent_id
+        ]
+        assert prompt_registry.get(ambient.prompt_id).sub_agent_ids == []
+        event_log = (tmp_path / "prompts" / "prompts.jsonl").read_text()
+        assert f'"agent_id": "{runner.agent_id}"' in event_log
+
+    def test_scheduled_child_does_not_associate_with_ambient_prompt(
+        self, make_builtin_executor, tmp_path
+    ):
+        from prompt_registry import PromptRegistry
+
+        prompt_registry = PromptRegistry(data_dir=str(tmp_path / "prompts"))
+        ambient = prompt_registry.start("r-ambient", "ambient prompt")
+        runner = FakeRunner(agent_id="sa-scheduled-prompt")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        exc._prompt_registry = prompt_registry
+        exc._current_prompt_id = ambient.prompt_id
+        local_reg = SubAgentRegistry()
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
+            result = exc._exec_spawn_agent(
+                {"task": "scheduled work"},
+                options=SupervisionOptions(
+                    source="scheduled",
+                    job_tag="nightly",
+                    notify=False,
+                ),
+            )
+
+        assert result["success"] is True
+        assert prompt_registry.get(ambient.prompt_id).sub_agent_ids == []
+
+
+class TestAdmissionRollback:
+    """Admission-time failures leave no stranded registry, turn, or child state."""
+
+    def _make_request(self, tmp_path, runner, prompt_registry):
+        from builtin_executor import _save_context
+
+        ownership = ExecutionOwnership(
+            origin=ORIGIN_ON_DEMAND,
+            owner_turn_id="r-owner",
+            prompt_id=None
+            if prompt_registry is None
+            else prompt_registry.start("r-owner", "owner prompt").prompt_id,
+        )
+        return SubmissionRequest(
+            task="rollback task",
+            response_format="text",
+            label="on-demand",
+            context_key=None,
+            factory=lambda **_k: runner,
+            factory_kwargs={},
+            data_dir=str(tmp_path),
+            notify_html_fn=None,
+            save_context=_save_context,
+            ownership=ownership,
+            prompt_registry=prompt_registry,
+        )
+
+    def test_prompt_association_failure_rolls_back_admission(self, tmp_path):
+        """A prompt-registry write failure leaves no registered or owned child."""
+        from prompt_registry import PromptRegistry
+
+        prompt_registry = PromptRegistry(data_dir=str(tmp_path / "prompts"))
+        runner = FakeRunner(agent_id="sa-rollback-prompt")
+        supervisor = SubAgentSupervisor(max_subagents=2)
+        local_reg = SubAgentRegistry()
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(
+                 prompt_registry,
+                 "associate_sub_agent",
+                 side_effect=OSError("disk full"),
+             ):
+            with pytest.raises(OSError):
+                supervisor.submit(
+                    self._make_request(tmp_path, runner, prompt_registry),
+                    SupervisionOptions(notify=False),
+                )
+
+        assert local_reg.get(runner.agent_id) is None
+        assert supervisor.unaccounted_children("r-owner") == []
+        assert supervisor.draining_children("r-owner") == []
+
+    def test_pool_submit_failure_rolls_back_admission(self, tmp_path):
+        """A worker-pool submit failure leaves no registered or owned child."""
+        from prompt_registry import PromptRegistry
+
+        prompt_registry = PromptRegistry(data_dir=str(tmp_path / "prompts"))
+        runner = FakeRunner(agent_id="sa-rollback-submit")
+        supervisor = SubAgentSupervisor(max_subagents=2)
+        local_reg = SubAgentRegistry()
+
+        request = self._make_request(tmp_path, runner, prompt_registry)
+        owner_prompt_id = request.ownership.prompt_id
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(
+                 supervisor._pool,
+                 "submit",
+                 side_effect=RuntimeError("pool closed"),
+             ):
+            with pytest.raises(RuntimeError):
+                supervisor.submit(request, SupervisionOptions(notify=False))
+
+        assert local_reg.get(runner.agent_id) is None
+        assert supervisor.unaccounted_children("r-owner") == []
+        assert supervisor.draining_children("r-owner") == []
+        assert runner.closed is False
+        # The successfully recorded prompt association is rolled back too.
+        assert prompt_registry.get(owner_prompt_id).sub_agent_ids == []
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +758,6 @@ class TestChannelSeparation:
                     finish_cb=lambda _t: None,
                     result_log_cb=lambda **_k: None,
                     notify=False,
-                    expandable=False,
                 ),
             )
 
@@ -307,6 +800,27 @@ class TestGraphMemoryNonAdmission:
         assert exc._graph_memory.mock_calls == []
         assert exc._graph_memory_writer.mock_calls == []
 
+    def test_scheduled_completion_not_admitted_to_graph(self, make_builtin_executor, tmp_path):
+        runner = FakeRunner(agent_id="sa-graph-sched", result="a fact worth remembering")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        exc._graph_memory = MagicMock()  # type: ignore[attr-defined]
+        exc._graph_memory_writer = MagicMock()  # type: ignore[attr-defined]
+
+        with patch.object(exc._supervisor._pool, "submit",
+                          side_effect=lambda fn, *a, **kw: fn()):
+            res = exc._exec_spawn_agent(
+                {"task": "produce a fact"},
+                caller_depth=0,
+                options=SupervisionOptions(source="scheduled", job_tag="nightly", notify=False),
+            )
+
+        assert res["success"]
+        assert exc._graph_memory.mock_calls == []
+        assert exc._graph_memory_writer.mock_calls == []
+
 
 # ---------------------------------------------------------------------------
 # 1.2 — capacity + SubAgentRecord.source preservation
@@ -329,6 +843,30 @@ class TestCapacityAndSourcePreservation:
         assert rec is not None
         assert rec.source == "on-demand"
         assert local_reg.count_managed() == 1
+
+    def test_scheduled_record_has_immutable_origin_without_turn_owner(
+        self, make_builtin_executor, tmp_path
+    ):
+        runner = FakeRunner(agent_id="sa-scheduled-owner")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        local_reg = SubAgentRegistry()
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit", return_value=MagicMock()):
+            res = exc._exec_spawn_agent(
+                {"task": "scheduled work", "context_payload": {"ignored": "later"}},
+                options=SupervisionOptions(source="scheduled", job_tag="nightly"),
+            )
+
+        record = local_reg.get(res["agent_id"])
+        assert record is not None
+        assert record.ownership.origin == "scheduled"
+        assert record.ownership.owner_turn_id is None
+        with pytest.raises(FrozenInstanceError):
+            record.ownership.origin = "on-demand"
 
     def test_scheduled_launch_record_source_is_scheduled_and_counts(self, make_builtin_executor, tmp_path):
         """Scheduled launches (source via options) record source=scheduled and count."""

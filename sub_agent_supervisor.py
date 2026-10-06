@@ -17,12 +17,12 @@ and other internal supervision controls flow through :class:`SupervisionOptions`
 
 from __future__ import annotations
 
-import html as _html_mod
 import inspect
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 from agent_logging import bind_run_context, clear_run_context
@@ -37,6 +37,57 @@ logger = logging.getLogger(__name__)
 
 
 CANCELLED_SENTINEL = "[Cancelled]"
+ORIGIN_ON_DEMAND = "on-demand"
+ORIGIN_SCHEDULED = "scheduled"
+# Upper bound on how long a turn waits for owned-child lifecycle cleanup. It
+# covers a full headless confirmation wait (120s) plus cleanup margin, so only
+# genuinely stuck, non-cooperative children are reported and released.
+OWNED_CHILD_DRAIN_TIMEOUT_S = 180.0
+
+
+@dataclass(frozen=True)
+class ExecutionOwnership:
+    """Immutable execution origin and optional owning operator-turn identity."""
+
+    origin: str
+    owner_turn_id: Optional[str] = None
+    prompt_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.origin not in (ORIGIN_ON_DEMAND, ORIGIN_SCHEDULED):
+            raise ValueError(f"Unsupported execution origin: {self.origin}")
+        if self.origin == ORIGIN_SCHEDULED and self.owner_turn_id is not None:
+            raise ValueError("Scheduled execution cannot have an operator-turn owner")
+        if self.origin == ORIGIN_SCHEDULED and self.prompt_id is not None:
+            raise ValueError("Scheduled execution cannot have an operator prompt")
+
+
+@dataclass
+class _OwnedChildState:
+    """Turn-owned child state retained through result accounting and cleanup."""
+
+    record: SubAgentRecord
+    cleanup_event: threading.Event = field(default_factory=threading.Event)
+    result_retrieved: bool = False
+    result_discarded: bool = False
+    cleanup_errors: list[str] = field(default_factory=list)
+    drain_expired: bool = False  # turn released before this child's cleanup completed
+
+
+@dataclass(frozen=True)
+class RunCompletion:
+    """Terminal outcome of one supervised run, handed to the presentation owner.
+
+    The supervisor signals completion; deciding when and how to show it is the
+    owner's job (ADR-0005), so this carries data only.
+    """
+
+    tag: str            # job tag / label of the run
+    status: str         # "done" | "failed" | "cancelled"
+    result: str         # complete result text ("[Cancelled]" when cancelled)
+    elapsed_s: int      # wall-clock seconds
+    model: str          # model id the run used
+    agent_id: str       # sub-agent id (diagnostic only; not an execution ID)
 
 
 @dataclass
@@ -52,8 +103,8 @@ class SupervisionOptions:
     job_tag: Optional[str] = None                       # scheduler job tag
     finish_cb: Optional[Callable[[str], None]] = None   # called with finish tag on terminal
     result_log_cb: Optional[Callable[..., None]] = None  # scheduler execution-log recorder
+    completion_cb: Optional[Callable[["RunCompletion"], None]] = None  # owner-side terminal handoff
     notify: bool = True                                 # deliver Telegram notification
-    expandable: bool = True                             # wrap result in expandable blockquote
     source: str = SOURCE_ON_DEMAND                      # registry source category (internal only)
     prompt_id: Optional[str] = None                     # parent prompt id for log correlation
     grant_scope_cb: Optional[Callable[[str], None]] = None  # called with agent_id on terminal so the depth-0 grant ledger can expire that sub-agent's prompt grants
@@ -77,6 +128,10 @@ class SubmissionRequest:
     data_dir: str                   # for context persistence
     notify_html_fn: Optional[Callable[[str], None]] = None  # HTML notify path
     save_context: Optional[Callable[[str, object, str], None]] = None  # context persister
+    ownership: ExecutionOwnership = field(
+        default_factory=lambda: ExecutionOwnership(ORIGIN_ON_DEMAND)
+    )
+    prompt_registry: Optional[object] = None
 
 
 class SubAgentSupervisor:
@@ -86,6 +141,192 @@ class SubAgentSupervisor:
         self._pool = ThreadPoolExecutor(
             max_workers=max_subagents, thread_name_prefix="sub-agent"
         )
+        self._owned_lock = threading.Lock()
+        self._owned_children: dict[str, _OwnedChildState] = {}
+        self._active_turn_ids: set[str] = set()
+
+    def register_active_turn(self, turn_id: str) -> None:
+        """Mark *turn_id* as an operator turn whose confirmation channel is live."""
+        with self._owned_lock:
+            self._active_turn_ids.add(turn_id)
+
+    def unregister_active_turn(self, turn_id: str) -> None:
+        """Remove only *turn_id* from the active set; unknown ids are a no-op."""
+        with self._owned_lock:
+            self._active_turn_ids.discard(turn_id)
+
+    def child_may_use_turn_grants(self, agent_id: str) -> bool:
+        """Return whether *agent_id* may consult its owning turn's session grants.
+
+        A child unknown to the supervisor is not turn-owned, so the legacy
+        ledger path stays unchanged for it. A known child that is cancelled or
+        drain-expired is always denied, whether or not any turn is active.
+        Otherwise only a child whose immutable owner is one of the currently
+        active operator turns may; every other known child is denied.
+        """
+        with self._owned_lock:
+            state = self._owned_children.get(agent_id)
+            if state is None:
+                return True
+            if state.drain_expired or state.record.is_cancelled:
+                return False
+            return state.record.ownership.owner_turn_id in self._active_turn_ids
+
+    @staticmethod
+    def turn_can_access_result(record: SubAgentRecord, owner_turn_id: Optional[str]) -> bool:
+        """Return whether ``record`` exposes its result to the calling turn."""
+        ownership = getattr(record, "ownership", None)
+        if ownership is None:
+            return record.source == SOURCE_ON_DEMAND and owner_turn_id is None
+        if ownership.origin != ORIGIN_ON_DEMAND:
+            return False
+        if ownership.owner_turn_id is None:
+            # Legacy/unowned on-demand run: readable only by an unowned caller.
+            return owner_turn_id is None
+        return ownership.owner_turn_id == owner_turn_id
+
+    def unaccounted_children(self, owner_turn_id: str) -> list[tuple[str, str]]:
+        """Return this turn's running or completed-but-unretrieved children."""
+        with self._owned_lock:
+            return [
+                (agent_id, state.record.status)
+                for agent_id, state in self._owned_children.items()
+                if state.record.ownership.owner_turn_id == owner_turn_id
+                and not state.result_retrieved
+                and not state.result_discarded
+                and not state.record.is_cancelled
+            ]
+
+    def draining_children(self, owner_turn_id: str) -> list[tuple[str, str]]:
+        """Return owned children whose lifecycle cleanup has not completed."""
+        with self._owned_lock:
+            return [
+                (agent_id, state.record.status)
+                for agent_id, state in self._owned_children.items()
+                if state.record.ownership.owner_turn_id == owner_turn_id
+                and not state.cleanup_event.is_set()
+            ]
+
+    def get_owned_record(
+        self, owner_turn_id: Optional[str], agent_id: str
+    ) -> Optional[SubAgentRecord]:
+        """Return a retained child record only to its immutable owning turn."""
+        if owner_turn_id is None:
+            return None
+        with self._owned_lock:
+            state = self._owned_children.get(agent_id)
+            if state is None:
+                return None
+            if state.record.ownership.owner_turn_id != owner_turn_id:
+                return None
+            return state.record
+
+    def result_was_discarded(self, owner_turn_id: str, agent_id: str) -> bool:
+        """Return whether explicit cancellation discarded an unread result."""
+        with self._owned_lock:
+            state = self._owned_children.get(agent_id)
+            return bool(
+                state is not None
+                and state.record.ownership.owner_turn_id == owner_turn_id
+                and state.result_discarded
+            )
+
+    def cancel_owned_child(self, owner_turn_id: str, agent_id: str) -> Optional[bool]:
+        """Cancel or discard one owned child, returning None when inaccessible."""
+        with self._owned_lock:
+            state = self._owned_children.get(agent_id)
+            if (
+                state is None
+                or state.record.ownership.owner_turn_id != owner_turn_id
+            ):
+                return None
+            if state.result_retrieved or state.result_discarded:
+                return False
+            state.result_discarded = True
+            record = state.record
+        if record.status == "running" and not record.is_cancelled:
+            record.cancel()
+        return True
+
+    def cancel_all_owned_children(self, owner_turn_id: str) -> int:
+        """Cancel or discard every unaccounted child owned by one turn."""
+        with self._owned_lock:
+            agent_ids = [
+                agent_id
+                for agent_id, state in self._owned_children.items()
+                if state.record.ownership.owner_turn_id == owner_turn_id
+            ]
+        return sum(
+            self.cancel_owned_child(owner_turn_id, agent_id) is True
+            for agent_id in agent_ids
+        )
+
+    def mark_result_retrieved(self, owner_turn_id: str, agent_id: str) -> None:
+        """Account for one terminal child result consumed by its owning turn."""
+        with self._owned_lock:
+            state = self._owned_children.get(agent_id)
+            if state is None:
+                return
+            if state.record.ownership.owner_turn_id != owner_turn_id:
+                return
+            state.result_retrieved = True
+
+    def drain_owned_children(
+        self,
+        owner_turn_id: str,
+        *,
+        cancel: bool,
+        timeout: float = OWNED_CHILD_DRAIN_TIMEOUT_S,
+    ) -> list[str]:
+        """Cancel when requested, await cleanup, and return cleanup errors.
+
+        The wait is bounded by *timeout* seconds overall. A child whose
+        lifecycle cleanup has not completed by then is reported as an error
+        naming it (never as a clean finish) and stays retained, still
+        draining, until its own cleanup completes; it is not waited for again.
+        """
+        with self._owned_lock:
+            states = [
+                (agent_id, state)
+                for agent_id, state in self._owned_children.items()
+                if state.record.ownership.owner_turn_id == owner_turn_id
+                and not state.drain_expired
+            ]
+        if cancel:
+            for _agent_id, state in states:
+                if state.record.status == "running":
+                    state.record.cancel()
+        deadline = time.monotonic() + timeout
+        stuck: list[str] = []
+        for agent_id, state in states:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not state.cleanup_event.wait(timeout=remaining):
+                stuck.append(agent_id)
+        with self._owned_lock:
+            for agent_id, state in states:
+                if agent_id not in stuck:
+                    self._owned_children.pop(agent_id, None)
+                    continue
+                if state.cleanup_event.is_set():
+                    # Cleanup completed after the deadline but before release.
+                    self._owned_children.pop(agent_id, None)
+                    stuck.remove(agent_id)
+                    continue
+                state.drain_expired = True
+            errors = [
+                error
+                for agent_id, state in states
+                if agent_id not in stuck
+                for error in state.cleanup_errors
+            ]
+        for agent_id in stuck:
+            error = (
+                f"lifecycle cleanup for {agent_id} did not complete within "
+                f"{timeout:g}s; the child is still draining"
+            )
+            logger.error("spawn_agent: %s", error)
+            errors.append(error)
+        return errors
 
     # ------------------------------------------------------------------
     # Admission + submission
@@ -104,8 +345,11 @@ class SubAgentSupervisor:
         """
         from sub_agent_registry import register_run
 
+        factory_kwargs = request.factory_kwargs
+        if request.ownership.origin == ORIGIN_SCHEDULED:
+            factory_kwargs = {**factory_kwargs, "context_payload": {}}
         try:
-            runner = request.factory(**request.factory_kwargs)
+            runner = request.factory(**factory_kwargs)
         except ValueError as exc:
             return {
                 "success": False,
@@ -128,15 +372,57 @@ class SubAgentSupervisor:
             task_preview=request.task,
             result_type=request.response_format,
         )
-        record.prompt_id = options.prompt_id
+        record.prompt_id = request.ownership.prompt_id
+        record.ownership = request.ownership
+        if request.ownership.owner_turn_id is not None:
+            with self._owned_lock:
+                self._owned_children[runner.agent_id] = _OwnedChildState(record)
+        try:
+            if (
+                request.ownership.origin == ORIGIN_ON_DEMAND
+                and request.ownership.prompt_id is not None
+                and request.prompt_registry is not None
+            ):
+                request.prompt_registry.associate_sub_agent(
+                    request.ownership.prompt_id,
+                    runner.agent_id,
+                )
 
-        # Log spawn params for observability
-        logger.info(
-            "spawn_agent: id=%s label=%s model=%s task=%s",
-            runner.agent_id, request.label, runner.model_id, request.task[:100],
-        )
+            # Log spawn params for observability
+            logger.info(
+                "spawn_agent: id=%s label=%s model=%s task=%s",
+                runner.agent_id, request.label, runner.model_id, request.task[:100],
+            )
 
-        self._pool.submit(lambda: self._run_and_notify(request, options, runner, record))
+            self._pool.submit(
+                lambda: self._run_and_notify(request, options, runner, record)
+            )
+        except Exception:
+            # Admission failed after registration: roll back every piece of
+            # per-run state so no registry capacity slot, owned-child record,
+            # or prompt association is stranded by the failed submission.
+            from sub_agent_registry import deregister_run
+
+            with self._owned_lock:
+                self._owned_children.pop(runner.agent_id, None)
+            if (
+                request.ownership.origin == ORIGIN_ON_DEMAND
+                and request.ownership.prompt_id is not None
+                and request.prompt_registry is not None
+            ):
+                try:
+                    request.prompt_registry.remove_sub_agent(
+                        request.ownership.prompt_id,
+                        runner.agent_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "spawn_agent: rollback of prompt association failed for %s",
+                        runner.agent_id,
+                        exc_info=True,
+                    )
+            deregister_run(runner.agent_id)
+            raise
 
         return {
             "success": True,
@@ -180,22 +466,11 @@ class SubAgentSupervisor:
         job_tag = options.job_tag
         finish_tag = job_tag or label
         result_log_cb = options.result_log_cb
-        notify_result = options.notify
-        expandable = options.expandable
-        notify_html = request.notify_html_fn
+        notify_result = (
+            options.notify and request.ownership.origin == ORIGIN_SCHEDULED
+        )
+        completion_cb = options.completion_cb
         context_save_attempted = False
-
-        def _send_result_html(header_html: str, body: str) -> None:
-            """Send header + body, optionally wrapped in an expandable blockquote."""
-            escaped = _html_mod.escape(body)
-            if expandable:
-                msg = f"{header_html}\n<blockquote expandable>{escaped}</blockquote>"
-            else:
-                msg = f"{header_html}\n\n{escaped}"
-            if notify_html:
-                notify_html(msg)
-            else:
-                runner.notify_fn(msg)
 
         def _save_context_before_completion() -> None:
             """Persist context before exposing completion to get_agent_result callers."""
@@ -219,7 +494,11 @@ class SubAgentSupervisor:
             bind_run_context(
                 trace=run_trace_id,
                 agent=runner.agent_id,
-                prompt_id=str(options.prompt_id) if options.prompt_id is not None else "",
+                prompt_id=(
+                    str(request.ownership.prompt_id)
+                    if request.ownership.prompt_id is not None
+                    else ""
+                ),
             )
             # Real SubAgentRunner.run() accepts a prompt_id kwarg; test fakes may
             # not, so fall back to the legacy signature. Use inspect.signature
@@ -227,7 +506,7 @@ class SubAgentSupervisor:
             # runner do not silently restart execution.
             run_signature = inspect.signature(runner.run)
             if "prompt_id" in run_signature.parameters:
-                result = runner.run(task, prompt_id=options.prompt_id)
+                result = runner.run(task, prompt_id=request.ownership.prompt_id)
             else:
                 result = runner.run(task)
             # P2 consolidation: sub-agent results are NOT auto-persisted into
@@ -248,9 +527,7 @@ class SubAgentSupervisor:
                     model=runner.model_id,
                     result_log_cb=result_log_cb,
                     notify=notify_result,
-                    notify_cb=lambda: self._send_cancelled_text(
-                        runner, record, label
-                    ),
+                    completion_cb=completion_cb,
                     save_context_cb=_save_context_before_completion,
                     result_log_result=CANCELLED_SENTINEL,
                     result_log_success=False,
@@ -272,12 +549,7 @@ class SubAgentSupervisor:
                     model=runner.model_id,
                     result_log_cb=result_log_cb,
                     notify=notify_result,
-                    notify_cb=lambda: _send_result_html(
-                        self._result_header(
-                            "✅", "finished", runner, label, task, elapsed
-                        ),
-                        result,
-                    ),
+                    completion_cb=completion_cb,
                     save_context_cb=_save_context_before_completion,
                     result_log_result=result,
                     result_log_success=True,
@@ -302,12 +574,7 @@ class SubAgentSupervisor:
                 model=runner.model_id,
                 result_log_cb=result_log_cb,
                 notify=notify_result,
-                notify_cb=lambda: _send_result_html(
-                    self._result_header(
-                        "❌", "failed", runner, label, task, elapsed
-                    ),
-                    error_text,
-                ),
+                completion_cb=completion_cb,
                 save_context_cb=_save_context_before_completion,
                 result_log_result=error_text,
                 result_log_success=False,
@@ -323,20 +590,57 @@ class SubAgentSupervisor:
             # Persist conversation context (if requested) regardless of
             # success/cancellation/failure so a crash mid-task does not lose
             # the sub-agent's short-term memory.
-            _save_context_before_completion()
-            deregister_run(runner.agent_id)
-            runner.close()
-            clear_run_context()
+            cleanup_stages: list[tuple[str, Callable[[], object]]] = [
+                ("save_context", _save_context_before_completion),
+                ("deregister_run", lambda: deregister_run(runner.agent_id)),
+                ("runner.close", runner.close),
+                ("clear_run_context", clear_run_context),
+            ]
             if options.grant_scope_cb:
-                try:
-                    options.grant_scope_cb(runner.agent_id)
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "spawn_agent: grant_scope_cb failed for %s", runner.agent_id,
-                        exc_info=True,
+                cleanup_stages.append(
+                    (
+                        "grant_scope_cb",
+                        lambda: options.grant_scope_cb(runner.agent_id),
                     )
+                )
             if options.finish_cb:
-                options.finish_cb(finish_tag)
+                cleanup_stages.append(("finish_cb", lambda: options.finish_cb(finish_tag)))
+
+            cleanup_errors: list[str] = []
+            try:
+                for stage_name, cleanup_stage in cleanup_stages:
+                    try:
+                        cleanup_stage()
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        error = f"{stage_name} failed for {runner.agent_id}: {cleanup_exc}"
+                        cleanup_errors.append(error)
+                        logger.warning("spawn_agent: %s", error, exc_info=True)
+            finally:
+                self._signal_owned_cleanup(record, cleanup_errors)
+
+    def _signal_owned_cleanup(
+        self, record: SubAgentRecord, cleanup_errors: Optional[list[str]] = None
+    ) -> None:
+        """Publish lifecycle cleanup after runner close and terminal callbacks."""
+        agent_id = getattr(record, "agent_id", None)
+        if agent_id is None:
+            return
+        with self._owned_lock:
+            state = self._owned_children.get(agent_id)
+            if state is None:
+                return
+            if cleanup_errors:
+                state.cleanup_errors.extend(cleanup_errors)
+            state.cleanup_event.set()
+            if state.drain_expired:
+                # The owning turn already reported this child as stuck and was
+                # released; finish its cleanup contract here.
+                self._owned_children.pop(agent_id, None)
+                logger.warning(
+                    "spawn_agent: late lifecycle cleanup completed for %s%s",
+                    agent_id,
+                    f" with errors: {state.cleanup_errors}" if state.cleanup_errors else "",
+                )
 
     def _finalize_terminal(
         self,
@@ -351,7 +655,7 @@ class SubAgentSupervisor:
         model: str,
         result_log_cb: Optional[Callable[..., None]],
         notify: bool,
-        notify_cb: Callable[[], None],
+        completion_cb: Optional[Callable[[RunCompletion], None]],
         save_context_cb: Callable[[], None],
         result_log_result: str,
         result_log_success: bool,
@@ -365,7 +669,8 @@ class SubAgentSupervisor:
 
         Sets the record status/result, persists context, signals completion,
         logs the outcome, invokes the scheduler result callback safely, and
-        delivers any branch-specific notification.
+        hands the terminal outcome to the presentation owner. The supervisor
+        never sends result notices itself.
         """
         record.status = status
         record.result = result
@@ -385,15 +690,20 @@ class SubAgentSupervisor:
             elapsed_s=elapsed,
             model=model,
         )
-        if not notify:
+        if not notify or completion_cb is None:
             return
         if status == "cancelled" and record.timeout_cancelled:
             return
         try:
-            notify_cb()
+            completion_cb(
+                RunCompletion(
+                    tag=label, status=status, result=result_log_result,
+                    elapsed_s=elapsed, model=model, agent_id=runner.agent_id,
+                )
+            )
         except Exception as notify_exc:  # noqa: BLE001
             logger.warning(
-                "spawn_agent: [%s] notify failed (%s): %s",
+                "spawn_agent: [%s] completion handoff failed (%s): %s",
                 label, icon_verb[1], notify_exc,
             )
 
@@ -425,37 +735,6 @@ class SubAgentSupervisor:
                 "spawn_agent: [%s] result_log_cb failed (%s): %s",
                 tag, "success" if success else "terminal", log_exc,
             )
-
-    def _result_header(
-        self,
-        icon: str,
-        verb: str,
-        runner: SubAgentRunner,
-        label: str,
-        task: str,
-        elapsed: int,
-    ) -> str:
-        """Build the common HTML header for a sub-agent result notification."""
-        return (
-            f"{icon} <b>Sub-agent</b> <code>{_html_mod.escape(runner.agent_id)}</code>"
-            f" {verb} ({elapsed}s)\n"
-            f"<b>Job:</b> {_html_mod.escape(label)}"
-            f" | <b>Model:</b> <code>{_html_mod.escape(runner.model_id)}</code>\n"
-            f"<b>Task:</b> {_html_mod.escape(task[:120])}"
-        )
-
-    def _send_cancelled_text(
-        self,
-        runner: SubAgentRunner,
-        record: SubAgentRecord,
-        label: str,
-    ) -> None:
-        """Send the plain-text notification for a cancelled sub-agent run."""
-        runner.notify_fn(
-            f"🛑 Sub-agent {runner.agent_id} cancelled\n"
-            f"Job: **{label}**\n"
-            f"Completed {record.iteration} iterations before stop."
-        )
 
     # ------------------------------------------------------------------
     # Shutdown
