@@ -158,7 +158,12 @@ def _validate_spawn_args(
 
     model = args.get("model") or None
     context_key = args.get("context_key") or None
-    if context_key:
+    if context_key and options.source == SOURCE_SCHEDULED:
+        # The scheduler's truthy context_key is only a preserve_context marker.
+        # The persisted key is derived from the job identity in an origin-scoped
+        # namespace; no model-facing value ever reaches it.
+        context_key = context_io.scheduled_context_key(options.job_tag or "")
+    elif context_key:
         try:
             context_key = context_io._validate_context_key(str(context_key))
         except ValueError as exc:

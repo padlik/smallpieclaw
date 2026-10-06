@@ -1232,6 +1232,8 @@ class Scheduler:
         if job_model:
             spawn_args["model"] = job_model
         if context_key:
+            # Marker only: the spawn path ignores this value for scheduled runs
+            # and derives an origin-scoped key from the job tag instead.
             spawn_args["context_key"] = context_key
 
         # Internal supervision controls travel through per-submission options,

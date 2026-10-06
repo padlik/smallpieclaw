@@ -854,6 +854,92 @@ class TestScheduledBoundariesUnchanged:
         assert result["success"] is True
         check.assert_not_called()
 
+    def _retargetable_diff(self, ex, policy, outside):
+        """Workspace symlinks that are ALLOWED at the gate and retarget to ``outside`` afterwards."""
+        import os
+
+        safe = os.path.join(policy.workspace_dir, "safe.txt")
+        with open(safe, "w") as fh:
+            fh.write("safe\n")
+        link_a = os.path.join(policy.workspace_dir, "link_a")
+        link_b = os.path.join(policy.workspace_dir, "link_b")
+        os.symlink(safe, link_a)
+        os.symlink(safe, link_b)
+        calls = {"n": 0}
+
+        class RetargetingPolicy:
+            """Delegates to the real policy; retargets the links after the initial gate."""
+
+            def __getattr__(self, name):
+                return getattr(policy, name)
+
+            def classify(self, path, operation):
+                calls["n"] += 1
+                verdict = policy.classify(path, operation)
+                if calls["n"] == 2:  # the initial gate has classified both paths
+                    for link, name in ((link_a, "a.txt"), (link_b, "b.txt")):
+                        os.remove(link)
+                        os.symlink(os.path.join(outside, name), link)
+                return verdict
+
+        ex.path_policy = RetargetingPolicy()
+        return link_a, link_b
+
+    def test_scheduled_diff_retargeted_to_unrecognised_is_denied(self, active_operator):
+        from agent_runtime import RuntimeProfile
+
+        ex, _coordinator, outside, policy = active_operator
+        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        link_a, link_b = self._retargetable_diff(ex, policy, outside)
+
+        result = _runner_execute(runner, "file_diff", {"path_a": link_a, "path_b": link_b})
+
+        assert result["success"] is False
+        assert result["error_type"] == "scheduled_approval_denied"
+
+    def test_scheduled_diff_retarget_never_consults_grant_ledger(self, active_operator):
+        from agent_runtime import RuntimeProfile
+
+        ex, coordinator, outside, policy = active_operator
+        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        link_a, link_b = self._retargetable_diff(ex, policy, outside)
+        ledger = coordinator.grant_ledger
+
+        with patch.object(ledger, "check", wraps=ledger.check) as check:
+            _runner_execute(runner, "file_diff", {"path_a": link_a, "path_b": link_b})
+
+        check.assert_not_called()
+
+    def test_scheduled_diff_retarget_does_not_open_outside_file(self, active_operator):
+        from agent_runtime import RuntimeProfile
+
+        ex, _coordinator, outside, policy = active_operator
+        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        link_a, link_b = self._retargetable_diff(ex, policy, outside)
+        opened: list[str] = []
+        real_open = open
+
+        def spy_open(path, *a, **kw):
+            opened.append(str(path))
+            return real_open(path, *a, **kw)
+
+        with patch("builtins.open", side_effect=spy_open):
+            result = _runner_execute(runner, "file_diff", {"path_a": link_a, "path_b": link_b})
+
+        assert result["success"] is False
+        assert not [p for p in opened if p.startswith(outside)]
+
+    def test_on_demand_diff_retarget_still_consults_grant_ledger(self, active_operator):
+        ex, coordinator, outside, policy = active_operator
+        link_a, link_b = self._retargetable_diff(ex, policy, outside)
+        ledger = coordinator.grant_ledger
+
+        with patch.object(ledger, "check", wraps=ledger.check) as check:
+            result = ex.execute("file_diff", {"path_a": link_a, "path_b": link_b})
+
+        check.assert_called()
+        assert result["success"] is True
+
     def test_scheduled_prohibited_path_keeps_prohibited_denial(self, active_operator, tmp_path):
         from agent_runtime import RuntimeProfile
 

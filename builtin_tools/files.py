@@ -326,6 +326,7 @@ class FileTools:
             return self._run_file_diff(
                 args, caller_tag=caller_tag,
                 scope_owner=self._owner._scope_owner_from_caller_tag(caller_depth, caller_tag),
+                scheduled=scheduled,
             )
 
         # Need consent for every distinct unrecognised directory lacking grant.
@@ -369,9 +370,14 @@ class FileTools:
 
     def _run_file_diff(
         self, args: dict, caller_tag: str = "", *, approved_zone_paths: tuple[str, ...] = (),
-        scope_owner: str | None = None,
+        scope_owner: str | None = None, scheduled: bool = False,
     ) -> dict:
-        """Execute file_diff after zone gate has passed."""
+        """Execute file_diff after zone gate has passed.
+
+        Paths are re-resolved here (a symlink may have been retargeted since the
+        gate). A *scheduled* run whose re-resolved path needs consent is denied
+        before the operator grant ledger is ever consulted.
+        """
         path_a = args.get("_resolved_path_a") or os.path.expanduser(str(args.get("path_a", "")).strip())
         path_b = args.get("_resolved_path_b") or os.path.expanduser(str(args.get("path_b", "")).strip())
         try:
@@ -398,6 +404,10 @@ class FileTools:
                 return self._prohibited_error(reason, path)
             if verdict != PathVerdict.UNRECOGNISED:
                 continue
+            if scheduled:
+                return self._owner._requires_confirmation(
+                    "file_diff", args, "", scheduled=True,
+                )
             has_grant = bool(ledger and ledger.check(
                 "file_diff", os.path.dirname(path), scope_owner=scope_owner,
             ))

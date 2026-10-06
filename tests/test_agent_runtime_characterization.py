@@ -705,7 +705,7 @@ def _fire_trigger(scheduler, trigger: str) -> None:
 
 def drive_scheduled_trigger(
     trigger: str, make_builtin_executor, tmp_path, monkeypatch,
-    *, preserve_context: bool = False,
+    *, preserve_context: bool = False, legacy_flat_context: bool = False,
 ):
     """Run one scheduled job via a real trigger route; return its ReactContext.
 
@@ -716,7 +716,7 @@ def drive_scheduled_trigger(
     """
     import schedule
 
-    from builtin_tools.context_io import _save_context
+    from builtin_tools.context_io import _save_context, scheduled_context_key
     from sub_agent_registry import get_registry
 
     executor, operator = _build_operator_stack(make_builtin_executor, tmp_path)
@@ -735,7 +735,10 @@ def drive_scheduled_trigger(
         saved = ShortTermMemory(max_turns=50)
         saved.add("user", "job-owned earlier request")
         saved.add("assistant", "job-owned earlier answer")
-        _save_context(_JOB_TAG, saved, str(tmp_path))
+        _save_context(
+            _JOB_TAG if legacy_flat_context else scheduled_context_key(_JOB_TAG),
+            saved, str(tmp_path),
+        )
 
     captured: dict = {}
     ran = threading.Event()
@@ -820,6 +823,15 @@ class TestScheduledRunJobOwnedContext:
             {"role": "user", "content": "job-owned earlier request"},
             {"role": "assistant", "content": "job-owned earlier answer"},
         ]
+
+    def test_legacy_flat_context_is_never_imported(
+        self, trigger, make_builtin_executor, tmp_path, monkeypatch,
+    ):
+        ctx, _operator = drive_scheduled_trigger(
+            trigger, make_builtin_executor, tmp_path, monkeypatch,
+            preserve_context=True, legacy_flat_context=True,
+        )
+        assert ctx.short_term.get_messages() == []
 
 
 class TestScheduledMemoryIsolatedPerRun:

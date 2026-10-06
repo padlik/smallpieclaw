@@ -58,6 +58,13 @@ An on-demand sub-agent spawned by the operator SHALL be associated with a unique
 - **THEN** the child is accounted for in that turn
 - **AND** the turn remains draining until lifecycle cleanup completes
 
+#### Scenario: Bounded drain releases a stuck child without hiding it
+- **GIVEN** a turn-owned child's lifecycle cleanup has not completed within the fixed drain window
+- **WHEN** the drain timeout expires
+- **THEN** the operator turn is released with an error naming the stuck child
+- **AND** the child's record is retained with a drain-expired marker so later drains do not wait on it again
+- **AND** its own late cleanup still finalizes and removes the record
+
 #### Scenario: Owned result remains retrievable beyond completed-record expiry
 - **GIVEN** a turn-owned child record has passed registry expiry
 - **WHEN** its owning turn retrieves or accounts for the child

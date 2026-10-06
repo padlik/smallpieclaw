@@ -439,6 +439,42 @@ The operator approved read-only `/jobs history <tag>` and `/jobs result <executi
 ### 🔴 Outstanding
 - None. All 52/52 tasks complete; implementation and artifacts validate clean. The change is eligible for archive (archive requires merge to main first, per git discipline).
 
+## Full-panel review + fixes — 2026-10-06
+
+### Panel verdict (architect FAIL / implementer PASS / sentinel FAIL; judge: REQUEST_CHANGES)
+- **Sentinel Critical 1 (judge-verified)**: scheduled `file_diff` revalidation consulted the operator ledger when a retargeted symlink made a path UNRECOGNISED. **Fixed**: `scheduled` propagated into `_run_file_diff`; newly-UNRECOGNISED paths refused before any ledger access; symlink-retarget regression tests + on-demand guard. Red→green verified.
+- **Sentinel Critical 2 (judge-verified)**: preserved job context shared the flat `job_contexts/<key>.json` namespace with model-chosen on-demand keys; normalization could collide distinct tags. **Fixed**: `scheduled_context_key()` namespace `job_contexts/scheduled/<stem>-<sha256[:16]>` derived from the job tag at SOURCE_SCHEDULED validation (model-supplied keys ignored; on-demand validator unchanged, cannot contain "/"); legacy flat files never imported (documented policy), untouched for on-demand readers; 14 red-first tests cover cross-origin isolation, tag collision, round-trip, and on-demand invariance.
+- **Architect Critical (drain timeout releases turn before cleanup)**: judged superseded by the operator's recorded H1 ruling — the 180s bounded drain replaced the unbounded operator-lock hang; reverting would reintroduce a worse approved-fixed defect. Resolution: declarative artifact reconciliation before archive (record the drain-expired/abandoned-run transition in design/spec wording) — pending.
+- Implementer PASS: locking discipline, cross-thread handoffs, asyncio.to_thread reads, test honesty verified; no findings.
+
+### Verification
+- Full suite after both fixes: **2773 passed, 2 skipped** (baseline only, zero new skips); Part 5 focused sweep 697 passed; ruff + vulture + `git diff --check` clean.
+
+### 🔴 Outstanding
+- Declarative drain-transition wording reconciliation in design/spec (per judge) before archive; panel re-run to confirm the two Criticals are closed.
+
+## Panel-fix reconciliation — 2026-10-06
+
+### 🔴 Fixed
+- Drain-transition wording reconciled declaratively: design.md and the sub-agent-supervision delta spec now state the operator-approved bounded drain (180s window, drain-expired retention, late-cleanup finalization, truthful operator warning) instead of the unbounded "draining until cleanup is terminal" wording. New spec scenario "Bounded drain releases a stuck child without hiding it". Strict `openspec validate` passes with the reconciled artifacts.
+- Sentinel Criticals 1 and 2 fixed in code (see the panel-review section above); scoped sentinel re-verification dispatched to confirm closure before merge.
+
+### Verification
+- Full suite 2773 passed / 2 baseline skips after both fixes; `openspec validate --type change --strict`: valid; ruff + vulture + `git diff --check` clean.
+
+### 🔴 Outstanding
+- Scoped sentinel confirmation of the two Critical fixes, then the branch is ready for the merge + archive decision.
+
+## Sentinel re-verification — 2026-10-06
+
+### VERDICT: CONFIRMED (both Criticals closed)
+- Critical 1 (scheduled file_diff grant borrowing): original retargeted-path repro re-attempted — scheduled dispatch returns `scheduled_approval_denied`, never consults the ledger, opens neither file; on-demand behavior covered.
+- Critical 2 (context origin isolation): model-facing validation rejects scheduled-namespace keys; colliding tags, long tags, Unicode, and traversal-like tags produce distinct contained paths; legacy flat context neither imported nor overwritten.
+- New findings: none in scope. 147 relevant tests passed; regression assertions verified to fail against the original defect paths.
+
+### 🔴 Outstanding
+- None. All panel REQUIRED_FIXES are closed (both code Criticals fixed and adversarially confirmed; drain wording reconciled declaratively, strict validation valid). Branch is ready for the operator's merge + archive decision.
+
 ### 🔴 Outstanding
 - None.
 

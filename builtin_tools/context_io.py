@@ -7,6 +7,7 @@ original ``builtin_executor``) to avoid an import cycle. No imports back into
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -14,6 +15,28 @@ import re
 logger = logging.getLogger(__name__)
 
 _CONTEXT_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+# Scheduled-origin preserved context lives under job_contexts/scheduled/. Keys
+# in that namespace contain "/", which ``_validate_context_key`` rejects, so a
+# model-chosen on-demand ``context_key`` can never name (read or overwrite) one.
+# Legacy policy: pre-isolation scheduled context was stored flat as
+# job_contexts/<normalized-tag>.json. It is deliberately never imported: flat
+# names are ambiguous (on-demand children and colliding tags shared them), so
+# scheduled jobs start fresh here and the flat files stay untouched for
+# on-demand readers.
+SCHEDULED_CONTEXT_PREFIX = "scheduled/"
+_SCHEDULED_STEM_RE = re.compile(r"[a-z0-9_]{0,64}-[0-9a-f]{16}\Z")
+
+
+def scheduled_context_key(tag: str) -> str:
+    """Return the origin-scoped persistence key for scheduled job *tag*.
+
+    The digest is taken over the raw tag, so distinct tags that normalise to the
+    same readable stem still get distinct storage.
+    """
+    stem = re.sub(r"[^a-z0-9_]+", "_", tag.strip().lower()).strip("_")[:64].rstrip("_") or "job"
+    digest = hashlib.sha256(tag.encode("utf-8")).hexdigest()[:16]
+    return f"{SCHEDULED_CONTEXT_PREFIX}{stem}-{digest}"
 
 
 def _validate_context_key(context_key: str) -> str:
@@ -30,8 +53,15 @@ def _validate_context_key(context_key: str) -> str:
 
 def _context_path(context_key: str, data_dir: str) -> str:
     """Return the absolute context path, rejecting path traversal."""
-    safe_key = _validate_context_key(context_key)
-    ctx_dir = os.path.abspath(os.path.join(data_dir, "job_contexts"))
+    base_dir = os.path.abspath(os.path.join(data_dir, "job_contexts"))
+    if isinstance(context_key, str) and context_key.startswith(SCHEDULED_CONTEXT_PREFIX):
+        safe_key = context_key[len(SCHEDULED_CONTEXT_PREFIX):]
+        if not _SCHEDULED_STEM_RE.fullmatch(safe_key):
+            raise ValueError("malformed scheduled context key")
+        ctx_dir = os.path.join(base_dir, "scheduled")
+    else:
+        safe_key = _validate_context_key(context_key)
+        ctx_dir = base_dir
     path = os.path.abspath(os.path.join(ctx_dir, f"{safe_key}.json"))
     if os.path.commonpath([ctx_dir, path]) != ctx_dir:
         raise ValueError("context_key resolves outside job_contexts")
