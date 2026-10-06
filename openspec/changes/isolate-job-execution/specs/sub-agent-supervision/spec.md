@@ -1,14 +1,30 @@
 ## ADDED Requirements
 
-### Requirement: Operator turn owns on-demand child results and lifetime
+### Requirement: Operator turn owns its on-demand children
 
-An on-demand sub-agent spawned by the operator SHALL be associated with a unique immutable **operator turn** identity at admission as a **turn-owned child**. Only that turn SHALL consume its result through `get_agent_result` or `wait_for_any_agent`; no independent child-completion Telegram message or automatic operator result-recall entry SHALL be created. A resumed run SHALL receive a new turn identity even when reusing a checkpoint trace; it SHALL NOT inherit prior-turn children or their outcomes. At normal finish the operator SHALL retrieve or cancel all its admitted children before the turn ends. Owned records SHALL remain available to their turn beyond registry expiry for retrieval/accounting. On stop, error, or exhausted run budget, outstanding children SHALL be cancelled and the turn SHALL remain active until their lifecycle cleanup completes; confirmation callbacks and `/stop` MUST remain responsive throughout.
+An operator-spawned on-demand sub-agent SHALL be admitted with a unique immutable **operator turn** identity as a **turn-owned child**. Only that turn SHALL consume its result via `get_agent_result` or `wait_for_any_agent`; no independent completion Telegram message or automatic result-recall entry SHALL be created. A resumed run, even reusing a checkpoint trace, SHALL get a new turn identity and SHALL NOT inherit prior children or outcomes.
 
 #### Scenario: Parent consumes its own completed child
 - **GIVEN** an operator turn spawned on-demand child A
 - **WHEN** A finishes and that turn calls `get_agent_result` for A
 - **THEN** the turn receives A's terminal status and result
 - **AND** A does not independently notify Telegram or enter operator result recall
+
+#### Scenario: Resumed run receives a new owner
+- **GIVEN** a run resumes a prior checkpoint trace after an earlier turn spawned child A
+- **WHEN** the resumed run is admitted as an operator turn
+- **THEN** it receives a unique owner distinct from the earlier turn
+- **AND** it neither inherits A nor receives A's outcome in its context
+
+#### Scenario: Non-owned child results cannot be read by the model
+- **GIVEN** a model-facing result tool is called in an operator turn with a scheduled, unknown, or other-turn agent ID
+- **WHEN** the result is requested through `get_agent_result` or `wait_for_any_agent`
+- **THEN** it returns an error naming the supplied ID and saying no child is accessible in this turn, without waiting
+- **AND** it does not disclose whether a non-owned run exists or reveal its result
+
+### Requirement: Operator turn ends only after its children are accounted and drained
+
+At normal finish the operator SHALL retrieve or cancel all its admitted children before the turn ends. Owned records SHALL remain available to their turn beyond registry expiry for retrieval/accounting. On stop, error, or exhausted run budget, outstanding children SHALL be cancelled and the turn SHALL remain active until their lifecycle cleanup completes; confirmation callbacks and `/stop` MUST remain responsive throughout.
 
 #### Scenario: Finishing with an outstanding child is refused
 - **GIVEN** a turn spawned child A, which is still running
@@ -34,23 +50,11 @@ An on-demand sub-agent spawned by the operator SHALL be associated with a unique
 - **THEN** the child remains unaccounted and owned by that turn
 - **AND** normal finish is refused until its outcome is retrieved or it is cancelled
 
-#### Scenario: Resumed run receives a new owner
-- **GIVEN** a run resumes a prior checkpoint trace after an earlier turn spawned child A
-- **WHEN** the resumed run is admitted as an operator turn
-- **THEN** it receives a unique owner distinct from the earlier turn
-- **AND** it neither inherits A nor receives A's outcome in its context
-
 #### Scenario: Stop drains children without blocking control callbacks
 - **GIVEN** an operator turn has two running children, one awaiting operator confirmation
 - **WHEN** the operator sends `/stop`
 - **THEN** the existing stop behavior requests cancellation of the turn and managed agents
 - **AND** the turn remains active until its children finish cleanup while Telegram control/confirmation callbacks remain processable
-
-#### Scenario: Non-owned child results cannot be read by the model
-- **GIVEN** a model-facing result tool is called in an operator turn with a scheduled, unknown, or other-turn agent ID
-- **WHEN** the result is requested through `get_agent_result` or `wait_for_any_agent`
-- **THEN** it returns an error naming the supplied ID and saying no child is accessible in this turn, without waiting
-- **AND** it does not disclose whether a non-owned run exists or reveal its result
 
 #### Scenario: Operator cancellation accounts for its turn-owned child
 - **GIVEN** a turn-owned child has not been accounted for
