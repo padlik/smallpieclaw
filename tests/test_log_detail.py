@@ -776,3 +776,34 @@ class TestReadTimeRedactionKeepsRecordSchema:
 
         assert sorted(record["request"].values()) == [1, 2]
         assert sorted(record["request"]) == ["[REDACTED]", "[REDACTED]_1"]
+
+
+@pytest.mark.parametrize("layers", [2, 3, 7])
+def test_log_detail_nested_json_credential_not_recoverable(
+    make_builtin_executor, tmp_path, layers
+):
+    """A credential serialized into JSON several times is gone at every decode depth."""
+    secret = 'ab12"ba21'
+    leaf = f"token={secret}"
+    for _ in range(layers):
+        leaf = json.dumps(leaf)
+    path = str(tmp_path / "nested.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A,
+                            "level": "error", "msg": leaf}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = '{secret}'\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault))
+    )
+
+    text = _detail(exc, 1)["record"]["msg"]
+
+    for _ in range(16):
+        assert secret not in text
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            break
+        if not isinstance(decoded, str):
+            break
+        text = decoded

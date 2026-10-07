@@ -20,7 +20,7 @@ import os
 import re
 import sqlite3
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 import structlog
 
@@ -31,7 +31,11 @@ from builtin_tools.logquery_helpers import (
     _log_query_project,
     _LOG_QUERY_MAX_LIMIT,
 )
-from builtin_tools.text_utils import build_redaction_needles, redact_structure
+from builtin_tools.text_utils import (
+    build_detection_probes,
+    build_redaction_needles,
+    redact_structure,
+)
 from sqlite_log import _compact_json, connect_store, row_to_record
 
 if TYPE_CHECKING:
@@ -51,6 +55,39 @@ _SQLITE_INT64_MAX: int = 2**63 - 1
 # as a results-directory path component. Stored content is untrusted; malformed
 # values fall back to the current run's trace context.
 _TRACE_ID_RE = re.compile(r"r-[0-9a-f]{8}")
+
+
+def _scan_dirty_rows(
+    rows: Iterable[sqlite3.Row],
+    secrets_list: list[str],
+    text_folded: str,
+    before_id: int | None,
+    limit: int,
+) -> tuple[int, list[tuple[int, dict]]]:
+    """Match *rows* (newest id first) against the redacted corpus in one streaming pass.
+
+    Returns the exact number of rows whose vault-redacted, casefolded compact
+    JSON contains *text_folded* and, newest first, only the first *limit* of
+    those below *before_id*. Because the traversal is descending, those are the
+    newest eligible matches, so memory stays bounded by *limit* however many
+    rows match.
+    """
+    count = 0
+    retained: list[tuple[int, dict]] = []
+    for row in rows:
+        redacted = redact_structure(
+            row_to_record(row), secrets_list, preserve_top_level_keys=True
+        )
+        corpus = _compact_json(
+            {k: v for k, v in redacted.items() if k != "id"}
+        ).casefold()
+        if text_folded not in corpus:
+            continue
+        count += 1
+        row_id = row["id"]
+        if len(retained) < limit and (before_id is None or row_id < before_id):
+            retained.append((row_id, redacted))
+    return count, retained
 
 
 class SecretsTools:
@@ -342,7 +379,7 @@ class LogQueryTools:
         try:
             if filters.text_folded and needles:
                 total_matched, records = self._log_query_redacted_text_search(
-                    conn, filters, count_filters, needles, secrets_list, limit, before_id
+                    conn, filters, count_filters, secrets_list, limit, before_id
                 )
             else:
                 total_matched = conn.execute(
@@ -388,7 +425,6 @@ class LogQueryTools:
         conn: sqlite3.Connection,
         filters: LogQueryFilters,
         count_filters: LogQueryFilters,
-        needles: tuple[str, ...],
         secrets_list: list[str],
         limit: int,
         before_id: int | None,
@@ -397,8 +433,10 @@ class LogQueryTools:
 
         The stored ``search_text`` predates the current vault, so matching it in
         SQL would let counts reveal credential prefixes. Rows are split by
-        whether their ``search_text`` contains any current-vault needle
-        (casefolded, plus one extra JSON-escape level for nested-JSON strings):
+        whether their ``search_text`` contains any detection probe (the
+        casefolded current-vault needles at every JSON-escape depth redaction
+        covers plus one for the serialization layer, and the deep-nesting
+        marker; see :func:`build_detection_probes`):
 
         * clean rows cannot be altered by redaction, so their stored corpus IS
           the redacted corpus and the indexed SQL ``instr`` match is exact;
@@ -408,13 +446,7 @@ class LogQueryTools:
         ``total_matched`` is the exact union count. The page is the newest
         ``limit`` of the union, honouring ``before_id``, so paging is gapless.
         """
-        probes: list[str] = []
-        for needle in build_redaction_needles(
-            [*needles, *(json.dumps(n)[1:-1] for n in needles)]
-        ):
-            folded = needle.casefold()
-            if folded not in probes:
-                probes.append(folded)
+        probes = build_detection_probes(secrets_list)
         dirty_sql = "(" + " OR ".join("instr(search_text, ?) > 0" for _ in probes) + ")"
 
         base_where, base_params = _log_query_compile_where(
@@ -443,18 +475,16 @@ class LogQueryTools:
             [*clean_params, *anchor_params, limit],
         ).fetchall()
 
-        dirty_matches: list[tuple[int, dict]] = []
-        for row in conn.execute(
-            f"SELECT * FROM events WHERE {base_where} AND {dirty_sql} ORDER BY id DESC",
-            [*base_params, *probes],
-        ):
-            record = row_to_record(row)
-            redacted = redact_structure(record, secrets_list, preserve_top_level_keys=True)
-            corpus = _compact_json(
-                {k: v for k, v in redacted.items() if k != "id"}
-            ).casefold()
-            if text_folded in corpus:
-                dirty_matches.append((row["id"], redacted))
+        dirty_count, dirty_retained = _scan_dirty_rows(
+            conn.execute(
+                f"SELECT * FROM events WHERE {base_where} AND {dirty_sql} ORDER BY id DESC",
+                [*base_params, *probes],
+            ),
+            secrets_list,
+            text_folded,
+            before_id,
+            limit,
+        )
 
         page = [
             (row["id"], redact_structure(
@@ -462,14 +492,11 @@ class LogQueryTools:
             ))
             for row in clean_rows
         ]
-        page += [
-            (rid, rec) for rid, rec in dirty_matches
-            if before_id is None or rid < before_id
-        ]
+        page += dirty_retained
         page.sort(key=lambda item: item[0], reverse=True)
         newest = page[:limit]
         newest.reverse()
-        return clean_count + len(dirty_matches), [rec for _rid, rec in newest]
+        return clean_count + dirty_count, [rec for _rid, rec in newest]
 
     def _log_query_result(self, records: list, total_matched: int, truncated: bool) -> dict:
         """Render a log_query payload using the peer result-dict convention.

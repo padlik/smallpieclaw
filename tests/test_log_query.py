@@ -1032,3 +1032,160 @@ def test_text_search_without_vault_secrets_is_unchanged(make_builtin_executor, t
     exc = _redacting_executor(make_builtin_executor, tmp_path, records, 'k = "zzzzzzzz"\n')
 
     assert _query(exc, text="boom visible")["total_matched"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Nested JSON serialization of a credential (repeated escaping) and bounded
+# retention of dirty matches
+# ---------------------------------------------------------------------------
+
+_ESCAPE_SECRET = 'ab12"ba21'
+_ESCAPE_VAULT = f"late_key = '{_ESCAPE_SECRET}'\n"
+
+
+def _nest(text: str, layers: int) -> str:
+    for _ in range(layers):
+        text = json.dumps(text)
+    return text
+
+
+def _decode_levels(text: str):
+    """Yield *text* and every successive json.loads() layer that stays a string."""
+    for _ in range(16):
+        yield text
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            return
+        if not isinstance(decoded, str):
+            return
+        text = decoded
+
+
+def _nested_records(layers: int) -> list[dict]:
+    return [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+         "msg": _nest(f"token={_ESCAPE_SECRET}", layers)},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "error",
+         "msg": "token=unrelated"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("layers", "expected_matches"),
+    [(1, 2), (2, 2), (3, 2), (4, 2), (6, 2), (7, 1)],
+)
+def test_nested_json_credential_not_recoverable_at_any_decode_depth(
+    make_builtin_executor, tmp_path, layers, expected_matches
+):
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, _nested_records(layers), _ESCAPE_VAULT
+    )
+
+    payload = _query(exc, text="token=")
+
+    assert payload["total_matched"] == expected_matches
+    for record in payload["records"]:
+        for level in _decode_levels(record["msg"]):
+            assert _ESCAPE_SECRET not in level
+
+
+@pytest.mark.parametrize("layers", [2, 3, 7])
+def test_nested_json_prefix_probes_match_fully_redacted_corpus(
+    make_builtin_executor, tmp_path, layers
+):
+    real = _redacting_executor(
+        make_builtin_executor, tmp_path, _nested_records(layers), _ESCAPE_VAULT
+    )
+    scrubbed_records = _nested_records(layers)
+    scrubbed_records[0]["msg"] = (
+        _nest("token=[REDACTED]", layers) if layers <= 6 else "[REDACTED]"
+    )
+    scrubbed_dir = tmp_path / "scrubbed"
+    scrubbed_dir.mkdir()
+    scrubbed = _redacting_executor(
+        make_builtin_executor, scrubbed_dir, scrubbed_records, 'k = "zzzzzzzz"\n'
+    )
+
+    probes = [f"token={_ESCAPE_SECRET[:end]}" for end in range(1, len(_ESCAPE_SECRET) + 1)]
+    probes += [f'token={json.dumps(_ESCAPE_SECRET)[1:end + 1]}' for end in range(1, 8)]
+    for probe in probes:
+        got = _query(real, text=probe)
+        expected = _query(scrubbed, text=probe)
+        assert got["total_matched"] == expected["total_matched"] == 0, probe
+        assert got["count"] == expected["count"], probe
+
+
+def test_dirty_scan_retains_only_newest_limit_records():
+    from builtin_tools.secrets_log import _scan_dirty_rows
+    from sqlite_log import row_to_record  # noqa: F401  (rows built below)
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_DDL)
+    for i in range(1, 201):
+        conn.execute(
+            "INSERT INTO events (id, ts, level, logger, agent, trace, prompt_id, event_type,"
+            " msg, extra, search_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, *record_to_row(
+                {"ts": f"2026-07-05T10:00:{i % 60:02d}", "level": "info",
+                 "msg": f"boom {i} sekret-value"}
+            )),
+        )
+    rows = conn.execute("SELECT * FROM events ORDER BY id DESC")
+
+    count, retained = _scan_dirty_rows(rows, ["sekret-value"], "boom", None, 5)
+
+    assert count == 200
+    assert [rid for rid, _rec in retained] == [200, 199, 198, 197, 196]
+
+
+def test_dirty_scan_before_id_counts_all_but_retains_only_eligible():
+    from builtin_tools.secrets_log import _scan_dirty_rows
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_DDL)
+    for i in range(1, 51):
+        conn.execute(
+            "INSERT INTO events (id, ts, level, logger, agent, trace, prompt_id, event_type,"
+            " msg, extra, search_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, *record_to_row(
+                {"ts": "2026-07-05T10:00:00", "level": "info", "msg": f"boom {i} sekret-value"}
+            )),
+        )
+    rows = conn.execute("SELECT * FROM events ORDER BY id DESC")
+
+    count, retained = _scan_dirty_rows(rows, ["sekret-value"], "boom", 20, 3)
+
+    assert count == 50
+    assert [rid for rid, _rec in retained] == [19, 18, 17]
+
+
+def test_handler_bounds_retained_dirty_records_by_limit(
+    make_builtin_executor, tmp_path, monkeypatch
+):
+    from builtin_tools import secrets_log
+
+    secret = "sekret-value"
+    records = [
+        {"ts": f"2026-07-05T10:{i // 60:02d}:{i % 60:02d}", "trace": TRACE_A, "level": "info",
+         "msg": f"boom {i} {secret}"}
+        for i in range(120)
+    ]
+    exc = _redacting_executor(make_builtin_executor, tmp_path, records, f'k = "{secret}"\n')
+    retained_sizes: list[int] = []
+    real_scan = secrets_log._scan_dirty_rows
+
+    def spy(*args, **kwargs):
+        count, retained = real_scan(*args, **kwargs)
+        retained_sizes.append(len(retained))
+        return count, retained
+
+    monkeypatch.setattr(secrets_log, "_scan_dirty_rows", spy)
+
+    payload = _query(exc, text="boom", limit=4)
+
+    assert payload["total_matched"] == 120
+    assert payload["count"] == 4
+    assert retained_sizes == [4]

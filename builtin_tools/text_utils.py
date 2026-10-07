@@ -50,22 +50,78 @@ _REDACTED_PLACEHOLDER = "[REDACTED]"
 _PROTECTED_PLACEHOLDERS = (_REDACTED_PLACEHOLDER, "***REDACTED***")
 
 
-def build_redaction_needles(secrets: "Iterable[str]") -> tuple[str, ...]:
-    """Return literal and JSON-escaped forms of each secret, longest first.
+# A secret nested in N layers of JSON string serialization appears as its
+# N-times-escaped form. Redaction covers every form up to this depth; any
+# deeper nesting is refused whole (see ``_exceeds_escape_coverage``).
+MAX_ESCAPE_DEPTH = 6
 
-    The escaped forms (ASCII and non-ASCII ``json.dumps`` flavours) catch a
-    secret that was serialized into a JSON string, where quotes, backslashes
-    and control characters change representation. Longest-first ordering keeps
-    overlapping secrets deterministic.
+# Every escaped form at depth > MAX_ESCAPE_DEPTH contains a backslash run at
+# least this long, so such a run is the marker of uncovered nesting.
+_DEEP_RUN = "\\" * 2**MAX_ESCAPE_DEPTH
+
+
+def _escape_forms(secret: str, depth: int) -> set[str]:
+    """Return *secret* and every JSON-string-escaped form up to *depth* layers.
+
+    Each layer may use either ``json.dumps`` flavour (``ensure_ascii`` on or
+    off), so all flavour sequences are expanded; duplicates collapse, which
+    keeps secrets without escape-sensitive characters at a single form.
     """
+    forms = {secret}
+    frontier = {secret}
+    for _ in range(depth):
+        frontier = {
+            json.dumps(form, ensure_ascii=ascii_flag)[1:-1]
+            for form in frontier
+            for ascii_flag in (True, False)
+        } - forms
+        forms |= frontier
+    return forms
+
+
+def _needles_for(secrets: "Iterable[str]", depth: int) -> tuple[str, ...]:
     needles: set[str] = set()
     for secret in secrets:
-        if not secret:
-            continue
-        needles.add(secret)
-        needles.add(json.dumps(secret)[1:-1])
-        needles.add(json.dumps(secret, ensure_ascii=False)[1:-1])
+        if secret:
+            needles |= _escape_forms(secret, depth)
     return tuple(sorted(needles, key=lambda n: (-len(n), n)))
+
+
+def build_redaction_needles(secrets: "Iterable[str]") -> tuple[str, ...]:
+    """Return literal and repeatedly JSON-escaped forms of each secret, longest first.
+
+    The escaped forms (up to :data:`MAX_ESCAPE_DEPTH` layers, both ``json.dumps``
+    flavours) catch a secret that was serialized into a JSON string, possibly
+    several times, where quotes, backslashes and control characters change
+    representation. Longest-first ordering keeps overlapping secrets
+    deterministic.
+    """
+    return _needles_for(secrets, MAX_ESCAPE_DEPTH)
+
+
+def build_detection_probes(secrets: "Iterable[str]") -> tuple[str, ...]:
+    """Return casefolded substrings whose absence proves a stored record is untouched.
+
+    A stored ``search_text`` is the casefolded compact JSON of the record, so a
+    leaf holding a redactable form at depth *d* appears there at depth *d* + 1.
+    The probes therefore cover one layer more than redaction does, plus the
+    doubled backslash run that marks nesting beyond redaction's coverage. A
+    record matching none of them cannot be changed by redaction.
+    """
+    needles = _needles_for(secrets, MAX_ESCAPE_DEPTH + 1)
+    probes = list(dict.fromkeys(n.casefold() for n in needles))
+    if any("\\" in n for n in needles):
+        probes.append(_DEEP_RUN * 2)
+    return tuple(probes)
+
+
+def _exceeds_escape_coverage(text: str, needles: tuple[str, ...]) -> bool:
+    """Return True when *text* may hold a secret nested deeper than the needles cover.
+
+    Only meaningful when some needle differs from its secret (contains a
+    backslash); otherwise nesting depth cannot disguise any secret.
+    """
+    return _DEEP_RUN in text and any("\\" in n for n in needles)
 
 
 @lru_cache(maxsize=64)
@@ -80,16 +136,27 @@ def _redaction_patterns(
     return re.compile(tokens), re.compile("|".join(map(re.escape, needles)))
 
 
-def _redact_string(text: str, needles: tuple[str, ...], placeholder: str) -> str:
+def _redact_string(
+    text: str,
+    needles: tuple[str, ...],
+    placeholder: str,
+    fail_closed: bool = False,
+) -> str:
     """Replace every needle occurrence in *text* that is not inside a placeholder.
 
     A match lying entirely within an existing placeholder token is left alone
     (keeps passes idempotent); a secret that extends beyond a token boundary
     is a real secret and is redacted whole. A secret exactly equal to a
     placeholder is therefore indistinguishable from it and stays as is.
+
+    With *fail_closed*, a string showing nesting deeper than the needles cover
+    is replaced whole by *placeholder*: partial redaction there could leave the
+    secret recoverable after further decoding.
     """
     if not needles:
         return text
+    if fail_closed and _exceeds_escape_coverage(text, needles):
+        return placeholder
     token_re, needle_re = _redaction_patterns(needles, placeholder)
     spans = [m.span() for m in token_re.finditer(text)]
     out: list[str] = []
@@ -153,7 +220,7 @@ def redact_with_needles(value: Any, needles: tuple[str, ...], placeholder: str) 
     order, skipping any name already used by an unchanged key.
     """
     if isinstance(value, str):
-        return _redact_string(value, needles, placeholder)
+        return _redact_string(value, needles, placeholder, fail_closed=True)
     if isinstance(value, dict):
         return _redact_dict(value, needles, placeholder)
     if isinstance(value, list):
@@ -166,7 +233,11 @@ def redact_with_needles(value: Any, needles: tuple[str, ...], placeholder: str) 
 def _redact_dict(value: dict, needles: tuple[str, ...], placeholder: str) -> dict:
     """Redact a dict's keys and values, keeping colliding redacted keys distinct."""
     new_keys = {
-        k: (_redact_string(k, needles, placeholder) if isinstance(k, str) else k)
+        k: (
+            _redact_string(k, needles, placeholder, fail_closed=True)
+            if isinstance(k, str)
+            else k
+        )
         for k in value
     }
     used: set = {k for k, nk in new_keys.items() if nk == k}

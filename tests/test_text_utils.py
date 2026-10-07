@@ -177,3 +177,101 @@ def test_extending_secrets_are_idempotent_across_passes():
 
     assert "live-token-42" not in once
     assert redact_vault_secrets(once, secrets) == once
+
+
+# ---------------------------------------------------------------------------
+# Repeated JSON escaping: shared depth strategy, fail-closed beyond coverage
+# ---------------------------------------------------------------------------
+
+_ESC_SECRET = 'ab12"ba21'
+
+
+def _nest(text: str, layers: int) -> str:
+    import json
+
+    for _ in range(layers):
+        text = json.dumps(text)
+    return text
+
+
+def _serialization_layers(value, depth: int):
+    """Compact JSON of *value*, then json.dumps applied 0..depth more times."""
+    import json
+
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    yield text
+    for _ in range(depth):
+        text = json.dumps(text, ensure_ascii=False)
+        yield text
+
+
+def test_redacted_structure_yields_no_needle_at_any_serialization_depth():
+    from builtin_tools.text_utils import (
+        MAX_ESCAPE_DEPTH,
+        build_redaction_needles,
+        redact_structure,
+    )
+
+    needles = build_redaction_needles([_ESC_SECRET])
+    for layers in range(0, MAX_ESCAPE_DEPTH + 1):
+        record = {"msg": _nest(f"token={_ESC_SECRET}", layers), "n": 1}
+        redacted = redact_structure(record, [_ESC_SECRET], preserve_top_level_keys=True)
+        for text in _serialization_layers(redacted, MAX_ESCAPE_DEPTH):
+            assert not any(n in text for n in needles), (layers, text)
+
+
+def test_nested_leaf_keeps_surrounding_text_after_redaction():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure(
+        {"msg": _nest(f"token={_ESC_SECRET}", 3)}, [_ESC_SECRET]
+    )
+
+    assert "token=[REDACTED]" in redacted["msg"]
+
+
+def test_leaf_nested_beyond_coverage_is_replaced_whole():
+    from builtin_tools.text_utils import MAX_ESCAPE_DEPTH, redact_structure
+
+    leaf = _nest(f"token={_ESC_SECRET}", MAX_ESCAPE_DEPTH + 1)
+
+    assert redact_structure({"msg": leaf}, [_ESC_SECRET]) == {"msg": "[REDACTED]"}
+
+
+def test_deep_backslash_run_is_kept_when_no_secret_needs_escaping():
+    from builtin_tools.text_utils import redact_structure
+
+    value = {"msg": "\\" * 500}
+
+    assert redact_structure(value, ["plainsecret1"]) == value
+
+
+def test_fail_closed_replacement_is_idempotent():
+    from builtin_tools.text_utils import MAX_ESCAPE_DEPTH, redact_structure
+
+    leaf = _nest(f"token={_ESC_SECRET}", MAX_ESCAPE_DEPTH + 2)
+    once = redact_structure({"msg": leaf}, [_ESC_SECRET])
+
+    assert redact_structure(once, [_ESC_SECRET]) == once
+
+
+def test_detection_probes_cover_one_layer_deeper_than_redaction():
+    import json
+
+    from builtin_tools.text_utils import MAX_ESCAPE_DEPTH, build_detection_probes
+
+    leaf = _nest(f"token={_ESC_SECRET}", MAX_ESCAPE_DEPTH)
+    serialized = json.dumps({"msg": leaf}, ensure_ascii=False, separators=(",", ":")).casefold()
+
+    assert any(p in serialized for p in build_detection_probes([_ESC_SECRET]))
+
+
+def test_detection_probes_flag_row_beyond_redaction_coverage():
+    import json
+
+    from builtin_tools.text_utils import MAX_ESCAPE_DEPTH, build_detection_probes
+
+    leaf = _nest(f"token={_ESC_SECRET}", MAX_ESCAPE_DEPTH + 3)
+    serialized = json.dumps({"msg": leaf}, ensure_ascii=False, separators=(",", ":")).casefold()
+
+    assert any(p in serialized for p in build_detection_probes([_ESC_SECRET]))
