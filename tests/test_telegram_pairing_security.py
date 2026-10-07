@@ -174,3 +174,14 @@ def test_real_interface_self_unpair_revokes_issued_token(monkeypatch):
     assert "Invalid or expired" in redeemed[0]
     assert 1 not in iface.allowed_ids
     assert 2 not in iface.allowed_ids
+
+
+def test_pair_token_never_appears_in_log_records(caplog):
+    iface = _iface()
+
+    with caplog.at_level("DEBUG"):
+        replies = _call(cmd_pair, iface, 1)
+
+    token = _token_from_reply(replies[0])
+    assert token not in caplog.text
+    assert any("1" in r.getMessage() for r in caplog.records if "airing" in r.getMessage())

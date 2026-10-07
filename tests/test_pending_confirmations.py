@@ -114,6 +114,150 @@ class TestHeadlessConfirmationCancellation:
         assert manager.signal_headless_confirmation(token, True) is False
 
 
+class TestHeadlessConfirmationLifecycleAtomicity:
+    """Waiter terminal decisions and signaler commits are mutually exclusive."""
+
+    TOKEN = "lifecycle-token"
+
+    class _FakeClock:
+        """Controllable stand-in for ``confirmation.time`` (monotonic only)."""
+
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    @pytest.fixture
+    def clock(self, monkeypatch: pytest.MonkeyPatch) -> "_FakeClock":
+        import confirmation
+
+        fake = self._FakeClock()
+        monkeypatch.setattr(confirmation, "time", fake)
+        return fake
+
+    def _start_waiter(self, manager, cancel_event=None):
+        prompted = threading.Event()
+        decisions: list[bool] = []
+        done = threading.Event()
+
+        def run() -> None:
+            decisions.append(
+                manager.request_headless_confirmation(
+                    self.TOKEN, "file_write", "write", lambda *_a: prompted.set(),
+                    cancel_event=cancel_event,
+                )
+            )
+            done.set()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        assert prompted.wait(timeout=1.0)
+        return thread, decisions, done
+
+    def test_timeout_during_approval_never_mints_unconsumed_grant(self, clock) -> None:
+        manager = ConfirmationManager()
+        manager.default_headless_timeout = 10
+        thread, decisions, waiter_done = self._start_waiter(manager)
+        on_approved_ran: list[bool] = []
+
+        def on_approved() -> None:
+            on_approved_ran.append(True)
+            # Interleave: the deadline passes while the signaler is mid-approval,
+            # then give a racing waiter bounded time to take its timeout decision.
+            clock.now = 11.0
+            waiter_done.wait(timeout=0.4)
+
+        signalled = manager.signal_headless_confirmation(
+            self.TOKEN, True, on_approved=on_approved
+        )
+        thread.join(timeout=2.0)
+
+        assert thread.is_alive() is False
+        assert not (on_approved_ran and decisions == [False])
+        assert signalled == bool(on_approved_ran)
+
+    def test_timeout_during_approval_leaves_no_result_entries(self, clock) -> None:
+        manager = ConfirmationManager()
+        manager.default_headless_timeout = 10
+        thread, _decisions, waiter_done = self._start_waiter(manager)
+
+        def on_approved() -> None:
+            clock.now = 11.0
+            waiter_done.wait(timeout=0.4)
+
+        manager.signal_headless_confirmation(self.TOKEN, True, on_approved=on_approved)
+        thread.join(timeout=2.0)
+
+        assert manager._headless_confirm_results == {}
+        assert manager._headless_confirm_events == {}
+
+    def test_signal_after_timeout_skips_on_approved(self, clock) -> None:
+        manager = ConfirmationManager()
+        manager.default_headless_timeout = 10
+        thread, decisions, _done = self._start_waiter(manager)
+        clock.now = 11.0
+        thread.join(timeout=2.0)
+        ran: list[bool] = []
+
+        signalled = manager.signal_headless_confirmation(
+            self.TOKEN, True, on_approved=lambda: ran.append(True)
+        )
+
+        assert decisions == [False]
+        assert signalled is False
+        assert ran == []
+        assert manager._headless_confirm_results == {}
+
+    def test_cancel_before_approval_skips_on_approved(self) -> None:
+        manager = ConfirmationManager()
+        cancel = threading.Event()
+        thread, decisions, _done = self._start_waiter(manager, cancel_event=cancel)
+        cancel.set()
+        thread.join(timeout=2.0)
+        ran: list[bool] = []
+
+        signalled = manager.signal_headless_confirmation(
+            self.TOKEN, True, on_approved=lambda: ran.append(True)
+        )
+
+        assert decisions == [False]
+        assert signalled is False
+        assert ran == []
+        assert manager._headless_confirm_results == {}
+
+    def test_cancel_during_approval_denies_waiter_without_orphans(self) -> None:
+        manager = ConfirmationManager()
+        cancel = threading.Event()
+        thread, decisions, _done = self._start_waiter(manager, cancel_event=cancel)
+
+        signalled = manager.signal_headless_confirmation(
+            self.TOKEN, True, on_approved=cancel.set
+        )
+        thread.join(timeout=2.0)
+
+        assert signalled is True
+        assert decisions == [False]
+        assert manager._headless_confirm_results == {}
+        assert manager._headless_confirm_events == {}
+
+    def test_live_waiter_approval_runs_on_approved_before_release(self) -> None:
+        manager = ConfirmationManager()
+        thread, decisions, done = self._start_waiter(manager)
+        released_at_approval: list[bool] = []
+
+        signalled = manager.signal_headless_confirmation(
+            self.TOKEN, True,
+            on_approved=lambda: released_at_approval.append(done.is_set()),
+        )
+        thread.join(timeout=2.0)
+
+        assert signalled is True
+        assert decisions == [True]
+        assert released_at_approval == [False]
+        assert manager._headless_confirm_results == {}
+
+
 class TestExecutorCompatShims:
     def test_zone_paths_compat_view(self, make_builtin_executor) -> None:
         executor = make_builtin_executor()

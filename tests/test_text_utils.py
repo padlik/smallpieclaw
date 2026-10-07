@@ -58,3 +58,26 @@ def test_redact_is_idempotent():
 def test_redact_preserves_text_without_secrets():
     text = "no confidential data here"
     assert redact_vault_secrets(text, ["secret"]) == text
+
+
+_QUOTED_SECRET = 'pa"ss\\word99'
+
+
+def test_redact_removes_json_escaped_form_of_secret():
+    import json
+
+    text = json.dumps({"auth": _QUOTED_SECRET})
+
+    redacted = redact_vault_secrets(text, [_QUOTED_SECRET])
+
+    assert json.loads(redacted)["auth"] != _QUOTED_SECRET
+    assert json.dumps(_QUOTED_SECRET)[1:-1] not in redacted
+
+
+def test_redact_structure_scrubs_dict_keys():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure({_QUOTED_SECRET: 1, "ok": [_QUOTED_SECRET]}, [_QUOTED_SECRET])
+
+    assert _QUOTED_SECRET not in repr(redacted)
+    assert redacted == {"[REDACTED]": 1, "ok": ["[REDACTED]"]}

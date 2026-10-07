@@ -34,6 +34,7 @@ import sys
 from typing import Any, Iterable, cast
 
 import sqlite_log
+from builtin_tools.text_utils import build_redaction_needles, redact_with_needles
 
 import structlog
 from structlog.typing import EventDict, WrappedLogger
@@ -78,38 +79,26 @@ class LogEvent(str, enum.Enum):
 # ---------------------------------------------------------------------------
 # Secret redaction processor (Option A: exact vault-value match)
 # ---------------------------------------------------------------------------
-def _redact_value(value: Any, needles: frozenset[str]) -> Any:
-    """Recursively scrub known secrets while preserving container shapes."""
-    if isinstance(value, str):
-        for secret in needles:
-            value = value.replace(secret, _REDACTION_PLACEHOLDER)
-        return value
-    if isinstance(value, dict):
-        return {key: _redact_value(item, needles) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_value(item, needles) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_value(item, needles) for item in value)
-    return value
-
-
 def _make_redactor(secret_values: frozenset[str]):
     """Return a structlog processor that scrubs known secret values.
 
-    Exact-substring match against known vault values across every string field
+    Exact-substring match against known vault values (literal and JSON-escaped
+    forms) across every string field, nested dict keys and values included
     (including the message). Deterministic, with no false positives; it is
     defense-in-depth, not a guarantee — emit sites should keep secrets out of
     structured fields by convention.
     """
 
     # Only values long enough to be genuine secrets are used as needles.
-    needles = frozenset(s for s in secret_values if len(s) >= _MIN_REDACTION_LEN)
+    needles = build_redaction_needles(
+        s for s in secret_values if len(s) >= _MIN_REDACTION_LEN
+    )
 
     def redact(_logger: WrappedLogger, _name: str, event_dict: EventDict) -> EventDict:
         if not needles:
             return event_dict
         for key, value in list(event_dict.items()):
-            event_dict[key] = _redact_value(value, needles)
+            event_dict[key] = redact_with_needles(value, needles, _REDACTION_PLACEHOLDER)
         return event_dict
 
     return redact

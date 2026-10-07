@@ -262,6 +262,29 @@ class TestLogDetailOversized:
         assert secret not in dumped_text
         assert "[REDACTED]" in dumped_text
 
+    def test_quoted_secret_absent_from_dump_in_key_and_json_value(
+        self, make_builtin_executor, tmp_path
+    ):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        secret = 'pa"ss\\word99'
+        rec = self._oversized_record(TRACE_VALID)
+        rec["request"] = {secret: 1, "blob": json.dumps({"k": secret})}
+        _insert_records(path, [rec])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(
+                results_dir=results_dir, log_store_path=path, vault_secrets=[secret]
+            ),
+        )
+
+        payload = _detail(exc, 1)
+
+        assert payload["dumped"] is True
+        with open(payload["dump_path"], encoding="utf-8") as fh:
+            dumped_text = fh.read()
+        assert secret not in dumped_text
+        assert json.dumps(secret)[1:-1] not in dumped_text
+
     def test_dump_permissions_owner_only(self, make_builtin_executor, tmp_path):
         """The dump artifact is 0600 inside a 0700 trace directory (POSIX)."""
         if os.name == "nt":
@@ -518,3 +541,66 @@ class TestLogDetailDescriptorSchema:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestLogDetailReadTimeRedaction:
+    """log_detail redacts against the CURRENT vault, not only the ingestion snapshot."""
+
+    SECRET = "LateAddedCred42"
+
+    def _executor(self, make_builtin_executor, tmp_path, records):
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, records)
+        vault = tmp_path / "vault.toml"
+        vault.write_text(f'late_key = "{self.SECRET}"\n')
+        return make_builtin_executor(
+            paths=ExecutorPaths(
+                results_dir=str(tmp_path / "results"),
+                log_store_path=path,
+                vault_path=str(vault),
+            ),
+        )
+
+    def test_full_fidelity_record_redacted_against_current_vault(
+        self, make_builtin_executor, tmp_path
+    ):
+        rec = {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+               "msg": f"login failed with {self.SECRET}", "err": self.SECRET}
+        exc = self._executor(make_builtin_executor, tmp_path, [rec])
+
+        payload = _detail(exc, 1)
+
+        assert payload["dumped"] is False
+        assert self.SECRET not in json.dumps(payload)
+
+    def test_oversized_preview_redacted_against_current_vault(
+        self, make_builtin_executor, tmp_path
+    ):
+        rec = {"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID, "level": "error",
+               "msg": f"login failed with {self.SECRET}", "err": "E" * 70000}
+        exc = self._executor(make_builtin_executor, tmp_path, [rec])
+
+        payload = _detail(exc, 1)
+
+        assert payload["dumped"] is True
+        assert self.SECRET not in json.dumps(payload)
+        with open(payload["dump_path"], encoding="utf-8") as fh:
+            assert self.SECRET not in fh.read()
+
+    def test_unreadable_vault_falls_back_to_startup_secrets(
+        self, make_builtin_executor, tmp_path
+    ):
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A,
+                                "level": "error", "msg": f"leak {self.SECRET}"}])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(
+                log_store_path=path,
+                vault_path=str(tmp_path / "missing.toml"),
+                vault_secrets=[self.SECRET],
+            ),
+        )
+
+        payload = _detail(exc, 1)
+
+        assert self.SECRET not in json.dumps(payload)

@@ -31,7 +31,7 @@ from builtin_tools.logquery_helpers import (
     _log_query_project,
     _LOG_QUERY_MAX_LIMIT,
 )
-from builtin_tools.text_utils import redact_vault_secrets
+from builtin_tools.text_utils import redact_structure, redact_vault_secrets
 from sqlite_log import connect_store, row_to_record
 
 if TYPE_CHECKING:
@@ -447,6 +447,30 @@ class LogQueryTools:
             "recoverable": True,
         }
 
+    def _current_vault_secrets(self) -> list[str]:
+        """Return the startup secrets plus string values re-read from the vault file now.
+
+        Best-effort on the vault read: an absent or unreadable vault falls back
+        to the startup list so log_detail never fails because of the vault.
+        """
+        from config_schema import parse_vault_content  # noqa: PLC0415 — import-cycle avoidance
+        from exceptions import ConfigError  # noqa: PLC0415
+
+        secrets_list = list(getattr(self._owner, "_vault_secrets", []) or [])
+        vault_path = getattr(self._owner, "_vault_path", "")
+        if not vault_path:
+            return secrets_list
+        try:
+            with open(vault_path, encoding="utf-8") as fh:
+                vault = parse_vault_content(
+                    fh.read(), vault_path, require_all_strings=False
+                )
+        except (OSError, ConfigError) as exc:
+            logger.warning("log_detail: cannot re-read vault for redaction: %s", exc)
+            return secrets_list
+        secrets_list.extend(v for v in vault.values() if isinstance(v, str) and v)
+        return secrets_list
+
     def _exec_log_detail(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         """Return one full log record by its store ``id`` at full fidelity.
 
@@ -506,19 +530,22 @@ class LogQueryTools:
         if row is None:
             return self._log_detail_empty()
 
-        record = row_to_record(row)
+        # Trust model (design D5), two layers: (1) structured records are
+        # vault-redacted at ingestion by the shared structlog chain, but that
+        # pass only knows the secrets present at process start, so credentials
+        # logged before being added to the vault slip through; (2) this
+        # read-time pass re-redacts the record against the CURRENT vault (file
+        # re-read plus the startup list) before anything is returned or dumped.
+        # Both the full-fidelity record and the oversized preview/artifact are
+        # derived from the redacted record, so they cannot disagree.
+        secrets_list = self._current_vault_secrets()
+        record = redact_structure(row_to_record(row), secrets_list)
         # The 65536-char gate measures the compact serialization; the emitted
         # payload uses default (spaced) separators, so a record just under the
         # gate serializes slightly larger in the tool output. The cap is a
         # fidelity threshold, not an output budget.
         serialized = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         if len(serialized) <= _LOG_DETAIL_MAX_CHARS:
-            # Trust model (design D5): structured records are vault-redacted at
-            # ingestion by the shared structlog chain (agent_logging), so the
-            # returned record is not re-redacted here; the oversized-dump path
-            # below re-applies the pass as idempotent defense-in-depth for the
-            # on-disk artifact (the spec anchors that pass: MUST NOT be weaker
-            # than the shell path's).
             return self._log_detail_result(record, dumped=False, dump_path=None)
 
         # Oversized: project a preview, dump the full record to results dir.
@@ -582,9 +609,9 @@ class LogQueryTools:
                 preview, dumped=False, dump_path=None, note=note
             )
 
-        # Redaction pass over the serialized record, via the same shared routine
-        # used by the shell oversized-output path so neither path can drift.
-        secrets_list = getattr(self._owner, "_vault_secrets", []) or []
+        # Defense-in-depth pass over the serialized artifact, via the same
+        # shared routine used by the shell oversized-output path so neither
+        # path can drift (idempotent after the structural read-time pass).
         serialized = redact_vault_secrets(serialized, secrets_list)
 
         base_path = os.path.join(dest_dir, f"log-detail-{raw_id}.json")

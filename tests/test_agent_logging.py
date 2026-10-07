@@ -191,6 +191,36 @@ class TestProcessorChain:
             {"token": "***REDACTED***"},
         )
 
+    def test_dict_key_secret_redacted(self):
+        redact = al._make_redactor(frozenset({"KEYSECRET1"}))
+
+        redacted = redact(None, "info", {"request": {"KEYSECRET1": "v"}})
+
+        assert redacted["request"] == {"***REDACTED***": "v"}
+
+    def test_quoted_secret_absent_from_every_sink_form(self, tmp_path):
+        secret = 'pa"ss\\word99'
+        escaped = json.dumps(secret)[1:-1]
+        log_file = str(tmp_path / "agent.log")
+        db_path = al.setup_logging(log_file, secret_values=[secret])
+        al.log_event(
+            al.LogEvent.TOOL_FAILED,
+            "request failed",
+            request={secret: 1, "blob": json.dumps({"k": secret})},
+        )
+        _flush()
+
+        conn = sqlite3.connect(db_path)
+        try:
+            stored = " ".join(
+                str(col) for row in conn.execute("SELECT * FROM events") for col in row
+            )
+        finally:
+            conn.close()
+        raw = stored + _read(log_file)
+        assert secret not in raw
+        assert escaped not in raw
+
     def test_foreign_record_gets_identity(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
         db_path = al.setup_logging(log_file)
