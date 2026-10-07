@@ -168,7 +168,7 @@ An operator-spawned on-demand sub-agent SHALL be admitted with a unique immutabl
 
 ### Requirement: Operator turn ends only after its children are accounted and drained
 
-At normal finish the operator SHALL retrieve or cancel all its admitted children before the turn ends. Owned records SHALL remain available to their turn beyond registry expiry for retrieval/accounting. On stop, error, or exhausted run budget, outstanding children SHALL be cancelled and the turn SHALL remain active until their lifecycle cleanup completes; confirmation callbacks and `/stop` MUST remain responsive throughout.
+At normal finish the operator SHALL retrieve or cancel all its admitted children before the turn ends. Owned records SHALL remain available to their turn beyond registry expiry for retrieval/accounting. On stop, error, or exhausted run budget, outstanding children SHALL be cancelled and the turn SHALL remain active until their lifecycle cleanup completes or the fixed drain window (180 s currently) expires; confirmation callbacks and `/stop` MUST remain responsive throughout.
 
 #### Scenario: Finishing with an outstanding child is refused
 - **GIVEN** a turn spawned child A, which is still running
@@ -186,7 +186,7 @@ At normal finish the operator SHALL retrieve or cancel all its admitted children
 - **GIVEN** an operator turn waits for its own child with `get_agent_result` and `cancel_on_timeout=true`
 - **WHEN** the wait times out and cancellation is actually requested
 - **THEN** the child is accounted for without retrieving its result
-- **AND** the turn remains draining until lifecycle cleanup completes
+- **AND** the turn remains draining until lifecycle cleanup completes or the drain window expires (see the bounded-drain scenario below)
 
 #### Scenario: Non-cancelling timeout leaves the child outstanding
 - **GIVEN** an operator turn waits with `get_agent_result` and `cancel_on_timeout=false`, or uses `wait_for_any_agent`
@@ -198,13 +198,13 @@ At normal finish the operator SHALL retrieve or cancel all its admitted children
 - **GIVEN** an operator turn has two running children, one awaiting operator confirmation
 - **WHEN** the operator sends `/stop`
 - **THEN** the existing stop behavior requests cancellation of the turn and managed agents
-- **AND** the turn remains active until its children finish cleanup while Telegram control/confirmation callbacks remain processable
+- **AND** the turn remains active until its children finish cleanup or the drain window expires, while Telegram control/confirmation callbacks remain processable
 
 #### Scenario: Operator cancellation accounts for its turn-owned child
 - **GIVEN** a turn-owned child has not been accounted for
 - **WHEN** the operator cancels it through `/agents`
 - **THEN** the child is accounted for in that turn
-- **AND** the turn remains draining until lifecycle cleanup completes
+- **AND** the turn remains draining until lifecycle cleanup completes or the drain window expires (see the bounded-drain scenario below)
 
 #### Scenario: Bounded drain releases a stuck child without hiding it
 - **GIVEN** a turn-owned child's lifecycle cleanup has not completed within the fixed drain window

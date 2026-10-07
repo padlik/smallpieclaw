@@ -41,11 +41,15 @@ Operator `/agents cancel managed` remains ADR-0006's cross-source visibility/cap
 
 Part 1 implementation review found the accepted ADR's prior assertion inaccurate: “`cancel_agent` and the operator's `/agents` controls keep their existing managed-source cancellation scope, including scheduled runs.” This correction records the deliberate architectural narrowing of model-facing `cancel_agent` to the caller's own turn-owned on-demand children, while `/agents` and `/stop` remain unchanged; it is not merely an editorial clarification or a claim that no architectural decision was made.
 
+### Amendment — 2026-10-07
+
+During implementation review the operator approved bounding turn draining. The accepted decision required a turn to account for or cancel its children before ending, which implied an unbounded wait for an uncooperative child's cleanup. The final behavior bounds the drain by a fixed window (180 seconds in the current implementation): on expiry the operator turn is released with an error naming the stuck child, the child's record is retained with a drain-expired marker so later drains do not wait on it again, and its late cleanup still finalizes and removes the record. This supersedes the indefinite-drain consequence originally recorded below; the amended Consequences line reflects the final behavior.
+
 ## Consequences
 
 - Good: scheduled work can proceed concurrently without silently adopting operator context or approvals; child results have one consumer and a defined lifetime.
 - Good: the existing scheduler/supervisor/runtime boundaries remain useful, with no detachable operator mode or per-job capability schema.
 - Bad: origin-aware tool enforcement, result history, and turn-draining behavior span several modules and require race/confirmation regression tests.
-- Bad: an uncooperative child can keep its parent turn draining until cleanup, and a best-effort Telegram notice can be lost while the job record remains available.
+- Bad: an uncooperative child can keep its parent turn draining, but only for a fixed drain window (180 seconds in the current implementation); on expiry the turn is released with a truthful error naming the stuck child, the child's record is retained with a drain-expired marker, and its late cleanup still finalizes (operator-approved bounded release; see the 2026-10-07 amendment). A best-effort Telegram notice can also be lost while the job record remains available.
 - Bad: scheduled runs still consume global sub-agent capacity, but only the operator can cancel them through `/agents` or `/stop`; the model cannot free that capacity.
 - Neutral: shared default-allowed file/tool effects, `log_query`/`log_detail`, and the published `parallel` overlap option remain; this is not a full sandbox or a fix for preserved-context last-writer-wins behavior.

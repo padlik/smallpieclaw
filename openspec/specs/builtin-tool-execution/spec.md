@@ -197,65 +197,81 @@ executor does not hold. The built-in executor's dispatch MUST NOT hold a handler
 - **THEN** the ReAct loop performs the vision query directly
 - **AND** invoking `execute` with `vision_query` on the built-in executor does not itself perform a vision query
 
-### Requirement: Approval grants expire at run end
+### Requirement: Confirmation grants are directory-scoped and expire by lifetime
 
-`auto_approve_tools` SHALL be cleared at the end of `AgentController.run()`, so approval grants expire when the prompt's results are presented. Grants do not survive into the next prompt.
+Confirmation prompts SHALL offer Confirm (prompt-lifetime grant), Till /reset (session-lifetime grant), and Deny, with the `approval-grants` semantics (ADR-0027). Grants are scoped to tool and directory on the depth-0 `GrantLedger`; there is no per-tool blanket approval or tool-name approval set. `shell` and `secret_get` never hold standing grants (sink-side veto).
 
 Feature: Builtin tool execution
-Rule: Per-prompt TTL — the operator's mental model is "I approved this for the current task," not "I approved this forever."
+Rule: Per-prompt TTL — the operator approves for the current task, not forever.
 
-#### Scenario: Grant expires when the run ends
-- **GIVEN** the operator tapped "Approve all file_read" during prompt #7
+#### Scenario: Prompt grant expires when the run ends
+- **GIVEN** the operator pressed Confirm for `(file_read, /data)` during prompt #7
 - **WHEN** prompt #7's run ends (results presented or error)
-- **THEN** `auto_approve_tools` is cleared
-- **AND** prompt #8 starts with an empty approval set — no grants carry over
+- **THEN** the prompt-lifetime grant is cleared
+- **AND** prompt #8 starts without that grant — access to `/data` prompts again
 
-#### Scenario: /reset still clears the approval set
-- **GIVEN** the operator tapped "Approve all file_write" during the current prompt
-- **WHEN** the operator runs `/reset` before the run ends
-- **THEN** `auto_approve_tools` is cleared
-- **AND** subsequent sensitive `file_write` calls in the same run re-prompt the operator
+#### Scenario: /reset clears session grants
+- **GIVEN** the operator pressed "Till /reset" for `(file_write, /data)`
+- **WHEN** the operator runs `/reset`
+- **THEN** the session-lifetime grant is cleared
+- **AND** subsequent sensitive `file_write` calls under `/data` re-prompt the operator
 
-### Requirement: Headless confirm bridge checks the shared approval set
+#### Scenario: Sub-agent prompt grant expires with its run
+- **GIVEN** a turn-owned child's confirmation received a prompt-lifetime Confirm carrying that child's run identity
+- **WHEN** the child run completes
+- **THEN** the grant is removed from the depth-0 ledger
 
-The `_headless_confirm_bridge` SHALL check the shared `auto_approve_tools` set on the coordinator before prompting the operator for a sub-agent's sensitive file operation. If the tool name is in the set, the operation is auto-approved without a prompt.
+#### Scenario: Grant is scoped to a directory and tool
+- **GIVEN** a prompt-lifetime grant `(file_write, /data/reports)`
+- **WHEN** `file_write` targets `/data/other.txt` or `file_read` targets `/data/reports/q1.txt`
+- **THEN** a confirmation prompt is sent in both cases
+
+### Requirement: Headless confirm bridge routes turn-owned children through the depth-0 coordinator
+
+The `_headless_confirm_bridge` SHALL serve only turn-owned on-demand sub-agents, routing their sensitive file-operation confirmations through the active operator turn's depth-0 coordinator. Before prompting, the bridge SHALL consult the depth-0 `GrantLedger` for a grant that covers the tool and directory and is valid for the requesting child run; a covering grant satisfies the confirmation without a prompt. Scheduled runs SHALL NOT use the bridge, the ledger, or the coordinator: an operation needing approval is denied noninteractively before any token is staged or prompt rendered.
 
 Feature: Builtin tool execution
-Rule: The shared `auto_approve_tools` set is owned by the `ConfirmationManager` (the coordinator). The `BuiltinExecutor` holds a `_coordinator` reference during a run, set at run start and set to `None` at run end. One grant covers the main agent and all sub-agents for the prompt.
+Rule: The `ConfirmationManager` (the coordinator) owns the `GrantLedger`. The `BuiltinExecutor` holds a `_coordinator` reference during a run, set at run start and set to `None` at run end. A sub-agent's prompt-lifetime grant is scoped to its own run and never covers the operator or sibling runs.
 
-#### Scenario: Sub-agent op auto-approved when tool is in the shared set
-- **GIVEN** "file_read" is in the coordinator's `auto_approve_tools` for the current prompt
-- **WHEN** a sub-agent attempts a sensitive `file_read`
-- **THEN** the operation is auto-approved via `confirm(token)` without an operator prompt
-- **AND** zone classification still ran first inside `execute()` — only the zone-triggered confirmation was auto-satisfied
+#### Scenario: Turn-owned child op satisfied by a covering grant
+- **GIVEN** the depth-0 ledger holds a grant `(file_read, /data)` valid for the requesting child run
+- **WHEN** that child attempts a sensitive `file_read` under `/data`
+- **THEN** the operation is satisfied via `confirm(token)` without an operator prompt
+- **AND** zone classification still ran first inside `execute()` — only the zone-triggered confirmation was satisfied by the grant
 
-#### Scenario: Sub-agent op prompts when tool is not in the shared set
-- **GIVEN** "file_write" is not in the coordinator's `auto_approve_tools`
-- **WHEN** a sub-agent attempts a sensitive `file_write`
-- **THEN** the operator is prompted with an "Approve all file_write" button
-- **AND** the sub-agent blocks until the operator responds or the confirmation times out
+#### Scenario: Turn-owned child op prompts when no grant covers it
+- **GIVEN** no ledger grant covers `(file_write, /data/x.txt)` for the requesting child run
+- **WHEN** that child attempts a sensitive `file_write`
+- **THEN** the operator is prompted with Confirm, Till /reset, and Deny controls
+- **AND** the child blocks until the operator responds or the confirmation times out
 
-#### Scenario: Shared set is None after run end (fail-closed)
+#### Scenario: Coordinator is None after run end (fail-closed)
 - **GIVEN** the prompt's run has ended and the executor's `_coordinator` reference is set to `None`
 - **WHEN** an orphaned sub-agent attempts a sensitive `file_read`
 - **THEN** the operation is blocked without prompting the operator because the coordinator is `None`
 - **AND** the sub-agent receives a fail-closed error result indicating the confirmation bridge is unavailable
 
-#### Scenario: Sub-agent approve-all is atomic
-- **GIVEN** a sub-agent confirmation prompt is pending and the operator taps "Approve all file_write"
-- **WHEN** the coordinator's `signal_headless_confirmation` is called with `approve_all=True` and `tool_name="file_write"`
-- **THEN** the tool name is added to `auto_approve_tools` AND the confirmation event is signalled in a single method call
-- **AND** no concurrent sub-agent thread can observe the approval set without the event already being set
+#### Scenario: Confirmation decision is signalled atomically
+- **GIVEN** a turn-owned child's confirmation prompt is pending and the operator presses Confirm
+- **WHEN** the coordinator's `signal_headless_confirmation(token, approved)` is called
+- **THEN** the result is recorded and the confirmation event is signalled in a single method call
+- **AND** no concurrent sub-agent thread can observe the event set without the result already recorded
+
+#### Scenario: Scheduled run is denied before any staging or prompt
+- **GIVEN** a scheduled run attempts a sensitive file operation that needs operator approval
+- **WHEN** the approval boundary is reached
+- **THEN** the operation is denied noninteractively
+- **AND** no token is staged, no prompt is rendered, and neither the ledger nor the coordinator is consulted
 
 ### Requirement: All confirmation signaling flows through a single coordinator
 
 The `ConfirmationManager` SHALL own the signaling (Event + result dict + token lifecycle) for all four confirmation flow types: tool confirmation at depth 0, tool confirmation at depth ≥ 1 (headless bridge), step extension, and LLM error retry. The `BuiltinExecutor` SHALL delegate headless confirmation wait/signaling to the coordinator via `request_headless_confirmation()` and `signal_headless_confirmation()`.
 
 Feature: Builtin tool execution
-Rule: The coordinator owns Event lifecycle and `auto_approve_tools`; the executor owns tool staging (`_pending`), zone context (`_zone_paths`, `_zone_trackers`), and execution (`confirm`/`cancel`). The coordinator is transport-agnostic — the Telegram prompt callback is passed at call time, not stored on the coordinator.
+Rule: The coordinator owns Event lifecycle and the depth-0 `GrantLedger`; the executor owns tool staging (`_pending`), zone context (`_zone_paths`, `_zone_trackers`), and execution (`confirm`/`cancel`). The coordinator is transport-agnostic — the Telegram prompt callback is passed at call time, not stored on the coordinator.
 
 #### Scenario: Headless bridge delegates to coordinator
-- **GIVEN** a sub-agent requests confirmation for a sensitive file operation and the tool is not in the approval set
+- **GIVEN** a turn-owned sub-agent requests confirmation for a sensitive file operation and no ledger grant covers it
 - **WHEN** the headless confirm bridge calls `coordinator.request_headless_confirmation()`
 - **THEN** the coordinator creates a `threading.Event`, stores it in its own `_headless_confirm_events` dict, calls the provided prompt function, and blocks on the event
 - **AND** the executor's `_headless_confirm_events` and `_headless_confirm_results` dicts are not used
@@ -264,7 +280,7 @@ Rule: The coordinator owns Event lifecycle and `auto_approve_tools`; the executo
 - **GIVEN** a sub-agent confirmation is pending and the operator responds via Telegram
 - **WHEN** the Telegram callback handler calls `coordinator.signal_headless_confirmation(token, approved)`
 - **THEN** the coordinator atomically pops the event from its `_headless_confirm_events` dict, writes the result to its `_headless_confirm_results` dict, and sets the event
-- **AND** no direct mutation of `auto_approve_tools` occurs outside the coordinator
+- **AND** no grant is created or mutated outside the coordinator's ledger
 
 #### Scenario: Headless confirmation timeout fails closed
 - **GIVEN** a sub-agent confirmation is pending and the operator does not respond within the timeout
@@ -301,12 +317,11 @@ Rule: The built-in set grows from 15 to 17 tools. The confirmation-capable set s
 - **THEN** exactly eight built-ins gate: `shell`, `file_read`, `file_write`, `file_patch`, `file_diff`, `file_send`, `memory_graph_store`, and `secret_get`
 - **AND** `wait_for_any_agent` and `cancel_agent` are not in the confirmation-capable set
 
-#### Scenario: shell cannot enter the shared approval set via the sub-agent approve-all path
-- **GIVEN** the operator is offered approve-all buttons only for file tools (`file_read`, `file_write`, `file_patch`) in sub-agent confirmation prompts
-- **WHEN** the operator grants an approve-all during a sub-agent confirmation
-- **THEN** `shell` is never added to `auto_approve_tools` via this path
-- **AND** `shell` remains always-blocked for sub-agents regardless of any approve-all grant
-- **NOTE** Main-agent shell approve-all removal is deferred to the `shell-guard-v0` change; the per-prompt TTL already bounds any such grant to one prompt.
+#### Scenario: shell cannot hold a standing grant via any sub-agent confirmation path
+- **GIVEN** a sub-agent confirmation prompt for `shell` is rendered
+- **WHEN** the operator responds
+- **THEN** the prompt offers Confirm and Deny only, and no standing grant for `shell` is ever stored (sink-side veto at the ledger)
+- **AND** `shell` remains always-blocked for sub-agents regardless of any grant
 
 ### Requirement: context_profile is a registered built-in tool
 
