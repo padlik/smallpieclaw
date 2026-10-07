@@ -285,6 +285,42 @@ class TestLogDetailOversized:
         assert secret not in dumped_text
         assert json.dumps(secret)[1:-1] not in dumped_text
 
+    @pytest.mark.parametrize(
+        "secrets", [["1"], ['"'], ["id"], ["pid"], ["id", "pid"]]
+    )
+    def test_dump_stays_valid_json_with_schema_keys_for_hostile_secret(
+        self, make_builtin_executor, tmp_path, secrets
+    ):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        rec = self._oversized_record(TRACE_VALID)
+        rec["request"] = {"id": 7, "pid": 8, "note": f"a{secrets[0]}b"}
+        _insert_records(path, [rec])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(
+                results_dir=results_dir, log_store_path=path, vault_secrets=secrets
+            ),
+        )
+
+        payload = _detail(exc, 1)
+
+        assert payload["dumped"] is True
+        with open(payload["dump_path"], encoding="utf-8") as fh:
+            text = fh.read()
+
+        def no_duplicates(pairs):
+            keys = [k for k, _ in pairs]
+            assert len(keys) == len(set(keys)), keys
+            return dict(pairs)
+
+        dumped = json.loads(text, object_pairs_hook=no_duplicates)
+        assert dumped["id"] == 1
+        assert {"trace", "event_type", "err", "request"} <= set(dumped)
+        request_values = list(dumped["request"].values())
+        assert len(request_values) == 3
+        assert 7 in request_values and 8 in request_values
+        assert all(secret not in str(v) for secret in secrets for v in request_values)
+
     def test_dump_permissions_owner_only(self, make_builtin_executor, tmp_path):
         """The dump artifact is 0600 inside a 0700 trace directory (POSIX)."""
         if os.name == "nt":

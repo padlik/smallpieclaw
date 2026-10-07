@@ -139,3 +139,41 @@ def test_redact_structure_colliding_keys_get_deterministic_suffix():
     redacted = redact_structure({"aaaaaa": 1, "bbbbbb": 2, "[REDACTED]_1": 3}, ["aaaaaa", "bbbbbb"])
 
     assert redacted == {"[REDACTED]": 1, "[REDACTED]_2": 2, "[REDACTED]_1": 3}
+
+
+def test_secret_extending_a_bracket_placeholder_is_redacted():
+    out = redact_vault_secrets("x [REDACTED]live-token-42 y", ["[REDACTED]live-token-42"])
+
+    assert out == "x [REDACTED] y"
+
+
+def test_secret_extending_the_ingestion_placeholder_is_redacted():
+    out = redact_vault_secrets(
+        "x ***REDACTED***live-token-42 y", ["***REDACTED***live-token-42"]
+    )
+
+    assert out == "x [REDACTED] y"
+
+
+def test_secret_starting_inside_a_placeholder_and_extending_past_it_is_redacted():
+    out = redact_vault_secrets("a [REDACTED]live b", ["ED]live"])
+
+    assert "live" not in out
+
+
+def test_secret_wholly_inside_a_placeholder_leaves_the_placeholder_intact():
+    assert redact_vault_secrets("a [REDACTED] b", ["REDACTED"]) == "a [REDACTED] b"
+
+
+def test_secret_exactly_equal_to_a_placeholder_is_indistinguishable_from_it():
+    assert redact_vault_secrets("a [REDACTED] b", ["[REDACTED]"]) == "a [REDACTED] b"
+
+
+def test_extending_secrets_are_idempotent_across_passes():
+    text = "[REDACTED]live-token-42 ***REDACTED***live-token-42 [REDACTED]"
+    secrets = ["[REDACTED]live-token-42", "***REDACTED***live-token-42", "REDACTED"]
+
+    once = redact_vault_secrets(text, secrets)
+
+    assert "live-token-42" not in once
+    assert redact_vault_secrets(once, secrets) == once

@@ -928,3 +928,107 @@ def test_all_result_pages_are_id_ordered(make_builtin_executor, tmp_path):
     p2 = _query(exc, trace=TRACE_A, event_type="TOOL_START", limit=7, before_id=before)
     assert [r["id"] for r in p2["records"]] == sorted(r["id"] for r in p2["records"])
 
+
+
+# ---------------------------------------------------------------------------
+# Read-time redaction of the text= search corpus (no credential oracle)
+# ---------------------------------------------------------------------------
+
+_HEX = "0123456789abcdef"
+
+
+def _redacting_executor(make_builtin_executor, tmp_path, records, secrets_toml):
+    from config_schema import ExecutorPaths
+
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, records)
+    vault = tmp_path / "vault.toml"
+    vault.write_text(secrets_toml)
+    return make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+        max_output=1_000_000,
+    )
+
+
+def test_adaptive_prefix_attack_cannot_recover_credential(make_builtin_executor, tmp_path):
+    """Extending a text= prefix never matches a credential added to the vault after ingestion."""
+    secret = "ab12ba21"
+    records = [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+         "msg": f"login failed token={secret}"},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "error",
+         "msg": "login failed token=unrelated"},
+    ]
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, records, f'late_key = "{secret}"\n'
+    )
+
+    recovered = ""
+    for _ in range(len(secret)):
+        hits = [
+            c for c in _HEX
+            if _query(exc, text=f"token={recovered}{c}")["total_matched"] > 0
+        ]
+        if len(hits) != 1:
+            break
+        recovered += hits[0]
+
+    assert recovered == ""
+    for end in range(1, len(secret) + 1):
+        payload = _query(exc, text=f"token={secret[:end]}")
+        assert payload["total_matched"] == 0
+        assert payload["count"] == 0
+
+
+def test_redacted_corpus_still_matches_surrounding_text(make_builtin_executor, tmp_path):
+    secret = "ab12ba21"
+    records = [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+                "msg": f"login failed token={secret}"}]
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, records, f'late_key = "{secret}"\n'
+    )
+
+    payload = _query(exc, text="login failed token=[REDACTED]")
+
+    assert payload["total_matched"] == 1
+    assert secret not in json.dumps(payload)
+
+
+def test_text_count_and_paging_are_exact_on_redacted_corpus(make_builtin_executor, tmp_path):
+    secret = "boomsecret99"
+    records = []
+    for i in range(6):
+        records.append({"ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A,
+                        "level": "info", "msg": f"boom clean {i}"})
+        records.append({"ts": f"2026-07-05T11:00:{i:02d}", "trace": TRACE_A,
+                        "level": "info", "msg": f"boom dirty {i} {secret}"})
+    records.append({"ts": "2026-07-05T12:00:00", "trace": TRACE_A, "level": "info",
+                    "msg": f"only the secret {secret}"})
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, records, f'k = "{secret}"\n'
+    )
+
+    first = _query(exc, text="boom", limit=5)
+    ids = [r["id"] for r in first["records"]]
+    pages = [ids]
+    before = min(ids)
+    while True:
+        page = _query(exc, text="boom", limit=5, before_id=before)
+        assert page["total_matched"] == first["total_matched"]
+        if not page["records"]:
+            break
+        pages.append([r["id"] for r in page["records"]])
+        before = min(pages[-1])
+
+    walked = [i for p in pages for i in p]
+    assert first["total_matched"] == 12
+    assert len(walked) == len(set(walked)) == 12
+    assert _query(exc, text="boomsecret99")["total_matched"] == 0
+
+
+def test_text_search_without_vault_secrets_is_unchanged(make_builtin_executor, tmp_path):
+    records = [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+                "msg": "boom visible"}]
+    exc = _redacting_executor(make_builtin_executor, tmp_path, records, 'k = "zzzzzzzz"\n')
+
+    assert _query(exc, text="boom visible")["total_matched"] == 1

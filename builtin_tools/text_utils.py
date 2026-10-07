@@ -69,28 +69,41 @@ def build_redaction_needles(secrets: "Iterable[str]") -> tuple[str, ...]:
 
 
 @lru_cache(maxsize=64)
-def _redaction_pattern(needles: tuple[str, ...], placeholder: str) -> "re.Pattern[str]":
-    """Compile one scanner: existing placeholder tokens first, then the needles.
-
-    The leftmost match wins and a token alternative beats a needle starting at
-    the same position, so a needle occurrence that lies inside an existing
-    placeholder is consumed by the token and left alone, while a secret that
-    merely contains placeholder text (starting earlier) is still redacted.
-    """
+def _redaction_patterns(
+    needles: tuple[str, ...], placeholder: str
+) -> "tuple[re.Pattern[str], re.Pattern[str]]":
+    """Compile the placeholder-token scanner and the needle scanner."""
     tokens = "|".join(
         re.escape(p) + r"(?:_\d+)?"
         for p in dict.fromkeys((*_PROTECTED_PLACEHOLDERS, placeholder))
     )
-    return re.compile(f"(?P<token>{tokens})|(?P<needle>{'|'.join(map(re.escape, needles))})")
+    return re.compile(tokens), re.compile("|".join(map(re.escape, needles)))
 
 
 def _redact_string(text: str, needles: tuple[str, ...], placeholder: str) -> str:
-    """Replace every needle occurrence in *text* that is not an existing placeholder."""
+    """Replace every needle occurrence in *text* that is not inside a placeholder.
+
+    A match lying entirely within an existing placeholder token is left alone
+    (keeps passes idempotent); a secret that extends beyond a token boundary
+    is a real secret and is redacted whole. A secret exactly equal to a
+    placeholder is therefore indistinguishable from it and stays as is.
+    """
     if not needles:
         return text
-    return _redaction_pattern(needles, placeholder).sub(
-        lambda m: m.group("token") or placeholder, text
-    )
+    token_re, needle_re = _redaction_patterns(needles, placeholder)
+    spans = [m.span() for m in token_re.finditer(text)]
+    out: list[str] = []
+    copied = cursor = 0
+    while (match := needle_re.search(text, cursor)) is not None:
+        start, end = match.span()
+        if any(s <= start and end <= e for s, e in spans):
+            cursor = start + 1  # contained: keep scanning, a longer secret may start inside
+            continue
+        out.append(text[copied:start])
+        out.append(placeholder)
+        copied = cursor = end
+    out.append(text[copied:])
+    return "".join(out)
 
 
 def redact_vault_secrets(

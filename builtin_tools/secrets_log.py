@@ -31,8 +31,8 @@ from builtin_tools.logquery_helpers import (
     _log_query_project,
     _LOG_QUERY_MAX_LIMIT,
 )
-from builtin_tools.text_utils import redact_structure, redact_vault_secrets
-from sqlite_log import connect_store, row_to_record
+from builtin_tools.text_utils import build_redaction_needles, redact_structure
+from sqlite_log import _compact_json, connect_store, row_to_record
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
@@ -333,19 +333,36 @@ class LogQueryTools:
         )
         where_count, params_count = _log_query_compile_where(count_filters)
 
+        # Read-time pass against the CURRENT vault before projection/truncation
+        # (same two-layer trust model as log_detail): field truncation alone
+        # does not protect a credential shorter than the field cap.
+        secrets_list = self._current_vault_secrets()
+        needles = build_redaction_needles(secrets_list)
+
         try:
-            total_matched = conn.execute(
-                f"SELECT COUNT(*) FROM events WHERE {where_count}", params_count
-            ).fetchone()[0]
-            rows = conn.execute(
-                f"""
-                SELECT * FROM (
-                    SELECT * FROM events WHERE {where}
-                    ORDER BY id DESC LIMIT ?
-                ) ORDER BY id ASC
-                """,
-                params + [limit],
-            ).fetchall()
+            if filters.text_folded and needles:
+                total_matched, records = self._log_query_redacted_text_search(
+                    conn, filters, count_filters, needles, secrets_list, limit, before_id
+                )
+            else:
+                total_matched = conn.execute(
+                    f"SELECT COUNT(*) FROM events WHERE {where_count}", params_count
+                ).fetchone()[0]
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM (
+                        SELECT * FROM events WHERE {where}
+                        ORDER BY id DESC LIMIT ?
+                    ) ORDER BY id ASC
+                    """,
+                    params + [limit],
+                ).fetchall()
+                records = [
+                    redact_structure(
+                        row_to_record(row), secrets_list, preserve_top_level_keys=True
+                    )
+                    for row in rows
+                ]
         except (OSError, sqlite3.Error) as exc:
             logger.warning("log_query: query failed for store %s: %s", path, exc)
             return self._log_query_result([], 0, False)
@@ -355,14 +372,6 @@ class LogQueryTools:
             except sqlite3.Error:
                 pass
 
-        # Read-time pass against the CURRENT vault before projection/truncation
-        # (same two-layer trust model as log_detail): field truncation alone
-        # does not protect a credential shorter than the field cap.
-        secrets_list = self._current_vault_secrets()
-        records = [
-            redact_structure(row_to_record(row), secrets_list, preserve_top_level_keys=True)
-            for row in rows
-        ]
         if before_id is not None:
             for rec in records:
                 rec_id = rec.get("id")
@@ -373,6 +382,94 @@ class LogQueryTools:
                     )
         truncated = total_matched > limit
         return self._log_query_result(records, total_matched, truncated)
+
+    def _log_query_redacted_text_search(
+        self,
+        conn: sqlite3.Connection,
+        filters: LogQueryFilters,
+        count_filters: LogQueryFilters,
+        needles: tuple[str, ...],
+        secrets_list: list[str],
+        limit: int,
+        before_id: int | None,
+    ) -> tuple[int, list[dict]]:
+        """Run a ``text=`` search against the vault-redacted corpus.
+
+        The stored ``search_text`` predates the current vault, so matching it in
+        SQL would let counts reveal credential prefixes. Rows are split by
+        whether their ``search_text`` contains any current-vault needle
+        (casefolded, plus one extra JSON-escape level for nested-JSON strings):
+
+        * clean rows cannot be altered by redaction, so their stored corpus IS
+          the redacted corpus and the indexed SQL ``instr`` match is exact;
+        * dirty rows are matched in Python against the casefolded compact JSON
+          of the redacted record (``id`` excluded, as at ingestion).
+
+        ``total_matched`` is the exact union count. The page is the newest
+        ``limit`` of the union, honouring ``before_id``, so paging is gapless.
+        """
+        probes: list[str] = []
+        for needle in build_redaction_needles(
+            [*needles, *(json.dumps(n)[1:-1] for n in needles)]
+        ):
+            folded = needle.casefold()
+            if folded not in probes:
+                probes.append(folded)
+        dirty_sql = "(" + " OR ".join("instr(search_text, ?) > 0" for _ in probes) + ")"
+
+        base_where, base_params = _log_query_compile_where(
+            LogQueryFilters(
+                trace=count_filters.trace, all_traces=count_filters.all_traces,
+                level=count_filters.level, min_level=count_filters.min_level,
+                event_type=count_filters.event_type, tool=count_filters.tool,
+                since=count_filters.since, prompt_id=count_filters.prompt_id,
+                use_default_view=count_filters.use_default_view,
+            )
+        )
+        text_folded = filters.text_folded
+
+        clean_where = f"{base_where} AND NOT {dirty_sql} AND instr(search_text, ?) > 0"
+        clean_params = [*base_params, *probes, text_folded]
+        clean_count = conn.execute(
+            f"SELECT COUNT(*) FROM events WHERE {clean_where}", clean_params
+        ).fetchone()[0]
+
+        anchor = ""
+        anchor_params: list = []
+        if before_id is not None and before_id > 0:
+            anchor, anchor_params = " AND id < ?", [before_id]
+        clean_rows = conn.execute(
+            f"SELECT * FROM events WHERE {clean_where}{anchor} ORDER BY id DESC LIMIT ?",
+            [*clean_params, *anchor_params, limit],
+        ).fetchall()
+
+        dirty_matches: list[tuple[int, dict]] = []
+        for row in conn.execute(
+            f"SELECT * FROM events WHERE {base_where} AND {dirty_sql} ORDER BY id DESC",
+            [*base_params, *probes],
+        ):
+            record = row_to_record(row)
+            redacted = redact_structure(record, secrets_list, preserve_top_level_keys=True)
+            corpus = _compact_json(
+                {k: v for k, v in redacted.items() if k != "id"}
+            ).casefold()
+            if text_folded in corpus:
+                dirty_matches.append((row["id"], redacted))
+
+        page = [
+            (row["id"], redact_structure(
+                row_to_record(row), secrets_list, preserve_top_level_keys=True
+            ))
+            for row in clean_rows
+        ]
+        page += [
+            (rid, rec) for rid, rec in dirty_matches
+            if before_id is None or rid < before_id
+        ]
+        page.sort(key=lambda item: item[0], reverse=True)
+        newest = page[:limit]
+        newest.reverse()
+        return clean_count + len(dirty_matches), [rec for _rid, rec in newest]
 
     def _log_query_result(self, records: list, total_matched: int, truncated: bool) -> dict:
         """Render a log_query payload using the peer result-dict convention.
@@ -618,10 +715,9 @@ class LogQueryTools:
                 preview, dumped=False, dump_path=None, note=note
             )
 
-        # Defense-in-depth pass over the serialized artifact, via the same
-        # shared routine used by the shell oversized-output path so neither
-        # path can drift (idempotent after the structural read-time pass).
-        serialized = redact_vault_secrets(serialized, secrets_list)
+        # The artifact is serialized from the structurally redacted record
+        # above; no text-level pass runs over the JSON, which would corrupt
+        # syntax (numbers, quotes) and merge keys for short secrets.
 
         base_path = os.path.join(dest_dir, f"log-detail-{raw_id}.json")
 
