@@ -355,7 +355,14 @@ class LogQueryTools:
             except sqlite3.Error:
                 pass
 
-        records = [row_to_record(row) for row in rows]
+        # Read-time pass against the CURRENT vault before projection/truncation
+        # (same two-layer trust model as log_detail): field truncation alone
+        # does not protect a credential shorter than the field cap.
+        secrets_list = self._current_vault_secrets()
+        records = [
+            redact_structure(row_to_record(row), secrets_list, preserve_top_level_keys=True)
+            for row in rows
+        ]
         if before_id is not None:
             for rec in records:
                 rec_id = rec.get("id")
@@ -539,7 +546,9 @@ class LogQueryTools:
         # Both the full-fidelity record and the oversized preview/artifact are
         # derived from the redacted record, so they cannot disagree.
         secrets_list = self._current_vault_secrets()
-        record = redact_structure(row_to_record(row), secrets_list)
+        record = redact_structure(
+            row_to_record(row), secrets_list, preserve_top_level_keys=True
+        )
         # The 65536-char gate measures the compact serialization; the emitted
         # payload uses default (spaced) separators, so a record just under the
         # gate serializes slightly larger in the tool output. The cap is a

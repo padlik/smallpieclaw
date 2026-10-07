@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
@@ -114,80 +115,124 @@ class TestHeadlessConfirmationCancellation:
         assert manager.signal_headless_confirmation(token, True) is False
 
 
+class _FakeClock:
+    """Controllable stand-in for ``confirmation.time`` (monotonic only).
+
+    ``deadline_initialized`` is set by the waiter's first ``monotonic()`` call,
+    which is the ``deadline = monotonic() + timeout`` initialization. The value
+    returned is captured before the event is set, so once a test has observed
+    the event the deadline is fixed regardless of later clock advances.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.deadline_initialized = threading.Event()
+
+    def monotonic(self) -> float:
+        value = self.now
+        self.deadline_initialized.set()
+        return value
+
+
+class _ContentionProbeLock:
+    """RLock proxy that reports when a non-owner thread contends for the lock.
+
+    Lets a test prove the waiter has reached the contested terminal transition
+    (it is blocked entering ``_headless_lock``) without sleeps or timeouts.
+    """
+
+    def __init__(self, inner: "threading.RLock", owner: threading.Thread) -> None:
+        self._inner = inner
+        self._owner = owner
+        self.armed = threading.Event()
+        self.waiter_contending = threading.Event()
+
+    def __enter__(self) -> bool:
+        if threading.current_thread() is not self._owner and self.armed.is_set():
+            self.waiter_contending.set()
+        return self._inner.__enter__()
+
+    def __exit__(self, *exc: object) -> None:
+        self._inner.__exit__(*exc)
+
+
 class TestHeadlessConfirmationLifecycleAtomicity:
     """Waiter terminal decisions and signaler commits are mutually exclusive."""
 
     TOKEN = "lifecycle-token"
 
-    class _FakeClock:
-        """Controllable stand-in for ``confirmation.time`` (monotonic only)."""
-
-        def __init__(self) -> None:
-            self.now = 0.0
-
-        def monotonic(self) -> float:
-            return self.now
-
     @pytest.fixture
-    def clock(self, monkeypatch: pytest.MonkeyPatch) -> "_FakeClock":
+    def clock(self, monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
         import confirmation
 
-        fake = self._FakeClock()
+        fake = _FakeClock()
         monkeypatch.setattr(confirmation, "time", fake)
         return fake
 
     def _start_waiter(self, manager, cancel_event=None):
         prompted = threading.Event()
         decisions: list[bool] = []
-        done = threading.Event()
+
+        def prompt_fn(*_args: object) -> None:
+            prompted.set()
+            # Adversarial: linger after signalling readiness so a harness that
+            # trusts ``prompted`` as "deadline initialized" would be exposed.
+            time.sleep(0.05)
 
         def run() -> None:
             decisions.append(
                 manager.request_headless_confirmation(
-                    self.TOKEN, "file_write", "write", lambda *_a: prompted.set(),
+                    self.TOKEN, "file_write", "write", prompt_fn,
                     cancel_event=cancel_event,
                 )
             )
-            done.set()
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        assert prompted.wait(timeout=1.0)
-        return thread, decisions, done
+        assert prompted.wait(timeout=5.0)
+        return thread, decisions
 
-    def test_timeout_during_approval_never_mints_unconsumed_grant(self, clock) -> None:
-        manager = ConfirmationManager()
+    def _approve_while_deadline_passes(self, manager, clock):
+        """Drive the contested interleave and return (decisions, on_approved_runs, signalled).
+
+        The deadline passes while the signaler is inside ``on_approved``; the
+        signaler holds until the waiter is observed contending for the lock, so
+        the waiter is proven to be at the terminal transition (no sleep or
+        timeout decides the order).
+        """
         manager.default_headless_timeout = 10
-        thread, decisions, waiter_done = self._start_waiter(manager)
-        on_approved_ran: list[bool] = []
+        probe = _ContentionProbeLock(manager._headless_lock, threading.current_thread())
+        manager._headless_lock = probe
+        thread, decisions = self._start_waiter(manager)
+        assert clock.deadline_initialized.wait(timeout=5.0)
+        runs: list[bool] = []
 
         def on_approved() -> None:
-            on_approved_ran.append(True)
-            # Interleave: the deadline passes while the signaler is mid-approval,
-            # then give a racing waiter bounded time to take its timeout decision.
+            runs.append(True)
             clock.now = 11.0
-            waiter_done.wait(timeout=0.4)
+            probe.armed.set()
+            assert probe.waiter_contending.wait(timeout=5.0)
 
         signalled = manager.signal_headless_confirmation(
             self.TOKEN, True, on_approved=on_approved
         )
-        thread.join(timeout=2.0)
-
+        thread.join(timeout=5.0)
         assert thread.is_alive() is False
-        assert not (on_approved_ran and decisions == [False])
-        assert signalled == bool(on_approved_ran)
+        return decisions, runs, signalled
+
+    def test_timeout_during_approval_waiter_consumes_the_approval(self, clock) -> None:
+        manager = ConfirmationManager()
+
+        decisions, runs, signalled = self._approve_while_deadline_passes(manager, clock)
+
+        assert runs == [True]
+        assert signalled is True
+        assert decisions == [True]
 
     def test_timeout_during_approval_leaves_no_result_entries(self, clock) -> None:
         manager = ConfirmationManager()
-        manager.default_headless_timeout = 10
-        thread, _decisions, waiter_done = self._start_waiter(manager)
 
-        def on_approved() -> None:
-            clock.now = 11.0
-            waiter_done.wait(timeout=0.4)
-
-        manager.signal_headless_confirmation(self.TOKEN, True, on_approved=on_approved)
-        thread.join(timeout=2.0)
+        self._approve_while_deadline_passes(manager, clock)
 
         assert manager._headless_confirm_results == {}
         assert manager._headless_confirm_events == {}
@@ -195,15 +240,17 @@ class TestHeadlessConfirmationLifecycleAtomicity:
     def test_signal_after_timeout_skips_on_approved(self, clock) -> None:
         manager = ConfirmationManager()
         manager.default_headless_timeout = 10
-        thread, decisions, _done = self._start_waiter(manager)
+        thread, decisions = self._start_waiter(manager)
+        assert clock.deadline_initialized.wait(timeout=5.0)
         clock.now = 11.0
-        thread.join(timeout=2.0)
+        thread.join(timeout=5.0)
         ran: list[bool] = []
 
         signalled = manager.signal_headless_confirmation(
             self.TOKEN, True, on_approved=lambda: ran.append(True)
         )
 
+        assert thread.is_alive() is False
         assert decisions == [False]
         assert signalled is False
         assert ran == []
@@ -212,9 +259,9 @@ class TestHeadlessConfirmationLifecycleAtomicity:
     def test_cancel_before_approval_skips_on_approved(self) -> None:
         manager = ConfirmationManager()
         cancel = threading.Event()
-        thread, decisions, _done = self._start_waiter(manager, cancel_event=cancel)
+        thread, decisions = self._start_waiter(manager, cancel_event=cancel)
         cancel.set()
-        thread.join(timeout=2.0)
+        thread.join(timeout=5.0)
         ran: list[bool] = []
 
         signalled = manager.signal_headless_confirmation(
@@ -229,12 +276,12 @@ class TestHeadlessConfirmationLifecycleAtomicity:
     def test_cancel_during_approval_denies_waiter_without_orphans(self) -> None:
         manager = ConfirmationManager()
         cancel = threading.Event()
-        thread, decisions, _done = self._start_waiter(manager, cancel_event=cancel)
+        thread, decisions = self._start_waiter(manager, cancel_event=cancel)
 
         signalled = manager.signal_headless_confirmation(
             self.TOKEN, True, on_approved=cancel.set
         )
-        thread.join(timeout=2.0)
+        thread.join(timeout=5.0)
 
         assert signalled is True
         assert decisions == [False]
@@ -243,18 +290,18 @@ class TestHeadlessConfirmationLifecycleAtomicity:
 
     def test_live_waiter_approval_runs_on_approved_before_release(self) -> None:
         manager = ConfirmationManager()
-        thread, decisions, done = self._start_waiter(manager)
-        released_at_approval: list[bool] = []
+        thread, decisions = self._start_waiter(manager)
+        decided_at_approval: list[bool] = []
 
         signalled = manager.signal_headless_confirmation(
             self.TOKEN, True,
-            on_approved=lambda: released_at_approval.append(done.is_set()),
+            on_approved=lambda: decided_at_approval.append(bool(decisions)),
         )
-        thread.join(timeout=2.0)
+        thread.join(timeout=5.0)
 
         assert signalled is True
         assert decisions == [True]
-        assert released_at_approval == [False]
+        assert decided_at_approval == [False]
         assert manager._headless_confirm_results == {}
 
 

@@ -604,3 +604,139 @@ class TestLogDetailReadTimeRedaction:
         payload = _detail(exc, 1)
 
         assert self.SECRET not in json.dumps(payload)
+
+
+def _query(exc, **filters) -> dict:
+    """Call log_query through public execute() and parse the payload."""
+    result = exc.execute("log_query", filters)
+    assert result["success"] is True
+    return json.loads(result["output"])
+
+
+class TestLogQueryReadTimeRedaction:
+    """log_query applies the same current-vault structural redaction as log_detail."""
+
+    SECRET = "LateAddedCred42"
+
+    def _records(self) -> list[dict]:
+        return [
+            {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+             "event_type": "TOOL_FAILED", "msg": f"login failed with {self.SECRET}",
+             "err": f"token={self.SECRET}", "request": {"auth": self.SECRET}},
+            {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "error",
+             "event_type": "TOOL_FAILED", "msg": f"retry with {self.SECRET}"},
+        ]
+
+    def _executor(self, make_builtin_executor, tmp_path, vault_text: str):
+        path = str(tmp_path / "query.sqlite")
+        _insert_records(path, self._records())
+        vault = tmp_path / "vault.toml"
+        vault.write_text(vault_text)
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+            max_output=1_000_000,
+        )
+        return exc, vault
+
+    def test_ordinary_query_redacts_current_vault_secret(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc, _ = self._executor(
+            make_builtin_executor, tmp_path, f'late_key = "{self.SECRET}"\n'
+        )
+
+        payload = _query(exc, trace=TRACE_A, level="error")
+
+        assert payload["count"] == 2
+        assert self.SECRET not in json.dumps(payload)
+
+    def test_before_id_pagination_redacts_current_vault_secret(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc, _ = self._executor(
+            make_builtin_executor, tmp_path, f'late_key = "{self.SECRET}"\n'
+        )
+
+        payload = _query(exc, trace="*", before_id=2, level="error")
+
+        assert payload["count"] == 1
+        assert self.SECRET not in json.dumps(payload)
+
+    def test_secret_added_mid_session_is_redacted_on_next_query(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc, vault = self._executor(make_builtin_executor, tmp_path, 'other = "x"\n')
+        assert self.SECRET in json.dumps(_query(exc, trace=TRACE_A, level="error"))
+
+        vault.write_text(f'other = "x"\nlate_key = "{self.SECRET}"\n')
+
+        assert self.SECRET not in json.dumps(_query(exc, trace=TRACE_A, level="error"))
+
+
+class TestReadTimeRedactionKeepsRecordSchema:
+    """Short vault values never rename fixed record keys; nested keys still scrub."""
+
+    def _executor(self, make_builtin_executor, tmp_path, secrets_toml: str, rec: dict):
+        path = str(tmp_path / "schema.sqlite")
+        _insert_records(path, [rec])
+        vault = tmp_path / "vault.toml"
+        vault.write_text(secrets_toml)
+        return make_builtin_executor(
+            paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+            max_output=1_000_000,
+        )
+
+    def _rec(self) -> dict:
+        return {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+                "event_type": "TOOL_END", "tool": "shell", "msg": "ok",
+                "request": {"idsecret": 1}}
+
+    def test_log_detail_preserves_top_level_keys_for_short_secret(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc = self._executor(
+            make_builtin_executor, tmp_path, 'a = "id"\nb = "tool"\n', self._rec()
+        )
+
+        record = _detail(exc, 1)["record"]
+
+        assert record["id"] == 1
+        assert record["tool"] == "shell"
+        assert "[REDACTED]" not in record
+
+    def test_log_query_preserves_top_level_keys_for_short_secret(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc = self._executor(
+            make_builtin_executor, tmp_path, 'a = "id"\nb = "tool"\n', self._rec()
+        )
+
+        record = _query(exc, trace=TRACE_A)["records"][0]
+
+        assert record["id"] == 1
+        assert record["tool"] == "shell"
+        assert "[REDACTED]" not in record
+
+    def test_nested_secret_key_is_still_scrubbed(self, make_builtin_executor, tmp_path):
+        exc = self._executor(
+            make_builtin_executor, tmp_path, 'a = "idsecret"\n', self._rec()
+        )
+
+        record = _detail(exc, 1)["record"]
+
+        assert record["request"] == {"[REDACTED]": 1}
+
+    def test_colliding_nested_keys_are_both_kept_with_suffix(
+        self, make_builtin_executor, tmp_path
+    ):
+        rec = self._rec()
+        rec["request"] = {"secretone": 1, "secrettwo": 2}
+        exc = self._executor(
+            make_builtin_executor, tmp_path,
+            'a = "secretone"\nb = "secrettwo"\n', rec,
+        )
+
+        record = _detail(exc, 1)["record"]
+
+        assert sorted(record["request"].values()) == [1, 2]
+        assert sorted(record["request"]) == ["[REDACTED]", "[REDACTED]_1"]

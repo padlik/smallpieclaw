@@ -81,3 +81,61 @@ def test_redact_structure_scrubs_dict_keys():
 
     assert _QUOTED_SECRET not in repr(redacted)
     assert redacted == {"[REDACTED]": 1, "ok": ["[REDACTED]"]}
+
+
+def test_secret_equal_to_placeholder_word_is_stable_across_passes():
+    once = redact_vault_secrets("token REDACTED here", ["REDACTED"])
+    twice = redact_vault_secrets(once, ["REDACTED"])
+
+    assert once == "token [REDACTED] here"
+    assert twice == once
+
+
+def test_secret_overlapping_placeholder_text_does_not_corrupt_existing_placeholder():
+    text = "a [REDACTED] b [REDACTED]_1 c"
+
+    assert redact_vault_secrets(text, ["RED", "ACTED]", "[REDACTED"]) == text
+
+
+def test_secret_containing_placeholder_text_is_still_redacted():
+    assert redact_vault_secrets("x[REDACTED]y leaked", ["x[REDACTED]y"]) == "[REDACTED] leaked"
+
+
+def test_redaction_is_idempotent_across_needle_sets():
+    text = 'plain pa"ss\\word99 REDACTED [REDACTED] ***REDACTED*** id'
+    for secrets in (
+        [_QUOTED_SECRET],
+        ["REDACTED"],
+        ["REDACTED", _QUOTED_SECRET, "id"],
+        ["ACTED", "***", "RED"],
+    ):
+        once = redact_vault_secrets(text, secrets)
+        assert redact_vault_secrets(once, secrets) == once
+
+
+def test_redact_structure_idempotent_with_ingestion_placeholder():
+    from builtin_tools.text_utils import redact_structure
+
+    value = {"k": "***REDACTED*** and REDACTED"}
+    once = redact_structure(value, ["REDACTED"])
+
+    assert once == {"k": "***REDACTED*** and [REDACTED]"}
+    assert redact_structure(once, ["REDACTED"]) == once
+
+
+def test_redact_structure_can_preserve_top_level_keys():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure(
+        {"id": 1, "msg": "id", "nested": {"id": 2}}, ["id"], preserve_top_level_keys=True
+    )
+
+    assert redacted == {"id": 1, "msg": "[REDACTED]", "nested": {"[REDACTED]": 2}}
+
+
+def test_redact_structure_colliding_keys_get_deterministic_suffix():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure({"aaaaaa": 1, "bbbbbb": 2, "[REDACTED]_1": 3}, ["aaaaaa", "bbbbbb"])
+
+    assert redacted == {"[REDACTED]": 1, "[REDACTED]_2": 2, "[REDACTED]_1": 3}

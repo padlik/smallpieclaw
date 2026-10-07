@@ -500,3 +500,11 @@ class TestLLMFailedLifecycle:
         llm_failed = [e for e, _ in captured if e == al.LogEvent.LLM_FAILED]
         assert len(llm_failed) == 1
         assert stdlib.error.call_count == 0
+
+
+def test_ingestion_placeholder_is_protected_by_shared_core():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = f"x {al._REDACTION_PLACEHOLDER} REDACTED"
+
+    assert redact_vault_secrets(text, ["REDACTED"]) == f"x {al._REDACTION_PLACEHOLDER} [REDACTED]"

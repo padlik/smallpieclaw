@@ -7,6 +7,8 @@ module, so it is safe to import eagerly.
 from __future__ import annotations
 
 import json
+import re
+from functools import lru_cache
 from typing import Any, Iterable
 
 
@@ -42,8 +44,13 @@ def _truncate_tail(tail: str, total_chars: int, limit: int) -> str:
 
 _REDACTED_PLACEHOLDER = "[REDACTED]"
 
+# Placeholders emitted by either redaction layer (read-time here, ingestion in
+# ``agent_logging``). Existing tokens, including ``_N`` collision suffixes, are
+# never re-redacted, which keeps every pass idempotent.
+_PROTECTED_PLACEHOLDERS = (_REDACTED_PLACEHOLDER, "***REDACTED***")
 
-def build_redaction_needles(secrets: "Iterable[str]") -> list[str]:
+
+def build_redaction_needles(secrets: "Iterable[str]") -> tuple[str, ...]:
     """Return literal and JSON-escaped forms of each secret, longest first.
 
     The escaped forms (ASCII and non-ASCII ``json.dumps`` flavours) catch a
@@ -58,14 +65,32 @@ def build_redaction_needles(secrets: "Iterable[str]") -> list[str]:
         needles.add(secret)
         needles.add(json.dumps(secret)[1:-1])
         needles.add(json.dumps(secret, ensure_ascii=False)[1:-1])
-    return sorted(needles, key=lambda n: (-len(n), n))
+    return tuple(sorted(needles, key=lambda n: (-len(n), n)))
 
 
-def _redact_string(text: str, needles: "list[str]", placeholder: str) -> str:
-    """Replace every needle in *text* with *placeholder*."""
-    for needle in needles:
-        text = text.replace(needle, placeholder)
-    return text
+@lru_cache(maxsize=64)
+def _redaction_pattern(needles: tuple[str, ...], placeholder: str) -> "re.Pattern[str]":
+    """Compile one scanner: existing placeholder tokens first, then the needles.
+
+    The leftmost match wins and a token alternative beats a needle starting at
+    the same position, so a needle occurrence that lies inside an existing
+    placeholder is consumed by the token and left alone, while a secret that
+    merely contains placeholder text (starting earlier) is still redacted.
+    """
+    tokens = "|".join(
+        re.escape(p) + r"(?:_\d+)?"
+        for p in dict.fromkeys((*_PROTECTED_PLACEHOLDERS, placeholder))
+    )
+    return re.compile(f"(?P<token>{tokens})|(?P<needle>{'|'.join(map(re.escape, needles))})")
+
+
+def _redact_string(text: str, needles: tuple[str, ...], placeholder: str) -> str:
+    """Replace every needle occurrence in *text* that is not an existing placeholder."""
+    if not needles:
+        return text
+    return _redaction_pattern(needles, placeholder).sub(
+        lambda m: m.group("token") or placeholder, text
+    )
 
 
 def redact_vault_secrets(
@@ -76,11 +101,12 @@ def redact_vault_secrets(
     """Replace every non-empty entry of *secrets* in *text* with *placeholder*.
 
     Shared redaction core for retained tool artifacts and log records: the
-    shell oversized output path, the log_detail read-time pass and dump, and
-    the structlog ingestion redactor all route through this single routine so
-    no path's redaction can silently weaken relative to another. Each secret is
-    matched both literally and in its JSON-escaped form, so a secret serialized
-    into a JSON string cannot leak on decode. Idempotent.
+    shell oversized output path, the log_detail/log_query read-time pass and
+    dump, and the structlog ingestion redactor all route through this single
+    routine so no path's redaction can silently weaken relative to another.
+    Each secret is matched both literally and in its JSON-escaped form, so a
+    secret serialized into a JSON string cannot leak on decode. Existing
+    placeholder tokens are never re-redacted, so the pass is idempotent.
     """
     return _redact_string(text, build_redaction_needles(secrets), placeholder)
 
@@ -89,28 +115,57 @@ def redact_structure(
     value: Any,
     secrets: "Iterable[str]",
     placeholder: str = _REDACTED_PLACEHOLDER,
+    preserve_top_level_keys: bool = False,
 ) -> Any:
     """Recursively redact secrets from strings AND dict keys of *value*.
 
     Container shapes (dict/list/tuple) are preserved; non-string leaves pass
     through. Scrubbing happens before serialization so that no serialized form
-    of a secret can be produced from the redacted structure.
+    of a secret can be produced from the redacted structure. With
+    *preserve_top_level_keys* the keys of a top-level dict are kept verbatim
+    (their values are still redacted) so fixed record-schema fields such as
+    ``id`` or ``trace`` survive short secrets; nested keys are always scrubbed.
     """
-    return redact_with_needles(value, build_redaction_needles(secrets), placeholder)
+    needles = build_redaction_needles(secrets)
+    if preserve_top_level_keys and isinstance(value, dict):
+        return {k: redact_with_needles(v, needles, placeholder) for k, v in value.items()}
+    return redact_with_needles(value, needles, placeholder)
 
 
-def redact_with_needles(value: Any, needles: "list[str]", placeholder: str) -> Any:
-    """Redact *value* using needles precomputed by :func:`build_redaction_needles`."""
+def redact_with_needles(value: Any, needles: tuple[str, ...], placeholder: str) -> Any:
+    """Redact *value* using needles precomputed by :func:`build_redaction_needles`.
+
+    Dict keys that redact to the same string stay distinct: the first keeps
+    *placeholder*, later ones get ``<placeholder>_1``, ``_2``, ... in dict
+    order, skipping any name already used by an unchanged key.
+    """
     if isinstance(value, str):
         return _redact_string(value, needles, placeholder)
     if isinstance(value, dict):
-        return {
-            (_redact_string(k, needles, placeholder) if isinstance(k, str) else k):
-            redact_with_needles(v, needles, placeholder)
-            for k, v in value.items()
-        }
+        return _redact_dict(value, needles, placeholder)
     if isinstance(value, list):
         return [redact_with_needles(v, needles, placeholder) for v in value]
     if isinstance(value, tuple):
         return tuple(redact_with_needles(v, needles, placeholder) for v in value)
     return value
+
+
+def _redact_dict(value: dict, needles: tuple[str, ...], placeholder: str) -> dict:
+    """Redact a dict's keys and values, keeping colliding redacted keys distinct."""
+    new_keys = {
+        k: (_redact_string(k, needles, placeholder) if isinstance(k, str) else k)
+        for k in value
+    }
+    used: set = {k for k, nk in new_keys.items() if nk == k}
+    result: dict = {}
+    for key, item in value.items():
+        new_key = new_keys[key]
+        if new_key != key:
+            candidate, n = new_key, 0
+            while candidate in used:
+                n += 1
+                candidate = f"{new_key}_{n}"
+            used.add(candidate)
+            new_key = candidate
+        result[new_key] = redact_with_needles(item, needles, placeholder)
+    return result
