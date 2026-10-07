@@ -93,9 +93,9 @@ Classification runs before the ledger check: a Tier 0 prohibited path MUST fail 
 - **THEN** the call fails with a `prohibited_path` hard error
 - **AND** no prompt is rendered
 
-### Requirement: Sub-agent grants are scoped to the sub-agent's run
+### Requirement: Turn-owned children use their owning turn's confirmation channel
 
-The ledger MUST remain single and depth-0-owned. A prompt-lifetime grant arising from a **turn-owned child** file-operation confirmation MUST carry the child run identity and MUST expire when that child run completes; session-lifetime grants from such confirmations behave as normal session grants. The active **operator turn** may provide the existing confirmation channel to its own on-demand children under the existing path policy and grant rules. A **scheduled run** MUST NOT consult the interactive grant ledger or confirmation coordinator, regardless of whether an operator turn is active or whether a matching prompt- or session-lifetime grant exists. A scheduled operation that requires additional approval MUST be denied promptly without rendering a prompt or staging a token. Classification-before-grant ordering, prohibited-path immunity, and sink-side vetoes remain unchanged.
+The ledger MUST remain single and depth-0-owned. A prompt-lifetime grant from a **turn-owned child** file-operation confirmation MUST carry the child run identity and expire when that run completes; session-lifetime grants behave as normal session grants. The active **operator turn** provides the confirmation channel under the existing path policy and grant rules.
 
 #### Scenario: Sub-agent prompt grant dies with the sub-agent
 - **GIVEN** a turn-owned child's file-operation confirmation receives a prompt-lifetime Confirm
@@ -109,6 +109,10 @@ The ledger MUST remain single and depth-0-owned. A prompt-lifetime grant arising
 - **AND** the child has a prompt-lifetime grant for `(file_write, /data)`
 - **WHEN** the operator calls `file_write` on a path under `/data`
 - **THEN** a confirmation prompt is sent because the child's scoped grant does not cover the operator
+
+### Requirement: Scheduled runs never consult interactive grants
+
+A **scheduled run** MUST NOT consult the interactive grant ledger or confirmation coordinator, regardless of any active **operator turn** or existing grant. An operation requiring approval MUST be denied promptly without a prompt or token. Classification-before-grant ordering, prohibited-path immunity, and sink-side vetoes remain unchanged.
 
 #### Scenario: Scheduled run never consults an existing grant
 - **GIVEN** an operator turn is active and the depth-0 ledger contains a matching session grant

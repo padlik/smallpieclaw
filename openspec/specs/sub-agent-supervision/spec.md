@@ -39,9 +39,9 @@ Scheduled sub-agent launches SHALL provide scheduler/internal control data throu
 - **THEN** each job's finish and result logging callbacks are invoked for the correct job
 - **AND** one job's callback data does not overwrite the other job's callback data
 
-### Requirement: Existing spawn supervision behavior is preserved
+### Requirement: Spawn validation and capacity remain compatible
 
-The supervision boundary SHALL preserve model-facing spawn validation and response behavior, capacity policy, context persistence, cancellation, and graph-memory non-admission. `get_agent_result` and `wait_for_any_agent` SHALL expose results only to the owning **operator turn**; a non-owned, scheduled, or unknown ID SHALL return an error naming the supplied ID and stating that no child is accessible in this turn, without waiting or revealing whether another run exists. Timeout cancellation SHALL suppress a later stale notice only for a timeout-cancelled scheduled run; turn-owned children never send independent completion notices. When an operator turn attempts normal finish with any unaccounted child, completed-but-unretrieved children included, finish SHALL be refused until each result is retrieved or the child is cancelled. A resumed run has a new unique turn owner even if its checkpoint trace is reused. Turn-owned records remain available for retrieval/accounting beyond registry TTL. Cross-source cancellation remains an operator `/agents` and `/stop` capability, not a model-facing capability.
+The supervision boundary SHALL preserve model-facing `spawn_agent` validation, task aliases, response-format shaping, context-key rejection, and the nested depth guard, and SHALL keep the global capacity policy that counts both on-demand and scheduled runs.
 
 #### Scenario: Model-facing spawn validation remains compatible
 - **GIVEN** a caller uses the model-facing `spawn_agent` tool contract
@@ -55,22 +55,9 @@ The supervision boundary SHALL preserve model-facing spawn validation and respon
 - **THEN** the launch is accepted or rejected according to the global max-subagents behavior defined by the running-agent visibility policy
 - **AND** scheduled runs carry `source="scheduled"` while continuing to count against the global guard
 
-#### Scenario: Timeout cancellation remains compatible
-- **GIVEN** an operator turn waits for its on-demand child result with a timeout and `cancel_on_timeout` enabled
-- **WHEN** the timeout expires before the sub-agent completes
-- **THEN** the system cancels the underlying sub-agent run using the same cancellation behavior as before
-- **AND** the turn-owned child does not later send an independent completion notification
+### Requirement: Owner-scoped retrieval and finish accounting
 
-#### Scenario: Context persistence remains compatible
-- **GIVEN** a spawned or scheduled sub-agent uses a valid `context_key`
-- **WHEN** the sub-agent run completes or is cleaned up
-- **THEN** the system persists the sub-agent short-term context using the same context-key storage behavior as before
-
-#### Scenario: Sub-agent results are not auto-admitted to graph memory
-- **GIVEN** a spawned or scheduled sub-agent completes with a result
-- **WHEN** the supervisor records and delivers that result
-- **THEN** the result is not automatically stored in graph memory
-- **AND** any graph-memory admission remains governed by the existing explicit graph-memory tools or policies
+`get_agent_result` and `wait_for_any_agent` SHALL expose results only to the owning **operator turn**; any other ID SHALL return an error naming the supplied ID and stating that no child is accessible in this turn, without revealing whether another run exists. Normal finish with any unaccounted child, completed-but-unretrieved included, SHALL be refused until each is retrieved or cancelled.
 
 #### Scenario: Finishing with a completed but unread child is refused
 - **GIVEN** a turn-owned child has completed but its result has not been retrieved or cancelled
@@ -83,9 +70,34 @@ The supervision boundary SHALL preserve model-facing spawn validation and respon
 - **THEN** the child is accounted for, but cleanup must finish before the turn closes
 - **AND** without an actual cancellation request, timeout alone leaves it unaccounted
 
-### Requirement: Source-aware supervised runs
+### Requirement: Timeout cancellation remains compatible
 
-The supervisor SHALL assign distinct source categories to on-demand and scheduled runs while preserving existing launch and completion contracts. Source labels govern visibility and capacity accounting, not result access or ownership. On-demand submissions carry immutable owning **operator turn** identity; scheduled submissions carry job-owned origin without a parent turn. Scheduler completion/result callbacks stay bound to their submitted run, and scheduled notification options are applied to that run's outcome.
+Timeout cancellation SHALL preserve existing behavior and suppress a later stale notice only for a timeout-cancelled scheduled run; turn-owned children never send independent completion notices. Cross-source cancellation remains an operator `/agents` and `/stop` capability, not a model-facing capability.
+
+#### Scenario: Timeout cancellation remains compatible
+- **GIVEN** an operator turn waits for its on-demand child result with a timeout and `cancel_on_timeout` enabled
+- **WHEN** the timeout expires before the sub-agent completes
+- **THEN** the system cancels the underlying sub-agent run using the same cancellation behavior as before
+- **AND** the turn-owned child does not later send an independent completion notification
+
+### Requirement: Context persistence, graph admission, and record lifetime remain compatible
+
+Sub-agent context persistence SHALL keep the same context-key storage behavior, and results SHALL NOT be auto-admitted to graph memory. Turn-owned records remain available for retrieval/accounting beyond registry TTL; a resumed run has a new unique turn owner even if its checkpoint trace is reused.
+
+#### Scenario: Context persistence remains compatible
+- **GIVEN** a spawned or scheduled sub-agent uses a valid `context_key`
+- **WHEN** the sub-agent run completes or is cleaned up
+- **THEN** the system persists the sub-agent short-term context using the same context-key storage behavior as before
+
+#### Scenario: Sub-agent results are not auto-admitted to graph memory
+- **GIVEN** a spawned or scheduled sub-agent completes with a result
+- **WHEN** the supervisor records and delivers that result
+- **THEN** the result is not automatically stored in graph memory
+- **AND** any graph-memory admission remains governed by the existing explicit graph-memory tools or policies
+
+### Requirement: Source labels distinguish on-demand and scheduled runs
+
+The supervisor SHALL assign distinct source categories to on-demand and scheduled runs while preserving existing launch and completion contracts. Source labels govern visibility and capacity accounting, not result access or ownership.
 
 #### Scenario: On-demand supervised run remains on-demand
 - **GIVEN** the model-facing `spawn_agent` tool admits a root-agent sub-agent run
@@ -104,6 +116,10 @@ The supervisor SHALL assign distinct source categories to on-demand and schedule
 - **WHEN** it completes, fails, or is cancelled and that turn calls `get_agent_result` for its ID
 - **THEN** the owning turn receives the terminal status and result, and existing timeout cancellation, context persistence, and graph-memory non-admission behavior remains compatible
 - **AND** an on-demand timeout cancellation does not produce an independent completion notification
+
+### Requirement: Supervised submissions carry ownership and bound callbacks
+
+On-demand submissions carry immutable owning **operator turn** identity; scheduled submissions carry job-owned origin without a parent turn. Scheduler completion/result callbacks stay bound to their submitted run, and scheduled notification options are applied to that run's outcome.
 
 #### Scenario: Scheduled completion uses its callback, not model join
 - **GIVEN** a scheduled supervised run has scheduler completion and result-logging callbacks associated with its submission
