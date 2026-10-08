@@ -859,7 +859,10 @@ def _recovered_by_oracle_decoders(secret: str, text: str) -> bool:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         unicode_escaped = codecs.decode(text, "unicode_escape")
+    from tests.test_text_utils import _per_run_percent_variants
+
     candidates = [
+        *_per_run_percent_variants(text),
         text,
         unquote(text),
         unquote(text, encoding="latin-1"),
@@ -1116,3 +1119,85 @@ def test_log_query_malformed_named_escape_does_not_break_credential_redaction(
     assert "token=[REDACTED]" in msgs
     assert _MALFORMED_MSG in msgs
     assert not any("ab12ba21" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 7: independent per-run percent readings
+# ---------------------------------------------------------------------------
+
+_SPLIT_SECRET = "prefix\u00e9-\u00c3\u00a9suffix"
+_SPLIT_MSG = "token=prefix%C3%A9-%C3%A9suffix"
+
+
+def test_log_detail_independent_percent_run_readings_not_recoverable(
+    make_builtin_executor, tmp_path
+):
+    assert _recovered_by_oracle_decoders(_SPLIT_SECRET, _SPLIT_MSG)
+    exc = _oracle_executor(make_builtin_executor, tmp_path, _SPLIT_SECRET, _SPLIT_MSG)
+
+    returned = _detail(exc, 1)["record"]["msg"]
+
+    assert not _recovered_by_oracle_decoders(_SPLIT_SECRET, returned)
+
+
+def test_log_query_independent_percent_run_readings_not_recoverable(
+    make_builtin_executor, tmp_path
+):
+    exc = _oracle_executor(make_builtin_executor, tmp_path, _SPLIT_SECRET, _SPLIT_MSG)
+
+    for filters in ({"level": "DEBUG"}, {"text": "REDACTED"}):
+        payload = _query(exc, **filters)
+        assert payload["records"], filters
+        for record in payload["records"]:
+            assert not _recovered_by_oracle_decoders(_SPLIT_SECRET, record["msg"])
+
+
+def test_oversized_dump_independent_percent_run_readings_not_recoverable(
+    make_builtin_executor, tmp_path
+):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID,
+                            "level": "error", "msg": _SPLIT_MSG, "err": "E" * 70_000}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(_SPLIT_SECRET)}\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(
+            results_dir=str(tmp_path / "results"), log_store_path=path, vault_path=str(vault)
+        ),
+        max_output=1_000_000,
+    )
+
+    payload = _detail(exc, 1)
+
+    assert payload["dumped"] is True
+    artifact = Path(payload["dump_path"]).read_text(encoding="utf-8")
+    assert not _recovered_by_oracle_decoders(_SPLIT_SECRET, json.loads(artifact)["msg"])
+
+
+def test_shell_artifact_independent_percent_run_readings_not_recoverable(
+    make_builtin_executor, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    exc = make_builtin_executor(
+        max_output=50,
+        data_dir=str(tmp_path),
+        agent_name="testagent",
+        vault_secrets=[_SPLIT_SECRET],
+    )
+    exc.conversation_id = "testconv"
+    script = f"print({_SPLIT_MSG!r}); print('padding ' * 30)"
+
+    result = exc.execute("shell", {"command": f"python3 -c {json.dumps(script)}"})
+
+    assert result["success"] is True
+    content = Path(result["full_log_path"]).read_bytes().decode("utf-8")
+    assert not _recovered_by_oracle_decoders(_SPLIT_SECRET, content)
+
+
+def test_log_query_honest_multilingual_url_survives_read_time_redaction(
+    make_builtin_executor, tmp_path
+):
+    url = "GET /wiki/%E6%97%A5%E6%9C%AC%E8%AA%9E/caf%C3%A9?a=%C3%B1o%C3%B1o&b=%E4%B8%AD HTTP/1.1"
+    exc = _oracle_executor(make_builtin_executor, tmp_path, _SPLIT_SECRET, url)
+
+    assert _detail(exc, 1)["record"]["msg"] == url

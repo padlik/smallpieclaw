@@ -257,6 +257,14 @@ class TestProcessorChain:
         assert redacted["msg"] == "ordinary diagnostic \\N{\\uD800}"
         assert redacted["other"] == "token=***REDACTED***"
 
+    def test_independent_percent_run_readings_redacted_at_ingestion(self):
+        secret = "prefix\u00e9-\u00c3\u00a9suffix"
+        redact = al._make_redactor(frozenset({secret}))
+
+        redacted = redact(None, "info", {"msg": "token=prefix%C3%A9-%C3%A9suffix"})
+
+        assert redacted["msg"] == "***REDACTED***"
+
     def test_quoted_secret_absent_from_every_sink_form(self, tmp_path):
         secret = 'pa"ss\\word99'
         escaped = json.dumps(secret)[1:-1]

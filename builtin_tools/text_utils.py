@@ -6,6 +6,7 @@ module, so it is safe to import eagerly.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import unicodedata
@@ -70,11 +71,13 @@ _DEEP_RUN = "\\" * 2**MAX_ESCAPE_DEPTH
 # length-preserving cases.
 MAX_DECODE_PASSES = 32
 
-# Distinct decoded texts explored (across all candidate readings) before
-# decoding is declared undecidable; honest text reaches a handful, branching
-# adversarial text hits this cap. Each text spawns at most one candidate per
-# decoder, and the ambiguous percent readings (UTF-8 vs Latin-1, with or
-# without ``+`` as space) contribute at most four distinct ones.
+# Distinct decoded texts (the original included) the search may ever hold.
+# Admission fails closed: the moment a new distinct text would be the
+# (MAX_DECODE_STATES + 1)th, the text is declared undecidable, so no more than
+# MAX_DECODE_STATES texts are ever generated or examined; a search that settles
+# within the cap passes honestly. Honest text reaches a handful of states;
+# branching adversarial text (independent percent-run readings, interleaved
+# grammars) hits this cap.
 MAX_DECODE_STATES = 32
 
 _JSON_ESCAPE_RE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))')
@@ -189,91 +192,144 @@ def _unescape_python_once(text: str) -> str:
     )
 
 
-def _unescape_percent_once(text: str) -> str:
-    """Decode every ``%XX`` run in *text* one layer (RFC 3986), never growing it.
+def _utf8_sequence_length(raw: bytes, start: int) -> int:
+    """Return the length of the valid multi-byte UTF-8 character at *start*, or 0."""
+    for length in (2, 3, 4):
+        chunk = raw[start : start + length]
+        if len(chunk) == length:
+            try:
+                if len(chunk.decode("utf-8")) == 1:
+                    return length
+            except UnicodeDecodeError:
+                continue
+    return 0
 
-    Each run of percent-escapes is decoded as UTF-8; bytes that are not valid
-    UTF-8 fall back to Latin-1, so both common URL encodings are recovered.
-    Malformed escapes (``%zz``, a trailing ``%``) are left untouched.
+
+def _percent_run_slots(
+    run: str, relevant: "frozenset[str] | None"
+) -> list[tuple[str, ...]]:
+    """Split one ``%XX`` *run* into slots, each a tuple of its alternative readings.
+
+    ASCII bytes and bytes that are not part of a valid UTF-8 character are
+    always read as Latin-1 (one alternative). Each valid multi-byte UTF-8
+    character is read independently as that character or as its bytes taken
+    as Latin-1 (``%C3%A9`` is ``é`` or ``Ã©``), so a secret assembled from
+    differently encoded parts is among the readings even when the parts are
+    adjacent in one run.
+
+    The two alternatives differ only in the non-ASCII characters they produce,
+    so with *relevant* (the characters that occur in any needle) an alternative
+    none of whose characters is relevant cannot take part in a needle match
+    that the other misses: it is dropped when the other can, and the choice
+    collapses to the UTF-8 reading when neither can. Percent-decoded non-ASCII
+    characters never feed a later decoding layer, so this loses no match while
+    keeping honest multilingual URLs to a single reading per character.
     """
-    if "%" not in text:
-        return text
+    raw = bytes.fromhex(run.replace("%", ""))
+    slots: list[tuple[str, ...]] = []
+    index = 0
+    while index < len(raw):
+        length = _utf8_sequence_length(raw, index) if raw[index] >= 0x80 else 0
+        if length == 0:
+            slots.append((raw[index : index + 1].decode("latin-1"),))
+            index += 1
+            continue
+        chunk = raw[index : index + length]
+        readings = (chunk.decode("utf-8"), chunk.decode("latin-1"))
+        if relevant is not None:
+            alive = tuple(r for r in readings if any(c in relevant for c in r))
+            readings = alive or readings[:1]
+        slots.append(readings)
+        index += length
+    return slots
 
-    def _decode(match: "re.Match[str]") -> str:
-        raw = bytes.fromhex(match.group().replace("%", ""))
-        decoded = raw.decode("utf-8", "surrogateescape")
-        return "".join(
-            chr(ord(c) - 0xDC00) if "\udc80" <= c <= "\udcff" else c for c in decoded
-        )
 
-    return _PERCENT_RUN_RE.sub(_decode, text)
+def _percent_candidates(text: str, relevant: "frozenset[str] | None") -> Iterator[str]:
+    """Yield every URL-decoded reading of *text* one layer deep, never growing it.
 
-
-def _unescape_percent_latin1_once(text: str) -> str:
-    """Decode every ``%XX`` run in *text* one layer, reading each byte as Latin-1.
-
-    The alternative reading of :func:`_unescape_percent_once`: a run whose
-    bytes also happen to form valid UTF-8 (``%C3%A9``) is two characters here
-    but one there, and a secret may have been encoded either way.
+    Every multi-byte UTF-8 character inside a ``%XX`` run is decoded
+    independently as UTF-8 or Latin-1 (:func:`_percent_run_slots`), and ``+``
+    is read both as itself and as a space (form encoding). The cross product
+    is generated lazily, all-UTF-8 first, so the caller can stop at its state
+    budget instead of materializing it. Malformed escapes (``%zz``, a trailing
+    ``%``) are left untouched.
     """
-    if "%" not in text:
-        return text
-    return _PERCENT_RUN_RE.sub(
-        lambda match: bytes.fromhex(match.group().replace("%", "")).decode("latin-1"),
-        text,
-    )
+    if "%" not in text and "+" not in text:
+        return
+    parts: list[tuple[bool, tuple[str, ...]]] = []
+    cursor = 0
+    for match in _PERCENT_RUN_RE.finditer(text):
+        parts.append((True, (text[cursor : match.start()],)))
+        parts.extend((False, slot) for slot in _percent_run_slots(match.group(), relevant))
+        cursor = match.end()
+    parts.append((True, (text[cursor:],)))
+    for plus_as_space in (False, True) if "+" in text else (False,):
+        slots: list[tuple[str, ...]] = []
+        for is_literal, alternatives in parts:
+            if is_literal and plus_as_space:
+                alternatives = (alternatives[0].replace("+", " "),)
+            if slots and len(slots[-1]) == 1 and len(alternatives) == 1:
+                slots[-1] = (slots[-1][0] + alternatives[0],)
+            else:
+                slots.append(alternatives)
+        for combo in itertools.product(*slots):
+            yield "".join(combo)
 
 
-def _unescape_url_form_once(text: str) -> str:
-    """Decode *text* like :func:`_unescape_percent_once`, also reading ``+`` as a space."""
-    return _unescape_percent_once(text.replace("+", " "))
+def _decode_candidates(text: str, relevant: "frozenset[str] | None") -> Iterator[str]:
+    """Yield every text one decoding layer can turn *text* into.
+
+    JSON escapes and Python escapes give one candidate each; URL decoding
+    gives one per independent reading of its percent runs
+    (:func:`_percent_candidates`).
+    """
+    yield _unescape_json_once(text)
+    yield _unescape_python_once(text)
+    yield from _percent_candidates(text, relevant)
 
 
-def _unescape_url_form_latin1_once(text: str) -> str:
-    """Decode *text* like :func:`_unescape_percent_latin1_once`, also reading ``+`` as a space."""
-    return _unescape_percent_latin1_once(text.replace("+", " "))
+def _decodes_to_hit(
+    text: str,
+    hit: "Callable[[str], bool]",
+    relevant: "frozenset[str] | None" = None,
+) -> bool:
+    """Return True when a decode of *text* satisfies *hit*, or cannot be shown clean.
 
+    Each level applies every decoder (JSON, Python, and URL decoding with each
+    percent run read independently as UTF-8 or Latin-1, ``+`` kept or read as
+    a space) to every text reached so far, so any interleaving of the grammars
+    and any combination of run readings is a candidate; a hit in any candidate
+    counts. A text already seen is not revisited. *relevant*, the characters
+    occurring in any needle, lets URL decoding skip readings that no needle can
+    match (:func:`_percent_run_readings`).
 
-_DECODERS: "tuple[Callable[[str], str], ...]" = (
-    _unescape_json_once,
-    _unescape_python_once,
-    _unescape_percent_once,
-    _unescape_percent_latin1_once,
-    _unescape_url_form_once,
-    _unescape_url_form_latin1_once,
-)
-
-
-def _decodes_to_hit(text: str, hit: "Callable[[str], bool]") -> bool:
-    """Return True when a decode of *text* satisfies *hit*, or never settles.
-
-    Each level applies every decoder (JSON, Python, percent as UTF-8 and as
-    Latin-1, each also form-encoded) to every text reached so far, so any
-    interleaving of the grammars and any reading of an ambiguous ``%XX`` run is
-    a candidate; a hit in any candidate counts. A text already seen is not
-    revisited. Decoding stops once a level reaches
-    nothing new. Fail closed (True) when decoding is still producing new texts
-    after :data:`MAX_DECODE_PASSES` levels or has reached
-    :data:`MAX_DECODE_STATES` distinct texts: such text cannot be shown clean.
+    The search holds at most :data:`MAX_DECODE_STATES` distinct texts, the
+    original included. Admission fails closed (True): the moment a new distinct
+    text would exceed that cap it is neither examined nor stored, so the
+    combinations of independent readings are never fully generated. A single
+    text with more than that many candidate readings is likewise undecidable,
+    as is a search still producing new texts after :data:`MAX_DECODE_PASSES`
+    levels. A search that settles within the budget returns False.
     """
     seen = {(len(text), hash(text))}
     frontier = [text]
     for _ in range(MAX_DECODE_PASSES):
         reached: list[str] = []
         for current in frontier:
-            for decode in _DECODERS:
-                decoded = decode(current)
+            for index, decoded in enumerate(_decode_candidates(current, relevant)):
+                if index >= MAX_DECODE_STATES:
+                    return True
                 key = (len(decoded), hash(decoded))
                 if key in seen:
                     continue
+                if len(seen) >= MAX_DECODE_STATES:
+                    return True
                 if hit(decoded):
                     return True
                 seen.add(key)
                 reached.append(decoded)
         if not reached:
             return False
-        if len(seen) > MAX_DECODE_STATES:
-            return True
         frontier = reached
     return True
 
@@ -281,8 +337,8 @@ def _decodes_to_hit(text: str, hit: "Callable[[str], bool]") -> bool:
 @lru_cache(maxsize=64)
 def _redaction_patterns(
     needles: tuple[str, ...], placeholder: str
-) -> "tuple[re.Pattern[str], re.Pattern[str], bool]":
-    """Compile the placeholder-token scanner, the needle scanner and the escape flag."""
+) -> "tuple[re.Pattern[str], re.Pattern[str], bool, frozenset[str]]":
+    """Compile the placeholder-token scanner, the needle scanner, the escape flag and needle alphabet."""
     tokens = "|".join(
         re.escape(p) + r"(?:_\d+)?"
         for p in dict.fromkeys((*_PROTECTED_PLACEHOLDERS, placeholder))
@@ -291,6 +347,7 @@ def _redaction_patterns(
         re.compile(tokens),
         re.compile("|".join(map(re.escape, needles))),
         any("\\" in n for n in needles),
+        frozenset("".join(needles)),
     )
 
 
@@ -322,15 +379,15 @@ def _redact_string(text: str, needles: tuple[str, ...], placeholder: str) -> str
     2. If the remainder holds a backslash, ``%`` or ``+``, it is decoded layer
        by layer (:func:`_decodes_to_hit`: JSON escapes, Python escapes, URL
        percent-encoding, in any interleaving); a layer containing a needle, or
-       decoding that does not settle within :data:`MAX_DECODE_PASSES`, marks
-       the text suspicious. Suspicious *lines* are replaced whole by
+       decoding that does not settle within :data:`MAX_DECODE_PASSES` and
+       :data:`MAX_DECODE_STATES`, marks the text suspicious. Suspicious *lines* are replaced whole by
        *placeholder* (an encoded secret never spans a raw newline); if the
        text is still suspicious afterwards (a secret spelled across lines),
        the whole text is replaced.
     """
     if not needles:
         return text
-    token_re, needle_re, escape_sensitive = _redaction_patterns(needles, placeholder)
+    token_re, needle_re, escape_sensitive, alphabet = _redaction_patterns(needles, placeholder)
     out: list[str] = []
     copied = 0
     for start, end in _unprotected_matches(text, token_re, needle_re):
@@ -349,6 +406,7 @@ def _redact_string(text: str, needles: tuple[str, ...], placeholder: str) -> str
             candidate,
             lambda layer: next(_unprotected_matches(layer, token_re, needle_re), None)
             is not None,
+            alphabet,
         )
 
     if not suspicious(redacted):

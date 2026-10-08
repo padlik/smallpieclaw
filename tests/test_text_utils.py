@@ -460,7 +460,7 @@ def _all_unicode_layer(text: str) -> str:
 
 
 def _random_secret(rng) -> str:
-    alphabet = 'abcXYZ0129-_ "\\\u00e9\u4e2d\n\t\U0001f600'
+    alphabet = 'abcXYZ0129-_ "\\\u00e9\u4e2d\n\t\U0001f600\u00c3\u00a9'
     return "".join(rng.choice(alphabet) for _ in range(rng.randint(6, 14)))
 
 
@@ -509,6 +509,32 @@ def test_randomized_mixed_spellings_never_leave_a_recoverable_credential():
 # ---------------------------------------------------------------------------
 
 
+def _per_run_percent_variants(text: str, limit: int = 256) -> list[str]:
+    """Return *text* with every ``%XX`` run decoded independently as UTF-8 or Latin-1.
+
+    The oracle's split-and-mixed-decode trick generalized: any combination of
+    per-run encodings, with ``+`` read as a space or kept, capped at *limit*.
+    """
+    import itertools
+    import re
+    from urllib.parse import unquote
+
+    parts = re.split(r"((?:%[0-9a-fA-F]{2})+)", text)
+    runs = [i for i, part in enumerate(parts) if i % 2]
+    variants: list[str] = []
+    for plus in (False, True):
+        for combo in itertools.islice(itertools.product(("utf-8", "latin-1"), repeat=len(runs)), limit):
+            out = list(parts)
+            for index, encoding in zip(runs, combo):
+                out[index] = unquote(parts[index], encoding=encoding)
+            joined = "".join(
+                part.replace("+", " ") if plus and i % 2 == 0 else part
+                for i, part in enumerate(out)
+            )
+            variants.append(joined)
+    return variants
+
+
 def _recoverable(secret: str, text: str, depth: int = 4) -> bool:
     """Return True when any chain of common decoders applied to *text* reveals *secret*."""
     import ast
@@ -550,6 +576,10 @@ def _recoverable(secret: str, text: str, depth: int = 4) -> bool:
                 if isinstance(decoded, str) and decoded not in seen:
                     seen.add(decoded)
                     nxt.append(decoded)
+            for variant in _per_run_percent_variants(current):
+                if variant not in seen:
+                    seen.add(variant)
+                    nxt.append(variant)
         frontier = nxt
     return any(secret in t for t in frontier)
 
@@ -733,6 +763,20 @@ def test_short_secret_replaces_a_coincidental_encoded_line():
     assert redact_vault_secrets(text, ["a\n"]) == "[REDACTED]"
 
 
+def _mixed_encoding_percent_layer(text: str) -> str:
+    """Percent-encode every non-alphanumeric run, alternating UTF-8 and Latin-1 per run."""
+    import itertools
+    import re
+    from urllib.parse import quote
+
+    encodings = itertools.cycle(("utf-8", "latin-1"))
+    return re.sub(
+        r"[^A-Za-z0-9]+",
+        lambda m: quote(m.group(), safe="", encoding=next(encodings), errors="replace"),
+        text,
+    )
+
+
 def _cr_continuation_layer(text: str) -> str:
     """Quote *text* as a Python literal split by a CRLF or CR line continuation."""
     middle = len(text) // 2
@@ -753,6 +797,7 @@ def _random_mixed_leaf(rng, secret: str) -> str:
         lambda t: quote(t, safe="", encoding="latin-1", errors="replace"),
         lambda t: quote_plus(t, encoding="latin-1", errors="replace"),
         _cr_continuation_layer,
+        _mixed_encoding_percent_layer,
     )
     text = f"token={secret}"
     for _ in range(rng.randint(1, 5)):
@@ -920,7 +965,7 @@ def test_honest_utf8_ambiguous_percent_url_is_untouched():
 def test_percent_decode_candidates_stay_within_the_state_budget():
     from builtin_tools.text_utils import MAX_DECODE_STATES, _decodes_to_hit
 
-    text = "q=" + "%C3%A9" * 4 + "&r=" + "%E4%B8%AD" * 4
+    text = "q=" + "%C3%A9" * 2 + "&r=" + "%E4%B8%AD" * 2
     reached: list[str] = []
 
     def record(layer: str) -> bool:
@@ -929,3 +974,241 @@ def test_percent_decode_candidates_stay_within_the_state_budget():
 
     assert _decodes_to_hit(text, record) is False
     assert len(set(reached)) <= MAX_DECODE_STATES
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 7: independent per-run percent readings, admission-time state cap
+# ---------------------------------------------------------------------------
+
+_SPLIT_SECRET = "prefix\u00e9-\u00c3\u00a9suffix"
+_SPLIT_MSG = "token=prefix%C3%A9-%C3%A9suffix"
+
+
+def _mixed_percent_text(parts: list[str], separator: str = "-") -> str:
+    """Encode *parts* alternately as UTF-8 and Latin-1 percent runs joined by *separator*."""
+    from urllib.parse import quote
+
+    encodings = ("utf-8", "latin-1")
+    return separator.join(
+        quote(part, safe="", encoding=encodings[i % 2]) for i, part in enumerate(parts)
+    )
+
+
+def test_split_and_mixed_decode_of_two_ambiguous_runs_is_detected_by_the_oracle_helper():
+    assert _recoverable(_SPLIT_SECRET, _SPLIT_MSG)
+
+
+def test_independent_percent_run_readings_are_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets(_SPLIT_MSG, [_SPLIT_SECRET]) == "[REDACTED]"
+
+
+def test_independent_percent_run_readings_are_not_recoverable_from_structure():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure({"msg": _SPLIT_MSG}, [_SPLIT_SECRET])
+
+    assert not _recoverable(_SPLIT_SECRET, redacted["msg"])
+
+
+def test_four_alternating_utf8_and_latin1_runs_are_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    parts = ["a\u00e9", "b\u00c3\u00a9", "c\u00e9", "d\u00c3\u00a9"]
+    secret = "-".join(parts)
+    text = "q=" + _mixed_percent_text(parts)
+    assert _recoverable(secret, text)
+
+    assert redact_vault_secrets(text, [secret]) == "[REDACTED]"
+
+
+def test_mixed_runs_whose_needle_needs_the_plus_as_space_reading_are_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    secret = "a b\u00e9 c\u00c3\u00a9"
+    text = "q=a+b%C3%A9+c%C3%A9"
+    assert _recoverable(secret, text)
+
+    assert redact_vault_secrets(text, [secret]) == "[REDACTED]"
+
+
+def test_honest_multilingual_url_with_many_runs_is_untouched_for_an_ascii_secret():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = (
+        "GET /wiki/%E6%97%A5%E6%9C%AC%E8%AA%9E/caf%C3%A9?a=%C3%B1o%C3%B1o&b=%E4%B8%AD"
+        "&c=%D0%9F%D1%80%D0%B8&d=%C3%BC&e=%C3%A4&f=%C3%B6 HTTP/1.1"
+    )
+
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == text
+
+
+def test_honest_multilingual_url_is_untouched_for_a_non_ascii_secret():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = (
+        "GET /wiki/%E6%97%A5%E6%9C%AC%E8%AA%9E/caf%C3%A9?a=%C3%B1o%C3%B1o&b=%E4%B8%AD"
+        "&c=%D0%9F%D1%80%D0%B8&d=%C3%BC&e=%C3%A4&f=%C3%B6 HTTP/1.1"
+    )
+
+    assert redact_vault_secrets(text, [_SPLIT_SECRET]) == text
+
+
+def test_ambiguous_runs_beyond_the_state_budget_are_replaced_not_passed_through():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "q=" + "-".join(["a%C3%A9"] * 6)
+
+    assert redact_vault_secrets(text, ["Q\u00e9\u00c3\u00a9"]) == "[REDACTED]"
+
+
+def test_ambiguous_runs_within_the_state_budget_are_passed_through_when_clean():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "q=" + "-".join(["a%C3%A9"] * 4)
+
+    assert redact_vault_secrets(text, ["Q\u00e9\u00c3\u00a9"]) == text
+
+
+def test_percent_decoding_never_grows_the_text_across_readings():
+    from builtin_tools.text_utils import _decodes_to_hit
+
+    text = "q=" + "-".join(["a%C3%A9+b"] * 4)
+    lengths: list[int] = []
+
+    def record(layer: str) -> bool:
+        lengths.append(len(layer))
+        return False
+
+    _decodes_to_hit(text, record)
+
+    assert max(lengths) <= len(text)
+
+
+def _chain_text(distinct_states: int) -> str:
+    """Return a text whose decode search reaches exactly *distinct_states* texts (root included)."""
+    text = "%41"
+    for _ in range(distinct_states - 2):
+        text = text.replace("%", "%25")
+    return text
+
+
+def _states_reached(text: str) -> int:
+    from builtin_tools.text_utils import _decodes_to_hit
+
+    layers: set[str] = {text}
+
+    def record(layer: str) -> bool:
+        layers.add(layer)
+        return False
+
+    _decodes_to_hit(text, record)
+    return len(layers)
+
+
+def test_state_cap_admits_exactly_the_budget_of_distinct_texts(monkeypatch):
+    from builtin_tools import text_utils
+
+    monkeypatch.setattr(text_utils, "MAX_DECODE_STATES", 6)
+    text = _chain_text(6)
+    assert _states_reached(text) == 6
+
+    assert text_utils.redact_vault_secrets(text, ["zzzz"]) == text
+
+
+def test_state_cap_fails_closed_when_one_more_distinct_text_would_be_admitted(monkeypatch):
+    from builtin_tools import text_utils
+
+    monkeypatch.setattr(text_utils, "MAX_DECODE_STATES", 6)
+
+    assert text_utils.redact_vault_secrets(_chain_text(7), ["zzzz"]) == "[REDACTED]"
+
+
+def test_state_cap_never_generates_texts_beyond_the_budget(monkeypatch):
+    from builtin_tools import text_utils
+
+    monkeypatch.setattr(text_utils, "MAX_DECODE_STATES", 6)
+    text = "q=" + "-".join(["a%C3%A9"] * 6)
+    seen: set[str] = {text}
+
+    def record(layer: str) -> bool:
+        seen.add(layer)
+        return False
+
+    assert text_utils._decodes_to_hit(text, record) is True
+    assert len(seen) <= 6
+
+
+def test_oracle_thirty_two_state_input_settles_at_exactly_the_budget():
+    from builtin_tools.text_utils import MAX_DECODE_STATES, redact_vault_secrets
+
+    text = r"\x25|%252B|\\u0061|\\|%5Cu0025|\\"
+
+    assert _states_reached(text) == MAX_DECODE_STATES
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == text
+
+
+def test_oracle_thirty_two_state_input_is_replaced_when_the_budget_is_one_lower(monkeypatch):
+    from builtin_tools import text_utils
+
+    monkeypatch.setattr(text_utils, "MAX_DECODE_STATES", text_utils.MAX_DECODE_STATES - 1)
+    text = r"\x25|%252B|\\u0061|\\|%5Cu0025|\\"
+
+    assert text_utils.redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == "[REDACTED]"
+
+
+def test_five_ambiguous_runs_exceed_the_real_budget_and_four_do_not():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    secret = "Q\u00e9\u00c3\u00a9"
+    four = "q=" + "-".join(["a%C3%A9"] * 4)
+    five = "q=" + "-".join(["a%C3%A9"] * 5)
+
+    assert redact_vault_secrets(four, [secret]) == four
+    assert redact_vault_secrets(five, [secret]) == "[REDACTED]"
+
+
+def test_randomized_independent_percent_run_readings_never_leave_a_recoverable_credential():
+    import random
+
+    from builtin_tools.text_utils import redact_structure, redact_vault_secrets
+
+    pieces = ["\u00e9", "\u00c3\u00a9", "-", "ab", "1", "_", "\u00fc", "\u00c3\u00bc"]
+    rng = random.Random(20261010)
+    for case in range(300):
+        secret = "".join(rng.choice(pieces) for _ in range(rng.randint(4, 9))) + "z"
+        text = "token=" + secret
+        for layer in rng.sample(
+            [_mixed_encoding_percent_layer, repr, lambda t: t.replace(" ", "+")], rng.randint(1, 2)
+        ):
+            text = layer(text)
+        leaf = f"GET /x?{text} HTTP/1.1" if rng.random() < 0.3 else text
+
+        redacted = redact_structure({"msg": leaf}, [secret])["msg"]
+        artifact = redact_vault_secrets(leaf, [secret])
+
+        for out in (redacted, artifact):
+            assert not _recoverable(secret, out), (case, secret, leaf, out)
+        assert redact_vault_secrets(redacted, [secret]) == redacted
+
+
+def test_needle_inside_a_run_that_also_holds_irrelevant_ascii_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("x%3D%E9%C3%BC", ["\u00e9\u00c3\u00bc"]) == "[REDACTED]"
+
+
+def test_mixed_readings_inside_one_adjacent_percent_run_are_redacted():
+    from urllib.parse import quote
+
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    secret = "\u00e9\u00c3\u00a9"
+    text = "token=" + quote("\u00e9", safe="") + quote("\u00c3\u00a9", safe="", encoding="latin-1")
+    assert text == "token=%C3%A9%C3%A9"
+    from urllib.parse import unquote
+
+    assert unquote("%C3%A9") + unquote("%C3%A9", encoding="latin-1") == secret
+
+    assert redact_vault_secrets(text, [secret]) == "[REDACTED]"
