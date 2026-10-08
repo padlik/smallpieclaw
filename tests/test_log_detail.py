@@ -854,7 +854,17 @@ def _recovered_by_oracle_decoders(secret: str, text: str) -> bool:
     import codecs
     from urllib.parse import unquote
 
-    candidates = [text, unquote(text), codecs.decode(text, "unicode_escape")]
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        unicode_escaped = codecs.decode(text, "unicode_escape")
+    candidates = [
+        text,
+        unquote(text),
+        unquote(text, encoding="latin-1"),
+        unicode_escaped,
+    ]
     try:
         value = ast.literal_eval(text)
     except (ValueError, SyntaxError):
@@ -980,3 +990,129 @@ def test_short_secret_may_replace_a_whole_coincidentally_encoded_line(
     )
 
     assert _detail(exc, 1)["record"]["msg"] == "[REDACTED]"
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 6: CR/CRLF continuations, Latin-1 percent, malformed \N{...}
+# ---------------------------------------------------------------------------
+
+_CR_SECRET = "ab12ba21"
+_LATIN1_SECRET = "p\u00c3\u00a9ssword"
+
+_ROUND6_CASES = [
+    pytest.param(_CR_SECRET, "{'token': 'ab12" + "\\" + "\r\n" + "ba21'}", id="crlf-continuation"),
+    pytest.param(_CR_SECRET, "{'token': 'ab12" + "\\" + "\r" + "ba21'}", id="cr-continuation"),
+    pytest.param(_LATIN1_SECRET, "token=p%C3%A9ssword", id="latin1-percent"),
+]
+_MALFORMED_MSG = r"ordinary diagnostic \N{\uD800}"
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ROUND6_CASES)
+def test_log_detail_round6_spellings_not_recoverable(make_builtin_executor, tmp_path, secret, msg):
+    assert _recovered_by_oracle_decoders(secret, msg)
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    returned = _detail(exc, 1)["record"]["msg"]
+
+    assert not _recovered_by_oracle_decoders(secret, returned)
+    assert secret not in returned
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ROUND6_CASES)
+def test_log_query_round6_spellings_not_recoverable(make_builtin_executor, tmp_path, secret, msg):
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    for filters in ({"level": "DEBUG"}, {"text": "REDACTED"}):
+        payload = _query(exc, **filters)
+        assert payload["records"], filters
+        for record in payload["records"]:
+            assert not _recovered_by_oracle_decoders(secret, record["msg"])
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ROUND6_CASES)
+def test_oversized_dump_round6_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID,
+                            "level": "error", "msg": msg, "err": "E" * 70_000}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(
+            results_dir=str(tmp_path / "results"), log_store_path=path, vault_path=str(vault)
+        ),
+        max_output=1_000_000,
+    )
+
+    payload = _detail(exc, 1)
+
+    assert payload["dumped"] is True
+    artifact = Path(payload["dump_path"]).read_text(encoding="utf-8")
+    assert not _recovered_by_oracle_decoders(secret, json.loads(artifact)["msg"])
+
+
+@pytest.mark.parametrize(
+    ("secret", "printed"),
+    [
+        pytest.param(_LATIN1_SECRET, "token=p%C3%A9ssword", id="latin1-percent"),
+    ],
+)
+def test_shell_artifact_round6_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, monkeypatch, secret, printed
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    exc = make_builtin_executor(
+        max_output=50,
+        data_dir=str(tmp_path),
+        agent_name="testagent",
+        vault_secrets=[secret],
+    )
+    exc.conversation_id = "testconv"
+    script = f"print({printed!r}); print('padding ' * 30)"
+
+    result = exc.execute("shell", {"command": f"python3 -c {json.dumps(script)}"})
+
+    assert result["success"] is True
+    content = Path(result["full_log_path"]).read_bytes().decode("utf-8")
+    assert not _recovered_by_oracle_decoders(secret, content)
+
+
+def _malformed_name_records(secret: str) -> list[dict]:
+    return [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error", "msg": _MALFORMED_MSG},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "error",
+         "msg": json.dumps(_MALFORMED_MSG)},
+        {"ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "error",
+         "msg": f"token={secret}"},
+    ]
+
+
+def _malformed_executor(make_builtin_executor, tmp_path, secret: str):
+    path = str(tmp_path / "malformed.sqlite")
+    _insert_records(path, _malformed_name_records(secret))
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    return make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+        max_output=1_000_000,
+    )
+
+
+def test_log_detail_malformed_named_escape_is_processed(make_builtin_executor, tmp_path):
+    exc = _malformed_executor(make_builtin_executor, tmp_path, "ab12ba21")
+
+    assert _detail(exc, 1)["record"]["msg"] == _MALFORMED_MSG
+    assert _detail(exc, 2)["record"]["msg"] == json.dumps(_MALFORMED_MSG)
+
+
+def test_log_query_malformed_named_escape_does_not_break_credential_redaction(
+    make_builtin_executor, tmp_path
+):
+    exc = _malformed_executor(make_builtin_executor, tmp_path, "ab12ba21")
+
+    msgs = [r["msg"] for r in _query(exc, level="DEBUG")["records"]]
+
+    assert "token=[REDACTED]" in msgs
+    assert _MALFORMED_MSG in msgs
+    assert not any("ab12ba21" in m for m in msgs)

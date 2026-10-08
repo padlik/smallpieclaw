@@ -528,6 +528,8 @@ def _recoverable(secret: str, text: str, depth: int = 4) -> bool:
         json.loads, _literal, _py_dict_values,
         lambda t: codecs.decode(t, "unicode_escape"),
         unquote, unquote_plus,
+        lambda t: unquote(t, encoding="latin-1"),
+        lambda t: unquote_plus(t, encoding="latin-1"),
     )
     import warnings
 
@@ -731,6 +733,13 @@ def test_short_secret_replaces_a_coincidental_encoded_line():
     assert redact_vault_secrets(text, ["a\n"]) == "[REDACTED]"
 
 
+def _cr_continuation_layer(text: str) -> str:
+    """Quote *text* as a Python literal split by a CRLF or CR line continuation."""
+    middle = len(text) // 2
+    terminator = "\r\n" if len(text) % 2 else "\r"
+    return "'" + text[:middle] + "\\" + terminator + text[middle:] + "'"
+
+
 def _random_mixed_leaf(rng, secret: str) -> str:
     import json
     from urllib.parse import quote, quote_plus
@@ -742,6 +751,8 @@ def _random_mixed_leaf(rng, secret: str) -> str:
         lambda t: quote(t, safe=""),
         lambda t: quote_plus(t),
         lambda t: quote(t, safe="", encoding="latin-1", errors="replace"),
+        lambda t: quote_plus(t, encoding="latin-1", errors="replace"),
+        _cr_continuation_layer,
     )
     text = f"token={secret}"
     for _ in range(rng.randint(1, 5)):
@@ -770,3 +781,151 @@ def test_randomized_python_and_url_layers_never_leave_a_recoverable_credential()
         for text in texts:
             assert not _recoverable(secret, text), (case, secret, leaf, text)
         assert redact_structure(redacted, [secret], preserve_top_level_keys=True) == redacted
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 6: malformed named escapes, CR/CRLF continuations, Latin-1 percent
+# ---------------------------------------------------------------------------
+
+_MALFORMED_NAME = r"ordinary diagnostic \N{\uD800}"
+
+
+def _malformed_name_texts():
+    import json
+
+    return [
+        pytest.param(_MALFORMED_NAME, id="raw"),
+        pytest.param(json.dumps(_MALFORMED_NAME), id="json-layered"),
+        pytest.param(json.dumps({"msg": _MALFORMED_NAME}), id="json-object"),
+    ]
+
+
+@pytest.mark.parametrize("text", _malformed_name_texts())
+def test_malformed_named_escape_does_not_crash_the_redactor(text):
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets(text, ["ab12ba21"]) == text
+
+
+@pytest.mark.parametrize("text", _malformed_name_texts())
+def test_malformed_named_escape_does_not_crash_structure_redaction(text):
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure({"msg": text, "k": "token=ab12ba21"}, ["ab12ba21"])
+
+    assert redacted == {"msg": text, "k": "token=[REDACTED]"}
+
+
+def test_credential_hidden_behind_a_malformed_named_escape_is_still_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = _MALFORMED_NAME + " token=ab12%22ba21"
+
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == "[REDACTED]"
+
+
+@pytest.mark.parametrize("terminator", ["\r\n", "\r", "\n"])
+def test_python_line_continuation_of_any_newline_style_cannot_split_a_secret(terminator):
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "{'token': 'ab12" + "\\" + terminator + "ba21'}"
+
+    assert redact_vault_secrets(text, ["ab12ba21"]) == "[REDACTED]"
+
+
+@pytest.mark.parametrize("terminator", ["\r\n", "\r"])
+def test_cr_continuation_credential_is_not_recoverable_by_literal_eval(terminator):
+    from builtin_tools.text_utils import redact_structure
+
+    text = "{'token': 'ab12" + "\\" + terminator + "ba21'}"
+    assert _recoverable("ab12ba21", text)
+
+    redacted = redact_structure({"msg": text}, ["ab12ba21"])
+
+    assert not _recoverable("ab12ba21", redacted["msg"])
+
+
+def test_honest_text_with_a_trailing_backslash_cr_and_no_needle_is_untouched():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "C:\\dir\\\r\nnext line"
+
+    assert redact_vault_secrets(text, ["ab12ba21"]) == text
+
+
+_LATIN1_SECRET = "p\u00c3\u00a9ssword"
+
+
+def test_latin1_percent_encoding_that_is_also_valid_utf8_is_redacted():
+    from urllib.parse import quote
+
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "token=" + quote(_LATIN1_SECRET, safe="", encoding="latin-1")
+    assert text == "token=p%C3%A9ssword"
+
+    assert redact_vault_secrets(text, [_LATIN1_SECRET]) == "[REDACTED]"
+
+
+def test_latin1_percent_credential_is_not_recoverable_by_latin1_unquote():
+    from urllib.parse import quote
+
+    from builtin_tools.text_utils import redact_structure
+
+    text = "token=" + quote(_LATIN1_SECRET, safe="", encoding="latin-1")
+    assert _recoverable(_LATIN1_SECRET, text)
+
+    redacted = redact_structure({"msg": text}, [_LATIN1_SECRET])
+
+    assert not _recoverable(_LATIN1_SECRET, redacted["msg"])
+
+
+def test_utf8_percent_reading_is_still_redacted_when_latin1_reading_differs():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("token=p%C3%A9ssword", ["p\u00e9ssword"]) == "[REDACTED]"
+
+
+def test_latin1_percent_inside_json_inside_repr_is_redacted():
+    import json
+    from urllib.parse import quote
+
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    inner = "token=" + quote(_LATIN1_SECRET, safe="", encoding="latin-1")
+    layered = repr(json.dumps({"q": inner}))
+
+    assert redact_vault_secrets(layered, [_LATIN1_SECRET]) == "[REDACTED]"
+
+
+def test_latin1_form_encoded_plus_credential_is_redacted():
+    from urllib.parse import quote_plus
+
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    secret = "caf\u00c3\u00a9 au lait"
+    text = "q=" + quote_plus(secret, encoding="latin-1")
+
+    assert redact_vault_secrets(text, [secret]) == "[REDACTED]"
+
+
+def test_honest_utf8_ambiguous_percent_url_is_untouched():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "GET /search?q=caf%C3%A9&lang=fr%2Dfr&x=%E4%B8%AD HTTP/1.1"
+
+    assert redact_vault_secrets(text, [_LATIN1_SECRET]) == text
+
+
+def test_percent_decode_candidates_stay_within_the_state_budget():
+    from builtin_tools.text_utils import MAX_DECODE_STATES, _decodes_to_hit
+
+    text = "q=" + "%C3%A9" * 4 + "&r=" + "%E4%B8%AD" * 4
+    reached: list[str] = []
+
+    def record(layer: str) -> bool:
+        reached.append(layer)
+        return False
+
+    assert _decodes_to_hit(text, record) is False
+    assert len(set(reached)) <= MAX_DECODE_STATES

@@ -227,6 +227,36 @@ class TestProcessorChain:
 
         assert redacted["msg"] == "***REDACTED***"
 
+    @pytest.mark.parametrize("terminator", ["\r\n", "\r"])
+    def test_cr_line_continuation_redacted_at_ingestion(self, terminator):
+        redact = al._make_redactor(frozenset({"ab12ba21"}))
+
+        redacted = redact(
+            None, "info", {"msg": "{'token': 'ab12" + "\\" + terminator + "ba21'}"}
+        )
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_latin1_percent_escape_redacted_at_ingestion(self):
+        secret = "p\u00c3\u00a9ssword"
+        redact = al._make_redactor(frozenset({secret}))
+
+        redacted = redact(None, "info", {"msg": "token=p%C3%A9ssword"})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_malformed_named_escape_does_not_break_ingestion_redaction(self):
+        redact = al._make_redactor(frozenset({"KEYSECRET1"}))
+
+        redacted = redact(
+            None,
+            "info",
+            {"msg": "ordinary diagnostic \\N{\\uD800}", "other": "token=KEYSECRET1"},
+        )
+
+        assert redacted["msg"] == "ordinary diagnostic \\N{\\uD800}"
+        assert redacted["other"] == "token=***REDACTED***"
+
     def test_quoted_secret_absent_from_every_sink_form(self, tmp_path):
         secret = 'pa"ss\\word99'
         escaped = json.dumps(secret)[1:-1]

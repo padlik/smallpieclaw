@@ -64,16 +64,22 @@ _DEEP_RUN = "\\" * 2**MAX_ESCAPE_DEPTH
 
 # Decode passes tried before a still-changing text is declared undecidable and
 # treated as hiding a secret. Each pass strips one escaping layer, so honest
-# text settles in a handful.
+# text settles in a handful. Every decoder only ever keeps a text the same
+# length or shortens it (``+`` -> space preserves length, escapes and ``%XX``
+# runs shrink), so decoding cannot grow or oscillate; this pass cap bounds the
+# length-preserving cases.
 MAX_DECODE_PASSES = 32
 
-# Distinct decoded texts explored before decoding is declared undecidable;
-# honest text reaches a handful, branching adversarial text hits this cap.
+# Distinct decoded texts explored (across all candidate readings) before
+# decoding is declared undecidable; honest text reaches a handful, branching
+# adversarial text hits this cap. Each text spawns at most one candidate per
+# decoder, and the ambiguous percent readings (UTF-8 vs Latin-1, with or
+# without ``+`` as space) contribute at most four distinct ones.
 MAX_DECODE_STATES = 32
 
 _JSON_ESCAPE_RE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))')
 _PYTHON_ESCAPE_RE = re.compile(
-    r"\\(?:(\n)|x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})"
+    r"\\(?:(\r\n|\r|\n)|x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})"
     r"|N\{([^}\n]{1,100})\}|([0-7]{1,3})|([\\'\"abfnrtv]))"
 )
 _PYTHON_SIMPLE_ESCAPES = {
@@ -154,7 +160,8 @@ def _unescape_python_once(text: str) -> str:
 
     Covers what ``repr()`` and the ``unicode_escape`` codec understand:
     ``\\xHH``, ``\\uXXXX``, ``\\UXXXXXXXX``, octal, ``\\N{NAME}``, the single
-    letter and quote escapes and backslash-newline continuation. It is a
+    letter and quote escapes and backslash-newline continuation (LF, CRLF or
+    CR). An unknown or unencodable ``\\N{...}`` name stays literal. It is a
     regular-expression decoder (no ``eval``), works on raw text without valid
     quoting, and leaves malformed or unknown escapes untouched.
     """
@@ -166,7 +173,7 @@ def _unescape_python_once(text: str) -> str:
         if name:
             try:
                 return unicodedata.lookup(name)
-            except KeyError:
+            except (KeyError, UnicodeError):
                 return match.group()
         if octal:
             return chr(int(octal, 8))
@@ -202,25 +209,49 @@ def _unescape_percent_once(text: str) -> str:
     return _PERCENT_RUN_RE.sub(_decode, text)
 
 
+def _unescape_percent_latin1_once(text: str) -> str:
+    """Decode every ``%XX`` run in *text* one layer, reading each byte as Latin-1.
+
+    The alternative reading of :func:`_unescape_percent_once`: a run whose
+    bytes also happen to form valid UTF-8 (``%C3%A9``) is two characters here
+    but one there, and a secret may have been encoded either way.
+    """
+    if "%" not in text:
+        return text
+    return _PERCENT_RUN_RE.sub(
+        lambda match: bytes.fromhex(match.group().replace("%", "")).decode("latin-1"),
+        text,
+    )
+
+
 def _unescape_url_form_once(text: str) -> str:
     """Decode *text* like :func:`_unescape_percent_once`, also reading ``+`` as a space."""
     return _unescape_percent_once(text.replace("+", " "))
+
+
+def _unescape_url_form_latin1_once(text: str) -> str:
+    """Decode *text* like :func:`_unescape_percent_latin1_once`, also reading ``+`` as a space."""
+    return _unescape_percent_latin1_once(text.replace("+", " "))
 
 
 _DECODERS: "tuple[Callable[[str], str], ...]" = (
     _unescape_json_once,
     _unescape_python_once,
     _unescape_percent_once,
+    _unescape_percent_latin1_once,
     _unescape_url_form_once,
+    _unescape_url_form_latin1_once,
 )
 
 
 def _decodes_to_hit(text: str, hit: "Callable[[str], bool]") -> bool:
     """Return True when a decode of *text* satisfies *hit*, or never settles.
 
-    Each level applies every decoder (JSON, Python, percent, form-encoded) to
-    every text reached so far, so any interleaving of the grammars is explored;
-    a text already seen is not revisited. Decoding stops once a level reaches
+    Each level applies every decoder (JSON, Python, percent as UTF-8 and as
+    Latin-1, each also form-encoded) to every text reached so far, so any
+    interleaving of the grammars and any reading of an ambiguous ``%XX`` run is
+    a candidate; a hit in any candidate counts. A text already seen is not
+    revisited. Decoding stops once a level reaches
     nothing new. Fail closed (True) when decoding is still producing new texts
     after :data:`MAX_DECODE_PASSES` levels or has reached
     :data:`MAX_DECODE_STATES` distinct texts: such text cannot be shown clean.
