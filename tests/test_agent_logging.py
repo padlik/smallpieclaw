@@ -205,6 +205,28 @@ class TestProcessorChain:
 
         assert redacted["msg"] == "***REDACTED***"
 
+    def test_python_repr_of_credential_redacted_at_ingestion(self):
+        secret = "abc'def\"ghi"
+        redact = al._make_redactor(frozenset({secret}))
+
+        redacted = redact(None, "info", {"msg": repr({"token": secret})})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_python_hex_escape_redacted_at_ingestion(self):
+        redact = al._make_redactor(frozenset({'ab12"ba21'}))
+
+        redacted = redact(None, "info", {"msg": r"token=ab12\x22ba21"})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_url_percent_escape_redacted_at_ingestion(self):
+        redact = al._make_redactor(frozenset({'ab12"ba21'}))
+
+        redacted = redact(None, "info", {"msg": "token=ab12%22ba21"})
+
+        assert redacted["msg"] == "***REDACTED***"
+
     def test_quoted_secret_absent_from_every_sink_form(self, tmp_path):
         secret = 'pa"ss\\word99'
         escaped = json.dumps(secret)[1:-1]

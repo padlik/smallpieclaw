@@ -838,3 +838,145 @@ def test_log_detail_unicode_escaped_credential_not_recoverable(
         if not isinstance(decoded, str):
             break
         text = decoded
+
+
+# ---------------------------------------------------------------------------
+# Python-repr / Python-escape / URL-percent spellings of a credential
+# ---------------------------------------------------------------------------
+
+_PYTHON_SECRET = "abc'def\"ghi"
+_QUOTE_SECRET = 'ab12"ba21'
+
+
+def _recovered_by_oracle_decoders(secret: str, text: str) -> bool:
+    """Apply the oracle's literal_eval / unicode_escape / unquote decoders to *text*."""
+    import ast
+    import codecs
+    from urllib.parse import unquote
+
+    candidates = [text, unquote(text), codecs.decode(text, "unicode_escape")]
+    try:
+        value = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        value = None
+    if isinstance(value, dict):
+        candidates.extend(str(v) for v in value.values())
+    return any(secret in candidate for candidate in candidates)
+
+
+_ORACLE_CASES = [
+    pytest.param(_PYTHON_SECRET, repr({"token": _PYTHON_SECRET}), id="python-repr"),
+    pytest.param(_QUOTE_SECRET, r"token=ab12\x22ba21", id="python-hex-escape"),
+    pytest.param(_QUOTE_SECRET, "token=ab12%22ba21", id="url-percent"),
+]
+
+
+def _oracle_executor(make_builtin_executor, tmp_path, secret: str, msg: str):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A,
+                            "level": "error", "msg": msg}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    return make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+        max_output=1_000_000,
+    )
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ORACLE_CASES)
+def test_log_detail_python_and_url_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    assert _recovered_by_oracle_decoders(secret, msg)
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    returned = _detail(exc, 1)["record"]["msg"]
+
+    assert not _recovered_by_oracle_decoders(secret, returned)
+    assert secret not in returned
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ORACLE_CASES)
+def test_log_query_python_and_url_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    for filters in ({"level": "DEBUG"}, {"text": "REDACTED"}):
+        payload = _query(exc, **filters)
+        assert payload["records"], filters
+        for record in payload["records"]:
+            assert not _recovered_by_oracle_decoders(secret, record["msg"])
+            assert secret not in record["msg"]
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ORACLE_CASES)
+def test_oversized_dump_python_and_url_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID,
+                            "level": "error", "msg": msg, "err": "E" * 70_000}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(
+            results_dir=str(tmp_path / "results"), log_store_path=path, vault_path=str(vault)
+        ),
+        max_output=1_000_000,
+    )
+
+    payload = _detail(exc, 1)
+
+    assert payload["dumped"] is True
+    artifact = Path(payload["dump_path"]).read_text(encoding="utf-8")
+    assert not _recovered_by_oracle_decoders(secret, json.loads(artifact)["msg"])
+    assert secret not in artifact
+
+
+@pytest.mark.parametrize(
+    ("secret", "printed"),
+    [
+        pytest.param(_QUOTE_SECRET, r"token=ab12\x22ba21", id="python-hex-escape"),
+        pytest.param(_QUOTE_SECRET, "token=ab12%22ba21", id="url-percent"),
+        pytest.param(_PYTHON_SECRET, repr({"token": _PYTHON_SECRET}), id="python-repr"),
+    ],
+)
+def test_shell_artifact_python_and_url_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, monkeypatch, secret, printed
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    exc = make_builtin_executor(
+        max_output=50,
+        data_dir=str(tmp_path),
+        agent_name="testagent",
+        vault_secrets=[secret],
+    )
+    exc.conversation_id = "testconv"
+    script = f"print({printed!r}); print('padding ' * 30)"
+
+    result = exc.execute("shell", {"command": f"python3 -c {json.dumps(script)}"})
+
+    assert result["success"] is True
+    content = Path(result["full_log_path"]).read_text(encoding="utf-8")
+    assert printed.split("=")[0] in content or "[REDACTED]" in content
+    assert not _recovered_by_oracle_decoders(secret, content)
+    assert secret not in content
+
+
+def test_short_secret_is_redacted_by_log_detail(make_builtin_executor, tmp_path):
+    """No read-time minimum length: a two-character vault value is redacted."""
+    exc = _oracle_executor(make_builtin_executor, tmp_path, "ab", "pw=ab ok")
+
+    assert _detail(exc, 1)["record"]["msg"] == "pw=[REDACTED] ok"
+
+
+def test_short_secret_may_replace_a_whole_coincidentally_encoded_line(
+    make_builtin_executor, tmp_path
+):
+    """Accepted tradeoff: an encoded short secret erases the whole line."""
+    exc = _oracle_executor(
+        make_builtin_executor, tmp_path, "a\n", r'diagnostic {"key":"\u0061\n"}'
+    )
+
+    assert _detail(exc, 1)["record"]["msg"] == "[REDACTED]"

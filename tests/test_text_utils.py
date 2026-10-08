@@ -502,3 +502,271 @@ def test_randomized_mixed_spellings_never_leave_a_recoverable_credential():
                 for level in _unescaped_passes(json_level):
                     assert secret not in level, (case, secret, leaf)
         assert redact_structure(redacted, [secret], preserve_top_level_keys=True) == redacted
+
+
+# ---------------------------------------------------------------------------
+# Python escape grammars and URL percent-encoding
+# ---------------------------------------------------------------------------
+
+
+def _recoverable(secret: str, text: str, depth: int = 4) -> bool:
+    """Return True when any chain of common decoders applied to *text* reveals *secret*."""
+    import ast
+    import codecs
+    import json
+    from urllib.parse import unquote, unquote_plus
+
+    def _literal(t: str):
+        value = ast.literal_eval(t)
+        return value if isinstance(value, str) else json.dumps(value)
+
+    def _py_dict_values(t: str):
+        value = ast.literal_eval(t)
+        return " ".join(map(str, value.values())) if isinstance(value, dict) else t
+
+    decoders = (
+        json.loads, _literal, _py_dict_values,
+        lambda t: codecs.decode(t, "unicode_escape"),
+        unquote, unquote_plus,
+    )
+    import warnings
+
+    seen = {text}
+    frontier = [text]
+    for _ in range(depth):
+        nxt = []
+        for current in frontier:
+            if secret in current:
+                return True
+            for decode in decoders:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        decoded = decode(current)
+                except (ValueError, SyntaxError, TypeError, UnicodeError, MemoryError):
+                    continue
+                if isinstance(decoded, str) and decoded not in seen:
+                    seen.add(decoded)
+                    nxt.append(decoded)
+        frontier = nxt
+    return any(secret in t for t in frontier)
+
+
+_PY_SECRET = "abc'def\"ghi"
+_ORACLE_X22_SECRET = 'ab12"ba21'
+
+
+def test_recoverable_helper_detects_the_oracle_shapes():
+    assert _recoverable(_PY_SECRET, repr({"token": _PY_SECRET}))
+    assert _recoverable(_ORACLE_X22_SECRET, r"token=ab12\x22ba21")
+    assert _recoverable(_ORACLE_X22_SECRET, "token=ab12%22ba21")
+
+
+def test_python_repr_of_dict_with_credential_is_not_recoverable():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure({"msg": repr({"token": _PY_SECRET})}, [_PY_SECRET])
+
+    assert not _recoverable(_PY_SECRET, redacted["msg"])
+
+
+def test_python_hex_escape_in_diagnostic_is_not_recoverable():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    redacted = redact_vault_secrets(r"token=ab12\x22ba21", [_ORACLE_X22_SECRET])
+
+    assert not _recoverable(_ORACLE_X22_SECRET, redacted)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [r"ab12\x22ba21", r"ab12\u0022ba21", r"ab12\U00000022ba21", r"ab12\042ba21",
+     r"ab12\N{QUOTATION MARK}ba21", "ab12\\\"ba21", r"ab12\'ba21"],
+)
+def test_every_python_escape_spelling_is_redacted(spelling):
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    secret = "ab12'ba21" if spelling.endswith(r"\'ba21") else _ORACLE_X22_SECRET
+
+    redacted = redact_vault_secrets(f"token={spelling}", [secret])
+
+    assert "[REDACTED]" in redacted
+    assert not _recoverable(secret, redacted)
+
+
+def test_python_line_continuation_cannot_split_a_secret():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("token=ab12\\\nba21", ["ab12ba21"]) == "[REDACTED]"
+
+
+def test_python_repr_of_nested_json_text_is_not_recoverable():
+    import json
+
+    from builtin_tools.text_utils import redact_structure
+
+    inner = json.dumps({"token": _PY_SECRET})
+    redacted = redact_structure({"msg": repr(inner)}, [_PY_SECRET])
+
+    assert not _recoverable(_PY_SECRET, redacted["msg"])
+
+
+def test_json_encoded_text_inside_python_repr_layers_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    layered = repr(_unicode_nest(f"token={_ESC_SECRET}", 2))
+
+    redacted = redact_vault_secrets(layered, [_ESC_SECRET])
+
+    assert not _recoverable(_ESC_SECRET, redacted)
+
+
+def test_url_escaped_credential_is_not_recoverable():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure({"msg": "token=ab12%22ba21"}, [_ORACLE_X22_SECRET])
+
+    assert not _recoverable(_ORACLE_X22_SECRET, redacted["msg"])
+
+
+def test_url_escaped_credential_in_artifact_is_not_recoverable():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    redacted = redact_vault_secrets("GET /x?token=ab12%22ba21 HTTP/1.1", [_ORACLE_X22_SECRET])
+
+    assert redacted == "[REDACTED]"
+
+
+def test_plus_encoded_space_in_url_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("q=correct+horse+battery", ["correct horse battery"]) == "[REDACTED]"
+
+
+def test_percent_encoded_multibyte_credential_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("token=p%C3%A4ss%E4%B8%AD", ["päss中"]) == "[REDACTED]"
+
+
+def test_percent_encoded_latin1_credential_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("token=p%E4ssword", ["pässword"]) == "[REDACTED]"
+
+
+def test_url_encoded_json_escaped_credential_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "token=ab12%5Cu0022ba21"
+
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == "[REDACTED]"
+
+
+def test_json_escaped_url_encoded_credential_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = '"token=ab12\\u0025\\u0032\\u0032ba21"'
+
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == "[REDACTED]"
+
+
+def test_double_url_encoded_credential_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("token=ab12%2522ba21", [_ORACLE_X22_SECRET]) == "[REDACTED]"
+
+
+def test_intermediate_layer_needle_is_not_lost_to_a_later_decoder():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "token=a\\u0025\\u0032\\u0030b"
+
+    assert redact_vault_secrets(text, ["a%20b"]) == "[REDACTED]"
+
+
+def test_honest_url_without_a_needle_is_untouched():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "GET /search?q=hello%20world%21&lang=en%2Dus+x%FF%FE HTTP/1.1"
+
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == text
+
+
+def test_honest_python_repr_without_a_needle_is_untouched():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = repr({"path": "C:\\temp\\new", "msg": "it's \x00 fine\n"})
+
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == text
+
+
+def test_honest_url_whose_decode_contains_a_needle_is_redacted():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("GET /a%2Fsecret%2Fb", ["a/secret/b"]) == "[REDACTED]"
+
+
+def test_mixed_decoder_layers_beyond_budget_fail_closed():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "harmless"
+    for _ in range(40):
+        text = text.replace("%", "%25").replace("h", "%68")
+
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET]) == "[REDACTED]"
+
+
+def test_short_secret_redacts_an_ordinary_value():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("pw=ab", ["ab"]) == "pw=[REDACTED]"
+
+
+def test_short_secret_replaces_a_coincidental_encoded_line():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = r'diagnostic {"key":"\u0061\n"}'
+
+    assert redact_vault_secrets(text, ["a\n"]) == "[REDACTED]"
+
+
+def _random_mixed_leaf(rng, secret: str) -> str:
+    import json
+    from urllib.parse import quote, quote_plus
+
+    layers = (
+        repr,
+        json.dumps,
+        _unicode_layer,
+        lambda t: quote(t, safe=""),
+        lambda t: quote_plus(t),
+        lambda t: quote(t, safe="", encoding="latin-1", errors="replace"),
+    )
+    text = f"token={secret}"
+    for _ in range(rng.randint(1, 5)):
+        text = rng.choice(layers)(text)
+    if rng.random() < 0.3:
+        text = f"GET /x?{text} HTTP/1.1"
+    return text
+
+
+def test_randomized_python_and_url_layers_never_leave_a_recoverable_credential():
+    import random
+
+    from builtin_tools.text_utils import redact_structure, redact_vault_secrets
+
+    rng = random.Random(20261009)
+    for case in range(300):
+        secret = _random_secret(rng)
+        leaf = _random_mixed_leaf(rng, secret)
+        value = {"msg": leaf, "nested": [{"deep": leaf}], leaf: 1}
+
+        redacted = redact_structure(value, [secret], preserve_top_level_keys=True)
+        artifact = redact_vault_secrets(leaf, [secret])
+
+        texts = [redacted["msg"], redacted["nested"][0]["deep"], artifact]
+        texts += [k for k in redacted if k not in value]
+        for text in texts:
+            assert not _recoverable(secret, text), (case, secret, leaf, text)
+        assert redact_structure(redacted, [secret], preserve_top_level_keys=True) == redacted

@@ -1276,25 +1276,37 @@ def test_many_escape_heavy_secrets_keep_text_search_working(
         assert secret not in json.dumps(payload, ensure_ascii=False)
 
 
-def test_text_search_builds_redaction_needles_once_per_query(
+def test_text_search_expands_each_secret_once_then_reuses_the_result(
     make_builtin_executor, tmp_path, monkeypatch
 ):
+    import uuid
+
     from builtin_tools import text_utils
 
-    secrets = [f'k{i}"\\x{i}yz' for i in range(8)]
-    vault = "".join(f's{i} = {json.dumps(s)}\n' for i, s in enumerate(secrets))
+    token = uuid.uuid4().hex
+    secrets = [f'k{i}"\\{token}yz' for i in range(8)]
+    vault = "".join(f"s{i} = {json.dumps(s)}\n" for i, s in enumerate(secrets))
     records = [
         {"ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A, "level": "info",
          "msg": f"boom {i}"}
         for i in range(40)
     ]
+    records[0]["msg"] = f"boom credential {secrets[0]}"
     exc = _redacting_executor(make_builtin_executor, tmp_path, records, vault)
-    text_utils._build_needles.cache_clear()
-    calls = []
+    expansions: list[str] = []
     real = text_utils._escape_forms
     monkeypatch.setattr(
-        text_utils, "_escape_forms", lambda *a: calls.append(a) or real(*a)
+        text_utils, "_escape_forms", lambda secret, depth: expansions.append(secret) or real(secret, depth)
     )
 
-    assert _query(exc, text="boom")["total_matched"] == 40
-    assert len(calls) <= len(secrets)
+    cold = _query(exc, text="boom")
+
+    assert cold["total_matched"] == 40
+    assert secrets[0] not in json.dumps(cold, ensure_ascii=False)
+    assert sorted(expansions) == sorted(secrets)
+
+    expansions.clear()
+    warmed = _query(exc, text="boom")
+
+    assert warmed["total_matched"] == 40
+    assert expansions == []

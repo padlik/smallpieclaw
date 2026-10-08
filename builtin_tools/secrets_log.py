@@ -562,6 +562,10 @@ class LogQueryTools:
         except (OSError, ConfigError) as exc:
             logger.warning("log_detail: cannot re-read vault for redaction: %s", exc)
             return secrets_list
+        # Deliberate: every non-empty vault string is redacted, with no minimum
+        # length (ingestion uses _MIN_REDACTION_LEN; read time must not). A very
+        # short value can therefore replace a whole line that merely decodes to
+        # it; that over-redaction is an accepted, conservative tradeoff.
         secrets_list.extend(v for v in vault.values() if isinstance(v, str) and v)
         return secrets_list
 

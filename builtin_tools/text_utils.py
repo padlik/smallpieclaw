@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from functools import lru_cache
 from typing import Any, Callable, Iterable, Iterator
 
@@ -66,7 +67,22 @@ _DEEP_RUN = "\\" * 2**MAX_ESCAPE_DEPTH
 # text settles in a handful.
 MAX_DECODE_PASSES = 32
 
+# Distinct decoded texts explored before decoding is declared undecidable;
+# honest text reaches a handful, branching adversarial text hits this cap.
+MAX_DECODE_STATES = 32
+
 _JSON_ESCAPE_RE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))')
+_PYTHON_ESCAPE_RE = re.compile(
+    r"\\(?:(\n)|x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})"
+    r"|N\{([^}\n]{1,100})\}|([0-7]{1,3})|([\\'\"abfnrtv]))"
+)
+_PYTHON_SIMPLE_ESCAPES = {
+    "\\": "\\", "'": "'", '"': '"', "a": "\a", "b": "\b", "f": "\f",
+    "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+}
+_MAX_CODEPOINT = 0x10FFFF
+_PERCENT_RUN_RE = re.compile(r"(?:%[0-9a-fA-F]{2})+")
+_ENCODING_MARKER_RE = re.compile(r"[\\%+]")
 _SURROGATE_PAIR_RE = re.compile("[\ud800-\udbff][\udc00-\udfff]")
 _SIMPLE_ESCAPES = {
     '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
@@ -133,20 +149,102 @@ def _unescape_json_once(text: str) -> str:
     )
 
 
-def _decodes_to_hit(text: str, hit: "Callable[[str], bool]") -> bool:
-    """Return True when a decode layer of *text* satisfies *hit*, or never settles.
+def _unescape_python_once(text: str) -> str:
+    """Decode every Python string escape in *text* one layer, never growing it.
 
-    Decoding stops once a pass changes nothing. A text still changing after
-    :data:`MAX_DECODE_PASSES` passes cannot be shown clean, so it fails closed.
+    Covers what ``repr()`` and the ``unicode_escape`` codec understand:
+    ``\\xHH``, ``\\uXXXX``, ``\\UXXXXXXXX``, octal, ``\\N{NAME}``, the single
+    letter and quote escapes and backslash-newline continuation. It is a
+    regular-expression decoder (no ``eval``), works on raw text without valid
+    quoting, and leaves malformed or unknown escapes untouched.
     """
+
+    def _decode(match: "re.Match[str]") -> str:
+        newline, hex2, hex4, hex8, name, octal, simple = match.groups()
+        if newline:
+            return ""
+        if name:
+            try:
+                return unicodedata.lookup(name)
+            except KeyError:
+                return match.group()
+        if octal:
+            return chr(int(octal, 8))
+        if simple:
+            return _PYTHON_SIMPLE_ESCAPES[simple]
+        code = int(hex2 or hex4 or hex8, 16)
+        return chr(code) if code <= _MAX_CODEPOINT else match.group()
+
+    decoded = _PYTHON_ESCAPE_RE.sub(_decode, text)
+    return _SURROGATE_PAIR_RE.sub(
+        lambda m: chr(0x10000 + ((ord(m.group()[0]) - 0xD800) << 10) + ord(m.group()[1]) - 0xDC00),
+        decoded,
+    )
+
+
+def _unescape_percent_once(text: str) -> str:
+    """Decode every ``%XX`` run in *text* one layer (RFC 3986), never growing it.
+
+    Each run of percent-escapes is decoded as UTF-8; bytes that are not valid
+    UTF-8 fall back to Latin-1, so both common URL encodings are recovered.
+    Malformed escapes (``%zz``, a trailing ``%``) are left untouched.
+    """
+    if "%" not in text:
+        return text
+
+    def _decode(match: "re.Match[str]") -> str:
+        raw = bytes.fromhex(match.group().replace("%", ""))
+        decoded = raw.decode("utf-8", "surrogateescape")
+        return "".join(
+            chr(ord(c) - 0xDC00) if "\udc80" <= c <= "\udcff" else c for c in decoded
+        )
+
+    return _PERCENT_RUN_RE.sub(_decode, text)
+
+
+def _unescape_url_form_once(text: str) -> str:
+    """Decode *text* like :func:`_unescape_percent_once`, also reading ``+`` as a space."""
+    return _unescape_percent_once(text.replace("+", " "))
+
+
+_DECODERS: "tuple[Callable[[str], str], ...]" = (
+    _unescape_json_once,
+    _unescape_python_once,
+    _unescape_percent_once,
+    _unescape_url_form_once,
+)
+
+
+def _decodes_to_hit(text: str, hit: "Callable[[str], bool]") -> bool:
+    """Return True when a decode of *text* satisfies *hit*, or never settles.
+
+    Each level applies every decoder (JSON, Python, percent, form-encoded) to
+    every text reached so far, so any interleaving of the grammars is explored;
+    a text already seen is not revisited. Decoding stops once a level reaches
+    nothing new. Fail closed (True) when decoding is still producing new texts
+    after :data:`MAX_DECODE_PASSES` levels or has reached
+    :data:`MAX_DECODE_STATES` distinct texts: such text cannot be shown clean.
+    """
+    seen = {(len(text), hash(text))}
+    frontier = [text]
     for _ in range(MAX_DECODE_PASSES):
-        decoded = _unescape_json_once(text)
-        if decoded == text:
+        reached: list[str] = []
+        for current in frontier:
+            for decode in _DECODERS:
+                decoded = decode(current)
+                key = (len(decoded), hash(decoded))
+                if key in seen:
+                    continue
+                if hit(decoded):
+                    return True
+                seen.add(key)
+                reached.append(decoded)
+        if not reached:
             return False
-        if hit(decoded):
+        if len(seen) > MAX_DECODE_STATES:
             return True
-        text = decoded
-    return _unescape_json_once(text) != text
+        frontier = reached
+    return True
 
 
 @lru_cache(maxsize=64)
@@ -190,8 +288,9 @@ def _redact_string(text: str, needles: tuple[str, ...], placeholder: str) -> str
     """Redact *text* by literal match, then fail closed on anything that decodes to a secret.
 
     1. Every needle occurrence outside a placeholder token is replaced in place.
-    2. If the remainder still holds a backslash, it is JSON-unescaped layer by
-       layer (:func:`_unescape_json_once`); a layer containing a needle, or
+    2. If the remainder holds a backslash, ``%`` or ``+``, it is decoded layer
+       by layer (:func:`_decodes_to_hit`: JSON escapes, Python escapes, URL
+       percent-encoding, in any interleaving); a layer containing a needle, or
        decoding that does not settle within :data:`MAX_DECODE_PASSES`, marks
        the text suspicious. Suspicious *lines* are replaced whole by
        *placeholder* (an encoded secret never spans a raw newline); if the
@@ -211,7 +310,7 @@ def _redact_string(text: str, needles: tuple[str, ...], placeholder: str) -> str
     redacted = "".join(out)
 
     def suspicious(candidate: str) -> bool:
-        if "\\" not in candidate:
+        if _ENCODING_MARKER_RE.search(candidate) is None:
             return False
         if escape_sensitive and _DEEP_RUN in candidate:
             return True
