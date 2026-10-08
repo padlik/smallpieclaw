@@ -265,6 +265,22 @@ class TestProcessorChain:
 
         assert redacted["msg"] == "***REDACTED***"
 
+    @pytest.mark.parametrize(
+        ("secret", "msg"),
+        [
+            ("prefix\ufffd\ufffdsuffix", "token=prefix%C0%AFsuffix"),
+            ("prefix\ufffdsuffix", "token=prefix%FFsuffix"),
+            ("prefix\ufffd\ufffd\ufffdsuffix", "token=prefix%ED%A0%80suffix"),
+            ("prefix\ufffd\ufffd\ufffd\ufffdsuffix", "token=prefix%F4%90%80%80suffix"),
+        ],
+    )
+    def test_replacement_reading_of_invalid_utf8_percent_redacted_at_ingestion(self, secret, msg):
+        redact = al._make_redactor(frozenset({secret}))
+
+        redacted = redact(None, "info", {"msg": msg})
+
+        assert redacted["msg"] == "***REDACTED***"
+
     def test_quoted_secret_absent_from_every_sink_form(self, tmp_path):
         secret = 'pa"ss\\word99'
         escaped = json.dumps(secret)[1:-1]

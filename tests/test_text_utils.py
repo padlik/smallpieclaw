@@ -1125,19 +1125,53 @@ def test_state_cap_fails_closed_when_one_more_distinct_text_would_be_admitted(mo
     assert text_utils.redact_vault_secrets(_chain_text(7), ["zzzz"]) == "[REDACTED]"
 
 
-def test_state_cap_never_generates_texts_beyond_the_budget(monkeypatch):
+def _count_construction_and_examination(monkeypatch, text: str) -> tuple[int, int, bool]:
+    """Run the search at cap 6; return (distinct candidates constructed, examined, verdict)."""
     from builtin_tools import text_utils
 
     monkeypatch.setattr(text_utils, "MAX_DECODE_STATES", 6)
-    text = "q=" + "-".join(["a%C3%A9"] * 6)
-    seen: set[str] = {text}
+    constructed: set[str] = set()
+    examined: set[str] = set()
+    original = text_utils._decode_candidates
+
+    def counting(current, relevant):
+        for candidate in original(current, relevant):
+            constructed.add(candidate)
+            yield candidate
 
     def record(layer: str) -> bool:
-        seen.add(layer)
+        examined.add(layer)
         return False
 
-    assert text_utils._decodes_to_hit(text, record) is True
-    assert len(seen) <= 6
+    monkeypatch.setattr(text_utils, "_decode_candidates", counting)
+    verdict = text_utils._decodes_to_hit(text, record)
+    return len(constructed | {text}), len(examined | {text}), verdict
+
+
+def test_settling_search_admits_and_examines_exactly_the_budget(monkeypatch):
+    constructed, examined, verdict = _count_construction_and_examination(
+        monkeypatch, _chain_text(6)
+    )
+
+    assert (constructed, examined, verdict) == (6, 6, False)
+
+
+def test_overflow_candidate_is_constructed_then_discarded_unexamined(monkeypatch):
+    constructed, examined, verdict = _count_construction_and_examination(
+        monkeypatch, _chain_text(7)
+    )
+
+    assert (constructed, examined, verdict) == (7, 6, True)
+
+
+def test_branching_readings_stop_at_the_budget_with_one_overflow_candidate(monkeypatch):
+    constructed, examined, verdict = _count_construction_and_examination(
+        monkeypatch, "q=" + "-".join(["a%C3%A9"] * 6)
+    )
+
+    assert verdict is True
+    assert examined <= 6
+    assert constructed <= examined + 1
 
 
 def test_oracle_thirty_two_state_input_settles_at_exactly_the_budget():
@@ -1212,3 +1246,93 @@ def test_mixed_readings_inside_one_adjacent_percent_run_are_redacted():
     assert unquote("%C3%A9") + unquote("%C3%A9", encoding="latin-1") == secret
 
     assert redact_vault_secrets(text, [secret]) == "[REDACTED]"
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 8: invalid UTF-8 percent bytes and the U+FFFD replacement reading
+# ---------------------------------------------------------------------------
+
+_REPLACEMENT_CASES = [
+    pytest.param("prefix%C0%AFsuffix", 2, id="overlong-C0AF"),
+    pytest.param("prefix%FFsuffix", 1, id="byte-FF"),
+    pytest.param("prefix%ED%A0%80suffix", 3, id="surrogate-bytes"),
+    pytest.param("prefix%F4%90%80%80suffix", 4, id="out-of-range"),
+]
+
+
+def _replacement_secret(encoded: str) -> str:
+    from urllib.parse import unquote
+
+    return unquote(encoded)
+
+
+@pytest.mark.parametrize(("encoded", "replacements"), _REPLACEMENT_CASES)
+def test_default_unquote_replacement_reading_of_invalid_utf8_is_redacted(encoded, replacements):
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    secret = _replacement_secret(encoded)
+    assert secret == "prefix" + "\ufffd" * replacements + "suffix"
+    text = "token=" + encoded
+
+    assert redact_vault_secrets(text, [secret]) == "[REDACTED]"
+
+
+@pytest.mark.parametrize(("encoded", "replacements"), _REPLACEMENT_CASES)
+def test_replacement_reading_credential_is_not_recoverable_from_structure(encoded, replacements):
+    from builtin_tools.text_utils import redact_structure
+
+    secret = _replacement_secret(encoded)
+    text = "token=" + encoded
+    assert _recoverable(secret, text)
+
+    redacted = redact_structure({"msg": text}, [secret])
+
+    assert not _recoverable(secret, redacted["msg"])
+
+
+def test_malformed_percent_bytes_pass_through_when_no_secret_has_a_replacement_character():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "GET /x?a=%C0%AF&b=%FF&c=%ED%A0%80&d=%F4%90%80%80 HTTP/1.1"
+
+    assert redact_vault_secrets(text, [_ORACLE_X22_SECRET, "p\u00e9ssword"]) == text
+
+
+def test_invalid_percent_bytes_are_still_read_as_latin1_for_a_latin1_secret():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    assert redact_vault_secrets("token=p%E4ssword", ["p\u00e4ssword"]) == "[REDACTED]"
+
+
+def test_valid_utf8_percent_text_passes_when_a_secret_has_a_replacement_character():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "GET /wiki/%E6%97%A5%E6%9C%AC/caf%C3%A9 HTTP/1.1"
+
+    assert redact_vault_secrets(text, ["prefix\ufffdsuffix"]) == text
+
+
+def test_randomized_malformed_utf8_percent_layers_never_leave_a_recoverable_credential():
+    import random
+    from urllib.parse import quote
+
+    from builtin_tools.text_utils import redact_structure, redact_vault_secrets
+
+    bad = [b"\xc0\xaf", b"\xff", b"\xed\xa0\x80", b"\xf4\x90\x80\x80", b"\xe4", b"\x80"]
+    rng = random.Random(20261011)
+    for case in range(300):
+        pieces = [rng.choice(["ab", "-", "9", "\u00e9"]) for _ in range(rng.randint(1, 3))]
+        raw = b"".join(
+            rng.choice(bad) if rng.random() < 0.5 else p.encode("utf-8") for p in pieces
+        )
+        encoded = "token=" + quote(raw, safe="")
+        secret = "\ufffd".join(["pre", "post"]) if rng.random() < 0.2 else _replacement_secret(encoded)
+        if "\ufffd" not in secret and rng.random() < 0.5:
+            secret = secret.encode("utf-8", "replace").decode("latin-1")
+        leaf = f"GET /x?{encoded} HTTP/1.1" if rng.random() < 0.3 else encoded
+
+        redacted = redact_structure({"msg": leaf}, [secret])["msg"]
+        artifact = redact_vault_secrets(leaf, [secret])
+
+        for out in (redacted, artifact):
+            assert not _recoverable(secret, out), (case, secret, leaf, out)

@@ -1201,3 +1201,91 @@ def test_log_query_honest_multilingual_url_survives_read_time_redaction(
     exc = _oracle_executor(make_builtin_executor, tmp_path, _SPLIT_SECRET, url)
 
     assert _detail(exc, 1)["record"]["msg"] == url
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 8: invalid UTF-8 percent bytes read with U+FFFD replacement
+# ---------------------------------------------------------------------------
+
+_REPLACEMENT_CASES = [
+    pytest.param("prefix\ufffd\ufffdsuffix", "token=prefix%C0%AFsuffix", id="overlong-C0AF"),
+    pytest.param("prefix\ufffdsuffix", "token=prefix%FFsuffix", id="byte-FF"),
+    pytest.param("prefix\ufffd\ufffd\ufffdsuffix", "token=prefix%ED%A0%80suffix", id="surrogate"),
+    pytest.param(
+        "prefix\ufffd\ufffd\ufffd\ufffdsuffix", "token=prefix%F4%90%80%80suffix", id="out-of-range"
+    ),
+]
+
+
+@pytest.mark.parametrize(("secret", "msg"), _REPLACEMENT_CASES)
+def test_log_detail_replacement_reading_not_recoverable(make_builtin_executor, tmp_path, secret, msg):
+    assert _recovered_by_oracle_decoders(secret, msg)
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    returned = _detail(exc, 1)["record"]["msg"]
+
+    assert not _recovered_by_oracle_decoders(secret, returned)
+
+
+@pytest.mark.parametrize(("secret", "msg"), _REPLACEMENT_CASES)
+def test_log_query_replacement_reading_not_recoverable(make_builtin_executor, tmp_path, secret, msg):
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    for filters in ({"level": "DEBUG"}, {"text": "REDACTED"}):
+        payload = _query(exc, **filters)
+        assert payload["records"], filters
+        for record in payload["records"]:
+            assert not _recovered_by_oracle_decoders(secret, record["msg"])
+
+
+@pytest.mark.parametrize(("secret", "msg"), _REPLACEMENT_CASES)
+def test_oversized_dump_replacement_reading_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID,
+                            "level": "error", "msg": msg, "err": "E" * 70_000}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(
+            results_dir=str(tmp_path / "results"), log_store_path=path, vault_path=str(vault)
+        ),
+        max_output=1_000_000,
+    )
+
+    payload = _detail(exc, 1)
+
+    assert payload["dumped"] is True
+    artifact = Path(payload["dump_path"]).read_text(encoding="utf-8")
+    assert not _recovered_by_oracle_decoders(secret, json.loads(artifact)["msg"])
+
+
+@pytest.mark.parametrize(("secret", "msg"), _REPLACEMENT_CASES)
+def test_shell_artifact_replacement_reading_not_recoverable(
+    make_builtin_executor, tmp_path, monkeypatch, secret, msg
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    exc = make_builtin_executor(
+        max_output=50,
+        data_dir=str(tmp_path),
+        agent_name="testagent",
+        vault_secrets=[secret],
+    )
+    exc.conversation_id = "testconv"
+    script = f"print({msg!r}); print('padding ' * 30)"
+
+    result = exc.execute("shell", {"command": f"python3 -c {json.dumps(script)}"})
+
+    assert result["success"] is True
+    content = Path(result["full_log_path"]).read_bytes().decode("utf-8")
+    assert not _recovered_by_oracle_decoders(secret, content)
+
+
+def test_log_detail_malformed_percent_bytes_pass_through_without_a_replacement_secret(
+    make_builtin_executor, tmp_path
+):
+    msg = "GET /x?a=%C0%AF&b=%FF&c=%ED%A0%80 HTTP/1.1"
+    exc = _oracle_executor(make_builtin_executor, tmp_path, "ab12ba21", msg)
+
+    assert _detail(exc, 1)["record"]["msg"] == msg

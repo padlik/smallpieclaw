@@ -71,10 +71,11 @@ _DEEP_RUN = "\\" * 2**MAX_ESCAPE_DEPTH
 # length-preserving cases.
 MAX_DECODE_PASSES = 32
 
-# Distinct decoded texts (the original included) the search may ever hold.
-# Admission fails closed: the moment a new distinct text would be the
-# (MAX_DECODE_STATES + 1)th, the text is declared undecidable, so no more than
-# MAX_DECODE_STATES texts are ever generated or examined; a search that settles
+# Distinct decoded texts (the original included) the search may admit and
+# examine. Admission fails closed: the moment a new distinct text would be the
+# (MAX_DECODE_STATES + 1)th, the text is declared undecidable. Candidates are
+# built lazily, so that one overflow candidate is constructed and then
+# discarded unexamined (never stored, never matched); a search that settles
 # within the cap passes honestly. Honest text reaches a handful of states;
 # branching adversarial text (independent percent-run readings, interleaved
 # grammars) hits this cap.
@@ -192,6 +193,10 @@ def _unescape_python_once(text: str) -> str:
     )
 
 
+class _Undecidable(Exception):
+    """Raised while generating readings that cannot be enumerated safely."""
+
+
 def _utf8_sequence_length(raw: bytes, start: int) -> int:
     """Return the length of the valid multi-byte UTF-8 character at *start*, or 0."""
     for length in (2, 3, 4):
@@ -224,13 +229,23 @@ def _percent_run_slots(
     collapses to the UTF-8 reading when neither can. Percent-decoded non-ASCII
     characters never feed a later decoding layer, so this loses no match while
     keeping honest multilingual URLs to a single reading per character.
+
+    Standard decoders (``urllib.parse.unquote``) turn invalid UTF-8 bytes into
+    U+FFFD, a reading this function does not enumerate. Rather than emulate
+    its byte-grouping rules, a run holding invalid UTF-8 bytes raises
+    :class:`_Undecidable` (fail closed) whenever U+FFFD occurs in *relevant*,
+    i.e. when some secret contains it; otherwise no needle can match that
+    reading and the Latin-1 reading above is complete.
     """
     raw = bytes.fromhex(run.replace("%", ""))
+    replacement_matters = relevant is not None and "\ufffd" in relevant
     slots: list[tuple[str, ...]] = []
     index = 0
     while index < len(raw):
         length = _utf8_sequence_length(raw, index) if raw[index] >= 0x80 else 0
         if length == 0:
+            if replacement_matters and raw[index] >= 0x80:
+                raise _Undecidable
             slots.append((raw[index : index + 1].decode("latin-1"),))
             index += 1
             continue
@@ -296,41 +311,47 @@ def _decodes_to_hit(
     """Return True when a decode of *text* satisfies *hit*, or cannot be shown clean.
 
     Each level applies every decoder (JSON, Python, and URL decoding with each
-    percent run read independently as UTF-8 or Latin-1, ``+`` kept or read as
-    a space) to every text reached so far, so any interleaving of the grammars
-    and any combination of run readings is a candidate; a hit in any candidate
-    counts. A text already seen is not revisited. *relevant*, the characters
-    occurring in any needle, lets URL decoding skip readings that no needle can
-    match (:func:`_percent_run_readings`).
+    multi-byte percent character read independently as UTF-8 or Latin-1, ``+``
+    kept or read as a space) to every text reached so far, so any interleaving
+    of the grammars and any combination of readings is a candidate; a hit in
+    any candidate counts. A text already seen is not revisited. *relevant*, the
+    characters occurring in any needle, lets URL decoding skip readings that no
+    needle can match and makes invalid UTF-8 percent bytes undecidable when a
+    needle contains U+FFFD (:func:`_percent_run_slots`).
 
-    The search holds at most :data:`MAX_DECODE_STATES` distinct texts, the
-    original included. Admission fails closed (True): the moment a new distinct
-    text would exceed that cap it is neither examined nor stored, so the
-    combinations of independent readings are never fully generated. A single
-    text with more than that many candidate readings is likewise undecidable,
-    as is a search still producing new texts after :data:`MAX_DECODE_PASSES`
-    levels. A search that settles within the budget returns False.
+    At most :data:`MAX_DECODE_STATES` distinct texts, the original included,
+    are admitted and examined. Admission fails closed (True): the moment a new
+    distinct text would exceed that cap it is rejected. Candidates are built
+    lazily, so one overflow candidate is constructed and discarded unexamined,
+    but the combinations of independent readings are never fully generated. A
+    single text with more than that many candidate readings is likewise
+    undecidable, as is a search still producing new texts after
+    :data:`MAX_DECODE_PASSES` levels. A search that settles within the budget
+    returns False.
     """
     seen = {(len(text), hash(text))}
     frontier = [text]
-    for _ in range(MAX_DECODE_PASSES):
-        reached: list[str] = []
-        for current in frontier:
-            for index, decoded in enumerate(_decode_candidates(current, relevant)):
-                if index >= MAX_DECODE_STATES:
-                    return True
-                key = (len(decoded), hash(decoded))
-                if key in seen:
-                    continue
-                if len(seen) >= MAX_DECODE_STATES:
-                    return True
-                if hit(decoded):
-                    return True
-                seen.add(key)
-                reached.append(decoded)
-        if not reached:
-            return False
-        frontier = reached
+    try:
+        for _ in range(MAX_DECODE_PASSES):
+            reached: list[str] = []
+            for current in frontier:
+                for index, decoded in enumerate(_decode_candidates(current, relevant)):
+                    if index >= MAX_DECODE_STATES:
+                        return True
+                    key = (len(decoded), hash(decoded))
+                    if key in seen:
+                        continue
+                    if len(seen) >= MAX_DECODE_STATES:
+                        return True
+                    if hit(decoded):
+                        return True
+                    seen.add(key)
+                    reached.append(decoded)
+            if not reached:
+                return False
+            frontier = reached
+    except _Undecidable:
+        return True
     return True
 
 
