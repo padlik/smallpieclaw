@@ -20,7 +20,7 @@ import os
 import re
 import sqlite3
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 import structlog
 
@@ -31,8 +31,8 @@ from builtin_tools.logquery_helpers import (
     _log_query_project,
     _LOG_QUERY_MAX_LIMIT,
 )
-from builtin_tools.text_utils import redact_vault_secrets
-from sqlite_log import connect_store, row_to_record
+from builtin_tools.text_utils import build_redaction_needles, redact_structure
+from sqlite_log import _compact_json, connect_store, row_to_record
 
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
@@ -51,6 +51,39 @@ _SQLITE_INT64_MAX: int = 2**63 - 1
 # as a results-directory path component. Stored content is untrusted; malformed
 # values fall back to the current run's trace context.
 _TRACE_ID_RE = re.compile(r"r-[0-9a-f]{8}")
+
+
+def _scan_text_matches(
+    rows: Iterable[sqlite3.Row],
+    secrets_list: list[str],
+    text_folded: str,
+    before_id: int | None,
+    limit: int,
+) -> tuple[int, list[tuple[int, dict]]]:
+    """Match *rows* (newest id first) against the redacted corpus in one streaming pass.
+
+    Returns the exact number of rows whose vault-redacted, casefolded compact
+    JSON contains *text_folded* and, newest first, only the first *limit* of
+    those below *before_id*. Because the traversal is descending, those are the
+    newest eligible matches, so memory stays bounded by *limit* however many
+    rows match.
+    """
+    count = 0
+    retained: list[tuple[int, dict]] = []
+    for row in rows:
+        redacted = redact_structure(
+            row_to_record(row), secrets_list, preserve_top_level_keys=True
+        )
+        corpus = _compact_json(
+            {k: v for k, v in redacted.items() if k != "id"}
+        ).casefold()
+        if text_folded not in corpus:
+            continue
+        count += 1
+        row_id = row["id"]
+        if len(retained) < limit and (before_id is None or row_id < before_id):
+            retained.append((row_id, redacted))
+    return count, retained
 
 
 class SecretsTools:
@@ -333,19 +366,36 @@ class LogQueryTools:
         )
         where_count, params_count = _log_query_compile_where(count_filters)
 
+        # Read-time pass against the CURRENT vault before projection/truncation
+        # (same two-layer trust model as log_detail): field truncation alone
+        # does not protect a credential shorter than the field cap.
+        secrets_list = self._current_vault_secrets()
+        needles = build_redaction_needles(secrets_list)
+
         try:
-            total_matched = conn.execute(
-                f"SELECT COUNT(*) FROM events WHERE {where_count}", params_count
-            ).fetchone()[0]
-            rows = conn.execute(
-                f"""
-                SELECT * FROM (
-                    SELECT * FROM events WHERE {where}
-                    ORDER BY id DESC LIMIT ?
-                ) ORDER BY id ASC
-                """,
-                params + [limit],
-            ).fetchall()
+            if filters.text_folded and needles:
+                total_matched, records = self._log_query_redacted_text_search(
+                    conn, filters, count_filters, secrets_list, limit, before_id
+                )
+            else:
+                total_matched = conn.execute(
+                    f"SELECT COUNT(*) FROM events WHERE {where_count}", params_count
+                ).fetchone()[0]
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM (
+                        SELECT * FROM events WHERE {where}
+                        ORDER BY id DESC LIMIT ?
+                    ) ORDER BY id ASC
+                    """,
+                    params + [limit],
+                ).fetchall()
+                records = [
+                    redact_structure(
+                        row_to_record(row), secrets_list, preserve_top_level_keys=True
+                    )
+                    for row in rows
+                ]
         except (OSError, sqlite3.Error) as exc:
             logger.warning("log_query: query failed for store %s: %s", path, exc)
             return self._log_query_result([], 0, False)
@@ -355,7 +405,6 @@ class LogQueryTools:
             except sqlite3.Error:
                 pass
 
-        records = [row_to_record(row) for row in rows]
         if before_id is not None:
             for rec in records:
                 rec_id = rec.get("id")
@@ -366,6 +415,51 @@ class LogQueryTools:
                     )
         truncated = total_matched > limit
         return self._log_query_result(records, total_matched, truncated)
+
+    def _log_query_redacted_text_search(
+        self,
+        conn: sqlite3.Connection,
+        filters: LogQueryFilters,
+        count_filters: LogQueryFilters,
+        secrets_list: list[str],
+        limit: int,
+        before_id: int | None,
+    ) -> tuple[int, list[dict]]:
+        """Run a ``text=`` search against the vault-redacted corpus.
+
+        The stored ``search_text`` predates the current vault, and a credential
+        can hide behind any number of JSON string-escape spellings, so no SQL
+        predicate can prove a row untouched by redaction. Every row passing the
+        non-text filters is therefore streamed newest-first through
+        :func:`_scan_text_matches`: redact the record, serialize it compactly,
+        casefold and match. One code path decides every row, so counts, pages
+        and the returned content cannot disagree, and there is no SQL
+        expression whose size grows with the vault.
+
+        ``total_matched`` is exact. The page is the newest ``limit`` matches
+        honouring ``before_id``, so paging is gapless.
+        """
+        base_where, base_params = _log_query_compile_where(
+            LogQueryFilters(
+                trace=count_filters.trace, all_traces=count_filters.all_traces,
+                level=count_filters.level, min_level=count_filters.min_level,
+                event_type=count_filters.event_type, tool=count_filters.tool,
+                since=count_filters.since, prompt_id=count_filters.prompt_id,
+                use_default_view=count_filters.use_default_view,
+            )
+        )
+        total, retained = _scan_text_matches(
+            conn.execute(
+                f"SELECT * FROM events WHERE {base_where} ORDER BY id DESC",
+                base_params,
+            ),
+            secrets_list,
+            filters.text_folded,
+            before_id,
+            limit,
+        )
+        retained.reverse()
+        return total, [rec for _rid, rec in retained]
 
     def _log_query_result(self, records: list, total_matched: int, truncated: bool) -> dict:
         """Render a log_query payload using the peer result-dict convention.
@@ -447,6 +541,34 @@ class LogQueryTools:
             "recoverable": True,
         }
 
+    def _current_vault_secrets(self) -> list[str]:
+        """Return the startup secrets plus string values re-read from the vault file now.
+
+        Best-effort on the vault read: an absent or unreadable vault falls back
+        to the startup list so log_detail never fails because of the vault.
+        """
+        from config_schema import parse_vault_content  # noqa: PLC0415 — import-cycle avoidance
+        from exceptions import ConfigError  # noqa: PLC0415
+
+        secrets_list = list(getattr(self._owner, "_vault_secrets", []) or [])
+        vault_path = getattr(self._owner, "_vault_path", "")
+        if not vault_path:
+            return secrets_list
+        try:
+            with open(vault_path, encoding="utf-8") as fh:
+                vault = parse_vault_content(
+                    fh.read(), vault_path, require_all_strings=False
+                )
+        except (OSError, ConfigError) as exc:
+            logger.warning("log_detail: cannot re-read vault for redaction: %s", exc)
+            return secrets_list
+        # Deliberate: every non-empty vault string is redacted, with no minimum
+        # length (ingestion uses _MIN_REDACTION_LEN; read time must not). A very
+        # short value can therefore replace a whole line that merely decodes to
+        # it; that over-redaction is an accepted, conservative tradeoff.
+        secrets_list.extend(v for v in vault.values() if isinstance(v, str) and v)
+        return secrets_list
+
     def _exec_log_detail(self, args: dict, caller_depth: int = 0, caller_tag: str = "") -> dict:
         """Return one full log record by its store ``id`` at full fidelity.
 
@@ -506,19 +628,24 @@ class LogQueryTools:
         if row is None:
             return self._log_detail_empty()
 
-        record = row_to_record(row)
+        # Trust model (design D5), two layers: (1) structured records are
+        # vault-redacted at ingestion by the shared structlog chain, but that
+        # pass only knows the secrets present at process start, so credentials
+        # logged before being added to the vault slip through; (2) this
+        # read-time pass re-redacts the record against the CURRENT vault (file
+        # re-read plus the startup list) before anything is returned or dumped.
+        # Both the full-fidelity record and the oversized preview/artifact are
+        # derived from the redacted record, so they cannot disagree.
+        secrets_list = self._current_vault_secrets()
+        record = redact_structure(
+            row_to_record(row), secrets_list, preserve_top_level_keys=True
+        )
         # The 65536-char gate measures the compact serialization; the emitted
         # payload uses default (spaced) separators, so a record just under the
         # gate serializes slightly larger in the tool output. The cap is a
         # fidelity threshold, not an output budget.
         serialized = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         if len(serialized) <= _LOG_DETAIL_MAX_CHARS:
-            # Trust model (design D5): structured records are vault-redacted at
-            # ingestion by the shared structlog chain (agent_logging), so the
-            # returned record is not re-redacted here; the oversized-dump path
-            # below re-applies the pass as idempotent defense-in-depth for the
-            # on-disk artifact (the spec anchors that pass: MUST NOT be weaker
-            # than the shell path's).
             return self._log_detail_result(record, dumped=False, dump_path=None)
 
         # Oversized: project a preview, dump the full record to results dir.
@@ -582,10 +709,9 @@ class LogQueryTools:
                 preview, dumped=False, dump_path=None, note=note
             )
 
-        # Redaction pass over the serialized record, via the same shared routine
-        # used by the shell oversized-output path so neither path can drift.
-        secrets_list = getattr(self._owner, "_vault_secrets", []) or []
-        serialized = redact_vault_secrets(serialized, secrets_list)
+        # The artifact is serialized from the structurally redacted record
+        # above; no text-level pass runs over the JSON, which would corrupt
+        # syntax (numbers, quotes) and merge keys for short secrets.
 
         base_path = os.path.join(dest_dir, f"log-detail-{raw_id}.json")
 

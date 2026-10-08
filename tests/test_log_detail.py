@@ -262,6 +262,65 @@ class TestLogDetailOversized:
         assert secret not in dumped_text
         assert "[REDACTED]" in dumped_text
 
+    def test_quoted_secret_absent_from_dump_in_key_and_json_value(
+        self, make_builtin_executor, tmp_path
+    ):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        secret = 'pa"ss\\word99'
+        rec = self._oversized_record(TRACE_VALID)
+        rec["request"] = {secret: 1, "blob": json.dumps({"k": secret})}
+        _insert_records(path, [rec])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(
+                results_dir=results_dir, log_store_path=path, vault_secrets=[secret]
+            ),
+        )
+
+        payload = _detail(exc, 1)
+
+        assert payload["dumped"] is True
+        with open(payload["dump_path"], encoding="utf-8") as fh:
+            dumped_text = fh.read()
+        assert secret not in dumped_text
+        assert json.dumps(secret)[1:-1] not in dumped_text
+
+    @pytest.mark.parametrize(
+        "secrets", [["1"], ['"'], ["id"], ["pid"], ["id", "pid"]]
+    )
+    def test_dump_stays_valid_json_with_schema_keys_for_hostile_secret(
+        self, make_builtin_executor, tmp_path, secrets
+    ):
+        results_dir = str(tmp_path / "results")
+        path = str(tmp_path / "detail.sqlite")
+        rec = self._oversized_record(TRACE_VALID)
+        rec["request"] = {"id": 7, "pid": 8, "note": f"a{secrets[0]}b"}
+        _insert_records(path, [rec])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(
+                results_dir=results_dir, log_store_path=path, vault_secrets=secrets
+            ),
+        )
+
+        payload = _detail(exc, 1)
+
+        assert payload["dumped"] is True
+        with open(payload["dump_path"], encoding="utf-8") as fh:
+            text = fh.read()
+
+        def no_duplicates(pairs):
+            keys = [k for k, _ in pairs]
+            assert len(keys) == len(set(keys)), keys
+            return dict(pairs)
+
+        dumped = json.loads(text, object_pairs_hook=no_duplicates)
+        assert dumped["id"] == 1
+        assert {"trace", "event_type", "err", "request"} <= set(dumped)
+        request_values = list(dumped["request"].values())
+        assert len(request_values) == 3
+        assert 7 in request_values and 8 in request_values
+        assert all(secret not in str(v) for secret in secrets for v in request_values)
+
     def test_dump_permissions_owner_only(self, make_builtin_executor, tmp_path):
         """The dump artifact is 0600 inside a 0700 trace directory (POSIX)."""
         if os.name == "nt":
@@ -518,3 +577,715 @@ class TestLogDetailDescriptorSchema:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestLogDetailReadTimeRedaction:
+    """log_detail redacts against the CURRENT vault, not only the ingestion snapshot."""
+
+    SECRET = "LateAddedCred42"
+
+    def _executor(self, make_builtin_executor, tmp_path, records):
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, records)
+        vault = tmp_path / "vault.toml"
+        vault.write_text(f'late_key = "{self.SECRET}"\n')
+        return make_builtin_executor(
+            paths=ExecutorPaths(
+                results_dir=str(tmp_path / "results"),
+                log_store_path=path,
+                vault_path=str(vault),
+            ),
+        )
+
+    def test_full_fidelity_record_redacted_against_current_vault(
+        self, make_builtin_executor, tmp_path
+    ):
+        rec = {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+               "msg": f"login failed with {self.SECRET}", "err": self.SECRET}
+        exc = self._executor(make_builtin_executor, tmp_path, [rec])
+
+        payload = _detail(exc, 1)
+
+        assert payload["dumped"] is False
+        assert self.SECRET not in json.dumps(payload)
+
+    def test_oversized_preview_redacted_against_current_vault(
+        self, make_builtin_executor, tmp_path
+    ):
+        rec = {"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID, "level": "error",
+               "msg": f"login failed with {self.SECRET}", "err": "E" * 70000}
+        exc = self._executor(make_builtin_executor, tmp_path, [rec])
+
+        payload = _detail(exc, 1)
+
+        assert payload["dumped"] is True
+        assert self.SECRET not in json.dumps(payload)
+        with open(payload["dump_path"], encoding="utf-8") as fh:
+            assert self.SECRET not in fh.read()
+
+    def test_unreadable_vault_falls_back_to_startup_secrets(
+        self, make_builtin_executor, tmp_path
+    ):
+        path = str(tmp_path / "detail.sqlite")
+        _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A,
+                                "level": "error", "msg": f"leak {self.SECRET}"}])
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(
+                log_store_path=path,
+                vault_path=str(tmp_path / "missing.toml"),
+                vault_secrets=[self.SECRET],
+            ),
+        )
+
+        payload = _detail(exc, 1)
+
+        assert self.SECRET not in json.dumps(payload)
+
+
+def _query(exc, **filters) -> dict:
+    """Call log_query through public execute() and parse the payload."""
+    result = exc.execute("log_query", filters)
+    assert result["success"] is True
+    return json.loads(result["output"])
+
+
+class TestLogQueryReadTimeRedaction:
+    """log_query applies the same current-vault structural redaction as log_detail."""
+
+    SECRET = "LateAddedCred42"
+
+    def _records(self) -> list[dict]:
+        return [
+            {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+             "event_type": "TOOL_FAILED", "msg": f"login failed with {self.SECRET}",
+             "err": f"token={self.SECRET}", "request": {"auth": self.SECRET}},
+            {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "error",
+             "event_type": "TOOL_FAILED", "msg": f"retry with {self.SECRET}"},
+        ]
+
+    def _executor(self, make_builtin_executor, tmp_path, vault_text: str):
+        path = str(tmp_path / "query.sqlite")
+        _insert_records(path, self._records())
+        vault = tmp_path / "vault.toml"
+        vault.write_text(vault_text)
+        exc = make_builtin_executor(
+            paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+            max_output=1_000_000,
+        )
+        return exc, vault
+
+    def test_ordinary_query_redacts_current_vault_secret(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc, _ = self._executor(
+            make_builtin_executor, tmp_path, f'late_key = "{self.SECRET}"\n'
+        )
+
+        payload = _query(exc, trace=TRACE_A, level="error")
+
+        assert payload["count"] == 2
+        assert self.SECRET not in json.dumps(payload)
+
+    def test_before_id_pagination_redacts_current_vault_secret(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc, _ = self._executor(
+            make_builtin_executor, tmp_path, f'late_key = "{self.SECRET}"\n'
+        )
+
+        payload = _query(exc, trace="*", before_id=2, level="error")
+
+        assert payload["count"] == 1
+        assert self.SECRET not in json.dumps(payload)
+
+    def test_secret_added_mid_session_is_redacted_on_next_query(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc, vault = self._executor(make_builtin_executor, tmp_path, 'other = "x"\n')
+        assert self.SECRET in json.dumps(_query(exc, trace=TRACE_A, level="error"))
+
+        vault.write_text(f'other = "x"\nlate_key = "{self.SECRET}"\n')
+
+        assert self.SECRET not in json.dumps(_query(exc, trace=TRACE_A, level="error"))
+
+
+class TestReadTimeRedactionKeepsRecordSchema:
+    """Short vault values never rename fixed record keys; nested keys still scrub."""
+
+    def _executor(self, make_builtin_executor, tmp_path, secrets_toml: str, rec: dict):
+        path = str(tmp_path / "schema.sqlite")
+        _insert_records(path, [rec])
+        vault = tmp_path / "vault.toml"
+        vault.write_text(secrets_toml)
+        return make_builtin_executor(
+            paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+            max_output=1_000_000,
+        )
+
+    def _rec(self) -> dict:
+        return {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+                "event_type": "TOOL_END", "tool": "shell", "msg": "ok",
+                "request": {"idsecret": 1}}
+
+    def test_log_detail_preserves_top_level_keys_for_short_secret(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc = self._executor(
+            make_builtin_executor, tmp_path, 'a = "id"\nb = "tool"\n', self._rec()
+        )
+
+        record = _detail(exc, 1)["record"]
+
+        assert record["id"] == 1
+        assert record["tool"] == "shell"
+        assert "[REDACTED]" not in record
+
+    def test_log_query_preserves_top_level_keys_for_short_secret(
+        self, make_builtin_executor, tmp_path
+    ):
+        exc = self._executor(
+            make_builtin_executor, tmp_path, 'a = "id"\nb = "tool"\n', self._rec()
+        )
+
+        record = _query(exc, trace=TRACE_A)["records"][0]
+
+        assert record["id"] == 1
+        assert record["tool"] == "shell"
+        assert "[REDACTED]" not in record
+
+    def test_nested_secret_key_is_still_scrubbed(self, make_builtin_executor, tmp_path):
+        exc = self._executor(
+            make_builtin_executor, tmp_path, 'a = "idsecret"\n', self._rec()
+        )
+
+        record = _detail(exc, 1)["record"]
+
+        assert record["request"] == {"[REDACTED]": 1}
+
+    def test_colliding_nested_keys_are_both_kept_with_suffix(
+        self, make_builtin_executor, tmp_path
+    ):
+        rec = self._rec()
+        rec["request"] = {"secretone": 1, "secrettwo": 2}
+        exc = self._executor(
+            make_builtin_executor, tmp_path,
+            'a = "secretone"\nb = "secrettwo"\n', rec,
+        )
+
+        record = _detail(exc, 1)["record"]
+
+        assert sorted(record["request"].values()) == [1, 2]
+        assert sorted(record["request"]) == ["[REDACTED]", "[REDACTED]_1"]
+
+
+@pytest.mark.parametrize("layers", [2, 3, 7])
+def test_log_detail_nested_json_credential_not_recoverable(
+    make_builtin_executor, tmp_path, layers
+):
+    """A credential serialized into JSON several times is gone at every decode depth."""
+    secret = 'ab12"ba21'
+    leaf = f"token={secret}"
+    for _ in range(layers):
+        leaf = json.dumps(leaf)
+    path = str(tmp_path / "nested.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A,
+                            "level": "error", "msg": leaf}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = '{secret}'\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault))
+    )
+
+    text = _detail(exc, 1)["record"]["msg"]
+
+    for _ in range(16):
+        assert secret not in text
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            break
+        if not isinstance(decoded, str):
+            break
+        text = decoded
+
+
+@pytest.mark.parametrize("layers", [1, 2, 3, 7, 8])
+def test_log_detail_unicode_escaped_credential_not_recoverable(
+    make_builtin_executor, tmp_path, layers
+):
+    """Unicode-escape spellings of quotes/backslashes are caught at every depth."""
+    secret = 'ab12"ba21'
+    leaf = f"token={secret}"
+    for _ in range(layers):
+        leaf = '"' + leaf.replace("\\", "\\u005c").replace('"', "\\u0022") + '"'
+    path = str(tmp_path / "unicode.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A,
+                            "level": "error", "msg": leaf}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = '{secret}'\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault))
+    )
+
+    text = _detail(exc, 1)["record"]["msg"]
+
+    for _ in range(16):
+        assert secret not in text
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            break
+        if not isinstance(decoded, str):
+            break
+        text = decoded
+
+
+# ---------------------------------------------------------------------------
+# Python-repr / Python-escape / URL-percent spellings of a credential
+# ---------------------------------------------------------------------------
+
+_PYTHON_SECRET = "abc'def\"ghi"
+_QUOTE_SECRET = 'ab12"ba21'
+
+
+def _recovered_by_oracle_decoders(secret: str, text: str) -> bool:
+    """Apply the oracle's literal_eval / unicode_escape / unquote decoders to *text*."""
+    import ast
+    import codecs
+    from urllib.parse import unquote
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        unicode_escaped = codecs.decode(text, "unicode_escape")
+    from tests.test_text_utils import _per_run_percent_variants
+
+    candidates = [
+        *_per_run_percent_variants(text),
+        text,
+        unquote(text),
+        unquote(text, encoding="latin-1"),
+        unicode_escaped,
+    ]
+    try:
+        value = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        value = None
+    if isinstance(value, dict):
+        candidates.extend(str(v) for v in value.values())
+    return any(secret in candidate for candidate in candidates)
+
+
+_ORACLE_CASES = [
+    pytest.param(_PYTHON_SECRET, repr({"token": _PYTHON_SECRET}), id="python-repr"),
+    pytest.param(_QUOTE_SECRET, r"token=ab12\x22ba21", id="python-hex-escape"),
+    pytest.param(_QUOTE_SECRET, "token=ab12%22ba21", id="url-percent"),
+]
+
+
+def _oracle_executor(make_builtin_executor, tmp_path, secret: str, msg: str):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A,
+                            "level": "error", "msg": msg}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    return make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+        max_output=1_000_000,
+    )
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ORACLE_CASES)
+def test_log_detail_python_and_url_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    assert _recovered_by_oracle_decoders(secret, msg)
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    returned = _detail(exc, 1)["record"]["msg"]
+
+    assert not _recovered_by_oracle_decoders(secret, returned)
+    assert secret not in returned
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ORACLE_CASES)
+def test_log_query_python_and_url_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    for filters in ({"level": "DEBUG"}, {"text": "REDACTED"}):
+        payload = _query(exc, **filters)
+        assert payload["records"], filters
+        for record in payload["records"]:
+            assert not _recovered_by_oracle_decoders(secret, record["msg"])
+            assert secret not in record["msg"]
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ORACLE_CASES)
+def test_oversized_dump_python_and_url_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID,
+                            "level": "error", "msg": msg, "err": "E" * 70_000}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(
+            results_dir=str(tmp_path / "results"), log_store_path=path, vault_path=str(vault)
+        ),
+        max_output=1_000_000,
+    )
+
+    payload = _detail(exc, 1)
+
+    assert payload["dumped"] is True
+    artifact = Path(payload["dump_path"]).read_text(encoding="utf-8")
+    assert not _recovered_by_oracle_decoders(secret, json.loads(artifact)["msg"])
+    assert secret not in artifact
+
+
+@pytest.mark.parametrize(
+    ("secret", "printed"),
+    [
+        pytest.param(_QUOTE_SECRET, r"token=ab12\x22ba21", id="python-hex-escape"),
+        pytest.param(_QUOTE_SECRET, "token=ab12%22ba21", id="url-percent"),
+        pytest.param(_PYTHON_SECRET, repr({"token": _PYTHON_SECRET}), id="python-repr"),
+    ],
+)
+def test_shell_artifact_python_and_url_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, monkeypatch, secret, printed
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    exc = make_builtin_executor(
+        max_output=50,
+        data_dir=str(tmp_path),
+        agent_name="testagent",
+        vault_secrets=[secret],
+    )
+    exc.conversation_id = "testconv"
+    script = f"print({printed!r}); print('padding ' * 30)"
+
+    result = exc.execute("shell", {"command": f"python3 -c {json.dumps(script)}"})
+
+    assert result["success"] is True
+    content = Path(result["full_log_path"]).read_text(encoding="utf-8")
+    assert printed.split("=")[0] in content or "[REDACTED]" in content
+    assert not _recovered_by_oracle_decoders(secret, content)
+    assert secret not in content
+
+
+def test_short_secret_is_redacted_by_log_detail(make_builtin_executor, tmp_path):
+    """No read-time minimum length: a two-character vault value is redacted."""
+    exc = _oracle_executor(make_builtin_executor, tmp_path, "ab", "pw=ab ok")
+
+    assert _detail(exc, 1)["record"]["msg"] == "pw=[REDACTED] ok"
+
+
+def test_short_secret_may_replace_a_whole_coincidentally_encoded_line(
+    make_builtin_executor, tmp_path
+):
+    """Accepted tradeoff: an encoded short secret erases the whole line."""
+    exc = _oracle_executor(
+        make_builtin_executor, tmp_path, "a\n", r'diagnostic {"key":"\u0061\n"}'
+    )
+
+    assert _detail(exc, 1)["record"]["msg"] == "[REDACTED]"
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 6: CR/CRLF continuations, Latin-1 percent, malformed \N{...}
+# ---------------------------------------------------------------------------
+
+_CR_SECRET = "ab12ba21"
+_LATIN1_SECRET = "p\u00c3\u00a9ssword"
+
+_ROUND6_CASES = [
+    pytest.param(_CR_SECRET, "{'token': 'ab12" + "\\" + "\r\n" + "ba21'}", id="crlf-continuation"),
+    pytest.param(_CR_SECRET, "{'token': 'ab12" + "\\" + "\r" + "ba21'}", id="cr-continuation"),
+    pytest.param(_LATIN1_SECRET, "token=p%C3%A9ssword", id="latin1-percent"),
+]
+_MALFORMED_MSG = r"ordinary diagnostic \N{\uD800}"
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ROUND6_CASES)
+def test_log_detail_round6_spellings_not_recoverable(make_builtin_executor, tmp_path, secret, msg):
+    assert _recovered_by_oracle_decoders(secret, msg)
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    returned = _detail(exc, 1)["record"]["msg"]
+
+    assert not _recovered_by_oracle_decoders(secret, returned)
+    assert secret not in returned
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ROUND6_CASES)
+def test_log_query_round6_spellings_not_recoverable(make_builtin_executor, tmp_path, secret, msg):
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    for filters in ({"level": "DEBUG"}, {"text": "REDACTED"}):
+        payload = _query(exc, **filters)
+        assert payload["records"], filters
+        for record in payload["records"]:
+            assert not _recovered_by_oracle_decoders(secret, record["msg"])
+
+
+@pytest.mark.parametrize(("secret", "msg"), _ROUND6_CASES)
+def test_oversized_dump_round6_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID,
+                            "level": "error", "msg": msg, "err": "E" * 70_000}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(
+            results_dir=str(tmp_path / "results"), log_store_path=path, vault_path=str(vault)
+        ),
+        max_output=1_000_000,
+    )
+
+    payload = _detail(exc, 1)
+
+    assert payload["dumped"] is True
+    artifact = Path(payload["dump_path"]).read_text(encoding="utf-8")
+    assert not _recovered_by_oracle_decoders(secret, json.loads(artifact)["msg"])
+
+
+@pytest.mark.parametrize(
+    ("secret", "printed"),
+    [
+        pytest.param(_LATIN1_SECRET, "token=p%C3%A9ssword", id="latin1-percent"),
+    ],
+)
+def test_shell_artifact_round6_spellings_not_recoverable(
+    make_builtin_executor, tmp_path, monkeypatch, secret, printed
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    exc = make_builtin_executor(
+        max_output=50,
+        data_dir=str(tmp_path),
+        agent_name="testagent",
+        vault_secrets=[secret],
+    )
+    exc.conversation_id = "testconv"
+    script = f"print({printed!r}); print('padding ' * 30)"
+
+    result = exc.execute("shell", {"command": f"python3 -c {json.dumps(script)}"})
+
+    assert result["success"] is True
+    content = Path(result["full_log_path"]).read_bytes().decode("utf-8")
+    assert not _recovered_by_oracle_decoders(secret, content)
+
+
+def _malformed_name_records(secret: str) -> list[dict]:
+    return [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error", "msg": _MALFORMED_MSG},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "error",
+         "msg": json.dumps(_MALFORMED_MSG)},
+        {"ts": "2026-07-05T10:00:02", "trace": TRACE_A, "level": "error",
+         "msg": f"token={secret}"},
+    ]
+
+
+def _malformed_executor(make_builtin_executor, tmp_path, secret: str):
+    path = str(tmp_path / "malformed.sqlite")
+    _insert_records(path, _malformed_name_records(secret))
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    return make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+        max_output=1_000_000,
+    )
+
+
+def test_log_detail_malformed_named_escape_is_processed(make_builtin_executor, tmp_path):
+    exc = _malformed_executor(make_builtin_executor, tmp_path, "ab12ba21")
+
+    assert _detail(exc, 1)["record"]["msg"] == _MALFORMED_MSG
+    assert _detail(exc, 2)["record"]["msg"] == json.dumps(_MALFORMED_MSG)
+
+
+def test_log_query_malformed_named_escape_does_not_break_credential_redaction(
+    make_builtin_executor, tmp_path
+):
+    exc = _malformed_executor(make_builtin_executor, tmp_path, "ab12ba21")
+
+    msgs = [r["msg"] for r in _query(exc, level="DEBUG")["records"]]
+
+    assert "token=[REDACTED]" in msgs
+    assert _MALFORMED_MSG in msgs
+    assert not any("ab12ba21" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 7: independent per-run percent readings
+# ---------------------------------------------------------------------------
+
+_SPLIT_SECRET = "prefix\u00e9-\u00c3\u00a9suffix"
+_SPLIT_MSG = "token=prefix%C3%A9-%C3%A9suffix"
+
+
+def test_log_detail_independent_percent_run_readings_not_recoverable(
+    make_builtin_executor, tmp_path
+):
+    assert _recovered_by_oracle_decoders(_SPLIT_SECRET, _SPLIT_MSG)
+    exc = _oracle_executor(make_builtin_executor, tmp_path, _SPLIT_SECRET, _SPLIT_MSG)
+
+    returned = _detail(exc, 1)["record"]["msg"]
+
+    assert not _recovered_by_oracle_decoders(_SPLIT_SECRET, returned)
+
+
+def test_log_query_independent_percent_run_readings_not_recoverable(
+    make_builtin_executor, tmp_path
+):
+    exc = _oracle_executor(make_builtin_executor, tmp_path, _SPLIT_SECRET, _SPLIT_MSG)
+
+    for filters in ({"level": "DEBUG"}, {"text": "REDACTED"}):
+        payload = _query(exc, **filters)
+        assert payload["records"], filters
+        for record in payload["records"]:
+            assert not _recovered_by_oracle_decoders(_SPLIT_SECRET, record["msg"])
+
+
+def test_oversized_dump_independent_percent_run_readings_not_recoverable(
+    make_builtin_executor, tmp_path
+):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID,
+                            "level": "error", "msg": _SPLIT_MSG, "err": "E" * 70_000}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(_SPLIT_SECRET)}\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(
+            results_dir=str(tmp_path / "results"), log_store_path=path, vault_path=str(vault)
+        ),
+        max_output=1_000_000,
+    )
+
+    payload = _detail(exc, 1)
+
+    assert payload["dumped"] is True
+    artifact = Path(payload["dump_path"]).read_text(encoding="utf-8")
+    assert not _recovered_by_oracle_decoders(_SPLIT_SECRET, json.loads(artifact)["msg"])
+
+
+def test_shell_artifact_independent_percent_run_readings_not_recoverable(
+    make_builtin_executor, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    exc = make_builtin_executor(
+        max_output=50,
+        data_dir=str(tmp_path),
+        agent_name="testagent",
+        vault_secrets=[_SPLIT_SECRET],
+    )
+    exc.conversation_id = "testconv"
+    script = f"print({_SPLIT_MSG!r}); print('padding ' * 30)"
+
+    result = exc.execute("shell", {"command": f"python3 -c {json.dumps(script)}"})
+
+    assert result["success"] is True
+    content = Path(result["full_log_path"]).read_bytes().decode("utf-8")
+    assert not _recovered_by_oracle_decoders(_SPLIT_SECRET, content)
+
+
+def test_log_query_honest_multilingual_url_survives_read_time_redaction(
+    make_builtin_executor, tmp_path
+):
+    url = "GET /wiki/%E6%97%A5%E6%9C%AC%E8%AA%9E/caf%C3%A9?a=%C3%B1o%C3%B1o&b=%E4%B8%AD HTTP/1.1"
+    exc = _oracle_executor(make_builtin_executor, tmp_path, _SPLIT_SECRET, url)
+
+    assert _detail(exc, 1)["record"]["msg"] == url
+
+
+# ---------------------------------------------------------------------------
+# Oracle round 8: invalid UTF-8 percent bytes read with U+FFFD replacement
+# ---------------------------------------------------------------------------
+
+_REPLACEMENT_CASES = [
+    pytest.param("prefix\ufffd\ufffdsuffix", "token=prefix%C0%AFsuffix", id="overlong-C0AF"),
+    pytest.param("prefix\ufffdsuffix", "token=prefix%FFsuffix", id="byte-FF"),
+    pytest.param("prefix\ufffd\ufffd\ufffdsuffix", "token=prefix%ED%A0%80suffix", id="surrogate"),
+    pytest.param(
+        "prefix\ufffd\ufffd\ufffd\ufffdsuffix", "token=prefix%F4%90%80%80suffix", id="out-of-range"
+    ),
+]
+
+
+@pytest.mark.parametrize(("secret", "msg"), _REPLACEMENT_CASES)
+def test_log_detail_replacement_reading_not_recoverable(make_builtin_executor, tmp_path, secret, msg):
+    assert _recovered_by_oracle_decoders(secret, msg)
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    returned = _detail(exc, 1)["record"]["msg"]
+
+    assert not _recovered_by_oracle_decoders(secret, returned)
+
+
+@pytest.mark.parametrize(("secret", "msg"), _REPLACEMENT_CASES)
+def test_log_query_replacement_reading_not_recoverable(make_builtin_executor, tmp_path, secret, msg):
+    exc = _oracle_executor(make_builtin_executor, tmp_path, secret, msg)
+
+    for filters in ({"level": "DEBUG"}, {"text": "REDACTED"}):
+        payload = _query(exc, **filters)
+        assert payload["records"], filters
+        for record in payload["records"]:
+            assert not _recovered_by_oracle_decoders(secret, record["msg"])
+
+
+@pytest.mark.parametrize(("secret", "msg"), _REPLACEMENT_CASES)
+def test_oversized_dump_replacement_reading_not_recoverable(
+    make_builtin_executor, tmp_path, secret, msg
+):
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, [{"ts": "2026-07-05T10:00:00", "trace": TRACE_VALID,
+                            "level": "error", "msg": msg, "err": "E" * 70_000}])
+    vault = tmp_path / "vault.toml"
+    vault.write_text(f"late_key = {json.dumps(secret)}\n")
+    exc = make_builtin_executor(
+        paths=ExecutorPaths(
+            results_dir=str(tmp_path / "results"), log_store_path=path, vault_path=str(vault)
+        ),
+        max_output=1_000_000,
+    )
+
+    payload = _detail(exc, 1)
+
+    assert payload["dumped"] is True
+    artifact = Path(payload["dump_path"]).read_text(encoding="utf-8")
+    assert not _recovered_by_oracle_decoders(secret, json.loads(artifact)["msg"])
+
+
+@pytest.mark.parametrize(("secret", "msg"), _REPLACEMENT_CASES)
+def test_shell_artifact_replacement_reading_not_recoverable(
+    make_builtin_executor, tmp_path, monkeypatch, secret, msg
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    exc = make_builtin_executor(
+        max_output=50,
+        data_dir=str(tmp_path),
+        agent_name="testagent",
+        vault_secrets=[secret],
+    )
+    exc.conversation_id = "testconv"
+    script = f"print({msg!r}); print('padding ' * 30)"
+
+    result = exc.execute("shell", {"command": f"python3 -c {json.dumps(script)}"})
+
+    assert result["success"] is True
+    content = Path(result["full_log_path"]).read_bytes().decode("utf-8")
+    assert not _recovered_by_oracle_decoders(secret, content)
+
+
+def test_log_detail_malformed_percent_bytes_pass_through_without_a_replacement_secret(
+    make_builtin_executor, tmp_path
+):
+    msg = "GET /x?a=%C0%AF&b=%FF&c=%ED%A0%80 HTTP/1.1"
+    exc = _oracle_executor(make_builtin_executor, tmp_path, "ab12ba21", msg)
+
+    assert _detail(exc, 1)["record"]["msg"] == msg

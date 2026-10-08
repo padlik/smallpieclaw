@@ -191,6 +191,119 @@ class TestProcessorChain:
             {"token": "***REDACTED***"},
         )
 
+    def test_dict_key_secret_redacted(self):
+        redact = al._make_redactor(frozenset({"KEYSECRET1"}))
+
+        redacted = redact(None, "info", {"request": {"KEYSECRET1": "v"}})
+
+        assert redacted["request"] == {"***REDACTED***": "v"}
+
+    def test_unicode_escaped_spelling_redacted_at_ingestion(self):
+        redact = al._make_redactor(frozenset({"KEYSECRET1"}))
+
+        redacted = redact(None, "info", {"msg": '"\\u004bEYSECRET1"'})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_python_repr_of_credential_redacted_at_ingestion(self):
+        secret = "abc'def\"ghi"
+        redact = al._make_redactor(frozenset({secret}))
+
+        redacted = redact(None, "info", {"msg": repr({"token": secret})})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_python_hex_escape_redacted_at_ingestion(self):
+        redact = al._make_redactor(frozenset({'ab12"ba21'}))
+
+        redacted = redact(None, "info", {"msg": r"token=ab12\x22ba21"})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_url_percent_escape_redacted_at_ingestion(self):
+        redact = al._make_redactor(frozenset({'ab12"ba21'}))
+
+        redacted = redact(None, "info", {"msg": "token=ab12%22ba21"})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    @pytest.mark.parametrize("terminator", ["\r\n", "\r"])
+    def test_cr_line_continuation_redacted_at_ingestion(self, terminator):
+        redact = al._make_redactor(frozenset({"ab12ba21"}))
+
+        redacted = redact(
+            None, "info", {"msg": "{'token': 'ab12" + "\\" + terminator + "ba21'}"}
+        )
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_latin1_percent_escape_redacted_at_ingestion(self):
+        secret = "p\u00c3\u00a9ssword"
+        redact = al._make_redactor(frozenset({secret}))
+
+        redacted = redact(None, "info", {"msg": "token=p%C3%A9ssword"})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_malformed_named_escape_does_not_break_ingestion_redaction(self):
+        redact = al._make_redactor(frozenset({"KEYSECRET1"}))
+
+        redacted = redact(
+            None,
+            "info",
+            {"msg": "ordinary diagnostic \\N{\\uD800}", "other": "token=KEYSECRET1"},
+        )
+
+        assert redacted["msg"] == "ordinary diagnostic \\N{\\uD800}"
+        assert redacted["other"] == "token=***REDACTED***"
+
+    def test_independent_percent_run_readings_redacted_at_ingestion(self):
+        secret = "prefix\u00e9-\u00c3\u00a9suffix"
+        redact = al._make_redactor(frozenset({secret}))
+
+        redacted = redact(None, "info", {"msg": "token=prefix%C3%A9-%C3%A9suffix"})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    @pytest.mark.parametrize(
+        ("secret", "msg"),
+        [
+            ("prefix\ufffd\ufffdsuffix", "token=prefix%C0%AFsuffix"),
+            ("prefix\ufffdsuffix", "token=prefix%FFsuffix"),
+            ("prefix\ufffd\ufffd\ufffdsuffix", "token=prefix%ED%A0%80suffix"),
+            ("prefix\ufffd\ufffd\ufffd\ufffdsuffix", "token=prefix%F4%90%80%80suffix"),
+        ],
+    )
+    def test_replacement_reading_of_invalid_utf8_percent_redacted_at_ingestion(self, secret, msg):
+        redact = al._make_redactor(frozenset({secret}))
+
+        redacted = redact(None, "info", {"msg": msg})
+
+        assert redacted["msg"] == "***REDACTED***"
+
+    def test_quoted_secret_absent_from_every_sink_form(self, tmp_path):
+        secret = 'pa"ss\\word99'
+        escaped = json.dumps(secret)[1:-1]
+        log_file = str(tmp_path / "agent.log")
+        db_path = al.setup_logging(log_file, secret_values=[secret])
+        al.log_event(
+            al.LogEvent.TOOL_FAILED,
+            "request failed",
+            request={secret: 1, "blob": json.dumps({"k": secret})},
+        )
+        _flush()
+
+        conn = sqlite3.connect(db_path)
+        try:
+            stored = " ".join(
+                str(col) for row in conn.execute("SELECT * FROM events") for col in row
+            )
+        finally:
+            conn.close()
+        raw = stored + _read(log_file)
+        assert secret not in raw
+        assert escaped not in raw
+
     def test_foreign_record_gets_identity(self, tmp_path):
         log_file = str(tmp_path / "agent.log")
         db_path = al.setup_logging(log_file)
@@ -470,3 +583,11 @@ class TestLLMFailedLifecycle:
         llm_failed = [e for e, _ in captured if e == al.LogEvent.LLM_FAILED]
         assert len(llm_failed) == 1
         assert stdlib.error.call_count == 0
+
+
+def test_ingestion_placeholder_is_protected_by_shared_core():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = f"x {al._REDACTION_PLACEHOLDER} REDACTED"
+
+    assert redact_vault_secrets(text, ["REDACTED"]) == f"x {al._REDACTION_PLACEHOLDER} [REDACTED]"

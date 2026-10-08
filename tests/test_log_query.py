@@ -928,3 +928,385 @@ def test_all_result_pages_are_id_ordered(make_builtin_executor, tmp_path):
     p2 = _query(exc, trace=TRACE_A, event_type="TOOL_START", limit=7, before_id=before)
     assert [r["id"] for r in p2["records"]] == sorted(r["id"] for r in p2["records"])
 
+
+
+# ---------------------------------------------------------------------------
+# Read-time redaction of the text= search corpus (no credential oracle)
+# ---------------------------------------------------------------------------
+
+_HEX = "0123456789abcdef"
+
+
+def _redacting_executor(make_builtin_executor, tmp_path, records, secrets_toml):
+    from config_schema import ExecutorPaths
+
+    path = str(tmp_path / "oracle.sqlite")
+    _insert_records(path, records)
+    vault = tmp_path / "vault.toml"
+    vault.write_text(secrets_toml)
+    return make_builtin_executor(
+        paths=ExecutorPaths(log_store_path=path, vault_path=str(vault)),
+        max_output=1_000_000,
+    )
+
+
+def test_adaptive_prefix_attack_cannot_recover_credential(make_builtin_executor, tmp_path):
+    """Extending a text= prefix never matches a credential added to the vault after ingestion."""
+    secret = "ab12ba21"
+    records = [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+         "msg": f"login failed token={secret}"},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "error",
+         "msg": "login failed token=unrelated"},
+    ]
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, records, f'late_key = "{secret}"\n'
+    )
+
+    recovered = ""
+    for _ in range(len(secret)):
+        hits = [
+            c for c in _HEX
+            if _query(exc, text=f"token={recovered}{c}")["total_matched"] > 0
+        ]
+        if len(hits) != 1:
+            break
+        recovered += hits[0]
+
+    assert recovered == ""
+    for end in range(1, len(secret) + 1):
+        payload = _query(exc, text=f"token={secret[:end]}")
+        assert payload["total_matched"] == 0
+        assert payload["count"] == 0
+
+
+def test_redacted_corpus_still_matches_surrounding_text(make_builtin_executor, tmp_path):
+    secret = "ab12ba21"
+    records = [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+                "msg": f"login failed token={secret}"}]
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, records, f'late_key = "{secret}"\n'
+    )
+
+    payload = _query(exc, text="login failed token=[REDACTED]")
+
+    assert payload["total_matched"] == 1
+    assert secret not in json.dumps(payload)
+
+
+def test_text_count_and_paging_are_exact_on_redacted_corpus(make_builtin_executor, tmp_path):
+    secret = "boomsecret99"
+    records = []
+    for i in range(6):
+        records.append({"ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A,
+                        "level": "info", "msg": f"boom clean {i}"})
+        records.append({"ts": f"2026-07-05T11:00:{i:02d}", "trace": TRACE_A,
+                        "level": "info", "msg": f"boom dirty {i} {secret}"})
+    records.append({"ts": "2026-07-05T12:00:00", "trace": TRACE_A, "level": "info",
+                    "msg": f"only the secret {secret}"})
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, records, f'k = "{secret}"\n'
+    )
+
+    first = _query(exc, text="boom", limit=5)
+    ids = [r["id"] for r in first["records"]]
+    pages = [ids]
+    before = min(ids)
+    while True:
+        page = _query(exc, text="boom", limit=5, before_id=before)
+        assert page["total_matched"] == first["total_matched"]
+        if not page["records"]:
+            break
+        pages.append([r["id"] for r in page["records"]])
+        before = min(pages[-1])
+
+    walked = [i for p in pages for i in p]
+    assert first["total_matched"] == 12
+    assert len(walked) == len(set(walked)) == 12
+    assert _query(exc, text="boomsecret99")["total_matched"] == 0
+
+
+def test_text_search_without_vault_secrets_is_unchanged(make_builtin_executor, tmp_path):
+    records = [{"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "info",
+                "msg": "boom visible"}]
+    exc = _redacting_executor(make_builtin_executor, tmp_path, records, 'k = "zzzzzzzz"\n')
+
+    assert _query(exc, text="boom visible")["total_matched"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Nested JSON serialization of a credential (repeated escaping) and bounded
+# retention of dirty matches
+# ---------------------------------------------------------------------------
+
+_ESCAPE_SECRET = 'ab12"ba21'
+_ESCAPE_VAULT = f"late_key = '{_ESCAPE_SECRET}'\n"
+
+
+def _nest(text: str, layers: int) -> str:
+    for _ in range(layers):
+        text = json.dumps(text)
+    return text
+
+
+def _decode_levels(text: str):
+    """Yield *text* and every successive json.loads() layer that stays a string."""
+    for _ in range(16):
+        yield text
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            return
+        if not isinstance(decoded, str):
+            return
+        text = decoded
+
+
+def _nested_records(layers: int) -> list[dict]:
+    return [
+        {"ts": "2026-07-05T10:00:00", "trace": TRACE_A, "level": "error",
+         "msg": _nest(f"token={_ESCAPE_SECRET}", layers)},
+        {"ts": "2026-07-05T10:00:01", "trace": TRACE_A, "level": "error",
+         "msg": "token=unrelated"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("layers", "expected_matches"),
+    [(1, 2), (2, 2), (3, 2), (4, 2), (6, 2), (7, 1)],
+)
+def test_nested_json_credential_not_recoverable_at_any_decode_depth(
+    make_builtin_executor, tmp_path, layers, expected_matches
+):
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, _nested_records(layers), _ESCAPE_VAULT
+    )
+
+    payload = _query(exc, text="token=")
+
+    assert payload["total_matched"] == expected_matches
+    for record in payload["records"]:
+        for level in _decode_levels(record["msg"]):
+            assert _ESCAPE_SECRET not in level
+
+
+@pytest.mark.parametrize("layers", [2, 3, 7])
+def test_nested_json_prefix_probes_match_fully_redacted_corpus(
+    make_builtin_executor, tmp_path, layers
+):
+    real = _redacting_executor(
+        make_builtin_executor, tmp_path, _nested_records(layers), _ESCAPE_VAULT
+    )
+    scrubbed_records = _nested_records(layers)
+    scrubbed_records[0]["msg"] = (
+        _nest("token=[REDACTED]", layers) if layers <= 6 else "[REDACTED]"
+    )
+    scrubbed_dir = tmp_path / "scrubbed"
+    scrubbed_dir.mkdir()
+    scrubbed = _redacting_executor(
+        make_builtin_executor, scrubbed_dir, scrubbed_records, 'k = "zzzzzzzz"\n'
+    )
+
+    probes = [f"token={_ESCAPE_SECRET[:end]}" for end in range(1, len(_ESCAPE_SECRET) + 1)]
+    probes += [f'token={json.dumps(_ESCAPE_SECRET)[1:end + 1]}' for end in range(1, 8)]
+    for probe in probes:
+        got = _query(real, text=probe)
+        expected = _query(scrubbed, text=probe)
+        assert got["total_matched"] == expected["total_matched"] == 0, probe
+        assert got["count"] == expected["count"], probe
+
+
+def test_text_scan_retains_only_newest_limit_records():
+    from builtin_tools.secrets_log import _scan_text_matches
+    from sqlite_log import row_to_record  # noqa: F401  (rows built below)
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_DDL)
+    for i in range(1, 201):
+        conn.execute(
+            "INSERT INTO events (id, ts, level, logger, agent, trace, prompt_id, event_type,"
+            " msg, extra, search_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, *record_to_row(
+                {"ts": f"2026-07-05T10:00:{i % 60:02d}", "level": "info",
+                 "msg": f"boom {i} sekret-value"}
+            )),
+        )
+    rows = conn.execute("SELECT * FROM events ORDER BY id DESC")
+
+    count, retained = _scan_text_matches(rows, ["sekret-value"], "boom", None, 5)
+
+    assert count == 200
+    assert [rid for rid, _rec in retained] == [200, 199, 198, 197, 196]
+
+
+def test_text_scan_before_id_counts_all_but_retains_only_eligible():
+    from builtin_tools.secrets_log import _scan_text_matches
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_DDL)
+    for i in range(1, 51):
+        conn.execute(
+            "INSERT INTO events (id, ts, level, logger, agent, trace, prompt_id, event_type,"
+            " msg, extra, search_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, *record_to_row(
+                {"ts": "2026-07-05T10:00:00", "level": "info", "msg": f"boom {i} sekret-value"}
+            )),
+        )
+    rows = conn.execute("SELECT * FROM events ORDER BY id DESC")
+
+    count, retained = _scan_text_matches(rows, ["sekret-value"], "boom", 20, 3)
+
+    assert count == 50
+    assert [rid for rid, _rec in retained] == [19, 18, 17]
+
+
+def test_handler_bounds_retained_dirty_records_by_limit(
+    make_builtin_executor, tmp_path, monkeypatch
+):
+    from builtin_tools import secrets_log
+
+    secret = "sekret-value"
+    records = [
+        {"ts": f"2026-07-05T10:{i // 60:02d}:{i % 60:02d}", "trace": TRACE_A, "level": "info",
+         "msg": f"boom {i} {secret}"}
+        for i in range(120)
+    ]
+    exc = _redacting_executor(make_builtin_executor, tmp_path, records, f'k = "{secret}"\n')
+    retained_sizes: list[int] = []
+    real_scan = secrets_log._scan_text_matches
+
+    def spy(*args, **kwargs):
+        count, retained = real_scan(*args, **kwargs)
+        retained_sizes.append(len(retained))
+        return count, retained
+
+    monkeypatch.setattr(secrets_log, "_scan_text_matches", spy)
+
+    payload = _query(exc, text="boom", limit=4)
+
+    assert payload["total_matched"] == 120
+    assert payload["count"] == 4
+    assert retained_sizes == [4]
+
+
+# ---------------------------------------------------------------------------
+# Unicode-escaped JSON spellings and many escape-heavy secrets
+# ---------------------------------------------------------------------------
+
+
+def _unicode_nest(text: str, layers: int) -> str:
+    """Nest *text* in JSON string layers spelling quote/backslash as \\uXXXX."""
+    for _ in range(layers):
+        text = '"' + text.replace("\\", "\\u005c").replace('"', "\\u0022") + '"'
+    return text
+
+
+def _unicode_records(layers: int) -> list[dict]:
+    records = _nested_records(layers)
+    records[0]["msg"] = _unicode_nest(f"token={_ESCAPE_SECRET}", layers)
+    return records
+
+
+@pytest.mark.parametrize("layers", [1, 2, 3, 7, 8])
+def test_unicode_escaped_credential_not_recoverable_at_any_decode_depth(
+    make_builtin_executor, tmp_path, layers
+):
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, _unicode_records(layers), _ESCAPE_VAULT
+    )
+
+    payload = _query(exc, text="token=")
+
+    assert payload["total_matched"] == 1
+    for record in payload["records"]:
+        for level in _decode_levels(record["msg"]):
+            assert _ESCAPE_SECRET not in level
+
+
+@pytest.mark.parametrize("layers", [1, 2, 3, 7, 8])
+def test_unicode_escaped_prefix_probes_match_fully_redacted_corpus(
+    make_builtin_executor, tmp_path, layers
+):
+    real = _redacting_executor(
+        make_builtin_executor, tmp_path, _unicode_records(layers), _ESCAPE_VAULT
+    )
+    scrubbed_records = _unicode_records(layers)
+    scrubbed_records[0]["msg"] = "[REDACTED]"
+    scrubbed_dir = tmp_path / "scrubbed"
+    scrubbed_dir.mkdir()
+    scrubbed = _redacting_executor(
+        make_builtin_executor, scrubbed_dir, scrubbed_records, 'k = "zzzzzzzz"\n'
+    )
+
+    probes = [f"token={_ESCAPE_SECRET[:end]}" for end in range(1, len(_ESCAPE_SECRET) + 1)]
+    probes += ["token=a", "token=ab12", 'token=ab12\\u0022', "[REDACTED]"]
+    for probe in probes:
+        got = _query(real, text=probe)
+        expected = _query(scrubbed, text=probe)
+        assert got["total_matched"] == expected["total_matched"], probe
+        assert got["count"] == expected["count"], probe
+
+
+def test_many_escape_heavy_secrets_keep_text_search_working(
+    make_builtin_executor, tmp_path
+):
+    secrets = [f'k{i}"\\é{i}x\ty' for i in range(30)]
+    vault = "".join(
+        f's{i} = "{json.dumps(s)[1:-1]}"\n' for i, s in enumerate(secrets)
+    )
+    records = [
+        {"ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A, "level": "info",
+         "msg": f"boom {i} {secret}"}
+        for i, secret in enumerate(secrets)
+    ]
+    records += [
+        {"ts": f"2026-07-05T11:00:{i:02d}", "trace": TRACE_A, "level": "info",
+         "msg": f"boom clean {i}"}
+        for i in range(5)
+    ]
+    exc = _redacting_executor(make_builtin_executor, tmp_path, records, vault)
+
+    payload = _query(exc, text="boom", limit=100)
+
+    assert payload["total_matched"] == 35
+    assert payload["count"] == 35
+    for secret in secrets:
+        assert secret not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_text_search_expands_each_secret_once_then_reuses_the_result(
+    make_builtin_executor, tmp_path, monkeypatch
+):
+    import uuid
+
+    from builtin_tools import text_utils
+
+    token = uuid.uuid4().hex
+    secrets = [f'k{i}"\\{token}yz' for i in range(8)]
+    vault = "".join(f"s{i} = {json.dumps(s)}\n" for i, s in enumerate(secrets))
+    records = [
+        {"ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A, "level": "info",
+         "msg": f"boom {i}"}
+        for i in range(40)
+    ]
+    records[0]["msg"] = f"boom credential {secrets[0]}"
+    exc = _redacting_executor(make_builtin_executor, tmp_path, records, vault)
+    expansions: list[str] = []
+    real = text_utils._escape_forms
+    monkeypatch.setattr(
+        text_utils, "_escape_forms", lambda secret, depth: expansions.append(secret) or real(secret, depth)
+    )
+
+    cold = _query(exc, text="boom")
+
+    assert cold["total_matched"] == 40
+    assert secrets[0] not in json.dumps(cold, ensure_ascii=False)
+    assert sorted(expansions) == sorted(secrets)
+
+    expansions.clear()
+    warmed = _query(exc, text="boom")
+
+    assert warmed["total_matched"] == 40
+    assert expansions == []

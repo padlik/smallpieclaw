@@ -214,6 +214,10 @@ class ConfirmationManager:
         self._headless_confirm_events: dict[str, threading.Event] = {}
         self._headless_confirm_results: dict[str, bool] = {}
         self._headless_confirm_cancels: dict[str, threading.Event] = {}
+        # Serializes the waiter's terminal decision (timeout / cancel / consume)
+        # against the signaler's commit (pop, cancel check, on_approved, publish),
+        # so exactly one side owns the transition and result-entry cleanup.
+        self._headless_lock = threading.RLock()
         self.default_headless_timeout: int = 120
 
         # --- Grant ledger (depth-0 owned single ledger) ---
@@ -419,30 +423,47 @@ class ConfirmationManager:
         try:
             prompt_fn(token, tool_name, description, caller_tag)
         except Exception:
-            self._headless_confirm_events.pop(token, None)
-            self._headless_confirm_results.pop(token, None)
+            with self._headless_lock:
+                self._headless_confirm_events.pop(token, None)
+                self._headless_confirm_results.pop(token, None)
             raise
         deadline = time.monotonic() + self.default_headless_timeout
         while True:
-            if cancel_event is not None and cancel_event.is_set():
-                self._headless_confirm_events.pop(token, None)
-                self._headless_confirm_results.pop(token, None)
-                event.set()
-                return False
+            with self._headless_lock:
+                decision = self._headless_terminal_decision(
+                    token, event, cancel_event, deadline
+                )
+            if decision is not None:
+                return decision
+            event.wait(timeout=min(0.05, max(deadline - time.monotonic(), 0.0)))
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._headless_confirm_events.pop(token, None)
-                self._headless_confirm_results.pop(token, None)
-                return False
+    def _headless_terminal_decision(
+        self,
+        token: str,
+        event: threading.Event,
+        cancel_event: Optional[threading.Event],
+        deadline: float,
+    ) -> Optional[bool]:
+        """Return the waiter's final decision, or None to keep waiting.
 
-            if event.wait(timeout=min(0.05, remaining)):
-                if cancel_event is not None and cancel_event.is_set():
-                    self._headless_confirm_events.pop(token, None)
-                    self._headless_confirm_results.pop(token, None)
-                    return False
-                self._headless_confirm_events.pop(token, None)
-                return self._headless_confirm_results.pop(token, False)
+        Caller holds ``_headless_lock``. The signaler commits (event set) only
+        under the same lock, so an already-set event means a committed
+        decision that this waiter consumes — even if the deadline has also
+        passed. Otherwise a cancel or timeout deregisters the token so any
+        later signal returns False without running ``on_approved``. The waiter
+        is the sole owner of result-entry cleanup.
+        """
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        signalled = event.is_set()
+        timed_out = time.monotonic() >= deadline
+        if not (cancelled or signalled or timed_out):
+            return None
+        self._headless_confirm_events.pop(token, None)
+        result = self._headless_confirm_results.pop(token, False)
+        if cancelled:
+            event.set()
+            return False
+        return result if signalled else False
 
     def signal_headless_confirmation(
         self,
@@ -456,20 +477,25 @@ class ConfirmationManager:
         already expired/resolved (double-press / stale button) or the waiting
         child was cancelled. *on_approved* runs only for an approval consumed
         by a live waiter, before the waiter is released, so approval side
-        effects (grant bookkeeping) never outlive a cancelled operation.
+        effects (grant bookkeeping) never outlive a cancelled operation. The
+        whole commit runs under ``_headless_lock``, which the waiter's timeout,
+        cancel and consume decisions also take, so a waiter that already timed
+        out or was cancelled forces a False return without running
+        *on_approved*, and a committed approval is always consumed by its waiter.
         """
-        event = self._headless_confirm_events.pop(token, None)
-        if event is None:
-            return False
-        cancel_event = self._headless_confirm_cancels.get(token)
-        if cancel_event is not None and cancel_event.is_set():
-            # The waiter observes cancellation itself and cleans up its result.
-            return False
-        if approved and on_approved is not None:
-            on_approved()
-        self._headless_confirm_results[token] = approved
-        event.set()
-        return True
+        with self._headless_lock:
+            event = self._headless_confirm_events.pop(token, None)
+            if event is None:
+                return False
+            cancel_event = self._headless_confirm_cancels.get(token)
+            if cancel_event is not None and cancel_event.is_set():
+                # The waiter observes cancellation itself and cleans up its result.
+                return False
+            if approved and on_approved is not None:
+                on_approved()
+            self._headless_confirm_results[token] = approved
+            event.set()
+            return True
 
     # ------------------------------------------------------------------
     # Lifecycle
