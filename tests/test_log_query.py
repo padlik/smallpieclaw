@@ -1116,8 +1116,8 @@ def test_nested_json_prefix_probes_match_fully_redacted_corpus(
         assert got["count"] == expected["count"], probe
 
 
-def test_dirty_scan_retains_only_newest_limit_records():
-    from builtin_tools.secrets_log import _scan_dirty_rows
+def test_text_scan_retains_only_newest_limit_records():
+    from builtin_tools.secrets_log import _scan_text_matches
     from sqlite_log import row_to_record  # noqa: F401  (rows built below)
 
     conn = sqlite3.connect(":memory:")
@@ -1134,14 +1134,14 @@ def test_dirty_scan_retains_only_newest_limit_records():
         )
     rows = conn.execute("SELECT * FROM events ORDER BY id DESC")
 
-    count, retained = _scan_dirty_rows(rows, ["sekret-value"], "boom", None, 5)
+    count, retained = _scan_text_matches(rows, ["sekret-value"], "boom", None, 5)
 
     assert count == 200
     assert [rid for rid, _rec in retained] == [200, 199, 198, 197, 196]
 
 
-def test_dirty_scan_before_id_counts_all_but_retains_only_eligible():
-    from builtin_tools.secrets_log import _scan_dirty_rows
+def test_text_scan_before_id_counts_all_but_retains_only_eligible():
+    from builtin_tools.secrets_log import _scan_text_matches
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -1156,7 +1156,7 @@ def test_dirty_scan_before_id_counts_all_but_retains_only_eligible():
         )
     rows = conn.execute("SELECT * FROM events ORDER BY id DESC")
 
-    count, retained = _scan_dirty_rows(rows, ["sekret-value"], "boom", 20, 3)
+    count, retained = _scan_text_matches(rows, ["sekret-value"], "boom", 20, 3)
 
     assert count == 50
     assert [rid for rid, _rec in retained] == [19, 18, 17]
@@ -1175,17 +1175,126 @@ def test_handler_bounds_retained_dirty_records_by_limit(
     ]
     exc = _redacting_executor(make_builtin_executor, tmp_path, records, f'k = "{secret}"\n')
     retained_sizes: list[int] = []
-    real_scan = secrets_log._scan_dirty_rows
+    real_scan = secrets_log._scan_text_matches
 
     def spy(*args, **kwargs):
         count, retained = real_scan(*args, **kwargs)
         retained_sizes.append(len(retained))
         return count, retained
 
-    monkeypatch.setattr(secrets_log, "_scan_dirty_rows", spy)
+    monkeypatch.setattr(secrets_log, "_scan_text_matches", spy)
 
     payload = _query(exc, text="boom", limit=4)
 
     assert payload["total_matched"] == 120
     assert payload["count"] == 4
     assert retained_sizes == [4]
+
+
+# ---------------------------------------------------------------------------
+# Unicode-escaped JSON spellings and many escape-heavy secrets
+# ---------------------------------------------------------------------------
+
+
+def _unicode_nest(text: str, layers: int) -> str:
+    """Nest *text* in JSON string layers spelling quote/backslash as \\uXXXX."""
+    for _ in range(layers):
+        text = '"' + text.replace("\\", "\\u005c").replace('"', "\\u0022") + '"'
+    return text
+
+
+def _unicode_records(layers: int) -> list[dict]:
+    records = _nested_records(layers)
+    records[0]["msg"] = _unicode_nest(f"token={_ESCAPE_SECRET}", layers)
+    return records
+
+
+@pytest.mark.parametrize("layers", [1, 2, 3, 7, 8])
+def test_unicode_escaped_credential_not_recoverable_at_any_decode_depth(
+    make_builtin_executor, tmp_path, layers
+):
+    exc = _redacting_executor(
+        make_builtin_executor, tmp_path, _unicode_records(layers), _ESCAPE_VAULT
+    )
+
+    payload = _query(exc, text="token=")
+
+    assert payload["total_matched"] == 1
+    for record in payload["records"]:
+        for level in _decode_levels(record["msg"]):
+            assert _ESCAPE_SECRET not in level
+
+
+@pytest.mark.parametrize("layers", [1, 2, 3, 7, 8])
+def test_unicode_escaped_prefix_probes_match_fully_redacted_corpus(
+    make_builtin_executor, tmp_path, layers
+):
+    real = _redacting_executor(
+        make_builtin_executor, tmp_path, _unicode_records(layers), _ESCAPE_VAULT
+    )
+    scrubbed_records = _unicode_records(layers)
+    scrubbed_records[0]["msg"] = "[REDACTED]"
+    scrubbed_dir = tmp_path / "scrubbed"
+    scrubbed_dir.mkdir()
+    scrubbed = _redacting_executor(
+        make_builtin_executor, scrubbed_dir, scrubbed_records, 'k = "zzzzzzzz"\n'
+    )
+
+    probes = [f"token={_ESCAPE_SECRET[:end]}" for end in range(1, len(_ESCAPE_SECRET) + 1)]
+    probes += ["token=a", "token=ab12", 'token=ab12\\u0022', "[REDACTED]"]
+    for probe in probes:
+        got = _query(real, text=probe)
+        expected = _query(scrubbed, text=probe)
+        assert got["total_matched"] == expected["total_matched"], probe
+        assert got["count"] == expected["count"], probe
+
+
+def test_many_escape_heavy_secrets_keep_text_search_working(
+    make_builtin_executor, tmp_path
+):
+    secrets = [f'k{i}"\\é{i}x\ty' for i in range(30)]
+    vault = "".join(
+        f's{i} = "{json.dumps(s)[1:-1]}"\n' for i, s in enumerate(secrets)
+    )
+    records = [
+        {"ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A, "level": "info",
+         "msg": f"boom {i} {secret}"}
+        for i, secret in enumerate(secrets)
+    ]
+    records += [
+        {"ts": f"2026-07-05T11:00:{i:02d}", "trace": TRACE_A, "level": "info",
+         "msg": f"boom clean {i}"}
+        for i in range(5)
+    ]
+    exc = _redacting_executor(make_builtin_executor, tmp_path, records, vault)
+
+    payload = _query(exc, text="boom", limit=100)
+
+    assert payload["total_matched"] == 35
+    assert payload["count"] == 35
+    for secret in secrets:
+        assert secret not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_text_search_builds_redaction_needles_once_per_query(
+    make_builtin_executor, tmp_path, monkeypatch
+):
+    from builtin_tools import text_utils
+
+    secrets = [f'k{i}"\\x{i}yz' for i in range(8)]
+    vault = "".join(f's{i} = {json.dumps(s)}\n' for i, s in enumerate(secrets))
+    records = [
+        {"ts": f"2026-07-05T10:00:{i:02d}", "trace": TRACE_A, "level": "info",
+         "msg": f"boom {i}"}
+        for i in range(40)
+    ]
+    exc = _redacting_executor(make_builtin_executor, tmp_path, records, vault)
+    text_utils._build_needles.cache_clear()
+    calls = []
+    real = text_utils._escape_forms
+    monkeypatch.setattr(
+        text_utils, "_escape_forms", lambda *a: calls.append(a) or real(*a)
+    )
+
+    assert _query(exc, text="boom")["total_matched"] == 40
+    assert len(calls) <= len(secrets)

@@ -31,11 +31,7 @@ from builtin_tools.logquery_helpers import (
     _log_query_project,
     _LOG_QUERY_MAX_LIMIT,
 )
-from builtin_tools.text_utils import (
-    build_detection_probes,
-    build_redaction_needles,
-    redact_structure,
-)
+from builtin_tools.text_utils import build_redaction_needles, redact_structure
 from sqlite_log import _compact_json, connect_store, row_to_record
 
 if TYPE_CHECKING:
@@ -57,7 +53,7 @@ _SQLITE_INT64_MAX: int = 2**63 - 1
 _TRACE_ID_RE = re.compile(r"r-[0-9a-f]{8}")
 
 
-def _scan_dirty_rows(
+def _scan_text_matches(
     rows: Iterable[sqlite3.Row],
     secrets_list: list[str],
     text_folded: str,
@@ -431,24 +427,18 @@ class LogQueryTools:
     ) -> tuple[int, list[dict]]:
         """Run a ``text=`` search against the vault-redacted corpus.
 
-        The stored ``search_text`` predates the current vault, so matching it in
-        SQL would let counts reveal credential prefixes. Rows are split by
-        whether their ``search_text`` contains any detection probe (the
-        casefolded current-vault needles at every JSON-escape depth redaction
-        covers plus one for the serialization layer, and the deep-nesting
-        marker; see :func:`build_detection_probes`):
+        The stored ``search_text`` predates the current vault, and a credential
+        can hide behind any number of JSON string-escape spellings, so no SQL
+        predicate can prove a row untouched by redaction. Every row passing the
+        non-text filters is therefore streamed newest-first through
+        :func:`_scan_text_matches`: redact the record, serialize it compactly,
+        casefold and match. One code path decides every row, so counts, pages
+        and the returned content cannot disagree, and there is no SQL
+        expression whose size grows with the vault.
 
-        * clean rows cannot be altered by redaction, so their stored corpus IS
-          the redacted corpus and the indexed SQL ``instr`` match is exact;
-        * dirty rows are matched in Python against the casefolded compact JSON
-          of the redacted record (``id`` excluded, as at ingestion).
-
-        ``total_matched`` is the exact union count. The page is the newest
-        ``limit`` of the union, honouring ``before_id``, so paging is gapless.
+        ``total_matched`` is exact. The page is the newest ``limit`` matches
+        honouring ``before_id``, so paging is gapless.
         """
-        probes = build_detection_probes(secrets_list)
-        dirty_sql = "(" + " OR ".join("instr(search_text, ?) > 0" for _ in probes) + ")"
-
         base_where, base_params = _log_query_compile_where(
             LogQueryFilters(
                 trace=count_filters.trace, all_traces=count_filters.all_traces,
@@ -458,45 +448,18 @@ class LogQueryTools:
                 use_default_view=count_filters.use_default_view,
             )
         )
-        text_folded = filters.text_folded
-
-        clean_where = f"{base_where} AND NOT {dirty_sql} AND instr(search_text, ?) > 0"
-        clean_params = [*base_params, *probes, text_folded]
-        clean_count = conn.execute(
-            f"SELECT COUNT(*) FROM events WHERE {clean_where}", clean_params
-        ).fetchone()[0]
-
-        anchor = ""
-        anchor_params: list = []
-        if before_id is not None and before_id > 0:
-            anchor, anchor_params = " AND id < ?", [before_id]
-        clean_rows = conn.execute(
-            f"SELECT * FROM events WHERE {clean_where}{anchor} ORDER BY id DESC LIMIT ?",
-            [*clean_params, *anchor_params, limit],
-        ).fetchall()
-
-        dirty_count, dirty_retained = _scan_dirty_rows(
+        total, retained = _scan_text_matches(
             conn.execute(
-                f"SELECT * FROM events WHERE {base_where} AND {dirty_sql} ORDER BY id DESC",
-                [*base_params, *probes],
+                f"SELECT * FROM events WHERE {base_where} ORDER BY id DESC",
+                base_params,
             ),
             secrets_list,
-            text_folded,
+            filters.text_folded,
             before_id,
             limit,
         )
-
-        page = [
-            (row["id"], redact_structure(
-                row_to_record(row), secrets_list, preserve_top_level_keys=True
-            ))
-            for row in clean_rows
-        ]
-        page += dirty_retained
-        page.sort(key=lambda item: item[0], reverse=True)
-        newest = page[:limit]
-        newest.reverse()
-        return clean_count + dirty_count, [rec for _rid, rec in newest]
+        retained.reverse()
+        return total, [rec for _rid, rec in retained]
 
     def _log_query_result(self, records: list, total_matched: int, truncated: bool) -> dict:
         """Render a log_query payload using the peer result-dict convention.

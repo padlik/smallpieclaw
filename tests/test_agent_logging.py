@@ -198,6 +198,13 @@ class TestProcessorChain:
 
         assert redacted["request"] == {"***REDACTED***": "v"}
 
+    def test_unicode_escaped_spelling_redacted_at_ingestion(self):
+        redact = al._make_redactor(frozenset({"KEYSECRET1"}))
+
+        redacted = redact(None, "info", {"msg": '"\\u004bEYSECRET1"'})
+
+        assert redacted["msg"] == "***REDACTED***"
+
     def test_quoted_secret_absent_from_every_sink_form(self, tmp_path):
         secret = 'pa"ss\\word99'
         escaped = json.dumps(secret)[1:-1]

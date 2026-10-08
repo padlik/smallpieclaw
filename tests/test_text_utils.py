@@ -5,6 +5,8 @@ Covers truncation and the shared vault-secret redaction core.
 
 from __future__ import annotations
 
+import pytest
+
 from builtin_tools.text_utils import (
     _truncate_output,
     _truncate_tail,
@@ -255,23 +257,248 @@ def test_fail_closed_replacement_is_idempotent():
     assert redact_structure(once, [_ESC_SECRET]) == once
 
 
-def test_detection_probes_cover_one_layer_deeper_than_redaction():
+# ---------------------------------------------------------------------------
+# Decode-then-match: every valid JSON spelling of a credential is caught
+# ---------------------------------------------------------------------------
+
+
+def _unicode_layer(text: str) -> str:
+    """One JSON string layer spelling backslashes and quotes as \\uXXXX escapes."""
+    return '"' + text.replace("\\", "\\u005c").replace('"', "\\u0022") + '"'
+
+
+def _unicode_nest(text: str, layers: int) -> str:
+    for _ in range(layers):
+        text = _unicode_layer(text)
+    return text
+
+
+def _json_layers(text: str):
+    """Yield *text* and every string reachable by repeated json.loads() decoding."""
     import json
 
-    from builtin_tools.text_utils import MAX_ESCAPE_DEPTH, build_detection_probes
+    for _ in range(64):
+        yield text
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            return
+        if isinstance(decoded, dict):
+            for value in decoded.values():
+                if isinstance(value, str):
+                    yield from _json_layers(value)
+            return
+        if not isinstance(decoded, str):
+            return
+        text = decoded
 
-    leaf = _nest(f"token={_ESC_SECRET}", MAX_ESCAPE_DEPTH)
-    serialized = json.dumps({"msg": leaf}, ensure_ascii=False, separators=(",", ":")).casefold()
 
-    assert any(p in serialized for p in build_detection_probes([_ESC_SECRET]))
+def _unescaped_passes(text: str):
+    """Yield *text* then repeated whole-text JSON-escape decodes until stable."""
+    import re
+
+    simple = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+    def sub(m):
+        return chr(int(m.group(1), 16)) if m.group(1) else simple[m.group(2)]
+
+    pattern = re.compile(r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))')
+    for _ in range(64):
+        yield text
+        decoded = pattern.sub(sub, text)
+        if decoded == text:
+            return
+        text = decoded
 
 
-def test_detection_probes_flag_row_beyond_redaction_coverage():
+@pytest.mark.parametrize("layers", [1, 2, 3, 7, 8])
+def test_unicode_escaped_layers_leave_no_credential_in_structure(layers):
+    from builtin_tools.text_utils import redact_structure
+
+    leaf = _unicode_nest(f"token={_ESC_SECRET}", layers)
+
+    redacted = redact_structure({"msg": leaf}, [_ESC_SECRET], preserve_top_level_keys=True)
+
+    for level in _json_layers(redacted["msg"]):
+        assert _ESC_SECRET not in level
+
+
+@pytest.mark.parametrize("layers", [1, 2, 3, 7, 8])
+def test_unicode_escaped_layers_in_dict_key_leave_no_credential(layers):
+    from builtin_tools.text_utils import redact_structure
+
+    key = _unicode_nest(f"token={_ESC_SECRET}", layers)
+
+    redacted = redact_structure({"outer": {key: 1}}, [_ESC_SECRET])
+
+    (new_key,) = redacted["outer"]
+    for level in _json_layers(new_key):
+        assert _ESC_SECRET not in level
+
+
+def test_unicode_escaped_leaf_is_replaced_whole():
+    from builtin_tools.text_utils import redact_structure
+
+    leaf = _unicode_nest(f"token={_ESC_SECRET}", 2)
+
+    assert redact_structure({"msg": leaf}, [_ESC_SECRET]) == {"msg": "[REDACTED]"}
+
+
+def test_unicode_escape_spelling_of_plain_secret_is_redacted():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure({"msg": "token=\\u0061b12ba21"}, ["ab12ba21"])
+
+    assert redacted == {"msg": "[REDACTED]"}
+
+
+def test_embedded_unicode_escaped_json_fragment_is_redacted():
+    from builtin_tools.text_utils import redact_structure
+
+    msg = 'request failed: {"token": "ab12\\u0022ba21"}'
+
+    redacted = redact_structure({"msg": msg}, [_ESC_SECRET])
+
+    for level in _unescaped_passes(redacted["msg"]):
+        assert _ESC_SECRET not in level
+
+
+def test_unicode_escaped_credential_without_escaping_secret_is_redacted():
+    from builtin_tools.text_utils import redact_structure
+
+    leaf = _unicode_nest("token=plainsecret1", 3)
+
+    redacted = redact_structure({"msg": leaf}, ["plainsecret1"])
+
+    for level in _json_layers(redacted["msg"]):
+        assert "plainsecret1" not in level
+
+
+@pytest.mark.parametrize("layers", [1, 3, 7, 8])
+def test_seven_layer_json_dumps_record_artifact_has_no_recoverable_credential(layers):
     import json
 
-    from builtin_tools.text_utils import MAX_ESCAPE_DEPTH, build_detection_probes
+    from builtin_tools.text_utils import redact_vault_secrets
 
-    leaf = _nest(f"token={_ESC_SECRET}", MAX_ESCAPE_DEPTH + 3)
-    serialized = json.dumps({"msg": leaf}, ensure_ascii=False, separators=(",", ":")).casefold()
+    text = json.dumps({"event": "login", "msg": f"token={_ESC_SECRET}"})
+    for _ in range(layers):
+        text = json.dumps(text)
 
-    assert any(p in serialized for p in build_detection_probes([_ESC_SECRET]))
+    redacted = redact_vault_secrets(text, [_ESC_SECRET])
+
+    for level in _json_layers(redacted):
+        assert _ESC_SECRET not in level
+
+
+@pytest.mark.parametrize("layers", [1, 2, 7, 8])
+def test_unicode_escaped_artifact_has_no_recoverable_credential(layers):
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = _unicode_nest(f"token={_ESC_SECRET}", layers)
+
+    redacted = redact_vault_secrets(text, [_ESC_SECRET])
+
+    for level in _json_layers(redacted):
+        assert _ESC_SECRET not in level
+
+
+def test_decode_budget_exhaustion_fails_closed():
+    from builtin_tools.text_utils import redact_structure
+
+    leaf = _unicode_nest("harmless text", 60)
+
+    assert redact_structure({"msg": leaf}, [_ESC_SECRET]) == {"msg": "[REDACTED]"}
+
+
+def test_clean_nested_text_is_untouched_when_decode_finds_nothing():
+    from builtin_tools.text_utils import redact_structure
+
+    value = {"msg": _unicode_nest("harmless text", 3), "path": "C:\\temp\\new"}
+
+    assert redact_structure(value, [_ESC_SECRET]) == value
+
+
+def test_only_the_offending_line_is_replaced_in_multiline_text():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "first ok\n" + _unicode_layer(f"token={_ESC_SECRET}") + "\nlast ok"
+
+    assert redact_vault_secrets(text, [_ESC_SECRET]) == "first ok\n[REDACTED]\nlast ok"
+
+
+def test_secret_spelled_across_raw_newline_and_escape_replaces_whole_text():
+    from builtin_tools.text_utils import redact_vault_secrets
+
+    text = "keep\nab\n\\u0063d\nkeep"
+
+    redacted = redact_vault_secrets(text, ["ab\ncd"])
+
+    assert redacted == "[REDACTED]"
+
+
+def test_decode_fail_closed_replacement_is_idempotent():
+    from builtin_tools.text_utils import redact_structure
+
+    leaf = _unicode_nest(f"token={_ESC_SECRET}", 7)
+    once = redact_structure({"msg": leaf}, [_ESC_SECRET])
+
+    assert redact_structure(once, [_ESC_SECRET]) == once
+
+
+def test_surrogate_pair_spelling_of_secret_is_redacted():
+    from builtin_tools.text_utils import redact_structure
+
+    redacted = redact_structure({"msg": "pw\\uD83D\\uDE00x"}, ["pw\U0001f600x"])
+
+    assert redacted == {"msg": "[REDACTED]"}
+
+
+def _all_unicode_layer(text: str) -> str:
+    """One JSON string layer spelling every character as \\uXXXX."""
+    units = text.encode("utf-16-be")
+    return '"' + "".join(f"\\u{units[i] << 8 | units[i + 1]:04x}" for i in range(0, len(units), 2)) + '"'
+
+
+def _random_secret(rng) -> str:
+    alphabet = 'abcXYZ0129-_ "\\\u00e9\u4e2d\n\t\U0001f600'
+    return "".join(rng.choice(alphabet) for _ in range(rng.randint(6, 14)))
+
+
+def _random_leaf(rng, secret: str) -> str:
+    import json
+
+    layers = (
+        lambda t: json.dumps(t),
+        lambda t: json.dumps(t, ensure_ascii=False),
+        _unicode_layer,
+        _all_unicode_layer,
+    )
+    text = f"token={secret}"
+    for _ in range(rng.randint(0, 8)):
+        text = rng.choice(layers)(text)
+    if rng.random() < 0.3:
+        text = f"request failed: {text} (retrying)"
+    return text
+
+
+def test_randomized_mixed_spellings_never_leave_a_recoverable_credential():
+    import random
+
+    from builtin_tools.text_utils import redact_structure, redact_vault_secrets
+
+    rng = random.Random(20261008)
+    for case in range(300):
+        secret = _random_secret(rng)
+        leaf = _random_leaf(rng, secret)
+        value = {"msg": leaf, "nested": [{"deep": leaf}], leaf: 1}
+
+        redacted = redact_structure(value, [secret], preserve_top_level_keys=True)
+        artifact = redact_vault_secrets(leaf, [secret])
+
+        texts = [redacted["msg"], redacted["nested"][0]["deep"], artifact]
+        texts += [k for k in redacted if k not in value]
+        for text in texts:
+            for json_level in _json_layers(text):
+                for level in _unescaped_passes(json_level):
+                    assert secret not in level, (case, secret, leaf)
+        assert redact_structure(redacted, [secret], preserve_top_level_keys=True) == redacted

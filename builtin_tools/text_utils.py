@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from functools import lru_cache
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 
 def _truncate_output(text: str, limit: int) -> str:
@@ -50,14 +50,27 @@ _REDACTED_PLACEHOLDER = "[REDACTED]"
 _PROTECTED_PLACEHOLDERS = (_REDACTED_PLACEHOLDER, "***REDACTED***")
 
 
-# A secret nested in N layers of JSON string serialization appears as its
-# N-times-escaped form. Redaction covers every form up to this depth; any
-# deeper nesting is refused whole (see ``_exceeds_escape_coverage``).
+# Surgical redaction covers a secret's literal form and its JSON-escaped forms
+# up to this many serialization layers (both ``json.dumps`` flavours), so
+# ordinary nested records keep their surrounding text. It is a convenience, not
+# the safety net: whatever it misses (other \\uXXXX spellings, deeper layers) is
+# caught by the decode check below.
 MAX_ESCAPE_DEPTH = 6
 
-# Every escaped form at depth > MAX_ESCAPE_DEPTH contains a backslash run at
-# least this long, so such a run is the marker of uncovered nesting.
+# A backslash run this long is the classic signature of deep escaping; when a
+# secret needs escaping at all, such a line is replaced without decoding.
 _DEEP_RUN = "\\" * 2**MAX_ESCAPE_DEPTH
+
+# Decode passes tried before a still-changing text is declared undecidable and
+# treated as hiding a secret. Each pass strips one escaping layer, so honest
+# text settles in a handful.
+MAX_DECODE_PASSES = 32
+
+_JSON_ESCAPE_RE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))')
+_SURROGATE_PAIR_RE = re.compile("[\ud800-\udbff][\udc00-\udfff]")
+_SIMPLE_ESCAPES = {
+    '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+}
 
 
 def _escape_forms(secret: str, depth: int) -> set[str]:
@@ -79,98 +92,141 @@ def _escape_forms(secret: str, depth: int) -> set[str]:
     return forms
 
 
-def _needles_for(secrets: "Iterable[str]", depth: int) -> tuple[str, ...]:
+def build_redaction_needles(secrets: "Iterable[str]") -> tuple[str, ...]:
+    """Return literal and JSON-escaped forms of each secret, longest first.
+
+    The escaped forms (up to :data:`MAX_ESCAPE_DEPTH` layers, both ``json.dumps``
+    flavours) let a secret serialized into a JSON string be redacted in place.
+    Longest-first ordering keeps overlapping secrets deterministic. Results
+    are cached per distinct secret set, since the expansion is costly and a
+    scan redacts many records against one vault.
+    """
+    return _build_needles(tuple(secrets))
+
+
+@lru_cache(maxsize=8)
+def _build_needles(secrets: tuple[str, ...]) -> tuple[str, ...]:
     needles: set[str] = set()
     for secret in secrets:
         if secret:
-            needles |= _escape_forms(secret, depth)
+            needles |= _escape_forms(secret, MAX_ESCAPE_DEPTH)
     return tuple(sorted(needles, key=lambda n: (-len(n), n)))
 
 
-def build_redaction_needles(secrets: "Iterable[str]") -> tuple[str, ...]:
-    """Return literal and repeatedly JSON-escaped forms of each secret, longest first.
+def _unescape_json_once(text: str) -> str:
+    """Decode every JSON string escape in *text* one layer, never growing it.
 
-    The escaped forms (up to :data:`MAX_ESCAPE_DEPTH` layers, both ``json.dumps``
-    flavours) catch a secret that was serialized into a JSON string, possibly
-    several times, where quotes, backslashes and control characters change
-    representation. Longest-first ordering keeps overlapping secrets
-    deterministic.
+    Handles every valid spelling (``\\"``, ``\\u0022``, ``\\\\``, ``\\u005c``,
+    surrogate pairs, ...) because the escape grammar is decoded rather than
+    enumerated. Each escape becomes a single character, so repeated decoding
+    cannot inflate the text.
     """
-    return _needles_for(secrets, MAX_ESCAPE_DEPTH)
+
+    def _decode(match: "re.Match[str]") -> str:
+        hex_digits, simple = match.groups()
+        return chr(int(hex_digits, 16)) if hex_digits else _SIMPLE_ESCAPES[simple]
+
+    decoded = _JSON_ESCAPE_RE.sub(_decode, text)
+    return _SURROGATE_PAIR_RE.sub(
+        lambda m: chr(0x10000 + ((ord(m.group()[0]) - 0xD800) << 10) + ord(m.group()[1]) - 0xDC00),
+        decoded,
+    )
 
 
-def build_detection_probes(secrets: "Iterable[str]") -> tuple[str, ...]:
-    """Return casefolded substrings whose absence proves a stored record is untouched.
+def _decodes_to_hit(text: str, hit: "Callable[[str], bool]") -> bool:
+    """Return True when a decode layer of *text* satisfies *hit*, or never settles.
 
-    A stored ``search_text`` is the casefolded compact JSON of the record, so a
-    leaf holding a redactable form at depth *d* appears there at depth *d* + 1.
-    The probes therefore cover one layer more than redaction does, plus the
-    doubled backslash run that marks nesting beyond redaction's coverage. A
-    record matching none of them cannot be changed by redaction.
+    Decoding stops once a pass changes nothing. A text still changing after
+    :data:`MAX_DECODE_PASSES` passes cannot be shown clean, so it fails closed.
     """
-    needles = _needles_for(secrets, MAX_ESCAPE_DEPTH + 1)
-    probes = list(dict.fromkeys(n.casefold() for n in needles))
-    if any("\\" in n for n in needles):
-        probes.append(_DEEP_RUN * 2)
-    return tuple(probes)
-
-
-def _exceeds_escape_coverage(text: str, needles: tuple[str, ...]) -> bool:
-    """Return True when *text* may hold a secret nested deeper than the needles cover.
-
-    Only meaningful when some needle differs from its secret (contains a
-    backslash); otherwise nesting depth cannot disguise any secret.
-    """
-    return _DEEP_RUN in text and any("\\" in n for n in needles)
+    for _ in range(MAX_DECODE_PASSES):
+        decoded = _unescape_json_once(text)
+        if decoded == text:
+            return False
+        if hit(decoded):
+            return True
+        text = decoded
+    return _unescape_json_once(text) != text
 
 
 @lru_cache(maxsize=64)
 def _redaction_patterns(
     needles: tuple[str, ...], placeholder: str
-) -> "tuple[re.Pattern[str], re.Pattern[str]]":
-    """Compile the placeholder-token scanner and the needle scanner."""
+) -> "tuple[re.Pattern[str], re.Pattern[str], bool]":
+    """Compile the placeholder-token scanner, the needle scanner and the escape flag."""
     tokens = "|".join(
         re.escape(p) + r"(?:_\d+)?"
         for p in dict.fromkeys((*_PROTECTED_PLACEHOLDERS, placeholder))
     )
-    return re.compile(tokens), re.compile("|".join(map(re.escape, needles)))
+    return (
+        re.compile(tokens),
+        re.compile("|".join(map(re.escape, needles))),
+        any("\\" in n for n in needles),
+    )
 
 
-def _redact_string(
-    text: str,
-    needles: tuple[str, ...],
-    placeholder: str,
-    fail_closed: bool = False,
-) -> str:
-    """Replace every needle occurrence in *text* that is not inside a placeholder.
+def _unprotected_matches(
+    text: str, token_re: "re.Pattern[str]", needle_re: "re.Pattern[str]"
+) -> Iterator[tuple[int, int]]:
+    """Yield each needle span of *text* that is not inside a placeholder token.
 
-    A match lying entirely within an existing placeholder token is left alone
+    A match lying entirely within an existing placeholder token is skipped
     (keeps passes idempotent); a secret that extends beyond a token boundary
-    is a real secret and is redacted whole. A secret exactly equal to a
-    placeholder is therefore indistinguishable from it and stays as is.
-
-    With *fail_closed*, a string showing nesting deeper than the needles cover
-    is replaced whole by *placeholder*: partial redaction there could leave the
-    secret recoverable after further decoding.
+    is a real secret. A secret exactly equal to a placeholder is therefore
+    indistinguishable from it and stays as is.
     """
-    if not needles:
-        return text
-    if fail_closed and _exceeds_escape_coverage(text, needles):
-        return placeholder
-    token_re, needle_re = _redaction_patterns(needles, placeholder)
     spans = [m.span() for m in token_re.finditer(text)]
-    out: list[str] = []
-    copied = cursor = 0
+    cursor = 0
     while (match := needle_re.search(text, cursor)) is not None:
         start, end = match.span()
         if any(s <= start and end <= e for s, e in spans):
             cursor = start + 1  # contained: keep scanning, a longer secret may start inside
             continue
+        yield start, end
+        cursor = end
+
+
+def _redact_string(text: str, needles: tuple[str, ...], placeholder: str) -> str:
+    """Redact *text* by literal match, then fail closed on anything that decodes to a secret.
+
+    1. Every needle occurrence outside a placeholder token is replaced in place.
+    2. If the remainder still holds a backslash, it is JSON-unescaped layer by
+       layer (:func:`_unescape_json_once`); a layer containing a needle, or
+       decoding that does not settle within :data:`MAX_DECODE_PASSES`, marks
+       the text suspicious. Suspicious *lines* are replaced whole by
+       *placeholder* (an encoded secret never spans a raw newline); if the
+       text is still suspicious afterwards (a secret spelled across lines),
+       the whole text is replaced.
+    """
+    if not needles:
+        return text
+    token_re, needle_re, escape_sensitive = _redaction_patterns(needles, placeholder)
+    out: list[str] = []
+    copied = 0
+    for start, end in _unprotected_matches(text, token_re, needle_re):
         out.append(text[copied:start])
         out.append(placeholder)
-        copied = cursor = end
+        copied = end
     out.append(text[copied:])
-    return "".join(out)
+    redacted = "".join(out)
+
+    def suspicious(candidate: str) -> bool:
+        if "\\" not in candidate:
+            return False
+        if escape_sensitive and _DEEP_RUN in candidate:
+            return True
+        return _decodes_to_hit(
+            candidate,
+            lambda layer: next(_unprotected_matches(layer, token_re, needle_re), None)
+            is not None,
+        )
+
+    if not suspicious(redacted):
+        return redacted
+    cleaned = "\n".join(
+        placeholder if suspicious(line) else line for line in redacted.split("\n")
+    )
+    return placeholder if suspicious(cleaned) else cleaned
 
 
 def redact_vault_secrets(
@@ -184,9 +240,11 @@ def redact_vault_secrets(
     shell oversized output path, the log_detail/log_query read-time pass and
     dump, and the structlog ingestion redactor all route through this single
     routine so no path's redaction can silently weaken relative to another.
-    Each secret is matched both literally and in its JSON-escaped form, so a
-    secret serialized into a JSON string cannot leak on decode. Existing
-    placeholder tokens are never re-redacted, so the pass is idempotent.
+    Each secret is matched literally and in its common JSON-escaped forms; text
+    that still decodes to a secret under any JSON string-escape spelling (or
+    nests deeper than the decode budget) is replaced line by line, or whole
+    when the secret is spread across lines. Existing placeholder tokens are
+    never re-redacted, so the pass is idempotent.
     """
     return _redact_string(text, build_redaction_needles(secrets), placeholder)
 
@@ -220,7 +278,7 @@ def redact_with_needles(value: Any, needles: tuple[str, ...], placeholder: str) 
     order, skipping any name already used by an unchanged key.
     """
     if isinstance(value, str):
-        return _redact_string(value, needles, placeholder, fail_closed=True)
+        return _redact_string(value, needles, placeholder)
     if isinstance(value, dict):
         return _redact_dict(value, needles, placeholder)
     if isinstance(value, list):
@@ -234,7 +292,7 @@ def _redact_dict(value: dict, needles: tuple[str, ...], placeholder: str) -> dic
     """Redact a dict's keys and values, keeping colliding redacted keys distinct."""
     new_keys = {
         k: (
-            _redact_string(k, needles, placeholder, fail_closed=True)
+            _redact_string(k, needles, placeholder)
             if isinstance(k, str)
             else k
         )
