@@ -17,6 +17,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import context_manager
+import pytest
 from context_manager import (
     _cap_recent_message,
     _format_middle_message,
@@ -25,10 +26,21 @@ from context_manager import (
     maybe_compact,
     resolve_compaction_threshold,
 )
+from model_registry import ModelMetadata
+from model_request_budget import compute_request_budget
 
 
 def _msg(role: str, content: str) -> dict:
     return {"role": role, "content": content}
+
+
+def _has_summary(messages: list[dict]) -> bool:
+    return any("[Compacted context" in str(m.get("content")) for m in messages)
+
+
+def _over_until_summarized(messages, system, model=None) -> int:
+    """Estimator: oversized until the compacted summary is present (or tiny)."""
+    return 10 if len(messages) <= 3 or _has_summary(messages) else 1_000_000
 
 
 class TestMiddleFormatting:
@@ -118,7 +130,7 @@ class TestMaybeCompact:
     def test_llm_failure_returns_deterministic_fallback(self, monkeypatch):
         msgs = self._big_messages()
         monkeypatch.setattr(context_manager, "estimate_messages_tokens",
-                             lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
+                             _over_until_summarized)
         llm = MagicMock()
         llm.chat.side_effect = RuntimeError("model down")
         out, _ = maybe_compact(msgs, "system", 100_000, llm)
@@ -132,7 +144,7 @@ class TestMaybeCompact:
     def test_empty_summary_falls_back(self, monkeypatch):
         msgs = self._big_messages()
         monkeypatch.setattr(context_manager, "estimate_messages_tokens",
-                             lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
+                             _over_until_summarized)
         llm = MagicMock()
         llm.chat.return_value = "   "
         out, _ = maybe_compact(msgs, "system", 100_000, llm)
@@ -171,11 +183,11 @@ class TestMaybeCompact:
         ctx_max = 4000  # threshold = 3400 tokens
         out, _ = maybe_compact(msgs, "system", ctx_max, llm)
 
-        final_tokens = char_estimate(out, "system")
-        assert final_tokens <= int(ctx_max * 0.85)
-        # Goal is preserved (head) but bounded, not the full 40k chars.
-        assert out[0]["content"].startswith("GOAL ")
-        assert len(out[0]["content"]) < 40_000
+        # The goal is never capped; everything else is driven to the floor.
+        assert out[0] == msgs[0]
+        rest = char_estimate(out[1:], "system")
+        assert rest < char_estimate(msgs[1:], "system") // 10
+        assert len(out[-1]["content"]) < 40_000
 
 
 class TestGoalDriftRegression:
@@ -449,7 +461,7 @@ class TestRepeatedCompactionRegression:
         """
         monkeypatch.setattr(
             context_manager, "estimate_messages_tokens",
-            lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10,
+            _over_until_summarized,
         )
         llm = MagicMock()
         llm.chat.return_value = "• summarized"
@@ -764,3 +776,398 @@ class TestResolveCompactionThreshold:
         )
         assert effective == 512
         assert threshold == 256
+
+    def test_catalog_metadata_uses_hard_budget_reserve(self):
+        effective, threshold = resolve_compaction_threshold(
+            {}, 90_000,
+            metadata=ModelMetadata(context_tokens=8_192, output_tokens=1_024),
+        )
+        assert effective == 8_192
+        assert threshold == max(int((8_192 - 1_024) * 0.85), 256)
+
+    def test_catalog_input_only_limit_is_not_reduced_by_output_or_local_context(self):
+        effective, threshold = resolve_compaction_threshold(
+            {}, 90_000,
+            metadata={"input_tokens": 1_000_000, "output_tokens": 65_536},
+        )
+        assert effective == 1_000_000
+        assert threshold == int(1_000_000 * 0.85)
+
+    def test_catalog_metadata_does_not_accept_model_config_context_window_key(self):
+        with pytest.raises(ValueError):
+            resolve_compaction_threshold({}, 90_000, metadata={"context_window": 8_192})
+
+    def test_required_output_budget_uses_actual_cap_without_metadata_recompute(self):
+        metadata = ModelMetadata(context_tokens=10_000, output_tokens=12_000)
+        budget = compute_request_budget(
+            metadata, input_tokens=100, local_context_tokens=90_000,
+            output_cap_required=True,
+        )
+        assert budget.output_cap == 9_900
+        effective, threshold = resolve_compaction_threshold(
+            {}, 90_000, metadata=metadata, request_budget=budget,
+        )
+        assert effective == 10_000
+        assert threshold == 256
+
+    def test_optional_budget_still_rejects_impossible_completion_reserve(self):
+        metadata = ModelMetadata(context_tokens=10_000, output_tokens=12_000)
+        with pytest.raises(ValueError):
+            resolve_compaction_threshold({}, 90_000, metadata=metadata)
+
+    def test_supplied_request_budget_threshold_is_hard_input_based_and_metadata_immutable(self):
+        metadata = ModelMetadata(input_tokens=5_000)
+        snapshot = metadata
+        budget = compute_request_budget(
+            metadata, input_tokens=100, local_context_tokens=90_000,
+        )
+        effective, threshold = resolve_compaction_threshold(
+            {"context_window": 1, "max_tokens": 99_999}, 90_000,
+            metadata=metadata, request_budget=budget,
+        )
+        assert effective == 5_000
+        assert threshold == int(budget.hard_input_budget * 0.85)
+        assert metadata is snapshot
+        assert metadata.input_tokens == 5_000
+
+    def test_request_budget_overrides_catalog_metadata_threshold_for_compaction(self, monkeypatch):
+        budget = compute_request_budget(
+            ModelMetadata(context_tokens=10_000, output_tokens=12_000),
+            input_tokens=100, local_context_tokens=90_000,
+            output_cap_required=True,
+        )
+        llm = MagicMock()
+        llm.llm_cfg = {"model": "local", "context_window": 10_000}
+        messages = [_msg("user", "goal"), _msg("assistant", "a"), _msg("user", "b"), _msg("assistant", "c")]
+        monkeypatch.setattr(
+            context_manager, "estimate_messages_tokens",
+            lambda m, *a, **k: 10 if _has_summary(m) else 8_500,
+        )
+        out, _ = maybe_compact(
+            messages, "system", 90_000, llm,
+            metadata=ModelMetadata(context_tokens=10_000, output_tokens=12_000),
+            request_budget=budget,
+        )
+        assert len(out) == len(messages)
+        llm.chat.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Atomic native groups and goal preservation
+# ---------------------------------------------------------------------------
+
+import copy  # noqa: E402
+import json  # noqa: E402
+
+from context_manager import _message_spans, _partition_compaction  # noqa: E402
+
+
+def _call(call_id: str, name: str = "shell", args: str = '{"cmd": "ls"}') -> dict:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": args}}
+
+
+def _assistant_calls(*calls: dict, content=None) -> dict:
+    return {"role": "assistant", "content": content, "tool_calls": list(calls)}
+
+
+def _tool(call_id: str, content: str = "ok") -> dict:
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+def _assert_wire_valid(messages: list[dict]) -> None:
+    """Every tool result follows its assistant call and every call has all results."""
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        assert m["role"] != "tool", f"orphan tool result at {i}"
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            ids = [c["id"] for c in m["tool_calls"]]
+            got = []
+            i += 1
+            while i < len(messages) and messages[i]["role"] == "tool":
+                got.append(messages[i]["tool_call_id"])
+                i += 1
+            assert sorted(got) == sorted(ids)
+            continue
+        i += 1
+
+
+def _char_estimate(messages, system, model=None):
+    total = 0
+    for m in messages:
+        total += len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or []))
+    return total // 4
+
+
+class TestAtomicSpans:
+    def test_spans_group_multicall_results(self):
+        msgs = [
+            _msg("user", "g"),
+            _assistant_calls(_call("a"), _call("b")),
+            _tool("a"), _tool("b"),
+            _msg("user", "tail"),
+        ]
+        assert _message_spans(msgs) == [(0, 1), (1, 4), (4, 5)]
+
+    def test_partition_expands_suffix_to_span_boundary(self):
+        msgs = [
+            _msg("user", "g"),
+            _msg("assistant", "x"),
+            _assistant_calls(_call("a"), _call("b")),
+            _tool("a"), _tool("b"),
+        ]
+        first, middle, last = _partition_compaction(msgs, 0)
+        assert (first, middle, last) == ([0], [1], [2, 3, 4])
+
+    def test_goal_inside_suffix_leaves_first_empty(self):
+        msgs = [_msg("user", "h"), _msg("assistant", "x"), _msg("user", "g")]
+        first, middle, last = _partition_compaction(msgs, 2)
+        assert (first, middle, last) == ([], [0], [1, 2])
+
+
+class TestGoalPreserved:
+    HUGE = "GOAL " + "g" * 60_000
+
+    @pytest.mark.parametrize("n_history", [0, 1, 6])
+    @pytest.mark.parametrize("forced", [False, True])
+    def test_huge_goal_unchanged_on_every_path(self, monkeypatch, n_history, forced):
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
+        goal = {"role": "user", "content": self.HUGE, "extra": {"k": [1, 2]}}
+        msgs = [goal]
+        for i in range(n_history):
+            msgs.append(_msg("assistant", f"a{i} " + "p" * 3000))
+            msgs.append(_msg("user", f"r{i} " + "r" * 3000))
+        before = copy.deepcopy(msgs)
+        llm = MagicMock()
+        llm.chat.return_value = "- s"
+        kwargs = dict(force=True, repair_target=500, input_tokens=_char_estimate(msgs, "")) if forced else {}
+        out, idx = maybe_compact(msgs, "system", 4000, llm, **kwargs)
+        assert out[idx] == goal
+        assert out[idx]["content"] == self.HUGE
+        assert msgs == before
+
+    def test_multimodal_goal_is_intact(self, monkeypatch):
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
+        goal = {"role": "user", "content": [
+            {"type": "text", "text": "look " + "t" * 30_000},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 30_000}},
+        ]}
+        msgs = [goal] + [_msg("assistant" if i % 2 == 0 else "user", "w" * 3000) for i in range(6)]
+        before = copy.deepcopy(msgs)
+        out, idx = maybe_compact(msgs, "system", 4000, MagicMock(**{"chat.return_value": "- s"}))
+        assert out[idx] == before[0]
+        assert msgs == before
+
+
+class TestAtomicGroupCompaction:
+    def _compact(self, msgs, goal_idx=0, summary="- sum"):
+        llm = MagicMock()
+        llm.chat.return_value = summary
+        return maybe_compact(msgs, "system", 4000, llm, goal_idx=goal_idx), llm
+
+    def test_five_message_orphan_reproduction(self, monkeypatch):
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
+        msgs = [
+            _msg("user", "GOAL"),
+            _msg("assistant", "thinking " + "t" * 5000),
+            _assistant_calls(_call("a"), _call("b"), content="plan " + "p" * 5000),
+            _tool("a", "ra " + "x" * 5000),
+            _tool("b", "rb " + "y" * 5000),
+        ]
+        (out, idx), llm = self._compact(msgs)
+        _assert_wire_valid(out)
+        assert out[idx]["content"] == "GOAL"
+        ids = [m.get("tool_call_id") for m in out if m["role"] == "tool"]
+        assert ids in ([], ["a", "b"])
+
+    def test_multicall_last_two_boundary_retains_whole_group(self, monkeypatch):
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
+        msgs = [_msg("user", "GOAL")]
+        for i in range(4):
+            msgs += [_assistant_calls(_call(f"c{i}")), _tool(f"c{i}", "r" * 4000)]
+        msgs += [_assistant_calls(_call("m1"), _call("m2"), _call("m3")),
+                 _tool("m1"), _tool("m2"), _tool("m3")]
+        (out, _idx), _llm = self._compact(msgs)
+        _assert_wire_valid(out)
+        assert [m["tool_call_id"] for m in out if m["role"] == "tool"][-3:] == ["m1", "m2", "m3"]
+
+    def test_historical_huge_args_demoted_whole_without_second_summary(self, monkeypatch):
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
+        huge = json.dumps({"blob": "Q" * 120_000})
+        msgs = [
+            _msg("user", "GOAL"),
+            _msg("assistant", "old " + "o" * 2000),
+            _msg("user", "older " + "u" * 2000),
+            _assistant_calls(_call("big", "write_file", huge), content="writing"),
+            _tool("big", "done"),
+        ]
+        calls: list[str] = []
+
+        def summarize(prompt: str) -> str:
+            calls.append(prompt)
+            return "- early"
+
+        out, idx = maybe_compact(msgs, "system", 4000, MagicMock(), summarize=summarize)
+        assert len(calls) == 1
+        _assert_wire_valid(out)
+        assert out[idx]["content"] == "GOAL"
+        assert not any(m.get("tool_calls") for m in out)
+        summary = next(m for m in out if "Compacted context" in str(m["content"]))["content"]
+        assert "id=big" in summary and "[tool result id=big]: done" in summary
+        assert len(summary) < 10_000
+
+    def test_summary_request_renders_calls_and_result_ids(self, monkeypatch):
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
+        msgs = [
+            _msg("user", "GOAL"),
+            _assistant_calls(_call("zz", "read_file", '{"path": "/a"}')),
+            _tool("zz", "contents"),
+            _msg("assistant", "x " * 4000),
+            _msg("user", "y " * 4000),
+        ]
+        seen: list[str] = []
+        maybe_compact(msgs, "system", 1000, MagicMock(),
+                      summarize=lambda p: seen.append(p) or "- s")
+        assert "read_file" in seen[0] and "/a" in seen[0] and "id=zz" in seen[0]
+
+
+class TestMiddleRendering:
+    def test_assistant_with_none_content_renders_calls(self):
+        rendered = _format_middle_message(_assistant_calls(_call("k1", "grep", '{"q": "x"}')))
+        assert "grep" in rendered and '{"q": "x"}' in rendered and "id=k1" in rendered
+
+    def test_tool_result_is_labelled_with_id(self):
+        assert _format_middle_message(_tool("k1", "body")).startswith("[tool result id=k1]")
+
+
+# ---------------------------------------------------------------------------
+# Malformed native history is rejected before any summary I/O
+# ---------------------------------------------------------------------------
+
+from providers._errors import LLMPermanentError  # noqa: E402
+
+_SECRET = "SECRET-MARK"
+
+
+def _malformed_cases() -> dict[str, list[dict]]:
+    a, b = f"a-{_SECRET}", f"b-{_SECRET}"
+    two = _assistant_calls(_call(a, args=f'{{"k": "{_SECRET}"}}'), _call(b))
+    return {
+        "incomplete_ab_with_a": [two, _tool(a, _SECRET)],
+        "incomplete_single": [_assistant_calls(_call(a)), _msg("user", _SECRET)],
+        "orphan_result": [_tool(a, _SECRET)],
+        "mismatched_result": [_assistant_calls(_call(a)), _tool(b, _SECRET)],
+        "duplicate_result": [_assistant_calls(_call(a)), _tool(a), _tool(a)],
+        "duplicate_call_id": [_assistant_calls(_call(a), _call(a)), _tool(a), _tool(a)],
+        "call_wrong_type": [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": a, "type": "not-function", "function": {"name": "n", "arguments": "{}"}}]},
+            _tool(a),
+        ],
+        "call_args_invalid_json": [_assistant_calls(_call(a, args="not-json")), _tool(a)],
+        "call_args_missing": [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": a, "type": "function", "function": {"name": "n"}}]},
+            _tool(a),
+        ],
+        "call_args_empty_string": [_assistant_calls(_call(a, args="")), _tool(a)],
+        "call_args_scalar_json": [_assistant_calls(_call(a, args="5")), _tool(a)],
+        "call_args_wrong_kind": [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": a, "function": {"name": "n", "arguments": 7}}]},
+            _tool(a),
+        ],
+        "result_id_list": [_assistant_calls(_call(a)), {"role": "tool", "tool_call_id": [a], "content": "x"}],
+        "result_id_dict": [_assistant_calls(_call(a)), {"role": "tool", "tool_call_id": {"k": a}, "content": "x"}],
+        "result_id_empty": [_assistant_calls(_call(a)), {"role": "tool", "tool_call_id": "", "content": "x"}],
+        "call_not_dict": [{"role": "assistant", "content": None, "tool_calls": [_SECRET]}, _tool(a)],
+        "call_missing_name": [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": a, "function": {}}]}, _tool(a),
+        ],
+        "call_empty_id": [_assistant_calls(_call("")), _tool("")],
+        "non_string_result": [_assistant_calls(_call(a)), {"role": "tool", "tool_call_id": a, "content": None}],
+        "tool_calls_not_list": [{"role": "assistant", "content": None, "tool_calls": {"id": a}}],
+    }
+
+
+def _place(group: list[dict], where: str) -> tuple[list[dict], int]:
+    filler = [_msg("user" if i % 2 == 0 else "assistant", "f " * 3000) for i in range(4)]
+    goal = _msg("user", "GOAL")
+    if where == "short":
+        return [goal] + group, 0
+    if where == "middle":
+        return [goal] + group + filler + [_msg("assistant", "x"), _msg("user", "y")], 0
+    return filler + [goal] + [_msg("assistant", "x")] + group, 4
+
+
+class TestMalformedNativeHistory:
+    @pytest.mark.parametrize("where", ["short", "middle", "suffix"])
+    @pytest.mark.parametrize("case", sorted(_malformed_cases()))
+    @pytest.mark.parametrize("forced", [False, True])
+    def test_rejected_before_summary_or_early_return(self, monkeypatch, case, where, forced):
+        group = _malformed_cases()[case]
+        msgs, goal_idx = _place(group, where)
+        # Under-threshold unless forced: the estimator says everything fits.
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", lambda *a, **k: 10)
+        before = copy.deepcopy(msgs)
+        llm = MagicMock()
+        summarize = MagicMock(return_value="- s")
+        kwargs = dict(force=True, repair_target=5, input_tokens=9_000) if forced else {}
+        with pytest.raises(LLMPermanentError) as info:
+            maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx,
+                          summarize=summarize, **kwargs)
+        assert _SECRET not in str(info.value)
+        summarize.assert_not_called()
+        llm.chat.assert_not_called()
+        assert msgs == before
+
+    @pytest.mark.parametrize("where", ["short", "middle", "suffix"])
+    def test_valid_single_and_multicall_groups_pass(self, monkeypatch, where):
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", lambda *a, **k: 10)
+        group = [
+            _assistant_calls(_call("s1")), _tool("s1"),
+            _assistant_calls(_call("m1"), _call("m2"), content="prose"), _tool("m2"), _tool("m1"),
+            {"role": "assistant", "content": "", "tool_calls": []},
+        ]
+        msgs, goal_idx = _place(group, where)
+        out, idx = maybe_compact(msgs, "system", 100_000, MagicMock(), goal_idx=goal_idx)
+        assert out is msgs and idx == goal_idx
+
+
+class TestValidReusedAndShapedCalls:
+    @pytest.mark.parametrize("where", ["short", "middle", "suffix"])
+    @pytest.mark.parametrize("forced", [False, True])
+    def test_production_groups_reusing_supplied_id_are_valid(self, monkeypatch, where, forced):
+        from interfaces import ToolCall
+        from native_turns import _append_native_tool_result
+
+        group: list[dict] = []
+        _append_native_tool_result(group, ToolCall(id="call_0", name="shell", arguments={"cmd": "ls"}), "r1")
+        _append_native_tool_result(group, ToolCall(id="call_0", name="shell", arguments={"cmd": "pwd"}), "r2")
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", lambda *a, **k: 10)
+        msgs, goal_idx = _place(group, where)
+        before = copy.deepcopy(msgs)
+        summarize = MagicMock(return_value="- s")
+        context_manager.validate_native_history(msgs)
+        kwargs = dict(force=True, repair_target=5, input_tokens=9_000) if forced else {}
+        try:
+            maybe_compact(msgs, "system", 100_000, MagicMock(), goal_idx=goal_idx,
+                          summarize=summarize, **kwargs)
+        except LLMPermanentError:
+            pytest.fail("valid reused IDs rejected")
+        if not forced:
+            assert msgs == before
+
+    def test_args_whitespace_dict_args_prose_and_missing_type_pass_unchanged(self):
+        msgs = [
+            _msg("user", "GOAL"),
+            _assistant_calls(_call("w", args='{ "a" :  "\\u00e9" }'), content="prose"),
+            _tool("w"),
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "d", "function": {"name": "n", "arguments": {"k": 1}}}]},
+            _tool("d"),
+            {"role": "user", "content": [{"type": "text", "text": "multi"}]},
+        ]
+        before = copy.deepcopy(msgs)
+        context_manager.validate_native_history(msgs)
+        assert msgs == before

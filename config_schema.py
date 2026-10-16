@@ -14,8 +14,11 @@ from __future__ import annotations
 import os
 import re
 import logging
+import copy
+import math
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 try:
     import tomli as _tomllib  # type: ignore[import]
@@ -115,6 +118,7 @@ def _load_vault(path: str) -> dict:
 
 # Strict variable-name rule: must start with letter/underscore, then alphanumeric.
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # Prefixes that mark whole-string references.
 _ENV_PREFIX = "env:"
@@ -340,26 +344,33 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class EmbeddingsConfig:
-    provider: str = "openai"
+    provider: str = ""
     api_key: str = field(default="", repr=False)
-    model: str = "text-embedding-3-small"
-    base_url: str = ""
+    model: str = ""
+    base_url: str = field(default="", repr=False)
+    unavailable_reason: str = ""
 
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    """Configuration for a named LLM provider (e.g. openai, anthropic).
-
-    Provides credential and transport defaults that individual models can
-    inherit when those fields are not explicitly set at the model level.
-    """
+    """A named provider connection with an unresolved credential source."""
 
     name: str
+    type: Literal["openai", "openrouter", "anthropic", "google", "ollama"]
     api_key: str = field(default="", repr=False)
-    base_url: str = ""
-    request_timeout: int = 120
-    max_retries: int = 5
-    retry_delay: int = 2
+    base_url: str = field(default="", repr=False)
+    request_timeout: int | float = 120
+
+
+@dataclass(frozen=True)
+class ResolvedProviderConnection:
+    """Runtime-only provider transport and credential for one connection."""
+
+    provider_id: str
+    adapter: Literal["openai", "openrouter", "anthropic", "google", "ollama"]
+    base_url: str = field(repr=False)
+    request_timeout: int | float
+    api_key: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -374,6 +385,8 @@ class AgentConfig:
     max_output_size: int = 4000  # chars: stdout/stderr per-stream limit for shell/tools
     top_tools: int = 3
     ctx_max_tokens: int = 90_000
+    max_retries: int = 4
+    retry_delay: float = 2.0
     max_subagents: int = 6
     subagent_result_timeout: int = 300
     long_run_warn_minutes: int = 30
@@ -682,27 +695,79 @@ def _parse_model(entry: dict, index: int) -> ModelConfig:
     return cfg
 
 
-def _parse_embeddings(raw: dict) -> EmbeddingsConfig:
+def _parse_embeddings(raw: dict, unavailable_reason: str = "") -> EmbeddingsConfig:
+    if unavailable_reason:
+        return EmbeddingsConfig(unavailable_reason=unavailable_reason)
     section = raw.get("embeddings") or {}
+    if not isinstance(section, dict):
+        return EmbeddingsConfig()
+    def string_value(key: str) -> str:
+        value = section.get(key, "")
+        return value if isinstance(value, str) else ""
     return EmbeddingsConfig(
-        provider=section.get("provider", "openai"),
-        api_key=section.get("api_key", ""),
-        model=section.get("model", "text-embedding-3-small"),
-        base_url=section.get("base_url", ""),
+        provider=string_value("provider"),
+        api_key=string_value("api_key"),
+        model=string_value("model"),
+        base_url=string_value("base_url"),
+        unavailable_reason=unavailable_reason,
     )
+
+
+def _resolve_embedding_settings(section: Any) -> tuple[dict[str, Any], str]:
+    """Expand non-secret embedding settings without making them startup-fatal."""
+    if section is None:
+        return {}, "embeddings.provider and embeddings.model must be configured explicitly"
+    if not isinstance(section, dict):
+        return {}, "embeddings must be a table"
+
+    result = dict(section)
+    for key in ("provider", "model", "base_url"):
+        if key not in section:
+            continue
+        value = section[key]
+        if not isinstance(value, str):
+            return result, f"embeddings.{key} must be a string"
+        try:
+            result[key] = _expand_value(value, path=f"embeddings.{key}")
+        except ConfigError:
+            result[key] = ""
+            return result, f"embeddings.{key} has an unavailable or invalid reference"
+
+    api_key = section.get("api_key", "")
+    if not isinstance(api_key, str):
+        return result, "embeddings.api_key must be a string credential or reference"
+
+    for key in ("provider", "model"):
+        if not result.get(key):
+            return result, f"embeddings.{key} must be configured explicitly"
+    base_url = result.get("base_url", "")
+    if base_url:
+        try:
+            _validate_http_url(base_url, "embeddings.base_url")
+        except ConfigError:
+            return result, "embeddings.base_url must be a valid HTTP(S) URL"
+    return result, ""
 
 
 def _parse_agent(raw: dict) -> AgentConfig:
     section = raw.get("agent") or {}
     agent_name = section.get("agent_name", "piclaw")
-    # Deprecation warning for fallback_models (kept for backward compat, ignored)
-    _fallback_models = list(section.get("fallback_models") or [])
-    if _fallback_models:
-        logger.warning(
-            "agent.fallback_models is deprecated and ignored — the LLM client is now "
-            "single-model. Remove this field from your config. Value: %s",
-            _fallback_models,
-        )
+    max_retries = section.get("max_retries", 4)
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+        raise ConfigError("Config field 'agent.max_retries' must be a nonnegative integer")
+    retry_delay = section.get("retry_delay", 2.0)
+    if (
+        isinstance(retry_delay, bool)
+        or not isinstance(retry_delay, (int, float))
+        or retry_delay < 0
+    ):
+        raise ConfigError("Config field 'agent.retry_delay' must be a finite nonnegative number")
+    try:
+        retry_delay_value = float(retry_delay)
+    except (OverflowError, ValueError):
+        raise ConfigError("Config field 'agent.retry_delay' must be a finite nonnegative number") from None
+    if not math.isfinite(retry_delay_value):
+        raise ConfigError("Config field 'agent.retry_delay' must be a finite nonnegative number")
     return AgentConfig(
         agent_name=agent_name,
         max_iterations=_parse_int(section.get("max_iterations"), 8, "agent.max_iterations"),
@@ -711,13 +776,15 @@ def _parse_agent(raw: dict) -> AgentConfig:
         max_output_size=_parse_int(section.get("max_output_size"), 4000, "agent.max_output_size"),
         top_tools=_parse_int(section.get("top_tools"), 3, "agent.top_tools"),
         ctx_max_tokens=_parse_int(section.get("ctx_max_tokens"), 90_000, "agent.ctx_max_tokens"),
+        max_retries=max_retries,
+        retry_delay=retry_delay_value,
         max_subagents=_parse_int(section.get("max_subagents"), 6, "agent.max_subagents"),
         subagent_result_timeout=_parse_int(section.get("subagent_result_timeout"), 300, "agent.subagent_result_timeout"),
         long_run_warn_minutes=_parse_int(section.get("long_run_warn_minutes"), 30, "agent.long_run_warn_minutes"),
         diagnose_empty_responses=_parse_bool(section.get("diagnose_empty_responses", False), "agent.diagnose_empty_responses"),
-        default_model=section.get("default_model", ""),
-        background_model=section.get("background_model", ""),
-        fallback_models=_fallback_models,
+        default_model="",
+        background_model="",
+        fallback_models=[],
         shell_backend=str(section.get("shell_backend", "subprocess")),
         shell_pty_cols=_parse_int(section.get("shell_pty_cols"), 220, "agent.shell_pty_cols"),
         shell_pty_rows=_parse_int(section.get("shell_pty_rows"), 50, "agent.shell_pty_rows"),
@@ -896,92 +963,149 @@ def resolve_model_id(selected: str, configured_models: list[dict]) -> str:
 # Provider parsing and credential-inheritance helpers
 # ---------------------------------------------------------------------------
 
+_PROVIDER_TYPES = ("openai", "openrouter", "anthropic", "google", "ollama")
+_PROVIDER_FIELDS = {"type", "api_key", "base_url", "request_timeout"}
+
+
+def _validate_provider_structure(raw: dict) -> None:
+    """Reject legacy model configuration and malformed connection tables early."""
+    if "models" in raw:
+        raise ConfigError(
+            "'models' / [[models]] is no longer supported; configure "
+            "[providers.<connection-id>] and select a discovered model with /models"
+        )
+
+    providers = raw.get("providers", {})
+    if providers is None:
+        return
+    if not isinstance(providers, dict):
+        raise ConfigError("providers must be a table of [providers.<id>] connections")
+    for connection_id, entry in providers.items():
+        if (
+            not isinstance(connection_id, str)
+            or not _PROVIDER_ID.fullmatch(connection_id)
+        ):
+            raise ConfigError(
+                "provider connection IDs must match "
+                "[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+            )
+        if not isinstance(entry, dict):
+            raise ConfigError(f"providers.{connection_id} must be a table")
+        for key in entry:
+            if key not in _PROVIDER_FIELDS:
+                if key == "api_key_file":
+                    raise ConfigError(
+                        f"providers.{connection_id}.api_key_file is unsupported; "
+                        f"configure the credential source at providers.{connection_id}.api_key"
+                    )
+                raise ConfigError(
+                    f"providers.{connection_id}.{key} is unsupported; "
+                    "configure provider connections without model tuning or retry overrides"
+                )
+        adapter = entry.get("type")
+        if not isinstance(adapter, str) or adapter not in _PROVIDER_TYPES:
+            raise ConfigError(
+                f"providers.{connection_id}.type must be one of: "
+                f"{', '.join(_PROVIDER_TYPES)}"
+            )
+        if "api_key" in entry and not isinstance(entry["api_key"], str):
+            raise ConfigError(f"providers.{connection_id}.api_key must be a string")
+        if "base_url" in entry and not isinstance(entry["base_url"], str):
+            raise ConfigError(f"providers.{connection_id}.base_url must be a string")
+        timeout = entry.get("request_timeout", 120)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ConfigError(
+                f"providers.{connection_id}.request_timeout must be a finite positive number"
+            )
+
+
+def _validate_http_url(url: str, field_path: str) -> None:
+    """Validate an absolute HTTP(S) URL without exposing parser details."""
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ConfigError(f"{field_path} must be a valid HTTP(S) URL") from None
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        raise ConfigError(f"{field_path} must be a valid HTTP(S) URL")
+    if port is not None and not 1 <= port <= 65535:
+        raise ConfigError(f"{field_path} must be a valid HTTP(S) URL")
+
+
 def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
-    """Parse ``[providers.<name>]`` sections from *raw*."""
-    providers_raw = raw.get("providers") or {}
+    """Parse strict ``[providers.<name>]`` connection sections."""
+    providers_raw = raw.get("providers", {})
+    if providers_raw is None:
+        providers_raw = {}
+    if not isinstance(providers_raw, dict):
+        raise ConfigError("providers must be a table of [providers.<id>] connections")
     result: dict[str, ProviderConfig] = {}
 
     for name, entry in providers_raw.items():
         if not isinstance(entry, dict):
-            continue
-
+            raise ConfigError(f"providers.{name} must be a table")
+        allowed = {"type", "api_key", "base_url", "request_timeout"}
+        for key in entry:
+            if key not in allowed:
+                destination = "[agent] max_retries/retry_delay" if key in {"max_retries", "retry_delay"} else "provider connection fields"
+                raise ConfigError(f"providers.{name}.{key} is unsupported; use {destination}")
+        adapter = entry.get("type")
+        supported = set(_PROVIDER_TYPES)
+        if adapter not in supported:
+            raise ConfigError(f"providers.{name}.type must be one of: {', '.join(sorted(supported))}")
+        api_key = entry.get("api_key", "")
+        if not isinstance(api_key, str):
+            raise ConfigError(f"providers.{name}.api_key must be a string credential or reference")
+        base_url = entry.get("base_url", "")
+        if not isinstance(base_url, str):
+            raise ConfigError(f"providers.{name}.base_url must be a string")
+        if adapter == "ollama":
+            if base_url:
+                _validate_http_url(base_url, f"providers.{name}.base_url")
+                try:
+                    parsed = urlsplit(base_url)
+                    valid_cloud = (
+                        parsed.scheme == "https"
+                        and parsed.hostname == "ollama.com"
+                        and parsed.port is None
+                        and parsed.username is None
+                        and parsed.password is None
+                        and not parsed.query
+                        and not parsed.fragment
+                        and parsed.path in {"", "/", "/api", "/api/"}
+                    )
+                except ValueError:
+                    valid_cloud = False
+                if not valid_cloud:
+                    raise ConfigError(f"providers.{name}.base_url must use the official cloud Ollama origin https://ollama.com (optional /api path only)")
+            if not api_key.strip():
+                raise ConfigError(f"providers.{name}.api_key is required for cloud Ollama")
+            base_url = "https://ollama.com"
+        elif base_url:
+            _validate_http_url(base_url, f"providers.{name}.base_url")
+        timeout_value = entry.get("request_timeout", 120)
+        if (
+            isinstance(timeout_value, bool)
+            or not isinstance(timeout_value, (int, float))
+            or not math.isfinite(timeout_value)
+            or timeout_value <= 0
+        ):
+            raise ConfigError(f"providers.{name}.request_timeout must be a finite positive number")
         result[name] = ProviderConfig(
             name=name,
-            api_key=entry.get("api_key", ""),
-            base_url=entry.get("base_url", ""),
-            request_timeout=_parse_int(
-                entry.get("request_timeout"), 120, f"providers.{name}.request_timeout"
-            ),
-            max_retries=_parse_int(
-                entry.get("max_retries"), 5, f"providers.{name}.max_retries"
-            ),
-            retry_delay=_parse_int(
-                entry.get("retry_delay"), 2, f"providers.{name}.retry_delay"
-            ),
+            type=cast(Any, adapter),
+            api_key=api_key,
+            base_url=base_url.rstrip("/"),
+            request_timeout=cast(int | float, timeout_value),
         )
 
     return result
-
-
-def _normalize_models(raw: dict, providers: dict[str, ProviderConfig]) -> None:
-    """Apply provider-level defaults for models that omit credential / transport fields.
-
-    Mutates *raw* in-place: writes inherited values back into each
-    ``raw["models"][i]`` entry so that ``_raw`` mirrors what the typed config
-    actually uses at runtime.
-
-    Cross-level precedence:
-    - Model-level ``api_key`` beats provider ``api_key``.
-    - Provider values fill in only when the model omits the field entirely.
-    """
-    for entry in (raw.get("models") or []):
-        if not providers:
-            continue
-        provider_name = entry.get("provider", "")
-        prov = providers.get(provider_name)
-        if prov is None:
-            continue
-
-        if "api_key" not in entry and prov.api_key:
-            entry["api_key"] = prov.api_key
-
-        if "base_url" not in entry and prov.base_url:
-            entry["base_url"] = prov.base_url
-
-        if "request_timeout" not in entry:
-            entry["request_timeout"] = prov.request_timeout
-
-        if "max_retries" not in entry:
-            entry["max_retries"] = prov.max_retries
-
-        if "retry_delay" not in entry:
-            entry["retry_delay"] = prov.retry_delay
-
-
-def _normalize_embeddings(raw: dict, providers: dict[str, ProviderConfig]) -> None:
-    """Apply provider defaults to the ``[embeddings]`` section when present.
-
-    Only runs when ``"embeddings"`` already exists in *raw* — an omitted
-    embeddings section is left unchanged so that ``_raw`` never gains a
-    spurious key.
-    """
-    if "embeddings" not in raw or not providers:
-        return
-
-    emb = raw["embeddings"]
-    if not isinstance(emb, dict):
-        return
-
-    provider_name = emb.get("provider", "openai")
-    prov = providers.get(provider_name)
-    if prov is None:
-        return
-
-    if "api_key" not in emb and prov.api_key:
-        emb["api_key"] = prov.api_key
-
-    if "base_url" not in emb and prov.base_url:
-        emb["base_url"] = prov.base_url
 
 
 def _reject_removed_fields(raw: dict) -> None:
@@ -1015,15 +1139,6 @@ def _reject_removed_fields(raw: dict) -> None:
                 f"[providers.{pname}] 'api_key_file' has been removed."
                 + _MIGRATION
                 + f" Example: api_key = \"sec:{pname}_api_key\""
-            )
-
-    for i, entry in enumerate(raw.get("models") or []):
-        if isinstance(entry, dict) and "api_key_file" in entry:
-            name = entry.get("name") or f"model-{i}"
-            raise ConfigError(
-                f"[[models]] entry '{name}': 'api_key_file' has been removed."
-                + _MIGRATION
-                + f" Example: api_key = \"sec:{name}_api_key\""
             )
 
     embeddings = raw.get("embeddings") or {}
@@ -1062,6 +1177,20 @@ def _reject_removed_fields(raw: dict) -> None:
             "The graph memory database path is now derived from XDG_DATA_HOME."
         )
 
+    providers = raw.get("providers") or {}
+    if isinstance(providers, dict):
+        for provider_id, entry in providers.items():
+            if isinstance(entry, dict):
+                for key in ("max_retries", "retry_delay", "retries"):
+                    if key in entry:
+                        raise ConfigError(f"providers.{provider_id}.{key} is no longer supported; retries are configured under [agent]")
+
+    agent = raw.get("agent") or {}
+    if isinstance(agent, dict):
+        for key in ("default_model", "background_model", "fallback_models", "fallback_model"):
+            if key in agent:
+                raise ConfigError(f"agent.{key} is no longer supported; select a discovered model with /models")
+
 
 def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "piclaw") -> AppConfig:
     """Parse and validate a raw TOML config dict into a typed AppConfig.
@@ -1078,7 +1207,16 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
     Raises ConfigError on missing required fields, invalid values, or
     unset required environment variables.
     """
+    raw = copy.deepcopy(raw)
+    _validate_provider_structure(raw)
     _reject_removed_fields(raw)
+
+    # Keep provider and embedding sections out of global expansion/vault scans:
+    # their credentials resolve only at their matching runtime client, and
+    # invalid embedding settings degrade indexing rather than blocking chat.
+    provider_source = raw.pop("providers", {})
+    embedding_present = "embeddings" in raw
+    embedding_source = raw.pop("embeddings", None)
 
     vault: dict | None = None
     if _has_sec_reference(raw):
@@ -1091,18 +1229,55 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
     # Expand ${VAR} / ${VAR:-default} placeholders and sec: secrets before any other processing.
     raw = expand_env(raw, vault=vault)
 
+    provider_values: dict[str, dict[str, Any]] = {}
+    if isinstance(provider_source, dict):
+        for connection_id, source in provider_source.items():
+            entry = dict(source)
+            if "base_url" in entry:
+                try:
+                    entry["base_url"] = _expand_value(
+                        entry["base_url"], path=f"providers.{connection_id}.base_url"
+                    )
+                except ConfigError:
+                    raise ConfigError(
+                        f"providers.{connection_id}.base_url has an unavailable or invalid reference"
+                    ) from None
+            provider_values[connection_id] = entry
+    if "providers" in raw or provider_values:
+        raw["providers"] = provider_values
+
+    embedding_values, embedding_reason = _resolve_embedding_settings(embedding_source)
+    if embedding_present:
+        raw["embeddings"] = embedding_values
+
     providers = _parse_providers(raw)
-
-    # Apply provider defaults to models/embeddings.
-    _normalize_models(raw, providers)
-    _normalize_embeddings(raw, providers)
-
-    # Require at least one model
-    models_raw = raw.get("models") or []
-    if not models_raw:
-        raise ConfigError("At least one [[models]] entry is required")
-
-    models = [_parse_model(m, i) for i, m in enumerate(models_raw)]
+    embeddings_config = _parse_embeddings(raw, embedding_reason)
+    if not embeddings_config.unavailable_reason:
+        embedding_provider = embeddings_config.provider
+        if embedding_provider in providers:
+            connection = providers[embedding_provider]
+            embeddings_config = EmbeddingsConfig(
+                provider=embedding_provider,
+                api_key=embeddings_config.api_key or connection.api_key,
+                model=embeddings_config.model,
+                base_url=embeddings_config.base_url or connection.base_url,
+            )
+        elif embedding_provider in _PROVIDER_TYPES:
+            if not embeddings_config.api_key:
+                embeddings_config = EmbeddingsConfig(
+                    unavailable_reason=(
+                        "embeddings.api_key must be configured explicitly for an "
+                        "adapter provider without a matching connection"
+                    )
+                )
+        else:
+            embeddings_config = EmbeddingsConfig(
+                unavailable_reason=(
+                    "embeddings.provider must name a supported adapter or "
+                    "configured provider connection"
+                )
+            )
+    models: list[ModelConfig] = []
 
     mcp_raw = raw.get("mcp_servers") or []
     mcp_servers = [_parse_mcp_server(s, i) for i, s in enumerate(mcp_raw)]
@@ -1111,7 +1286,7 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
         telegram=_parse_telegram(raw),
         agent=_parse_agent(raw),
         models=models,
-        embeddings=_parse_embeddings(raw),
+        embeddings=embeddings_config,
         scheduler=_parse_scheduler(raw),
         paths=_parse_paths(raw, agent_name=agent_name),
         vault=_parse_vault(raw),
@@ -1121,4 +1296,44 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
         llm_error_handling=_parse_llm_error_handling(raw),
         security=_parse_security(raw),
         _raw=raw,
+    )
+
+
+def resolve_provider_connection(
+    connection: ProviderConfig, *, vault_file: str | None
+) -> ResolvedProviderConnection:
+    """Resolve one connection's credential for its matching provider client.
+
+    Errors intentionally identify only the configuration field, never its
+    credential source or value.
+    """
+    source = connection.api_key
+    api_key = source
+    if source.startswith("env:"):
+        variable = source[4:]
+        if not _ENV_VAR_NAME.fullmatch(variable):
+            raise ConfigError(f"providers.{connection.name}.api_key has an invalid credential reference")
+        api_key = os.environ.get(variable, "")
+        if not api_key:
+            raise ConfigError(f"providers.{connection.name}.api_key credential is unavailable")
+    elif source.startswith("sec:"):
+        key = source[4:]
+        if not vault_file or not _ENV_VAR_NAME.fullmatch(key):
+            raise ConfigError(f"providers.{connection.name}.api_key credential is unavailable")
+        try:
+            vault = _load_vault(vault_file)
+        except ConfigError:
+            raise ConfigError(f"providers.{connection.name}.api_key credential is unavailable") from None
+        resolved = vault.get(key)
+        if not isinstance(resolved, str) or not resolved:
+            raise ConfigError(f"providers.{connection.name}.api_key credential is unavailable")
+        api_key = resolved
+    if connection.type == "ollama" and not api_key:
+        raise ConfigError(f"providers.{connection.name}.api_key is required for cloud Ollama")
+    return ResolvedProviderConnection(
+        provider_id=connection.name,
+        adapter=connection.type,
+        base_url=connection.base_url,
+        request_timeout=connection.request_timeout,
+        api_key=api_key,
     )

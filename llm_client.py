@@ -1,22 +1,4 @@
-"""
-llm_client.py
--------------
-Unified LLM client supporting OpenAI-compatible APIs, Google Gemini, Anthropic, and Ollama.
-Handles both chat completions and embeddings, configured separately.
-
-Note on OpenAI reasoning models (o1, o1-mini, o3, o3-mini, o4-mini, gpt-5, etc.):
-  These models do NOT accept a `temperature` parameter — passing any value causes
-  a 400 "Unsupported parameter" error. The client detects these models by name
-  and omits temperature (and other unsupported sampling params) automatically.
-
-Retry behaviour:
-  Transient errors (timeouts, connection resets, 5xx responses) are retried with
-  exponential backoff. Configure via config.toml:
-    [llm]
-    request_timeout = 120   # seconds per attempt (default: 120)
-    max_retries     = 5     # attempts before giving up (default: 5)
-    retry_delay     = 2     # base delay in seconds; doubles each attempt (default: 2)
-"""
+"""Single-run-model provider client with a final, bounded HTTP send gate."""
 
 from __future__ import annotations
 
@@ -25,182 +7,357 @@ import json
 import logging
 import threading
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, TypeVar
+from urllib.parse import quote, urlsplit
 
 import httpx
 import ollama as _ollama_lib
 
 import agent_logging
+from call_attempt_state import CallAttemptState, CallAttemptStateError
+from config_schema import AgentConfig
+from embedding_client import EmbeddingClient, EmbeddingUnavailableError
 from interfaces import ChatResponse, ProviderContext
+from model_registry import ModelMetadata, RunModel
+from model_request_budget import (
+    ModelRequestBudget,
+    ModelRequestBudgetError,
+    compute_request_budget,
+    ordinary_output_cap_required,
+    repair_input_ceiling,
+)
+from model_selection_guard import SelectionBudgetIdentity
 from providers import anthropic_provider, google_provider, ollama_provider, openai_provider
 from providers._errors import (
     LLMCancelledError,
-    LLMEmptyResponseError,  # noqa: F401 — re-exported for module-path callers
+    LLMContextOverflowError as LLMContextOverflowError,
+    LLMEmptyResponseError as LLMEmptyResponseError,
     LLMError,
     LLMPermanentError,
 )
-from providers._utils import _encode_images  # noqa: F401 — re-exported for module-path callers
+from providers._utils import (
+    _encode_images as _encode_images,
+    _is_reasoning_model,
+    is_context_overflow_message,
+    provider_error_code,
+)
+from token_estimator import estimate_request_payload_tokens
+from token_usage import TokenUsageRegistry
 
 logger = logging.getLogger(__name__)
 slog = agent_logging.get_logger(__name__)
+_ChatResult = TypeVar("_ChatResult", str, ChatResponse)
 
-
-_LLM_CALL_ERRORS = (
-    LLMError,
-    httpx.HTTPError,
-    json.JSONDecodeError,
-    KeyError,
-    ValueError,
-)
-_LLM_CHAT_ERRORS = _LLM_CALL_ERRORS + (LLMCancelledError,)
-
-# Provider dispatch: maps the config `provider` string to the backend module
-# whose `chat()` (and, for openai/google, `embed()`) implements it. Adding a
-# provider means one new entry here plus the module — not editing routing
-# elif-chains scattered across the class.
 _PROVIDER_MODULES: dict[str, Any] = {
     "openai": openai_provider,
-    "openrouter": openai_provider,   # OpenAI-compatible wire format
+    "openrouter": openai_provider,
     "anthropic": anthropic_provider,
     "google": google_provider,
     "ollama": ollama_provider,
 }
+_NATIVE_TOOL_PROVIDERS = frozenset({"openai", "openrouter", "google", "ollama"})
+_LLM_CHAT_ERRORS = (
+    LLMError,
+    LLMEmptyResponseError,
+    httpx.HTTPError,
+    json.JSONDecodeError,
+    KeyError,
+    ValueError,
+    LLMCancelledError,
+)
+_DEFAULT_ENDPOINTS = {
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "anthropic": "https://api.anthropic.com",
+    "google": "https://generativelanguage.googleapis.com",
+    "ollama": "https://ollama.com",
+}
 
-# Providers with a native tool-calling implementation. Others (e.g. anthropic)
-# raise NotImplementedError from chat_with_tools() so the ReAct loop falls back
-# to the json_mode path.
-_NATIVE_TOOL_PROVIDERS = {"openai", "openrouter", "google", "ollama"}
+
+def _safe_llm_failure_category(exc: Exception) -> str:
+    """Map classified chat failures to fixed, non-sensitive log categories."""
+    if isinstance(exc, LLMCancelledError):
+        return "cancelled"
+    if isinstance(exc, LLMEmptyResponseError):
+        return "empty_response"
+    if isinstance(exc, ModelRequestBudgetError):
+        return f"budget_{exc.code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connection"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"http_status_{exc.response.status_code}"
+    if isinstance(exc, httpx.HTTPError):
+        return "transport_error"
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_json"
+    if isinstance(exc, (KeyError, ValueError)):
+        return "invalid_response"
+    if isinstance(exc, LLMPermanentError):
+        return "permanent"
+    return "provider_error"
 
 
-# ---------------------------------------------------------------------------
-# LLM Client
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class RequestPreview:
+    """Sanitized final-wire estimate without payload, credentials, or endpoint."""
+
+    canonical_model_id: str
+    mode: str
+    input_tokens: int
+    hard_input_budget: int
+    output_cap: int | None
+    completion_reserve: int
+    assumed_context: bool
+    assumed_completion_reserve: bool
+    definition_revision: str | int | None
+    budget: ModelRequestBudget
+
+
+@dataclass
+class _AttemptBinding:
+    state: CallAttemptState
+    manual: bool
+    definition_revision: str | int | None
+    sent: bool = False
+
+
+@dataclass(frozen=True)
+class _OllamaInvocation:
+    """Immutable request mode and caller tool JSON for one SDK invocation."""
+
+    mode: str
+    tools_json: str | None
+
+
+@dataclass(frozen=True)
+class _GraphPolicy:
+    output_cap: int = 1024
+    temperature: float = 0.1
+
+
+class _NoInheritedAuth(httpx.Auth):
+    """Prevent a transport client's ambient auth from changing the request."""
+
+    def auth_flow(self, request: httpx.Request) -> Iterator[httpx.Request]:
+        yield request
+
+
+class _OllamaWireTransport(httpx.BaseTransport):
+    """Finalize SDK requests before handing them to the owned HTTP transport."""
+
+    def __init__(self, owner: LLMClient, inner: httpx.BaseTransport) -> None:
+        self._owner = owner
+        self._inner = inner
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        """Replace SDK-projected tool schemas, budget, count, then delegate once."""
+        return self._owner._handle_ollama_transport_request(request, self._inner)
+
+    def close(self) -> None:
+        """Close the wrapped transport owned by this SDK client."""
+        self._inner.close()
+
+
+class _PreviewCaptured(Exception):
+    """Private control flow used only by the SDK-backed preview path."""
+
+    def __init__(self, preview: RequestPreview) -> None:
+        self.preview = preview
+        super().__init__("preview captured")
+
 
 class LLMClient:
-    """
-    Thin wrapper around remote LLM APIs.
-    Supports:
-      - OpenAI  (and any OpenAI-compatible endpoint such as OpenRouter)
-      - Google Gemini (via generateContent REST API)
-      - Anthropic Claude
-      - Ollama (cloud API at https://ollama.com or local at http://localhost:11434)
+    """One immutable admitted model and its matching provider connection."""
 
-    Multi-model support:
-      Define [[models]] in config.toml (array of tables). Each entry must have:
-        name, provider, api_key, model, base_url, max_tokens, temperature,
-        request_timeout, max_retries, retry_delay.
-      Set agent.default_model to the 'model' value of the entry to use by default.
-    """
+    def __init__(
+        self,
+        run_model: RunModel,
+        *,
+        agent_config: AgentConfig,
+        embedding_client: EmbeddingClient | None = None,
+        http_transport: httpx.BaseTransport | None = None,
+        cancel_event: threading.Event | None = None,
+        usage_registry: TokenUsageRegistry | None = None,
+        caller_tag: str | None = None,
+    ) -> None:
+        """Create a client pinned to one admitted model/connection snapshot."""
+        if not isinstance(run_model, RunModel):
+            raise LLMPermanentError("LLMClient requires an admitted RunModel")
+        if not isinstance(agent_config, AgentConfig):
+            raise LLMPermanentError("LLMClient requires typed agent configuration")
+        if run_model.model.provider_id != run_model.connection.provider_id:
+            raise LLMPermanentError("Pinned model and provider connection do not match")
+        if run_model.model.provider_id == "" or run_model.connection.adapter not in _PROVIDER_MODULES:
+            raise LLMPermanentError("Pinned provider configuration is invalid")
+        if run_model.connection.adapter == "ollama":
+            self._validate_ollama_connection(run_model)
 
-    def __init__(self, config: dict, usage_registry=None, cancel_event=None,
-                 caller_tag: str | None = None):
-        """
-        Args:
-            config: full agent config dict
-            usage_registry: optional TokenUsageRegistry for cross-instance token aggregation
-            cancel_event: optional threading.Event; when set, in-progress LLM calls raise LLMCancelledError
-            caller_tag: optional label for log messages (e.g. "main", "sa-fcf85d"). Used to
-                        identify which agent triggered an LLM call in concurrent log streams.
-        """
-        self.cfg = config
+        self._run_model = run_model
+        self._ctx_max_tokens = int(agent_config.ctx_max_tokens)
+        self._max_retries = int(agent_config.max_retries)
+        self._retry_delay = float(agent_config.retry_delay)
+        self._diagnose_empty = bool(agent_config.diagnose_empty_responses)
+        self._embedding_client = embedding_client
+        self._cancel_event = cancel_event
+        self._usage_registry = usage_registry
         self._base_caller_tag = caller_tag or ""
         self._trace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
-            f"llm_client_trace_{id(self)}",
-            default="",
+            f"llm_client_trace_{id(self)}", default=""
         )
+        self._binding_var: contextvars.ContextVar[_AttemptBinding | None] = contextvars.ContextVar(
+            f"llm_client_attempt_{id(self)}", default=None
+        )
+        self._ollama_invocation_var: contextvars.ContextVar[_OllamaInvocation | None] = (
+            contextvars.ContextVar(f"llm_client_ollama_invocation_{id(self)}", default=None)
+        )
+        self._preview_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+            f"llm_client_preview_{id(self)}", default=False
+        )
+        self._usage_date = date.today()
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._graph_policy: _GraphPolicy | None = None
+        self._closed = False
 
-        # Require [[models]] — no legacy [llm] fallback
-        models = config.get("models")
-        if not models or not isinstance(models, list):
-            raise ValueError(
-                "config.toml must define at least one [[models]] entry. "
-                "The legacy [llm] block is no longer supported."
+        connection = run_model.connection
+        timeout = float(connection.request_timeout)
+        self._timeout = timeout
+        self._endpoint = connection.base_url.rstrip("/") or _DEFAULT_ENDPOINTS[connection.adapter]
+        self._api_key = connection.api_key
+        self._ollama_client: _ollama_lib.Client | None = None
+        if connection.adapter == "ollama":
+            if not self._api_key.strip():
+                raise LLMPermanentError("Cloud Ollama requires an API credential")
+            self._http: httpx.Client | None = None
+            # Ownership of an injected transport transfers to this client; the
+            # public SDK close method closes the wrapper and its inner transport.
+            inner_transport = http_transport or httpx.HTTPTransport(
+                trust_env=False, retries=0
             )
-        self._models: list[dict] = models
+            wire_transport = _OllamaWireTransport(self, inner_transport)
+            self._ollama_client = _ollama_lib.Client(
+                host=self._endpoint,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
+                follow_redirects=False,
+                trust_env=False,
+                transport=wire_transport,
+            )
+        else:
+            self._http = httpx.Client(
+                timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
+                follow_redirects=False,
+                trust_env=False,
+                transport=http_transport,
+            )
 
-        # Resolve default model from agent.default_model
-        default_model: str = config.get("agent", {}).get("default_model", "")
-        self._active_idx: int = 0
-        if default_model:
-            for i, m in enumerate(self._models):
-                if m.get("model") == default_model:
-                    self._active_idx = i
-                    break
-            else:
-                raise ValueError(
-                    f"agent.default_model = {default_model!r} does not match "
-                    f"any [[models]] entry. Available: "
-                    f"{[m.get('model') for m in self._models]}"
-                )
-
-        # Embeddings config (with fallback to active LLM key/base_url)
-        emb_cfg = dict(config.get("embeddings", self._models[self._active_idx]))
-        if not emb_cfg.get("api_key"):
-            emb_cfg["api_key"] = self._models[self._active_idx].get("api_key", "")
-        if not emb_cfg.get("base_url"):
-            emb_cfg["base_url"] = self._models[self._active_idx].get("base_url", "")
-        self.emb_cfg = emb_cfg
-
-        # Embedding cache: keyed on text, bounded to avoid unbounded growth in long sessions.
-        # Avoids redundant API round-trips when the same text is embedded multiple times
-        # (e.g. tool-index queries repeated across user turns).
-        self._embed_cache: dict[str, list[float]] = {}
-        self._embed_cache_max: int = 512
-        self._embed_cache_lock = threading.Lock()
-
-        # Retry / timeout from active model config
-        _ref = self._models[self._active_idx]
-        self._max_retries: int = _ref.get("max_retries", 5)
-        self._retry_delay: float = float(_ref.get("retry_delay", 2))
-        timeout_secs: float = float(_ref.get("request_timeout", 120))
-        self._http = httpx.Client(
-            timeout=httpx.Timeout(timeout_secs, connect=10.0)
+    @classmethod
+    def for_graph_extraction(
+        cls,
+        run_model: RunModel,
+        *,
+        agent_config: AgentConfig,
+        embedding_client: EmbeddingClient | None = None,
+        http_transport: httpx.BaseTransport | None = None,
+        cancel_event: threading.Event | None = None,
+        usage_registry: TokenUsageRegistry | None = None,
+        caller_tag: str | None = None,
+    ) -> LLMClient:
+        """Build the private fixed-policy graph extraction client."""
+        if run_model.model.metadata.output_tokens is not None and run_model.model.metadata.output_tokens < 1024:
+            raise LLMPermanentError("Pinned model output capacity is below the graph extraction allowance")
+        client = cls(
+            run_model,
+            agent_config=agent_config,
+            embedding_client=embedding_client,
+            http_transport=http_transport,
+            cancel_event=cancel_event,
+            usage_registry=usage_registry,
+            caller_tag=caller_tag,
         )
+        client._graph_policy = _GraphPolicy()
+        return client
 
-        # Build one ollama.Client per ollama-provider model entry (None for others).
-        # Stored in a list parallel to self._models so lookups are O(1) by index.
-        self._ollama_clients: list[Optional[_ollama_lib.Client]] = []
-        for m in self._models:
-            if m.get("provider") == "ollama":
-                host = m.get("base_url") or "http://localhost:11434"
-                api_key = m.get("api_key", "")
-                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-                timeout_val = float(m.get("request_timeout", 120))
-                oc = _ollama_lib.Client(host=host, headers=headers,
-                                        timeout=timeout_val)
-                self._ollama_clients.append(oc)
-            else:
-                self._ollama_clients.append(None)
-
-        # Diagnostic mode for empty responses
-        self._diagnose_empty: bool = bool(
-            config.get("agent", {}).get("diagnose_empty_responses", False)
-        )
-
-        # Daily token usage tracking (per-instance)
-        self._usage_date: date = date.today()
-        self._prompt_tokens: int = 0
-        self._completion_tokens: int = 0
-
-        # Cross-instance token registry (shared across main + sub-agents)
-        self._usage_registry = usage_registry
-
-        # Cancellation support (for sub-agents)
-        self._cancel_event = cancel_event  # Optional[threading.Event]
-
-    # ------------------------------------------------------------------
-    # Multi-model API
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_ollama_connection(run_model: RunModel) -> None:
+        """Fail closed unless the admitted Ollama connection is official cloud."""
+        try:
+            parsed = urlsplit(run_model.connection.base_url)
+            valid = (
+                parsed.scheme == "https"
+                and parsed.hostname == "ollama.com"
+                and parsed.port is None
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.path in ("", "/")
+                and not parsed.query
+                and not parsed.fragment
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            raise LLMPermanentError("Cloud Ollama requires the official https://ollama.com origin")
 
     @property
-    def llm_cfg(self) -> dict:
-        """Return the currently active model config."""
-        return self._models[self._active_idx]
+    def metadata(self) -> ModelMetadata:
+        """Return the immutable typed metadata of the pinned model."""
+        return self._run_model.model.metadata
+
+    def selection_identity(self) -> SelectionBudgetIdentity:
+        """Return the sanitized budget identity of the pinned model for the guard."""
+        record = self._run_model.model
+        metadata = record.metadata
+        adapter = self._run_model.connection.adapter
+        try:
+            ceiling: int | None = repair_input_ceiling(
+                metadata,
+                local_context_tokens=self._ctx_max_tokens,
+                output_cap_required=ordinary_output_cap_required(adapter),
+            )
+        except ModelRequestBudgetError:
+            ceiling = None
+        return SelectionBudgetIdentity(
+            model_id=record.id,
+            selection_revision=self._run_model.selection_revision,
+            adapter=adapter,
+            input_ceiling=ceiling,
+            assumed=metadata.context_tokens is None and metadata.input_tokens is None,
+            metadata=metadata,
+            local_context_tokens=self._ctx_max_tokens,
+        )
+
+    @property
+    def llm_cfg(self) -> dict[str, Any]:
+        """Return a fresh, sanitized projection of the pinned model snapshot."""
+        record = self._run_model.model
+        metadata = record.metadata
+        return {
+            "id": record.id,
+            "name": record.display_name,
+            "model": record.upstream_id,
+            "provider": self._run_model.connection.adapter,
+            "provider_id": record.provider_id,
+            "metadata": {
+                "context_tokens": metadata.context_tokens,
+                "input_tokens": metadata.input_tokens,
+                "output_tokens": metadata.output_tokens,
+                "vision": metadata.vision,
+                "tool_calling": metadata.tool_calling,
+                "reasoning": metadata.reasoning,
+                "sources": dict(metadata.sources),
+            },
+            "catalog_revision": self._run_model.catalog_revision,
+            "selection_revision": self._run_model.selection_revision,
+        }
 
     @property
     def _trace_id(self) -> str:
-        """Return the current execution-context trace ID."""
+        """Return the context-local trace ID used by client log tags."""
         return self._trace_id_var.get()
 
     @_trace_id.setter
@@ -209,81 +366,616 @@ class LLMClient:
 
     @property
     def _caller_tag(self) -> str:
-        """Return the base caller label plus the context-local trace ID."""
         trace_id = self._trace_id
-        if trace_id:
-            base = self._base_caller_tag.strip()
-            return f"{base} {trace_id}".strip()
-        return self._base_caller_tag
+        return f"{self._base_caller_tag} {trace_id}".strip()
 
     def set_trace_id(self, trace_id: str | None) -> None:
-        """Set (or clear) the request-scoped trace ID woven into log tags.
-
-        The trace ID is stored in a context-local variable, then appended to the
-        caller tag so concurrent runs sharing this LLMClient do not overwrite one
-        another's log correlation state. Passing an empty value restores the bare
-        caller label in the current execution context.
-
-        Structured-log run identity (including ``trace``) is owned solely by
-        ``agent_logging.bind_run_context`` at run entry; this method only manages
-        the llm-local ``_trace_id`` used by the caller tag.
-        """
+        """Set a context-local trace label without changing the pinned model."""
         self._trace_id = trace_id
 
-    def list_models(self) -> list[dict]:
-        """Return summary of all configured models."""
-        result = []
-        for i, m in enumerate(self._models):
-            entry: dict = {
-                "name": m.get("name", f"model_{i}"),
-                "model": m.get("model", "?"),
-                "provider": m.get("provider", "?"),
-                "active": i == self._active_idx,
-            }
-            if m.get("vision"):
-                entry["vision"] = True
-            # Normalize aliases: accept list or comma-separated string
-            raw_aliases = m.get("aliases", [])
-            if isinstance(raw_aliases, str):
-                raw_aliases = [a.strip() for a in raw_aliases.split(",") if a.strip()]
-            if raw_aliases:
-                entry["aliases"] = raw_aliases
-            result.append(entry)
-        return result
+    def list_models(self) -> list[dict[str, Any]]:
+        """Return only the pinned sanitized model projection."""
+        return [{**self.llm_cfg, "active": True}]
 
     def set_model(self, name: str) -> bool:
-        """Switch the active model by name. Returns False if not found."""
-        for i, m in enumerate(self._models):
-            if m.get("name", "") == name:
-                self._active_idx = i
-                logger.info("Switched active model to '%s' (%s)", name, m.get("model", "?"))
+        """Reject retargeting: an admitted client cannot change models."""
+        del name
+        raise LLMPermanentError("LLMClient is pinned; start a new run to select another model")
+
+    @contextmanager
+    def bind_attempt(
+        self,
+        state: CallAttemptState,
+        *,
+        manual: bool = False,
+        definition_revision: str | int = 0,
+    ) -> Iterator[None]:
+        """Bind one public invocation to its shared logical-request state."""
+        if not isinstance(state, CallAttemptState):
+            raise CallAttemptStateError("invalid_state", "state must be CallAttemptState")
+        binding = _AttemptBinding(state, manual, definition_revision)
+        token = self._binding_var.set(binding)
+        try:
+            yield
+        finally:
+            self._binding_var.reset(token)
+
+    def chat(
+        self,
+        messages: list[dict],
+        system: str | None = None,
+        progress_cb=None,
+        json_mode: bool = False,
+    ) -> str:
+        """Send one pinned text/JSON request; retry orchestration belongs to ReAct."""
+
+        def invoke() -> str:
+            result = self._invoke_provider(
+                messages, system, tools=None, json_mode=json_mode, progress_cb=progress_cb
+            )
+            if not isinstance(result, str):
+                raise LLMError("Provider returned an unexpected response")
+            return result
+
+        return self._logged_chat_invocation("text", invoke)
+
+    def chat_with_fallback(
+        self,
+        messages: list[dict],
+        system: str | None = None,
+        progress_cb=None,
+        json_mode: bool = False,
+    ) -> str:
+        """Compatibility wrapper; delegates once without model/protocol fallback."""
+        return self.chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system: str | None = None,
+        progress_cb=None,
+    ) -> ChatResponse:
+        """Send one native-tool request, or report local unsupported capability."""
+        if self._run_model.connection.adapter not in _NATIVE_TOOL_PROVIDERS:
+            raise NotImplementedError(
+                f"Native tool calling is unsupported for {self._run_model.connection.adapter}"
+            )
+
+        def invoke() -> ChatResponse:
+            result = self._invoke_provider(
+                messages, system, tools=tools, progress_cb=progress_cb
+            )
+            if not isinstance(result, ChatResponse):
+                raise LLMError("Provider returned an unexpected native-tool response")
+            return result
+
+        return self._logged_chat_invocation("native tools", invoke)
+
+    def _logged_chat_invocation(
+        self,
+        mode: str,
+        invoke: Callable[[], _ChatResult],
+    ) -> _ChatResult:
+        """Emit one structured request event and one safe event per classified failure."""
+        model = self._run_model.model.upstream_id
+        suffix = " (tools)" if mode == "native tools" else ""
+        agent_logging.log_event(
+            agent_logging.LogEvent.LLM_CALL,
+            f"LLM request{suffix} → {model}",
+            level=logging.INFO,
+            logger=slog,
+            model=model,
+        )
+        started = time.monotonic()
+        try:
+            return invoke()
+        except _LLM_CHAT_ERRORS as exc:
+            duration_ms = max(0, int((time.monotonic() - started) * 1000))
+            agent_logging.log_event(
+                agent_logging.LogEvent.LLM_FAILED,
+                f"LLM request failed: {model}",
+                level=logging.ERROR,
+                logger=slog,
+                model=model,
+                dur_ms=duration_ms,
+                err=_safe_llm_failure_category(exc),
+            )
+            raise
+
+    def chat_with_tools_fallback(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system: str | None = None,
+        progress_cb=None,
+    ) -> ChatResponse:
+        """Compatibility wrapper; delegates once without hidden fallback."""
+        return self.chat_with_tools(messages, tools, system, progress_cb=progress_cb)
+
+    def _invoke_provider(
+        self,
+        messages: list[dict],
+        system: str | None,
+        *,
+        tools: list[dict] | None,
+        json_mode: bool = False,
+        progress_cb=None,
+    ) -> str | ChatResponse:
+        self._validate_vision(messages)
+        mode = "native" if tools is not None else "json"
+        binding = self._binding_var.get()
+        if binding is None:
+            state = CallAttemptState(self._max_retries, self._retry_delay)
+            with self.bind_attempt(state):
+                return self._invoke_provider_bound(
+                    messages, system, tools=tools, json_mode=json_mode,
+                    mode=mode, progress_cb=progress_cb,
+                )
+        return self._invoke_provider_bound(
+            messages, system, tools=tools, json_mode=json_mode,
+            mode=mode, progress_cb=progress_cb,
+        )
+
+    def _invoke_provider_bound(
+        self,
+        messages: list[dict],
+        system: str | None,
+        *,
+        tools: list[dict] | None,
+        json_mode: bool,
+        mode: str,
+        progress_cb=None,
+    ) -> str | ChatResponse:
+        adapter = self._run_model.connection.adapter
+        module = _PROVIDER_MODULES[adapter]
+        context = self._provider_context(mode)
+        invocation_token = None
+        if adapter == "ollama":
+            tools_json = None
+            if tools is not None:
+                try:
+                    tools_json = json.dumps(
+                        tools, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    raise LLMPermanentError(
+                        "Cloud Ollama tool definitions must be valid JSON"
+                    ) from None
+            invocation_token = self._ollama_invocation_var.set(
+                _OllamaInvocation(mode=mode, tools_json=tools_json)
+            )
+        try:
+            return module.chat(
+                context,
+                messages,
+                system,
+                tools=tools,
+                json_mode=json_mode,
+                progress_cb=progress_cb,
+            )
+        finally:
+            if invocation_token is not None:
+                self._ollama_invocation_var.reset(invocation_token)
+
+    def _provider_context(self, mode: str) -> ProviderContext:
+        return ProviderContext(
+            model=self._run_model.model,
+            adapter=self._run_model.connection.adapter,
+            mode=mode,
+            send_json=lambda payload: self._send_json(payload, mode),
+            track_usage=self._track_usage,
+            caller_tag=self._caller_tag,
+            diagnose_empty=self._diagnose_empty,
+            cancel_event=self._cancel_event,
+            ollama_client=self._ollama_client,
+            graph_extraction=self._graph_policy is not None,
+        )
+
+    @staticmethod
+    def _messages_have_images(messages: list[dict]) -> bool:
+        for message in messages:
+            if message.get("images"):
                 return True
-        logger.warning("Model '%s' not found in configured models", name)
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") in {"image", "image_url"}
+                for part in content
+            ):
+                return True
         return False
 
-    def close_http(self) -> None:
-        """
-        Close the HTTP transport for the currently active model.
+    def _validate_vision(self, messages: list[dict]) -> None:
+        if self._messages_have_images(messages) and self._run_model.model.metadata.vision is not True:
+            raise LLMPermanentError(
+                "The pinned model does not have verified vision support; select a verified vision model with /models or start a new task."
+            )
 
-        Used by SubAgentRecord.cancel() to interrupt an in-flight LLM request
-        immediately rather than waiting for it to time out.
-        """
-        # Always close the shared httpx client (used by openai/google/anthropic)
+    def _send_json(self, payload: dict[str, Any], mode: str) -> httpx.Response:
+        if self._run_model.connection.adapter == "ollama":
+            raise LLMPermanentError("Ollama requests must use the pinned SDK transport")
+        binding = self._binding_var.get()
+        if binding is None:
+            raise LLMPermanentError("Provider send is missing an attempt binding")
+        if binding.sent:
+            raise LLMPermanentError("A public provider invocation may send only once")
+        request = self._prepare_request(payload, mode, binding.definition_revision)
+        if self._preview_var.get():
+            raise _PreviewCaptured(
+                self._preview_for_request(request, mode, binding.definition_revision)
+            )
+        self._check_cancelled()
+        binding.state.begin_outbound_attempt(mode, manual=binding.manual)
+        binding.sent = True
+        if self._http is None:
+            raise LLMPermanentError("HTTP transport is unavailable")
         try:
-            self._http.close()
-        except Exception:
-            pass
-        # Also close the ollama client's internal httpx transport if active
-        oc = self._ollama_clients[self._active_idx] if self._ollama_clients else None
-        if oc is not None:
-            try:
-                oc._client.close()
-            except Exception:
-                pass
+            response = self._http.send(
+                request, auth=_NoInheritedAuth(), follow_redirects=False
+            )
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as exc:
+            self._raise_sanitized_status(exc.response)
+        except httpx.HTTPError as exc:
+            self._raise_safe_transport_error(exc)
+        raise AssertionError("unreachable")
 
-    # ------------------------------------------------------------------
-    # Token tracking
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_request(method: str = "POST") -> httpx.Request:
+        """Return a credential-free placeholder request for exposed errors."""
+        return httpx.Request(method, "https://provider.invalid/")
+
+    @classmethod
+    def _raise_sanitized_status(
+        cls,
+        response: httpx.Response,
+        *,
+        error_text: str | None = None,
+    ) -> None:
+        """Map status categories while detaching original endpoint/body/headers."""
+        status = response.status_code
+        raw_text = error_text if error_text is not None else response.text
+        is_context = status in {400, 413} and is_context_overflow_message(raw_text)
+        if is_context:
+            raise LLMContextOverflowError(
+                "Provider rejected request: context_length_exceeded",
+                status_code=status,
+            ) from None
+        if status in {408, 429, 500, 502, 503, 504}:
+            safe_request = cls._safe_request(response.request.method if response.request else "POST")
+            safe_response = httpx.Response(status, request=safe_request)
+            raise httpx.HTTPStatusError(
+                f"Provider returned HTTP {status}",
+                request=safe_request,
+                response=safe_response,
+            ) from None
+
+        permanent_code = None
+        try:
+            error_payload = json.loads(raw_text)
+        except (ValueError, TypeError):
+            error_payload = None
+        if isinstance(error_payload, dict):
+            permanent_code = provider_error_code(error_payload.get("error"))
+        if status in {401, 403, 404} or permanent_code is not None:
+            message = "Provider rejected the request"
+            if permanent_code is not None:
+                message += f" ({permanent_code})"
+            raise LLMPermanentError(message) from None
+
+        safe_request = cls._safe_request(response.request.method if response.request else "POST")
+        safe_response = httpx.Response(status, request=safe_request)
+        raise httpx.HTTPStatusError(
+            f"Provider returned HTTP {status}",
+            request=safe_request,
+            response=safe_response,
+        ) from None
+
+    def _prepare_request(
+        self,
+        payload: dict[str, Any],
+        mode: str,
+        definition_revision: str | int | None,
+    ) -> httpx.Request:
+        """Validate, fit, and serialize the complete final request before send."""
+        adapter = self._run_model.connection.adapter
+        body = json.loads(json.dumps(payload, ensure_ascii=False))
+        if not isinstance(body, dict):
+            raise LLMPermanentError("Provider request payload must be an object")
+        upstream = self._run_model.model.upstream_id
+        if "model" in body and body["model"] != upstream:
+            raise LLMPermanentError("Provider payload model does not match the pinned model")
+        if self._graph_policy is not None:
+            self._apply_graph_policy(body, adapter, mode)
+
+        initial_request = self._make_http_request(body, mode)
+        initial_tokens = self._estimate_wire_input(initial_request, definition_revision)
+        fixed_cap = self._graph_policy.output_cap if self._graph_policy else None
+        required = ordinary_output_cap_required(adapter) and fixed_cap is None
+        initial_budget = self._compute_budget(
+            initial_tokens, output_cap_required=required, fixed_output_cap=fixed_cap
+        )
+        if required:
+            body["max_tokens"] = initial_budget.output_cap
+        final_request = self._make_http_request(body, mode)
+        final_tokens = self._estimate_wire_input(final_request, definition_revision)
+        self._compute_budget(
+            final_tokens,
+            output_cap_required=required,
+            fixed_output_cap=fixed_cap,
+        )
+        return final_request
+
+    def _make_http_request(self, payload: dict[str, Any], mode: str) -> httpx.Request:
+        adapter = self._run_model.connection.adapter
+        url = self._route(mode)
+        headers = {"Content-Type": "application/json"}
+        if adapter in {"openai", "openrouter"}:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        elif adapter == "anthropic":
+            headers.update({"x-api-key": self._api_key, "anthropic-version": "2023-06-01"})
+        elif adapter == "google":
+            headers["x-goog-api-key"] = self._api_key
+        request = httpx.Request("POST", url, headers=headers, json=payload)
+        request.extensions["timeout"] = httpx.Timeout(
+            self._timeout, connect=min(10.0, self._timeout)
+        ).as_dict()
+        return request
+
+    def _route(self, mode: str) -> str:
+        adapter = self._run_model.connection.adapter
+        if adapter == "openai":
+            path = _api_path(self._endpoint, "/v1/chat/completions", "/chat/completions", "/v1")
+        elif adapter == "openrouter":
+            path = _api_path(self._endpoint, "/api/v1/chat/completions", "/chat/completions", "/api/v1")
+        elif adapter == "anthropic":
+            path = _api_path(self._endpoint, "/v1/messages", "/messages", "/v1")
+        elif adapter == "google":
+            if mode == "native":
+                path = _api_path(
+                    self._endpoint,
+                    "/v1beta/openai/chat/completions",
+                    "/openai/chat/completions",
+                    "/v1beta",
+                )
+            else:
+                model = quote(self._run_model.model.upstream_id, safe="")
+                path = _api_path(
+                    self._endpoint,
+                    f"/v1beta/models/{model}:generateContent",
+                    f"/models/{model}:generateContent",
+                    "/v1beta",
+                )
+        else:
+            raise LLMPermanentError("Ollama route is provided by its SDK")
+        return f"{self._endpoint.rstrip('/')}{path}"
+
+    def _estimate_wire_input(
+        self, request: httpx.Request, definition_revision: str | int | None
+    ) -> int:
+        try:
+            text = request.content.decode("utf-8")
+            return estimate_request_payload_tokens(
+                text,
+                model=self._run_model.model.upstream_id,
+                definition_revision=definition_revision,
+            )
+        except (UnicodeDecodeError, TypeError, ValueError):
+            raise LLMPermanentError("Provider request could not be estimated safely") from None
+
+    def _compute_budget(
+        self,
+        input_tokens: int,
+        *,
+        output_cap_required: bool,
+        fixed_output_cap: int | None,
+    ) -> ModelRequestBudget:
+        try:
+            return compute_request_budget(
+                self._run_model.model.metadata,
+                input_tokens=input_tokens,
+                local_context_tokens=self._ctx_max_tokens,
+                output_cap_required=output_cap_required,
+                fixed_output_cap=fixed_output_cap,
+            )
+        except ModelRequestBudgetError as exc:
+            message = f"Provider request rejected by local budget ({exc.code})"
+            if exc.code in {"input_exceeds_budget", "no_input_budget"}:
+                try:
+                    ceiling = repair_input_ceiling(
+                        self._run_model.model.metadata,
+                        local_context_tokens=self._ctx_max_tokens,
+                        output_cap_required=output_cap_required,
+                        fixed_output_cap=fixed_output_cap,
+                    )
+                except ModelRequestBudgetError:
+                    ceiling = None
+                if ceiling is not None and input_tokens > ceiling:
+                    raise LLMContextOverflowError(
+                        message,
+                        input_tokens=input_tokens,
+                        repair_input_ceiling=ceiling,
+                    ) from None
+            raise LLMPermanentError(message) from None
+
+    def _apply_graph_policy(self, payload: dict[str, Any], adapter: str, mode: str) -> None:
+        policy = self._graph_policy
+        if policy is None:
+            return
+        if adapter in {"openai", "openrouter"} or (adapter == "google" and mode == "native"):
+            cap_key = "max_completion_tokens" if adapter in {"openai", "openrouter"} else "max_tokens"
+            payload[cap_key] = policy.output_cap
+            if not _is_reasoning_model(self._run_model.model.upstream_id):
+                payload["temperature"] = policy.temperature
+        elif adapter == "anthropic":
+            payload["max_tokens"] = policy.output_cap
+            payload["temperature"] = policy.temperature
+        elif adapter == "google":
+            config = payload.setdefault("generationConfig", {})
+            config["maxOutputTokens"] = policy.output_cap
+            config["temperature"] = policy.temperature
+        elif adapter == "ollama":
+            options = payload.setdefault("options", {})
+            options["num_predict"] = policy.output_cap
+            options["temperature"] = policy.temperature
+
+    def _handle_ollama_transport_request(
+        self,
+        request: httpx.Request,
+        inner_transport: httpx.BaseTransport,
+    ) -> httpx.Response:
+        """Validate/finalize SDK JSON, apply budget/count, and perform one send."""
+        if (
+            request.method != "POST"
+            or request.url.scheme != "https"
+            or request.url.host != "ollama.com"
+            or request.url.port is not None
+            or request.url.path != "/api/chat"
+            or request.url.query
+            or request.url.fragment
+            or request.headers.get("authorization") != f"Bearer {self._api_key}"
+        ):
+            raise LLMPermanentError("Cloud Ollama SDK request failed its origin or auth policy")
+        try:
+            payload = json.loads(request.read())
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            raise LLMPermanentError("Cloud Ollama SDK produced an invalid request") from None
+        if not isinstance(payload, dict) or payload.get("model") != self._run_model.model.upstream_id:
+            raise LLMPermanentError("Cloud Ollama SDK request does not match the pinned model")
+        if payload.get("stream") is not False:
+            raise LLMPermanentError("Cloud Ollama requests must be non-streaming")
+        binding = self._binding_var.get()
+        invocation = self._ollama_invocation_var.get()
+        if binding is None or invocation is None:
+            raise LLMPermanentError("Cloud Ollama send is missing an invocation binding")
+        if binding.sent:
+            raise LLMPermanentError("A public provider invocation may send only once")
+
+        sdk_tools = payload.get("tools")
+        if invocation.mode == "native":
+            if invocation.tools_json is None or (sdk_tools is not None and sdk_tools != []):
+                raise LLMPermanentError("Cloud Ollama SDK native tool placeholder is invalid")
+            try:
+                payload["tools"] = json.loads(invocation.tools_json)
+            except (json.JSONDecodeError, TypeError):
+                raise LLMPermanentError("Cloud Ollama tool definitions are invalid") from None
+        elif sdk_tools and sdk_tools != []:
+            raise LLMPermanentError("Cloud Ollama JSON request unexpectedly contains tools")
+
+        if self._graph_policy is not None:
+            self._apply_graph_policy(payload, "ollama", invocation.mode)
+        headers = [
+            (name, value)
+            for name, value in request.headers.multi_items()
+            if name.lower() not in {"content-length", "transfer-encoding"}
+        ]
+        final_request = httpx.Request(
+            request.method,
+            request.url,
+            headers=headers,
+            json=payload,
+            extensions=dict(request.extensions),
+        )
+        input_tokens = self._estimate_wire_input(final_request, binding.definition_revision)
+        fixed_cap = self._graph_policy.output_cap if self._graph_policy else None
+        self._compute_budget(
+            input_tokens,
+            output_cap_required=False,
+            fixed_output_cap=fixed_cap,
+        )
+        self._check_cancelled()
+        if self._preview_var.get():
+            raise _PreviewCaptured(
+                self._preview_for_request(
+                    final_request, invocation.mode, binding.definition_revision
+                )
+            )
+
+        binding.state.begin_outbound_attempt(invocation.mode, manual=binding.manual)
+        binding.sent = True
+        try:
+            return inner_transport.handle_request(final_request)
+        except httpx.HTTPError as exc:
+            self._raise_safe_transport_error(exc)
+        except TimeoutError:
+            safe_request = self._safe_request()
+            raise httpx.TimeoutException(
+                "Provider request timed out", request=safe_request
+            ) from None
+        except ConnectionError:
+            safe_request = self._safe_request()
+            raise httpx.ConnectError(
+                "Provider connection failed", request=safe_request
+            ) from None
+        raise AssertionError("unreachable")
+
+    def _preview_for_request(
+        self,
+        request: httpx.Request,
+        mode: str,
+        definition_revision: str | int | None,
+    ) -> RequestPreview:
+        """Build a sanitized preview from the exact finalized HTTP request."""
+        input_tokens = self._estimate_wire_input(request, definition_revision)
+        fixed_cap = self._graph_policy.output_cap if self._graph_policy else None
+        required = (
+            ordinary_output_cap_required(self._run_model.connection.adapter) and fixed_cap is None
+        )
+        budget = self._compute_budget(
+            input_tokens,
+            output_cap_required=required,
+            fixed_output_cap=fixed_cap,
+        )
+        return RequestPreview(
+            canonical_model_id=self._run_model.model.id,
+            mode=mode,
+            input_tokens=input_tokens,
+            hard_input_budget=budget.hard_input_budget,
+            output_cap=budget.output_cap,
+            completion_reserve=budget.completion_reserve,
+            assumed_context=budget.assumed_context,
+            assumed_completion_reserve=budget.assumed_completion_reserve,
+            definition_revision=definition_revision,
+            budget=budget,
+        )
+
+    def preview_request(
+        self,
+        messages: list[dict],
+        system: str | None = None,
+        *,
+        tools: list[dict] | None = None,
+        json_mode: bool = False,
+        definition_revision: str | int = 0,
+    ) -> RequestPreview:
+        """Assemble and budget the final provider wire request without sending."""
+        self._validate_vision(messages)
+        if tools is not None and self._run_model.connection.adapter not in _NATIVE_TOOL_PROVIDERS:
+            raise NotImplementedError(
+                f"Native tool calling is unsupported for {self._run_model.connection.adapter}"
+            )
+        token = self._preview_var.set(True)
+        try:
+            try:
+                with self.bind_attempt(
+                    CallAttemptState(self._max_retries, self._retry_delay),
+                    definition_revision=definition_revision,
+                ):
+                    self._invoke_provider_bound(
+                        messages,
+                        system,
+                        tools=tools,
+                        json_mode=json_mode,
+                        mode="native" if tools is not None else "json",
+                    )
+            except _PreviewCaptured as captured:
+                return captured.preview
+            if self._run_model.connection.adapter == "ollama":
+                raise LLMPermanentError("Cloud Ollama preview did not reach its SDK request hook")
+            raise LLMPermanentError("Provider preview did not reach the final send gate")
+        finally:
+            self._preview_var.reset(token)
 
     def _track_usage(self, prompt: int, completion: int) -> None:
         today = date.today()
@@ -293,12 +985,11 @@ class LLMClient:
             self._completion_tokens = 0
         self._prompt_tokens += prompt
         self._completion_tokens += completion
-        # Also record in the shared cross-instance registry
         if self._usage_registry is not None:
-            model_name = self._models[self._active_idx].get("model", "unknown")
-            self._usage_registry.record(model_name, prompt, completion)
+            self._usage_registry.record(self._run_model.model.id, prompt, completion)
 
-    def get_today_usage(self) -> dict:
+    def get_today_usage(self) -> dict[str, Any]:
+        """Return per-client token usage counters."""
         return {
             "date": self._usage_date.isoformat(),
             "prompt_tokens": self._prompt_tokens,
@@ -306,387 +997,60 @@ class LLMClient:
             "total_tokens": self._prompt_tokens + self._completion_tokens,
         }
 
-    # ------------------------------------------------------------------
-    # Provider backend context
-    # ------------------------------------------------------------------
-
-    def _ctx(self) -> ProviderContext:
-        """Build the dependency bag passed to extracted provider backends.
-
-        Bundles the mutable client state each provider module needs — the
-        active-model config accessor, HTTP transport, retry settings,
-        cancellation event, caller tag, usage tracking, and empty-response
-        diagnostics — so backends run without a reference to LLMClient itself.
-        """
-        return ProviderContext(
-            get_cfg=lambda: self.llm_cfg,
-            http=self._http,
-            max_retries=self._max_retries,
-            retry_delay=self._retry_delay,
-            cancel_event=self._cancel_event,
-            caller_tag=self._caller_tag,
-            diagnose_empty=self._diagnose_empty,
-            track_usage=self._track_usage,
-            emb_cfg=self.emb_cfg,
-        )
-
-    def _provider_chat(
-        self,
-        messages: list[dict],
-        system: str | None,
-        *,
-        tools: list[dict] | None = None,
-        json_mode: bool = False,
-        progress_cb=None,
-    ) -> str | ChatResponse:
-        """Route a chat request to the active provider's backend ``chat()``.
-
-        The single dispatch seam for every provider: looks up the backend module
-        in ``_PROVIDER_MODULES`` by the active model's ``provider`` and forwards
-        the shared kwargs. Ollama additionally needs its per-model
-        ``ollama.Client``. Returns ``str`` on the text path (``tools`` is None)
-        and ``ChatResponse`` on the native tool-calling path.
-        """
-        provider = self.llm_cfg.get("provider", "openai")
-        mod = _PROVIDER_MODULES.get(provider)
-        if mod is None:
-            raise LLMError(f"Unknown LLM provider: {provider!r}")
-        kwargs: dict[str, Any] = dict(
-            tools=tools, json_mode=json_mode, progress_cb=progress_cb,
-        )
-        ctx = self._ctx()
-        if provider == "ollama":
-            # Resolve the active ollama.Client lazily on each attempt so a
-            # mid-flight set_model() to a different ollama host is picked up by
-            # retries instead of POSTing the new model to a stale client.
-            ctx.get_ollama_client = lambda: self._ollama_clients[self._active_idx]
-        return mod.chat(ctx, messages, system, **kwargs)
-
-    # ------------------------------------------------------------------
-    # Chat
-    # ------------------------------------------------------------------
-
-    def chat(self, messages: list[dict], system: str | None = None, progress_cb=None,
-             json_mode: bool = False) -> str:
-        """Send a chat request and return the assistant text.
-
-        json_mode=True requests the provider to constrain output to valid JSON.
-        Supported by OpenAI/OpenRouter (response_format), Google (responseMimeType),
-        and Ollama (format="json"). Anthropic falls back to prompt-only enforcement.
-        """
-        model_id = self.llm_cfg.get("model", "?")
-        agent_logging.log_event(
-            agent_logging.LogEvent.LLM_CALL,
-            f"LLM request \u2192 {model_id}",
-            level=logging.INFO,
-            logger=slog,
-            model=model_id,
-        )
-        _t0 = time.perf_counter()
-        try:
-            return self._provider_chat(
-                messages, system, json_mode=json_mode, progress_cb=progress_cb,
-            )  # type: ignore[return-value]
-        except _LLM_CHAT_ERRORS as exc:
-            agent_logging.log_event(
-                agent_logging.LogEvent.LLM_FAILED,
-                f"LLM request failed: {model_id}",
-                level=logging.ERROR,
-                logger=slog,
-                model=model_id,
-                dur_ms=int((time.perf_counter() - _t0) * 1000),
-                err=str(exc),
-            )
-            raise
-
-    @staticmethod
-    def _messages_have_images(messages: list[dict]) -> bool:
-        """True if any message carries image data the model must be able to see.
-
-        Detects the ReAct loop's ``images`` field as well as provider-style
-        multimodal content lists (``[{"type": "image_url", ...}]``).
-        """
-        for m in messages:
-            if m.get("images"):
-                return True
-            content = m.get("content")
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
-                        return True
-        return False
-
-    def _run_with_fallback(
-        self,
-        messages: list[dict],
-        call_fn: Callable,
-        progress_cb=None,
-    ) -> Any:
-        """Run ``call_fn`` against the active model (single-model — no fallback chain).
-
-        Shared implementation for ``chat_with_fallback`` and
-        ``chat_with_tools_fallback``. Handles vision routing: when images are
-        present and the active model is not vision-capable, scans all configured
-        ``[[models]]`` entries for the first with ``vision = true`` (by config
-        order), routes the request there, and reverts to the primary model
-        afterward in a ``finally`` block (success or error).
-
-        ``LLMPermanentError`` and ``LLMCancelledError`` propagate directly. On
-        any error ``_active_idx`` is restored to the primary model before
-        propagating.
-        """
-        primary_idx = self._active_idx
-        _tag = f"[{self._caller_tag.strip()}] " if self._caller_tag.strip() else ""
-
-        # Vision routing: when images are present, ensure a vision-capable model
-        # is used. Scan ALL configured models (independent of any fallback list)
-        # for the first with vision=true by config order.
-        vision_switch = False
-        if self._messages_have_images(messages):
-            if not self._models[primary_idx].get("vision"):
-                vision_models = [
-                    i for i, m in enumerate(self._models) if m.get("vision")
-                ]
-                if not vision_models:
-                    self._active_idx = primary_idx  # restore before propagating
-                    configured = [m.get("model", "?") for m in self._models]
-                    raise LLMPermanentError(
-                        "This request includes an image, but no vision-capable model is "
-                        "configured. Set `vision = true` on a model in [[models]]. "
-                        f"Configured models: {configured}"
-                    )
-                target = self._models[vision_models[0]].get("model", "?")
-                if progress_cb:
-                    progress_cb(
-                        f"⚠️ Active model is not vision-capable; switching to vision model '{target}'…"
-                    )
-                self._active_idx = vision_models[0]
-                vision_switch = True
-
-        try:
-            return call_fn()
-        except LLMPermanentError:
-            raise  # permanent errors propagate — no retry, no error log
-        except LLMCancelledError:
-            raise  # user cancelled — no retry, no error log
-        except _LLM_CALL_ERRORS as exc:
-            logger.error("%sActive model failed: %s", _tag, exc)
-            raise
-        finally:
-            if vision_switch:
-                self._active_idx = primary_idx
-
-    def chat_with_fallback(self, messages: list[dict], system: str | None = None,
-                           progress_cb=None, json_mode: bool = False) -> str:
-        """
-        Like chat(), but with vision routing: when the request contains images
-        and the active model is not vision-capable, scans all configured
-        ``[[models]]`` for the first with ``vision = true`` (by config order),
-        routes the request there, and reverts to the primary model afterward.
-
-        The LLM client is single-model — there is no fallback chain. Transient
-        errors on the primary model propagate to the caller. The method name is
-        preserved for backward compatibility with existing call sites.
-
-        ``LLMPermanentError`` is raised when images are present but no
-        vision-capable model is configured.
-        """
-        return self._run_with_fallback(
-            messages,
-            lambda: self.chat(messages, system, progress_cb=progress_cb, json_mode=json_mode),
-            progress_cb=progress_cb,
-        )
-
-    # ------------------------------------------------------------------
-    # Native tool calling methods
-    # ------------------------------------------------------------------
-
-    def chat_with_tools(
-        self, messages: list[dict], tools: list[dict],
-        system: str | None = None, progress_cb=None,
-    ) -> ChatResponse:
-        """Send a chat request with tool definitions and return a structured response.
-
-        Providers without a native implementation (e.g., ``anthropic``) raise
-        ``NotImplementedError`` so the caller can fall back to ``chat(json_mode=True)``.
-        """
-        provider = self.llm_cfg.get("provider", "openai")
-        model_id = self.llm_cfg.get("model", "?")
-        # Guard before logging: providers without a native backend (e.g.
-        # anthropic) must raise NotImplementedError without emitting a phantom
-        # LLM_CALL entry for a request that is never dispatched.
-        if provider not in _NATIVE_TOOL_PROVIDERS:
-            raise NotImplementedError(
-                f"Native tool calling not implemented for provider '{provider}'"
-            )
-        agent_logging.log_event(
-            agent_logging.LogEvent.LLM_CALL,
-            f"LLM request (tools) → {model_id}",
-            level=logging.INFO,
-            logger=slog,
-            model=model_id,
-        )
-        _t0 = time.perf_counter()
-        try:
-            return self._provider_chat(
-                messages, system, tools=tools, progress_cb=progress_cb,
-            )  # type: ignore[return-value]
-        except _LLM_CHAT_ERRORS as exc:
-            agent_logging.log_event(
-                agent_logging.LogEvent.LLM_FAILED,
-                f"LLM request (tools) failed: {model_id}",
-                level=logging.ERROR,
-                logger=slog,
-                model=model_id,
-                dur_ms=int((time.perf_counter() - _t0) * 1000),
-                err=str(exc),
-            )
-            raise
-
-    def chat_with_tools_fallback(
-        self, messages: list[dict], tools: list[dict],
-        system: str | None = None, progress_cb=None,
-    ) -> ChatResponse:
-        """Like chat_with_tools(), but with vision routing (single-model, no fallback chain).
-
-        Mirrors ``chat_with_fallback()``: same vision all-models scan and
-        ``_active_idx`` restore logic. Calls ``chat_with_tools()`` instead of
-        ``chat()``. The LLM client is single-model — transient errors propagate
-        to the caller with no fallback attempt.
-        """
-        return self._run_with_fallback(
-            messages,
-            lambda: self.chat_with_tools(messages, tools, system, progress_cb=progress_cb),
-            progress_cb=progress_cb,
-        )
-
-    # ------------------------------------------------------------------
-    # Embeddings
-    # ------------------------------------------------------------------
-
     def embed(self, text: str) -> list[float]:
-        """Return an embedding vector for the given text.
-
-        Results are cached in-memory (up to _embed_cache_max entries) so repeated
-        calls with the same text — common during tool-index searches across turns —
-        skip the API round-trip entirely.
-        """
-        with self._embed_cache_lock:
-            if text in self._embed_cache:
-                logger.debug("embed: cache hit (text_len=%d)", len(text))
-                return self._embed_cache[text]
-
-        provider = self.emb_cfg.get("provider", "openai")
-        logger.debug("embed: calling %s provider (text_len=%d)", provider, len(text))
-        try:
-            if provider in ("openai", "openrouter"):
-                vector = openai_provider.embed(self._ctx(), text)
-            elif provider == "google":
-                vector = google_provider.embed(self._ctx(), text)
-            else:
-                logger.warning(
-                    "Embedding provider '%s' has no native support; "
-                    "attempting OpenAI-compatible endpoint. "
-                    "Configure [embeddings] provider as 'openai', 'openrouter', or 'google'.",
-                    provider,
-                )
-                vector = openai_provider.embed(self._ctx(), text)
-        except _LLM_CALL_ERRORS as exc:
-            logger.error("Embedding error: %s", exc)
-            raise
-
-        self._cache_embedding(text, vector)
-        return vector
-
-    def _cache_embedding(self, text: str, vector: list[float]) -> None:
-        """Store a single embedding vector in the bounded in-memory cache.
-
-        Evicts the oldest entry (FIFO via dict insertion order, Python 3.7+) when
-        the cache is full. Locking is required because concurrent sub-agents share
-        this LLMClient and can race on the check-evict-insert sequence.
-        """
-        with self._embed_cache_lock:
-            if len(self._embed_cache) >= self._embed_cache_max:
-                oldest = next(iter(self._embed_cache))
-                del self._embed_cache[oldest]
-                logger.debug("embed: cache evicted oldest entry")
-            self._embed_cache[text] = vector
-            cache_size = len(self._embed_cache)
-        logger.debug(
-            "embed: cached vector (dim=%d, cache=%d/%d)",
-            len(vector),
-            cache_size,
-            self._embed_cache_max,
-        )
+        """Delegate embedding work to the independently configured client."""
+        if self._embedding_client is None:
+            raise EmbeddingUnavailableError("Embedding client was not configured for this run.")
+        return self._embedding_client.embed(text)
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Return embedding vectors for multiple text strings in one batch call.
+        """Delegate embedding batch work unchanged to its independent owner."""
+        if self._embedding_client is None:
+            raise EmbeddingUnavailableError("Embedding client was not configured for this run.")
+        return self._embedding_client.embed_batch(texts)
 
-        OpenAI/OpenRouter and Google providers use their native batch embedding
-        endpoints; other providers fall back to serial ``embed()`` calls. Cache
-        hits are served from memory, and misses are cached after the batch call.
-        """
-        if not texts:
-            return []
+    def close_http(self) -> None:
+        """Close the owned provider transport to interrupt in-flight requests."""
+        self.close()
 
-        results: list[Optional[list[float]]] = [None] * len(texts)
-        missing_indices: list[int] = []
-        missing_texts: list[str] = []
-
-        with self._embed_cache_lock:
-            for idx, text in enumerate(texts):
-                if text in self._embed_cache:
-                    logger.debug("embed_batch: cache hit (text_len=%d)", len(text))
-                    results[idx] = self._embed_cache[text]
-                else:
-                    missing_indices.append(idx)
-                    missing_texts.append(text)
-
-        if not missing_texts:
-            return [v for v in results if v is not None]
-
-        provider = self.emb_cfg.get("provider", "openai")
-        logger.debug(
-            "embed_batch: calling %s provider for %d texts",
-            provider,
-            len(missing_texts),
-        )
-        try:
-            if provider in ("openai", "openrouter"):
-                vectors = openai_provider.embed_batch(self._ctx(), missing_texts)
-            elif provider == "google":
-                vectors = google_provider.embed_batch(self._ctx(), missing_texts)
-            else:
-                logger.warning(
-                    "Embedding provider '%s' has no native batch support; "
-                    "falling back to serial embed() calls.",
-                    provider,
-                )
-                vectors = [self.embed(text) for text in missing_texts]
-        except _LLM_CALL_ERRORS as exc:
-            logger.error("Batch embedding error: %s", exc)
-            raise
-
-        for text, vector in zip(missing_texts, vectors, strict=True):
-            self._cache_embedding(text, vector)
-        for idx, vector in zip(missing_indices, vectors, strict=True):
-            results[idx] = vector
-
-        return [v for v in results if v is not None]
-
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
-
-    def close(self):
-        """Close all HTTP transports owned by this client. Idempotent."""
-        try:
+    def close(self) -> None:
+        """Close only transports owned by this run-local client; idempotently."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._http is not None:
             self._http.close()
-        except Exception:
-            pass
-        for oc in self._ollama_clients:
-            if oc is not None:
-                try:
-                    oc._client.close()
-                except Exception:
-                    pass
+        if self._ollama_client is not None:
+            self._ollama_client.close()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise LLMCancelledError("LLM request cancelled")
+
+    @classmethod
+    def _raise_safe_transport_error(cls, exc: httpx.HTTPError) -> None:
+        if isinstance(exc, httpx.HTTPStatusError):
+            cls._raise_sanitized_status(exc.response)
+        if isinstance(exc, httpx.TimeoutException):
+            raise type(exc)(
+                "Provider request timed out", request=cls._safe_request()
+            ) from None
+        if isinstance(exc, httpx.ConnectError):
+            raise httpx.ConnectError(
+                "Provider connection failed", request=cls._safe_request()
+            ) from None
+        if isinstance(exc, httpx.NetworkError):
+            raise type(exc)(
+                "Provider transport failed", request=cls._safe_request()
+            ) from None
+        raise LLMError("Provider transport failed") from None
+
+
+def _api_path(endpoint: str, full_path: str, suffix: str, version_prefix: str) -> str:
+    """Append an adapter API path once while retaining a custom gateway prefix."""
+    path = urlsplit(endpoint).path.rstrip("/")
+    if path.endswith(version_prefix):
+        return suffix
+    if path.endswith(full_path):
+        return ""
+    return full_path

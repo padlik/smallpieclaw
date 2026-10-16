@@ -94,6 +94,8 @@ class ControllerDeps:
     checkpoint_store: Optional[object] = None
     checkpoint_enabled: bool = True
     retry_timeout_seconds: int = 120
+    max_retries: int = 4
+    retry_delay: float = 2.0
     context_monitor: ContextMonitor | None = None
     step_notify_interval: int = 0
 
@@ -260,8 +262,8 @@ class AgentRuntime:
         This is the runtime-owned per-run context builder. It is deliberately
         separate from create-time construction: ``AgentController.run`` (and the
         sub-agent path via ``SubAgentRunner.run`` -> ``AgentController.run``) mints
-        the per-run trace id, saves/restores the model ``_active_idx``, and sets
-        the LLM trace id, then delegates the dataclass assembly here.
+        the per-run trace id and sets the LLM trace id, then delegates the
+        dataclass assembly here. The LLM client remains pinned for the run.
 
         The controller exposes its runtime dependencies through
         ``controller.runtime_deps`` (a :class:`ControllerDeps` dataclass).  The

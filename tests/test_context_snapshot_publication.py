@@ -286,6 +286,8 @@ def test_tool_defs_grouping_failure_degrades_to_zero_in_loop() -> None:
     llm.llm_cfg = {"model": "test", "max_tokens": 512, "context_window": 4096}
     llm.chat_with_fallback.return_value = '{"action":"finish","result":"done"}'
     llm.chat_with_tools_fallback = MagicMock(side_effect=NotImplementedError())
+    from tests.execution_harness import attach_preview
+    attach_preview(llm)
     ctx.llm = llm
 
     # Force the grouping computation to fail in the first turn.
@@ -339,6 +341,8 @@ def test_react_loop_caches_tool_def_grouping_per_run() -> None:
     llm.llm_cfg = {"model": "test", "max_tokens": 512, "context_window": 4096}
     llm.chat_with_fallback.return_value = '{"action":"finish","result":"done"}'
     llm.chat_with_tools_fallback = MagicMock(side_effect=NotImplementedError())
+    from tests.execution_harness import attach_preview
+    attach_preview(llm)
     ctx.llm = llm
 
     with patch("react_loop.group_tool_defs_by_server") as mock_group:

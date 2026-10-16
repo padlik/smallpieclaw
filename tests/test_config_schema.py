@@ -16,7 +16,20 @@ from config_schema import (
     parse_config,
     parse_vault_content,
     resolve_model_id,
+    resolve_provider_connection,
 )
+
+
+@pytest.fixture
+def minimal_config():
+    """Minimal valid connection-oriented configuration."""
+    return {
+        "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [12345], "security_mode": "allowlist"},
+        "agent": {"max_iterations": 8, "scheduled_max_iterations": 100, "tool_timeout": 10, "max_output_size": 4000, "top_tools": 3, "ctx_max_tokens": 90000},
+        "providers": {"openai-main": {"type": "openai", "api_key": "test-provider-key", "base_url": "https://api.openai.com/v1"}},
+        "embeddings": {"provider": "openai-main", "model": "test-embedding"},
+        "paths": {},
+    }
 
 
 class TestParseConfig:
@@ -28,8 +41,8 @@ class TestParseConfig:
         assert cfg.telegram.bot_token == "123456:ABC-DEF"
         assert cfg.agent.max_iterations == 8
         assert cfg.agent.agent_name == "piclaw"
-        assert len(cfg.models) == 1
-        assert cfg.models[0].provider == "openai"
+        assert cfg.models == []
+        assert cfg.providers["openai-main"].type == "openai"
         assert cfg.vault.type == "file"
 
     def test_defaults_applied(self, minimal_config):
@@ -39,16 +52,16 @@ class TestParseConfig:
         assert cfg.agent.ctx_max_tokens == 90_000
         assert cfg.scheduler.enabled is True
 
-    def test_multiple_models(self, minimal_config):
-        minimal_config["models"].append({
-            "name": "claude",
-            "provider": "anthropic",
-            "model": "claude-3-haiku",
-            "api_key": "sk-ant-test",
-        })
-        cfg = parse_config(minimal_config)
-        assert len(cfg.models) == 2
-        assert cfg.models[1].name == "claude"
+    def test_legacy_models_key_is_rejected_even_when_empty(self, minimal_config):
+        minimal_config["models"] = []
+        with pytest.raises(ConfigError, match=r"models.*providers.*\/models"):
+            parse_config(minimal_config)
+
+    def test_model_entry_error_does_not_report_legacy_fields(self, minimal_config):
+        minimal_config["models"] = [{"temperature": 0.4, "name": "PRIVATE_MODEL_SENTINEL"}]
+        with pytest.raises(ConfigError, match=r"models.*providers") as error:
+            parse_config(minimal_config)
+        assert "PRIVATE_MODEL_SENTINEL" not in str(error.value)
 
     def test_mcp_servers_stdio(self, minimal_config):
         minimal_config["mcp_servers"] = [{
@@ -78,7 +91,7 @@ class TestParseConfig:
         # _raw holds the resolved (env-expanded) copy, plus expanded defaults for
         # path fields and agent_home. Compare non-path sections that exist.
         assert cfg._raw["telegram"] == minimal_config["telegram"]
-        assert cfg._raw["models"] == minimal_config["models"]
+        assert cfg._raw["providers"] == minimal_config["providers"]
         if "embeddings" in minimal_config:
             assert cfg._raw["embeddings"] == minimal_config["embeddings"]
         if "scheduler" in minimal_config:
@@ -96,21 +109,6 @@ class TestValidation:
     def test_missing_bot_token(self, minimal_config):
         del minimal_config["telegram"]["bot_token"]
         with pytest.raises(ConfigError, match="bot_token"):
-            parse_config(minimal_config)
-
-    def test_no_models(self, minimal_config):
-        minimal_config["models"] = []
-        with pytest.raises(ConfigError, match="At least one"):
-            parse_config(minimal_config)
-
-    def test_model_missing_provider(self, minimal_config):
-        minimal_config["models"][0]["provider"] = ""
-        with pytest.raises(ConfigError, match="provider"):
-            parse_config(minimal_config)
-
-    def test_model_missing_model_id(self, minimal_config):
-        del minimal_config["models"][0]["model"]
-        with pytest.raises(ConfigError, match="model"):
             parse_config(minimal_config)
 
     def test_mcp_invalid_transport(self, minimal_config):
@@ -295,81 +293,130 @@ class TestValidation:
             parse_config(minimal_config)
 
 
-class TestModelConfig:
-    """Model-specific parsing."""
+class TestProviderConnections:
+    """Connection identity and obsolete model configuration are validated."""
 
-    def test_vision_flag(self, minimal_config):
-        minimal_config["models"][0]["vision"] = True
+    @pytest.mark.parametrize("field", ["max_tokens", "temperature", "top_p", "model", "provider", "api_key_override"])
+    def test_legacy_model_entry_rejected(self, minimal_config, field):
+        minimal_config["models"] = [{field: "obsolete"}]
+        with pytest.raises(ConfigError, match="models"):
+            parse_config(minimal_config)
+
+    def test_legacy_model_error_does_not_echo_name_or_secret_source(self, minimal_config):
+        minimal_config["models"] = [{
+            "name": "PRIVATE_MODEL_SENTINEL",
+            "api_key_file": "env:SECRET_REFERENCE_SENTINEL",
+        }]
+        with pytest.raises(ConfigError) as error:
+            parse_config(minimal_config)
+        assert "PRIVATE_MODEL_SENTINEL" not in str(error.value)
+        assert "SECRET_REFERENCE_SENTINEL" not in str(error.value)
+
+    def test_unsupported_provider_field_rejected_before_expansion(self, minimal_config):
+        minimal_config["providers"]["openai-main"]["temperature"] = "env:SECRET_REFERENCE_SENTINEL"
+        with pytest.raises(ConfigError) as error:
+            parse_config(minimal_config)
+        assert "providers.openai-main.temperature" in str(error.value)
+        assert "SECRET_REFERENCE_SENTINEL" not in str(error.value)
+
+    @pytest.mark.parametrize("providers", [["bad"], "bad", 7])
+    def test_provider_container_type_is_validated(self, minimal_config, providers):
+        minimal_config["providers"] = providers
+        with pytest.raises(ConfigError, match="providers must be a table"):
+            parse_config(minimal_config)
+
+    def test_provider_adapter_type_must_be_string(self, minimal_config):
+        minimal_config["providers"]["openai-main"]["type"] = ["openai"]
+        with pytest.raises(ConfigError, match=r"providers\.openai-main\.type"):
+            parse_config(minimal_config)
+
+    @pytest.mark.parametrize(
+        "connection_id",
+        ["", "team/account", "team account", "_team", "équipe", "a" * 129, 7],
+    )
+    def test_connection_ids_must_be_nonempty_string_without_slash(self, minimal_config, connection_id):
+        minimal_config["providers"] = {connection_id: {"type": "openai"}}
+        with pytest.raises(ConfigError, match="connection IDs"):
+            parse_config(minimal_config)
+
+    @pytest.mark.parametrize("connection_id", ["a", "a" * 128])
+    def test_connection_id_codec_boundaries_preserved(self, minimal_config, connection_id):
+        minimal_config["providers"] = {connection_id: {"type": "openai"}}
         cfg = parse_config(minimal_config)
-        assert cfg.models[0].vision is True
+        assert list(cfg.providers) == [connection_id]
+        assert cfg.providers[connection_id].name == connection_id
 
-    def test_reasoning_flag(self, minimal_config):
-        minimal_config["models"][0]["reasoning"] = True
-        cfg = parse_config(minimal_config)
-        assert cfg.models[0].reasoning is True
-
-    def test_top_p_optional(self, minimal_config):
-        cfg = parse_config(minimal_config)
-        assert cfg.models[0].top_p is None
-
-    def test_top_p_set(self, minimal_config):
-        minimal_config["models"][0]["top_p"] = 0.9
-        cfg = parse_config(minimal_config)
-        assert cfg.models[0].top_p == 0.9
-
-    def test_context_window_positive(self, minimal_config):
-        """A valid positive context_window is parsed."""
-        minimal_config["models"][0]["context_window"] = 8192
-        cfg = parse_config(minimal_config)
-        assert cfg.models[0].context_window == 8192
-
-    def test_context_window_zero_raises(self, minimal_config):
-        """context_window = 0 raises ConfigError naming the field."""
-        minimal_config["models"][0]["context_window"] = 0
-        with pytest.raises(ConfigError, match=r"models\..*\.context_window.*positive"):
+    @pytest.mark.parametrize("field", ["max_retries", "retry_delay"])
+    def test_provider_retry_keys_rejected_actionably(self, minimal_config, field):
+        minimal_config["providers"]["openai-main"][field] = 2
+        with pytest.raises(ConfigError, match=rf"providers\.openai-main\.{field}"):
             parse_config(minimal_config)
 
-    def test_context_window_negative_raises(self, minimal_config):
-        """A negative context_window raises ConfigError naming the field."""
-        minimal_config["models"][0]["context_window"] = -1
-        with pytest.raises(ConfigError, match=r"models\..*\.context_window.*positive"):
+    @pytest.mark.parametrize("value", [0, -1, True, "10", float("nan"), float("inf"), -float("inf")])
+    def test_timeout_must_be_positive_number(self, minimal_config, value):
+        minimal_config["providers"]["openai-main"]["request_timeout"] = value
+        with pytest.raises(ConfigError, match="request_timeout"):
             parse_config(minimal_config)
 
-    def test_context_window_non_integer_raises(self, minimal_config):
-        """A non-integer context_window raises ConfigError, not raw ValueError."""
-        minimal_config["models"][0]["context_window"] = "abc"
-        with pytest.raises(ConfigError, match=r"models\..*\.context_window.*integer"):
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "not-an-endpoint",
+            "ftp://api.example.test/v1",
+            "https:///v1",
+            "https://api.example.test:PRIVATE_VALUE/v1",
+            "https://[broken/v1",
+            "https://api.example.test:99999/v1",
+        ],
+    )
+    def test_invalid_provider_urls_raise_sanitized_config_error(self, minimal_config, url):
+        minimal_config["providers"]["openai-main"]["base_url"] = url
+        with pytest.raises(ConfigError) as error:
+            parse_config(minimal_config)
+        assert "providers.openai-main.base_url" in str(error.value)
+        assert "PRIVATE_VALUE" not in str(error.value)
+
+    def test_non_ollama_connection_path_and_missing_endpoint_are_allowed(self, minimal_config):
+        minimal_config["providers"]["openai-main"].pop("base_url")
+        assert parse_config(minimal_config).providers["openai-main"].base_url == ""
+        minimal_config["providers"]["openai-main"]["base_url"] = "https://api.example.test/account/path/"
+        assert parse_config(minimal_config).providers["openai-main"].base_url == "https://api.example.test/account/path"
+
+    def test_ollama_is_official_cloud_only(self, minimal_config):
+        minimal_config["providers"]["ollama"] = {
+            "type": "ollama", "api_key": "env:OLLAMA_KEY", "base_url": "http://localhost:11434"
+        }
+        with pytest.raises(ConfigError, match="official cloud Ollama"):
             parse_config(minimal_config)
 
-    def test_context_window_less_than_max_tokens_raises(self, minimal_config):
-        """context_window must be greater than max_tokens to avoid negative threshold."""
-        minimal_config["models"][0]["context_window"] = 1024
-        minimal_config["models"][0]["max_tokens"] = 1024
-        with pytest.raises(
-            ConfigError,
-            match=r"models\..*\.context_window.*must be greater than.*max_tokens",
-        ):
+    def test_ollama_normalizes_api_suffix_and_requires_key(self, minimal_config):
+        minimal_config["providers"]["ollama"] = {
+            "type": "ollama", "api_key": "env:OLLAMA_KEY", "base_url": "https://ollama.com/api/"
+        }
+        assert parse_config(minimal_config).providers["ollama"].base_url == "https://ollama.com"
+
+    def test_ollama_requires_credential_source(self, minimal_config):
+        minimal_config["providers"]["ollama"] = {"type": "ollama"}
+        with pytest.raises(ConfigError, match="api_key.*required"):
             parse_config(minimal_config)
 
-    def test_context_window_equal_to_max_tokens_raises(self, minimal_config):
-        """context_window equal to max_tokens is rejected."""
-        minimal_config["models"][0]["context_window"] = 2048
-        minimal_config["models"][0]["max_tokens"] = 2048
-        with pytest.raises(
-            ConfigError,
-            match=r"models\..*\.context_window.*must be greater than.*max_tokens",
-        ):
+    def test_obsolete_agent_selectors_rejected(self, minimal_config):
+        minimal_config["agent"]["default_model"] = "gpt-x"
+        with pytest.raises(ConfigError, match="agent.default_model"):
             parse_config(minimal_config)
 
-    def test_context_window_less_than_default_max_tokens_raises(self, minimal_config):
-        """context_window below the default max_tokens (1024) raises ConfigError."""
-        minimal_config["models"][0]["context_window"] = 512
-        # max_tokens is not explicitly set, so it defaults to 1024.
-        with pytest.raises(
-            ConfigError,
-            match=r"models\..*\.context_window.*must be greater than.*max_tokens",
-        ):
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["https://ollama.com:PRIVATE_VALUE", "https://[broken", "https://ollama.com:99999"],
+    )
+    def test_ollama_malformed_urls_are_sanitized(self, minimal_config, endpoint):
+        minimal_config["providers"]["ollama"] = {
+            "type": "ollama", "api_key": "fake-key", "base_url": endpoint
+        }
+        with pytest.raises(ConfigError) as error:
             parse_config(minimal_config)
+        assert "providers.ollama.base_url" in str(error.value) or "official cloud Ollama" in str(error.value)
+        assert "PRIVATE_VALUE" not in str(error.value)
 
 
 # ---------------------------------------------------------------------------
@@ -667,10 +714,10 @@ class TestParseConfigWithVault:
     def test_api_key_from_vault(self, minimal_config, tmp_path):
         vault_file = tmp_path / "secrets.toml"
         vault_file.write_text('openai_key = "sk-vault"\n')
-        minimal_config["models"][0]["api_key"] = "sec:openai_key"
+        minimal_config["providers"]["openai-main"]["api_key"] = "sec:openai_key"
         cfg = parse_config(minimal_config, vault_file=str(vault_file))
-        assert cfg.models[0].api_key == "sk-vault"
-        assert cfg._raw["models"][0]["api_key"] == "sk-vault"
+        assert cfg.providers["openai-main"].api_key == "sec:openai_key"
+        assert cfg._raw["providers"]["openai-main"]["api_key"] == "sec:openai_key"
 
     def test_missing_vault_key_fails_startup(self, minimal_config, tmp_path):
         vault_file = tmp_path / "secrets.toml"
@@ -714,9 +761,9 @@ class TestParseConfigWithEnvVars:
 
     def test_api_key_from_env(self, minimal_config, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
-        minimal_config["models"][0]["api_key"] = "env:OPENAI_API_KEY"
+        minimal_config["providers"]["openai-main"]["api_key"] = "env:OPENAI_API_KEY"
         cfg = parse_config(minimal_config)
-        assert cfg.models[0].api_key == "sk-from-env"
+        assert cfg.providers["openai-main"].api_key == "env:OPENAI_API_KEY"
 
     def test_missing_required_var_fails_startup(self, minimal_config, monkeypatch):
         monkeypatch.delenv("UNSET_TOKEN", raising=False)
@@ -724,11 +771,11 @@ class TestParseConfigWithEnvVars:
         with pytest.raises(ConfigError, match="UNSET_TOKEN"):
             parse_config(minimal_config)
 
-    def test_raw_dict_contains_resolved_values(self, minimal_config, monkeypatch):
+    def test_raw_dict_preserves_provider_credential_reference(self, minimal_config, monkeypatch):
         monkeypatch.setenv("RAW_KEY", "resolved-raw")
-        minimal_config["models"][0]["api_key"] = "env:RAW_KEY"
+        minimal_config["providers"]["openai-main"]["api_key"] = "env:RAW_KEY"
         cfg = parse_config(minimal_config)
-        assert cfg._raw["models"][0]["api_key"] == "resolved-raw"
+        assert cfg._raw["providers"]["openai-main"]["api_key"] == "env:RAW_KEY"
 
     def test_string_value_for_bool_field_raises(self, minimal_config):
         # A string value (which is what you'd get if env:VAR resolved a flag)
@@ -740,20 +787,20 @@ class TestParseConfigWithEnvVars:
     def test_string_value_for_int_field_raises(self, minimal_config):
         # A numeric string like "4096" must be rejected — env:VAR in numeric fields
         # is not supported; the plan restricts env references to string fields only.
-        minimal_config["models"][0]["max_tokens"] = "4096"
-        with pytest.raises(ConfigError, match="models\\..*\\.max_tokens"):
+        minimal_config["models"] = [{"max_tokens": "4096"}]
+        with pytest.raises(ConfigError, match="models"):
             parse_config(minimal_config)
 
     def test_string_value_for_float_field_raises(self, minimal_config):
-        minimal_config["models"][0]["temperature"] = "0.5"
-        with pytest.raises(ConfigError, match="models\\..*\\.temperature"):
+        minimal_config["models"] = [{"temperature": "0.5"}]
+        with pytest.raises(ConfigError, match="models"):
             parse_config(minimal_config)
 
     def test_env_var_in_numeric_field_raises(self, minimal_config, monkeypatch):
         # env:VAR on a numeric field resolves to a string and must be rejected.
         monkeypatch.setenv("MAX_TOKENS", "4096")
-        minimal_config["models"][0]["max_tokens"] = "env:MAX_TOKENS"
-        with pytest.raises(ConfigError, match="max_tokens"):
+        minimal_config["models"] = [{"max_tokens": "env:MAX_TOKENS"}]
+        with pytest.raises(ConfigError, match="models"):
             parse_config(minimal_config)
 
     def test_pairing_timeout_string_raises(self, minimal_config):
@@ -794,6 +841,28 @@ class TestAgentConfigFields:
         cfg = parse_config(minimal_config)
         assert cfg.agent.agent_name == "myagent"
 
+    def test_retry_defaults_and_agent_overrides(self, minimal_config):
+        defaults = parse_config(minimal_config).agent
+        assert defaults.max_retries == 4
+        assert defaults.retry_delay == 2.0
+
+        minimal_config["agent"].update(max_retries=0, retry_delay=0)
+        configured = parse_config(minimal_config).agent
+        assert configured.max_retries == 0
+        assert configured.retry_delay == 0.0
+
+    @pytest.mark.parametrize("value", [-1, True, 1.5, "4", None])
+    def test_agent_max_retries_requires_nonnegative_integer(self, minimal_config, value):
+        minimal_config["agent"]["max_retries"] = value
+        with pytest.raises(ConfigError, match=r"agent\.max_retries"):
+            parse_config(minimal_config)
+
+    @pytest.mark.parametrize("value", [-0.1, True, "2", float("nan"), float("inf"), -float("inf")])
+    def test_agent_retry_delay_requires_finite_nonnegative_number(self, minimal_config, value):
+        minimal_config["agent"]["retry_delay"] = value
+        with pytest.raises(ConfigError, match=r"agent\.retry_delay"):
+            parse_config(minimal_config)
+
     def test_allow_net_defaults_false(self, minimal_config):
         cfg = parse_config(minimal_config)
         assert cfg.agent.allow_net is False
@@ -819,94 +888,187 @@ class TestAgentConfigFields:
 # ---------------------------------------------------------------------------
 
 class TestProviderCredentialInheritance:
-    """Provider defaults and credential inheritance behavior."""
+    """Provider credentials stay unresolved until matching-client setup."""
 
-    def test_model_inherits_provider_credentials_and_transport_defaults(self, minimal_config):
-        minimal_config["providers"] = {
-            "openai": {
-                "api_key": "provider-key",
-                "base_url": "https://provider.example/v1",
-                "request_timeout": 180,
-                "max_retries": 7,
-                "retry_delay": 3,
-            }
-        }
-        model = minimal_config["models"][0]
-        del model["api_key"]
-        del model["base_url"]
-        model.pop("request_timeout", None)
-        model.pop("max_retries", None)
-        model.pop("retry_delay", None)
-
-        cfg = parse_config(minimal_config)
-
-        assert cfg.models[0].api_key == "provider-key"
-        assert cfg.models[0].base_url == "https://provider.example/v1"
-        assert cfg.models[0].request_timeout == 180
-        assert cfg.models[0].max_retries == 7
-        assert cfg.models[0].retry_delay == 3
-        assert cfg._raw["models"][0]["api_key"] == "provider-key"
-        assert cfg._raw["models"][0]["base_url"] == "https://provider.example/v1"
-        assert cfg._raw["models"][0]["request_timeout"] == 180
-
-    def test_provider_sec_value_inherited_by_model(self, minimal_config, tmp_path):
+    def test_provider_secret_reference_deferred_until_resolver(self, minimal_config, tmp_path):
         vault_file = tmp_path / "secrets.toml"
-        vault_file.write_text('openai_key = "provider-vault-key"\n')
-        minimal_config["providers"] = {"openai": {"api_key": "sec:openai_key"}}
-        del minimal_config["models"][0]["api_key"]
+        vault_file.write_text('sample_key = "fake-vault-value"\n')
+        minimal_config["providers"]["openai-main"]["api_key"] = "sec:sample_key"
+        connection = parse_config(minimal_config, vault_file="/not-read").providers["openai-main"]
+        assert connection.api_key == "sec:sample_key"
+        assert "fake-vault-value" not in repr(connection)
+        resolved = resolve_provider_connection(connection, vault_file=str(vault_file))
+        assert resolved.api_key == "fake-vault-value"
+        assert "fake-vault-value" not in repr(resolved)
 
-        cfg = parse_config(minimal_config, vault_file=str(vault_file))
+    def test_env_credential_reference_is_deferred(self, minimal_config, monkeypatch):
+        monkeypatch.setenv("FAKE_PROVIDER_KEY", "fake-env-value")
+        minimal_config["providers"]["openai-main"]["api_key"] = "env:FAKE_PROVIDER_KEY"
+        connection = parse_config(minimal_config).providers["openai-main"]
+        assert connection.api_key == "env:FAKE_PROVIDER_KEY"
+        assert resolve_provider_connection(connection, vault_file=None).api_key == "fake-env-value"
 
-        assert cfg.providers["openai"].api_key == "provider-vault-key"
-        assert cfg.models[0].api_key == "provider-vault-key"
-        assert cfg._raw["providers"]["openai"]["api_key"] == "provider-vault-key"
-        assert cfg._raw["models"][0]["api_key"] == "provider-vault-key"
+    def test_resolution_errors_do_not_expose_reference_or_value(self, minimal_config, monkeypatch):
+        monkeypatch.delenv("MISSING_FAKE_KEY", raising=False)
+        minimal_config["providers"]["openai-main"]["api_key"] = "env:MISSING_FAKE_KEY"
+        connection = parse_config(minimal_config).providers["openai-main"]
+        with pytest.raises(ConfigError) as error:
+            resolve_provider_connection(connection, vault_file=None)
+        assert "MISSING_FAKE_KEY" not in str(error.value)
+        assert "env:" not in str(error.value)
 
-    def test_legacy_config_raw_dict_remains_unchanged(self, minimal_config):
+    def test_parse_raw_credentials_remain_references(self, minimal_config):
+        minimal_config["providers"]["openai-main"]["api_key"] = "sec:some_key"
         cfg = parse_config(minimal_config)
+        assert cfg._raw["providers"]["openai-main"]["api_key"] == "sec:some_key"
 
-        # Only non-path sections remain identical because path fields are
-        # normalized at parse time.
-        assert cfg._raw["telegram"] == minimal_config["telegram"]
-        assert cfg._raw["models"] == minimal_config["models"]
-        if "embeddings" in minimal_config:
-            assert cfg._raw["embeddings"] == minimal_config["embeddings"]
-        if "scheduler" in minimal_config:
-            assert cfg._raw["scheduler"] == minimal_config["scheduler"]
-
-    def test_embeddings_inherit_provider_credentials_when_section_present(self, minimal_config):
-        minimal_config["providers"] = {
-            "openai": {
-                "api_key": "provider-key",
-                "base_url": "https://provider.example/v1",
-            }
-        }
-        minimal_config["embeddings"] = {
-            "provider": "openai",
-            "model": "text-embedding-3-small",
-        }
-
+    def test_embeddings_are_explicit_and_do_not_inherit(self, minimal_config):
+        minimal_config.pop("embeddings")
         cfg = parse_config(minimal_config)
+        assert cfg.embeddings.provider == ""
+        assert cfg.embeddings.model == ""
+        assert cfg.embeddings.api_key == ""
+        assert cfg.embeddings.base_url == ""
 
-        assert cfg.embeddings.api_key == "provider-key"
-        assert cfg.embeddings.base_url == "https://provider.example/v1"
-        assert cfg._raw["embeddings"]["api_key"] == "provider-key"
-        assert cfg._raw["embeddings"]["base_url"] == "https://provider.example/v1"
+    def test_embedding_reference_remains_unresolved(self, minimal_config):
+        minimal_config["embeddings"]["api_key"] = "sec:embedding_key"
+        cfg = parse_config(minimal_config, vault_file="/not-read")
+        assert cfg.embeddings.api_key == "sec:embedding_key"
+        assert cfg._raw["embeddings"]["api_key"] == "sec:embedding_key"
 
-    def test_omitted_embeddings_section_preserves_active_model_fallback(self, minimal_config):
+    def test_omitted_embeddings_section_is_unavailable(self, minimal_config):
         minimal_config.pop("embeddings", None)
-        minimal_config["providers"] = {
-            "openai": {
-                "api_key": "provider-key",
-                "base_url": "https://provider.example/v1",
-            }
-        }
-
         cfg = parse_config(minimal_config)
-
         assert "embeddings" not in cfg._raw
         assert cfg.embeddings.api_key == ""
         assert cfg.embeddings.base_url == ""
+
+    @pytest.mark.parametrize("field", ["provider", "model", "base_url"])
+    def test_missing_embedding_environment_reference_degrades_only_embeddings(
+        self, minimal_config, monkeypatch, field
+    ):
+        variable = f"MISSING_EMBEDDING_{field.upper()}_SENTINEL"
+        monkeypatch.delenv(variable, raising=False)
+        minimal_config["embeddings"][field] = f"env:{variable}"
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.providers["openai-main"].type == "openai"
+        assert cfg.embeddings.unavailable_reason.startswith(f"embeddings.{field}")
+        assert variable not in cfg.embeddings.unavailable_reason
+        assert variable not in repr(cfg.embeddings)
+        if field != "base_url":
+            assert getattr(cfg.embeddings, field) == ""
+
+    def test_invalid_embedding_provider_is_unavailable_without_chat_fallback(self, minimal_config):
+        minimal_config["embeddings"]["provider"] = "missing-connection"
+        minimal_config["embeddings"]["model"] = "explicit-embedding-model"
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.embeddings.provider == ""
+        assert cfg.embeddings.model == ""
+        assert "supported adapter or configured provider connection" in cfg.embeddings.unavailable_reason
+
+    def test_explicit_adapter_credentials_do_not_require_matching_chat_connection(self, minimal_config):
+        minimal_config["providers"] = {
+            "chat-account": {"type": "anthropic", "api_key": "fake-chat-key"}
+        }
+        minimal_config["embeddings"] = {
+            "provider": "openai",
+            "model": "explicit-embedding-model",
+            "api_key": "sec:embedding_key",
+            "base_url": "https://embedding.example.test/v1",
+        }
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.embeddings.provider == "openai"
+        assert cfg.embeddings.model == "explicit-embedding-model"
+        assert cfg.embeddings.api_key == "sec:embedding_key"
+        assert cfg.embeddings.base_url == "https://embedding.example.test/v1"
+        assert cfg.embeddings.unavailable_reason == ""
+        assert "embedding_key" not in repr(cfg.embeddings)
+
+    def test_explicit_adapter_uses_normal_endpoint_default_when_url_omitted(self, minimal_config):
+        minimal_config["providers"] = {
+            "chat-account": {"type": "anthropic", "api_key": "fake-chat-key"}
+        }
+        minimal_config["embeddings"] = {
+            "provider": "openai", "model": "explicit-embedding-model", "api_key": "fake-key"
+        }
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.embeddings.provider == "openai"
+        assert cfg.embeddings.base_url == ""
+        assert cfg.embeddings.unavailable_reason == ""
+
+    def test_connection_id_embedding_selection_inherits_connection_transport(self, minimal_config):
+        minimal_config["providers"]["openai-main"]["api_key"] = "sec:shared_embedding_key"
+        minimal_config["providers"]["openai-main"]["base_url"] = "https://connection.example.test/v1"
+        minimal_config["embeddings"] = {
+            "provider": "openai-main", "model": "explicit-embedding-model"
+        }
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.embeddings.provider == "openai-main"
+        assert cfg.embeddings.api_key == "sec:shared_embedding_key"
+        assert cfg.embeddings.base_url == "https://connection.example.test/v1"
+        assert "shared_embedding_key" not in repr(cfg.embeddings)
+
+    def test_unknown_embedding_adapter_is_unavailable_and_sanitized(self, minimal_config):
+        minimal_config["embeddings"] = {
+            "provider": "PRIVATE_UNKNOWN_PROVIDER_SENTINEL",
+            "model": "sec:PRIVATE_MODEL_SENTINEL",
+            "api_key": "sec:PRIVATE_KEY_SENTINEL",
+            "base_url": "https://private.example.test",
+        }
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.embeddings.unavailable_reason
+        for value in (
+            "PRIVATE_UNKNOWN_PROVIDER_SENTINEL",
+            "PRIVATE_MODEL_SENTINEL",
+            "PRIVATE_KEY_SENTINEL",
+            "private.example.test",
+            "sec:",
+        ):
+            assert value not in repr(cfg.embeddings)
+            assert value not in repr(cfg)
+
+    @pytest.mark.parametrize(
+        "section",
+        [
+            {"provider": 7, "model": "sec:PRIVATE_MODEL_SENTINEL"},
+            {"provider": "openai", "model": "sec:PRIVATE_MODEL_SENTINEL", "base_url": 3},
+            {"provider": ["openai"], "model": "sec:PRIVATE_MODEL_SENTINEL", "api_key": []},
+        ],
+    )
+    def test_any_embedding_shape_failure_returns_safe_unavailable_config(self, minimal_config, section):
+        minimal_config["embeddings"] = section
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.embeddings.unavailable_reason
+        assert cfg.embeddings.provider == ""
+        assert cfg.embeddings.model == ""
+        assert cfg.embeddings.api_key == ""
+        assert cfg.embeddings.base_url == ""
+        assert "PRIVATE_MODEL_SENTINEL" not in repr(cfg.embeddings)
+        assert "sec:" not in repr(cfg.embeddings)
+        assert "PRIVATE_MODEL_SENTINEL" not in repr(cfg)
+
+    def test_invalid_embedding_url_is_unavailable_not_chat_fatal(self, minimal_config):
+        minimal_config["embeddings"]["base_url"] = "https://[private-value"
+
+        cfg = parse_config(minimal_config)
+
+        assert cfg.providers["openai-main"].type == "openai"
+        assert cfg.embeddings.unavailable_reason == "embeddings.base_url must be a valid HTTP(S) URL"
+        assert "private-value" not in cfg.embeddings.unavailable_reason
 
 
 # ---------------------------------------------------------------------------
@@ -934,8 +1096,8 @@ class TestRemovedFileSecretFields:
             parse_config(minimal_config)
 
     def test_model_api_key_file_raises(self, minimal_config):
-        minimal_config["models"][0]["api_key_file"] = "/run/secrets/openai_key"
-        with pytest.raises(ConfigError, match="api_key_file"):
+        minimal_config["models"] = [{"api_key_file": "/run/secrets/openai_key"}]
+        with pytest.raises(ConfigError, match="models"):
             parse_config(minimal_config)
 
     def test_embeddings_api_key_file_raises(self, minimal_config):
@@ -956,7 +1118,7 @@ class TestRemovedFileSecretFields:
         minimal_config["providers"] = {
             "openai": {"api_key_file": "/run/secrets/openai_key"}
         }
-        with pytest.raises(ConfigError, match=r"sec:"):
+        with pytest.raises(ConfigError, match=r"providers\.openai\.api_key_file"):
             parse_config(minimal_config)
 
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from typing import Callable, Optional
 from unittest.mock import patch
 
 import httpx
 
 from checkpoint_store import CheckpointStore
+from call_attempt_state import CallAttemptState
 from confirmation import ConfirmationManager
 from llm_client import LLMCancelledError, LLMEmptyResponseError, LLMPermanentError
 from react_loop import (
@@ -144,10 +146,39 @@ def _checkpoint_path(ctx: ReactContext, trace_id: str) -> str:
     )
 
 
-class ScriptedFinishLLM:
+class _AttemptBoundFake:
+    """Test-only binder counts each scripted provider call exactly once."""
+
+    def __init__(self):
+        self._attempt_binding: tuple[CallAttemptState, bool] | None = None
+
+    @contextmanager
+    def bind_attempt(self, state, *, manual=False, definition_revision=0):
+        del definition_revision
+        previous = self._attempt_binding
+        self._attempt_binding = (state, manual)
+        try:
+            yield
+        finally:
+            self._attempt_binding = previous
+
+    def preview_request(self, messages, system=None, *, tools=None, json_mode=False,
+                        definition_revision=0):
+        from tests.execution_harness import DEFAULT_FAKE_METADATA, scripted_preview
+
+        return scripted_preview(DEFAULT_FAKE_METADATA, messages, system, tools, definition_revision)
+
+    def _record_send(self):
+        if self._attempt_binding is not None:
+            state, manual = self._attempt_binding
+            state.begin_outbound_attempt("json", manual=manual)
+
+
+class ScriptedFinishLLM(_AttemptBoundFake):
     """Fake LLM that never raises and returns a finish response."""
 
     def __init__(self, response: str = '{"action": "finish", "result": "done"}'):
+        super().__init__()
         self._response = response
         self._call_count = 0
         self.calls: list[list[dict]] = []
@@ -166,6 +197,7 @@ class ScriptedFinishLLM:
         progress_cb: Optional[Callable[[str], None]] = None,
         json_mode: bool = False,
     ) -> str:
+        self._record_send()
         self.calls.append(list(messages))
         self._call_count += 1
         return self._response
@@ -180,10 +212,11 @@ class ScriptedFinishLLM:
         return "compaction summary"
 
 
-class ErrorThenSuccessLLM:
+class ErrorThenSuccessLLM(_AttemptBoundFake):
     """Fake LLM that raises on the first call and succeeds afterwards."""
 
     def __init__(self, error: Exception, success_response: str):
+        super().__init__()
         self._error = error
         self._success = success_response
         self._call_count = 0
@@ -204,6 +237,7 @@ class ErrorThenSuccessLLM:
         json_mode: bool = False,
     ) -> str:
         _ = system, progress_cb, json_mode
+        self._record_send()
         self.calls.append(list(messages))
         self._call_count += 1
         if self._call_count == 1:
@@ -243,6 +277,8 @@ def _build_context(
         checkpoint_store=CheckpointStore(data_dir),
         checkpoint_enabled=checkpoint_enabled,
         confirmation=confirmation or ConfirmationManager(),
+        max_retries=0,
+        retry_wait=lambda event, seconds: event.is_set(),
     )
 
 

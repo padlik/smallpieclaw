@@ -53,10 +53,10 @@ The ReAct loop SHALL use native calling first. A local pre-network unsupported r
 
 ### Requirement: Tool definition assembly
 
-The system SHALL build OpenAI-format definitions from 15 built-in schemas, the `plan` pseudo-tool schema, and MCP input schemas. It SHALL exclude script tools and cache definitions across loop steps. Complete tool definitions SHALL count toward actual-wire token budgets and compaction.
+The system SHALL build OpenAI-format definitions from all 23 existing built-in schemas, the `plan` pseudo-tool schema, and MCP input schemas. It SHALL exclude script tools and cache definitions across loop steps. Complete tool definitions SHALL count toward actual-wire token budgets and compaction.
 
 #### Scenario: Built-in tools included
-- **GIVEN** `BUILTIN_TOOL_SCHEMAS` contains all 15 built-in tools
+- **GIVEN** `BUILTIN_TOOL_SCHEMAS` contains all 23 existing built-in tools
 - **WHEN** `build_tool_definitions()` is called
 - **THEN** every built-in produces the established OpenAI function schema
 

@@ -22,6 +22,7 @@ class TestXdgPathsDefaults:
         assert paths.runtime_dir == home_state / "test-agent"
 
         assert paths.config_file == paths.config_home / "config.toml"
+        assert paths.models_config_file == paths.config_home / "models-config.toml"
         assert paths.scheduler_config == paths.config_home / "scheduler.toml"
         assert paths.memory_file == paths.data_home / "memory.json"
         assert paths.graph_memory_db == paths.data_home / "graph_memory"
@@ -48,6 +49,7 @@ class TestXdgPathsDefaults:
         paths = xdg_paths("agent")
 
         assert paths.config_home == tmp_path / "c1" / "agent"
+        assert paths.models_config_file == tmp_path / "c1" / "agent" / "models-config.toml"
         assert paths.data_home == tmp_path / "c2" / "agent"
         assert paths.state_home == tmp_path / "c3" / "agent"
         assert paths.cache_home == tmp_path / "c4" / "agent"

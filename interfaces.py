@@ -22,26 +22,28 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 import httpx
+from model_registry import ModelRecord
+from model_selection_guard import SelectionBudgetIdentity
 
 
 # ---------------------------------------------------------------------------
 # Provider Backend Context
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class ProviderContext:
-    """Dependency bag passed to provider backend functions."""
+    """Narrow pinned-model context passed to a concrete provider adapter."""
 
-    get_cfg: Callable[[], dict]
-    http: httpx.Client
-    max_retries: int
-    retry_delay: float
-    cancel_event: Optional[threading.Event]
-    caller_tag: str
-    diagnose_empty: bool
+    model: ModelRecord
+    adapter: str
+    mode: str
+    send_json: Callable[[dict[str, Any]], httpx.Response]
     track_usage: Callable[[int, int], None]
-    emb_cfg: dict = field(default_factory=dict)
-    get_ollama_client: Optional[Callable[[], Any]] = None
+    caller_tag: str = ""
+    diagnose_empty: bool = False
+    cancel_event: Optional[threading.Event] = None
+    ollama_client: Any = field(default=None, repr=False)
+    graph_extraction: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -238,4 +240,40 @@ class MCPManagerProtocol(Protocol):
 
     def get_tools(self) -> list[Any]:
         """Return all tools from all connected MCP servers."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Conversation selection guard / graph preparation
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class SelectionIdentityProvider(Protocol):
+    """A pinned model client that can describe its sanitized budget identity."""
+
+    def selection_identity(self) -> SelectionBudgetIdentity:
+        """Return the secret-free budget identity of the pinned model."""
+        ...
+
+
+@runtime_checkable
+class PreparedGraphContext(Protocol):
+    """Read-only graph recall whose usage counters are committed explicitly."""
+
+    @property
+    def text(self) -> str:
+        """Return the prompt section that was recalled (may be empty)."""
+        ...
+
+    def commit_metrics(self) -> None:
+        """Record this recall in the store's usage counters, exactly once."""
+        ...
+
+
+@runtime_checkable
+class GraphPromptPreparer(Protocol):
+    """Graph store capability: recall prompt context without counting it yet."""
+
+    def prepare_for_prompt(self, query: str, max_entries: int = 10) -> PreparedGraphContext:
+        """Retrieve context for ``query`` without mutating usage counters."""
         ...

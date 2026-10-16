@@ -14,6 +14,8 @@ Workflow for each user request:
 from __future__ import annotations
 
 import logging
+import json
+import math
 import os
 import threading
 import time
@@ -27,6 +29,7 @@ from confirmation import ConfirmationManager
 from context_monitor import ContextMonitor
 from conversation_io import _load_or_create_conversation_id, _save_conversation
 from llm_client import LLMClient
+from model_selection_guard import ConversationSelectionGuard, SelectionBudgetIdentity
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
 from prompt_builder import estimate_tokens as _estimate_tokens
@@ -35,6 +38,130 @@ from tool_index import ToolIndex
 from trace_context import child_trace_id
 
 logger = logging.getLogger(__name__)
+
+
+def _is_checkpoint_primitive(value: object) -> bool:
+    """Check that nested message data is JSON-safe and finite."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_is_checkpoint_primitive(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_checkpoint_primitive(item) for key, item in value.items())
+    return False
+
+
+def _valid_checkpoint_content(content: object, role: str) -> bool:
+    """Validate supported text and multimodal content-block forms."""
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list) or not content:
+        return False
+    for block in content:
+        if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+            return False
+        block_type = block["type"]
+        if block_type in {"text", "input_text"}:
+            if not isinstance(block.get("text"), str):
+                return False
+        elif block_type == "image_url":
+            if role != "user":
+                return False
+            image_url = block.get("image_url")
+            if not isinstance(image_url, dict) or not isinstance(image_url.get("url"), str):
+                return False
+        elif block_type in {"image", "input_image"}:
+            if role != "user" or not _is_checkpoint_primitive(block):
+                return False
+            if block_type == "image":
+                source = block.get("source")
+                if (
+                    not isinstance(source, dict)
+                    or source.get("type") != "base64"
+                    or not isinstance(source.get("media_type"), str)
+                    or not isinstance(source.get("data"), str)
+                ):
+                    return False
+            elif not isinstance(block.get("image_url"), (str, dict)):
+                return False
+        else:
+            return False
+        if not _is_checkpoint_primitive(block):
+            return False
+    return True
+
+
+def _valid_checkpoint_messages(messages: object, goal_idx: int, user_goal: str) -> bool:
+    """Validate message records without modifying legitimate stored history."""
+    if not isinstance(messages, list) or not messages:
+        return False
+    pending_tool_calls: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict) or not _is_checkpoint_primitive(message):
+            return False
+        role = message.get("role")
+        if not isinstance(role, str) or role not in {"system", "developer", "user", "assistant", "tool"}:
+            return False
+        if "images" in message and (
+            role != "user"
+            or
+            not isinstance(message["images"], list)
+            or not all(isinstance(path, str) for path in message["images"])
+        ):
+            return False
+        calls = message.get("tool_calls")
+        if calls is not None:
+            if role != "assistant" or not isinstance(calls, list) or not calls:
+                return False
+            for call in calls:
+                if not isinstance(call, dict) or not isinstance(call.get("id"), str) or not call["id"]:
+                    return False
+                if call.get("type") not in (None, "function"):
+                    return False
+                function = call.get("function")
+                if not isinstance(function, dict) or not isinstance(function.get("name"), str) or not function["name"]:
+                    return False
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        parsed = json.loads(arguments)
+                    except (json.JSONDecodeError, TypeError):
+                        return False
+                    if not isinstance(parsed, (dict, list)):
+                        return False
+                elif not isinstance(arguments, (dict, list)):
+                    return False
+                if call["id"] in pending_tool_calls:
+                    return False
+                pending_tool_calls.add(call["id"])
+        if role == "tool":
+            if not isinstance(message.get("tool_call_id"), str) or not message["tool_call_id"]:
+                return False
+            if message["tool_call_id"] not in pending_tool_calls:
+                return False
+            pending_tool_calls.remove(message["tool_call_id"])
+            if not isinstance(message.get("content"), str):
+                return False
+        elif "content" not in message:
+            if not (role == "assistant" and calls):
+                return False
+        elif message["content"] is None:
+            if not (role == "assistant" and calls):
+                return False
+        elif not _valid_checkpoint_content(message["content"], role):
+            return False
+
+    if type(goal_idx) is not int or not 0 <= goal_idx < len(messages):
+        return False
+    goal_message = messages[goal_idx]
+    return (
+        isinstance(goal_message, dict)
+        and goal_message.get("role") == "user"
+        and goal_message.get("content") == user_goal
+        and not pending_tool_calls
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +306,10 @@ class AgentController:
         # AgentController and BuiltinExecutor so that the context_profile tool
         # reads the same monitor the ReAct loop publishes to. See ADR-0022.
         self.context_monitor = context_monitor or ContextMonitor()
+        self._selection_guard = ConversationSelectionGuard()
+        if short_term is not None and short_term.get_messages():
+            # Injected history has unknown provenance: protect it until a request fits.
+            self._selection_guard.notify_history_restored(None)
 
     # ------------------------------------------------------------------
     # AgentConfig / ExecutorPaths accessors
@@ -282,6 +413,8 @@ class AgentController:
             checkpoint_store=self.checkpoint_store,
             checkpoint_enabled=self._checkpoint_enabled,
             retry_timeout_seconds=self._retry_timeout_seconds,
+            max_retries=self._agent_cfg.max_retries,
+            retry_delay=self._agent_cfg.retry_delay,
             context_monitor=self.context_monitor,
             step_notify_interval=self.step_notify_interval,
         )
@@ -300,16 +433,13 @@ class AgentController:
         trace_id: Optional[str] = None,
         resume_from: Optional[str] = None,
         milestone_notify_fn: Optional[Callable[[int], None]] = None,
+        admitted_llm: Optional[LLMClient] = None,
     ) -> str:
         """
         Process a user goal and return the final answer string.
         Optionally calls progress_callback(msg) for intermediate updates.
         Pass images=["/path/to/file.jpg", ...] to include images in the first
         user message for vision-capable models.
-
-        The primary model index is always restored on exit so a vision
-        model switch during this run never permanently demotes subsequent
-        requests.
 
         ``trace_id`` may be supplied by the caller (e.g. TelegramInterface) to
         correlate the run with an externally managed prompt record. When omitted,
@@ -318,56 +448,154 @@ class AgentController:
         ``prompt_id`` is the operator-facing "Prompt #N"; it is propagated into
         the log context and onto the shared BuiltinExecutor for sub-agent
         tracking.
-        """
-        # Save primary model index — mirrors the same pattern in SubAgentRunner.run().
-        # chat_with_fallback() may transiently switch _active_idx to a vision-capable
-        # model for image requests, but always reverts in its own finally block.
-        # This save/restore is belt-and-suspenders: it guarantees the *next*
-        # interactive request always starts on the configured primary model
-        # even if an internal revert path is ever changed.
-        _primary_idx = self.llm._active_idx
 
+        ``admitted_llm`` is the already-admitted client this run uses for resume
+        validation, trace binding, context and cleanup; it never replaces
+        ``self.llm`` or retargets runs already in flight.
+        """
         # Request-scoped trace ID: reuse a propagated parent trace when present,
         # otherwise mint a fresh one so each interactive run is correlatable.
         run_trace_id = trace_id if trace_id else child_trace_id(self._trace_id)
 
+        checkpoint_owner = None
+        if self.checkpoint_store is not None and (self._checkpoint_enabled or resume_from is not None):
+            owner_trace = resume_from if resume_from is not None else run_trace_id
+            try:
+                checkpoint_owner = self.checkpoint_store.acquire_owner(owner_trace)
+            except (ValueError, RuntimeError):
+                return "❌ Checkpoint ownership could not be acquired for this run."
+            if checkpoint_owner is None:
+                return "❌ A run for this checkpoint trace is already active. Try again after it finishes."
+
+        try:
+            return self._run_with_checkpoint_owner(
+                user_goal,
+                progress_callback,
+                images,
+                prompt_id=prompt_id,
+                run_trace_id=run_trace_id,
+                resume_from=resume_from,
+                milestone_notify_fn=milestone_notify_fn,
+                checkpoint_owner=checkpoint_owner,
+                admitted_llm=admitted_llm,
+            )
+        finally:
+            if checkpoint_owner is not None:
+                checkpoint_owner.release()
+
+    def _run_with_checkpoint_owner(
+        self,
+        user_goal: str,
+        progress_callback: Optional[Callable[[str], None]],
+        images: Optional[list[str]],
+        *,
+        prompt_id: Optional[str],
+        run_trace_id: str,
+        resume_from: Optional[str],
+        milestone_notify_fn: Optional[Callable[[int], None]],
+        checkpoint_owner: object,
+        admitted_llm: Optional[LLMClient] = None,
+    ) -> str:
+        """Execute a run while ``run`` owns the checkpoint trace lease."""
+        run_llm = admitted_llm if admitted_llm is not None else self.llm
         # Load a saved checkpoint when resuming after an LLM error.
         # This must happen BEFORE build_react_context so the checkpoint's
         # trace_id is used for the context, LLM trace binding, and log correlation.
         initial_state = None
-        if resume_from is not None and self.checkpoint_store is not None:
-            checkpoint = self.checkpoint_store.load(resume_from)
-            if checkpoint is not None:
+        if resume_from is not None:
+            checkpoint = (
+                self.checkpoint_store.load(resume_from, owner=checkpoint_owner)
+                if self.checkpoint_store else None
+            )
+            try:
+                from call_attempt_state import CallAttemptState
                 from react_loop import _LoopState
+                if (
+                    not isinstance(checkpoint, dict)
+                    or type(checkpoint.get("format_version")) is not int
+                    or checkpoint.get("format_version") != 2
+                ):
+                    raise ValueError("checkpoint is legacy, missing, or has an unsupported format")
+                required = {
+                    "format_version", "trace_id", "user_goal", "messages", "step",
+                    "goal_idx", "max_steps", "json_fail_streak", "model_id",
+                    "attempt_state", "error_info", "created_at",
+                }
+                if set(checkpoint) != required:
+                    raise ValueError("checkpoint fields are incomplete or unknown")
+                model_id = run_llm.llm_cfg.get("id")
+                if not model_id or checkpoint["model_id"] != model_id:
+                    raise ValueError("checkpoint model does not match this pinned run model")
+                if not isinstance(checkpoint["error_info"], dict):
+                    raise ValueError("checkpoint history or error information is malformed")
+                if set(checkpoint["error_info"]) != {"type", "message", "retryable", "detail"}:
+                    raise ValueError("checkpoint error information is incomplete or unknown")
+                if (
+                    not isinstance(checkpoint["trace_id"], str)
+                    or not isinstance(checkpoint["user_goal"], str)
+                    or not isinstance(checkpoint["model_id"], str)
+                    or not isinstance(checkpoint["created_at"], str)
+                ):
+                    raise ValueError("checkpoint identity or timestamp is malformed")
+                if checkpoint["trace_id"] != resume_from:
+                    raise ValueError("checkpoint trace does not match its requested identity")
+                error_info = checkpoint["error_info"]
+                if (
+                    not isinstance(error_info["type"], str)
+                    or error_info["type"] not in {"timeout", "connection", "rate_limit", "empty", "context", "permanent", "unknown"}
+                    or not isinstance(error_info["message"], str)
+                    or not isinstance(error_info["retryable"], bool)
+                    or not isinstance(error_info["detail"], str)
+                ):
+                    raise ValueError("checkpoint error information is malformed")
+                for key in ("step", "goal_idx", "max_steps", "json_fail_streak"):
+                    if type(checkpoint[key]) is not int or checkpoint[key] < 0:
+                        raise ValueError(f"checkpoint {key} is malformed")
+                if checkpoint["max_steps"] == 0 or not _valid_checkpoint_messages(
+                    checkpoint["messages"], checkpoint["goal_idx"], checkpoint["user_goal"]
+                ):
+                    raise ValueError("checkpoint history or goal position is malformed")
+                attempt_state = CallAttemptState.from_dict(checkpoint["attempt_state"])
+                if attempt_state.outbound_attempts and not attempt_state.manual_retry_authorized:
+                    attempt_state.authorize_manual_retry()
                 initial_state = _LoopState(
-                    messages=checkpoint.get("messages", []),
-                    goal_idx=checkpoint.get("goal_idx", 0),
-                    max_steps=checkpoint.get("max_steps", self.max_iterations),
-                    step=checkpoint.get("step", 0),
-                    json_fail_streak=checkpoint.get("json_fail_streak", 0),
+                    messages=checkpoint["messages"], goal_idx=checkpoint["goal_idx"],
+                    max_steps=checkpoint["max_steps"], step=checkpoint["step"],
+                    json_fail_streak=checkpoint["json_fail_streak"],
+                    attempt_state=attempt_state,
                 )
-                # Reuse the checkpoint's trace_id for log correlation and
-                # correct checkpoint deletion on successful completion.
-                run_trace_id = checkpoint.get("trace_id", run_trace_id)
-                user_goal = checkpoint.get("user_goal", user_goal)
+                run_trace_id = checkpoint["trace_id"]
+                user_goal = checkpoint["user_goal"]
+            except (ValueError, TypeError, KeyError) as exc:
+                return f"❌ Cannot resume checkpoint: {exc}. Start a new task instead."
 
-        _prev_trace = getattr(self.llm, "_trace_id", "")
-        if hasattr(self.llm, "set_trace_id"):
-            self.llm.set_trace_id(run_trace_id)
+        try:
+            _prev_trace = getattr(run_llm, "_trace_id", "")
+            if hasattr(run_llm, "set_trace_id"):
+                run_llm.set_trace_id(run_trace_id)
 
         # Bind run identity into structlog context so every log line carries
         # trace/agent/prompt_id.
-        bind_run_context(trace=run_trace_id, agent=self.label, prompt_id=str(prompt_id) if prompt_id is not None else "")
+            bind_run_context(trace=run_trace_id, agent=self.label, prompt_id=str(prompt_id) if prompt_id is not None else "")
 
-        if self.builtin_executor is not None and self._depth == 0:
-            self.builtin_executor._coordinator = self._confirmation
-            self.builtin_executor._current_prompt_id = prompt_id
-            # Clear main-agent prompt-lifetime grants at the start of each
-            # depth-0 run (react_loop entry boundary).
-            self._confirmation.grant_ledger.clear_prompt_scope(None)
+            identity_fn = getattr(run_llm, "selection_identity", None)
+            ticket = (
+                self._selection_guard.begin(identity_fn())
+                if callable(identity_fn) else None
+            )
+            guarded = ticket is not None and ticket.guarded
+
+            def install_run_scope() -> None:
+                if self.builtin_executor is not None and self._depth == 0:
+                    self.builtin_executor._coordinator = self._confirmation
+                    self.builtin_executor._current_prompt_id = prompt_id
+                    self._confirmation.grant_ledger.clear_prompt_scope(None)
+
+            if not guarded:
+                install_run_scope()
         # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
-        # keeps only the per-run concerns: trace minting (above), model
-        # _active_idx save/restore (below), and progress/image passthrough.
+        # keeps only per-run concerns: trace minting (above), checkpoint
+        # restoration, and progress/image passthrough. The LLM client is pinned.
         #
         # Cancellation: when this controller owns its cancel_event (no external
         # event was supplied), mint a run-private event via the registry instead
@@ -376,14 +604,25 @@ class AgentController:
         # externally-supplied event (sub-agents forwarding a parent's stop
         # signal) pass cancel_event=None here and keep using that shared event
         # unchanged, since that sharing is intentional cascade-cancel behavior.
-        run_cancel_event = (
-            self._cancel_registry.new_run_event()
-            if self._cancel_registry is not None
-            else None
-        )
-        ctx = AgentRuntime.build_react_context(self, run_trace_id, cancel_event=run_cancel_event)
-        ctx.prompt_id = prompt_id
-        ctx.milestone_notify_fn = milestone_notify_fn
+            run_cancel_event = (
+                self._cancel_registry.new_run_event()
+                if self._cancel_registry is not None
+                else None
+            )
+            ctx = AgentRuntime.build_react_context(self, run_trace_id, cancel_event=run_cancel_event)
+            if run_llm is not self.llm:
+                ctx.llm = run_llm
+            if ticket is not None:
+                ctx.on_accepted = lambda: self._selection_guard.complete(ticket)
+            if guarded:
+                ctx.guarded_first_request = True
+                ctx.activated = False
+                ctx.on_activate = install_run_scope
+            ctx.checkpoint_owner = checkpoint_owner
+            ctx.prompt_id = prompt_id
+            ctx.milestone_notify_fn = milestone_notify_fn
+        except Exception:
+            raise
 
         loop_kwargs: dict = {}
         if initial_state is not None:
@@ -391,10 +630,9 @@ class AgentController:
         try:
             return react_loop(ctx, user_goal, progress_callback, images, **loop_kwargs)
         finally:
-            self.llm._active_idx = _primary_idx
-            if hasattr(self.llm, "set_trace_id"):
-                self.llm.set_trace_id(_prev_trace)
-            if self.builtin_executor is not None and self._depth == 0:
+            if hasattr(run_llm, "set_trace_id"):
+                run_llm.set_trace_id(_prev_trace)
+            if self.builtin_executor is not None and self._depth == 0 and ctx.activated:
                 # Idempotent fallback only: react_loop's finally is the canonical
                 # turn drain (with progress). Repeating it here is a no-op once
                 # the children are released and covers a loop that exited before
@@ -422,6 +660,22 @@ class AgentController:
             if self._cancel_registry is not None and run_cancel_event is not None:
                 self._cancel_registry.release(run_cancel_event)
 
+
+    def notify_manual_selection(self, identity: SelectionBudgetIdentity) -> None:
+        """Record a persisted manual model selection for the conversation guard."""
+        self._selection_guard.notify_manual_selection(identity)
+
+    def notify_history_restored(
+        self, selection: Optional[SelectionBudgetIdentity] = None
+    ) -> None:
+        """Record that conversation history was restored from an earlier selection."""
+        history = self.short_term.get_messages() if self.short_term is not None else []
+        self._selection_guard.notify_history_restored(selection, empty=not history)
+
+    @property
+    def selection_guard_armed(self) -> bool:
+        """Whether the next first request is previewed before any run effect."""
+        return self._selection_guard.armed
 
     def cancel(self) -> None:
         """Cancel the currently-running task(s). Safe to call from any thread.
@@ -515,6 +769,7 @@ class AgentController:
             self.short_term.clear()
         # /reset clears both prompt and session grants (session lifetime boundary).
         self._confirmation.grant_ledger.clear_all()
+        self._selection_guard.reset()
         return msg
 
     def compress_context(self) -> str:

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 
 from react_loop import ReactContext, react_loop, _JSON_FAIL_LIMIT
+from tests.execution_harness import attach_preview
 
 
 def _make_ctx(llm_responses: list[str]) -> tuple[ReactContext, list[str]]:
@@ -30,6 +31,7 @@ def _make_ctx(llm_responses: list[str]) -> tuple[ReactContext, list[str]]:
     # Native tool calling not supported in these tests — fall through to json_mode
     llm.chat_with_tools_fallback.side_effect = NotImplementedError("native tools not mocked")
     llm.llm_cfg = {"model": "test-model"}
+    attach_preview(llm)
 
     ctx = ReactContext(
         llm=llm,

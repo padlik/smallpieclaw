@@ -1,0 +1,179 @@
+"""Focused tests for pinned request transport and attempt-counting gates."""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+from call_attempt_state import CallAttemptState
+from config_schema import AgentConfig, ResolvedProviderConnection
+from interfaces import ChatResponse
+from llm_client import LLMClient
+from model_registry import ModelMetadata, ModelRecord, RunModel
+
+
+def _client(
+    adapter: str = "openai",
+    *,
+    base_url: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+    metadata: ModelMetadata | None = None,
+) -> LLMClient:
+    model = ModelRecord(
+        "connection/upstream/model",
+        "connection",
+        "upstream/model",
+        "Pinned display",
+        metadata or ModelMetadata(context_tokens=8192, output_tokens=1024),
+    )
+    connection = ResolvedProviderConnection(
+        provider_id="connection",
+        adapter=adapter,
+        base_url=base_url or f"https://{adapter}.example.test",
+        request_timeout=9,
+        api_key="fake-key",
+    )
+    return LLMClient(
+        RunModel(model, connection, catalog_revision=5, selection_revision=3),
+        agent_config=AgentConfig(ctx_max_tokens=4096),
+        http_transport=transport,
+    )
+
+
+def _openai_response() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": "ok"}}], "usage": {}},
+    )
+
+
+@pytest.mark.parametrize(
+    ("adapter", "base_url", "expected_path", "auth_header"),
+    [
+        ("openai", "https://gw.test/proxy/v1", "/proxy/v1/chat/completions", "authorization"),
+        ("openrouter", "https://gw.test/proxy", "/proxy/api/v1/chat/completions", "authorization"),
+        ("anthropic", "https://gw.test/proxy", "/proxy/v1/messages", "x-api-key"),
+        (
+            "google",
+            "https://gw.test/proxy/v1beta",
+            "/proxy/v1beta/models/upstream%2Fmodel:generateContent",
+            "x-goog-api-key",
+        ),
+    ],
+)
+def test_provider_request_uses_pinned_route_auth_and_one_count(
+    adapter: str, base_url: str, expected_path: str, auth_header: str
+) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if adapter == "anthropic":
+            return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+        if adapter == "google":
+            return httpx.Response(
+                200,
+                json={"candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+            )
+        return _openai_response()
+
+    client = _client(adapter, base_url=base_url, transport=httpx.MockTransport(handler))
+    attempts = CallAttemptState(max_retries=2, retry_delay=0)
+
+    with client.bind_attempt(attempts):
+        assert client.chat([{"role": "user", "content": "hello"}]) == "ok"
+
+    request = captured[0]
+    assert len(captured) == 1
+    if adapter == "google":
+        assert request.url.raw_path.decode() == expected_path
+    else:
+        assert request.url.path == expected_path
+    assert request.headers.get(auth_header) in {"Bearer fake-key", "fake-key"}
+    assert request.extensions["timeout"]["read"] == 9
+    assert attempts.outbound_attempts == 1
+    assert json.loads(request.content)["messages" if adapter != "google" else "contents"]
+    client.close()
+
+
+def test_native_tool_success_counts_once_and_preserves_nested_definition_fields() -> None:
+    captured: list[httpx.Request] = []
+    transport = httpx.MockTransport(
+        lambda request: (
+            captured.append(request)
+            or httpx.Response(
+                200,
+                json={"choices": [{"message": {"tool_calls": [
+                    {"id": "call-1", "function": {"name": "lookup", "arguments": "{}"}}
+                ]}}]},
+            )
+        )
+    )
+    client = _client(transport=transport)
+    state = CallAttemptState(max_retries=1, retry_delay=0)
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {
+        "type": "object", "properties": {"value": {"type": "string", "x-extra": [1, 2]}}
+    }}}]
+
+    with client.bind_attempt(state, definition_revision=8):
+        response = client.chat_with_tools([{"role": "user", "content": "call"}], tools)
+
+    assert isinstance(response, ChatResponse)
+    assert state.outbound_attempts == 1
+    assert json.loads(captured[0].content)["tools"] == tools
+    client.close()
+
+
+def test_preview_uses_final_wire_estimate_without_sending_or_counting() -> None:
+    requests: list[httpx.Request] = []
+    client = _client(transport=httpx.MockTransport(
+        lambda request: requests.append(request) or _openai_response()
+    ))
+
+    preview = client.preview_request(
+        [{"role": "user", "content": "hello"}],
+        tools=[{"type": "function", "function": {"name": "go", "parameters": {"type": "object"}}}],
+        definition_revision=12,
+    )
+
+    assert preview.canonical_model_id == "connection/upstream/model"
+    assert preview.definition_revision == 12
+    assert preview.input_tokens > 0
+    assert preview.hard_input_budget >= preview.input_tokens
+    assert requests == []
+    client.close()
+
+
+def test_unknown_vision_and_unsupported_native_are_rejected_before_send() -> None:
+    requests: list[httpx.Request] = []
+    client = _client(
+        "anthropic",
+        transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200, json={})),
+    )
+    state = CallAttemptState(max_retries=2, retry_delay=0)
+
+    with client.bind_attempt(state):
+        with pytest.raises(NotImplementedError, match="unsupported"):
+            client.chat_with_tools([{"role": "user", "content": "x"}], [])
+        with pytest.raises(Exception, match="verified vision"):
+            client.chat([{"role": "user", "content": "x", "images": ["fake-image"]}])
+
+    assert requests == []
+    assert state.outbound_attempts == 0
+    client.close()
+
+
+def test_http_failure_is_single_count_and_redacts_request_details() -> None:
+    client = _client(transport=httpx.MockTransport(lambda request: httpx.Response(503, text="body-secret")))
+    state = CallAttemptState(max_retries=1, retry_delay=0)
+
+    with client.bind_attempt(state), pytest.raises(httpx.HTTPStatusError) as caught:
+        client.chat([{"role": "user", "content": "request-secret"}])
+
+    assert state.outbound_attempts == 1
+    assert "body-secret" not in str(caught.value)
+    assert "request-secret" not in str(caught.value)
+    assert "fake-key" not in str(caught.value)
+    client.close()

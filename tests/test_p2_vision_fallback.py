@@ -1,171 +1,162 @@
-"""P2: vision-aware routing tests (all-models scan + revert).
-
-Covers LLMClient.chat_with_fallback() image handling after the fallback removal:
-- Image request with a non-vision primary routes to the first vision-capable
-  model by config order (scanning ALL configured models, not a fallback list).
-- The active model index is restored to the primary after the request completes
-  (success or error).
-- Image request with no vision-capable model configured raises a clear
-  permanent error.
-- Active model already vision-capable → no switch.
-- Text-only requests use the primary model directly (single-model, no fallback).
-"""
+"""Vision capability is explicit and requests remain pinned to one model."""
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
-from llm_client import LLMClient, LLMError, LLMPermanentError
+from llm_client import LLMPermanentError
+from model_registry import ModelMetadata
+from tests.run_model_fixtures import make_run_model_client
 
 
-def _config(models: list[dict], default: str) -> dict:
-    """Return a minimal config dict for the given models and default model."""
-    return {
-        "models": models,
-        "agent": {"default_model": default},
-    }
+def _response() -> httpx.Response:
+    """Return a deterministic OpenAI-compatible text response."""
+    return httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": "ok"}}], "usage": {}},
+    )
 
 
-_NONVISION = {
-    "name": "text-model", "provider": "openai", "model": "text-x",
-    "api_key": "sk-x", "base_url": "https://api.openai.com/v1",
-}
-_VISION = {
-    "name": "vision-model", "provider": "openai", "model": "vision-x",
-    "api_key": "sk-x", "base_url": "https://api.openai.com/v1", "vision": True,
-}
-_VISION2 = {
-    "name": "vision-model-2", "provider": "openai", "model": "vision-y",
-    "api_key": "sk-x", "base_url": "https://api.openai.com/v1", "vision": True,
-}
+@pytest.mark.parametrize("vision", [False, None], ids=["verified-false", "unknown"])
+def test_unverified_pinned_model_rejects_images_before_io(vision: bool | None) -> None:
+    captured: list[httpx.Request] = []
+    client = make_run_model_client(
+        "openai",
+        httpx.MockTransport(lambda request: captured.append(request) or _response()),
+        metadata=ModelMetadata(
+            context_tokens=8192,
+            output_tokens=1024,
+            vision=vision,
+            tool_calling=True,
+        ),
+        upstream_id="text-only-model",
+    )
+    try:
+        with pytest.raises(LLMPermanentError, match="verified vision support"):
+            client.chat([{
+                "role": "user",
+                "content": "what is this?",
+                "images": ["does-not-need-to-exist.png"],
+            }])
+        assert captured == []
+        assert client.llm_cfg["model"] == "text-only-model"
+    finally:
+        client.close()
 
 
-def _make_client(models, default):
-    """Build an LLMClient from model definitions and a default model name."""
-    return LLMClient(_config(models, default))
+def test_verified_vision_model_sends_images_on_its_pinned_route(tmp_path) -> None:
+    captured: list[httpx.Request] = []
+    image = tmp_path / "fake.png"
+    image.write_bytes(b"fake-image-bytes")
+    client = make_run_model_client(
+        "openai",
+        httpx.MockTransport(lambda request: captured.append(request) or _response()),
+        metadata=ModelMetadata(
+            context_tokens=8192,
+            output_tokens=1024,
+            vision=True,
+            tool_calling=True,
+        ),
+        upstream_id="verified-vision-model",
+    )
+    try:
+        assert client.chat_with_fallback([{
+            "role": "user", "content": "what is this?", "images": [str(image)]
+        }]) == "ok"
+        assert len(captured) == 1
+        body = json.loads(captured[0].content)
+        assert body["model"] == "verified-vision-model"
+        assert body["messages"][0]["content"][1]["type"] == "image_url"
+        with pytest.raises(LLMPermanentError, match="LLMClient is pinned"):
+            client.set_model("another-model")
+        assert client.list_models()[0]["model"] == "verified-vision-model"
+    finally:
+        client.close()
 
 
-class TestVisionAllModelsScan:
-    def test_image_routes_to_first_vision_model_by_config_order(self, monkeypatch):
-        """Image routes to the first vision-capable model by config order."""
-        client = _make_client([_NONVISION, _VISION, _VISION2], "text-x")
-        used: list[str] = []
-
-        def fake_chat(messages, system=None, progress_cb=None, json_mode=False):
-            used.append(client._models[client._active_idx]["model"])
-            return "ok"
-
-        monkeypatch.setattr(client, "chat", fake_chat)
-        msgs = [{"role": "user", "content": "what is this?", "images": ["/tmp/x.png"]}]
-        out = client.chat_with_fallback(msgs)
-        assert out == "ok"
-        # Non-vision primary must never be invoked; first vision model by order.
-        assert used == ["vision-x"]
-
-    def test_primary_restored_after_vision_request(self, monkeypatch):
-        """Active model index restored to primary after image request succeeds."""
-        client = _make_client([_NONVISION, _VISION], "text-x")
-        monkeypatch.setattr(client, "chat", lambda *a, **k: "ok")
-        msgs = [{"role": "user", "content": "x", "images": ["/tmp/x.png"]}]
-        client.chat_with_fallback(msgs)
-        assert client._active_idx == 0  # restored to primary (text-x at index 0)
-
-    def test_primary_restored_after_vision_error(self, monkeypatch):
-        """Active model index restored to primary even when the vision call errors."""
-        client = _make_client([_NONVISION, _VISION], "text-x")
-
-        def boom(*a, **k):
-            raise LLMError("vision model down")
-
-        monkeypatch.setattr(client, "chat", boom)
-        msgs = [{"role": "user", "content": "x", "images": ["/tmp/x.png"]}]
-        with pytest.raises(LLMError):
-            client.chat_with_fallback(msgs)
-        assert client._active_idx == 0  # restored to primary despite error
-
-    def test_no_vision_model_raises_permanent(self):
-        """No vision-capable model configured → LLMPermanentError."""
-        client = _make_client([_NONVISION], "text-x")
-        msgs = [{"role": "user", "content": "see this", "images": ["/tmp/x.png"]}]
-        with pytest.raises(LLMPermanentError) as ei:
-            client.chat_with_fallback(msgs)
-        assert "vision-capable" in str(ei.value)
-
-    def test_no_vision_error_restores_active_idx(self):
-        """Active idx restored even on the no-vision-model error path."""
-        client = _make_client([_NONVISION], "text-x")
-        client._active_idx = 0
-        with pytest.raises(LLMPermanentError):
-            client.chat_with_fallback(
-                [{"role": "user", "content": "see", "images": ["/tmp/x.png"]}]
-            )
-        assert client._active_idx == 0  # restored
-
-    def test_active_model_already_vision_no_switch(self, monkeypatch):
-        """Active model is vision-capable → no switch, request sent directly."""
-        client = _make_client([_VISION, _NONVISION], "vision-x")
-        used: list[str] = []
-        monkeypatch.setattr(
-            client, "chat",
-            lambda *a, **k: used.append(client._models[client._active_idx]["model"]) or "ok",
-        )
-        msgs = [{"role": "user", "content": "x", "images": ["/tmp/x.png"]}]
-        client.chat_with_fallback(msgs)
-        assert used == ["vision-x"]  # no switch — active model used directly
-        assert client._active_idx == 0  # unchanged
-
-    def test_multimodal_content_list_detected(self, monkeypatch):
-        """Provider-style multimodal content lists are detected as images."""
-        client = _make_client([_NONVISION, _VISION], "text-x")
-        used: list[str] = []
-        monkeypatch.setattr(
-            client, "chat",
-            lambda *a, **k: used.append(client._models[client._active_idx]["model"]) or "ok",
-        )
-        msgs = [{"role": "user", "content": [
-            {"type": "text", "text": "hi"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
-        ]}]
-        client.chat_with_fallback(msgs)
-        assert used == ["vision-x"]
-
-    def test_progress_message_on_vision_switch(self, monkeypatch):
-        """Progress callback receives the vision-switch message."""
-        client = _make_client([_NONVISION, _VISION], "text-x")
-        monkeypatch.setattr(client, "chat", lambda *a, **k: "ok")
-        msgs_seen: list[str] = []
-        client.chat_with_fallback(
-            [{"role": "user", "content": "x", "images": ["/tmp/x.png"]}],
-            progress_cb=msgs_seen.append,
-        )
-        assert any("not vision-capable" in m for m in msgs_seen)
+def test_text_request_uses_same_pinned_model_without_vision_routing() -> None:
+    captured: list[httpx.Request] = []
+    client = make_run_model_client(
+        "openai",
+        httpx.MockTransport(lambda request: captured.append(request) or _response()),
+        metadata=ModelMetadata(
+            context_tokens=8192,
+            output_tokens=1024,
+            vision=False,
+            tool_calling=True,
+        ),
+        upstream_id="chosen-text-model",
+    )
+    progress: list[str] = []
+    try:
+        assert client.chat_with_fallback(
+            [{"role": "user", "content": "plain text"}], progress_cb=progress.append
+        ) == "ok"
+        assert len(captured) == 1
+        assert json.loads(captured[0].content)["model"] == "chosen-text-model"
+        assert progress == []
+    finally:
+        client.close()
 
 
-class TestTextOnlySingleModel:
-    def test_text_only_uses_primary(self, monkeypatch):
-        """Text-only request uses the primary model directly (no vision filtering)."""
-        client = _make_client([_NONVISION, _VISION], "text-x")
-        used: list[str] = []
-        monkeypatch.setattr(
-            client, "chat",
-            lambda *a, **k: used.append(client._models[client._active_idx]["model"]) or "ok",
-        )
-        out = client.chat_with_fallback([{"role": "user", "content": "plain text"}])
-        assert out == "ok"
-        assert used == ["text-x"]  # primary, no switch
+@pytest.mark.parametrize("vision", [False, None], ids=["verified-false", "unknown"])
+def test_provider_style_image_content_is_gated_by_pinned_metadata(
+    vision: bool | None,
+) -> None:
+    captured: list[httpx.Request] = []
+    client = make_run_model_client(
+        "openai",
+        httpx.MockTransport(lambda request: captured.append(request) or _response()),
+        metadata=ModelMetadata(
+            context_tokens=8192,
+            output_tokens=1024,
+            vision=vision,
+            tool_calling=True,
+        ),
+        upstream_id="multimodal-model",
+    )
+    try:
+        with pytest.raises(LLMPermanentError, match="verified vision support"):
+            client.chat([{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZmFrZQ=="}},
+                ],
+            }])
+        assert captured == []
+        assert client.llm_cfg["model"] == "multimodal-model"
+    finally:
+        client.close()
 
-    def test_text_only_error_propagates_no_fallback(self, monkeypatch):
-        """Transient error on primary propagates — no fallback attempt (single-model)."""
-        client = _make_client([_NONVISION, _VISION], "text-x")
-        used: list[str] = []
 
-        def fake_chat(*a, **k):
-            model = client._models[client._active_idx]["model"]
-            used.append(model)
-            raise LLMError("transient")
+def test_text_only_provider_failure_does_not_retry_or_retarget() -> None:
+    captured: list[httpx.Request] = []
+    client = make_run_model_client(
+        "openai",
+        httpx.MockTransport(
+            lambda request: captured.append(request)
+            or httpx.Response(503, text="temporary provider failure")
+        ),
+        metadata=ModelMetadata(
+            context_tokens=8192,
+            output_tokens=1024,
+            vision=False,
+            tool_calling=True,
+        ),
+        upstream_id="chosen-text-model",
+    )
+    pinned_model = client.llm_cfg["model"]
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            client.chat_with_fallback([{"role": "user", "content": "plain text"}])
 
-        monkeypatch.setattr(client, "chat", fake_chat)
-        with pytest.raises(LLMError):
-            client.chat_with_fallback([{"role": "user", "content": "plain"}])
-        # Only the primary was tried — no fallback to vision-x.
-        assert used == ["text-x"]
+        assert len(captured) == 1
+        assert json.loads(captured[0].content)["model"] == "chosen-text-model"
+        assert client.llm_cfg["model"] == pinned_model
+        assert client.list_models() == [{**client.llm_cfg, "active": True}]
+    finally:
+        client.close()

@@ -26,6 +26,45 @@ class LLMPermanentError(LLMError):
     """
 
 
+def _safe_token_count(value: object) -> int | None:
+    """Keep only a positive plain integer token count; drop anything else."""
+    if type(value) is int and value > 0:
+        return value
+    return None
+
+
+class LLMContextOverflowError(LLMPermanentError):
+    """A request exceeds context capacity, locally or as reported by the provider.
+
+    ``input_tokens`` and ``repair_input_ceiling`` are set only when the local
+    budget found a recoverable oversize input: the estimated input and the
+    largest input that could fit. They carry numbers only, never request,
+    model, endpoint, or credential text. Both are ``None`` for provider-reported
+    overflow, which gives no safe repair target. ``status_code`` is the plain
+    integer HTTP status of a provider-reported overflow, else ``None``.
+    """
+
+    def __init__(
+        self,
+        message: str = "Request exceeds the model context capacity",
+        *,
+        input_tokens: int | None = None,
+        repair_input_ceiling: int | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        """Create the error, keeping the optional repair numbers only as a pair."""
+        super().__init__(message)
+        self.status_code = (
+            status_code if type(status_code) is int and 100 <= status_code <= 599 else None
+        )
+        tokens = _safe_token_count(input_tokens)
+        ceiling = _safe_token_count(repair_input_ceiling)
+        if tokens is None or ceiling is None or tokens <= ceiling:
+            tokens = ceiling = None
+        self.input_tokens = tokens
+        self.repair_input_ceiling = ceiling
+
+
 # Error codes (from OpenAI / OpenRouter / Anthropic) that are permanent — retrying
 # them wastes quota, burns time, and can trigger duplicate billing on some providers.
 _PERMANENT_ERROR_CODES = frozenset({

@@ -509,79 +509,75 @@ class TestBuiltinExecutorLifecycle:
 
 
 class TestLLMFailedLifecycle:
-    """Real ``LLMClient.chat`` failure path emits exactly one LLM_FAILED.
+    """Real pinned-client failures emit one safe lifecycle pair."""
 
-    Covers spec scenario "LLM failure is recorded exactly once" through the
-    production ``except _LLM_CHAT_ERRORS`` block (the dedup removed the paired
-    ``logger.error`` prose line; only the structured ``LLM_FAILED`` remains).
-    """
+    @staticmethod
+    def _client(monkeypatch):
+        import httpx
 
-    def _make_client(self):
-        """Build a minimal LLMClient without running __init__ (no network)."""
         import llm_client as lc
+        from model_registry import ModelMetadata
+        from tests.run_model_fixtures import make_run_model_client
 
-        client = lc.LLMClient.__new__(lc.LLMClient)
-        client._models = [{"model": "test-model", "provider": "openai"}]
-        client._active_idx = 0
-        return client, lc
+        captured_requests = []
 
-    def test_chat_failure_emits_single_llm_failed(self, tmp_path, monkeypatch):
+        def fail(request):
+            captured_requests.append(request)
+            raise httpx.ConnectError(
+                "provider-secret request-secret", request=request
+            )
+
+        client = make_run_model_client(
+            "openai",
+            httpx.MockTransport(fail),
+            metadata=ModelMetadata(context_tokens=8192, output_tokens=1024),
+            upstream_id="test-pinned-model",
+        )
+        events = []
+        monkeypatch.setattr(
+            lc.agent_logging,
+            "log_event",
+            lambda event, message, **fields: events.append((event, message, fields)),
+        )
+        return client, lc, captured_requests, events
+
+    @pytest.mark.parametrize("native", [False, True], ids=["text", "native-tools"])
+    def test_provider_failure_emits_one_safe_llm_failed(
+        self, native, monkeypatch
+    ):
         from unittest.mock import MagicMock
 
-        client, lc = self._make_client()
-        captured: list = []
+        import httpx
 
-        def _capture(event, _msg, **kw):
-            captured.append((event, kw))
+        from agent_logging import LogEvent
 
-        monkeypatch.setattr(lc.agent_logging, "log_event", _capture)
-
+        client, lc, requests, events = self._client(monkeypatch)
         stdlib = MagicMock()
         monkeypatch.setattr(lc, "logger", stdlib)
 
-        def _raise(*_a, **_k):
-            raise lc.LLMError("llm boom")
+        message = [{"role": "user", "content": "request-secret"}]
+        with pytest.raises(httpx.ConnectError) as caught:
+            if native:
+                client.chat_with_tools(message, tools=[])
+            else:
+                client.chat(message)
 
-        monkeypatch.setattr(client, "_provider_chat", _raise)
-
-        with pytest.raises(lc.LLMError, match="llm boom"):
-            client.chat([{"role": "user", "content": "hi"}])
-
-        llm_failed = [e for e, _ in captured if e == al.LogEvent.LLM_FAILED]
-        assert len(llm_failed) == 1
-        kw = [kw for e, kw in captured if e == al.LogEvent.LLM_FAILED][0]
-        assert kw["model"] == "test-model"
-        assert kw["err"] == "llm boom"
-        assert isinstance(kw["dur_ms"], int)
-        # No paired logger.error prose record restating the failure.
-        error_msgs = [c.args[0] for c in stdlib.error.call_args_list]
-        assert not any("LLM chat" in m for m in error_msgs)
-        assert stdlib.error.call_count == 0
-
-    def test_chat_with_tools_failure_emits_single_llm_failed(self, tmp_path, monkeypatch):
-        from unittest.mock import MagicMock
-
-        client, lc = self._make_client()
-        captured: list = []
-
-        def _capture(event, _msg, **kw):
-            captured.append((event, kw))
-
-        monkeypatch.setattr(lc.agent_logging, "log_event", _capture)
-
-        stdlib = MagicMock()
-        monkeypatch.setattr(lc, "logger", stdlib)
-
-        def _raise(*_a, **_k):
-            raise lc.LLMError("tools boom")
-
-        monkeypatch.setattr(client, "_provider_chat", _raise)
-
-        with pytest.raises(lc.LLMError, match="tools boom"):
-            client.chat_with_tools([{"role": "user", "content": "hi"}], tools=[])
-
-        llm_failed = [e for e, _ in captured if e == al.LogEvent.LLM_FAILED]
-        assert len(llm_failed) == 1
+        assert [event for event, _message, _fields in events] == [
+            LogEvent.LLM_CALL, LogEvent.LLM_FAILED
+        ]
+        call_fields = events[0][2]
+        failure_fields = events[1][2]
+        assert call_fields["model"] == "test-pinned-model"
+        assert failure_fields["model"] == "test-pinned-model"
+        assert failure_fields["err"] == "connection"
+        assert isinstance(failure_fields["dur_ms"], int)
+        assert failure_fields["dur_ms"] >= 0
+        assert len(requests) == 1
+        assert json.loads(requests[0].content)["model"] == "test-pinned-model"
+        assert str(caught.value) == "Provider connection failed"
+        assert str(caught.value.request.url) == "https://provider.invalid/"
+        assert "request-secret" not in repr(events)
+        assert "provider-secret" not in repr(events)
         assert stdlib.error.call_count == 0
 
 

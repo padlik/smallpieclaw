@@ -10,13 +10,15 @@ mutable state. This decouples the iteration logic from the controller class.
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import json
 import logging
 import os
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace as dataclass_replace
 from typing import Callable, Optional
 
@@ -28,7 +30,7 @@ from builtin_tools.schemas import (
     builtin_tool_names,
 )
 from confirmation import ConfirmationManager
-from context_manager import maybe_compact, resolve_compaction_threshold
+from context_manager import maybe_compact, resolve_compaction_threshold, validate_native_history
 from context_monitor import (
     ContextMonitor,
     ContextSnapshot,
@@ -37,7 +39,11 @@ from context_monitor import (
     group_tool_defs_by_server,
 )
 from interfaces import ToolCall
-from llm_client import LLMClient, LLMCancelledError, LLMEmptyResponseError, LLMError, LLMPermanentError, _encode_images
+from call_attempt_state import CallAttemptState
+from checkpoint_store import CheckpointRetireStatus
+from llm_client import LLMClient, LLMCancelledError, LLMContextOverflowError, LLMEmptyResponseError, LLMError, LLMPermanentError, _encode_images
+from model_request_budget import ModelRequestBudget
+from model_selection_guard import GUARD_PREPARATION_FAILED_MESSAGE, GUARD_REJECTION_MESSAGE
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from outcome_utils import fail_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
@@ -235,6 +241,8 @@ class ReactContext:
     # confirmation log lines. Defaulted so test/standalone constructors that omit
     # it still work; AgentController.run() assigns a fresh ID per run.
     trace_id: str = ""
+    checkpoint_owner: object = None
+    disk_recovery_available: bool = True
 
     # Immutable identity for result ownership during one interactive run. It is
     # deliberately independent of trace_id because resumed runs reuse traces.
@@ -290,6 +298,9 @@ class ReactContext:
     plan_max_iterations: int = 50
     # Minutes of inactivity before injecting a soft "still working?" prompt
     inactivity_warn_minutes: int = 15
+    max_retries: int = 4
+    retry_delay: float = 2.0
+    retry_wait: Optional[Callable[[threading.Event, float], bool]] = None
 
     # Sub-agent context sharing (set by AgentController.run for sub-agents).
     # _context_payload is the parent context dict injected as PARENT CONTEXT;
@@ -317,6 +328,14 @@ class ReactContext:
 
     # Shared, lock-free context-window profiler; injected from AgentController/main.py.
     context_monitor: ContextMonitor | None = None
+
+    # Conversation selection guard (set by AgentController for a guarded run).
+    # A guarded run stages its exact first request and defers every run effect
+    # until it fits; ``activated`` tells cleanup whether the run took effect.
+    guarded_first_request: bool = False
+    on_activate: Optional[Callable[[], None]] = None
+    on_accepted: Optional[Callable[[], None]] = None
+    activated: bool = True
 
     @property
     def log_prefix(self) -> str:
@@ -422,7 +441,11 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     path = str(args.get("path", "")).strip()
     question = args.get("question", "What is in this image?")
     if not path:
-        return {"success": False, "output": "", "error": "vision_query: 'path' argument is required."}
+        return {
+            "success": False, "output": "",
+            "error": "vision_query: 'path' argument is required.",
+            "_guard_refusal": True,
+        }
 
     # ADR-0026 path-policy gate: vision_query reads a file, so apply the same
     # tier classification as file_read. This gate was ported from the legacy
@@ -434,6 +457,7 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
         return {
             "success": False, "output": "",
             "error": "vision_query: confirmation infrastructure not available.",
+            "_guard_refusal": True,
         }
 
     policy = getattr(builtin, "path_policy", None)
@@ -631,6 +655,12 @@ class _LoopState:
     max_steps: int
     step: int = 0
     json_fail_streak: int = 0
+    attempt_state: CallAttemptState | None = None
+    last_budget: ModelRequestBudget | None = None
+    action_accepted: bool = False
+    # Set only by dispatch of an actually executed, usable action; the guard's
+    # one-shot completion fires from this and never from action_accepted.
+    guard_eligible: bool = False
     operator_cancelled: bool = False
     last_action_time: float = field(default_factory=time.time)
     warned_inactivity: bool = False
@@ -674,7 +704,7 @@ def _classify_llm_error(exc: Exception) -> LLMErrorInfo:
 
     LLMCancelledError is NOT classified here — it propagates before classification.
     """
-    detail = f"{type(exc).__name__}: {exc}"
+    detail = type(exc).__name__
 
     if isinstance(exc, httpx.TimeoutException):
         return LLMErrorInfo("timeout", "⏱️ Request timed out", True, detail)
@@ -691,18 +721,21 @@ def _classify_llm_error(exc: Exception) -> LLMErrorInfo:
             if any(indicator in body for indicator in _CONTEXT_OVERFLOW_INDICATORS):
                 return LLMErrorInfo("context", "📏 Context too long", False, detail)
         return LLMErrorInfo("unknown", "❌ LLM error", True, detail)
+    if isinstance(exc, LLMContextOverflowError):
+        return LLMErrorInfo("context", "📏 Context too long", False, detail)
     if isinstance(exc, LLMEmptyResponseError):
         return LLMErrorInfo("empty", "📭 Model returned no content", True, detail)
     if isinstance(exc, LLMPermanentError):
-        return LLMErrorInfo("permanent", f"❌ {exc}", False, detail)
-    return LLMErrorInfo("unknown", f"❌ LLM error: {exc}", True, detail)
+        return LLMErrorInfo("permanent", "❌ Provider rejected the request", False, detail)
+    return LLMErrorInfo("unknown", "❌ LLM error: unexpected provider failure", True, detail)
 
 
 def _get_user_goal(state: _LoopState) -> str:
-    """Extract the user's goal from the first user message in state."""
-    for msg in state.messages:
-        if msg.get("role") == "user":
-            return msg.get("content", "")
+    """Return the current user goal from its preserved history anchor."""
+    if 0 <= state.goal_idx < len(state.messages):
+        msg = state.messages[state.goal_idx]
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            return msg["content"]
     return ""
 
 
@@ -720,6 +753,9 @@ def _handle_llm_error(
     import json as _json
     import secrets as _secrets
 
+    attempt = state.attempt_state
+    checkpoint: dict | None = None
+    ctx.disk_recovery_available = False
     # Step 1: Write checkpoint if enabled
     if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
         checkpoint = {
@@ -730,7 +766,9 @@ def _handle_llm_error(
             "goal_idx": state.goal_idx,
             "max_steps": state.max_steps,
             "json_fail_streak": state.json_fail_streak,
-            "model": ctx.llm.llm_cfg.get("model", "?"),
+            "model_id": ctx.llm.llm_cfg.get("id", ctx.llm.llm_cfg.get("model", "?")),
+            "format_version": 2,
+            "attempt_state": attempt.to_dict() if attempt is not None else None,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "error_info": {
                 "type": error_info.type,
@@ -739,7 +777,17 @@ def _handle_llm_error(
                 "detail": error_info.detail,
             },
         }
-        ctx.checkpoint_store.save(ctx.trace_id, checkpoint)
+        if ctx.checkpoint_owner is None:
+            saved = ctx.checkpoint_store.save(ctx.trace_id, checkpoint)
+        else:
+            saved = ctx.checkpoint_store.save(
+                ctx.trace_id, checkpoint, owner=ctx.checkpoint_owner
+            )
+        ctx.disk_recovery_available = bool(saved) and (
+            ctx.checkpoint_owner is None
+            or not hasattr(ctx.checkpoint_store, "recovery_available")
+            or bool(ctx.checkpoint_store.recovery_available(ctx.trace_id, ctx.checkpoint_owner))
+        )
 
     # Step 2: Prompt user for retry/cancel
     token = _secrets.token_hex(4)
@@ -758,16 +806,50 @@ def _handle_llm_error(
             and "tool '" in m.get("content", "").lower()
         ),
     })
+    prompt_message = error_info_json
+    if not ctx.disk_recovery_available:
+        progress(
+            "⚠️ Disk recovery is unavailable because the checkpoint could not be saved. "
+            "A retry can continue in this session, but a process restart will not restore this request."
+        )
     response = ctx.confirmation.request_retry(
-        token, error_info_json, progress, timeout_seconds=ctx.retry_timeout_seconds
+        token, prompt_message, progress, timeout_seconds=ctx.retry_timeout_seconds
     )
 
     # Step 3: Handle response
     if response == "retry":
+        if attempt is not None and attempt.outbound_attempts:
+            if not attempt.manual_retry_authorized:
+                attempt.authorize_manual_retry()
+            if checkpoint is not None and ctx.checkpoint_store is not None:
+                checkpoint["attempt_state"] = attempt.to_dict()
+                if ctx.checkpoint_owner is None:
+                    saved = ctx.checkpoint_store.save(ctx.trace_id, checkpoint)
+                else:
+                    saved = ctx.checkpoint_store.save(
+                        ctx.trace_id, checkpoint, owner=ctx.checkpoint_owner
+                    )
+                ctx.disk_recovery_available = bool(saved) and (
+                    ctx.checkpoint_owner is None
+                    or not hasattr(ctx.checkpoint_store, "recovery_available")
+                    or bool(ctx.checkpoint_store.recovery_available(ctx.trace_id, ctx.checkpoint_owner))
+                )
+                if not ctx.disk_recovery_available:
+                    logger.warning("Retry continuation has no verified disk recovery checkpoint")
+                    progress(
+                        "⚠️ The retry authorization could not be saved for restart recovery. "
+                        "This continuation remains available only while this run stays active."
+                    )
         return None  # loop continues, re-calls LLM with same state
     if response == "cancel":
         if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
-            ctx.checkpoint_store.delete(ctx.trace_id)
+            try:
+                if ctx.checkpoint_owner is None:
+                    ctx.checkpoint_store.delete(ctx.trace_id)
+                else:
+                    ctx.checkpoint_store.delete(ctx.trace_id, owner=ctx.checkpoint_owner)
+            except (OSError, RuntimeError):
+                logger.warning("Checkpoint cleanup was blocked; preserving recovery data")
         return f"❌ {error_info.message}"
     # timeout
     return f"❌ {error_info.message}"
@@ -821,9 +903,13 @@ def _publish_context_snapshot(
     if tool_defs_tokens is None:
         tool_defs_tokens = sum(tool_defs_by_server.values())
     effective_window, compaction_threshold = resolve_compaction_threshold(
-        ctx.llm.llm_cfg, ctx.ctx_max_tokens,
+        ctx.llm.llm_cfg, ctx.ctx_max_tokens, request_budget=state.last_budget,
     )
-    completion_reserve = ctx.llm.llm_cfg.get("max_tokens", 1024)
+    completion_reserve = (
+        state.last_budget.completion_reserve
+        if state.last_budget is not None
+        else ctx.llm.llm_cfg.get("max_tokens", 1024)
+    )
     headroom_nominal = compaction_threshold - system_prompt_tokens - chat_history_tokens
     headroom_real = compute_headroom_real(
         compaction_threshold, system_prompt_tokens, chat_history_tokens, tool_defs_tokens,
@@ -848,14 +934,23 @@ def _publish_context_snapshot(
     ctx.context_monitor.publish(snapshot)
 
 
-def _assemble_system_prompt(ctx: ReactContext, user_goal: str) -> str:
+_GRAPH_NOT_PREPARED = object()
+
+
+def _assemble_system_prompt(
+    ctx: ReactContext, user_goal: str, graph_text: object = _GRAPH_NOT_PREPARED
+) -> str:
     """Assemble the full system prompt string for a run.
 
     Scheduled-job history is never injected: it is job-owned, not operator
-    context (isolate-job-execution, design decision 2).
+    context (isolate-job-execution, design decision 2). A guarded run passes
+    ``graph_text`` (possibly empty) from its single read-only preparation; the
+    explicit sentinel, not truthiness, selects the ordinary retrieval path.
     """
     _graph_context_section = ""
-    if ctx.graph_memory is not None:
+    if graph_text is not _GRAPH_NOT_PREPARED:
+        _graph_context_section = graph_text if isinstance(graph_text, str) else ""
+    elif ctx.graph_memory is not None:
         try:
             _graph_context_section = (
                 ctx.graph_memory.format_for_prompt(
@@ -926,14 +1021,20 @@ def _init_messages(
     return messages, goal_idx
 
 
-def _ensure_tool_defs(ctx: ReactContext) -> None:
-    """Lazily build _tool_defs if not already populated."""
+def _ensure_tool_defs(ctx: ReactContext, *, strict: bool = False) -> None:
+    """Lazily build _tool_defs if not already populated.
+
+    ``strict`` (guarded staging) propagates a build failure instead of silently
+    dropping MCP schemas.
+    """
     if ctx._tool_defs is None:
         try:
             ctx._tool_defs = build_tool_definitions(
                 mcp_manager=ctx.mcp_manager,
             )
         except Exception as _btd_exc:  # noqa: BLE001
+            if strict:
+                raise
             logger.warning("build_tool_definitions failed: %s — MCP tools skipped", _btd_exc, )
             ctx._tool_defs = build_tool_definitions(mcp_manager=None)
 
@@ -1026,6 +1127,116 @@ def _action_from_turn(turn: _Turn, state: _LoopState) -> tuple[dict, Callable[[s
     return action_obj, _result_sink(state)
 
 
+def _definition_revision(ctx: ReactContext) -> str:
+    """Return the stable digest of the tool definitions sent with a request."""
+    return hashlib.sha256(
+        json.dumps(ctx._tool_defs or [], sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """Return whether a failure is a transient transport or status error."""
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {408, 429, 500, 502, 503, 504}
+    return False
+
+
+def _summarize_on_pin(ctx: ReactContext, prompt: str) -> str:
+    """Summarize on the pinned model with its own bounded attempt state.
+
+    The summary prompt is previewed first so an oversized prompt costs no I/O and
+    falls back deterministically in the caller. Waits are cancel-responsive and
+    cancellation propagates; the main request's attempt state and pending
+    checkpoint are never touched.
+    """
+    messages = [{"role": "user", "content": prompt}]
+    ctx.llm.preview_request(messages, None)
+    attempt = CallAttemptState(ctx.max_retries, ctx.retry_delay)
+    wait = ctx.retry_wait or (lambda event, seconds: event.wait(seconds))
+    while True:
+        if ctx.cancel_event.is_set():
+            raise LLMCancelledError("cancelled")
+        try:
+            with ctx.llm.bind_attempt(attempt, manual=attempt.manual_retry_authorized):
+                return ctx.llm.chat(messages)
+        except LLMCancelledError:
+            raise
+        except (LLMError, httpx.HTTPError) as exc:
+            if not _is_transient_llm_error(exc) or not attempt.can_retry_automatically():
+                raise
+            if wait(ctx.cancel_event, attempt.next_retry_delay()) or ctx.cancel_event.is_set():
+                raise LLMCancelledError("cancelled") from None
+
+
+def _prepare_request(
+    ctx: ReactContext,
+    state: _LoopState,
+    system: str,
+    effective_ctx: int,
+    supports_native_fallback: bool,
+) -> None:
+    """Preview the exact selected request and compact before any send.
+
+    A fitting request goes through ordinary threshold compaction using the
+    preview's budget. A recoverable oversize request gets one forced bounded
+    compaction toward the repair ceiling. Either way a strict re-preview must
+    pass; otherwise the error propagates with no provider I/O.
+    """
+    attempt = state.attempt_state
+    native = bool(
+        ctx._tool_defs and supports_native_fallback
+        and (attempt is None or attempt.mode == "native")
+    )
+    revision = _definition_revision(ctx)
+
+    def preview(messages: list[dict] | None = None):
+        nonlocal native
+        messages = state.messages if messages is None else messages
+        if native:
+            try:
+                return ctx.llm.preview_request(
+                    messages, system, tools=ctx._tool_defs,
+                    definition_revision=revision,
+                )
+            except NotImplementedError:
+                native = False
+        return ctx.llm.preview_request(
+            _linearize_native_turns(messages), system, json_mode=True,
+            definition_revision=revision,
+        )
+
+    summarize = lambda prompt: _summarize_on_pin(ctx, prompt)  # noqa: E731
+    forced = False
+    try:
+        first = preview()
+    except LLMContextOverflowError as exc:
+        if exc.repair_input_ceiling is None or exc.input_tokens is None:
+            raise
+        forced = True
+        if state.messages:
+            # Diagnostic only: the intact goal with the full system and definitions
+            # must fit before any summary I/O. Its budget is never used.
+            preview([state.messages[min(max(0, state.goal_idx), len(state.messages) - 1)]])
+        compacted, goal_idx = maybe_compact(
+            state.messages, system, effective_ctx, ctx.llm, goal_idx=state.goal_idx,
+            input_tokens=exc.input_tokens, repair_target=exc.repair_input_ceiling,
+            force=True, summarize=summarize,
+        )
+    else:
+        state.last_budget = first.budget
+        compacted, goal_idx = maybe_compact(
+            state.messages, system, effective_ctx, ctx.llm, goal_idx=state.goal_idx,
+            input_tokens=first.input_tokens, request_budget=first.budget,
+            summarize=summarize,
+        )
+    if compacted is state.messages and not forced:
+        return
+    state.messages, state.goal_idx = compacted, goal_idx
+    state.last_budget = preview().budget
+
+
 def _request_turn(
     ctx: ReactContext,
     state: _LoopState,
@@ -1033,66 +1244,117 @@ def _request_turn(
     progress: Callable[[str], None],
     supports_native_fallback: bool = False,
 ) -> _Turn:
-    """Make one LLM call and return the structured turn result."""
+    """Perform bounded same-request retries and return the accepted model turn."""
     raw = ""
     tool_calls: list[ToolCall] = []
-    native_attempted = False
     text_from_native = False
     linearized_messages = None
-    _MAX_EMPTY_RETRIES = 2
-
-    if ctx._tool_defs and supports_native_fallback:
-        try:
-            response = ctx.llm.chat_with_tools_fallback(
-                state.messages, tools=ctx._tool_defs, system=system, progress_cb=progress,
+    attempt = state.attempt_state
+    if attempt is None:
+        attempt = state.attempt_state = CallAttemptState(ctx.max_retries, ctx.retry_delay)
+    native = bool(ctx._tool_defs and supports_native_fallback and attempt.mode == "native")
+    manual_call = False
+    empty_count = 0
+    while True:
+        if ctx.cancel_event.is_set():
+            return _Turn([], "", False, "[Cancelled]")
+        if ctx.checkpoint_store is not None and ctx.checkpoint_owner is not None:
+            retirement = ctx.checkpoint_store.retire_pending(
+                ctx.trace_id, ctx.checkpoint_owner
             )
-            native_attempted = True
-            if response.is_tool_call and response.tool_calls:
-                tool_calls = response.tool_calls
-            elif response.text:
-                raw = response.text
-                text_from_native = True
-        except NotImplementedError:
-            logger.debug("Native tool calling not supported by provider — falling back to json_mode")
-        except LLMPermanentError:
-            raise
-        except LLMError:
-            logger.warning("Native tool calling failed (LLMError) — falling back to json_mode")
-        except Exception as exc:
-            logger.warning("Native tool calling unexpected error: %s — falling back to json_mode", exc, )
+            if retirement.status is CheckpointRetireStatus.BLOCKED:
+                ctx.disk_recovery_available = False
+                return _Turn([], "", False, retirement.message)
+            ctx.disk_recovery_available = False
+        manual_call = attempt.manual_retry_authorized
+        bind = getattr(ctx.llm, "bind_attempt", None)
+        has_transport_binding = callable(bind)
+        definition_revision = _definition_revision(ctx)
+        binding = (
+            bind(attempt, manual=manual_call, definition_revision=definition_revision)
+            if has_transport_binding else nullcontext()
+        )
 
-    if not raw and not native_attempted:
-        linearized_messages = _linearize_native_turns(state.messages)
-        empty_retries = 0
-        while True:
-            try:
+        try:
+            with binding:
+                if native:
+                    attempts_before = attempt.outbound_attempts
+                    try:
+                        response = ctx.llm.chat_with_tools_fallback(
+                            state.messages, tools=ctx._tool_defs, system=system,
+                            progress_cb=progress,
+                        )
+                    except NotImplementedError:
+                        if attempt.outbound_attempts != attempts_before:
+                            raise
+                        # Native unsupported is a local conversion only; the real
+                        # client leaves the counter unchanged for this path.
+                        attempt.select_mode("json")
+                        native = False
+                        linearized_messages = _linearize_native_turns(state.messages)
+                        continue
+                    if response.is_tool_call and response.tool_calls:
+                        tool_calls = response.tool_calls
+                    elif response.text:
+                        raw = response.text
+                        text_from_native = True
+                    else:
+                        raise LLMEmptyResponseError("empty response")
+                    return _Turn(tool_calls, raw, text_from_native, None, linearized_messages)
+                if linearized_messages is None:
+                    linearized_messages = _linearize_native_turns(state.messages)
                 raw = ctx.llm.chat_with_fallback(
                     linearized_messages, system=system, progress_cb=progress, json_mode=True,
                 )
-            except LLMCancelledError:
-                logger.info("Agent LLM call cancelled at step %d", state.step)
-                return _Turn([], "", False, "[Cancelled]")
-            except (LLMError, LLMEmptyResponseError, httpx.HTTPError) as exc:
-                error_info = _classify_llm_error(exc)
-                logger.warning("LLM error at step %d: %s — %s", state.step, error_info.type, error_info.detail)
-                # Try to handle the error (checkpoint + retry prompt)
-                result = _handle_llm_error(ctx, state, error_info, progress, _get_user_goal(state))
-                if result is None:
-                    # User pressed Retry — re-attempt the LLM call.
-                    # This is an unbounded, human-paced retry, NOT tied to
-                    # the empty-response retry counter.
-                    continue
-                return _Turn([], "", False, result)
             if raw.strip():
-                break
-            if empty_retries < _MAX_EMPTY_RETRIES:
-                logger.warning("LLM returned empty response (step %d), retrying (%d/%d)…", state.step, empty_retries + 1, _MAX_EMPTY_RETRIES, )
-                progress(f"⏳ Empty LLM response, retrying ({empty_retries + 1}/{_MAX_EMPTY_RETRIES})…")
-                empty_retries += 1
+                return _Turn([], raw, False, None, linearized_messages)
+            empty_count += 1
+            if empty_count <= 2 and attempt.can_retry_automatically():
+                progress(f"⏳ Empty LLM response, retrying ({empty_count}/2)…")
+                delay = attempt.next_retry_delay()
+                wait = ctx.retry_wait or (lambda event, seconds: event.wait(seconds))
+                if wait(ctx.cancel_event, delay) or ctx.cancel_event.is_set():
+                    return _Turn([], "", False, "[Cancelled]")
                 continue
-            break
-
-    return _Turn(tool_calls, raw, text_from_native, None, linearized_messages)
+            raise LLMEmptyResponseError("empty response")
+        except LLMCancelledError:
+            logger.info("Agent LLM call cancelled at step %d", state.step)
+            return _Turn([], "", False, "[Cancelled]")
+        except NotImplementedError:
+            # A native implementation that reports unsupported after sending is
+            # not eligible for protocol conversion.
+            raise
+        except (LLMError, httpx.HTTPError, LLMEmptyResponseError) as exc:
+            info = _classify_llm_error(exc)
+            transient = isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
+            if isinstance(exc, httpx.HTTPStatusError):
+                transient = exc.response.status_code in {408, 429, 500, 502, 503, 504}
+            retryable_control = isinstance(exc, LLMEmptyResponseError)
+            if retryable_control:
+                empty_count += 1
+            if (
+                (transient or retryable_control)
+                and (not retryable_control or empty_count <= 2)
+                and attempt.can_retry_automatically()
+            ):
+                if retryable_control:
+                    progress(f"⏳ Empty LLM response, retrying ({empty_count}/2)…")
+                delay = attempt.next_retry_delay()
+                wait = ctx.retry_wait or (lambda event, seconds: event.wait(seconds))
+                if wait(ctx.cancel_event, delay) or ctx.cancel_event.is_set():
+                    return _Turn([], "", False, "[Cancelled]")
+                continue
+            logger.warning("LLM request failed at step %d: %s", state.step, info.type)
+            result = _handle_llm_error(ctx, state, info, progress, _get_user_goal(state))
+            if result is None:
+                continue
+            return _Turn([], "", False, result)
+        except Exception as exc:
+            info = _classify_llm_error(exc)
+            result = _handle_llm_error(ctx, state, info, progress, _get_user_goal(state))
+            if result is None:
+                continue
+            return _Turn([], "", False, result)
 
 
 def _result_sink(
@@ -1106,6 +1368,46 @@ def _result_sink(
     if tc is not None:
         return lambda content: _append_native_tool_result(state.messages, tc, content)
     return lambda content: state.messages.append({"role": "user", "content": content})
+
+
+_GUARD_REFUSAL_ERROR_TYPES = frozenset(
+    {"prohibited_path", "scheduled_approval_denied", "confirmation_failed"}
+)
+
+
+def _outcome_guard_eligible(outcome: dict) -> bool:
+    """Return whether a tool outcome proves the model's action actually executed.
+
+    Local refusals, staged confirmations and operator cancellations are not a
+    usable response; an ordinary executed tool failure is.
+    """
+    if outcome.get("success"):
+        return True
+    if (
+        outcome.get("requires_confirmation")
+        or outcome.get("vision_reexecute")
+        or outcome.get("_operator_cancelled")
+        or outcome.get("_guard_refusal")
+    ):
+        return False
+    return outcome.get("error_type") not in _GUARD_REFUSAL_ERROR_TYPES
+
+
+def _fire_accepted(ctx: ReactContext, state: _LoopState) -> None:
+    """Run the guard's one-shot completion after a usable, uncancelled dispatch."""
+    callback = ctx.on_accepted
+    if (
+        callback is None
+        or not state.guard_eligible
+        or state.operator_cancelled
+        or ctx.cancel_event.is_set()
+    ):
+        return
+    ctx.on_accepted = None
+    try:
+        callback()
+    except Exception:  # noqa: BLE001
+        logger.warning("selection guard completion failed", exc_info=True)
 
 
 def _dispatch_action(
@@ -1138,7 +1440,10 @@ def _dispatch_action(
                     "wait for running children, or call cancel_agent."
                 )
                 return None
-        return _finish_run(ctx, action_obj, user_goal)
+        result = _finish_run(ctx, action_obj, user_goal)
+        state.action_accepted = True
+        state.guard_eligible = True
+        return result
 
     if action == "tool":
         tool_name = action_obj.get("tool", "")
@@ -1169,6 +1474,8 @@ def _dispatch_action(
         _end_status = "ok" if outcome.get("success") else "fail"
         progress(f"__TOOL_END__:{_end_status}:{tool_name}\n{fmt_tool_result_progress(tool_name, args, outcome)}")
         sink(tool_result)
+        state.action_accepted = True
+        state.guard_eligible = _outcome_guard_eligible(outcome)
 
         if tool_name in ("get_agent_result", "wait_for_any_agent"):
             status = outcome.get("status")
@@ -1231,6 +1538,8 @@ def _dispatch_action(
         if new_max_steps is not None:
             state.max_steps = max(state.step, min(int(new_max_steps), _ABSOLUTE_PLAN_CEILING))
         sink(result_msg)
+        state.action_accepted = True
+        state.guard_eligible = True
         if ctx.cancel_event.is_set():
             state.operator_cancelled = True
         return None
@@ -1312,11 +1621,21 @@ def _run_single_step(
             ctx._tool_defs_tokens = 0
     _tool_defs_by_server = ctx._tool_defs_by_server
     _tool_defs_tokens = ctx._tool_defs_tokens
-    state.messages, state.goal_idx = maybe_compact(
-        state.messages, system, _effective_ctx, ctx.llm,
-        goal_idx=state.goal_idx,
-        tool_defs_tokens=_tool_defs_tokens,
-    )
+    if state.attempt_state is None:
+        state.attempt_state = CallAttemptState(ctx.max_retries, ctx.retry_delay)
+    while True:
+        try:
+            _prepare_request(ctx, state, system, _effective_ctx, supports_native_fallback)
+            break
+        except LLMCancelledError:
+            return _StepResult(early_return="[Cancelled]")
+        except (LLMError, httpx.HTTPError) as exc:
+            logger.warning("Request preparation failed at step %d: %s", state.step, _classify_llm_error(exc).type)
+            result = _handle_llm_error(
+                ctx, state, _classify_llm_error(exc), progress, _get_user_goal(state),
+            )
+            if result is not None:
+                return _StepResult(early_return=result)
 
     turn = _request_turn(
         ctx, state, system, progress,
@@ -1336,12 +1655,15 @@ def _run_single_step(
         progress(err_msg)
         return _StepResult(early_return=err_msg)
 
+    state.action_accepted = False
+    state.guard_eligible = False
     final = _dispatch_action(
         ctx, action_obj, sink, state, user_goal, run_start, progress,
     )
     if final is not None:
-        if ctx.checkpoint_store is not None and ctx.checkpoint_enabled:
-            ctx.checkpoint_store.delete(ctx.trace_id)
+        if state.action_accepted:
+            state.attempt_state = None
+        _fire_accepted(ctx, state)
         try:
             _publish_context_snapshot(
                 ctx, state, system,
@@ -1351,6 +1673,12 @@ def _run_single_step(
         except Exception:
             logger.warning("context snapshot publication failed", exc_info=True)
         return _StepResult(early_return=final)
+
+    # Dispatch sets this marker only after accepting a valid action and recording
+    # its result. Corrective refusals such as finish-veto keep the request alive.
+    if state.action_accepted:
+        state.attempt_state = None
+    _fire_accepted(ctx, state)
 
     if state.operator_cancelled:
         return _StepResult(should_continue=False)
@@ -1377,7 +1705,129 @@ def react_loop(
     images: Optional[list[str]] = None,
     initial_state: Optional[_LoopState] = None,
 ) -> str:
-    """Execute the ReAct loop: LLM → parse → dispatch → repeat. Returns the final answer string."""
+    """Execute the ReAct loop while guaranteeing release of locally acquired ownership."""
+    acquired_owner = False
+    if (
+        ctx.checkpoint_store is not None
+        and ctx.checkpoint_owner is None
+        and ctx.trace_id
+        and hasattr(ctx.checkpoint_store, "acquire_owner")
+        and (ctx.checkpoint_enabled or initial_state is not None)
+    ):
+        ctx.checkpoint_owner = ctx.checkpoint_store.acquire_owner(ctx.trace_id)
+        if ctx.checkpoint_owner is None:
+            return "❌ A run for this checkpoint trace is already active. Try again after it finishes."
+        acquired_owner = True
+    try:
+        return _react_loop_owned(
+            ctx, user_goal, progress_callback, images, initial_state
+        )
+    finally:
+        if acquired_owner:
+            ctx.checkpoint_owner.release()
+            ctx.checkpoint_owner = None
+
+
+def _register_turn(ctx: ReactContext) -> None:
+    """Register the depth-0 turn with the sub-agent supervisor, if any."""
+    supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
+    if ctx.depth == 0 and supervisor is not None:
+        supervisor.register_active_turn(ctx.turn_id)
+
+
+@dataclass
+class _StagedFirstRequest:
+    """Frozen first-request bundle of a guarded run; built with no run effects."""
+
+    rejected: bool = False
+    system: str = ""
+    messages: list = field(default_factory=list)
+    goal_idx: int = 0
+    tool_defs: Optional[list] = None
+    graph_commit: Optional[Callable[[], None]] = None
+    graph_injected: bool = False
+
+
+def _stage_guarded_first_request(
+    ctx: ReactContext,
+    user_goal: str,
+    images: Optional[list[str]],
+    initial_state: Optional[_LoopState],
+    supports_native_fallback: bool,
+) -> _StagedFirstRequest:
+    """Stage and strictly preview the exact first request without side effects.
+
+    Only an overflow of the selected model rejects; every other preview error
+    proceeds to activation so the ordinary path reports it.
+    """
+    if initial_state is not None:
+        messages = copy.deepcopy(initial_state.messages)
+        goal_idx = initial_state.goal_idx
+        attempt = initial_state.attempt_state
+    else:
+        messages, goal_idx = _init_messages(ctx, user_goal, images)
+        messages = copy.deepcopy(messages)
+        attempt = None
+
+    validate_native_history(messages)
+    ctx._tool_defs = None
+    _ensure_tool_defs(ctx, strict=True)
+    tool_defs = copy.deepcopy(ctx._tool_defs)
+    ctx._tool_defs = tool_defs
+
+    graph_text = ""
+    graph_commit: Optional[Callable[[], None]] = None
+    if ctx.graph_memory is not None:
+        try:
+            prepared = ctx.graph_memory.prepare_for_prompt(
+                user_goal, max_entries=ctx.graph_memory_max_entries
+            )
+            text = prepared.text
+            graph_text = text if isinstance(text, str) else ""
+            graph_commit = prepared.commit_metrics
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Graph memory preparation failed: %s", type(exc).__name__)
+            graph_text, graph_commit = "", None
+    system = _assemble_system_prompt(ctx, user_goal, graph_text)
+
+    # Fail closed: only an overflow rejects, only a local native-unsupported signal
+    # converts to the JSON form, and every other error terminates the preflight.
+    preview_messages = copy.deepcopy(messages)
+    native = bool(
+        tool_defs and supports_native_fallback
+        and (attempt is None or attempt.mode == "native")
+    )
+    revision = _definition_revision(ctx)
+    try:
+        if native:
+            try:
+                ctx.llm.preview_request(
+                    preview_messages, system, tools=tool_defs,
+                    definition_revision=revision,
+                )
+            except NotImplementedError:
+                native = False
+        if not native:
+            ctx.llm.preview_request(
+                _linearize_native_turns(preview_messages), system, json_mode=True,
+                definition_revision=revision,
+            )
+    except LLMContextOverflowError:
+        return _StagedFirstRequest(rejected=True)
+    return _StagedFirstRequest(
+        system=system, messages=messages, goal_idx=goal_idx, tool_defs=tool_defs,
+        graph_commit=graph_commit, graph_injected=bool(graph_text),
+    )
+
+
+def _react_loop_owned(
+    ctx: ReactContext,
+    user_goal: str,
+    progress_callback: Optional[Callable[[str], None]],
+    images: Optional[list[str]],
+    initial_state: Optional[_LoopState],
+) -> str:
+    """Run the loop; the public wrapper owns all setup and cleanup exceptions."""
     run_start = time.time()
     _ctx_tokens = agent_logging.bind_run_context(trace=ctx.trace_id, agent=ctx.label)
     active_model = ctx.llm.llm_cfg.get("model", "?")
@@ -1393,18 +1843,49 @@ def react_loop(
 
     state = None
     try:
-        _turn_supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
-        if ctx.depth == 0 and _turn_supervisor is not None:
-            _turn_supervisor.register_active_turn(ctx.turn_id)
-        ctx._tool_defs = None
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
+
+        _supports_native_fallback = hasattr(ctx.llm, "chat_with_tools_fallback") and callable(
+            ctx.llm.chat_with_tools_fallback
+        )
+
+        graph_commit: Optional[Callable[[], None]] = None
+        if ctx.guarded_first_request:
+            if ctx.cancel_event.is_set():
+                return "⚠️ Task stopped by operator."
+            try:
+                staged = _stage_guarded_first_request(
+                    ctx, user_goal, images, initial_state, _supports_native_fallback
+                )
+            except LLMCancelledError:
+                return "⚠️ Task stopped by operator."
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Guarded request preparation failed: %s", type(exc).__name__)
+                return GUARD_PREPARATION_FAILED_MESSAGE
+            if staged.rejected:
+                return GUARD_REJECTION_MESSAGE
+            if ctx.cancel_event.is_set():
+                return "⚠️ Task stopped by operator."
+            graph_commit = staged.graph_commit
+            if ctx.on_activate is not None:
+                ctx.on_activate()
+            ctx.activated = True
+            system = staged.system
+            messages, goal_idx = staged.messages, staged.goal_idx
+            ctx._tool_defs = staged.tool_defs
+            _register_turn(ctx)
+        else:
+            _register_turn(ctx)
+            ctx._tool_defs = None
+            system = messages = goal_idx = None  # assigned below
 
         if ctx.working:
             ctx.working.start_task(user_goal)
 
-        system = _assemble_system_prompt(ctx, user_goal)
-        messages, goal_idx = _init_messages(ctx, user_goal, images)
+        if not ctx.guarded_first_request:
+            system = _assemble_system_prompt(ctx, user_goal)
+            messages, goal_idx = _init_messages(ctx, user_goal, images)
         ctx.memory.record_event(f"User request: {user_goal[:100]}")
 
         if ctx.graph_memory_writer is not None:
@@ -1413,11 +1894,15 @@ def react_loop(
             except Exception as _gw_exc:  # noqa: BLE001
                 logger.debug("Graph memory enqueue failed: %s", _gw_exc)
 
-        _ensure_tool_defs(ctx)
+        if graph_commit is not None:
+            try:
+                graph_commit()
+            except Exception as _gc_exc:  # noqa: BLE001
+                logger.debug("Graph metrics commit failed: %s", type(_gc_exc).__name__)
+            if ctx.guarded_first_request and staged.graph_injected:
+                logger.info("Graph memory context injected")
 
-        _supports_native_fallback = hasattr(ctx.llm, "chat_with_tools_fallback") and callable(
-            ctx.llm.chat_with_tools_fallback
-        )
+        _ensure_tool_defs(ctx)
 
         if initial_state is not None:
             state = initial_state
@@ -1460,6 +1945,19 @@ def react_loop(
         ctx.memory.record_event("Task cancelled by operator")
         return "⚠️ Task stopped by operator."
     finally:
+        if (
+            ctx.activated
+            and ctx.cancel_event.is_set()
+            and ctx.checkpoint_store is not None
+            and (ctx.checkpoint_enabled or ctx.checkpoint_owner is not None)
+        ):
+            try:
+                if ctx.checkpoint_owner is None:
+                    ctx.checkpoint_store.delete(ctx.trace_id)
+                else:
+                    ctx.checkpoint_store.delete(ctx.trace_id, owner=ctx.checkpoint_owner)
+            except (OSError, RuntimeError):
+                logger.warning("Cancelled-run checkpoint cleanup was blocked; preserving recovery data")
         # Canonical turn-drain boundary: the depth-0 turn cancels and awaits its
         # owned on-demand children here, publishing drain progress. Grants and
         # staged tokens are cleared by the caller only after this returns, and
@@ -1467,7 +1965,7 @@ def react_loop(
         # callbacks remain processable. AgentController.run repeats the drain
         # as an idempotent fallback (see there); it must stay a no-op after this.
         supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
-        if ctx.depth == 0 and supervisor is not None:
+        if ctx.depth == 0 and supervisor is not None and ctx.activated:
             try:
                 draining = supervisor.draining_children(ctx.turn_id)
                 if draining:
@@ -1878,4 +2376,6 @@ def _dispatch_tool(
         return span.outcome
 
     # Unknown tool — no hand-written tools exist anymore
-    return fail_outcome(f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.")
+    outcome = fail_outcome(f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.")
+    outcome["_guard_refusal"] = True
+    return outcome

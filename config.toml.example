@@ -20,15 +20,15 @@
 #
 # Vault format (TOML — plain key = "value" pairs):
 #   OPENAI_API_KEY = "sk-..."
-#   OLLAMA_HOST    = "http://localhost:11434"
+#   OLLAMA_API_KEY = "ollama-cloud-key"
 #
 # For values with a prefix (e.g. Bearer tokens in MCP headers), put the
 # full header value in the vault and reference it directly:
 #   Authorization = "sec:MY_AUTH_HEADER"   # where MY_AUTH_HEADER="Bearer sk-..."
 #
-# This keeps secrets out of config.toml. Values referenced with sec: are
-# resolved at startup and never cached in os.environ, so they are not leaked
-# to shell/tool/MCP subprocesses.
+# This keeps secrets out of config.toml. Telegram/MCP values retain their
+# existing startup resolution; provider and embedding API-key references stay
+# unresolved until the matching client is constructed.
 
 [telegram]
 bot_token = "sec:TELEGRAM_BOT_TOKEN"
@@ -42,118 +42,51 @@ allowed_user_ids = []
 pairing_timeout = 300
 
 # ---------------------------------------------------------------------------
-# LLM Models
-# Define one or more [[models]] entries. The active model is chosen by
-# matching agent.default_model against the 'model' field of each entry.
-# Users can switch manually with /models.
-#
-# Provider defaults can be defined once and inherited by matching [[models]]
-# entries. Model-level fields override provider-level defaults.
-#
-# [providers.openai]
-# api_key         = "sec:OPENAI_API_KEY"
-# base_url        = "https://api.openai.com/v1"
-# request_timeout = 120
-# max_retries     = 5
-# retry_delay     = 2
-#
-# Fields per model:
-#   name             — display name shown in /models
-#   provider         — openai | openrouter | google | anthropic | ollama
-#   api_key          — provider API key (or inherit from [providers.<name>])
-#   model            — exact model identifier (used to match default_model)
-#   base_url         — API base URL (leave empty for Anthropic/Google defaults)
-#   max_tokens       — max tokens in LLM response
-#   temperature      — sampling temperature
-#   top_p            — nucleus sampling (optional; omit to use provider default)
-#   request_timeout  — per-request timeout in seconds (default: 120)
-#   max_retries      — retry attempts on timeout/connection errors (default: 5)
-#   retry_delay      — base retry delay in seconds, doubles each attempt (default: 2)
-#   vision           — true if the model accepts image input (informational; shown in /models)
+# Provider connections are discovery accounts, not model definitions. Model
+# inventories and selection are managed by the application; use /models to
+# discover and select a model. Credentials resolve when the matching client is
+# constructed, not while this file is parsed.
 # ---------------------------------------------------------------------------
-[[models]]
-name            = "default"
-provider        = "openai"
-api_key         = "sec:OPENAI_API_KEY"
-# Alternative using an environment variable:
-# api_key       = "env:OPENAI_API_KEY"
-model           = "gpt-4o-mini"
-base_url        = "https://api.openai.com/v1"
-max_tokens      = 1024
-temperature     = 0.2
-vision          = true   # gpt-4o-mini supports image input
-# top_p         = 0.9  # optional: nucleus sampling (omit to use provider default)
-# aliases       = ["gpt-4o-mini"]  # optional: names to match against models_capabilities.json
-# context_window = 128000  # optional: per-model context window in tokens.
-#   When set, the compaction threshold is derived from this value instead of
-#   agent.ctx_max_tokens. Falls back to agent.ctx_max_tokens when unset.
-#   Must be greater than max_tokens (validated at startup).
+# api_key is optional for adapters that support unauthenticated connections;
+# it may be a literal, env:NAME, or sec:NAME reference.
+[providers.openai-main]
+type = "openai"
+api_key = "sec:OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
 request_timeout = 120
-max_retries     = 5
-retry_delay     = 2
 
-# Example second model
-# [[models]]
-# name            = "smart"
-# provider        = "anthropic"
-# api_key         = "env:ANTHROPIC_API_KEY"
-# model           = "claude-3-5-sonnet-20241022"
-# base_url        = ""
-# max_tokens      = 8192
-# temperature     = 0.2
-# request_timeout = 180
-# max_retries     = 5
-# retry_delay     = 2
-
-# Ollama Cloud API (https://ollama.com) — hosted cloud models.
-# Requires the 'ollama' Python package (pip install ollama>=0.4.0).
-# Create an API key at https://ollama.com/settings/keys.
-# Available cloud models: https://ollama.com/search?c=cloud
-# Examples: gpt-oss:120b-cloud, deepseek-v3.1:671b-cloud, kimi-k2:1t-cloud
-# [[models]]
-# name            = "ollama-cloud"
-# provider        = "ollama"
-# api_key         = "env:OLLAMA_API_KEY"
-# model           = "kimi-k2:1t-cloud"
-# base_url        = "https://ollama.com"
-# max_tokens      = 4096
-# temperature     = 0.2
-# aliases         = ["kimi-k2.6", "kimi-k2"]  # map to models_capabilities.json entries
-# request_timeout = 300
-# max_retries     = 3
-# retry_delay     = 2
-
-# Ollama local instance (no API key required).
-# Make sure Ollama is running: https://ollama.com/download
-# Pull a model first: ollama pull gemma3:27b
-# [[models]]
-# name            = "ollama-local"
-# provider        = "ollama"
-# api_key         = ""
-# model           = "gemma3:27b"
-# base_url        = "http://localhost:11434"
-# max_tokens      = 4096
-# temperature     = 0.2
+# [providers.anthropic-main]
+# type = "anthropic"
+# api_key = "env:ANTHROPIC_API_KEY"
 # request_timeout = 120
-# max_retries     = 3
-# retry_delay     = 2
+
+# Ollama is cloud-only; its API key is required and the endpoint is fixed to
+# https://ollama.com (an optional /api path is normalized by the application).
+# [providers.ollama-cloud]
+# type = "ollama"
+# api_key = "env:OLLAMA_API_KEY"
+# base_url = "https://ollama.com"
+# request_timeout = 120
 
 [embeddings]
-# Use same provider as LLM or configure separately.
-# If api_key is empty and a matching [providers.<name>] entry exists,
-# embeddings inherit provider credentials/base_url. Otherwise embeddings fall
-# back to the active model's api_key/base_url at runtime.
-provider = "openai"
-api_key  = "sec:OPENAI_API_KEY"
-# Alternative using an environment variable:
-# api_key = "env:OPENAI_API_KEY"
-model    = "text-embedding-3-small"
-base_url = "https://api.openai.com/v1"
+# Embeddings are independent of chat selection and require explicit model and
+# provider. Credentials/endpoint may come from this section or its matching
+# provider connection; they never fall back to the active chat model.
+provider = "openai-main"
+model = "text-embedding-3-small"
+# api_key = "sec:OPENAI_API_KEY"  # optional explicit embedding credential
+# base_url = "https://api.openai.com/v1"  # optional embedding endpoint
 
 [agent]
 # Logical agent name used to derive default shared state locations.
 # Defaults to "piclaw" when omitted.
 agent_name = "piclaw"
+# Automatic retries are additional to the initial call. Default 4 means five
+# total attempts; retry delays grow 2/4/8/16 seconds from this base. Set to 0
+# for one initial call and no automatic retries. These settings apply agent-wide;
+# retry overrides are not accepted on providers or models.
+max_retries = 4
+retry_delay = 2.0
 # Agent home directory. Defaults to ~/<agent_name> when omitted or empty.
 # The vault path is independent and defaults to ~/.local/share/<agent_name>/secrets.toml.
 # agent_home = "~/piclaw"
@@ -173,15 +106,7 @@ tool_timeout   = 10
 # Increase for sophisticated scripts that produce large logs.
 max_output_size = 4000
 top_tools      = 3
-# Must match the 'model' field of one [[models]] entry.
-default_model  = "gpt-4o-mini"
-# Model used by sub-agents (scheduled jobs and spawn_agent tool).
-# Must match the 'model' field of a [[models]] entry. Defaults to default_model if not set.
-# background_model = "gpt-4o-mini"
-# DEPRECATED: agent.fallback_models — parsed but ignored with a deprecation warning.
-# The LLM client is now single-model. Vision auto-switch works with any configured
-# vision model (set vision = true on a [[models]] entry) — no fallback list needed.
-# fallback_models = ["claude-3-haiku-20240307", "gemini-1.5-flash"]
+# Choose the active model with /models after provider discovery.
 # Maximum estimated context tokens per LLM request (4 chars ≈ 1 token).
 # When 85% is reached the agent auto-summarises older messages before the next call.
 ctx_max_tokens = 90000
@@ -283,15 +208,15 @@ type = "file"
 # ─────────────────────────────────────────────────────────────────────────────
 # Graph-Based Memory (opt-in — disabled by default)
 # Requires: pip install ladybug  (LadybugDB — community fork of KuzuDB)
-# Also requires [embeddings] to be configured (reuses the same embedding model).
+# Also requires explicit [embeddings] settings and graph extraction model.
 # ─────────────────────────────────────────────────────────────────────────────
 # [graph_memory]
 # enabled               = false        # set to true to enable
 # # db_path is not configurable — always <XDG_DATA_HOME>/<agent_name>/graph_memory
 # buffer_pool_mb        = 256          # RAM for DB buffer pool (lower on Pi 3/4)
 # # extraction_model: model to use for triplet extraction (LLM call per batch).
-# # Must match the 'model' field of a [[models]] entry. Falls back to default_model.
-# # extraction_model    = "gpt-4o-mini"
+# # Canonical ID of an explicitly selected/discovered provider model.
+# extraction_model = "openai-main/gpt-example"
 # extract_every_n_turns = 3            # batch: extract every N user turns (cost control)
 # min_message_length    = 100          # skip short messages / chatter
 # max_context_entries   = 10           # max entities/facts injected into prompt

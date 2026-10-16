@@ -46,19 +46,20 @@ class TestMakeOnRetry:
 
 
 class TestRunWithRetry:
-    """Exercise the shared retry runner that wires ``make_on_retry`` + ``_with_retry``."""
+    """Ensure provider compatibility plumbing cannot orchestrate retries."""
 
-    def _ctx(self, max_retries=2, retry_delay=0.0, cancel_event=None):
+    def _ctx(self, cancel_event=None):
         from interfaces import ProviderContext
+        from model_registry import ModelRecord
         return ProviderContext(
-            get_cfg=lambda: {"model": "test-model"},
-            http=MagicMock(),
-            max_retries=max_retries,
-            retry_delay=retry_delay,
+            model=ModelRecord("p/test-model", "p", "test-model", "Test"),
+            adapter="openai",
+            mode="json",
+            send_json=MagicMock(),
+            track_usage=MagicMock(),
             cancel_event=cancel_event,
             caller_tag="test",
             diagnose_empty=False,
-            track_usage=MagicMock(),
         )
 
     def test_returns_first_success(self):
@@ -70,24 +71,21 @@ class TestRunWithRetry:
         assert result == "ok"
         do_request.assert_called_once()
 
-    def test_retries_and_calls_progress_cb(self):
+    def test_transient_failure_is_not_retried_or_notified(self):
         progress_cb = MagicMock()
-        ctx = self._ctx(max_retries=2, retry_delay=0.0)
         import httpx
-        do_request = MagicMock(
-            side_effect=[httpx.TimeoutException("boom"), "ok"]
-        )
+        ctx = self._ctx()
+        do_request = MagicMock(side_effect=httpx.TimeoutException("boom"))
 
-        result = run_with_retry(ctx, do_request, progress_cb=progress_cb)
+        with pytest.raises(httpx.TimeoutException, match="boom"):
+            run_with_retry(ctx, do_request, progress_cb=progress_cb)
 
-        assert result == "ok"
-        assert do_request.call_count == 2
-        progress_cb.assert_called_once()
-        assert "retry 1/2" in progress_cb.call_args[0][0]
+        do_request.assert_called_once()
+        progress_cb.assert_not_called()
 
     def test_propagates_after_exhaustion(self):
         import httpx
-        ctx = self._ctx(max_retries=1, retry_delay=0.0)
+        ctx = self._ctx()
         do_request = MagicMock(side_effect=httpx.TimeoutException("final"))
 
         with pytest.raises(httpx.TimeoutException, match="final"):

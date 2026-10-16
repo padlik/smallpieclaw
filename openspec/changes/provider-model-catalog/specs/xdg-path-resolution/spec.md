@@ -27,7 +27,7 @@ Add the managed model-settings path through the central pure XDG resolver.
 - **AND** `pid_file` is `~/.local/state/piclaw/agent.pid`
 - **AND** `logs_dir` is `~/.local/state/piclaw/logs`
 - **AND** `log_file` is `~/.local/state/piclaw/logs/agent.log`
-- **AND** `log_jsonl` is `~/.local/state/piclaw/logs/agent.jsonl`
+- **AND** `log_store` is `~/.local/state/piclaw/logs/agent_logs.sqlite`
 - **AND** `skills_dir` is `~/.local/state/piclaw/skills`
 - **AND** `secrets_file` is `~/.local/state/piclaw/secrets.toml`
 - **AND** `scheduler_state` is `~/.local/state/piclaw/scheduler_state.json`
