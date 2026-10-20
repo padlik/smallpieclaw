@@ -159,7 +159,7 @@ Selection and refresh persistence SHALL share one lock and merge against current
 
 ### Requirement: Model admission requires an active main selection and pins a run snapshot
 
-Every run admission SHALL resolve an explicit canonical ID or snapshot active main selection. Admission fails when no active selection exists. The admitted model, connection, endpoint, and metadata SHALL remain pinned through that run.
+Every run admission SHALL resolve an explicit canonical ID or snapshot active main selection. Admission fails when no active selection exists. The admitted model, connection, endpoint, and metadata SHALL remain pinned through that run. Scheduled jobs SHALL apply only the pre-pin selector classification defined by `scheduled-job-execution`.
 
 #### Scenario: Saved-but-inactive model blocks explicit job override
 - **GIVEN** a remembered model exists but active selection is unset
@@ -167,11 +167,27 @@ Every run admission SHALL resolve an explicit canonical ID or snapshot active ma
 - **THEN** admission fails without provider I/O
 - **AND** the job's existing launch-failure handling records and alerts the failure
 
-#### Scenario: Obsolete job selector fails after execution record creation
-- **GIVEN** a scheduled job has an obsolete or unavailable selector
-- **WHEN** the execution ID/record is minted and model resolution fails
-- **THEN** the launch failure is recorded and existing alert behavior runs
-- **AND** no job converter or fallback model is used
+#### Scenario: Unresolvable scheduled selector inherits a valid main model
+- **GIVEN** a valid active main model and a scheduled job whose saved selector is malformed or absent from the catalog
+- **WHEN** scheduled model admission runs after the run ID is minted
+- **THEN** it warns and pins the main model
+- **AND** the saved selector is not rewritten and no job converter or other fallback model is used
+
+#### Scenario: Scheduled job fails when main is invalid
+- **GIVEN** no valid active main model exists
+- **WHEN** a scheduled job with any selector, including a valid explicit canonical one, is admitted
+- **THEN** it fails normally before any model call with the existing launch-failure record and alert
+
+#### Scenario: Ordinary explicit selectors remain strict
+- **GIVEN** an on-demand, plan, or diagnostic request supplies a padded, aliased, blank, or unknown selector, or no valid main exists
+- **WHEN** ordinary admission runs
+- **THEN** it fails without substituting main and without scheduled classification
+
+#### Scenario: Each run is admitted exactly once
+- **GIVEN** scheduled and ordinary runs reach the root factory
+- **WHEN** their models are admitted
+- **THEN** the scheduled profile uses one scheduled admission and every other profile uses ordinary admission, each yielding one immutable pin
+- **AND** runtime construction does not re-admit
 
 #### Scenario: Removed model does not change a running task
 - **GIVEN** a run has a pinned model snapshot and refresh removes that model
@@ -218,9 +234,14 @@ Embeddings SHALL use explicit configuration and matching connection inheritance 
 
 #### Scenario: Invalid graph extraction prerequisites disable graph only
 - **GIVEN** graph extraction model or explicit global embedding model/provider is missing or invalid
-- **WHEN** startup or graph backfill validates prerequisites
-- **THEN** both use the shared validation policy and warn actionably
-- **AND** graph alone is disabled while the bot remains operational
+- **WHEN** startup validates prerequisites
+- **THEN** it warns actionably and disables graph alone
+- **AND** the bot remains operational and no model is inferred from main, default, or first catalog entry
+
+#### Scenario: Live backfill fails on invalid prerequisites
+- **GIVEN** the same prerequisites are invalid for a live backfill
+- **WHEN** backfill validates them with the shared policy
+- **THEN** it fails actionably before any database construction or write
 
 #### Scenario: Graph request exceeds fixed allowance
 - **GIVEN** one graph extraction request cannot fit its source and fixed 1024 cap
@@ -245,6 +266,79 @@ Embeddings SHALL use explicit configuration and matching connection inheritance 
 - **WHEN** the adapter prepares the graph request
 - **THEN** it strips unsupported temperature per existing compatibility behavior
 - **AND** it does not select another model
+
+#### Scenario: Google discovery fields do not imply capabilities
+- **GIVEN** a Google model lists resource names and supported generation methods
+- **WHEN** graph prerequisites are checked
+- **THEN** those fields are discovery-only and infer no capability or token cap
+- **AND** an unsupported fixed generation request fails safely through actual validation with no alternate model
+
+### Requirement: Graph extraction resolves its model independently of main selection
+
+Graph resolution SHALL resolve the configured canonical `graph_memory.extraction_model` through an entry that does not require, check, or gate on, or change, main selection, settings, or revisions; it MAY copy the current catalog and selection revisions read-only for provenance, and they gate nothing. Ordinary admission SHALL keep its active-main gate and SHALL NOT reach graph resolution. Each graph component start or backfill invocation SHALL settle exactly one pin.
+
+#### Scenario: Graph resolves without a main selection
+- **GIVEN** main is unselected, missing, or switching
+- **WHEN** graph resolves its explicit canonical selector, fresh or stale
+- **THEN** it pins that model and main selection, settings, and revision are unchanged
+
+#### Scenario: Selector is exact and never inferred
+- **GIVEN** the graph selector is padded, aliased, or absent from the catalog
+- **WHEN** graph resolves it
+- **THEN** resolution fails typed and actionably
+- **AND** no default, first, or main model is used
+
+#### Scenario: One pin with per-call owned clients
+- **GIVEN** graph memory or a backfill invocation holds its pin
+- **WHEN** extractions run
+- **THEN** each call builds its own owned graph extraction client from that same pin and closes it in `finally`
+- **AND** no new pin or component-long shared chat client is created
+
+#### Scenario: Rechecks occur only inside resolution
+- **GIVEN** a pin exists and main selection changes or a credential is later rotated or removed
+- **WHEN** later extractions run
+- **THEN** credential, fingerprint, configuration, and model rechecks do not repeat and unrelated main changes never fail graph
+- **AND** a provider rejection uses existing graph failure handling with no re-resolution or fallback, and a later component start or invocation resolves anew
+
+#### Scenario: Other paths cannot reach graph resolution
+- **GIVEN** a tool, prompt, Telegram, spawn, or scheduler path
+- **WHEN** it requests a model
+- **THEN** it can only use ordinary or scheduled admission
+
+### Requirement: Graph startup and live backfill validate prerequisites before side effects
+
+Daemon startup SHALL resolve the graph model only after the normal startup refresh completes and SHALL then validate selector, pin, credentials, explicit embeddings, and budget before graph database setup. Live backfill SHALL use the saved catalog only and validate the same prerequisites before constructing any database. Dry run SHALL create no pin, credential, client, database, embedding, or inference.
+
+#### Scenario: Startup resolves after the completed refresh
+- **GIVEN** a provider refresh failed and kept last-good stale entries
+- **WHEN** startup resolves the graph model after refresh completes
+- **THEN** fresh and stale entries are resolvable and no main selection is required
+
+#### Scenario: Live backfill reads the saved catalog only
+- **GIVEN** a standalone live backfill
+- **WHEN** it resolves the graph model
+- **THEN** it performs no discovery refresh or network discovery and writes no managed settings
+
+#### Scenario: Missing, corrupt, or unknown catalog fails before the database
+- **GIVEN** the saved catalog is missing or corrupt, or the model is unknown
+- **WHEN** live backfill validates prerequisites
+- **THEN** it fails actionably with `/models` refresh instructions before database construction and with no side effect
+
+#### Scenario: Dry run touches nothing
+- **GIVEN** a backfill dry run
+- **WHEN** it executes
+- **THEN** it creates no pin, credential, client, database, embedding, or inference and may only read input and state
+
+#### Scenario: Prerequisite budget precedes inference
+- **GIVEN** a resolved graph pin
+- **WHEN** prerequisites are checked and each extraction runs
+- **THEN** a budget check with zero input runs first and the actual request is rechecked before inference and usage accounting
+- **AND** failure disables graph or fails that extraction as specified by `per-model-context-window`
+
+#### Scenario: Explicit embeddings are unchanged
+- **GIVEN** graph uses its independent resolver
+- **WHEN** embeddings are configured
+- **THEN** the explicit global `[embeddings]` model and provider are used with no active-chat credential fallback
 
 ### Requirement: Legacy configuration migration is preview-first and recoverable
 
