@@ -340,6 +340,21 @@ Daemon startup SHALL resolve the graph model only after the normal startup refre
 - **WHEN** embeddings are configured
 - **THEN** the explicit global `[embeddings]` model and provider are used with no active-chat credential fallback
 
+### Requirement: Graph shutdown preserves active writer dependencies
+
+Successful graph shutdown SHALL flush buffered work and await writer termination before closing its store or worker-used dependencies. The finite join timeout SHALL remain a waiting limit. If the writer remains alive, stopping SHALL fail explicitly without indefinite waiting. The production shutdown owner SHALL report failure, retain worker-used resources, and not claim success. Catching a stop failure SHALL NOT permit dependent teardown.
+
+#### Scenario: Completed drain precedes dependent teardown
+- **GIVEN** a graph writer has buffered extraction work
+- **WHEN** shutdown flushes the work and the writer terminates within the finite join timeout
+- **THEN** buffered work is drained and writer termination precedes closing the store or its worker-used dependencies
+
+#### Scenario: Stop timeout retains active writer dependencies
+- **GIVEN** a graph extraction is blocked
+- **WHEN** the finite join timeout expires with the writer still alive
+- **THEN** stopping fails explicitly without switching to an indefinite wait
+- **AND** the production shutdown owner reports failure, keeps the store and worker-used dependencies open, and does not claim successful shutdown
+
 ### Requirement: Legacy configuration migration is preview-first and recoverable
 
 Migration SHALL be preview-only unless `--apply` is explicit. It SHALL preserve unresolved secret references and stop when bounded edits cannot prove unrelated values unchanged.
