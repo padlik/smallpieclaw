@@ -389,3 +389,97 @@ Verdict: PASS. Tasks are frozen at 6a5474cc9cd1d3fc5d83c4f8bbdc4634a1b53a7b8afc2
 ### 🔴 Outstanding
 
 None.
+
+## design Round 1 — 2026-10-25 (graph lifecycle reconciliation)
+
+Verdict: PASS for the user-approved design amendment only. Independent reviewer: `ses_e8aeb848fffeb4jvzIVTjwYhoi`. Design is frozen at `ffdd77f6829ab86451854c1c8840d67e82accb90fcd01303a048517191913945`. Proposal and accepted ADR-0039 remain unchanged; affected downstream specs, change-local ADR notes, and tasks await separately approved reconciliation and review. This entry supersedes any earlier whole-chain readiness statement for the amended graph lifecycle; apply remains paused until the revised chain passes review and is published to main through separately authorized Git actions.
+
+### 🔴 Fixed
+- No blocking findings in this round. The approved design now makes finite-timeout stop failure explicit, retains worker-used resources on failure, forbids caught-error dependent teardown, and preserves per-extraction owned-client cleanup.
+
+### 🟡 Addressed
+- Coordinated helper, daemon/backfill caller, and legacy-test cutover remains mandatory; component-only evidence is not production-root proof. Timeout signaling and the actual shutdown-owner guard must land together.
+- Normal-drain and deterministically blocked-worker production-route evidence is required. Legacy return-shape, message-only chat, fixed wire policy, configuration nonmutation, close, and delegation assertions remain required on fixture migration.
+- Command validation confirmed exactly the three approved design edits, all other preimage planning files and accepted ADR unchanged, source/test/task/config hashes preserved, clean design whitespace, and structural OpenSpec validation passing. Evidence: `graph-component-design-amendment-20261025-{parity.json,design-diff.txt,validate.json}` in the apply worktree's `.slim/deepwork/resume-20261021/`.
+- Actual progress remains 44/68, with 12.16 unchecked. The three legacy helper-fixture failures and three earlier fallback failures remain separate and unwaived. No product tests were rerun for this documentation-only amendment; no implementation readiness, commit, merge, or task completion is claimed.
+
+### 🔴 Outstanding
+
+None for this design batch. Downstream artifact reconciliation is pending, not waived.
+
+## specs Round 1 — 2026-10-25 (graph lifecycle reconciliation)
+
+Verdict: semantic PASS from independent reviewer `ses_e8aeb848fffeb4jvzIVTjwYhoi`, but batch not frozen because strict structural validation failed.
+
+### 🔴 Fixed
+- No semantic blockers: the new shutdown requirement and completed-drain/timeout scenarios preserve the approved design's bounded failure, reporting, retained worker dependencies, and prohibition of catch-and-continue teardown.
+
+### 🟡 Addressed
+- Only the approved provider-model-catalog shutdown requirement/scenarios were added. Existing spec text, frozen design, accepted ADR, source/tests, task statuses, and unrelated main config were preserved.
+
+### 🔴 Outstanding
+
+- Strict validation exit 1: the requirement paragraph exceeds 500 characters. Non-strict validation is valid with that warning; no warning is waived. Evidence retained in `graph-component-shutdown-spec-20261025-*`.
+
+## specs Round 2 — 2026-10-25 (graph lifecycle reconciliation)
+
+Verdict: PASS. Independent reviewer `ses_e8aeb848fffeb4jvzIVTjwYhoi` confirmed semantic equivalence after shortening only the requirement paragraph. The provider-model-catalog spec is frozen at `187202606363979775af04e3137607f33f26fffa2c085c5a7eced91605cd2672`; all eight other delta specs are unchanged.
+
+### 🔴 Fixed
+- Reduced the requirement paragraph to 442 characters without changing its obligations or either scenario. Strict validation now exits 0; JSON validation reports `valid: true`, `issues: []`. No suppression or waiver was introduced; Round 1 evidence remains intact.
+
+### 🟡 Addressed
+- Scoped whitespace checks pass; the spec remains a pure insertion before legacy migration. Frozen design, accepted ADR-0039, source/test/task/config hashes remain unchanged. Evidence: `graph-component-shutdown-spec-r2-20261025-{parity.json,diff.txt,validate-strict.txt,validate.json}` in the apply worktree's `.slim/deepwork/resume-20261021/`.
+- This is planning-only evidence. Actual progress remains 44/68, 12.16 unchecked, with both identified failure sets unwaived. Change-local ADR notes and task reconciliation remain separately gated; no implementation or Git integration is authorized.
+
+### 🔴 Outstanding
+
+None for this spec batch. Downstream artifact reconciliation and publication remain pending.
+
+## adr Round 1 — 2026-10-25 (graph lifecycle reconciliation)
+
+Verdict: PASS for the user-approved change-local compatibility note. Independent reviewer: `ses_e8aeb848fffeb4jvzIVTjwYhoi`. Change-local `adr.md` is frozen at `80c10b4ab05a1aec4eda39a0611fcdf73b9d34a19075d14971bec5d1fba15036`; accepted repository-level ADR-0039 and all supersession edges remain unchanged.
+
+### 🔴 Fixed
+- No blocking findings. The note faithfully records the bounded-failure policy and existing termination-before-dependent-closure invariant without creating a new accepted ADR, supersession edge, failure waiver, or implementation authorization.
+
+### 🟡 Addressed
+- Coordinated helper/caller/legacy-test cutover and paired timeout-signaling/production-owner changes remain explicit mandatory work. Component evidence is not production readiness.
+- Parent read fresh parity JSON and strict output: the note is a pure append preserving its historical prefix; frozen design/spec, source/test/task/config hashes remain intact; strict validation exits 0 and JSON validation has no issues. Evidence: `graph-component-adr-note-20261025-*` in the apply worktree's `.slim/deepwork/resume-20261021/`.
+- Actual progress remains 44/68; 12.16 is unchecked. Task reconciliation, its separate user confirmation/review, and revised-planning publication remain pending. No product test or implementation completion is claimed.
+
+### 🔴 Outstanding
+
+None for this ADR-note batch. Task reconciliation and publication remain pending.
+
+## tasks Round 1 — 2026-10-25 (graph lifecycle reconciliation)
+
+Verdict: PASS with three nonblocking follow-ups to reconcile before freezing, from user-requested independent `openspec-reviewer` session `ses_e8ad805c2ffelc6naAySNjizaF`. A supplementary earlier oracle review also passed; it was not substituted for the requested specialist review.
+
+### 🔴 Fixed
+- No blockers found. Component preparation, coordinated helper/daemon/backfill/legacy-test cutover, bounded shutdown implementation, and final production proof retain separate mandatory unchecked owners.
+
+### 🟡 Addressed
+- First mechanical evidence confirmed 44/70 tasks, all 44 checked rows verbatim, preserved old IDs/order/states, and an acyclic 70-node/160-edge DAG. Strict structural validation passed; no implementation readiness was claimed.
+
+### 🔴 Outstanding
+
+None blocking. Three should-fix follow-ups remained before freeze: name concrete retained resources and suppress the shutdown success log; require all assertions before completing 12.24/12.25; reconcile 3.6/4.2 component-versus-production ownership and sequencing. The user explicitly approved these clarifications and another specialist check.
+
+## tasks Round 2 — 2026-10-25 (graph lifecycle reconciliation)
+
+Verdict: PASS. User-requested `openspec-reviewer` session `ses_e8ad805c2ffelc6naAySNjizaF` confirmed all three follow-ups resolved with no new blockers. Tasks are frozen at `0756a631edb8e6c9040a7ffb206446f36cfb79380457c8e5f1aafeb66402d17c`. The reviewed graph lifecycle planning chain remains unpublished; publication to main and a separate explicit apply command are required before implementation resumes.
+
+### 🔴 Fixed
+- No blocking findings remain. Task 3.6 now requires actual startup after 7.1/12.25; 4.2 is explicitly component coverage after 4.1/9.1, with production warn/disable behavior owned by 12.25/12.24. These edges do not create a cycle.
+
+### 🟡 Addressed
+- Task 12.26 names retained store, embedding source/client (including the currently wired LLM-backed source), worker logging/log-store resources, and other worker-used dependencies. Failed stopping suppresses `Agent stopped.` and cannot continue dependent teardown.
+- Tasks 12.24/12.25 require every listed actual-route assertion to pass before completion; partial closure is forbidden. Scope-budget overruns require explicit replanning with the row left unchecked.
+- Parent read fresh command evidence: 70 tasks, 44 checked rows full-text byte-equal, all 68 old IDs/order/states preserved, only new unchecked 12.25/12.26. The 70-node/164-edge DAG is acyclic with no missing/self/duplicate references. Strict validation exits 0, JSON issues are empty, and scoped whitespace is clean. Frozen upstream artifacts, accepted ADR-0039, source/test/config hashes are preserved. Evidence: `graph-component-task-reconcile-r2-20261025-*` in the apply worktree's `.slim/deepwork/resume-20261021/`.
+- Optional smoke-script stop-caller handling is an input to future 12.26 implementation recon; the authoritative DAG governs the already-reviewed 3.6/4.2 phase ordering. Neither observation requires further planning edits or grants implementation permission.
+- Actual progress is **44/70 complete, 26 remaining**. No task was newly completed, no source/test code was changed, no product tests were rerun for planning edits, and both identified failure sets remain unwaived. No commit, merge, push, archive, or apply authorization is inferred.
+
+### 🔴 Outstanding
+
+None for the task batch. Revised-planning publication and separate implementation authorization remain pending.

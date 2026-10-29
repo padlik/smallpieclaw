@@ -26,6 +26,7 @@ from typing import Callable, Optional
 
 import httpx
 
+from model_registry import ModelRegistryError
 from trace_context import new_trace_id
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -56,7 +57,7 @@ from telegram_commands import (
 )
 from telegram_mcp_commands import cmd_mcp
 from telegram_callbacks import (
-    cb_confirm, cb_model_switch, cb_mode_switch,
+    cb_confirm, cb_model_select, cb_model_switch, cb_models_refresh, cb_mode_switch,
     cb_deferred, cb_subagent_confirm,
     cb_oauth_cancel, cb_llm_retry, cb_job_details,
 )
@@ -498,6 +499,8 @@ class TelegramInterface:
         usage_registry=None,
         downloads_dir: str = "downloads",
         mcp_manager=None,             # Optional[MCPManager]
+        model_registry=None,          # Optional[ModelRegistry] — provider catalog (task 8.1)
+        model_selection_tokens=None,  # Optional[SelectionTokenCache] — /models selection (task 8.2)
     ):
         tg_cfg = config["telegram"]
         self._config = config
@@ -516,6 +519,12 @@ class TelegramInterface:
         self.skill_registry = skill_registry
         self._usage_registry = usage_registry  # TokenUsageRegistry
         self.mcp_manager = mcp_manager
+        self.model_registry = model_registry  # Optional[ModelRegistry] — provider catalog (task 8.1)
+        if model_selection_tokens is None:
+            from telegram_model_selection import SelectionTokenCache
+
+            model_selection_tokens = SelectionTokenCache()
+        self.model_selection_tokens = model_selection_tokens  # SelectionTokenCache — /models selection (task 8.2)
         self._downloads_dir = os.path.abspath(downloads_dir)
         self._prompt_registry = None  # Optional[PromptRegistry] — wired by main.py
         self._start_time = time.time()
@@ -739,6 +748,8 @@ class TelegramInterface:
         app.add_handler(CommandHandler("resume", partial(cmd_resume, self)))
         # Inline button callbacks
         app.add_handler(CallbackQueryHandler(partial(cb_model_switch, self), pattern=r"^model:"))
+        app.add_handler(CallbackQueryHandler(partial(cb_models_refresh, self), pattern=r"^models_refresh$"))
+        app.add_handler(CallbackQueryHandler(partial(cb_model_select, self), pattern=r"^modelsel:"))
         app.add_handler(CallbackQueryHandler(partial(cb_mode_switch, self), pattern=r"^mode:"))
         app.add_handler(CallbackQueryHandler(partial(cb_confirm, self), pattern=r"^confirm_(yes|no|till_reset):"))
         app.add_handler(CallbackQueryHandler(partial(cb_llm_retry, self), pattern=r"^llm_retry:"))
@@ -758,9 +769,9 @@ class TelegramInterface:
         app.add_error_handler(self._error_handler)
 
     @staticmethod
-    def _format_jobs_list(jobs: list) -> str:
+    def _format_jobs_list(jobs: list, redactor: Optional[Callable[[str], str]] = None) -> str:
         """Render a list of job dicts (from scheduler.list_jobs()) as HTML."""
-        return _format_jobs_list_impl(jobs)
+        return _format_jobs_list_impl(jobs, redactor=redactor)
 
     async def _on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming files (documents, photos, audio, video, voice)."""
@@ -985,7 +996,13 @@ class TelegramInterface:
         except Exception as exc:
             logger.exception("Agent error for user %d", user.id)
             await self._safe_edit_html(status_msg, panel.build_panel())
-            await self._safe_edit(status_msg, f"❌ Error: {exc}")
+            if isinstance(exc, ModelRegistryError) and exc.code == "no_active_selection":
+                await self._safe_edit(
+                    status_msg,
+                    "❌ No model is selected. Use /models to select a model, then retry your request.",
+                )
+            else:
+                await self._safe_edit(status_msg, f"❌ Error: {exc}")
         finally:
             typing_task.cancel()
             await asyncio.gather(typing_task, return_exceptions=True)

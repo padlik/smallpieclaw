@@ -32,6 +32,7 @@ def _paths_for(state_dir) -> XDGPaths:
         config_home=state_dir, data_home=state_dir, state_home=state_dir,
         cache_home=state_dir, runtime_dir=state_dir,
         config_file=state_dir / "config.toml",
+        models_config_file=state_dir / "models.toml",
         scheduler_config=state_dir / "scheduler.toml",
         memory_file=state_dir / "memory.json",
         graph_memory_db=state_dir / "graph_memory",

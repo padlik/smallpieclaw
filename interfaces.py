@@ -97,7 +97,10 @@ class LLMProvider(Protocol):
         progress_cb=None,
         json_mode: bool = False,
     ) -> str:
-        """Chat with automatic fallback to alternative models on failure."""
+        """Compatibility alias for ``chat`` on the admitted immutable run model.
+
+        Never retries with an alternative model.
+        """
         ...
 
     def chat_with_tools(
@@ -121,7 +124,10 @@ class LLMProvider(Protocol):
         system: str | None = None,
         progress_cb=None,
     ) -> ChatResponse:
-        """Chat with tools and automatic fallback to alternative models on failure."""
+        """Compatibility alias for ``chat_with_tools`` on the admitted immutable run model.
+
+        Never retries with an alternative model.
+        """
         ...
 
     def embed(self, text: str) -> list[float]:

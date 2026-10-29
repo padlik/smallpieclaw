@@ -10,6 +10,14 @@ Covers:
 - The user goal (first message) is never dropped.
 - [Regression] The *current* active goal is preserved even when short-term
   history is prepended before it (goal_idx != 0).
+
+Task 12.19 coverage note: unguarded requests keep ordinary compaction driven by
+the hard input budget (``TestResolveCompactionThreshold``, including the
+``T``-only and required-cap cases); the guard's derived-budget comparison and
+its source budget matrix are evidenced in
+``tests/test_model_switch_budget_guard.py`` (``TestDerivedBudgetComparison``,
+``TestGuardedRejection.test_unguarded_oversize_still_compacts``) and
+``tests/test_model_request_budget.py``.
 """
 
 from __future__ import annotations

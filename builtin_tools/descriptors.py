@@ -106,21 +106,18 @@ BUILTIN_TOOLS: dict[str, BuiltinTool] = {
             "Args:\n"
             "  task            (str, REQUIRED) — self-contained instructions for the sub-agent.\n"
             "                  Must be named 'task', NOT 'prompt', 'goal', or 'description'.\n"
-            "  model           (str, optional) — model id from AVAILABLE MODELS (default: background_model).\n"
+            "  model           (str, optional) — canonical provider-id/upstream-id from /models; omit to inherit the active main model.\n"
             "  response_format (str, optional) — 'text' (default) | 'json' | 'file'.\n"
             "                  json → sub-agent must return a single valid JSON object.\n"
             "                  file → sub-agent writes output to a file and returns the absolute path.\n"
             "  context_payload (dict, optional) — parent context to inject into the sub-agent's system prompt.\n"
             "  context_key     (str, optional) — key for persisting conversation history between calls.\n"
-            "  max_tokens      (int, optional) — override maximum tokens in the sub-agent's response.\n"
-            "  temperature     (float, optional) — override sampling temperature (0.0–2.0).\n"
-            "  top_p           (float, optional) — override nucleus sampling probability (0.0–1.0).\n"
             "\n"
             "Example (good task — self-contained):\n"
             "{\"task\": \"Summarise the podcast transcript already saved at /tmp/piclaw/clean_transcript.txt "
             "in Russian. Use file_read to load the file. Return a structured report with three sections: "
             "Key Topics, Main Arguments, Conclusions. Plain text, maximum 800 words.\", "
-            "\"model\": \"kimi-k2.5:cloud\", \"response_format\": \"text\"}"
+            "\"response_format\": \"text\"}"
         ),
     ),
     "get_agent_result": BuiltinTool(

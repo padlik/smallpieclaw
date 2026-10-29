@@ -69,3 +69,11 @@ No supersession edge against ADR-0020 is created by 0038. ADR-0020's decision re
 ### Review status of this amendment
 
 New records 0037, 0038, 0039: **Accepted** — 2026-10-20, after the independent ADR review Round 2 PASS and correct file-relative validation. The amendment is complete as a planning-only record: it authorizes no implementation, commit, merge, or apply work.
+
+## Clarification — 2026-10-25: bounded graph shutdown and coordinated cutover
+
+The user selected bounded shutdown failure rather than indefinite waiting. A finite writer join timeout remains a waiting limit: if the writer is still alive, stopping fails explicitly. The production shutdown owner reports that failure, retains the store and dependencies still usable by the worker, and does not claim successful shutdown. Catching the failure must not permit dependent teardown to continue. This implements ADR-0039's existing termination-before-dependent-closure invariant; accepted repository-level ADR-0039, its status, and all supersession edges remain unchanged.
+
+Component preparation with supplied settled pins is not production extractor or root-readiness proof. The existing extraction helper, both daemon/backfill caller paths, and the three legacy regression tests must undergo one coordinated cutover once their pin sources are available, preserving the tests' behavioral assertions without a raw-configuration shim, parallel factory, Main fallback, or per-extraction resolution. Writer timeout signaling and the actual production shutdown-owner guard must likewise change together. All integration and shutdown obligations remain mandatory under explicit unchecked task owners until implemented and verified.
+
+This change-local note records the approved design/specification clarification only. It creates no new accepted repository-level ADR or supersession edge, waives no failure, and authorizes no implementation, task completion, commit, merge, or archive. Downstream task reconciliation and publication of the revised planning chain remain pending.

@@ -495,3 +495,25 @@ def test_pagination_cycle_fails_without_partial_inventory() -> None:
     with pytest.raises(ModelDiscoveryError) as error:
         _discovery(handler).fetch(Connection(adapter="anthropic"))
     assert error.value.code == "pagination_cycle"
+
+
+def test_cloud_ollama_empty_api_key_requires_authentication_before_any_request() -> None:
+    from config_schema import ResolvedProviderConnection
+
+    provider_requests: list[httpx.Request] = []
+    public_requests: list[httpx.Request] = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        provider_requests.append(request)
+        return httpx.Response(200, json={"models": [{"name": "m"}]})
+
+    def public(request: httpx.Request) -> httpx.Response:
+        public_requests.append(request)
+        return httpx.Response(200, json={})
+
+    connection = ResolvedProviderConnection("cloud", "ollama", "https://ollama.com", 3.0, "")
+    with pytest.raises(ModelDiscoveryError) as error:
+        _discovery(provider, public).fetch(connection)
+    assert error.value.code == "authentication_required"
+    assert provider_requests == []
+    assert public_requests == []

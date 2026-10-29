@@ -8,6 +8,8 @@ if it is not installed.
 from __future__ import annotations
 
 import os
+import re
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -771,6 +773,114 @@ class TestGraphMemoryWriter:
         writer.stop()
         # After stop(), the worker thread must have terminated (joined)
         assert not writer._thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Bounded writer stop (task 12.26) — actual worker thread, Event barriers only.
+# The future GraphMemoryStopError is asserted by runtime type name so this
+# module still collects before the class exists.
+# ---------------------------------------------------------------------------
+
+_STOP_TIMEOUT_MESSAGE = (
+    "Graph memory worker did not terminate before the shutdown deadline; "
+    "dependent resources retained."
+)
+
+
+def _end_worker(writer: GraphMemoryWriter) -> None:
+    """Test hygiene: deliver a sentinel to a still-running worker, join boundedly,
+    and fail if it survives. Never evidence of production stop behavior."""
+    if writer._thread.is_alive():
+        writer._queue.put(GraphMemoryWriter._SENTINEL)
+        writer._thread.join(timeout=10)
+    assert not writer._thread.is_alive(), "graph worker survived the bounded cleanup join"
+
+
+class TestGraphMemoryWriterBoundedStop:
+    def test_blocked_worker_stop_fails_explicitly_until_released(self, store):
+        """A finite stop on a blocked worker raises the safe error, every time,
+        and a bounded stop after release terminates the worker."""
+        entered, release = threading.Event(), threading.Event()
+        processed: list[str] = []
+
+        def _llm(prompt: str) -> str:
+            entered.set()
+            if not release.wait(timeout=30):
+                raise AssertionError("test barrier was never released")
+            processed.append(prompt)
+            return '{"entities":[],"facts":[]}'
+
+        writer = GraphMemoryWriter(
+            store=store, llm_call_fn=_llm, extract_every_n_turns=1, min_message_length=10,
+        )
+        try:
+            writer.enqueue("a long enough message to block the worker", user_id="u1")
+            assert entered.wait(timeout=10), "worker never reached the extraction barrier"
+            for join_timeout in (0.0, 0.05):
+                with pytest.raises(RuntimeError, match=re.escape(_STOP_TIMEOUT_MESSAGE)) as caught:
+                    writer.stop(join_timeout=join_timeout)
+                assert type(caught.value).__name__ == "GraphMemoryStopError"
+                assert str(caught.value) == _STOP_TIMEOUT_MESSAGE
+                assert writer._thread.is_alive()
+            assert processed == []
+
+            release.set()
+            writer.stop(join_timeout=10.0)
+            assert not writer._thread.is_alive()
+            assert len(processed) == 1
+        finally:
+            release.set()
+            _end_worker(writer)
+
+    def test_cleanup_ends_blocked_worker_when_test_fails_before_stop(self, store):
+        """Hygiene regression: a test failing before any stop still releases the
+        barrier, delivers a sentinel and confirms termination in its finally."""
+        entered, release = threading.Event(), threading.Event()
+
+        def _llm(prompt: str) -> str:
+            entered.set()
+            if not release.wait(timeout=30):
+                raise AssertionError("test barrier was never released")
+            return '{"entities":[],"facts":[]}'
+
+        writer = GraphMemoryWriter(
+            store=store, llm_call_fn=_llm, extract_every_n_turns=1, min_message_length=10,
+        )
+        with pytest.raises(AssertionError, match="simulated early failure"):
+            try:
+                writer.enqueue("a long enough message to block the worker", user_id="u1")
+                assert entered.wait(timeout=10), "worker never reached the extraction barrier"
+                raise AssertionError("simulated early failure before stop")
+            finally:
+                release.set()
+                _end_worker(writer)
+        assert not writer._thread.is_alive()
+
+    def test_finite_stop_drains_buffered_pending_batch_before_returning(self, store):
+        """Buffered (not yet batched) work is flushed and processed before stop returns."""
+        processed: list[str] = []
+        text = "a buffered message long enough to keep"
+
+        def _llm(prompt: str) -> str:
+            processed.append(prompt)
+            return '{"entities":[],"facts":[]}'
+
+        writer = GraphMemoryWriter(
+            store=store, llm_call_fn=_llm, extract_every_n_turns=10, min_message_length=10,
+        )
+        try:
+            writer.enqueue(text, user_id="u1")
+            assert writer.get_stats()["pending_depth"] == 1
+            assert processed == []
+            writer.stop(join_timeout=10.0)
+            assert not writer._thread.is_alive()
+            assert len(processed) == 1 and processed[0].endswith(text)
+            stats = writer.get_stats()
+            assert stats["pending_depth"] == 0
+            assert stats["queue_depth"] == 0
+            assert stats["parse_failures"] == 1
+        finally:
+            _end_worker(writer)
 
 
 # ---------------------------------------------------------------------------

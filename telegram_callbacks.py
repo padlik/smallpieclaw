@@ -14,7 +14,13 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from telegram_commands import _apply_mode, _MODE_DESCRIPTIONS
+from telegram_commands import (
+    _apply_mode,
+    _MODE_DESCRIPTIONS,
+    _models_catalog_keyboard,
+    _principal_id,
+    _render_models_catalog,
+)
 
 if TYPE_CHECKING:
     from telegram_interface import TelegramInterface
@@ -162,9 +168,20 @@ async def cb_llm_retry(iface: "TelegramInterface", update: Update, ctx: ContextT
 
 @_require_cb_auth
 async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle model switch button presses."""
+    """Handle legacy model switch button presses.
+
+    Once a provider model catalog is configured, raw ``model:<name>`` callback
+    data is no longer trusted: selection goes through opaque `/models` tokens
+    only, so this handler never reaches the legacy client.
+    """
     query = update.callback_query
     await _ack_query(query)
+    if getattr(iface, "model_registry", None) is not None:
+        try:
+            await query.edit_message_text(_MODELS_REOPEN_TEXT)
+        except Exception:
+            pass
+        return
     model_name = query.data.split(":", 1)[1]
 
     if iface.llm_client and hasattr(iface.llm_client, "set_model"):
@@ -185,6 +202,105 @@ async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: Conte
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)
     except Exception:
         pass
+
+
+@_require_cb_auth
+async def cb_models_refresh(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-run the real provider catalog refresh and edit the /models message in place."""
+    query = update.callback_query
+    await _ack_query(query)
+
+    registry = getattr(iface, "model_registry", None)
+    if registry is None:
+        try:
+            await query.edit_message_text("❌ Model catalog not available.")
+        except Exception:
+            pass
+        return
+
+    result = await _render_models_catalog(registry)
+    keyboard = _models_catalog_keyboard(
+        iface, registry, result,
+        user_id=query.from_user.id if query.from_user else None,
+        chat_id=_callback_chat_id(update),
+    )
+    try:
+        await query.edit_message_text(result.text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except Exception as exc:
+        logger.debug("Could not edit models catalog message: %s", exc)
+
+
+_MODELS_REOPEN_TEXT = "⌛ This selection is no longer valid. Send /models to see the current catalog."
+_MODELS_SAVE_FAILED_TEXT = (
+    "❌ Could not save the model selection. Your previous selection is unchanged. "
+    "Send /models to try again."
+)
+_MODELS_SELECT_FAILED_TEXT = "❌ Model selection failed. Send /models to try again."
+
+
+def _callback_chat_id(update: Update) -> int | None:
+    """Return the chat the pressed button lives in, or ``None`` if unknown."""
+    message = getattr(update.callback_query, "message", None)
+    chat_id = _principal_id(getattr(getattr(message, "chat", None), "id", None))
+    if chat_id is None:
+        chat_id = _principal_id(getattr(getattr(update, "effective_chat", None), "id", None))
+    return chat_id
+
+
+@_require_cb_auth
+async def cb_model_select(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Redeem an opaque `/models` selection token and persist the choice.
+
+    The registry write completes before any acknowledgment or success edit,
+    so the user is never told about a selection that was not durably saved.
+    Every rejection (missing catalog/cache, unknown, expired or foreign
+    token, removed model, changed connection) asks the user to reopen
+    `/models`; no error detail is ever echoed or logged.
+    """
+    from model_registry import ModelRegistryError
+
+    query = update.callback_query
+    registry = getattr(iface, "model_registry", None)
+    token_cache = getattr(iface, "model_selection_tokens", None)
+    user_id = _principal_id(query.from_user.id if query.from_user else None)
+    chat_id = _callback_chat_id(update)
+
+    canonical_id = None
+    if registry is not None and token_cache is not None and user_id is not None and chat_id is not None:
+        canonical_id = token_cache.resolve(query.data, user_id=user_id, chat_id=chat_id)
+
+    view = None
+    if canonical_id is None:
+        text = _MODELS_REOPEN_TEXT
+    else:
+        try:
+            view = await asyncio.to_thread(registry.select, canonical_id)
+        except ModelRegistryError as exc:
+            if exc.code == "persistence_failed":
+                text = _MODELS_SAVE_FAILED_TEXT
+            elif exc.code in ("model_not_found", "connection_changed"):
+                text = _MODELS_REOPEN_TEXT
+            else:
+                logger.warning("model selection was rejected by the registry")
+                text = _MODELS_SELECT_FAILED_TEXT
+        except Exception:
+            logger.warning("model selection raised an unexpected error")
+            text = _MODELS_SELECT_FAILED_TEXT
+
+    if view is not None:
+        record = next((m for m in view.models if m.id == canonical_id), None)
+        name = record.display_name[:80] if record is not None else canonical_id
+        text = (
+            f"✅ Switched to <b>{html.escape(name)}</b>"
+            f" (<code>{html.escape(canonical_id[:120])}</code>)\n"
+            f"<i>Takes effect from your next message; work already running keeps its current model.</i>"
+        )
+
+    await _ack_query(query)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.debug("Could not edit model selection message: %s", exc)
 
 
 @_require_cb_auth

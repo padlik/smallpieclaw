@@ -20,6 +20,11 @@ Sub-agents (caller_depth >= 1) may only use the read-only actions ``list`` and
 
 from __future__ import annotations
 
+from typing import Callable
+
+from model_registry import bounded_selector_evidence
+from outcome_utils import with_execution
+
 
 # Valid overlap-policy values, enforced at the tool layer before reaching the
 # Scheduler (which stays permissive for operator-authored scheduler.toml).
@@ -70,6 +75,36 @@ def _coerce_context_max_messages(value: object, action: str) -> int:
     return parsed
 
 
+def _file_notice(scheduler) -> str:
+    """Return the scheduler's file-failure notice, or "" when there is none."""
+    accessor = getattr(scheduler, "load_notice", None)
+    notice = accessor() if callable(accessor) else None
+    return notice if isinstance(notice, str) else ""
+
+
+def _reload_required_refusal(scheduler) -> dict | None:
+    """Return a refused result while the scheduler requires a reload, else None."""
+    accessor = getattr(scheduler, "reload_required_notice", None)
+    notice = accessor() if callable(accessor) else None
+    if not isinstance(notice, str) or not notice:
+        return None
+    return with_execution({"success": False, "output": "", "error": notice, "exit_code": -1}, "refused")
+
+
+_CHANGE_VERBS = {"remove": "removed", "pause": "paused", "resume": "resumed"}
+
+
+def _change_core(scheduler) -> Callable[..., tuple[bool, str, bool]] | None:
+    """Return the scheduler class's detailed remove/pause/resume core, or None.
+
+    Looked up on the class, never the instance, so a mock collaborator's
+    auto-created attribute is not mistaken for it; such collaborators keep
+    the boolean ``remove_job``/``pause_job``/``resume_job`` path.
+    """
+    core = getattr(type(scheduler), "_change_job", None)
+    return core if callable(core) else None
+
+
 def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
     """Run the ``schedule`` built-in tool's ``action`` against *scheduler*.
 
@@ -89,7 +124,7 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
     scheduled jobs that persist beyond the sub-agent's lifetime.
     """
     if not scheduler:
-        return {"success": False, "output": "", "error": "Scheduler not available.", "exit_code": -1}
+        return with_execution({"success": False, "output": "", "error": "Scheduler not available.", "exit_code": -1}, "refused")
     action = str(args.get("action", "list")).lower()
     tag = str(args.get("tag", "")).strip()
 
@@ -97,7 +132,7 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
     # ``list`` and ``show`` actions are allowed; all other actions are
     # hard-blocked with a non-recoverable error.
     if caller_depth >= 1 and action not in ("list", "show"):
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": (
@@ -112,33 +147,44 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                 "Ask the parent agent to modify scheduled jobs; sub-agents may "
                 "only list or show them."
             ),
-        }
+        }, "refused")
 
     if action == "list":
+        notice = _file_notice(scheduler)
         jobs = scheduler.list_jobs()
         if not jobs:
-            return {"success": True, "output": "No scheduled jobs.", "error": "", "exit_code": 0}
-        lines = []
+            output = "No scheduled jobs."
+            if notice:
+                output = f"⚠️ {notice}\n{output}"
+            return with_execution({"success": True, "output": output, "error": "", "exit_code": 0}, "executed")
+        lines = [f"⚠️ {notice}"] if notice else []
         for j in jobs:
             status = "✅" if j["enabled"] else "⏸"
             stype = j.get("schedule_type", "interval")
             task_label = "Message" if stype == "once" else "Task"
             err = f"\n   ⚠️ last error: {j['last_error'][:120]}" if j.get("last_error") else ""
+            if j.get("config_error"):
+                err += f"\n   ⚠️ config_error (not scheduled): {j['config_error']}"
             lines.append(
                 f"{status} {j['tag']} ({j['schedule']})\n"
                 f"   {task_label}: {j['task']}\n"
                 f"   Last run: {j['last_run'] or 'never'}{err}"
             )
-        return {"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}
+        return with_execution({"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}, "executed")
 
     if action == "show":
         if not tag:
-            return {"success": False, "output": "", "error": "tag is required for show", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "tag is required for show", "exit_code": -1}, "refused")
+        notice = _file_notice(scheduler)
         job = scheduler.show_job(tag)
         if not job:
             known = ", ".join(entry["tag"] for entry in scheduler.list_jobs()) or "none"
-            return {"success": False, "output": "", "error": f"Job '{tag}' not found. Known jobs: {known}", "exit_code": -1}
-        lines = [
+            error = f"Job '{tag}' not found. Known jobs: {known}"
+            if notice:
+                error = f"{error}\n{notice}"
+            return with_execution({"success": False, "output": "", "error": error, "exit_code": -1}, "executed")
+        lines = [f"⚠️ {notice}"] if notice else []
+        lines += [
             f"tag: {job['tag']}",
             f"task: {job['task']}",
             f"schedule: {job['schedule']}",
@@ -154,7 +200,9 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             f"is_running: {job['is_running']}",
             f"source: {job['source']}",
             f"notify: {job['notify']}",
-            f"model: {job['model'] or 'default'}",
+            "model: " + bounded_selector_evidence(
+                job.get("model"), redact=getattr(scheduler, "selector_redactor", None),
+            ),
             f"preserve_context: {job['preserve_context']}",
             f"context_max_messages: {job['context_max_messages']}",
             f"overlap_policy: {job['overlap_policy']}",
@@ -162,14 +210,16 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             f"last_error: {job['last_error'] or 'none'}",
             f"created_at: {job['created_at'] or 'unknown'}",
         ])
-        return {"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}
+        if job.get("config_error"):
+            lines.append(f"config_error: {job['config_error']} (not scheduled; fix the job, then reload)")
+        return with_execution({"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}, "executed")
 
     if action == "add":
         if not tag:
-            return {"success": False, "output": "", "error": "tag is required for add", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "tag is required for add", "exit_code": -1}, "refused")
         overlap_policy = str(args.get("overlap_policy", "skip")).lower()
         if args.get("overlap_policy") is not None and overlap_policy not in _OVERLAP_POLICIES:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": (
@@ -180,12 +230,12 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                 "error_type": "validation_error",
                 "recoverable": True,
                 "suggestion": "Set overlap_policy to 'skip' or 'parallel'.",
-            }
+            }, "refused")
         if args.get("context_max_messages") is not None:
             try:
                 context_max_messages = _coerce_context_max_messages(args["context_max_messages"], "add")
             except ValueError as exc:
-                return {
+                return with_execution({
                     "success": False,
                     "output": "",
                     "error": str(exc),
@@ -193,7 +243,7 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                     "error_type": "validation_error",
                     "recoverable": True,
                     "suggestion": "Provide context_max_messages as an integer >= 1, e.g. 50.",
-                }
+                }, "refused")
         else:
             context_max_messages = 50
         notify = True
@@ -201,7 +251,7 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             try:
                 notify = _coerce_bool(args["notify"], "notify", "add")
             except ValueError as exc:
-                return {
+                return with_execution({
                     "success": False,
                     "output": "",
                     "error": str(exc),
@@ -209,13 +259,13 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                     "error_type": "validation_error",
                     "recoverable": True,
                     "suggestion": "Provide notify as a boolean (true/false).",
-                }
+                }, "refused")
         preserve_context = False
         if args.get("preserve_context") is not None:
             try:
                 preserve_context = _coerce_bool(args["preserve_context"], "preserve_context", "add")
             except ValueError as exc:
-                return {
+                return with_execution({
                     "success": False,
                     "output": "",
                     "error": str(exc),
@@ -223,7 +273,13 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                     "error_type": "validation_error",
                     "recoverable": True,
                     "suggestion": "Provide preserve_context as a boolean (true/false).",
-                }
+                }, "refused")
+        attempted = False
+
+        def _mark_attempt() -> None:
+            nonlocal attempted
+            attempted = True
+
         result = scheduler.add_job(
             tag=tag,
             schedule_type=str(args.get("schedule_type", args.get("schedule", "cron"))),
@@ -234,36 +290,56 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             time_str=str(args.get("time", "")) or None,
             run_at=str(args.get("run_at", "")) or None,
             cron=str(args.get("cron", "")) or None,
-            model=str(args["model"]) if args.get("model") else None,
+            model=args.get("model"),
             preserve_context=preserve_context,
             context_max_messages=context_max_messages,
             overlap_policy=overlap_policy,
+            _on_attempt=_mark_attempt,
         )
+        disposition = "executed" if attempted else "refused"
         if result["success"]:
-            return {"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}
-        return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
+            return with_execution({"success": True, "output": f"Job '{tag}' added.", "error": "", "exit_code": 0}, disposition)
+        return with_execution({"success": False, "output": "", "error": result["error"], "exit_code": -1}, disposition)
+
+    if action in ("remove", "pause", "resume"):
+        # Known before any attempt: a latched scheduler changes nothing.
+        refusal = _reload_required_refusal(scheduler)
+        if refusal is not None:
+            return refusal
+        core = _change_core(scheduler)
+        if core is not None:
+            # The core reports whether the change was attempted: pre-known
+            # refusals (bad file, legacy read-only, shadow check) are refused.
+            ok, error, attempted = core(scheduler, action, tag)
+            disposition = "executed" if attempted else "refused"
+            if ok:
+                return with_execution({"success": True, "output": f"Job '{tag}' {_CHANGE_VERBS[action]}.", "error": "", "exit_code": 0}, disposition)
+            return with_execution({"success": False, "output": "", "error": error or f"Job '{tag}' not found.", "exit_code": -1}, disposition)
 
     if action == "remove":
+        disposition = "executed" if tag else "refused"
         ok = scheduler.remove_job(tag)
         if ok:
-            return {"success": True, "output": f"Job '{tag}' removed.", "error": "", "exit_code": 0}
-        return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
+            return with_execution({"success": True, "output": f"Job '{tag}' removed.", "error": "", "exit_code": 0}, disposition)
+        return with_execution({"success": False, "output": "", "error": _file_notice(scheduler) or f"Job '{tag}' not found.", "exit_code": -1}, disposition)
 
     if action == "pause":
+        disposition = "executed" if tag else "refused"
         ok = scheduler.pause_job(tag)
         if ok:
-            return {"success": True, "output": f"Job '{tag}' paused.", "error": "", "exit_code": 0}
-        return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
+            return with_execution({"success": True, "output": f"Job '{tag}' paused.", "error": "", "exit_code": 0}, disposition)
+        return with_execution({"success": False, "output": "", "error": _file_notice(scheduler) or f"Job '{tag}' not found.", "exit_code": -1}, disposition)
 
     if action == "resume":
+        disposition = "executed" if tag else "refused"
         ok = scheduler.resume_job(tag)
         if ok:
-            return {"success": True, "output": f"Job '{tag}' resumed.", "error": "", "exit_code": 0}
-        return {"success": False, "output": "", "error": f"Job '{tag}' not found.", "exit_code": -1}
+            return with_execution({"success": True, "output": f"Job '{tag}' resumed.", "error": "", "exit_code": 0}, disposition)
+        return with_execution({"success": False, "output": "", "error": _file_notice(scheduler) or f"Job '{tag}' not found.", "exit_code": -1}, disposition)
 
     if action == "modify":
         if not tag:
-            return {"success": False, "output": "", "error": "tag is required for modify", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "tag is required for modify", "exit_code": -1}, "refused")
         updates: dict = {}
         for field in (
             "task",
@@ -286,7 +362,7 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             try:
                 updates["context_max_messages"] = _coerce_context_max_messages(updates["context_max_messages"], "modify")
             except ValueError as exc:
-                return {
+                return with_execution({
                     "success": False,
                     "output": "",
                     "error": str(exc),
@@ -294,11 +370,11 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                     "error_type": "validation_error",
                     "recoverable": True,
                     "suggestion": "Provide context_max_messages as an integer >= 1, e.g. 50.",
-                }
+                }, "refused")
         if "overlap_policy" in updates:
             updates["overlap_policy"] = str(updates["overlap_policy"]).lower()
             if updates["overlap_policy"] not in _OVERLAP_POLICIES:
-                return {
+                return with_execution({
                     "success": False,
                     "output": "",
                     "error": (
@@ -309,12 +385,12 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                     "error_type": "validation_error",
                     "recoverable": True,
                     "suggestion": "Set overlap_policy to 'skip' or 'parallel'.",
-                }
+                }, "refused")
         if "notify" in updates:
             try:
                 updates["notify"] = _coerce_bool(updates["notify"], "notify", "modify")
             except ValueError as exc:
-                return {
+                return with_execution({
                     "success": False,
                     "output": "",
                     "error": str(exc),
@@ -322,12 +398,12 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                     "error_type": "validation_error",
                     "recoverable": True,
                     "suggestion": "Provide notify as a boolean (true/false).",
-                }
+                }, "refused")
         if "preserve_context" in updates:
             try:
                 updates["preserve_context"] = _coerce_bool(updates["preserve_context"], "preserve_context", "modify")
             except ValueError as exc:
-                return {
+                return with_execution({
                     "success": False,
                     "output": "",
                     "error": str(exc),
@@ -335,14 +411,18 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
                     "error_type": "validation_error",
                     "recoverable": True,
                     "suggestion": "Provide preserve_context as a boolean (true/false).",
-                }
-        if "model" in updates:
-            updates["model"] = str(updates["model"]) if updates["model"] else None
+                }, "refused")
+        attempted = False
 
-        result = scheduler.modify_job(tag, updates)
+        def _mark_attempt() -> None:
+            nonlocal attempted
+            attempted = True
+
+        result = scheduler.modify_job(tag, updates, _on_attempt=_mark_attempt)
+        disposition = "executed" if attempted else "refused"
         if result["success"]:
-            return {"success": True, "output": f"Job '{tag}' modified.", "error": "", "exit_code": 0}
-        return {
+            return with_execution({"success": True, "output": f"Job '{tag}' modified.", "error": "", "exit_code": 0}, disposition)
+        return with_execution({
             "success": False,
             "output": "",
             "error": result["error"],
@@ -350,17 +430,17 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             "error_type": "validation_error",
             "recoverable": True,
             "suggestion": "Check the error message and retry with valid, updatable fields.",
-        }
+        }, disposition)
 
     if action == "run_now":
         if not tag:
-            return {"success": False, "output": "", "error": "tag is required for run_now", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "tag is required for run_now", "exit_code": -1}, "refused")
         # Snapshot before triggering: a fast once-job can complete and
         # self-remove before the result-building read-back runs.
         job = scheduler.show_job(tag)
         result = scheduler.run_now(tag)
         if not result["success"]:
-            return {"success": False, "output": "", "error": result["error"], "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": result["error"], "exit_code": -1}, "executed")
 
         enabled = bool(job.get("enabled", True)) if job else True
         schedule_type = job.get("schedule_type", "cron") if job else "cron"
@@ -378,9 +458,9 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             notes.append("The job remains paused (enabled=false); scheduled firings will still skip it.")
         if schedule_type == "once":
             notes.append("This is a once job: it will be removed after the run completes.")
-        return {"success": True, "output": "\n".join(notes), "error": "", "exit_code": 0}
+        return with_execution({"success": True, "output": "\n".join(notes), "error": "", "exit_code": 0}, "executed")
 
-    return {
+    return with_execution({
         "success": False,
         "output": "",
         "error": (
@@ -388,4 +468,4 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             "Use: list, show, add, remove, pause, resume, modify, run_now"
         ),
         "exit_code": -1,
-    }
+    }, "refused")

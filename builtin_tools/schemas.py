@@ -13,7 +13,10 @@ tool interfaces — keep them in sync when adding or changing tools.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from model_registry import CatalogView
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +181,7 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model id from AVAILABLE MODELS (default: background_model).",
+                    "description": "Canonical provider-id/upstream-id from /models; omit to inherit the active main model.",
                 },
                 "response_format": {
                     "type": "string",
@@ -192,18 +195,6 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "context_key": {
                     "type": "string",
                     "description": "Key for persisting conversation history between calls.",
-                },
-                "max_tokens": {
-                    "type": "integer",
-                    "description": "Override maximum tokens in the sub-agent's response.",
-                },
-                "temperature": {
-                    "type": "number",
-                    "description": "Override sampling temperature (0.0–2.0).",
-                },
-                "top_p": {
-                    "type": "number",
-                    "description": "Override nucleus sampling probability (0.0–1.0).",
                 },
             },
             "required": ["task"],
@@ -552,23 +543,34 @@ PSEUDO_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 
 def build_tool_definitions(
     mcp_manager: object | None = None,
+    *,
+    model_catalog_view: CatalogView | None = None,
 ) -> list[dict[str, Any]]:
     """Assemble OpenAI-format tool definitions from built-in, pseudo, and MCP schemas.
 
     Args:
         mcp_manager: Optional MCPManagerProtocol for MCP tool schemas.
+        model_catalog_view: Optional sanitized catalog view; when given, the
+            built-in ``spawn_agent``/``schedule`` descriptions get the compact
+            catalog summary appended on a fresh copy (static schemas untouched).
 
     Returns:
         A list of tool definition dicts in OpenAI function-calling format:
         ``{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}``
     """
+    from prompt_builder import MODEL_AWARE_TOOL_NAMES, format_model_catalog_summary
+
+    summary = format_model_catalog_summary(model_catalog_view)
     tools: list[dict[str, Any]] = []
 
     # Built-in tools
     for name, schema in BUILTIN_TOOL_SCHEMAS.items():
+        function = {"name": name, **schema}
+        if summary and name in MODEL_AWARE_TOOL_NAMES:
+            function["description"] = f"{schema['description']} {summary}"
         tools.append({
             "type": "function",
-            "function": {"name": name, **schema},
+            "function": function,
         })
 
     # Pseudo-tools

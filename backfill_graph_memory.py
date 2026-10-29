@@ -42,16 +42,22 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from functools import partial
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, NoReturn, Optional
 
 import httpx
 
-from graph_memory import (
-    EXTRACTION_PROMPT,
-    GraphMemoryStore,
-    parse_extraction,
-)
+from config_schema import resolve_provider_connection
+from embedding_client import EmbeddingClient
+from model_registry import ModelRegistry
+from model_settings import ModelSettings, ModelSettingsError
 from providers._errors import LLMError
+
+if TYPE_CHECKING:
+    from config_schema import AgentConfig, AppConfig, ResolvedProviderConnection
+    from graph_memory import GraphMemoryStore, GraphPrerequisites
+    from model_registry import RunModel
 
 # ---------------------------------------------------------------------------
 # Bootstrap — ensure the repo root is on sys.path regardless of cwd
@@ -149,6 +155,57 @@ def _load_toml(path: str) -> dict:
         import tomllib as tomli  # type: ignore[no-redef]  # Python 3.11+
     with open(path, "rb") as f:
         return tomli.load(f)
+
+
+_REFRESH_GUIDANCE = "start the agent and run /models refresh to save the provider model catalog"
+
+
+class _NoDiscovery:
+    """Discovery guard for saved-catalog preparation, which never refreshes."""
+
+    def fetch(self, _connection: ResolvedProviderConnection) -> NoReturn:
+        """Refuse provider discovery; backfill preparation uses only saved data."""
+        raise RuntimeError("backfill preparation must not run provider model discovery")
+
+
+def prepare_backfill_prerequisites(
+    app_cfg: AppConfig,
+    settings_path: Path,
+    *,
+    vault_file: str | None = None,
+) -> GraphPrerequisites:
+    """Pin the graph model from the saved catalog without changing any state.
+
+    The settings file is read once in read-only mode (no backup, no writes)
+    and its status is checked before building a ``ModelRegistry``, whose
+    constructor would otherwise hide load failures. No Main model is
+    restored or selected, no catalog is refreshed, and ``graph_memory.enabled``
+    is left to the caller. ``vault_file`` must be the vault used to parse
+    ``app_cfg``. Raises ``GraphPrerequisiteError`` on failure.
+    """
+    from graph_memory import GraphPrerequisiteError, resolve_graph_prerequisites
+
+    settings = ModelSettings(settings_path, read_only=True)
+    try:
+        status = settings.load().status
+    except ModelSettingsError:
+        raise GraphPrerequisiteError(
+            "catalog_read_failed",
+            "saved model catalog could not be read: check the settings file permissions, "
+            f"then {_REFRESH_GUIDANCE}",
+        ) from None
+    if status == "missing":
+        raise GraphPrerequisiteError("catalog_missing", f"no saved model catalog: {_REFRESH_GUIDANCE}")
+    if status == "corrupt":
+        raise GraphPrerequisiteError("catalog_corrupt", f"saved model catalog is corrupt: {_REFRESH_GUIDANCE}")
+
+    registry = ModelRegistry(
+        app_cfg.providers,
+        settings,
+        _NoDiscovery(),
+        partial(resolve_provider_connection, vault_file=vault_file),
+    )
+    return resolve_graph_prerequisites(app_cfg, registry, vault_file=vault_file)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +311,8 @@ def backfill_longterm_to_graph(
 
     Returns a BackfillResult with per-entry outcomes and aggregate counts.
     """
+    from graph_memory import EXTRACTION_PROMPT, parse_extraction
+
     state = {} if dry_run else _load_backfill_state(state_path)
     imported_map: dict = state.get("imported", {})
 
@@ -457,15 +516,16 @@ def backfill_longterm_to_graph(
     return result
 
 
-def _build_llm_call(cfg: dict, app_cfg, all_models: list) -> "Callable[[str], str]":
+def _build_llm_call(pin: RunModel, agent_config: AgentConfig) -> "Callable[[str], str]":
     """Build a one-shot LLM callable that uses the extraction model.
 
-    Delegates to the shared ``build_extraction_llm_call`` helper in graph_memory.py
-    so that both the backfill CLI and the live main-process path use identical logic.
+    Delegates to the shared ``build_extraction_llm_call`` helper in graph_memory.py,
+    passing the settled pin and typed agent configuration, so that both the
+    backfill CLI and the live main-process path use identical extraction logic.
     """
     from graph_memory import build_extraction_llm_call
 
-    return build_extraction_llm_call(cfg, app_cfg, all_models, caller_tag="backfill")
+    return build_extraction_llm_call(pin, agent_config, caller_tag="backfill")
 
 
 def main() -> None:
@@ -513,7 +573,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
-    # Load config
+    # Load raw config and resolve XDG paths
     # ------------------------------------------------------------------
     if not os.path.exists(args.config):
         logger.error("Config file not found: %s", args.config)
@@ -521,84 +581,47 @@ def main() -> None:
 
     raw_cfg = _load_toml(args.config)
 
-    from config_schema import parse_config
-    from exceptions import ConfigError
     from xdg import xdg_paths
 
     xdg = xdg_paths(args.agent_name)
-    try:
-        app_cfg = parse_config(raw_cfg, vault_file=str(xdg.secrets_file), agent_name=args.agent_name)
-    except ConfigError as exc:
-        logger.error("Config error: %s", exc)
-        sys.exit(1)
-
-    # Use the resolved (env-expanded) config dict from here on.
-    raw_cfg = app_cfg._raw
-
-    # ------------------------------------------------------------------
-    # Check graph memory is enabled + ladybug is available
-    # ------------------------------------------------------------------
-    if not app_cfg.graph_memory.enabled:
-        logger.error(
-            "Graph memory is not enabled in config.toml.\n"
-            "Set [graph_memory] enabled = true and run again."
-        )
-        sys.exit(1)
-
-    try:
-        import ladybug  # type: ignore[import-untyped]  # noqa: F401
-    except ImportError:
-        logger.error(
-            "The 'ladybug' package is not installed.\n"
-            "Install it with: pip install ladybug"
-        )
-        sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # Resolve paths
-    # ------------------------------------------------------------------
-    gm_cfg = app_cfg.graph_memory
-    db_path = args.db_path or str(xdg.graph_memory_db)
     longterm_path = args.longterm_path or str(xdg.data_home / "longterm_memory.json")
     state_file = args.state_file or str(xdg.data_home / "graph_memory_backfill_state.json")
 
-    if not os.path.exists(longterm_path):
-        logger.warning("LongTermMemory file not found: %s — nothing to import.", longterm_path)
-        sys.exit(0)
-
     # ------------------------------------------------------------------
-    # Load LongTermMemory entries
-    # ------------------------------------------------------------------
-    from memory_store import LongTermMemory
-    from llm_client import LLMClient
-    from token_usage import get_registry as get_token_registry
-
-    logger.info("Loading LongTermMemory from %s", longterm_path)
-    # For dry-run we only need the file reader, not the embed LLM.
-    # Avoid spinning up LLMClient (and incurring API calls) until needed.
-    long_term = LongTermMemory(path=longterm_path, llm=None)
-    entries = long_term.entries()
-
-    logger.info("Found %d LongTermMemory entries", len(entries))
-    if not entries:
-        logger.info("Nothing to import.")
-        sys.exit(0)
-
-    # Compute limit display
-    logger.info(
-        "Mode: %s  |  Limit: %s  |  Force: %s  |  State: %s",
-        "DRY-RUN" if args.dry_run else "LIVE",
-        str(args.limit) if args.limit is not None else "all",
-        str(args.force),
-        state_file,
-    )
-
-    # ------------------------------------------------------------------
-    # DRY-RUN fast path — count/preview without opening the graph DB,
-    # calling embeddings, or making LLM calls.
+    # DRY-RUN fast path — count/preview before credential resolution,
+    # catalog preparation, ladybug import, embeddings, or DB work.
     # ------------------------------------------------------------------
     if args.dry_run:
+        if not raw_cfg.get("graph_memory", {}).get("enabled", False):
+            logger.error(
+                "Graph memory is not enabled in config.toml.\n"
+                "Set [graph_memory] enabled = true and run again."
+            )
+            sys.exit(1)
+
+        if not os.path.exists(longterm_path):
+            logger.warning("LongTermMemory file not found: %s — nothing to import.", longterm_path)
+            sys.exit(0)
+
+        from memory_store import LongTermMemory
+
+        logger.info("Loading LongTermMemory from %s", longterm_path)
+        long_term = LongTermMemory(path=longterm_path, llm=None)
+        entries = long_term.entries()
+
+        logger.info("Found %d LongTermMemory entries", len(entries))
+        if not entries:
+            logger.info("Nothing to import.")
+            sys.exit(0)
+
+        logger.info(
+            "Mode: DRY-RUN  |  Limit: %s  |  Force: %s  |  State: %s",
+            str(args.limit) if args.limit is not None else "all",
+            str(args.force),
+            state_file,
+        )
         logger.info("DRY-RUN — counting entries only; no DB, embeddings, or LLM calls.")
+
         state = _load_backfill_state(state_file)
         imported_map = state.get("imported", {})
         result = BackfillResult(total=len(entries))
@@ -626,58 +649,114 @@ def main() -> None:
         sys.exit(0)
 
     # ------------------------------------------------------------------
-    # LIVE path — open LLM client, embedding, and graph store.
+    # LIVE path — validate typed config, then prepare before DB/live HTTP.
     # ------------------------------------------------------------------
-    llm = LLMClient(raw_cfg, usage_registry=get_token_registry(), caller_tag="backfill-embed")
+    from config_schema import parse_config
+    from exceptions import ConfigError
 
-    # ------------------------------------------------------------------
-    # Build graph store
-    # ------------------------------------------------------------------
-    logger.info("Opening graph store at %s", db_path)
     try:
-        embedding_dim = len(llm.embed("test"))
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to determine embedding dimension: %s", exc)
-        llm.close()
+        app_cfg = parse_config(raw_cfg, vault_file=str(xdg.secrets_file), agent_name=args.agent_name)
+    except ConfigError as exc:
+        logger.error("Config error: %s", exc)
+        sys.exit(1)
+
+    if not app_cfg.graph_memory.enabled:
+        logger.error(
+            "Graph memory is not enabled in config.toml.\n"
+            "Set [graph_memory] enabled = true and run again."
+        )
         sys.exit(1)
 
     try:
-        store = GraphMemoryStore(
-            db_path=db_path,
-            embedder_fn=lambda text: llm.embed(text),
-            embedding_dim=embedding_dim,
-            buffer_pool_mb=gm_cfg.buffer_pool_mb,
+        import ladybug  # type: ignore[import-untyped]  # noqa: F401
+    except ImportError:
+        logger.error(
+            "The 'ladybug' package is not installed.\n"
+            "Install it with: pip install ladybug"
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to open graph store: %s", exc)
-        llm.close()
         sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # Build extraction LLM callable
-    # ------------------------------------------------------------------
-    all_models = raw_cfg.get("models", [])
-    llm_call_fn = _build_llm_call(raw_cfg, app_cfg, all_models)
+    gm_cfg = app_cfg.graph_memory
+    db_path = args.db_path or str(xdg.graph_memory_db)
 
-    # ------------------------------------------------------------------
-    # Run backfill
-    # ------------------------------------------------------------------
-    logger.info("Starting backfill...")
-    progress = _ProgressPrinter(len(entries), args.verbose)
+    if not os.path.exists(longterm_path):
+        logger.warning("LongTermMemory file not found: %s — nothing to import.", longterm_path)
+        sys.exit(0)
+
+    from memory_store import LongTermMemory
+
+    logger.info("Loading LongTermMemory from %s", longterm_path)
+    long_term = LongTermMemory(path=longterm_path, llm=None)
+    entries = long_term.entries()
+
+    logger.info("Found %d LongTermMemory entries", len(entries))
+    if not entries:
+        logger.info("Nothing to import.")
+        sys.exit(0)
+
+    logger.info(
+        "Mode: %s  |  Limit: %s  |  Force: %s  |  State: %s",
+        "LIVE",
+        str(args.limit) if args.limit is not None else "all",
+        str(args.force),
+        state_file,
+    )
+
+    # Saved-catalog preparation before any database or live embedding HTTP.
+    from graph_memory import GraphPrerequisiteError
+
     try:
-        result = backfill_longterm_to_graph(
-            long_term_entries=entries,
-            store=store,
-            llm_call_fn=llm_call_fn,
-            state_path=state_file,
-            dry_run=False,
-            limit=args.limit,
-            force=args.force,
-            notify_fn=progress,
+        prepared = prepare_backfill_prerequisites(
+            app_cfg, xdg.models_config_file, vault_file=str(xdg.secrets_file)
         )
+    except GraphPrerequisiteError as exc:
+        logger.error("Backfill prerequisites failed: %s", exc)
+        sys.exit(1)
+
+    # One independent embedding client for this CLI invocation.
+    embed_client = EmbeddingClient(
+        app_cfg.embeddings, app_cfg.providers, vault_file=str(xdg.secrets_file)
+    )
+    try:
+        logger.info("Opening graph store at %s", db_path)
+        try:
+            embedding_dim = len(embed_client.embed("test"))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to determine embedding dimension: %s", exc)
+            sys.exit(1)
+
+        try:
+            from graph_memory import GraphMemoryStore
+
+            store = GraphMemoryStore(
+                db_path=db_path,
+                embedder_fn=lambda text: embed_client.embed(text),
+                embedding_dim=embedding_dim,
+                buffer_pool_mb=gm_cfg.buffer_pool_mb,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to open graph store: %s", exc)
+            sys.exit(1)
+
+        try:
+            llm_call_fn = _build_llm_call(prepared.pin, app_cfg.agent)
+
+            logger.info("Starting backfill...")
+            progress = _ProgressPrinter(len(entries), args.verbose)
+            result = backfill_longterm_to_graph(
+                long_term_entries=entries,
+                store=store,
+                llm_call_fn=llm_call_fn,
+                state_path=state_file,
+                dry_run=False,
+                limit=args.limit,
+                force=args.force,
+                notify_fn=progress,
+            )
+        finally:
+            store.close()
     finally:
-        store.close()
-        llm.close()
+        embed_client.close()
 
     progress.finalize()
     _print_summary(result, dry_run=False, verbose=args.verbose)

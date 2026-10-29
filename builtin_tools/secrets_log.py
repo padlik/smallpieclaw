@@ -32,6 +32,7 @@ from builtin_tools.logquery_helpers import (
     _LOG_QUERY_MAX_LIMIT,
 )
 from builtin_tools.text_utils import build_redaction_needles, redact_structure
+from outcome_utils import with_execution
 from sqlite_log import _compact_json, connect_store, row_to_record
 
 if TYPE_CHECKING:
@@ -97,12 +98,12 @@ class SecretsTools:
         """Stage a vault lookup for operator confirmation."""
         key = args.get("key", "")
         if not key:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": "secret_get: 'key' is required.",
                 "exit_code": -1,
-            }
+            }, "refused")
         desc = f"Look up vault key '{key}'"
         if scheduled:
             # Scheduled runs never reach the Telegram bridge: the seam denies
@@ -140,7 +141,7 @@ class SecretsTools:
             with open(self._owner._vault_path, encoding="utf-8") as fh:
                 content = fh.read()
         except OSError as exc:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": f"Cannot read vault: {exc}",
@@ -148,7 +149,7 @@ class SecretsTools:
                 "error_type": "config_error",
                 "recoverable": False,
                 "suggestion": "Check vault file path and TOML validity.",
-            }
+            }, "executed")
 
         try:
             vault = _parse_vault_content(
@@ -160,7 +161,7 @@ class SecretsTools:
             msg = str(exc)
             if not msg.startswith("Cannot read vault"):
                 msg = f"Cannot read vault: {msg}"
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": msg,
@@ -168,11 +169,11 @@ class SecretsTools:
                 "error_type": "config_error",
                 "recoverable": False,
                 "suggestion": "Check vault file path and TOML validity.",
-            }
+            }, "executed")
 
         value = vault.get(key)
         if value is None and key not in vault:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": f"Vault key '{key}' not found.",
@@ -180,12 +181,12 @@ class SecretsTools:
                 "error_type": "not_found",
                 "recoverable": False,
                 "suggestion": "Add the key to the vault file.",
-            }
+            }, "executed")
 
         # Per-key type check: siblings may be non-string (require_all_strings=False),
         # but the value we hand back must be a string secret.
         if not isinstance(value, str):
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": (
@@ -199,17 +200,17 @@ class SecretsTools:
                     "Store the secret as a top-level string key "
                     '(e.g. api_key = "sk-...") in the vault file.'
                 ),
-            }
+            }, "executed")
 
         # value is guaranteed to be a string by the per-key check above.
-        return {
+        return with_execution({
             "success": True,
             "output": value,
             "error": "",
             "exit_code": 0,
             "error_type": "",
             "recoverable": True,
-        }
+        }, "executed")
 
 
 class LogQueryTools:
@@ -328,7 +329,7 @@ class LogQueryTools:
 
         path = self._owner._log_store_path
         if not path:
-            return self._log_query_result([], 0, False)
+            return with_execution(self._log_query_result([], 0, False), "refused")
 
         try:
             conn = connect_store(path)
@@ -493,18 +494,18 @@ class LogQueryTools:
             "truncated": truncated,
             "total_matched": total_matched,
         }
-        return {
+        return with_execution({
             "success": True,
             "output": json.dumps(payload, ensure_ascii=False),
             "error": "",
             "exit_code": 0,
             "error_type": "",
             "recoverable": True,
-        }
+        }, "executed")
 
     def _log_detail_empty(self) -> dict:
         """Return the well-formed EMPTY log_detail payload in the peer convention."""
-        return {
+        return with_execution({
             "success": True,
             "output": json.dumps(
                 {"found": False, "record": None, "dumped": False, "dump_path": None},
@@ -514,7 +515,7 @@ class LogQueryTools:
             "exit_code": 0,
             "error_type": "",
             "recoverable": True,
-        }
+        }, "executed")
 
     def _log_detail_result(
         self,
@@ -532,14 +533,14 @@ class LogQueryTools:
         }
         if note is not None:
             payload["note"] = note
-        return {
+        return with_execution({
             "success": True,
             "output": json.dumps(payload, ensure_ascii=False),
             "error": "",
             "exit_code": 0,
             "error_type": "",
             "recoverable": True,
-        }
+        }, "executed")
 
     def _current_vault_secrets(self) -> list[str]:
         """Return the startup secrets plus string values re-read from the vault file now.
@@ -601,11 +602,11 @@ class LogQueryTools:
             or raw_id <= 0
             or raw_id > _SQLITE_INT64_MAX
         ):
-            return self._log_detail_empty()
+            return with_execution(self._log_detail_empty(), "refused")
 
         path = self._owner._log_store_path
         if not path:
-            return self._log_detail_empty()
+            return with_execution(self._log_detail_empty(), "refused")
 
         try:
             conn = connect_store(path)

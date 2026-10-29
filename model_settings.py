@@ -62,18 +62,33 @@ class SettingsLoadResult:
 class ModelSettings:
     """Load and atomically write one validated v1 TOML catalog document."""
 
-    def __init__(self, path: Path) -> None:
-        """Bind managed settings to ``path`` without creating it."""
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
+        """Bind managed settings to ``path`` without creating it.
+
+        With ``read_only=True`` the instance never writes, backs up, or creates
+        files: the first successful ``load`` result becomes a stable snapshot
+        and ``write`` always raises ``ModelSettingsError("read_only")``.
+        """
         self.path = Path(path)
+        self._read_only = read_only
+        self._snapshot: SettingsLoadResult | None = None
         self._preserved_content: bytes | None = None
         self._preservation_failed = False
 
     def load(self) -> SettingsLoadResult:
-        """Return valid, missing, or preserved-corrupt settings state."""
+        """Return valid, missing, or corrupt settings state.
+
+        Default mode rereads the file on every call and preserves corrupt bytes
+        in a sibling backup. Read-only mode reports corrupt state without any
+        backup (``preserved_path`` is ``None``) and returns its first
+        successful result on every later call.
+        """
+        if self._snapshot is not None:
+            return self._snapshot
         try:
             content = self.path.read_bytes()
         except FileNotFoundError:
-            return SettingsLoadResult("missing")
+            return self._settle(SettingsLoadResult("missing"))
         except OSError:
             raise ModelSettingsError("read_failed") from None
 
@@ -81,12 +96,20 @@ class ModelSettings:
             parsed = _tomllib.loads(content.decode("utf-8"))
             document = _document_from_mapping(parsed)
         except (UnicodeDecodeError, _tomllib.TOMLDecodeError, ModelSettingsError, TypeError, ValueError):
+            if self._read_only:
+                return self._settle(SettingsLoadResult("corrupt"))
             preserved = self._preserve_corrupt()
             return SettingsLoadResult("corrupt", preserved_path=preserved)
-        return SettingsLoadResult("valid", document)
+        return self._settle(SettingsLoadResult("valid", document))
 
     def write(self, document: CatalogDocument) -> None:
-        """Validate and atomically replace the settings file."""
+        """Validate and atomically replace the settings file.
+
+        Read-only instances raise ``ModelSettingsError("read_only")`` before
+        any validation or filesystem access.
+        """
+        if self._read_only:
+            raise ModelSettingsError("read_only")
         _validate_document(document)
         payload = _document_to_toml(document).encode("utf-8")
         temporary: str | None = None
@@ -111,6 +134,12 @@ class ModelSettings:
                     pass
                 except OSError:
                     pass
+
+    def _settle(self, result: SettingsLoadResult) -> SettingsLoadResult:
+        """Record ``result`` as the read-only snapshot; default mode never caches."""
+        if self._read_only:
+            self._snapshot = result
+        return result
 
     def _preserve_corrupt(self) -> Path:
         """Copy corrupt bytes to a unique sibling before exposing corrupt state."""

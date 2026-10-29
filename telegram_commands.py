@@ -21,6 +21,8 @@ from telegram.ext import ContextTypes
 from sub_agent_registry import get_registry as _get_agent_registry
 
 if TYPE_CHECKING:
+    from model_registry import ModelRegistry
+    from telegram_formatter import CatalogRenderResult
     from telegram_interface import TelegramInterface
 
     assert TelegramInterface
@@ -89,6 +91,27 @@ def _fmt_signed_stat(val: object, suffix: str = "") -> str:
     return f"{html.escape(str(val) if val is not None else 'N/A')}{suffix}"
 
 
+def _registry_selection_label(iface: "TelegramInterface") -> str | None:
+    """Return the root registry's current selection as plain (unescaped) text.
+
+    Reads one ``registry.view()`` snapshot and never selects, refreshes, or
+    persists anything. Returns ``None`` when no registry is wired, so callers
+    keep their legacy ``llm_client`` label.
+    """
+    registry = getattr(iface, "model_registry", None)
+    if registry is None:
+        return None
+    from telegram_formatter import _SELECTION_STATUS_LABELS
+
+    view = registry.view()
+    if view.selection_status == "active" and view.active_model_id:
+        return view.active_model_id
+    label = _SELECTION_STATUS_LABELS.get(view.selection_status, view.selection_status)
+    if view.remembered_model_id:
+        return f"{label} ({view.remembered_model_id})"
+    return label
+
+
 @_require_auth
 async def cmd_start(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
@@ -135,14 +158,18 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     m = (uptime_secs % 3600) // 60
     s = uptime_secs % 60
 
-    if iface.llm_client:
-        active = iface.llm_client.llm_cfg
-        llm_model = f"{active.get('name', '')} / {active.get('model', 'N/A')}".lstrip("/ ")
-    else:
-        llm_model = "N/A"
+    llm_model = _registry_selection_label(iface)
+    if llm_model is None:
+        if iface.llm_client:
+            active = iface.llm_client.llm_cfg
+            llm_model = f"{active.get('name', '')} / {active.get('model', 'N/A')}".lstrip("/ ")
+        else:
+            llm_model = "N/A"
     emb_cfg = iface._config.get("embeddings", {})
     emb_model = emb_cfg.get("model", "N/A")
-    emb_key_status = "own key" if emb_cfg.get("api_key") else "using active model key (fallback)"
+    # Embeddings are configured independently of the chat selection; no
+    # credential is resolved or inferred for this display line.
+    emb_provider = emb_cfg.get("provider") or "N/A"
 
     tools_count = len(iface.tool_registry.all()) if iface.tool_registry else 0
     skills_count = iface.skill_registry.count() if iface.skill_registry else 0
@@ -254,7 +281,7 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         f"🕐 Time: <code>{now_str}</code>\n"
         f"⏱ Uptime: <code>{h}h {m}m {s}s</code>\n"
         f"🤖 LLM: <code>{html.escape(llm_model)}</code>\n"
-        f"🔍 Embeddings: <code>{html.escape(emb_model)}</code> ({html.escape(emb_key_status)})\n"
+        f"🔍 Embeddings: <code>{html.escape(emb_model)}</code> (provider: <code>{html.escape(emb_provider)}</code>)\n"
         f"🔐 Security: <code>{html.escape(iface.security_mode)}</code>\n"
         f"🎭 Mode: <code>{html.escape(mode)}</code> — <i>{html.escape(_MODE_DESCRIPTIONS.get(mode, ''))}</i>\n"
         f"👥 Authorized users: {len(iface.allowed_ids)}\n"
@@ -315,11 +342,17 @@ async def cmd_context(
         )
         return
 
-    if iface.llm_client:
+    # The snapshot carries no model ID: with a registry, label the *current*
+    # selection rather than attributing the measurements to it.
+    selection_label = _registry_selection_label(iface)
+    if selection_label is not None:
+        heading_label = f"current selection: {html.escape(selection_label)}"
+    elif iface.llm_client:
         active = iface.llm_client.llm_cfg
         model_name = f"{active.get('name', '')} / {active.get('model', 'N/A')}".lstrip("/ ")
+        heading_label = f"model: {html.escape(model_name)}"
     else:
-        model_name = "N/A"
+        heading_label = "model: N/A"
 
     live_indicator = (
         f"🔴 LIVE (turn {snapshot.turn})"
@@ -345,7 +378,7 @@ async def cmd_context(
     servers_block = "\n".join(server_lines) if server_lines else "  <i>No tool servers</i>"
 
     message = (
-        f"<b>Context Profile</b> — model: {html.escape(model_name)}\n"
+        f"<b>Context Profile</b> — {heading_label}\n"
         f"Window: {_fmt_stat(snapshot.effective_window)} tokens | {live_indicator}\n\n"
         f"<pre>{chart}</pre>\n\n"
         f"Danger: {danger_emoji} {html.escape(snapshot.danger_level)} | "
@@ -868,10 +901,48 @@ async def cmd_mode(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     )
 
 
+def _scheduler_file_notice(iface: "TelegramInterface") -> str:
+    """Return a plain-text scheduler file notice, if the scheduler exposes one."""
+    accessor = getattr(iface.scheduler, "load_notice", None)
+    notice = accessor() if callable(accessor) else None
+    return notice if isinstance(notice, str) else ""
+
+
+def _change_scheduled_job(iface: "TelegramInterface", action: str, tag: str) -> tuple[bool, str]:
+    """Remove, pause, or resume a job; return ``(ok, plain-text reason)``.
+
+    A real scheduler's class-declared core supplies the refusal or failure
+    reason ("" for an unknown tag). Lightweight collaborators keep the
+    boolean ``<action>_job`` path, with the scheduler file notice as reason.
+    """
+    core = getattr(type(iface.scheduler), "_change_job", None)
+    if callable(core):
+        ok, error, _attempted = core(iface.scheduler, action, tag)
+        return ok, error
+    ok = getattr(iface.scheduler, f"{action}_job")(tag)
+    return ok, "" if ok else _scheduler_file_notice(iface)
+
+
+def _job_change_status(tag: str, ok: bool, reason: str, done: str) -> str:
+    """Return the HTML status line for a /jobs remove/pause/resume result."""
+    safe_tag = html.escape(tag)
+    if ok:
+        return done.format(tag=safe_tag)
+    if reason:
+        return f"⚠️ {html.escape(reason)}"
+    return f"❌ Job <code>{safe_tag}</code> not found."
+
+
 async def _reply_jobs_list(iface: "TelegramInterface", message) -> None:
     """Fetch the current scheduler job list, format it, and reply in chunks."""
     jobs = iface.scheduler.list_jobs()
-    for chunk in iface._split_message(iface._format_jobs_list(jobs)):
+    text = iface._format_jobs_list(
+        jobs, redactor=getattr(iface.scheduler, "selector_redactor", None),
+    )
+    notice = _scheduler_file_notice(iface)
+    if notice:
+        text = f"⚠️ {html.escape(notice)}\n{text}"
+    for chunk in iface._split_message(text):
         await message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
@@ -969,12 +1040,22 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
     # /jobs reload — hot-reload scheduler.toml from disk
     if sub == "reload":
         result = iface.scheduler.reload()
-        await update.effective_message.reply_text(
+        if result.get("error"):
+            await update.effective_message.reply_text(
+                f"⚠️ Scheduler reload failed.\n{html.escape(result['error'])}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        text = (
             f"🔄 Scheduler reloaded.\n"
             f"  ✅ Active jobs: <b>{result['reloaded']}</b>\n"
-            f"  ❌ Failed: <b>{result['failed']}</b>",
-            parse_mode=ParseMode.HTML,
+            f"  ❌ Failed: <b>{result['failed']}</b>"
         )
+        # A reload can succeed beside a malformed legacy job file; keep its notice visible.
+        notice = _scheduler_file_notice(iface)
+        if notice:
+            text += f"\n⚠️ {html.escape(notice)}"
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
         return
 
     # /jobs remove <tag>
@@ -985,8 +1066,8 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
                 parse_mode=ParseMode.HTML,
             )
             return
-        ok = iface.scheduler.remove_job(tag)
-        status = f"🗑 Job <code>{html.escape(tag)}</code> removed." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
+        ok, reason = _change_scheduled_job(iface, "remove", tag)
+        status = _job_change_status(tag, ok, reason, "🗑 Job <code>{tag}</code> removed.")
         await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
         await _reply_jobs_list(iface, update.effective_message)
         return
@@ -999,8 +1080,8 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
                 parse_mode=ParseMode.HTML,
             )
             return
-        ok = iface.scheduler.pause_job(tag)
-        status = f"⏸ Job <code>{html.escape(tag)}</code> paused." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
+        ok, reason = _change_scheduled_job(iface, "pause", tag)
+        status = _job_change_status(tag, ok, reason, "⏸ Job <code>{tag}</code> paused.")
         await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
         await _reply_jobs_list(iface, update.effective_message)
         return
@@ -1013,8 +1094,8 @@ async def cmd_jobs(iface: "TelegramInterface", update: Update, ctx: ContextTypes
                 parse_mode=ParseMode.HTML,
             )
             return
-        ok = iface.scheduler.resume_job(tag)
-        status = f"▶️ Job <code>{html.escape(tag)}</code> resumed." if ok else f"❌ Job <code>{html.escape(tag)}</code> not found."
+        ok, reason = _change_scheduled_job(iface, "resume", tag)
+        status = _job_change_status(tag, ok, reason, "▶️ Job <code>{tag}</code> resumed.")
         await update.effective_message.reply_text(status, parse_mode=ParseMode.HTML)
         await _reply_jobs_list(iface, update.effective_message)
         return
@@ -1369,9 +1450,96 @@ async def cmd_memory(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         await update.effective_message.reply_text(text[i:i + chunk_size], parse_mode=ParseMode.HTML)
 
 
+async def _render_models_catalog(registry: "ModelRegistry") -> "CatalogRenderResult":
+    """Refresh all providers off the event loop, then render the sanitized view.
+
+    Neither failure path ever mutates catalog state or fabricates success:
+
+    - An exception escaping the registry boundary (not one of its own
+      whitelisted codes) is logged at a fixed, safe category only — no
+      exception message, type, repr, or traceback — and the last known
+      view is rendered with a visible "refresh failed unexpectedly" notice.
+    - A refresh that completed but could not persist
+      (``RefreshReport.persisted is False``) is rendered with a distinct
+      "not persisted" notice. Both cases render the registry's current,
+      unchanged `CatalogView` — never a guessed or re-derived one.
+    """
+    from telegram_formatter import render_models_catalog
+
+    refresh_failed = False
+    refresh_not_saved = False
+    try:
+        report = await asyncio.to_thread(registry.refresh)
+    except Exception:
+        refresh_failed = True
+        logger.warning("model catalog refresh raised an unexpected error; showing the last known catalog")
+    else:
+        if not report.persisted:
+            refresh_not_saved = True
+    view = registry.view()
+    return render_models_catalog(view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved)
+
+
+async def _render_models_catalog_text(registry: "ModelRegistry") -> str:
+    """Text-only convenience for callers that don't need shown-model ids."""
+    return (await _render_models_catalog(registry)).text
+
+
+def _principal_id(value: object) -> int | None:
+    """Return `value` if it is a real Telegram int id, else ``None``."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _models_catalog_keyboard(
+    iface: "TelegramInterface",
+    registry: "ModelRegistry",
+    result: "CatalogRenderResult",
+    *,
+    user_id: object,
+    chat_id: object,
+) -> InlineKeyboardMarkup:
+    """Build the `/models` keyboard: Refresh, then one opaque Select control
+    per shown model, bound to `user_id`/`chat_id`.
+
+    Fails closed: without a token cache or a valid user and chat id, only the
+    Refresh button is rendered — tokens are never minted for a shared or
+    placeholder principal.
+    """
+    from telegram_formatter import MODELS_REFRESH_CALLBACK
+
+    rows = [[InlineKeyboardButton("🔄 Refresh", callback_data=MODELS_REFRESH_CALLBACK)]]
+    token_cache = getattr(iface, "model_selection_tokens", None)
+    user = _principal_id(user_id)
+    chat = _principal_id(chat_id)
+    if token_cache is not None and user is not None and chat is not None and result.shown_model_ids:
+        view = registry.view()
+        records_by_id = {record.id: record for record in view.models}
+        for model_id in result.shown_model_ids:
+            record = records_by_id.get(model_id)
+            if record is None:
+                continue
+            callback_data = token_cache.issue(model_id, user_id=user, chat_id=chat)
+            label = f"Select: {record.display_name[:40]}"
+            rows.append([InlineKeyboardButton(label, callback_data=callback_data)])
+    return InlineKeyboardMarkup(rows)
+
+
 @_require_auth
 async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """List configured LLM models and allow switching."""
+    """Show the provider model catalog, or fall back to the legacy model list."""
+    registry = getattr(iface, "model_registry", None)
+    if registry is not None:
+        result = await _render_models_catalog(registry)
+        keyboard = _models_catalog_keyboard(
+            iface, registry, result,
+            user_id=getattr(getattr(update, "effective_user", None), "id", None),
+            chat_id=getattr(getattr(update, "effective_chat", None), "id", None),
+        )
+        await update.effective_message.reply_text(result.text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
     if not iface.llm_client or not hasattr(iface.llm_client, "list_models"):
         await update.effective_message.reply_text("Multi-model support not available.")
         return
@@ -1399,5 +1567,4 @@ async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
-
 

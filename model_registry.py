@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from dataclasses import dataclass, field, replace
@@ -25,6 +26,7 @@ MetadataField = Literal[
 MetadataSource = Literal["provider", "models.dev"]
 ProviderStatus = Literal["fresh", "stale"]
 SelectionStatus = Literal["active", "no_selection", "saved_selection_unavailable"]
+logger = logging.getLogger(__name__)
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SECRETISH = re.compile(
     r"(?i)(?:\b(?:bearer|authorization|api[_ -]?key|secret|password|token)\b\s*[:= ]|"
@@ -42,9 +44,30 @@ _SAFE_ERROR_CODES = frozenset(
         "model_not_found",
         "no_active_selection",
         "persistence_failed",
+        "selection_changed",
         "settings_load_failed",
     }
 )
+_SELECTOR_EVIDENCE_BOUND = 256
+
+
+def bounded_selector_evidence(raw: object, *, redact: Callable[[str], str] | None = None) -> str:
+    """One bounded, redacted representation of a saved selector (task 12.22).
+
+    ``inherit`` for absent, a classification label (never the contents) for
+    blank and non-string values, and a length-bounded secret-redacted string
+    for exact strings. The authoritative raw value stays in the document.
+    """
+    if raw is None:
+        return "inherit"
+    if not isinstance(raw, str):
+        return "malformed (not a string)"
+    if not raw.strip():
+        return "blank"
+    value = redact(raw) if redact is not None else raw
+    if len(value) > _SELECTOR_EVIDENCE_BOUND:
+        value = value[: _SELECTOR_EVIDENCE_BOUND - 3] + "..."
+    return value
 
 
 @dataclass(frozen=True)
@@ -167,9 +190,16 @@ class ModelRegistry:
         settings: ModelSettings,
         discovery: ModelDiscovery,
         credential_resolver: Callable[[ProviderConfig], ResolvedProviderConnection],
+        *,
+        selector_redactor: Callable[[str], str] | None = None,
     ) -> None:
-        """Load cached settings and bind injected connection/discovery services."""
+        """Load cached settings and bind injected connection/discovery services.
+
+        ``selector_redactor`` optionally redacts saved scheduled selector strings
+        before they are bounded into a scheduled-selector warning.
+        """
         self._lock = threading.RLock()
+        self._selector_redactor = selector_redactor
         self._settings = settings
         self._discovery = discovery
         self._credential_resolver = credential_resolver
@@ -311,6 +341,124 @@ class ModelRegistry:
                 raise ModelRegistryError("connection_changed")
             if self._active_model_id is None or self._active_model_id not in self._models:
                 raise ModelRegistryError("no_active_selection")
+        if not _resolved_connection_matches(provider_id, config, connection):
+            raise ModelRegistryError("credential_resolution_failed")
+        return RunModel(model, connection, catalog_revision, selection_revision)
+
+    def admit_scheduled(self, raw_selector: object = None) -> RunModel:
+        """Pin a scheduled run to its saved selector, inheriting Main otherwise.
+
+        Requires a valid active Main first. ``None`` inherits Main silently; a
+        blank, whitespace-only or non-string selector, or an exact string that
+        is not in the catalog, inherits Main with one bounded warning. A known
+        selector (fresh or stale provider) is used verbatim with no fallback.
+        Credentials are resolved once outside the lock; any connection change
+        during resolution fails with ``connection_changed`` and any Main,
+        selection or catalog-document change with ``selection_changed``.
+        """
+        warning: tuple[str, tuple[object, ...]] | None = None
+        with self._lock:
+            main_id = self._active_model_id
+            if main_id is None or main_id not in self._models:
+                raise ModelRegistryError("no_active_selection")
+            if raw_selector is None:
+                model_id = main_id
+            elif not isinstance(raw_selector, str) or not raw_selector.strip():
+                model_id = main_id
+                warning = (
+                    f"Scheduled selector {bounded_selector_evidence(raw_selector)}; inheriting Main",
+                    (),
+                )
+            elif raw_selector in self._models:
+                model_id = raw_selector
+            else:
+                model_id = main_id
+                evidence = bounded_selector_evidence(raw_selector, redact=self._selector_redactor)
+                warning = (f"Scheduled selector unknown; inheriting Main: '{evidence}'", ())
+            model = self._models[model_id]
+            provider_id = model.provider_id
+            config = self._connections.get(provider_id)
+            if config is None:
+                raise ModelRegistryError("connection_changed")
+            fingerprint = self._fingerprints[provider_id]
+            configuration_generation = self._configuration_generation[provider_id]
+            catalog_revision = self._document.revision
+            selection_revision = self._selection_revision
+            document = self._document
+
+        if warning is not None:
+            logger.warning(warning[0], *warning[1], extra={"scheduled_selector_warning": True})
+
+        try:
+            connection = self._credential_resolver(config)
+        except Exception:
+            raise ModelRegistryError("credential_resolution_failed") from None
+
+        with self._lock:
+            if (
+                provider_id not in self._connections
+                or self._fingerprints.get(provider_id) != fingerprint
+                or self._configuration_generation.get(provider_id) != configuration_generation
+                or self._models.get(model_id) != model
+            ):
+                raise ModelRegistryError("connection_changed")
+            if (
+                self._active_model_id != main_id
+                or self._selection_revision != selection_revision
+                or main_id not in self._models
+                or self._document is not document
+            ):
+                raise ModelRegistryError("selection_changed")
+        if not _resolved_connection_matches(provider_id, config, connection):
+            raise ModelRegistryError("credential_resolution_failed")
+        return RunModel(model, connection, catalog_revision, selection_revision)
+
+    def resolve_graph_model(self, selector: str) -> RunModel:
+        """Pin one exact catalog record for graph work, independent of Main.
+
+        ``selector`` must be a ``str`` (otherwise ``invalid_request``) and is
+        looked up verbatim: no trimming, case folding, aliasing, defaulting or
+        Main inheritance; any string that is not an exact canonical id fails
+        with ``model_not_found``. Main's active, remembered or missing selection
+        is neither required nor consulted. Credentials are resolved once
+        outside the lock; a resolver failure or a connection that does not
+        match the configured route fails with ``credential_resolution_failed``.
+        Only the target is rechecked afterwards: removal or reconfiguration of
+        its provider (including an ABA restore) or a change or removal of its
+        record fails with ``connection_changed``; unrelated Main selection,
+        catalog refresh or other-provider changes do not. The returned pin
+        carries the catalog and selection revisions current at that final
+        recheck as read-only provenance. This method is read-only: it never
+        selects, restores, refreshes, persists or changes revisions.
+        """
+        if not isinstance(selector, str):
+            raise ModelRegistryError("invalid_request")
+        with self._lock:
+            model = self._models.get(selector)
+            if model is None:
+                raise ModelRegistryError("model_not_found")
+            provider_id = model.provider_id
+            config = self._connections.get(provider_id)
+            if config is None:
+                raise ModelRegistryError("connection_changed")
+            fingerprint = self._fingerprints[provider_id]
+            configuration_generation = self._configuration_generation[provider_id]
+
+        try:
+            connection = self._credential_resolver(config)
+        except Exception:
+            raise ModelRegistryError("credential_resolution_failed") from None
+
+        with self._lock:
+            if (
+                provider_id not in self._connections
+                or self._fingerprints.get(provider_id) != fingerprint
+                or self._configuration_generation.get(provider_id) != configuration_generation
+                or self._models.get(selector) != model
+            ):
+                raise ModelRegistryError("connection_changed")
+            catalog_revision = self._document.revision
+            selection_revision = self._selection_revision
         if not _resolved_connection_matches(provider_id, config, connection):
             raise ModelRegistryError("credential_resolution_failed")
         return RunModel(model, connection, catalog_revision, selection_revision)

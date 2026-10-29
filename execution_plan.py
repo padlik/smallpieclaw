@@ -25,7 +25,7 @@ from typing import Any, Callable, Generator, Optional
 from error_registry import ErrorTypeRegistry
 from agent_runtime import RuntimeProfile
 from exceptions import AgentError
-from outcome_utils import fail_outcome
+from outcome_utils import fail_outcome, read_execution, strip_execution, with_execution
 from react_loop import ReactContext, parse_json
 from sub_agent_registry import (
     SOURCE_DIAGNOSTIC,
@@ -204,7 +204,9 @@ def substitute_results(step: PlanStep, results: dict[str, dict]) -> PlanStep:
             def _replace(match: re.Match) -> str:
                 step_id = match.group(1)
                 if step_id in results:
-                    return json.dumps(results[step_id], ensure_ascii=False)
+                    return json.dumps(
+                        strip_execution(results[step_id]), ensure_ascii=False,
+                    )
                 return match.group(0)
             return _PLACEHOLDER_RE.sub(_replace, value)
         if isinstance(value, dict):
@@ -290,6 +292,42 @@ def _standardize_sub_agent_result(result: str, response_format: str) -> dict:
     }
 
 
+_VETO_PRIORITY = ("cancelled", "deferred", "refused")
+
+
+def _step_disposition(trace_dispositions: list[str]) -> str:
+    """Return a step's disposition from its final attempt's local tool traces.
+
+    Every final trace of the attempt counts: cancelled > deferred > refused >
+    executed. Unknown or invalid values never erase execution, and an attempt
+    with no valid trace earns no credit.
+    """
+    for disposition in (*_VETO_PRIORITY, "executed"):
+        if disposition in trace_dispositions:
+            return disposition
+    return "unknown"
+
+
+def _plan_disposition(
+    plan: ExecutionPlan, results: dict[str, dict], cancel_event: threading.Event,
+) -> str:
+    """Derive the plan's execution disposition from locally stamped step results.
+
+    A set cancellation event (parent cancel, timeout or cancelled backoff)
+    yields cancelled regardless of earlier execution evidence. Otherwise a
+    cancelled, deferred or refused step vetoes the aggregate; otherwise one
+    executed step earns credit regardless of plan success. Skipped,
+    diagnostic-only and unstamped steps earn nothing.
+    """
+    if cancel_event.is_set():
+        return "cancelled"
+    readings = [read_execution(results.get(step.id, {})) for step in plan.steps]
+    for veto in _VETO_PRIORITY:
+        if veto in readings:
+            return veto
+    return "executed" if "executed" in readings else "unknown"
+
+
 def _format_plan_result_message(plan: ExecutionPlan, result: dict) -> str:
     """Build a concise user message summarising a plan execution result."""
     success = result.get("success", False)
@@ -371,6 +409,16 @@ def _parent_cancel_bridge(
             bridge_thread.join(timeout=0.5)
 
 
+def _attempt_observer(sink: Optional[list[str]]) -> Callable[[Any], None]:
+    """Return a trace observer recording only the local disposition of each tool call."""
+
+    def _observe(trace: Any) -> None:
+        if sink is not None:
+            sink.append(getattr(trace, "execution_disposition", "unknown"))
+
+    return _observe
+
+
 class PlanExecutor:
     """Execute an :class:`ExecutionPlan` by running each step in a sub-agent.
 
@@ -411,6 +459,7 @@ class PlanExecutor:
         ctx: ReactContext,
         cancel_event: threading.Event,
         factory: Callable,
+        attempt_dispositions: Optional[list[str]] = None,
     ) -> tuple[Optional[Any], Optional[dict]]:
         """Create a sub-agent runner for *step*.
 
@@ -437,6 +486,7 @@ class PlanExecutor:
                 context_payload=payload,
                 prompt_variant="sub-agent",
                 runtime_profile=RuntimeProfile.PLAN_STEP_AGENT,
+                on_tool_trace=_attempt_observer(attempt_dispositions),
             )
             return runner, None
         except Exception as exc:  # noqa: BLE001
@@ -552,8 +602,9 @@ class PlanExecutor:
         while True:
             if cancel_event.is_set():
                 return self._skip_step(step, "cancelled before execution")
+            attempt_dispositions: list[str] = []
             runner, creation_error = self._create_runner(
-                step, ctx, cancel_event, factory,
+                step, ctx, cancel_event, factory, attempt_dispositions,
             )
             if runner is None:
                 err = creation_error.get("error", "Sub-agent creation failed.") if creation_error else "Sub-agent creation failed."
@@ -588,7 +639,12 @@ class PlanExecutor:
                 result_type=response_format,
             )
             try:
-                outcome = self._execute_runner(runner, task, response_format)
+                outcome = strip_execution(
+                    self._execute_runner(runner, task, response_format)
+                )
+                attempt_disposition = _step_disposition(attempt_dispositions)
+                if attempt_disposition != "unknown":
+                    outcome = with_execution(outcome, attempt_disposition)  # type: ignore[arg-type]
             finally:
                 with self._active_lock:
                     self._active_runners.pop(step.id, None)
@@ -842,12 +898,16 @@ class PlanExecutor:
             and all(r.get("success", False) for r in results.values())
             and len(results) == len(plan.steps)
         )
-        return {
+        summary = {
             "success": success,
             "results": results,
             "errors": errors,
             "elapsed_seconds": round(time.monotonic() - start, 1),
         }
+        disposition = _plan_disposition(plan, results, cancel_event)
+        for sid in list(results):
+            results[sid] = strip_execution(results[sid])
+        return summary if disposition == "unknown" else with_execution(summary, disposition)  # type: ignore[arg-type]
 
     def _process_batches(
         self,
@@ -1051,6 +1111,12 @@ class PlanExecutor:
                 plan.timeout,
                 cancelled_by_parent,
             )
+
+        # Sample the parent event synchronously so a cancel that landed inside the
+        # bridge's polling interval still reaches the plan event and flag.
+        if parent_cancel is not None and parent_cancel.is_set():
+            cancel_event.set()
+            cancelled_by_parent[0] = True
 
         result = self._build_summary(
             plan, results, errors, cancel_event, start, cancelled_by_parent[0]

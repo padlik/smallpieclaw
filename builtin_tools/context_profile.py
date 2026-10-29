@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
+from outcome_utils import with_execution
+
 if TYPE_CHECKING:
     from context_monitor import ContextMonitor
 
@@ -21,11 +23,11 @@ def exec_context_profile(context_monitor: Optional["ContextMonitor"]) -> "dict[s
     response contract (``success``, token counts, headroom, danger level, etc.).
     """
     if context_monitor is None:
-        return {"success": False, "error": "Context monitor not available"}
+        return with_execution({"success": False, "error": "Context monitor not available"}, "refused")
     snapshot = context_monitor.read()
     if snapshot is None:
-        return {"success": False, "error": "No context snapshot available yet"}
-    return {
+        return with_execution({"success": False, "error": "No context snapshot available yet"}, "refused")
+    return with_execution({
         "success": True,
         "danger_level": snapshot.danger_level,
         "total_tokens": snapshot.system_prompt_tokens + snapshot.chat_history_tokens + snapshot.tool_defs_tokens,
@@ -40,4 +42,4 @@ def exec_context_profile(context_monitor: Optional["ContextMonitor"]) -> "dict[s
         "headroom_real": snapshot.headroom_real,
         "is_live": snapshot.is_live,
         "turn": snapshot.turn,
-    }
+    }, "executed")

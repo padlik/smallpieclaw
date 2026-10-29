@@ -65,6 +65,7 @@ class TestExecScheduleShow:
 
     def test_show_returns_full_metadata(self) -> None:
         scheduler = MagicMock()
+        scheduler.selector_redactor = None
         scheduler.show_job.return_value = {
             "tag": "report",
             "task": "do work",

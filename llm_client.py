@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable, Iterator, TypeVar
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 import ollama as _ollama_lib
@@ -227,7 +227,7 @@ class LLMClient:
         connection = run_model.connection
         timeout = float(connection.request_timeout)
         self._timeout = timeout
-        self._endpoint = connection.base_url.rstrip("/") or _DEFAULT_ENDPOINTS[connection.adapter]
+        self._endpoint = connection.base_url or _DEFAULT_ENDPOINTS[connection.adapter]
         self._api_key = connection.api_key
         self._ollama_client: _ollama_lib.Client | None = None
         if connection.adapter == "ollama":
@@ -712,7 +712,8 @@ class LLMClient:
         url = self._route(mode)
         headers = {"Content-Type": "application/json"}
         if adapter in {"openai", "openrouter"}:
-            headers["Authorization"] = f"Bearer {self._api_key}"
+            if self._api_key:
+                headers["Authorization"] = f"Bearer {self._api_key}"
         elif adapter == "anthropic":
             headers.update({"x-api-key": self._api_key, "anthropic-version": "2023-06-01"})
         elif adapter == "google":
@@ -749,7 +750,8 @@ class LLMClient:
                 )
         else:
             raise LLMPermanentError("Ollama route is provided by its SDK")
-        return f"{self._endpoint.rstrip('/')}{path}"
+        parts = urlsplit(self._endpoint)
+        return urlunsplit(parts._replace(path=f"{parts.path.rstrip('/')}{path}"))
 
     def _estimate_wire_input(
         self, request: httpx.Request, definition_revision: str | int | None

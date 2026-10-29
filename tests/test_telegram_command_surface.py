@@ -9,11 +9,13 @@ Spec assertions:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import sys
 import os
 import threading
 from collections import deque
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -68,6 +70,7 @@ def _make_iface():
     iface._notice_gate = asyncio.Lock()
     iface._active_turns = 0
     iface._flush_tasks = set()
+    iface.model_registry = None  # optional provider-model-catalog injection (task 8.1)
     return iface
 
 
@@ -171,6 +174,17 @@ class TestBotCommandDiscovery:
         assert "status" in commands, (
             "/status must remain in BotCommand registration"
         )
+
+    def test_models_is_the_only_catalog_command(self):
+        """Task 8.1: catalog features extend /models; no second command is added."""
+        iface = _make_iface()
+        bot_commands = _collect_bot_commands(iface)
+        handler_commands = _collect_handler_command_names(iface)
+        assert bot_commands.count("models") == 1
+        assert handler_commands.count("models") == 1
+        catalog_ish = {"catalog", "modelscatalog", "models_catalog", "modellist", "providers"}
+        assert not (catalog_ish & set(bot_commands))
+        assert not (catalog_ish & set(handler_commands))
 
 
 # ---------------------------------------------------------------------------
@@ -1428,3 +1442,327 @@ class TestJobsHelpDiscovery:
     @pytest.mark.parametrize("hint", ["/jobs reload", "/jobs remove", "/jobs pause", "/jobs resume"])
     def test_jobs_usage_keeps_existing_management_hints(self, tmp_path, hint):
         assert hint in _reply_text(_run_jobs(_jobs_iface(tmp_path, []), []))
+
+
+# ---------------------------------------------------------------------------
+# Registry-backed /status and /context (no standing llm_client)
+# ---------------------------------------------------------------------------
+#
+# A real ModelRegistry/ModelSettings with the FakeDiscovery boundary from
+# tests/test_telegram_models.py supplies the current selection. The legacy
+# client below stands in for a stale pre-registry ``iface.llm_client``.
+
+_SEL_ACTIVE_ID = "p/alpha"
+_SEL_GONE_ID = "p/gone"
+_SEL_STATES = ("active", "no_selection", "saved_selection_unavailable")
+#: Fragments that must name the current selection state, per registry state.
+_SEL_EXPECTED = {
+    "active": (_SEL_ACTIVE_ID,),
+    "no_selection": ("no selection",),
+    "saved_selection_unavailable": ("saved selection unavailable", _SEL_GONE_ID),
+}
+
+
+class _LegacyClient:
+    """Stale legacy chat client: the pre-registry ``llm_cfg`` surface only."""
+
+    llm_cfg = {"name": "legacy", "model": "legacy-model"}
+
+    @staticmethod
+    def get_today_usage() -> dict[str, int]:
+        """Return zero usage, as the legacy client reports it."""
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+class _MonitoredAgent:
+    """Agent stand-in exposing only the shared ``context_monitor``."""
+
+    def __init__(self, monitor: Any) -> None:
+        """Bind the monitor read by ``/context``."""
+        self.context_monitor = monitor
+
+
+def _selection_registry(tmp_path: Path, state: str):
+    """Return ``(registry, settings_path)`` restored into *state* after a real refresh."""
+    from model_registry import CatalogDocument, ProviderState
+
+    from tests.test_telegram_models import _inventory, _make_registry, _model, _provider_config
+
+    provider = _provider_config("p")
+    alpha = _model("alpha", "p", context_tokens=1000)
+    gone = _model("gone", "p", context_tokens=1000)
+    default = {"active": _SEL_ACTIVE_ID, "no_selection": None,
+               "saved_selection_unavailable": _SEL_GONE_ID}[state]
+    seed = CatalogDocument(
+        1, 1, default,
+        (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+        (alpha, gone),
+        (),
+    )
+    registry, _settings, discovery = _make_registry(tmp_path, (provider,), seed_document=seed)
+    discovery.responses["p"] = _inventory("p", (alpha,))  # the refresh drops p/gone
+    registry.refresh()
+    registry.restore_selection()
+    assert registry.view().selection_status == state
+    return registry, tmp_path / "models-config.toml"
+
+
+def _run_registry_command(handler, iface) -> str:
+    """Run an authorized command handler and return every reply text."""
+    sent: list[str] = []
+
+    async def _run():
+        message = MagicMock()
+        message.reply_text = AsyncMock(side_effect=lambda text, **kw: sent.append(text))
+        update = MagicMock()
+        update.effective_user.id = 42
+        update.effective_message = message
+        await handler(iface, update, MagicMock())
+
+    asyncio.run(_run())
+    return "\n".join(sent)
+
+
+def _line_with(text: str, marker: str) -> str:
+    """Return the single reply line containing *marker*."""
+    lines = [line for line in text.splitlines() if marker in line]
+    assert len(lines) == 1, f"expected one {marker!r} line, got {lines!r}"
+    return lines[0]
+
+
+def _published_monitor():
+    """Return a real ContextMonitor holding one idle snapshot (no model field)."""
+    from context_monitor import ContextMonitor, ContextSnapshot
+
+    monitor = ContextMonitor()
+    monitor.publish(ContextSnapshot(
+        system_prompt_tokens=1_000, chat_history_tokens=2_000, tool_defs_tokens=500,
+        tool_defs_by_server={"builtin": 500}, completion_reserve=4_096,
+        effective_window=100_000, compaction_threshold=85_000,
+        headroom_nominal=92_404, headroom_real=7_404,
+        danger_level="safe", is_live=False, turn=3,
+    ))
+    return monitor
+
+
+class TestRegistryBackedStatus:
+    """/status shows the registry's current selection, never a stale client."""
+
+    @pytest.mark.parametrize("state", _SEL_STATES)
+    @pytest.mark.parametrize("standing_client", [False, True], ids=["no_standing_client", "stale_client"])
+    def test_status_shows_registry_selection_without_standing_client(self, tmp_path, state, standing_client):
+        from telegram_commands import cmd_status
+
+        registry, settings_path = _selection_registry(tmp_path, state)
+        before = settings_path.read_bytes()
+        iface = _make_iface()
+        iface.model_registry = registry
+        iface.llm_client = _LegacyClient() if standing_client else None
+
+        text = _run_registry_command(cmd_status, iface)
+
+        llm_line = _line_with(text, "LLM")
+        for fragment in _SEL_EXPECTED[state]:
+            assert fragment in llm_line, (state, llm_line)
+        assert "legacy-model" not in text
+        if state != "active":
+            assert _SEL_ACTIVE_ID not in llm_line
+        # Presentation never selects a model or rewrites the saved selection.
+        assert registry.view().selection_status == state
+        assert settings_path.read_bytes() == before
+
+    def test_status_without_registry_keeps_legacy_client_label(self):
+        from telegram_commands import cmd_status
+
+        iface = _make_iface()
+        iface.llm_client = _LegacyClient()
+
+        text = _run_registry_command(cmd_status, iface)
+
+        assert "legacy / legacy-model" in _line_with(text, "LLM")
+
+    @pytest.mark.parametrize(
+        ("embeddings", "provider"),
+        [
+            ({"provider": "openai", "model": "embed-small"}, "openai"),
+            ({"provider": "acme", "model": "embed-small"}, "acme"),
+            ({"provider": "openai", "model": "embed-small",
+              "api_key": "sk-inline-embed-secret-987654"}, "openai"),
+        ],
+        ids=["adapter_without_inline_key", "named_provider_connection", "inline_key"],
+    )
+    def test_status_embeddings_line_is_independent_of_active_model(
+        self, tmp_path, embeddings, provider,
+    ):
+        from telegram_commands import cmd_status
+
+        registry, _ = _selection_registry(tmp_path, "active")
+        iface = _make_iface()
+        iface.model_registry = registry
+        iface._config["providers"] = {
+            "acme": {"type": "anthropic", "api_key": "env:ACME_EMBED_KEY"},
+        }
+        iface._config["embeddings"] = embeddings
+
+        text = _run_registry_command(cmd_status, iface)
+
+        line = _line_with(text, "Embeddings")
+        assert "embed-small" in line and provider in line
+        assert "active model key" not in text and "fallback" not in line.lower()
+        # A missing inline key alone is not proof that credentials are unavailable.
+        assert "unavailable" not in line.lower()
+        assert "sk-inline-embed-secret-987654" not in text
+        assert "ACME_EMBED_KEY" not in text
+
+
+class TestRegistryBackedContext:
+    """/context labels the current selection without attributing the snapshot to it."""
+
+    _LAYOUT = (
+        "<b>Context Profile</b>", "Window: 100,000 tokens", "⚪ idle (last run turn 3)",
+        "<pre>", "System prompt", "Chat history", "Tool defs", "Completion reserve",
+        "Danger: 🟢 safe", "Headroom: 7,404 tokens", "<b>Tool defs by server:</b>", "builtin: 500",
+    )
+
+    @pytest.mark.parametrize("state", _SEL_STATES)
+    @pytest.mark.parametrize("standing_client", [False, True], ids=["no_standing_client", "stale_client"])
+    def test_context_labels_current_registry_selection(self, tmp_path, state, standing_client):
+        from telegram_commands import cmd_context
+
+        registry, settings_path = _selection_registry(tmp_path, state)
+        before = settings_path.read_bytes()
+        iface = _make_iface()
+        iface.model_registry = registry
+        iface.llm_client = _LegacyClient() if standing_client else None
+        iface.agent = _MonitoredAgent(_published_monitor())
+
+        text = _run_registry_command(cmd_context, iface)
+
+        header = text.splitlines()[0]
+        for fragment in _SEL_EXPECTED[state]:
+            assert fragment in header, (state, header)
+        assert "selection" in header.lower(), "label the current selection, not the snapshot's model"
+        assert f"model: {_SEL_ACTIVE_ID}" not in text
+        assert "legacy-model" not in text
+        for fragment in self._LAYOUT:
+            assert fragment in text, fragment
+        assert registry.view().selection_status == state
+        assert settings_path.read_bytes() == before
+
+    def test_context_without_registry_keeps_legacy_client_label(self):
+        from telegram_commands import cmd_context
+
+        iface = _make_iface()
+        iface.llm_client = _LegacyClient()
+        iface.agent = _MonitoredAgent(_published_monitor())
+
+        text = _run_registry_command(cmd_context, iface)
+
+        assert "model: legacy / legacy-model" in text.splitlines()[0]
+        for fragment in self._LAYOUT:
+            assert fragment in text, fragment
+
+
+# ---------------------------------------------------------------------------
+# Ordinary-request error presentation
+# ---------------------------------------------------------------------------
+
+
+class _InlineExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Default-executor stand-in that runs work inline: no worker thread starts."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        """Run *fn* now and return its completed future."""
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 — delivered through the future
+            future.set_exception(exc)
+        return future
+
+
+def _run_on_inline_loop(coro):
+    """Run *coro* on a fresh loop whose executor is inline (closed without threads)."""
+    loop = asyncio.new_event_loop()
+    loop.set_default_executor(_InlineExecutor())
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _ordinary_turn(tmp_path: Path, handler) -> tuple[list[str], str]:
+    """Drive one real ordinary turn; return status-message edits and prompt status."""
+    from prompt_registry import PromptRegistry
+
+    iface = _make_iface()
+    iface._pending_resume = {}
+    iface._prompt_registry = PromptRegistry(str(tmp_path / "prompts"))
+    iface.agent_handler = handler
+    status = MagicMock()
+    status.edit_text = AsyncMock()
+    message = MagicMock()
+    message.reply_text = AsyncMock(return_value=status)
+    update = MagicMock()
+    update.effective_user.id = 42
+    update.effective_chat.id = 42
+    update.effective_message = message
+    ctx = MagicMock()
+    ctx.bot.send_chat_action = AsyncMock()
+
+    _run_on_inline_loop(iface._run_agent_task_locked(update, ctx, "do work", None, 42))
+
+    edits = [call.args[0] for call in status.edit_text.await_args_list]
+    (record,) = iface._prompt_registry.list_recent(5)
+    return edits, record.status
+
+
+class TestOrdinaryRequestErrorPresentation:
+    """no_active_selection gets /models guidance; every other error is unchanged."""
+
+    @pytest.mark.parametrize("state", ["no_selection", "saved_selection_unavailable"])
+    def test_no_active_selection_offers_models_selection_and_finalizes_failed(self, tmp_path, state):
+        from model_registry import ModelRegistryError
+
+        registry, settings_path = _selection_registry(tmp_path, state)
+        before = settings_path.read_bytes()
+        raised: list[BaseException] = []
+
+        def handler(*_args, **_kwargs):
+            """Ordinary admission against the real registry (raises no_active_selection)."""
+            try:
+                return registry.admit()
+            except ModelRegistryError as exc:
+                raised.append(exc)
+                raise
+
+        edits, prompt_status = _ordinary_turn(tmp_path, handler)
+
+        assert [getattr(exc, "code", None) for exc in raised] == ["no_active_selection"]
+        final = edits[-1]
+        assert "/models" in final, final
+        assert "select" in final.lower(), final
+        assert prompt_status == "failed"
+        # Guidance only: no automatic substitution or saved-selection change.
+        assert registry.view().active_model_id is None
+        assert settings_path.read_bytes() == before
+
+    @pytest.mark.parametrize("kind", ["unrelated_runtime_error", "other_registry_error"])
+    def test_other_errors_keep_existing_presentation(self, tmp_path, kind):
+        import telegram_interface
+        from model_registry import ModelRegistryError
+
+        error: Exception = (
+            RuntimeError("disk boom") if kind == "unrelated_runtime_error"
+            else ModelRegistryError("credential_resolution_failed")
+        )
+
+        def handler(*_args, **_kwargs):
+            """Fail the ordinary request with a non-selection error."""
+            raise error
+
+        edits, prompt_status = _ordinary_turn(tmp_path, handler)
+
+        assert edits[-1] == telegram_interface._md_to_html(f"❌ Error: {error}")[:4096]
+        assert "/models" not in edits[-1]
+        assert prompt_status == "failed"

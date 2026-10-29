@@ -3,6 +3,7 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -350,3 +351,172 @@ def test_invalid_write_never_touches_existing_file(tmp_path: Path) -> None:
         ModelSettings(path).write(CatalogDocument(1, -1, None, (), (), ()))
 
     assert path.read_text(encoding="utf-8") == "keep = true\n"
+
+
+# ---------------------------------------------------------------------------
+# Read-only mode (task 12.17): saved-catalog consumers never repair or write
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_LEAK = "sk-readonlyleak12345"
+
+
+def _tree(root: Path) -> dict[str, bytes | None]:
+    """Snapshot every entry below ``root`` with file bytes, without Path.read_bytes."""
+    snapshot: dict[str, bytes | None] = {}
+    for entry in sorted(root.rglob("*")):
+        if entry.is_file():
+            with entry.open("rb") as stream:
+                snapshot[entry.relative_to(root).as_posix()] = stream.read()
+        else:
+            snapshot[entry.relative_to(root).as_posix()] = None
+    return snapshot
+
+
+def _refuse(name: str) -> Callable[..., None]:
+    """Return a callable that fails the test if a forbidden write primitive runs."""
+    def refused(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError(f"read-only settings must not call {name}")
+    return refused
+
+
+class TestReadOnlyModelSettings:
+    """``ModelSettings(path, read_only=True)`` reads one snapshot and never writes."""
+
+    def test_valid_settings_decode_without_filesystem_changes(self, tmp_path: Path) -> None:
+        """A valid file yields its decoded document and leaves the directory untouched."""
+        path = tmp_path / "models.toml"
+        ModelSettings(path).write(sample_document())
+        before = _tree(tmp_path)
+
+        result = ModelSettings(path, read_only=True).load()
+
+        assert result.status == "valid"
+        assert result.document == sample_document()
+        assert result.preserved_path is None
+        assert _tree(tmp_path) == before
+        with pytest.raises(TypeError):
+            ModelSettings(path, True)  # type: ignore[misc]
+
+    @pytest.mark.parametrize("parent_exists", [True, False], ids=["file-missing", "parent-missing"])
+    def test_missing_settings_create_nothing(self, tmp_path: Path, parent_exists: bool) -> None:
+        """Missing settings return no document and create neither file nor parent."""
+        parent = tmp_path if parent_exists else tmp_path / "absent"
+        path = parent / "models.toml"
+
+        result = ModelSettings(path, read_only=True).load()
+
+        assert (result.status, result.document, result.preserved_path) == ("missing", None, None)
+        assert _tree(tmp_path) == {}
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            f"schema_version = 1\nrevision = [\n# {_READ_ONLY_LEAK}\n".encode(),
+            f'schema_version = 2\nrevision = 1\nnote = "{_READ_ONLY_LEAK}"\n'.encode(),
+            b"\xff\xfe not utf-8",
+        ],
+        ids=["toml-syntax", "invalid-schema", "invalid-utf8"],
+    )
+    def test_corrupt_settings_are_reported_without_backup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+    ) -> None:
+        """Corrupt bytes stay in place with no sibling backup; default mode still preserves."""
+        path = tmp_path / "models.toml"
+        path.write_bytes(content)
+        with monkeypatch.context() as patched:
+            patched.setattr(model_settings.shutil, "copy2", _refuse("shutil.copy2"))
+            result = ModelSettings(path, read_only=True).load()
+
+        assert (result.status, result.document, result.preserved_path) == ("corrupt", None, None)
+        assert _tree(tmp_path) == {"models.toml": content}
+        assert _READ_ONLY_LEAK not in repr(result)
+
+        default = ModelSettings(path).load()
+        assert default.status == "corrupt"
+        assert default.preserved_path is not None
+        assert default.preserved_path.read_bytes() == content
+
+    def test_first_read_is_one_stable_snapshot_and_new_instances_reread(self, tmp_path: Path) -> None:
+        """Repeated read-only loads reuse the first snapshot; defaults and new instances reread."""
+        path = tmp_path / "models.toml"
+        original = sample_document()
+        replacement = replace(original, revision=original.revision + 1, default_model=None)
+        writer = ModelSettings(path)
+        writer.write(original)
+        reader = ModelSettings(path, read_only=True)
+        default_reader = ModelSettings(path)
+        assert reader.load().document == original
+        assert default_reader.load().document == original
+
+        writer.write(replacement)
+
+        assert reader.load().document == original
+        assert default_reader.load().document == replacement
+        assert ModelSettings(path, read_only=True).load().document == replacement
+
+    def test_missing_snapshot_stays_missing_after_external_creation(self, tmp_path: Path) -> None:
+        """A first missing result is the instance's snapshot even if the file appears later."""
+        path = tmp_path / "models.toml"
+        reader = ModelSettings(path, read_only=True)
+        assert reader.load().status == "missing"
+
+        ModelSettings(path).write(sample_document())
+
+        assert reader.load().status == "missing"
+        assert ModelSettings(path, read_only=True).load().document == sample_document()
+
+    @pytest.mark.parametrize(
+        ("existing", "parent_exists", "document"),
+        [
+            pytest.param(True, True, sample_document(), id="existing-valid-document"),
+            pytest.param(False, False, sample_document(), id="missing-parent"),
+            pytest.param(True, True, CatalogDocument(1, -1, None, (), (), ()), id="invalid-document"),
+        ],
+    )
+    def test_write_is_refused_before_any_validation_or_filesystem_effect(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        existing: bool,
+        parent_exists: bool,
+        document: CatalogDocument,
+    ) -> None:
+        """Read-only write raises ``read_only`` first and touches no file, temp or parent."""
+        path = (tmp_path if parent_exists else tmp_path / "absent") / "models.toml"
+        if existing:
+            ModelSettings(path).write(replace(sample_document(), revision=9))
+        before = _tree(tmp_path)
+        settings = ModelSettings(path, read_only=True)
+        with monkeypatch.context() as patched:
+            patched.setattr(model_settings.tempfile, "mkstemp", _refuse("tempfile.mkstemp"))
+            patched.setattr(model_settings.shutil, "copy2", _refuse("shutil.copy2"))
+            with pytest.raises(ModelSettingsError) as error:
+                settings.write(document)
+
+        assert error.value.code == "read_only"
+        assert _tree(tmp_path) == before
+        expected = "valid" if existing else "missing"
+        assert settings.load().status == expected
+
+    def test_read_failure_is_safe_and_performs_no_writes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OS read error becomes ``read_failed`` with no raw detail and no filesystem change."""
+        path = tmp_path / "models.toml"
+        ModelSettings(path).write(sample_document())
+        before = _tree(tmp_path)
+        real_read_bytes = Path.read_bytes
+
+        def denied(self: Path) -> bytes:
+            if self == path:
+                raise PermissionError(13, f"Permission denied {_READ_ONLY_LEAK}")
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", denied)
+        with pytest.raises(ModelSettingsError) as error:
+            ModelSettings(path, read_only=True).load()
+
+        assert error.value.code == "read_failed"
+        assert _READ_ONLY_LEAK not in str(error.value)
+        assert error.value.__cause__ is None
+        assert _tree(tmp_path) == before

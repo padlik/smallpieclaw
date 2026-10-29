@@ -20,7 +20,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace as dataclass_replace
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
 
@@ -45,7 +45,12 @@ from llm_client import LLMClient, LLMCancelledError, LLMContextOverflowError, LL
 from model_request_budget import ModelRequestBudget
 from model_selection_guard import GUARD_PREPARATION_FAILED_MESSAGE, GUARD_REJECTION_MESSAGE
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
-from outcome_utils import fail_outcome
+from outcome_utils import (
+    consume_execution,
+    effective_execution,
+    fail_outcome,
+    with_execution,
+)
 from prompt_loader import build_system_prompt as _build_system_prompt
 from trace_context import new_trace_id
 
@@ -65,6 +70,9 @@ from tool_formatting import (  # noqa: F401
     fmt_tool_result_progress,
 )
 from native_turns import _append_native_tool_result, _linearize_native_turns
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from model_registry import CatalogView
 
 logger = logging.getLogger(__name__)
 slog = agent_logging.get_logger(__name__)
@@ -143,7 +151,7 @@ def _handle_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -
         server_name = ctx.mcp_manager.server_name_for_tool(tool_name)  # type: ignore[attr-defined]
         ctx.mcp_manager.mark_needs_auth(server_name)  # type: ignore[attr-defined]
     display_name = server_name or "unknown"
-    return {
+    translated = {
         "success": False,
         "output": "",
         "error": (
@@ -152,6 +160,8 @@ def _handle_mcp_auth_failure(ctx: ReactContext, tool_name: str, outcome: dict) -
         ),
         "exit_code": -1,
     }
+    prior = effective_execution(outcome)
+    return translated if prior == "unknown" else with_execution(translated, prior)
 
 
 def _format_parent_context(ctx: ReactContext) -> str:
@@ -210,6 +220,7 @@ class ToolTrace:
     duration_ms: float
     error: str = ""     # only populated when success=False
     timestamp: float = field(default_factory=time.time)
+    execution_disposition: str = "unknown"  # local proof of execution; never serialized
 
 
 @dataclass
@@ -337,6 +348,13 @@ class ReactContext:
     on_accepted: Optional[Callable[[], None]] = None
     activated: bool = True
 
+    # Presentation-only sanitized catalog view (never the authoritative run
+    # pin). A replacement applies at the next prompt/definition build.
+    model_catalog_view: CatalogView | None = None
+    # View captured when _tool_defs was last built; a differing current view
+    # invalidates the cached definitions and their token grouping.
+    _tool_defs_view: CatalogView | None = None
+
     @property
     def log_prefix(self) -> str:
         if self.trace_id:
@@ -441,11 +459,11 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     path = str(args.get("path", "")).strip()
     question = args.get("question", "What is in this image?")
     if not path:
-        return {
+        return with_execution({
             "success": False, "output": "",
             "error": "vision_query: 'path' argument is required.",
             "_guard_refusal": True,
-        }
+        }, "refused")
 
     # ADR-0026 path-policy gate: vision_query reads a file, so apply the same
     # tier classification as file_read. This gate was ported from the legacy
@@ -454,34 +472,34 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     real_path = os.path.realpath(os.path.expanduser(path))
     builtin = ctx.builtin_executor
     if builtin is None:
-        return {
+        return with_execution({
             "success": False, "output": "",
             "error": "vision_query: confirmation infrastructure not available.",
             "_guard_refusal": True,
-        }
+        }, "refused")
 
     policy = getattr(builtin, "path_policy", None)
     if policy is None:
         logger.error("PathPolicy not wired — refusing vision_query")
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": "vision_query: path policy not configured — refusing file operation",
             "error_type": "prohibited_path",
             "recoverable": False,
             "suggestion": "Restart the agent with a valid configuration so the path policy is initialised.",
-        }
+        }, "refused")
 
     verdict, mode_or_reason = policy.classify(real_path, "read")
     if verdict == PathVerdict.PROHIBITED:
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": f"vision_query: permission denied: prohibited path ({mode_or_reason})",
             "error_type": "prohibited_path",
             "recoverable": False,
             "suggestion": "Use an allowed directory for image files.",
-        }
+        }, "refused")
 
     if verdict == PathVerdict.UNRECOGNISED and getattr(builtin, "scheduled", False) is True:
         # Scheduled dispatch (ScheduledToolDispatch) never borrows grants or
@@ -523,19 +541,19 @@ def _exec_vision_query(ctx: ReactContext, args: dict) -> dict:
     encoded = _encode_images([path])
 
     if not encoded:
-        return {
+        return with_execution({
             "success": False, "output": "",
             "error": f"vision_query: could not read or encode image at '{path}'. "
                      "Check that the path is correct and the file exists.",
-        }
+        }, "executed")
     messages = [{"role": "user", "content": question, "images": [path]}]
     try:
         answer = ctx.llm.chat(messages, system=None)
     except LLMCancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
-        return {"success": False, "output": "", "error": f"vision_query LLM call failed: {exc}"}
-    return {"success": True, "output": answer, "error": ""}
+        return with_execution({"success": False, "output": "", "error": f"vision_query LLM call failed: {exc}"}, "executed")
+    return with_execution({"success": True, "output": answer, "error": ""}, "executed")
 
 
 def _run_vision_query(
@@ -565,7 +583,7 @@ def _run_vision_query(
 
     def _refusal_outcome() -> dict:
         """Fail-closed outcome when re-run could not resolve the grant."""
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": (
@@ -574,7 +592,7 @@ def _run_vision_query(
             ),
             "error_type": "confirmation_failed",
             "recoverable": False,
-        }
+        }, "refused")
 
     def _guard_re_run(outcome: dict, old_token: str | None = None) -> dict:
         """Leak guard: a re-run must not stage another confirmation cycle."""
@@ -626,6 +644,7 @@ def _run_vision_query(
             "Respond with a finish action now.",
         )
         outcome["_operator_cancelled"] = True
+        outcome = with_execution(outcome, "cancelled")
         progress_cb("❌ Cancelled by operator — stopping task.")
     return outcome
 
@@ -935,10 +954,15 @@ def _publish_context_snapshot(
 
 
 _GRAPH_NOT_PREPARED = object()
+_VIEW_FROM_CONTEXT = object()
 
 
 def _assemble_system_prompt(
-    ctx: ReactContext, user_goal: str, graph_text: object = _GRAPH_NOT_PREPARED
+    ctx: ReactContext,
+    user_goal: str,
+    graph_text: object = _GRAPH_NOT_PREPARED,
+    *,
+    model_catalog_view: object = _VIEW_FROM_CONTEXT,
 ) -> str:
     """Assemble the full system prompt string for a run.
 
@@ -946,7 +970,10 @@ def _assemble_system_prompt(
     context (isolate-job-execution, design decision 2). A guarded run passes
     ``graph_text`` (possibly empty) from its single read-only preparation; the
     explicit sentinel, not truthiness, selects the ordinary retrieval path.
+    A guarded run likewise passes the ``model_catalog_view`` captured with its
+    staged definitions; otherwise ``ctx.model_catalog_view`` is presented.
     """
+    view = ctx.model_catalog_view if model_catalog_view is _VIEW_FROM_CONTEXT else model_catalog_view
     _graph_context_section = ""
     if graph_text is not _GRAPH_NOT_PREPARED:
         _graph_context_section = graph_text if isinstance(graph_text, str) else ""
@@ -974,6 +1001,8 @@ def _assemble_system_prompt(
 
     parent_context_section = _format_parent_context(ctx)
     _sub_agent_prompt_variant = ctx._prompt_variant if ctx.depth >= 1 else None
+    # Absent view keeps the legacy builder call shape exactly.
+    view_kwargs = {} if view is None else {"model_catalog_view": view}
 
     system, _ = _build_system_prompt(
         tool_index=ctx.tool_index,
@@ -995,6 +1024,7 @@ def _assemble_system_prompt(
         results_top_k=0 if _graph_context_section else 2,
         parent_context_section=parent_context_section,
         mode=_sub_agent_prompt_variant or ctx.creativity_mode,
+        **view_kwargs,
     )
     return system
 
@@ -1021,22 +1051,41 @@ def _init_messages(
     return messages, goal_idx
 
 
-def _ensure_tool_defs(ctx: ReactContext, *, strict: bool = False) -> None:
-    """Lazily build _tool_defs if not already populated.
+def _ensure_tool_defs(
+    ctx: ReactContext,
+    *,
+    strict: bool = False,
+    model_catalog_view: object = _VIEW_FROM_CONTEXT,
+) -> None:
+    """Lazily build _tool_defs if not populated for the requested catalog view.
 
     ``strict`` (guarded staging) propagates a build failure instead of silently
-    dropping MCP schemas.
+    dropping MCP schemas. ``model_catalog_view`` is the view captured for the
+    request (an explicit ``None`` included); by default ``ctx.model_catalog_view``
+    is read. Cached definitions are rebuilt when that view differs from the
+    view they were built with; a rebuild also drops the dependent per-run token
+    grouping cache (the definition revision is a digest of ``_tool_defs`` and
+    follows it).
     """
-    if ctx._tool_defs is None:
-        try:
-            ctx._tool_defs = build_tool_definitions(
-                mcp_manager=ctx.mcp_manager,
-            )
-        except Exception as _btd_exc:  # noqa: BLE001
-            if strict:
-                raise
-            logger.warning("build_tool_definitions failed: %s — MCP tools skipped", _btd_exc, )
-            ctx._tool_defs = build_tool_definitions(mcp_manager=None)
+    view = ctx.model_catalog_view if model_catalog_view is _VIEW_FROM_CONTEXT else model_catalog_view
+    built_view = ctx._tool_defs_view
+    if ctx._tool_defs is not None and (built_view is view or built_view == view):
+        return
+    # Absent view keeps the legacy builder call shape exactly.
+    view_kwargs = {} if view is None else {"model_catalog_view": view}
+    try:
+        tool_defs = build_tool_definitions(
+            mcp_manager=ctx.mcp_manager, **view_kwargs,
+        )
+    except Exception as _btd_exc:  # noqa: BLE001
+        if strict:
+            raise
+        logger.warning("build_tool_definitions failed: %s — MCP tools skipped", _btd_exc, )
+        tool_defs = build_tool_definitions(mcp_manager=None, **view_kwargs)
+    ctx._tool_defs = tool_defs
+    ctx._tool_defs_view = view
+    ctx._tool_defs_by_server = None
+    ctx._tool_defs_tokens = 0
 
 
 def _normalize_shorthand_action(action_obj: dict) -> dict:
@@ -1370,27 +1419,14 @@ def _result_sink(
     return lambda content: state.messages.append({"role": "user", "content": content})
 
 
-_GUARD_REFUSAL_ERROR_TYPES = frozenset(
-    {"prohibited_path", "scheduled_approval_denied", "confirmation_failed"}
-)
-
-
 def _outcome_guard_eligible(outcome: dict) -> bool:
-    """Return whether a tool outcome proves the model's action actually executed.
+    """Return whether a tool outcome carries local proof the action executed.
 
-    Local refusals, staged confirmations and operator cancellations are not a
-    usable response; an ordinary executed tool failure is.
+    Only an explicit ``executed`` marker stamped by the producing boundary
+    qualifies; success flags and error strings are never evidence. Refusals,
+    staged confirmations and operator cancellations veto a conflicting marker.
     """
-    if outcome.get("success"):
-        return True
-    if (
-        outcome.get("requires_confirmation")
-        or outcome.get("vision_reexecute")
-        or outcome.get("_operator_cancelled")
-        or outcome.get("_guard_refusal")
-    ):
-        return False
-    return outcome.get("error_type") not in _GUARD_REFUSAL_ERROR_TYPES
+    return effective_execution(outcome) == "executed"
 
 
 def _fire_accepted(ctx: ReactContext, state: _LoopState) -> None:
@@ -1459,10 +1495,12 @@ def _dispatch_action(
         else:
             outcome = _dispatch_tool(ctx, action_obj, progress)
         _duration_ms = (time.time() - _t0) * 1000
+        outcome, disposition = consume_execution(outcome)
         _emit_tool_trace(
             ctx, tool_name, args, success=outcome.get("success", False),
             duration_ms=_duration_ms,
             error=outcome.get("error", "") if not outcome.get("success", False) else "",
+            execution_disposition=disposition,
         )
         if ctx.working:
             ctx.working.add_step("tool", {"tool": tool_name, "args": args, "success": outcome.get("success", False)})
@@ -1475,7 +1513,7 @@ def _dispatch_action(
         progress(f"__TOOL_END__:{_end_status}:{tool_name}\n{fmt_tool_result_progress(tool_name, args, outcome)}")
         sink(tool_result)
         state.action_accepted = True
-        state.guard_eligible = _outcome_guard_eligible(outcome)
+        state.guard_eligible = disposition == "executed"
 
         if tool_name in ("get_agent_result", "wait_for_any_agent"):
             status = outcome.get("status")
@@ -1534,12 +1572,16 @@ def _dispatch_action(
             )
             return None
         plan_data = action_obj.get("plan", {})
-        result_msg, new_max_steps, _ = _run_plan(ctx, plan_data, state.max_steps, progress)
+        plan_disposition: list[str] = ["unknown"]
+        result_msg, new_max_steps, _ = _run_plan(
+            ctx, plan_data, state.max_steps, progress,
+            on_disposition=plan_disposition.append,
+        )
         if new_max_steps is not None:
             state.max_steps = max(state.step, min(int(new_max_steps), _ABSOLUTE_PLAN_CEILING))
         sink(result_msg)
         state.action_accepted = True
-        state.guard_eligible = True
+        state.guard_eligible = plan_disposition[-1] == "executed"
         if ctx.cancel_event.is_set():
             state.operator_cancelled = True
         return None
@@ -1774,6 +1816,9 @@ def _stage_guarded_first_request(
     _ensure_tool_defs(ctx, strict=True)
     tool_defs = copy.deepcopy(ctx._tool_defs)
     ctx._tool_defs = tool_defs
+    # One presentation view for the whole bundle: the prompt uses the view the
+    # staged definitions were built with, even if ctx's view is later replaced.
+    staged_view = ctx._tool_defs_view
 
     graph_text = ""
     graph_commit: Optional[Callable[[], None]] = None
@@ -1788,7 +1833,9 @@ def _stage_guarded_first_request(
         except Exception as exc:  # noqa: BLE001
             logger.debug("Graph memory preparation failed: %s", type(exc).__name__)
             graph_text, graph_commit = "", None
-    system = _assemble_system_prompt(ctx, user_goal, graph_text)
+    system = _assemble_system_prompt(
+        ctx, user_goal, graph_text, model_catalog_view=staged_view
+    )
 
     # Fail closed: only an overflow rejects, only a local native-unsupported signal
     # converts to the JSON form, and every other error terminates the preflight.
@@ -1874,17 +1921,23 @@ def _react_loop_owned(
             system = staged.system
             messages, goal_idx = staged.messages, staged.goal_idx
             ctx._tool_defs = staged.tool_defs
+            request_view = ctx._tool_defs_view  # view the staged bundle was built with
             _register_turn(ctx)
         else:
             _register_turn(ctx)
             ctx._tool_defs = None
             system = messages = goal_idx = None  # assigned below
+            # One presentation view per request bundle: a replacement made by a
+            # collaborator during assembly applies at the next run.
+            request_view = ctx.model_catalog_view
 
         if ctx.working:
             ctx.working.start_task(user_goal)
 
         if not ctx.guarded_first_request:
-            system = _assemble_system_prompt(ctx, user_goal)
+            system = _assemble_system_prompt(
+                ctx, user_goal, model_catalog_view=request_view
+            )
             messages, goal_idx = _init_messages(ctx, user_goal, images)
         ctx.memory.record_event(f"User request: {user_goal[:100]}")
 
@@ -1902,7 +1955,10 @@ def _react_loop_owned(
             if ctx.guarded_first_request and staged.graph_injected:
                 logger.info("Graph memory context injected")
 
-        _ensure_tool_defs(ctx)
+        # A guarded run dispatches its staged bundle as-is: a catalog view
+        # replaced during staging must not retarget the staged definitions.
+        if not ctx.guarded_first_request or ctx._tool_defs is None:
+            _ensure_tool_defs(ctx, model_catalog_view=request_view)
 
         if initial_state is not None:
             state = initial_state
@@ -2026,6 +2082,7 @@ def _emit_tool_trace(
     success: bool,
     duration_ms: float,
     error: str = "",
+    execution_disposition: str = "unknown",
 ) -> None:
     """Emit a tool trace event if a handler is registered."""
     if ctx.on_tool_trace is not None:
@@ -2035,6 +2092,7 @@ def _emit_tool_trace(
             success=success,
             duration_ms=round(duration_ms, 1),
             error=error,
+            execution_disposition=execution_disposition,
         ))
 
 
@@ -2043,8 +2101,14 @@ def _run_plan(
     plan_data: dict,
     max_steps: int,
     progress: Callable[[str], None],
+    *,
+    on_disposition: Optional[Callable[[str], None]] = None,
 ) -> tuple[str, int, bool]:
-    """Execute a plan. Returns (result_message, new_max_steps, success)."""
+    """Execute a plan. Returns (result_message, new_max_steps, success).
+
+    ``on_disposition`` receives the plan's derived execution disposition
+    (never the plan's success flag) after the private markers are stripped.
+    """
     from execution_plan import ExecutionPlan, PlanExecutor, PlanStep  # noqa: PLC0415
     old_max_steps = max_steps
     plan_limit = ctx.plan_max_iterations or (ctx.max_iterations + 20)
@@ -2057,6 +2121,7 @@ def _run_plan(
 
     _t0 = time.time()
     plan_success = True
+    _trace_disposition = "unknown"
     progress("📋 Executing plan…")
     logger.info("plan | description: %s", plan_data.get("description", "")[:60])
     try:
@@ -2077,7 +2142,12 @@ def _run_plan(
             timeout=plan_data.get("timeout", 300),
         )
         executor = PlanExecutor(max_concurrent=ctx.max_subagents)
-        plan_result = executor.execute(plan, ctx, progress_cb=progress)
+        plan_result, plan_disposition = consume_execution(
+            executor.execute(plan, ctx, progress_cb=progress)
+        )
+        _trace_disposition = plan_disposition
+        if on_disposition is not None:
+            on_disposition(plan_disposition)
         logger.info("plan | completed | results: %d", len(plan_result.get("results", {})))
         if max_steps > old_max_steps:
             max_steps = old_max_steps + 10
@@ -2092,7 +2162,8 @@ def _run_plan(
 
     _duration_ms = (time.time() - _t0) * 1000
     _emit_tool_trace(ctx, "plan", plan_data, success=plan_success, duration_ms=_duration_ms,
-                     error="" if plan_success else "plan execution failed")
+                     error="" if plan_success else "plan execution failed",
+                     execution_disposition=_trace_disposition)
     if ctx.working:
         ctx.working.add_step("plan", {"description": plan_data.get("description", ""), "success": plan_success})
 
@@ -2359,6 +2430,7 @@ def _dispatch_tool(
                     "Respond with a finish action now.",
                 )
                 outcome["_operator_cancelled"] = True
+                outcome = with_execution(outcome, "cancelled")
                 _progress("❌ Cancelled by operator — stopping task.")
         return outcome
 
@@ -2378,4 +2450,4 @@ def _dispatch_tool(
     # Unknown tool — no hand-written tools exist anymore
     outcome = fail_outcome(f"Tool '{tool_name}' is not a built-in tool, MCP tool, or vision_query.")
     outcome["_guard_refusal"] = True
-    return outcome
+    return with_execution(outcome, "refused")

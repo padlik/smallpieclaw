@@ -1,11 +1,54 @@
 """Conversation selection guard: a first request that no longer fits after a
-manual switch to a smaller model is rejected before any action or summary I/O."""
+manual switch to a smaller model is rejected before any action or summary I/O.
+
+Task 12.19 coverage notes (evidence map for the amended 6.3 wording; 6.3 itself
+stays open until its own verification):
+
+- R6 ticket identity (canonical ID, selection revision, generation, token):
+  ``TestTransitions.test_same_revision_different_canonical_id_cannot_clear``,
+  ``.test_new_switch_after_ticket_invalidates_old_completion``,
+  ``.test_reset_clears_and_invalidates_old_tickets``,
+  ``TestHistoryReplacementInvalidatesTickets``,
+  ``TestDelayedNotificationAfterFirstAdmission.test_stale_delivery_preserves_identity_and_token_until_completion``,
+  ``TestExplicitAdmissionDoesNotBorrowExemption.test_fitting_explicit_b_checkpoint_resume_at_c_keeps_b_ticket_and_main_c``.
+- Effective hard input budget ``B`` from stored ``C``/``T``/``O`` (``T``-only,
+  labelled assumed local ``C``, required/optional reserve, unknown ``None``),
+  never raw ``C``: ``TestSelectionIdentity``, ``TestDerivedBudgetComparison``,
+  ``TestTransitions.test_unknown_or_incomparable_arms``,
+  ``.test_assumed_larger_clears``; source budget matrix in
+  ``tests/test_model_request_budget.py`` (``test_optional_cap_budget_matrix``).
+- ``A 100000 -> B 10000 reject -> C 20000`` against the preceding B:
+  ``TestTransitions.test_a_b_c_compares_against_b_and_does_not_rearm_a``,
+  ``TestDerivedBudgetComparison.test_t_only_increase_clears_without_output_subtraction``;
+  real-registry reject then larger switch:
+  ``TestGuardedRejection.test_reject_repeats_until_larger_model_or_reset``,
+  ``.test_larger_selection_clears_and_runs_normally``.
+- Explicit B checkpoint resume under Main C (no borrowed exemption, Main
+  immutable), rejecting and fitting: ``TestExplicitAdmissionDoesNotBorrowExemption``
+  (``test_explicit_b_checkpoint_resume_at_c_revision_is_rejected_untouched``,
+  ``test_fitting_explicit_b_checkpoint_resume_at_c_keeps_b_ticket_and_main_c``,
+  ``test_guard_level_mismatched_admission_is_guarded_but_cannot_clear``),
+  ``TestGuardedRejection.test_reject_with_checkpoint_resume_keeps_checkpoint``.
+- Read-only candidate, approved embedding preparation, and action/summary/
+  history/graph accounting only after a fit:
+  ``TestGuardedRejection.test_reject_before_any_http_or_mutation``,
+  ``TestGuardedFit``, ``TestGraphPreparation``, ``TestRejectionWording``,
+  ``TestRealGraphContract``, ``TestFailClosedPreflight``.
+- Guard persistence, ordinary compaction, unknown restored history,
+  cancellation and checkpoint compatibility:
+  ``TestGuardedRejection.test_reject_repeats_until_larger_model_or_reset``,
+  ``.test_unguarded_oversize_still_compacts``, ``TestUnknownHistoryProtection``,
+  ``TestCancellationBeforeActivation``,
+  ``TestFailClosedPreflight.test_malformed_resumed_native_group_on_json_selected_pin_fails_closed``;
+  compaction thresholds in ``tests/test_p2_compaction.py``.
+"""
 
 from __future__ import annotations
 
 import copy
 import json
 import threading
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +77,7 @@ from model_registry import (
     ModelRegistry,
     ModelRegistryError,
     ProviderState,
+    RunModel,
 )
 from model_selection_guard import (
     GUARD_PREPARATION_FAILED_MESSAGE,
@@ -42,6 +86,7 @@ from model_selection_guard import (
     SelectionBudgetIdentity,
 )
 from model_settings import ModelSettings
+from outcome_utils import with_execution
 from react_loop import _outcome_guard_eligible
 from tests.execution_harness import _NullToolIndex
 from tests.run_model_fixtures import make_run_model_client
@@ -121,7 +166,7 @@ class _Executor:
         self._pending_confirmations = PendingConfirmations()
         self._supervisor = _Supervisor()
         self.calls: list[tuple[str, dict]] = []
-        self.outcome = {"success": True, "output": "ok", "error": ""}
+        self.outcome = with_execution({"success": True, "output": "ok", "error": ""}, "executed")
         self.on_execute = None
 
     def is_builtin(self, name: str) -> bool:
@@ -309,6 +354,30 @@ def _baseline(target, identity=None):
     assert not guard.armed
 
 
+def _pinned_client(
+    upstream: str, revision: int, metadata: ModelMetadata, *, local_context_tokens: int = 4096,
+) -> LLMClient:
+    """A real pinned client at an explicit selection revision and local context.
+
+    ``make_run_model_client`` fixes revision 1 and a 4096 local context, which the
+    derived-budget cases below must vary.
+    """
+    run_model = RunModel(
+        model=ModelRecord(f"p/{upstream}", "p", upstream, upstream, metadata),
+        connection=ResolvedProviderConnection(
+            provider_id="p", adapter="openai", base_url="https://openai.example.test/v1",
+            request_timeout=5, api_key="fake-test-key",
+        ),
+        catalog_revision=1,
+        selection_revision=revision,
+    )
+    return LLMClient(
+        run_model,
+        agent_config=AgentConfig(ctx_max_tokens=local_context_tokens, max_retries=0, retry_delay=0),
+        http_transport=httpx.MockTransport(lambda r: pytest.fail("no I/O")),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Identity from the pinned client (policy-derived, never inferred)
 # ---------------------------------------------------------------------------
@@ -404,11 +473,11 @@ class TestTransitions:
         ctl.notify_manual_selection(_ident("p/A", 3, 100_000))
         assert ctl.selection_guard_armed  # previous ceiling unknown: cannot prove larger
 
-    def test_assumed_larger_cannot_clear(self, world):
+    def test_assumed_larger_clears(self, world):
         ctl = world.controller
         _baseline(ctl, _ident("p/B", 1, 10_000))
         ctl.notify_manual_selection(_ident("p/N", 2, 20_000, assumed=True))
-        assert ctl.selection_guard_armed
+        assert not ctl.selection_guard_armed
 
     def test_stale_and_out_of_order_revisions_are_ignored(self, world):
         ctl = world.controller
@@ -480,6 +549,73 @@ class TestTransitions:
         assert not ctl.selection_guard_armed
 
 
+class TestDerivedBudgetComparison:
+    """Transitions compare the derived budget ``B`` of real pins, never raw ``C``."""
+
+    def test_t_only_increase_clears_without_output_subtraction(self):
+        with ExitStack() as stack:
+            pins = [
+                _pinned_client("T50k", 1, ModelMetadata(input_tokens=50_000)),
+                _pinned_client("T10k", 2, ModelMetadata(input_tokens=10_000, output_tokens=900_000)),
+                _pinned_client("T20k", 3, ModelMetadata(input_tokens=20_000, output_tokens=900_000)),
+            ]
+            for pin in pins:
+                stack.callback(pin.close)
+            origin, t10, t20 = (pin.selection_identity() for pin in pins)
+            assert (t10.input_ceiling, t20.input_ceiling) == (10_000, 20_000)  # T, not T - O
+            assert not t10.assumed and not t20.assumed
+            assert (t10.model_id, t10.selection_revision) == ("p/T10k", 2)
+            assert (t20.model_id, t20.selection_revision) == ("p/T20k", 3)
+            guard = ConversationSelectionGuard()
+            _baseline(guard, origin)
+            guard.notify_manual_selection(t10)
+            assert guard.armed
+            ticket = guard.begin(t10)
+            assert ticket.guarded and (ticket.model_id, ticket.selection_revision) == ("p/T10k", 2)
+            guard.notify_manual_selection(t20)
+            assert not guard.armed
+            assert not guard.complete(ticket)
+            assert not guard.begin(t20).guarded
+
+    def test_assumed_local_capacity_increase_clears(self):
+        with ExitStack() as stack:
+            pins = [
+                _pinned_client("Known", 1, ModelMetadata(input_tokens=8_000)),
+                _pinned_client("L4096", 2, ModelMetadata(), local_context_tokens=4_096),
+                _pinned_client("L5120", 3, ModelMetadata(), local_context_tokens=5_120),
+            ]
+            for pin in pins:
+                stack.callback(pin.close)
+            origin, small, large = (pin.selection_identity() for pin in pins)
+            assert small.assumed and large.assumed
+            assert (small.local_context_tokens, large.local_context_tokens) == (4_096, 5_120)
+            # unknown optional output reserves 1024 of the labelled local C
+            assert (small.input_ceiling, large.input_ceiling) == (3_072, 4_096)
+            guard = ConversationSelectionGuard()
+            _baseline(guard, origin)
+            guard.notify_manual_selection(small)
+            assert guard.armed
+            guard.notify_manual_selection(large)
+            assert not guard.armed
+
+    def test_raw_local_c_increase_with_smaller_derived_budget_arms(self):
+        with ExitStack() as stack:
+            pins = [
+                _pinned_client("O1024", 1, ModelMetadata(output_tokens=1_024), local_context_tokens=4_096),
+                _pinned_client("O3072", 2, ModelMetadata(output_tokens=3_072), local_context_tokens=5_120),
+            ]
+            for pin in pins:
+                stack.callback(pin.close)
+            first, second = (pin.selection_identity() for pin in pins)
+            assert first.assumed and second.assumed
+            assert second.local_context_tokens > first.local_context_tokens  # raw C grows
+            assert (first.input_ceiling, second.input_ceiling) == (3_072, 2_048)  # B shrinks
+            guard = ConversationSelectionGuard()
+            _baseline(guard, first)
+            guard.notify_manual_selection(second)
+            assert guard.armed
+
+
 # ---------------------------------------------------------------------------
 # Eligibility of dispatch outcomes for the one-shot accepted callback
 # ---------------------------------------------------------------------------
@@ -488,15 +624,22 @@ class TestOutcomeEligibility:
     @pytest.mark.parametrize(
         "outcome, eligible",
         [
-            ({"success": True, "output": "ok"}, True),
-            ({"success": False, "error": "boom", "error_type": "tool_timeout"}, True),
-            ({"success": False, "error": "x", "requires_confirmation": True, "token": "t"}, False),
-            ({"success": False, "error": "x", "vision_reexecute": True}, False),
-            ({"success": False, "error": "c", "_operator_cancelled": True}, False),
-            ({"success": False, "error": "p", "error_type": "prohibited_path"}, False),
-            ({"success": False, "error": "s", "error_type": "scheduled_approval_denied"}, False),
-            ({"success": False, "error": "u", "_guard_refusal": True}, False),
-            ({"success": False, "error": "c", "error_type": "confirmation_failed"}, False),
+            # Only an explicit local ``executed`` marker is evidence of execution.
+            (with_execution({"success": True, "output": "ok"}, "executed"), True),
+            (with_execution({"success": False, "error": "boom", "error_type": "tool_timeout"}, "executed"), True),
+            ({"success": True, "output": "ok"}, False),
+            ({"success": False, "error": "boom", "error_type": "tool_timeout"}, False),
+            (with_execution({"success": True, "output": "ok"}, "refused"), False),
+            (with_execution({"success": True, "output": "ok"}, "deferred"), False),
+            (with_execution({"success": True, "output": "ok"}, "cancelled"), False),
+            (with_execution({"success": False, "error": "x", "requires_confirmation": True, "token": "t"}, "executed"), False),
+            (with_execution({"success": False, "error": "x", "vision_reexecute": True}, "executed"), False),
+            (with_execution({"success": False, "error": "c", "_operator_cancelled": True}, "executed"), False),
+            (with_execution({"success": False, "error": "p", "error_type": "prohibited_path"}, "executed"), False),
+            (with_execution({"success": False, "error": "s", "error_type": "scheduled_approval_denied"}, "executed"), False),
+            (with_execution({"success": False, "error": "u", "_guard_refusal": True}, "executed"), False),
+            (with_execution({"success": False, "error": "c", "error_type": "confirmation_failed"}, "executed"), False),
+            ({"success": True, "_execution_disposition": "bogus"}, False),
         ],
     )
     def test_outcomes(self, outcome, eligible):
@@ -701,7 +844,9 @@ class TestGuardedFit:
     def test_ordinary_tool_failure_is_eligible(self, small_world):
         w = small_world
         client = self._arm_fitting(w)
-        w.executor.outcome = {"success": False, "output": "", "error": "boom"}
+        w.executor.outcome = with_execution(
+            {"success": False, "output": "", "error": "boom"}, "executed"
+        )
         assert not self._armed_at_second_request(w, client, [TOOL_FAIL])
 
     def test_operator_cancel_during_tool_does_not_clear(self, small_world):
@@ -1107,6 +1252,100 @@ class TestExplicitAdmissionDoesNotBorrowExemption:
             assert not world.controller.selection_guard_armed  # global C state preserved
         finally:
             client_b.close()
+
+    def test_fitting_explicit_b_checkpoint_resume_at_c_keeps_b_ticket_and_main_c(self, world):
+        client_c = self._cleared_at_c(world)
+        guard = world.controller._selection_guard
+        c_identity = guard._current
+        assert c_identity == client_c.selection_identity()
+        c_revision = client_c.llm_cfg["selection_revision"]
+        _save_checkpoint(world, "r-bfit0001", "p/B", "resume goal")
+        owner = world.store.acquire_owner("r-bfit0001")
+        try:
+            persisted = world.store.load("r-bfit0001", owner=owner)
+        finally:
+            owner.release()
+        # the store keeps the canonical model and attempt state, never a guard ticket
+        assert persisted["model_id"] == "p/B"
+        assert persisted["attempt_state"] == CallAttemptState().to_dict()
+        assert not {"guarded", "selection_revision", "generation", "token"} & set(persisted)
+        run_model = world.registry.admit("p/B")
+        assert run_model.selection_revision == c_revision
+        wire_b = world.wires["B"]
+        requests_before = {name: len(wire.requests) for name, wire in world.wires.items()}
+        registered_before = list(world.executor._supervisor.registered)
+        settings_before = world.settings_path.read_bytes()
+        generation, token = guard._generation, guard._token
+        events: list = []
+        tickets: list = []
+        completions: list = []
+        real_begin, real_complete = guard.begin, guard.complete
+
+        def begin(admitted):
+            ticket = real_begin(admitted)
+            tickets.append(ticket)
+            events.append("begin")
+            return ticket
+
+        def complete(ticket):
+            cleared = real_complete(ticket)
+            completions.append((ticket, cleared))
+            events.append("complete")
+            return cleared
+
+        with ExitStack() as stack:
+            client_b = LLMClient(
+                run_model, agent_config=AgentConfig(ctx_max_tokens=4096, max_retries=3, retry_delay=0),
+                http_transport=httpx.MockTransport(wire_b),
+            )
+            stack.callback(client_b.close)
+            real_preview = client_b.preview_request
+
+            def preview(*args, **kwargs):
+                events.append((
+                    "preview", len(wire_b.requests) - requests_before["B"],
+                    world.executor._coordinator is None,
+                    list(world.executor._supervisor.registered),
+                ))
+                return real_preview(*args, **kwargs)
+
+            wire_b.on_request = lambda n: events.append("send")
+            stack.callback(setattr, wire_b, "on_request", None)
+            stack.enter_context(patch.object(guard, "begin", side_effect=begin))
+            stack.enter_context(patch.object(guard, "complete", side_effect=complete))
+            stack.enter_context(patch.object(
+                guard, "notify_manual_selection", side_effect=AssertionError("no B notification"),
+            ))
+            stack.enter_context(patch.object(client_b, "preview_request", side_effect=preview))
+            result = world.controller.run("ignored", resume_from="r-bfit0001", admitted_llm=client_b)
+
+        assert result == "done"
+        _assert_owner_released(world, "r-bfit0001")
+        # the actual B ticket: guarded, canonical B, current admission revision/generation/token
+        assert len(tickets) == 1
+        ticket = tickets[0]
+        assert ticket.guarded
+        assert (ticket.model_id, ticket.selection_revision) == ("p/B", c_revision)
+        assert (ticket.generation, ticket.token) == (generation, token)
+        # read-only strict preview before the first send and before activation
+        assert events[0] == "begin"
+        previews = [i for i, event in enumerate(events) if isinstance(event, tuple)]
+        assert previews and previews[0] < events.index("send")
+        assert events[previews[0]][1:] == (0, True, registered_before)
+        assert world.executor._supervisor.registered != registered_before  # activated after the fit
+        # only B was contacted
+        assert len(wire_b.requests) > requests_before["B"]
+        for name, wire in world.wires.items():
+            if name != "B":
+                assert len(wire.requests) == requests_before[name]
+        # the one-shot completion of the B ticket cannot touch Main C
+        assert completions == [(ticket, False)]
+        assert not guard.armed
+        assert guard._current == c_identity
+        assert guard._evaluated_revision == c_revision
+        assert (guard._generation, guard._token) == (generation, token)
+        assert world.settings_path.read_bytes() == settings_before
+        assert world.registry.view().selection_revision == c_revision
 
     def test_c_admission_keeps_its_larger_model_escape(self, world):
         client_c = self._cleared_at_c(world)

@@ -17,6 +17,9 @@ Architecture
   writes them to the store without blocking the agent turn
 - parse_extraction()  : JSON triplet parser (no Pydantic required)
 - format_for_prompt() : assemble graph context string for system prompt injection
+- resolve_graph_prerequisites() : data-only startup check that pins the graph
+  extraction model, computes its fixed-cap request budget and verifies the
+  embedding configuration; it creates no graph client, store or writer
 
 Three-layer schema
 ------------------
@@ -38,11 +41,16 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from queue import Empty, Queue
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import httpx
 
 from providers._errors import LLMError
+
+if TYPE_CHECKING:
+    from config_schema import AgentConfig, AppConfig
+    from model_registry import ModelRegistry, RunModel
+    from model_request_budget import ModelRequestBudget
 
 logger = logging.getLogger(__name__)
 
@@ -1123,6 +1131,23 @@ class GraphMemoryStore:
 # ---------------------------------------------------------------------------
 
 
+class GraphMemoryStopError(RuntimeError):
+    """Graph worker termination was not confirmed during shutdown.
+
+    The message is fixed and secret-free. Whoever catches it must keep the
+    worker's dependencies (graph store, embedding client, logging) open.
+    """
+
+    TIMEOUT_MESSAGE = (
+        "Graph memory worker did not terminate before the shutdown deadline; "
+        "dependent resources retained."
+    )
+    FAILED_MESSAGE = (
+        "Graph memory shutdown failed; worker termination is unconfirmed and "
+        "dependent resources retained."
+    )
+
+
 class GraphMemoryWriter:
     """Background daemon thread that extracts triplets from text and writes to
     the graph store.
@@ -1201,14 +1226,23 @@ class GraphMemoryWriter:
     def stop(self, join_timeout: float = 10.0) -> None:
         """Signal the worker to stop after finishing pending work, then join.
 
+        Buffered items are flushed first, so they are processed before the
+        worker exits. The join waits at most *join_timeout* seconds.
+
         Joining before the caller closes the GraphMemoryStore prevents the
         worker from issuing queries against a closed connection.
+
+        Raises:
+            GraphMemoryStopError: The worker is still alive after the join
+                deadline. Nothing is closed or cancelled; the caller must keep
+                every resource the worker depends on (store, embedder,
+                logging) open. Calling ``stop`` again later is allowed.
         """
         self.flush()
         self._queue.put(self._SENTINEL)
         self._thread.join(timeout=join_timeout)
         if self._thread.is_alive():
-            logger.warning("GraphMemoryWriter worker did not stop within %.1fs", join_timeout)
+            raise GraphMemoryStopError(GraphMemoryStopError.TIMEOUT_MESSAGE)
 
     def get_stats(self) -> dict[str, Any]:
         """Return privacy-safe writer statistics.
@@ -1470,6 +1504,91 @@ class GraphMemoryWriter:
 
 
 # ---------------------------------------------------------------------------
+# Graph prerequisites
+# ---------------------------------------------------------------------------
+
+# Fixed policy output cap for one graph extraction request.
+_GRAPH_OUTPUT_CAP = 1024
+
+
+class GraphPrerequisiteError(ValueError):
+    """A safe, categorized graph-memory prerequisite failure."""
+
+    def __init__(self, code: str, message: str) -> None:
+        """Store a stable error code with fixed, secret-free operator guidance."""
+        self.code = code
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class GraphPrerequisites:
+    """Validated, immutable inputs for graph memory; owns no live resources."""
+
+    pin: RunModel
+    budget: ModelRequestBudget
+    embedding_provider: str
+    embedding_model: str
+
+
+def resolve_graph_prerequisites(
+    app_cfg: AppConfig,
+    registry: ModelRegistry,
+    *,
+    vault_file: str | None = None,
+) -> GraphPrerequisites:
+    """Pin the graph model, compute its budget and verify embeddings once.
+
+    This is data-only preparation: it never checks ``graph_memory.enabled``
+    (the caller decides whether graph memory runs), refreshes no catalog,
+    writes no settings, and creates no graph LLM client, store or writer.
+    The temporary embedding client used for the availability check is always
+    closed and never returned. Raises ``GraphPrerequisiteError`` on failure.
+    """
+    from embedding_client import EmbeddingClient
+    from model_registry import ModelRegistryError
+    from model_request_budget import ModelRequestBudgetError, compute_request_budget
+
+    try:
+        pin = registry.resolve_graph_model(app_cfg.graph_memory.extraction_model)
+    except ModelRegistryError as exc:
+        raise GraphPrerequisiteError(
+            exc.code,
+            "graph memory extraction model is unusable: set graph_memory.extraction_model "
+            "to an exact catalog model ID (see /models), refresh with /models refresh, "
+            "and check the provider credentials",
+        ) from None
+
+    try:
+        budget = compute_request_budget(
+            pin.model.metadata,
+            input_tokens=0,
+            local_context_tokens=app_cfg.agent.ctx_max_tokens,
+            fixed_output_cap=_GRAPH_OUTPUT_CAP,
+        )
+    except ModelRequestBudgetError as exc:
+        raise GraphPrerequisiteError(
+            exc.code,
+            "graph memory extraction model cannot fit a request: its token limits "
+            f"(or agent.ctx_max_tokens) must allow the required {_GRAPH_OUTPUT_CAP}-token "
+            "output cap plus input; choose another graph_memory.extraction_model",
+        ) from None
+
+    embeddings = app_cfg.embeddings
+    client = EmbeddingClient(embeddings, app_cfg.providers, vault_file=vault_file)
+    try:
+        available = client.available
+    finally:
+        client.close()
+    if not available:
+        raise GraphPrerequisiteError(
+            "embedding_unavailable",
+            "graph memory requires embeddings: check the [embeddings] provider/model/"
+            "credential and matching provider connection",
+        )
+    return GraphPrerequisites(pin, budget, embeddings.provider, embeddings.model)
+
+
+# ---------------------------------------------------------------------------
 # Factory helper
 # ---------------------------------------------------------------------------
 
@@ -1536,58 +1655,40 @@ def create_graph_memory(
 
 
 def build_extraction_llm_call(
-    raw_cfg: dict,
-    app_cfg,
-    all_models: list,
+    run_model: RunModel,
+    agent_config: AgentConfig,
+    *,
     caller_tag: str = "graph-extract",
 ) -> "Callable[[str], str]":
     """Build a one-shot LLM callable for graph-memory triplet extraction.
 
-    Injects ``temperature=0.1`` and ``max_tokens=1024`` onto a *copy* of the
-    extraction model config so that ``LLMClient.chat()`` picks them up from
-    ``self.llm_cfg``.  The shared ``all_models`` list is never mutated.
+    Each invocation of the returned closure creates a distinct, owned
+    ``LLMClient.for_graph_extraction`` pinned to *run_model* and configured
+    with *agent_config*.  The client applies the fixed graph extraction
+    policy (``temperature=0.1`` and ``max_tokens=1024``) at the provider
+    wire and is always closed in ``finally`` on success or failure.
 
     Parameters
     ----------
-    raw_cfg     : full raw config dict (as loaded from config.toml / TOML parse)
-    app_cfg     : parsed AppConfig instance (for graph_memory.extraction_model,
-                  agent.default_model)
-    all_models  : list of model config dicts from raw_cfg["models"]
-    caller_tag  : caller tag passed to LLMClient for log identification
+    run_model     : settled ``RunModel`` pin for the extraction model
+    agent_config  : parsed ``AgentConfig`` (provides context window and retry
+                    settings for the client)
+    caller_tag    : caller tag passed to ``LLMClient`` for log identification
     """
-    from config_schema import resolve_model_id  # local to avoid circular import
     from llm_client import LLMClient
     from token_usage import get_registry as get_token_registry  # local import
 
-    gm_cfg = app_cfg.graph_memory
-    extraction_selector = gm_cfg.extraction_model or app_cfg.agent.default_model
-    extraction_model_id = resolve_model_id(extraction_selector, all_models)
-    if not extraction_model_id:
-        extraction_model_id = resolve_model_id(app_cfg.agent.default_model, all_models) or ""
-
-    extraction_model_cfg = next(
-        (m for m in all_models if m.get("model") == extraction_model_id),
-        all_models[0] if all_models else {},
+    logger.info(
+        "Graph extraction model: %s (tag=%s)", run_model.model.id, caller_tag
     )
-    # Inject low-temperature extraction settings onto a COPY of the model dict —
-    # never mutate the shared all_models entry. Reasoning models strip temperature
-    # automatically inside LLMClient, so this is provider-safe.
-    extraction_model_cfg = dict(extraction_model_cfg)
-    extraction_model_cfg["temperature"] = 0.1
-    extraction_model_cfg["max_tokens"] = 1024
-
-    extraction_model_name = extraction_model_cfg.get("model", "")
-    other_models = [m for m in all_models if m.get("model") != extraction_model_name]
-    extraction_cfg = dict(raw_cfg)
-    extraction_cfg["models"] = [extraction_model_cfg] + other_models
-    extraction_agent = dict(raw_cfg.get("agent", {}))
-    extraction_agent["default_model"] = extraction_model_name
-    extraction_cfg["agent"] = extraction_agent
-
-    logger.info("Graph extraction model: %s (tag=%s)", extraction_model_id or "(default)", caller_tag)
 
     def _llm_call(prompt: str) -> str:
-        llm = LLMClient(extraction_cfg, usage_registry=get_token_registry(), caller_tag=caller_tag)
+        llm = LLMClient.for_graph_extraction(
+            run_model,
+            agent_config=agent_config,
+            usage_registry=get_token_registry(),
+            caller_tag=caller_tag,
+        )
         try:
             return llm.chat([{"role": "user", "content": prompt}])
         finally:

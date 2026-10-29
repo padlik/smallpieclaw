@@ -23,6 +23,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
+from outcome_utils import with_execution
 from sub_agent_supervisor import (
     ORIGIN_ON_DEMAND,
     ORIGIN_SCHEDULED,
@@ -58,7 +59,7 @@ def _inaccessible_child_result(tool_name: str, agent_ids: str | list[str]) -> di
         supplied = f"id '{agent_ids}'"
     else:
         supplied = "ids " + ", ".join(f"'{agent_id}'" for agent_id in agent_ids)
-    return {
+    return with_execution({
         "success": False,
         "output": "",
         "error": (
@@ -69,7 +70,10 @@ def _inaccessible_child_result(tool_name: str, agent_ids: str | list[str]) -> di
         "error_type": "file_not_found",
         "recoverable": False,
         "suggestion": "Use an agent_id spawned by this operator turn.",
-    }
+    }, "refused")
+
+
+_OBSOLETE_SPAWN_KEYS = ("max_tokens", "temperature", "top_p")
 
 
 def _validate_spawn_args(
@@ -101,7 +105,7 @@ def _validate_spawn_args(
                 task = _v
                 break
     if not task:
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": "spawn_agent: 'task' is required.",
@@ -109,11 +113,11 @@ def _validate_spawn_args(
             "error_type": "fundamentally_wrong_approach",
             "recoverable": False,
             "suggestion": "Provide a clear task string describing what the sub-agent should do.",
-        }
+        }, "refused")
 
     # Depth guard — prevent recursive sub-agent spawning (hard error, not a silent no-op)
     if caller_depth >= 1:
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": "spawn_agent cannot be called from within a sub-agent (max nesting depth: 1).",
@@ -121,10 +125,10 @@ def _validate_spawn_args(
             "error_type": "fundamentally_wrong_approach",
             "recoverable": False,
             "suggestion": "Do not spawn sub-agents from within a sub-agent; perform the work directly.",
-        }
+        }, "refused")
 
     if owner._sub_agent_factory is None:
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": "spawn_agent: sub_agent_factory not configured.",
@@ -132,14 +136,14 @@ def _validate_spawn_args(
             "error_type": "impossible_with_current_tools",
             "recoverable": False,
             "suggestion": "The agent runtime is missing sub-agent support; this cannot be recovered in-flight.",
-        }
+        }, "refused")
 
     # Concurrency cap — preserve current managed-record semantics.
     # Scheduled launches still use source="on-demand" until the later
     # running-agent visibility/cap policy change decides otherwise.
     current_managed = get_agent_registry().count_managed()
     if current_managed >= owner._max_subagents:
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": (
@@ -150,7 +154,42 @@ def _validate_spawn_args(
             "error_type": "tool_timeout",
             "recoverable": True,
             "suggestion": "Wait for an existing sub-agent to finish, then retry.",
-        }
+        }, "refused")
+
+    obsolete = [key for key in _OBSOLETE_SPAWN_KEYS if key in args]
+    if obsolete:
+        return with_execution({
+            "success": False,
+            "output": "",
+            "error": (
+                "spawn_agent: unsupported argument(s): "
+                + ", ".join(obsolete)
+                + ". Remove them; sub-agents use the configured model settings."
+            ),
+            "exit_code": -1,
+            "error_type": "validation_error",
+            "recoverable": False,
+            "suggestion": "Remove max_tokens, temperature and top_p; use the 'model' argument to pick a different model.",
+        }, "refused")
+
+    model = args.get("model")
+    # Scheduler-built options are trusted: the raw saved selector (any type,
+    # untrimmed) is forwarded verbatim for exactly one root admission. The
+    # strict shape guard stays on for every model-facing source.
+    if (
+        model is not None
+        and options.source != SOURCE_SCHEDULED
+        and (not isinstance(model, str) or not model.strip())
+    ):
+        return with_execution({
+            "success": False,
+            "output": "",
+            "error": "spawn_agent: 'model' must be a non-empty string or omitted.",
+            "exit_code": -1,
+            "error_type": "validation_error",
+            "recoverable": False,
+            "suggestion": "Pass a canonical provider-id/upstream-id from /models, or omit model to inherit the active main model.",
+        }, "refused")
 
     # response_format — how the sub-agent should return its result
     response_format = args.get("response_format", "text").lower()
@@ -161,7 +200,6 @@ def _validate_spawn_args(
     elif response_format == "file":
         task = task + "\n\nWrite your output to a file and return only the absolute file path as your answer."
 
-    model = args.get("model") or None
     context_key = args.get("context_key") or None
     if context_key and options.source == SOURCE_SCHEDULED:
         # The scheduler's truthy context_key is only a preserve_context marker.
@@ -172,7 +210,7 @@ def _validate_spawn_args(
         try:
             context_key = context_io._validate_context_key(str(context_key))
         except ValueError as exc:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": f"spawn_agent: invalid context_key: {exc}",
@@ -180,7 +218,7 @@ def _validate_spawn_args(
                 "error_type": "permission_denied",
                 "recoverable": False,
                 "suggestion": "Use a context_key with only letters, digits, underscore, dash, or dot.",
-            }
+            }, "refused")
 
     label = options.job_tag or context_key or "on-demand"
     return task, response_format, model, context_key, label
@@ -211,29 +249,6 @@ def _build_context_payload(task: str, args: dict, owner: BuiltinExecutor) -> dic
     if not isinstance(context_payload, dict):
         context_payload = {"parent_note": str(context_payload)}
     return context_payload
-
-
-def _coerce_overrides(args: dict) -> dict[str, Optional[int | float]]:
-    """Coerce optional LLM parameter overrides from model-facing args.
-
-    ``max_tokens`` is converted to ``int``; ``temperature`` and ``top_p`` to
-    ``float``. Unparsable or missing values become ``None``.
-    """
-    overrides: dict[str, Optional[int | float]] = {}
-    for key, converter in (
-        ("max_tokens", int),
-        ("temperature", float),
-        ("top_p", float),
-    ):
-        raw = args.get(key)
-        if raw is None:
-            overrides[key] = None
-            continue
-        try:
-            overrides[key] = converter(raw)
-        except (ValueError, TypeError):
-            overrides[key] = None
-    return overrides
 
 
 class AgentTools:
@@ -282,7 +297,6 @@ class AgentTools:
             if options.source == SOURCE_SCHEDULED
             else _build_context_payload(task, args, self._owner)
         )
-        overrides = _coerce_overrides(args)
 
         # Internal supervision controls (job tag, callbacks, notify/expandable)
         # arrive via `options`, never through the model-facing `args` dict.
@@ -322,9 +336,6 @@ class AgentTools:
             context_key=context_key,
             label=label,
             notify_fn=None,   # factory sets this from main notify_fn
-            max_tokens=overrides["max_tokens"],
-            temperature=overrides["temperature"],
-            top_p=overrides["top_p"],
             trace_id=trace_id or None,
             context_payload=context_payload,
             runtime_profile=runtime_profile,
@@ -347,7 +358,10 @@ class AgentTools:
         # callbacks, and cleanup.
         result = self._owner._supervisor.submit(request, options)
 
-        return result
+        # Only an admitted run (an agent was registered) is an executed spawn;
+        # a rejected runner construction never started anything.
+        admitted = bool(result.get("success")) and bool(result.get("agent_id"))
+        return with_execution(result, "executed" if admitted else "refused")
 
     def _exec_wait_for_any_agent(self, args: dict, caller_tag: str = "") -> dict:
         """Wait for the first of a set of sub-agents to finish and return its result.
@@ -361,7 +375,7 @@ class AgentTools:
 
         agent_ids = args.get("agent_ids", [])
         if not isinstance(agent_ids, list) or not agent_ids:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": "wait_for_any_agent: 'agent_ids' must be a non-empty list.",
@@ -369,7 +383,7 @@ class AgentTools:
                 "error_type": "fundamentally_wrong_approach",
                 "recoverable": False,
                 "suggestion": "Provide a list of sub-agent IDs returned by spawn_agent.",
-            }
+            }, "refused")
 
         timeout = args.get("timeout", self._owner._subagent_result_timeout)
         try:
@@ -421,17 +435,17 @@ class AgentTools:
                     self._owner._supervisor.mark_result_retrieved(
                         owner_turn_id, record.agent_id
                     )
-                    return result
+                    return with_execution(result, "executed")
             time.sleep(0.2)
 
-        return {
+        return with_execution({
             "success": False,
             "output": f"wait_for_any_agent: timed out after {timeout}s.",
             "error": "",
             "exit_code": 0,
             "status": "timeout",
             "agent_ids": [r.agent_id for r in records],
-        }
+        }, "executed")
 
     def _exec_cancel_agent(self, args: dict, caller_tag: str = "") -> dict:
         """Cancel a specific sub-agent or all managed sub-agents.
@@ -443,7 +457,7 @@ class AgentTools:
 
         agent_id = args.get("agent_id", "").strip()
         if not agent_id:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": "cancel_agent: 'agent_id' is required (or 'managed'/'all' to cancel all).",
@@ -451,19 +465,19 @@ class AgentTools:
                 "error_type": "fundamentally_wrong_approach",
                 "recoverable": False,
                 "suggestion": "Provide a sub-agent id, or use 'managed'/'all' to cancel all managed agents.",
-            }
+            }, "refused")
 
         owner_turn_id = args.pop(
             "_operator_turn_id", None
         ) or _turn_id_from_caller_tag(caller_tag)
         if agent_id in ("managed", "all"):
             n = self._owner._supervisor.cancel_all_owned_children(owner_turn_id)
-            return {
+            return with_execution({
                 "success": True,
                 "output": f"Cancelled {n} turn-owned sub-agent(s).",
                 "error": "",
                 "exit_code": 0,
-            }
+            }, "executed")
 
         record = self._owner._supervisor.get_owned_record(owner_turn_id, agent_id)
         if record is None:
@@ -480,12 +494,12 @@ class AgentTools:
         if cancelled is None:
             if record.status == "running" and not record.is_cancelled:
                 record.cancel()
-        return {
+        return with_execution({
             "success": True,
             "output": f"Cancelled sub-agent '{agent_id}'.",
             "error": "",
             "exit_code": 0,
-        }
+        }, "executed")
 
     def _exec_get_agent_result(self, args: dict, caller_tag: str = "") -> dict:
         """
@@ -497,7 +511,7 @@ class AgentTools:
 
         agent_id = args.get("agent_id", "").strip()
         if not agent_id:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": "get_agent_result: 'agent_id' is required.",
@@ -505,7 +519,7 @@ class AgentTools:
                 "error_type": "fundamentally_wrong_approach",
                 "recoverable": False,
                 "suggestion": "Provide the agent_id returned by spawn_agent.",
-            }
+            }, "refused")
 
         timeout = args.get("timeout", self._owner._subagent_result_timeout)
         try:
@@ -549,7 +563,7 @@ class AgentTools:
                     "get_agent_result: timed out after %ds — auto-cancelled agent '%s'",
                     timeout, agent_id,
                 )
-            return {
+            return with_execution({
                 "success": False,
                 "output": f"get_agent_result: timed out after {timeout}s waiting for agent '{agent_id}'.",
                 "error": "",
@@ -559,7 +573,7 @@ class AgentTools:
                 "error_type": "tool_timeout",
                 "recoverable": True,
                 "suggestion": "Wait for the sub-agent to finish and call get_agent_result again.",
-            }
+            }, "executed")
 
         error_type = ""
         recoverable = False
@@ -582,12 +596,12 @@ class AgentTools:
             "suggestion": suggestion,
         }
         self._owner._supervisor.mark_result_retrieved(owner_turn_id, agent_id)
-        return result
+        return with_execution(result, "executed")
 
     @staticmethod
     def _discarded_result(tool_name: str, agent_id: str) -> dict:
         """Return an actionable terminal response without discarded result text."""
-        return {
+        return with_execution({
             "success": False,
             "output": (
                 f"{tool_name}: child '{agent_id}' was cancelled and its unread "
@@ -601,4 +615,4 @@ class AgentTools:
             "error_type": "",
             "recoverable": False,
             "suggestion": "Spawn a new child if this work is still needed.",
-        }
+        }, "executed")

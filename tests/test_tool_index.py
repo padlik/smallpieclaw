@@ -8,10 +8,16 @@ import json
 import logging
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import httpx
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from config_schema import EmbeddingsConfig
+from embedding_client import EmbeddingClient, EmbeddingUnavailableError
 from tool_index import ToolIndex
 from tool_registry import Tool, ToolRegistry
 
@@ -165,3 +171,158 @@ class TestRebuildLogging:
 
         assert result["embedded"] == 2
         assert any("rebuilt" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Unavailable embedding client handling
+# ---------------------------------------------------------------------------
+
+_REASON = "embedding configuration is unavailable (test)"
+
+
+def _unavailable_llm() -> MagicMock:
+    llm = MagicMock()
+    llm.embed.side_effect = EmbeddingUnavailableError(_REASON)
+    return llm
+
+
+def _prime(index_path: str, registry, builtin_executor=None) -> None:
+    """Build and persist a cache through the public API with a working embedder."""
+    ToolIndex(registry, _make_llm([0.5] * 8), index_path, builtin_executor).build()
+
+
+def _read(index_path: str) -> dict:
+    with open(index_path) as f:
+        return json.load(f)
+
+
+@pytest.fixture
+def real_unavailable_client():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected network I/O: {request.url}")
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = EmbeddingClient(EmbeddingsConfig(), {}, http_client=http)
+    assert client.available is False
+    try:
+        yield client
+    finally:
+        client.close()
+        http.close()
+
+
+class TestUnavailableEmbeddings:
+    def test_build_degrades_and_logs_reason(self, tmp_path, caplog):
+        llm = _unavailable_llm()
+        ti = ToolIndex(_make_registry("a", "b"), llm, str(tmp_path / "index.json"))
+
+        with caplog.at_level(logging.INFO, logger="tool_index"):
+            ti.build()
+
+        assert llm.embed.called
+        assert ti._index == {}
+        assert any(_REASON in r.getMessage() for r in caplog.records)
+
+    def test_build_failed_replacement_keeps_old_entry_and_removes_stale(self, tmp_path):
+        path = str(tmp_path / "index.json")
+        registry = _make_registry("a", "b")
+        _prime(path, registry)
+        old = _read(path)["a"]
+
+        registry.all.return_value = [_make_tool("a", "changed description")]
+        ti = ToolIndex(registry, _unavailable_llm(), path)
+        ti.build()
+
+        assert ti._index == {"a": old}
+        assert _read(path) == {"a": old}
+
+    def test_rebuild_all_failures_persist_empty_cache(self, tmp_path, caplog):
+        path = str(tmp_path / "index.json")
+        registry = _make_registry("a", "b")
+        _prime(path, registry)
+        ti = ToolIndex(registry, _unavailable_llm(), path)
+
+        with caplog.at_level(logging.ERROR, logger="tool_index"):
+            result = ti.rebuild()
+
+        assert result["embedded"] == 0 and result["failed"] == 2
+        assert ti._index == {}
+        assert _read(path) == {}
+        assert any(_REASON in r.getMessage() for r in caplog.records)
+
+    def test_rebuild_mixed_keeps_only_new_successes(self, tmp_path):
+        path = str(tmp_path / "index.json")
+        registry = _make_registry("a", "b")
+        _prime(path, registry)
+        llm = MagicMock()
+
+        def embed(text: str) -> list[float]:
+            if text.startswith("b "):
+                raise EmbeddingUnavailableError(_REASON)
+            return [0.9] * 8
+
+        llm.embed.side_effect = embed
+        ti = ToolIndex(registry, llm, path)
+        result = ti.rebuild()
+
+        assert result["embedded"] == 1 and result["failed"] == 1
+        assert set(ti._index) == {"a"}
+        assert ti._index["a"]["vector"] == [0.9] * 8
+        assert set(_read(path)) == {"a"}
+        assert _read(path) == ti._index
+
+    def test_search_uses_registry_order_with_disk_cache(self, tmp_path):
+        path = str(tmp_path / "index.json")
+        registry = _make_registry("a", "b", "c")
+        builtin = SimpleNamespace(name="shell", description="run shell commands")
+        executor = MagicMock()
+        executor.all_tools.return_value = [builtin]
+        _prime(path, registry, executor)
+        assert "shell" in _read(path)
+
+        llm = _unavailable_llm()
+        ti = ToolIndex(registry, llm, path, executor)
+        assert ti._index
+        results = ti.search("anything", top_k=2)
+
+        assert llm.embed.called
+        assert [t.name for t in results] == ["a", "b"]
+        results = ti.search("anything", top_k=4)
+        assert [t.name for t in results] == ["a", "b", "c"]
+        assert llm.embed.call_count == 2
+
+    @pytest.mark.parametrize("operation", ["build", "rebuild", "search"])
+    def test_real_unavailable_client(self, tmp_path, real_unavailable_client, operation):
+        path = str(tmp_path / "index.json")
+        registry = _make_registry("a", "b", "c")
+        if operation == "search":
+            _prime(path, registry)
+        ti = ToolIndex(registry, real_unavailable_client, path)
+
+        if operation == "build":
+            ti.build()
+            assert ti._index == {}
+        elif operation == "rebuild":
+            result = ti.rebuild()
+            assert result["embedded"] == 0 and result["failed"] == 3
+            assert _read(path) == {}
+        else:
+            assert [t.name for t in ti.search("q", top_k=2)] == ["a", "b"]
+
+    @pytest.mark.parametrize("exc_type", [RuntimeError, TypeError])
+    @pytest.mark.parametrize("operation", ["build", "rebuild", "search"])
+    def test_unrelated_errors_propagate(self, tmp_path, operation, exc_type):
+        path = str(tmp_path / "index.json")
+        registry = _make_registry("a")
+        if operation == "search":
+            _prime(path, registry)
+        exc = exc_type("unrelated failure")
+        llm = MagicMock()
+        llm.embed.side_effect = exc
+        ti = ToolIndex(registry, llm, path)
+
+        with pytest.raises(exc_type) as info:
+            getattr(ti, operation)(*(["q"] if operation == "search" else []))
+
+        assert info.value is exc
+        assert llm.embed.called

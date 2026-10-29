@@ -20,6 +20,7 @@ import threading
 
 import httpx
 
+from embedding_client import EmbeddingClient, EmbeddingUnavailableError
 from llm_client import LLMClient, LLMError
 from tool_registry import Tool, ToolRegistry
 from vector_utils import cosine_similarity
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _EMBEDDING_ERRORS = (
     LLMError,
+    EmbeddingUnavailableError,
     httpx.HTTPError,
     json.JSONDecodeError,
     KeyError,
@@ -55,7 +57,7 @@ class ToolIndex:
     def __init__(
         self,
         registry: ToolRegistry,
-        llm: LLMClient,
+        llm: LLMClient | EmbeddingClient,
         index_path: str,
         builtin_executor=None,   # Optional[BuiltinExecutor] — avoids circular import
     ):

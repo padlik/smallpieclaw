@@ -24,6 +24,7 @@ import sys
 import time
 from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
+from outcome_utils import with_execution
 from builtin_tools.patterns import _is_dangerous_shell
 from builtin_tools.text_utils import _truncate_tail
 from builtin_tools.text_utils import redact_vault_secrets
@@ -445,7 +446,10 @@ class ShellTools:
                     scheduled: bool = False) -> dict:
         command = str(args.get("command", "")).strip()
         if not command:
-            return {"success": False, "output": "", "error": "No command provided.", "exit_code": -1}
+            return with_execution(
+                {"success": False, "output": "", "error": "No command provided.", "exit_code": -1},
+                "refused",
+            )
 
         dangerous, reason, category = _is_dangerous_shell(command)
         if dangerous and self._should_confirm(category):
@@ -460,11 +464,20 @@ class ShellTools:
     def _run_shell(self, args: dict, caller_tag: str = "",
                    chunk_callback: Optional[Callable[[str], None]] = None) -> dict:
         """Dispatch to the configured shell backend (subprocess, pty, or nsjail)."""
+        if not str(args.get("command", "")).strip():
+            return with_execution(
+                {"success": False, "output": "", "error": "No command provided.", "exit_code": -1},
+                "refused",
+            )
         if self._owner._shell_backend == "nsjail" and self._owner._shell_nsjail_active:
-            return self._run_shell_nsjail(args, caller_tag=caller_tag)
-        if self._owner._shell_backend == "pty" and sys.platform != "win32":
-            return self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
-        return self._run_shell_subprocess(args, caller_tag=caller_tag)
+            result = self._run_shell_nsjail(args, caller_tag=caller_tag)
+        elif self._owner._shell_backend == "pty" and sys.platform != "win32":
+            result = self._run_shell_pty(args, caller_tag=caller_tag, chunk_callback=chunk_callback)
+        else:
+            result = self._run_shell_subprocess(args, caller_tag=caller_tag)
+        # A sandbox setup failure means the command never ran.
+        disposition = "refused" if result.get("error_type") == "nsjail_error" else "executed"
+        return with_execution(result, disposition)
 
     def _open_shell_log(self, caller_tag: str = "", conv_id: str = "") -> tuple[Optional[_SupportsWriteClose], Optional[str]]:
         """Open a run-specific artifact log file for incremental writing.

@@ -70,6 +70,7 @@ from mcp.types import CallToolResult
 
 import mcp_oauth
 import httpx
+from outcome_utils import with_execution
 from tool_registry import Tool
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,11 @@ def _tool_outcome(output: str = "", error: str = "", success: bool = True) -> di
         "error": error,
         "exit_code": 0 if success else 1,
     }
+
+
+def _refused_outcome(error: str) -> dict:
+    """Failure outcome for a call that never reached the server."""
+    return with_execution(_tool_outcome(error=error, success=False), "refused")
 
 
 def _sdk_result_to_outcome(result: CallToolResult) -> dict:
@@ -418,21 +424,16 @@ class _SdkClientWrapper:
     def call_tool(self, tool_name: str, args: dict) -> dict:
         """Enqueue a tool call request; block until result or timeout."""
         if self.needs_auth:
-            return _tool_outcome(
+            return _refused_outcome(
                 error=f"MCP server '{self.name}' needs authorization. Run /mcp auth {self.name}.",
-                success=False,
             )
         if not self.connected or self._queue is None:
-            return _tool_outcome(
-                error=f"MCP server '{self.name}' not connected", success=False
-            )
+            return _refused_outcome(error=f"MCP server '{self.name}' not connected")
         req = _ToolRequest(name=tool_name, args=args)
         try:
             self._loop.call_soon_threadsafe(self._queue.put_nowait, req)
         except RuntimeError:
-            return _tool_outcome(
-                error=f"MCP server '{self.name}' is closing", success=False
-            )
+            return _refused_outcome(error=f"MCP server '{self.name}' is closing")
         logger.debug("MCP [%s] calling tool '%s'", self.name, tool_name)
         try:
             return req.future.result(timeout=self._timeout)
@@ -467,7 +468,7 @@ class _SdkClientWrapper:
             except asyncio.QueueEmpty:
                 break
             if req is not None and not req.future.done():
-                req.future.set_result(_tool_outcome(error=error_msg, success=False))
+                req.future.set_result(_refused_outcome(error=error_msg))
 
     async def _session_runner(self) -> None:
         """Long-lived coroutine — owns the transport + ClientSession for this server."""
@@ -622,14 +623,16 @@ class _SdkClientWrapper:
                     try:
                         result = await session.call_tool(req.name, req.args)
                         if not req.future.done():
-                            req.future.set_result(_sdk_result_to_outcome(result))
+                            # Received SDK result: the call really ran on the server.
+                            # The marker is stamped locally; nothing in the remote
+                            # payload is ever read as a disposition.
+                            req.future.set_result(
+                                with_execution(_sdk_result_to_outcome(result), "executed")
+                            )
                     except asyncio.CancelledError:
                         if not req.future.done():
                             req.future.set_result(
-                                _tool_outcome(
-                                    error=f"MCP server '{self.name}' closing",
-                                    success=False,
-                                )
+                                _refused_outcome(error=f"MCP server '{self.name}' closing")
                             )
                         raise
                     except Exception as exc:
@@ -942,18 +945,14 @@ class MCPManager:
 
     def call_tool(self, tool_name: str, args: dict) -> dict:
         if self._loop is None or not self._loop.is_running():
-            return _tool_outcome(error="MCP event loop not running", success=False)
+            return _refused_outcome(error="MCP event loop not running")
         with self._lock:
             server_name = self._tool_to_server.get(tool_name)
             if not server_name:
-                return _tool_outcome(
-                    error=f"MCP tool '{tool_name}' not found", success=False
-                )
+                return _refused_outcome(error=f"MCP tool '{tool_name}' not found")
             wrapper = self._wrappers.get(server_name)
         if not wrapper:
-            return _tool_outcome(
-                error=f"MCP server '{server_name}' not connected", success=False
-            )
+            return _refused_outcome(error=f"MCP server '{server_name}' not connected")
         return wrapper.call_tool(tool_name, args)
 
     # ------------------------------------------------------------------

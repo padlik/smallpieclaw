@@ -20,6 +20,7 @@ import threading
 from contextlib import contextmanager
 from contextvars import Context
 from io import StringIO
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -27,9 +28,18 @@ import structlog
 
 import agent_controller
 import agent_logging
+from config_schema import EmbeddingsConfig, ProviderConfig, ResolvedProviderConnection
 from confirmation import RETRY_PREFIX, ConfirmationManager
+from embedding_client import EmbeddingClient
 from react_loop import ReactContext, react_loop
-from model_registry import ModelMetadata
+from model_registry import (
+    CatalogDocument,
+    ModelMetadata,
+    ModelRecord,
+    ModelRegistry,
+    ProviderState,
+)
+from model_settings import ModelSettings
 import sqlite_log
 from tests.run_model_fixtures import make_run_model_client
 from trace_context import child_trace_id, new_trace_id
@@ -516,7 +526,7 @@ def test_provider_failure_warning_and_run_lifecycle_keep_request_trace(tmp_path,
 
 
 class TestSubAgentTracePropagation:
-    def test_subagent_forwards_trace_to_controller(self):
+    def test_subagent_forwards_trace_to_controller(self, tmp_path: Path) -> None:
         captured = {}
         real_init = agent_controller.AgentController.__init__
 
@@ -526,18 +536,53 @@ class TestSubAgentTracePropagation:
 
         from config_schema import AgentConfig, ExecutorPaths
 
-        cfg = {
-            "models": [{"name": "m", "provider": "openai", "model": "gpt-4o-mini",
-                        "api_key": "sk", "base_url": "https://api.openai.com/v1"}],
-            "agent": {},
-        }
-        with patch.object(agent_controller.AgentController, "__init__", spy_init):
-            runner = agent_controller.SubAgentRunner(
-                model_cfg=cfg["models"][0], config=cfg,
-                agent_cfg=AgentConfig(),
-                paths=ExecutorPaths(),
-                tool_index=MagicMock(), base_memory=MagicMock(), builtin_executor=MagicMock(),
-                trace_id="r-parent99",
+        class _NoDiscovery:
+            def fetch(self, connection: object) -> object:
+                raise AssertionError("discovery must not run during admission")
+
+        def _resolve(config: ProviderConfig) -> ResolvedProviderConnection:
+            return ResolvedProviderConnection(
+                provider_id=config.name, adapter=config.type, base_url=config.base_url,
+                request_timeout=config.request_timeout, api_key="sk-fake",
             )
-        assert captured["trace_id"] == "r-parent99"
-        assert runner._agent._trace_id == "r-parent99"
+
+        def _unavailable_embedding(event: threading.Event) -> EmbeddingClient:
+            return EmbeddingClient(EmbeddingsConfig(), {}, cancel_event=event)
+
+        record = ModelRecord(
+            "pa/up/m", "pa", "up/m", "up/m display",
+            ModelMetadata(
+                5000, None, 2048, False, True, None,
+                (("context_tokens", "provider"), ("vision", "provider"),
+                 ("output_tokens", "provider"), ("tool_calling", "provider")),
+            ),
+        )
+        providers = {
+            "pa": ProviderConfig("pa", "openai", "env:KEY_pa", "https://a.example.test/v1", 9),
+        }
+        settings = ModelSettings(tmp_path / "models-config.toml")
+        settings.write(CatalogDocument(
+            1, 2, None,
+            (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+            (record,), (),
+        ))
+        registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+        registry.select(record.id)
+        run_model = registry.admit()
+
+        runner = None
+        try:
+            with patch.object(agent_controller.AgentController, "__init__", spy_init):
+                runner = agent_controller.SubAgentRunner(
+                    run_model=run_model,
+                    agent_cfg=AgentConfig(),
+                    embedding_factory=_unavailable_embedding,
+                    paths=ExecutorPaths(),
+                    tool_index=MagicMock(), base_memory=MagicMock(), builtin_executor=MagicMock(),
+                    trace_id="r-parent99",
+                )
+            assert captured["trace_id"] == "r-parent99"
+            assert runner._agent._trace_id == "r-parent99"
+        finally:
+            if runner is not None:
+                runner.close()

@@ -67,9 +67,6 @@ def compare_identities(
         return "smaller"
     if current.input_ceiling == previous.input_ceiling:
         return "equal"
-    # A larger ceiling derived from an assumption cannot prove capacity.
-    if previous.assumed or current.assumed:
-        return "unknown"
     return "larger"
 
 

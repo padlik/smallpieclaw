@@ -1208,3 +1208,19 @@ class TestPathsExpansion:
         minimal_config["paths"]["workspace_dir"] = "~/my-workspace"
         cfg = parse_config(minimal_config)
         assert cfg._raw["paths"]["workspace_dir"] == cfg.paths.workspace_dir
+
+
+def test_provider_base_url_preserves_terminal_query_slash(minimal_config):
+    minimal_config["providers"]["openai-main"]["base_url"] = "https://gw.test/v1?sig=a/"
+    connection = parse_config(minimal_config).providers["openai-main"]
+    assert connection.base_url == "https://gw.test/v1?sig=a/"
+    resolved = resolve_provider_connection(connection, vault_file=None)
+    assert resolved.base_url == "https://gw.test/v1?sig=a/"
+
+
+def test_provider_base_url_preserves_terminal_fragment_slash(minimal_config):
+    minimal_config["providers"]["openai-main"]["base_url"] = "https://gw.test/v1#frg/"
+    connection = parse_config(minimal_config).providers["openai-main"]
+    assert connection.base_url == "https://gw.test/v1#frg/"
+    resolved = resolve_provider_connection(connection, vault_file=None)
+    assert resolved.base_url == "https://gw.test/v1#frg/"

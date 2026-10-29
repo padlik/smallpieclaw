@@ -27,6 +27,7 @@ def _make_iface(snapshot: ContextSnapshot | None = None, *, authorized: bool = T
     llm_client.llm_cfg = llm_cfg
 
     iface = MagicMock()
+    iface.model_registry = None
     iface.agent = agent
     iface.llm_client = llm_client
     iface._is_authorized = MagicMock(return_value=authorized)

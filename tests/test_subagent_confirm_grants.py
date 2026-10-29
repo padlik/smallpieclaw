@@ -824,24 +824,81 @@ class TestSinkVeto:
 # ---------------------------------------------------------------------------
 
 
-def _scheduled_cfg() -> dict:
-    """Minimal real model config so ``AgentRuntime`` can build a runner."""
-    model = {"name": "a", "provider": "openai", "model": "model-a",
-             "api_key": "k", "base_url": "http://x"}
-    return {"models": [model], "agent": {"default_model": "model-a"}}
+class _NoDiscovery:
+    """Discovery tripwire: admission must never fetch a provider catalog."""
+
+    def fetch(self, connection: object) -> object:
+        raise AssertionError("discovery must not run during admission")
 
 
-def _runtime_runner(executor, profile, *, memory=None):
-    """Build a runner through the production ``AgentRuntime.create`` path."""
-    from agent_runtime import AgentRuntime, RuntimeOptions
+@pytest.fixture
+def runtime_runner(tmp_path):
+    """Strict admitted-pin factory ``(executor, profile, *, memory=None)``.
 
-    cfg = _scheduled_cfg()
-    runtime = AgentRuntime(
-        config=cfg, all_models=cfg["models"], background_model_cfg=cfg["models"][0],
-        tool_index=MagicMock(), base_memory=memory if memory is not None else MagicMock(),
-        builtin_executor=executor, skill_registry=MagicMock(), results=MagicMock(),
+    Each call admits its own pin from a real catalog registry (active Main
+    ``pa/model-a``) — ``admit_scheduled(None)`` for ``SCHEDULED_AGENT``,
+    ``admit(None)`` otherwise — and builds the runner through the real
+    ``AgentRuntime.create``. Every created runner is closed on teardown.
+    """
+    from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile
+    from config_schema import (
+        AgentConfig, EmbeddingsConfig, ProviderConfig, ResolvedProviderConnection,
     )
-    return runtime.create(profile, RuntimeOptions(label="nightly"))
+    from embedding_client import EmbeddingClient
+    from model_registry import (
+        CatalogDocument, ModelMetadata, ModelRecord, ModelRegistry, ProviderState,
+    )
+    from model_settings import ModelSettings
+
+    model = ModelRecord(
+        "pa/model-a", "pa", "model-a", "model-a display",
+        ModelMetadata(
+            5000, None, 2048, False, True, None,
+            (("context_tokens", "provider"), ("vision", "provider"),
+             ("output_tokens", "provider"), ("tool_calling", "provider")),
+        ),
+    )
+    provider = ProviderConfig("pa", "openai", "env:KEY_pa", "https://a.example.test/v1", 9)
+    settings = ModelSettings(tmp_path / "models-config.toml")
+    settings.write(CatalogDocument(
+        1, 2, None,
+        (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+        (model,), (),
+    ))
+
+    def resolve(config: ProviderConfig) -> ResolvedProviderConnection:
+        return ResolvedProviderConnection(
+            provider_id=config.name, adapter=config.type, base_url=config.base_url,
+            request_timeout=config.request_timeout, api_key="test-secret",
+        )
+
+    registry = ModelRegistry({"pa": provider}, settings, _NoDiscovery(), resolve)
+    registry.select(model.id)
+
+    def unavailable_embedding(event: threading.Event) -> EmbeddingClient:
+        return EmbeddingClient(EmbeddingsConfig(), {}, cancel_event=event)
+
+    runners: list = []
+
+    def _make(executor, profile, *, memory=None):
+        if profile is RuntimeProfile.SCHEDULED_AGENT:
+            run_model = registry.admit_scheduled(None)
+        else:
+            run_model = registry.admit(None)
+        runtime = AgentRuntime(
+            agent_cfg=AgentConfig(), embedding_factory=unavailable_embedding,
+            tool_index=MagicMock(), base_memory=memory if memory is not None else MagicMock(),
+            builtin_executor=executor, skill_registry=MagicMock(), results=MagicMock(),
+        )
+        runner = runtime.create(profile, RuntimeOptions(run_model=run_model, label="nightly"))
+        runners.append(runner)
+        return runner
+
+    try:
+        yield _make
+    finally:
+        for runner in runners:
+            runner.close()
 
 
 def _runner_execute(runner, tool_name: str, args: dict) -> dict:
@@ -870,11 +927,11 @@ class TestScheduledMemoryToolsUnavailable:
     """Scheduled memory tools return scheduled_memory_unavailable without operator-store access."""
 
     @pytest.mark.parametrize("action", ["get", "set", "append", "delete"])
-    def test_scheduled_memory_write_never_touches_operator_kv(self, operator_memory_executor, action):
+    def test_scheduled_memory_write_never_touches_operator_kv(self, operator_memory_executor, runtime_runner, action):
         from agent_runtime import RuntimeProfile
 
         ex, memory, _graph, _writer = operator_memory_executor
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT, memory=memory)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT, memory=memory)
 
         result = _runner_execute(runner, "memory_write", {"action": action, "key": "k", "value": "v"})
 
@@ -886,11 +943,11 @@ class TestScheduledMemoryToolsUnavailable:
         ("memory_graph_search", {"query": "who"}),
         ("memory_graph_store", {"content": "a fact"}),
     ])
-    def test_scheduled_graph_tool_never_touches_operator_graph(self, operator_memory_executor, tool_name, args):
+    def test_scheduled_graph_tool_never_touches_operator_graph(self, operator_memory_executor, runtime_runner, tool_name, args):
         from agent_runtime import RuntimeProfile
 
         ex, _memory, graph, writer = operator_memory_executor
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
 
         result = _runner_execute(runner, tool_name, args)
 
@@ -974,11 +1031,11 @@ class TestScheduledApprovalDenied:
     """Scheduled confirmable operations fail noninteractively, even with an active operator grant."""
 
     @pytest.mark.parametrize("tool_name", _FILE_TOOLS)
-    def test_scheduled_outside_boundary_file_op_is_denied(self, active_operator, tool_name):
+    def test_scheduled_outside_boundary_file_op_is_denied(self, active_operator, runtime_runner, tool_name):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, outside, _policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
 
         result = _runner_execute(runner, tool_name, _outside_call(tool_name, outside))
 
@@ -986,11 +1043,11 @@ class TestScheduledApprovalDenied:
         assert result["error_type"] == "scheduled_approval_denied"
 
     @pytest.mark.parametrize("tool_name", _FILE_TOOLS)
-    def test_scheduled_file_op_never_consults_grant_ledger(self, active_operator, tool_name):
+    def test_scheduled_file_op_never_consults_grant_ledger(self, active_operator, runtime_runner, tool_name):
         from agent_runtime import RuntimeProfile
 
         ex, coordinator, outside, _policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
         ledger = coordinator.grant_ledger
 
         with patch.object(ledger, "check", wraps=ledger.check) as check:
@@ -999,11 +1056,11 @@ class TestScheduledApprovalDenied:
         check.assert_not_called()
 
     @pytest.mark.parametrize("tool_name", _FILE_TOOLS)
-    def test_scheduled_file_op_stages_no_prompt_or_token(self, active_operator, tool_name):
+    def test_scheduled_file_op_stages_no_prompt_or_token(self, active_operator, runtime_runner, tool_name):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, outside, _policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
 
         with patch.object(ex._pending_confirmations, "stage", wraps=ex._pending_confirmations.stage) as stage:
             _runner_execute(runner, tool_name, _outside_call(tool_name, outside))
@@ -1011,24 +1068,24 @@ class TestScheduledApprovalDenied:
         stage.assert_not_called()
         ex._subagent_confirm_prompt_fn.assert_not_called()
 
-    def test_scheduled_outside_file_is_left_unmodified(self, active_operator):
+    def test_scheduled_outside_file_is_left_unmodified(self, active_operator, runtime_runner):
         import os
 
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, outside, _policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
 
         _runner_execute(runner, "file_write", _outside_call("file_write", outside))
 
         with open(os.path.join(outside, "a.txt")) as fh:
             assert fh.read() == "a.txt body\n"
 
-    def test_scheduled_secret_get_is_denied_without_prompt(self, active_operator):
+    def test_scheduled_secret_get_is_denied_without_prompt(self, active_operator, runtime_runner):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, _outside, _policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
 
         with patch.object(ex._pending_confirmations, "stage", wraps=ex._pending_confirmations.stage) as stage:
             result = _runner_execute(runner, "secret_get", {"key": "k"})
@@ -1037,12 +1094,12 @@ class TestScheduledApprovalDenied:
         stage.assert_not_called()
         ex._subagent_confirm_prompt_fn.assert_not_called()
 
-    def test_scheduled_graph_store_stages_no_prompt_or_token(self, active_operator):
+    def test_scheduled_graph_store_stages_no_prompt_or_token(self, active_operator, runtime_runner):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, _outside, _policy = active_operator
         ex._graph_memory = MagicMock(name="operator_graph")
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
 
         with patch.object(ex._pending_confirmations, "stage", wraps=ex._pending_confirmations.stage) as stage:
             _runner_execute(runner, "memory_graph_store", {"content": "a fact"})
@@ -1054,13 +1111,13 @@ class TestScheduledApprovalDenied:
 class TestScheduledBoundariesUnchanged:
     """Default-allowed, prohibited-path, and depth-1 shell outcomes keep existing behavior."""
 
-    def test_scheduled_default_allowed_write_succeeds_without_prompt(self, active_operator):
+    def test_scheduled_default_allowed_write_succeeds_without_prompt(self, active_operator, runtime_runner):
         import os
 
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, _outside, policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
         target = os.path.join(policy.workspace_dir, "job.txt")
 
         result = _runner_execute(runner, "file_write", {"path": target, "content": "ok"})
@@ -1068,13 +1125,13 @@ class TestScheduledBoundariesUnchanged:
         assert result["success"] is True
         ex._subagent_confirm_prompt_fn.assert_not_called()
 
-    def test_scheduled_default_allowed_diff_never_consults_grant_ledger(self, active_operator):
+    def test_scheduled_default_allowed_diff_never_consults_grant_ledger(self, active_operator, runtime_runner):
         import os
 
         from agent_runtime import RuntimeProfile
 
         ex, coordinator, _outside, policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
         a, b = (os.path.join(policy.workspace_dir, n) for n in ("a.txt", "b.txt"))
         for path in (a, b):
             with open(path, "w") as fh:
@@ -1118,11 +1175,11 @@ class TestScheduledBoundariesUnchanged:
         ex.path_policy = RetargetingPolicy()
         return link_a, link_b
 
-    def test_scheduled_diff_retargeted_to_unrecognised_is_denied(self, active_operator):
+    def test_scheduled_diff_retargeted_to_unrecognised_is_denied(self, active_operator, runtime_runner):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, outside, policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
         link_a, link_b = self._retargetable_diff(ex, policy, outside)
 
         result = _runner_execute(runner, "file_diff", {"path_a": link_a, "path_b": link_b})
@@ -1130,11 +1187,11 @@ class TestScheduledBoundariesUnchanged:
         assert result["success"] is False
         assert result["error_type"] == "scheduled_approval_denied"
 
-    def test_scheduled_diff_retarget_never_consults_grant_ledger(self, active_operator):
+    def test_scheduled_diff_retarget_never_consults_grant_ledger(self, active_operator, runtime_runner):
         from agent_runtime import RuntimeProfile
 
         ex, coordinator, outside, policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
         link_a, link_b = self._retargetable_diff(ex, policy, outside)
         ledger = coordinator.grant_ledger
 
@@ -1143,11 +1200,11 @@ class TestScheduledBoundariesUnchanged:
 
         check.assert_not_called()
 
-    def test_scheduled_diff_retarget_does_not_open_outside_file(self, active_operator):
+    def test_scheduled_diff_retarget_does_not_open_outside_file(self, active_operator, runtime_runner):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, outside, policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
         link_a, link_b = self._retargetable_diff(ex, policy, outside)
         opened: list[str] = []
         real_open = open
@@ -1173,21 +1230,21 @@ class TestScheduledBoundariesUnchanged:
         check.assert_called()
         assert result["success"] is True
 
-    def test_scheduled_prohibited_path_keeps_prohibited_denial(self, active_operator, tmp_path):
+    def test_scheduled_prohibited_path_keeps_prohibited_denial(self, active_operator, runtime_runner, tmp_path):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, _outside, _policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
 
         result = _runner_execute(runner, "file_read", {"path": str(tmp_path / "vault.toml")})
 
         assert result["error_type"] == "prohibited_path"
 
-    def test_scheduled_dangerous_shell_keeps_depth1_block(self, active_operator):
+    def test_scheduled_dangerous_shell_keeps_depth1_block(self, active_operator, runtime_runner):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, _outside, _policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
+        runner = runtime_runner(ex, RuntimeProfile.SCHEDULED_AGENT)
 
         result = _runner_execute(runner, "shell", {"command": "rm -rf /tmp/test-agent-x"})
 
@@ -1198,18 +1255,18 @@ class TestScheduledBoundariesUnchanged:
 class TestOnDemandApprovalUnchanged:
     """On-demand children keep using the active operator turn's grants and prompt bridge."""
 
-    def test_on_demand_child_uses_operator_session_grant(self, active_operator):
+    def test_on_demand_child_uses_operator_session_grant(self, active_operator, runtime_runner):
         from agent_runtime import RuntimeProfile
 
         ex, _coordinator, outside, _policy = active_operator
-        runner = _runtime_runner(ex, RuntimeProfile.ON_DEMAND_SUBAGENT)
+        runner = runtime_runner(ex, RuntimeProfile.ON_DEMAND_SUBAGENT)
 
         result = _runner_execute(runner, "file_read", _outside_call("file_read", outside))
 
         assert result["success"] is True
         assert "a.txt body" in result["output"]
 
-    def test_on_demand_child_without_grant_prompts_operator(self, active_operator, tmp_path):
+    def test_on_demand_child_without_grant_prompts_operator(self, active_operator, runtime_runner, tmp_path):
         import os
 
         from agent_runtime import RuntimeProfile
@@ -1217,7 +1274,7 @@ class TestOnDemandApprovalUnchanged:
         ex, _coordinator, _outside, _policy = active_operator
         ungranted = os.path.join(str(tmp_path), "ungranted")
         os.makedirs(ungranted, exist_ok=True)
-        runner = _runtime_runner(ex, RuntimeProfile.ON_DEMAND_SUBAGENT)
+        runner = runtime_runner(ex, RuntimeProfile.ON_DEMAND_SUBAGENT)
 
         _runner_execute(runner, "file_read", {"path": os.path.join(ungranted, "x.txt")})
 

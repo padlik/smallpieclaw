@@ -16,7 +16,7 @@ import re
 import logging
 import copy
 import math
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -1097,11 +1097,12 @@ def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
             or timeout_value <= 0
         ):
             raise ConfigError(f"providers.{name}.request_timeout must be a finite positive number")
+        url_parts = urlsplit(base_url)
         result[name] = ProviderConfig(
             name=name,
             type=cast(Any, adapter),
             api_key=api_key,
-            base_url=base_url.rstrip("/"),
+            base_url=urlunsplit(url_parts._replace(path=url_parts.path.rstrip("/"))),
             request_timeout=cast(int | float, timeout_value),
         )
 

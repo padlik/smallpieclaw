@@ -15,7 +15,7 @@ A lightweight autonomous Telegram bot that controls and queries your server usin
 - **Cron scheduler** — jobs defined in `scheduler.toml`; manage from chat or `/jobs`; ±5 min jitter, hot-reload, overlap policy
 - **Streaming responses** — bot edits its message in real time as the agent works
 - **MCP server support** — [Model Context Protocol](https://modelcontextprotocol.io) via `stdio` (subprocess) and `http` transports
-- **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama (cloud & local)
+- **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama Cloud
 - **Multimodal vision** — send a photo with a caption; image + text forwarded to vision-capable models
 - **File uploads** — any Telegram file saved to `downloads/`
 - **Context compaction** — auto-summarises at 85% of token budget; no manual intervention
@@ -29,7 +29,7 @@ A lightweight autonomous Telegram bot that controls and queries your server usin
 
 - Python 3.9+ (3.11+ recommended)
 - A Telegram bot token — create one with [@BotFather](https://t.me/BotFather)
-- At least one LLM provider API key (OpenAI, Anthropic, Google, OpenRouter) or a local Ollama instance
+- At least one LLM provider API key (OpenAI, Anthropic, Google, OpenRouter, Ollama Cloud)
 - An embeddings API key — can be the same as the LLM key
 - Your Telegram user ID — message [@userinfobot](https://t.me/userinfobot) to find it
 
@@ -108,9 +108,12 @@ Provider-level defaults under `[providers.<name>]` are inherited by all matching
 
 ```toml
 [embeddings]
-model   = "text-embedding-3-small"
-api_key = ""    # empty = inherit from the active model's provider key
+provider = "openai"
+model    = "text-embedding-3-small"
+api_key  = "env:OPENAI_API_KEY"
 ```
+
+Embedding model and provider must be configured explicitly. To inherit a provider connection's key and endpoint, set `provider` to its exact connection name and omit the embedding-specific values; explicit `api_key` and `base_url` override that connection's values. An adapter name without a matching connection requires its own credential. Credentials and endpoint never fall back to the active chat selection.
 
 ---
 
@@ -189,6 +192,37 @@ systemctl --user enable --now telegram-agent
 
 Hidden diagnostic commands (not in menu, available to authorised users): `/show_ctx`, `/show_env`, `/memory`, `/compress`.
 
+When a provider model catalog is injected, `/models` instead lists a sanitized
+view of up to 20 discovered models with refresh and selection buttons:
+each provider's fresh/stale status, the current selection state
+(active, no selection, or a saved choice that's no longer available), and each
+model's known/unknown/unsupported capabilities and token limits with their
+source (provider-reported vs. models.dev). Appearing in this list reflects
+what a provider advertises, not a guarantee the model is currently callable.
+Selection buttons use opaque tokens bound to your user and chat for five minutes.
+Expired buttons, a bot restart, or token-cache eviction require reopening `/models`.
+A selection is rechecked against the current inventory and saved before success
+is shown; a failed save leaves the previous selection unchanged. Retained stale
+entries remain selectable. Without an injected catalog, `/models` keeps its
+existing list-and-switch behavior.
+
+Prompt-building components and model-selecting tool descriptions also accept an
+optional sanitized catalog view. It distinguishes the running model's
+admission-time snapshot from the selection for future runs and current discovery
+metadata. The caller supplies this view; rendering does not acquire the registry
+or perform model admission, and discovery still does not guarantee callability.
+
+At startup the agent refreshes every configured provider (all pages) through
+the same path as `/models`, then restores the remembered main model only if it
+is still in the catalog. If none is saved or it disappeared, the bot and its
+commands still start, but tasks and sub-agents are refused until you pick a
+model with `/models`; no default is chosen. There is no standing chat client:
+each task admits the active model once and uses a client pinned to it, so a
+`/models` change mid-task affects only later tasks, and the task's prompt shows
+both its pinned model and the current selection. Tool search and results recall
+use only the explicit `[embeddings]` settings; when those are unavailable the
+agent logs a warning and runs with degraded tool search.
+
 `/reset` and `/compress` are rejected while the agent is busy running a task —
 wait for it to finish or `/stop` it first. A message you send while one of these
 commands is running is not run automatically; it is saved and offered back with
@@ -215,7 +249,7 @@ Send any file to Telegram to save it to `downloads/`. Photos with a caption are 
 📷 + "Is there anything wrong with this network diagram?"
 ```
 
-Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google Gemini, Ollama (LLaVA, llama3.2-vision). The `vision = true` field in config adds a 👁 badge in `/models`. When images are present and the active model is not vision-capable, the agent automatically routes the request to the first vision-capable model in `[[models]]` (by config order) and reverts to the primary model afterward — no fallback list needed.
+Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google Gemini, Ollama (LLaVA, llama3.2-vision). The `vision = true` field in config adds a 👁 badge in `/models`. When images are present and the run's pinned model is not vision-capable, the request fails before anything is sent with an actionable message; select a vision-capable model yourself (for example via `/models`) — the agent never switches models automatically.
 
 ### Built-in tools reference
 
@@ -428,7 +462,7 @@ extra_auth_params = { access_type = "offline", prompt = "consent" }
 
 ### Scheduler
 
-`scheduler.toml` is the single source of truth for all jobs. All schedules use **5-field cron expressions** (local server time):
+Writable job definitions live in `scheduler.toml`. Cron schedules use **5-field cron expressions** (local server time):
 
 ```
 minute  hour  day  month  weekday
@@ -457,6 +491,10 @@ One-time reminders: `schedule = "once"` with `run_at = "HH:MM"` — auto-removed
 Per-job options: `model`, `preserve_context`, `context_max_messages`, `overlap_policy` (`skip`/`parallel`), `notify`. (A legacy `max_iterations` job key is still accepted and silently ignored.)
 
 Key features: hot-reload without restart (`/jobs reload`), automatic backups before each write (last 5 kept), ±5 min jitter on first cron run, run history in `data/scheduler_state.json`.
+
+Scheduler state stores schedule/enable fields and run-history values, not job definitions or raw model selectors. Definitions remain in `scheduler.toml` or the read-only legacy JSON file. If state serialization fails, the scheduler logs the failure and keeps the previous state file without stopping scheduling.
+
+**Legacy `scheduler_jobs.json` (read-only).** Jobs from an existing `scheduler_jobs.json` in the agent's state directory keep running. Their schedule in `/jobs` and the `schedule` tool's list/show output is marked `legacy, read-only`. If `scheduler.toml` has a job with the same tag, the `scheduler.toml` job wins. The scheduler never writes, converts or adopts this file. You can't modify, remove, pause or resume a job that exists only in the JSON file from chat or tools; the refusal names the file. To change such a job, edit or delete its entry in the file by hand, then run `/jobs reload`. If a `scheduler.toml` job shares its tag with a JSON entry, removing it is refused until you delete the JSON entry, because the legacy job would otherwise come back. If the file can't be read or parsed, you get a warning with its path and repair steps, and `scheduler.toml` jobs keep running. Removing `scheduler.toml` jobs stays refused until the file is fixed. A reload that can't read the file fails and keeps the current jobs.
 
 **Run results and notices.** Every scheduled run gets its own execution ID (`run-<32 hex>`) and a complete result record in `job_execution_log.jsonl` in the state directory. Records are kept for `[scheduler] execution_log_max_age_hours` (default 48) and at most `execution_log_max_per_job` (default 10) per job; older records expire and their results become unavailable. A scheduled run uses its own job context only — it does not read or write operator memory, and a run's result never enters your chat context.
 
@@ -498,7 +536,7 @@ Add to `config.toml`:
 enabled               = true
 db_path               = "data/graph_memory"
 buffer_pool_mb        = 256          # use 64 on low-memory hosts
-extraction_model      = ""           # empty = use agent.default_model
+extraction_model      = "graph/graph-model"  # exact catalog model ID; no fallback
 extract_every_n_turns = 3
 min_message_length    = 100
 max_context_entries   = 10
@@ -546,8 +584,7 @@ Sub-agents cannot spawn further sub-agents (max depth: 1).
 | `openrouter` | OpenRouter | `base_url = "https://openrouter.ai/api/v1"` |
 | `google` | Google Gemini | Leave `base_url` empty |
 | `anthropic` | Anthropic Claude | Leave `base_url` empty |
-| `ollama` | Ollama Cloud | `base_url = "https://ollama.com"` |
-| `ollama` | Ollama Local | `base_url = "http://localhost:11434"`, no API key |
+| `ollama` | Ollama Cloud | `base_url = "https://ollama.com"`, API key required (local/keyless Ollama is not supported) |
 | `openai` | Any OAI-compatible | Custom `base_url` (xAI Grok, Together, Fireworks, LM Studio) |
 
 Ollama requires the official Python package: `pip install "ollama>=0.4.0"`.
@@ -687,7 +724,8 @@ config.toml              # All configuration
 scheduler.toml           # Scheduled job definitions
 agent_controller.py      # Thin orchestrator — builds ReactContext, delegates to react_loop.py
 react_loop.py            # Canonical ReAct loop logic
-llm_client.py            # Multi-provider LLM + embeddings client (token tracking)
+llm_client.py            # Multi-provider chat client; delegates embedding requests
+embedding_client.py      # Independent embedding dispatch and bounded cache
 builtin_executor.py      # Built-in tools (shell, file_read/write, schedule, spawn_agent, memory)
 tool_registry.py         # MCP tool registry
 tool_index.py            # Semantic tool search via embedding cosine similarity

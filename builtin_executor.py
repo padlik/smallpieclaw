@@ -55,6 +55,7 @@ from xdg import xdg_paths
 from builtin_tools.shell_env import ShellEnvTools
 from config_schema import AgentConfig, ExecutorPaths
 from nsjail_config import NsjailConfigBuilder
+from outcome_utils import with_execution
 from builtin_tools.text_utils import (
     _truncate_output,  # noqa: F401  re-exported for tests
     _truncate_tail,  # noqa: F401  re-exported for tests
@@ -82,7 +83,7 @@ def scheduled_approval_denied(tool_name: str) -> dict:
     Returned before any grant lookup, token staging, or confirmation prompt
     (isolate-job-execution, design decision 2).
     """
-    return {
+    return with_execution({
         "success": False,
         "output": "",
         "error": (
@@ -97,7 +98,7 @@ def scheduled_approval_denied(tool_name: str) -> dict:
             "non-destructive alternative; otherwise ask the operator to run this step "
             "interactively or add the directory to allowed_dirs."
         ),
-    }
+    }, "refused")
 
 
 @dataclass
@@ -609,7 +610,10 @@ class BuiltinExecutor:
         """Route a built-in tool call to its handler (no lifecycle logging)."""
         handler = self._exec_table.get(tool_name)
         if handler is None:
-            return {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1}
+            return with_execution(
+                {"success": False, "output": "", "error": f"Unknown built-in: {tool_name}", "exit_code": -1},
+                "refused",
+            )
         ctx = _CallContext(
             caller_depth=caller_depth, caller_tag=caller_tag,
             chunk_callback=chunk_callback, trace_id=trace_id, scheduled=scheduled,
@@ -634,7 +638,10 @@ class BuiltinExecutor:
         scope_owner = self._pending_confirmations.scope(token)
         entry = self._pending_confirmations.take(token)
         if entry is None:
-            return {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1}
+            return with_execution(
+                {"success": False, "output": "", "error": "Confirmation token expired or unknown.", "exit_code": -1},
+                "refused",
+            )
         tool_name, args = entry
         logger.info("Executing confirmed built-in '%s' (token %s)", tool_name, token[:8])
         start = time.perf_counter()
@@ -695,7 +702,7 @@ class BuiltinExecutor:
                 "Headless sub-agent: dangerous shell command blocked (requires confirmation): %s",
                 command[:120],
             )
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": (
@@ -703,7 +710,7 @@ class BuiltinExecutor:
                     "Tip: use a safer alternative, or break the command into non-destructive steps."
                 ),
                 "exit_code": -1,
-            }
+            }, "refused")
         if scheduled:
             logger.info("Scheduled run: '%s' needs operator approval — denied noninteractively", tool_name)
             return scheduled_approval_denied(tool_name)
@@ -718,11 +725,11 @@ class BuiltinExecutor:
             zone_path=zone_path, extra_zone_paths=extra_zone_paths, scope_owner=scope_owner,
         )
         logger.info("Built-in '%s' requires confirmation, token=%s", tool_name, token[:8])
-        return {
+        return with_execution({
             "requires_confirmation": True,
             "token": token,
             "description": description,
-        }
+        }, "deferred")
 
     def _headless_confirm_bridge(self, tool_name: str, args: dict, description: str,
                                  caller_tag: str = "", zone_path: str = "",
@@ -736,7 +743,7 @@ class BuiltinExecutor:
                 "Headless sub-agent: coordinator unavailable (run ended) — blocking %s (fail-closed)",
                 tool_name,
             )
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": (
@@ -744,7 +751,7 @@ class BuiltinExecutor:
                     f"(run ended) for '{tool_name}'."
                 ),
                 "exit_code": -1,
-            }
+            }, "refused")
 
         scope_owner = self._scope_owner_from_caller_tag(1, caller_tag)
         if self._subagent_confirm_prompt_fn is None:
@@ -752,7 +759,7 @@ class BuiltinExecutor:
                 "Headless sub-agent: Telegram bridge not wired — blocking %s (fail-closed)",
                 tool_name,
             )
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": (
@@ -760,7 +767,7 @@ class BuiltinExecutor:
                     f"not available for '{tool_name}'."
                 ),
                 "exit_code": -1,
-            }
+            }, "refused")
 
         token = secrets.token_hex(12)
         self._pending_confirmations.stage(token, tool_name, args, zone_path=zone_path,
@@ -776,7 +783,7 @@ class BuiltinExecutor:
 
         def _cancelled_result() -> dict:
             self._pending_confirmations.discard(token)
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": (
@@ -784,7 +791,7 @@ class BuiltinExecutor:
                     f"('{tool_name}')."
                 ),
                 "exit_code": -1,
-            }
+            }, "cancelled")
 
         if cancel_event is not None and cancel_event.is_set():
             return _cancelled_result()
@@ -806,12 +813,12 @@ class BuiltinExecutor:
                 tool_name, exc,
             )
             self._pending_confirmations.discard(token)
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": f"Sub-agent sensitive operation blocked: could not send Telegram prompt ({exc}).",
                 "exit_code": -1,
-            }
+            }, "refused")
 
         if cancel_event is not None and cancel_event.is_set():
             return _cancelled_result()
@@ -819,7 +826,7 @@ class BuiltinExecutor:
         if not approved:
             self._pending_confirmations.discard(token)
             logger.info("Headless sub-agent: operator denied/timed-out %s (token=%s)", tool_name, token[:8])
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": (
@@ -827,7 +834,7 @@ class BuiltinExecutor:
                     f"('{tool_name}', {self._coordinator.default_headless_timeout}s)."
                 ),
                 "exit_code": -1,
-            }
+            }, "refused")
 
         logger.info("Headless sub-agent: operator approved %s (token=%s) — executing", tool_name, token[:8])
         # vision_query is executed by the ReAct loop, not by this executor's
@@ -837,19 +844,19 @@ class BuiltinExecutor:
         if tool_name == "vision_query":
             entry = self._pending_confirmations.take(token)
             if entry is None:
-                return {
+                return with_execution({
                     "success": False,
                     "output": "",
                     "error": "vision_query: staged confirmation token expired or unknown.",
                     "exit_code": -1,
-                }
-            return {
+                }, "refused")
+            return with_execution({
                 "vision_reexecute": True,
                 "args": entry[1],
                 "success": False,
                 "output": "",
                 "error": "",
-            }
+            }, "deferred")
         # The enclosing execute() call already owns this tool's lifecycle span,
         # so suppress confirm()'s own completion event to avoid double-logging.
         return self.confirm(token, _emit_lifecycle=False)
@@ -859,7 +866,10 @@ class BuiltinExecutor:
         """Actually execute without any confirmation check."""
         handler = self._run_table.get(tool_name)
         if handler is None:
-            return {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1}
+            return with_execution(
+                {"success": False, "output": "", "error": "Unknown built-in", "exit_code": -1},
+                "refused",
+            )
         ctx = _CallContext(caller_tag=caller_tag, chunk_callback=chunk_callback)
         return handler(args, ctx)
 
