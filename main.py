@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import functools
 import logging
 import os
@@ -31,71 +30,14 @@ from pathlib import Path
 
 import agent_logging
 
+# PID file locking — prevents multiple concurrent instances. The shared lock
+# lives in process_lock so offline tools (migrate_models.py --apply) exclude a
+# live daemon; _PidFileLock is the compatibility name.
+from process_lock import PidFileLock as _PidFileLock
+
 # Bootstrap logging to stdout until config (and the resolved XDG log path) load.
 agent_logging.setup_bootstrap()
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# PID file locking — prevents multiple concurrent instances
-# ---------------------------------------------------------------------------
-class _PidFileLock:
-    """
-    Advisory exclusive lock on a PID file using fcntl.flock().
-
-    The OS releases the lock automatically when the process exits (even on
-    crash), so stale PID files left by a previous crash are handled without
-    any PID-alive check — if flock() succeeds, the previous holder is gone.
-
-    Usage::
-
-        with _PidFileLock("/run/agent.pid"):
-            ...  # only one process can hold this at a time
-    """
-
-    def __init__(self, path: str) -> None:
-        self._path = path
-        self._fd: int | None = None
-
-    def __enter__(self) -> "_PidFileLock":
-        os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
-        try:
-            fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o644)
-        except OSError as exc:
-            logger.error("Cannot open PID file %s: %s", self._path, exc)
-            sys.exit(1)
-
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            try:
-                existing_pid = open(self._path).read().strip()
-            except OSError:
-                existing_pid = "unknown"
-            logger.error(
-                "Another instance is already running (PID %s). Aborting.", existing_pid
-            )
-            os.close(fd)
-            sys.exit(1)
-
-        # Lock acquired — write our PID
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode())
-        self._fd = fd
-        return self
-
-    def __exit__(self, *_) -> None:
-        if self._fd is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-                os.close(self._fd)
-            except OSError:
-                pass
-            self._fd = None
-        try:
-            os.unlink(self._path)
-        except OSError:
-            pass
 
 # ---------------------------------------------------------------------------
 # Third-party & local imports
@@ -617,22 +559,24 @@ def main():
     _check_migration(paths, agent_name)
     _create_xdg_dirs(paths)
 
-    if not paths.config_file.exists():
-        sys.exit(f"No config found. Create: {paths.config_file}")
-
-    cfg, app_cfg = load_config(paths.config_file, vault_file=str(paths.secrets_file), agent_name=agent_name)
-    _warn_relative_paths(cfg)
-
-    workspace_dir = os.path.abspath(os.path.expanduser(
-        cfg.get("paths", {}).get("workspace_dir", f"~/Documents/{agent_name}_workspace")
-    ))
-    downloads_dir = os.path.join(workspace_dir, "downloads")
-    tmp_dir = f"/tmp/{agent_name}"
-
-    # SIGTERM → clean exit so the finally: block always runs (e.g. systemctl stop)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-
+    # The shared lock is held from the first config read through startup, so a
+    # concurrent migration can never restore originals around a live config load.
     with _PidFileLock(str(paths.pid_file)):
+        if not paths.config_file.exists():
+            sys.exit(f"No config found. Create: {paths.config_file}")
+
+        cfg, app_cfg = load_config(paths.config_file, vault_file=str(paths.secrets_file), agent_name=agent_name)
+        _warn_relative_paths(cfg)
+
+        workspace_dir = os.path.abspath(os.path.expanduser(
+            cfg.get("paths", {}).get("workspace_dir", f"~/Documents/{agent_name}_workspace")
+        ))
+        downloads_dir = os.path.join(workspace_dir, "downloads")
+        tmp_dir = f"/tmp/{agent_name}"
+
+        # SIGTERM → clean exit so the finally: block always runs (e.g. systemctl stop)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
         _run(
             cfg=cfg, app_cfg=app_cfg, paths=paths,
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,

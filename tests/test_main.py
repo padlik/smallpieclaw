@@ -165,6 +165,50 @@ class TestDownloadsDirDerivation:
         assert downloads_dir == str(tmp_path / "myworkspace" / "downloads")
 
 
+class TestStartupLockOrdering:
+    def test_lock_precedes_config_read_and_holds_through_run(self, tmp_xdg, monkeypatch):
+        """The daemon holds the shared lock before reading config and through _run.
+
+        A migration that restores originals while a starting daemon is past its
+        config read would serve stale candidate configuration, so the lock must
+        be acquired strictly before the first config read and released only
+        after the startup path (_run) has finished.
+        """
+        events = []
+
+        class RecordingLock:
+            def __init__(self, path):
+                self._path = path
+
+            def __enter__(self):
+                events.append("lock")
+                return self
+
+            def __exit__(self, *args):
+                events.append("unlock")
+
+        def record_config_read(*args, **kwargs):
+            events.append("config-read")
+            return {"paths": {}}, object()
+
+        def record_run(**kwargs):
+            events.append("run")
+
+        monkeypatch.setattr(main_mod, "_PidFileLock", RecordingLock)
+        monkeypatch.setattr(main_mod, "load_config", record_config_read)
+        monkeypatch.setattr(main_mod, "_run", record_run)
+        monkeypatch.setattr("sys.argv", ["main.py", "--agent-name", "agent"])
+
+        config = xdg_paths("agent").config_file
+        config.parent.mkdir(parents=True)
+        config.write_text("placeholder = true\n")
+
+        main_mod.main()
+
+        assert events.index("lock") < events.index("config-read") < events.index("run")
+        assert events.index("run") < events.index("unlock")
+
+
 class TestCheckMigration:
     def test_auto_triggers_when_config_toml_alongside_main_and_no_sentinel(self, tmp_xdg, monkeypatch):
         calls = []
@@ -494,6 +538,74 @@ class TestRootStartupComposition:
         saved = ModelSettings(root.paths.models_config_file).load().document
         assert saved.default_model == saved_default
         assert tuple(m.id for m in saved.models) == DISCOVERED
+        assert root.unexpected == []
+
+    def test_exhausted_request_keeps_commands_and_next_task_available(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An exhausted transient request ends only its own run on the real loop.
+
+        The root config has ``max_retries = 0``: the first request's single
+        outbound call fails with 503, the operator answers the retry card with
+        Cancel through the controller's public handler, and the run ends. A
+        later independent request on the same controller and Main succeeds.
+        """
+        root_harness.serve_provider_chat()
+        served = root_harness._route
+        outage = {"on": True}
+
+        def route(request: httpx.Request) -> httpx.Response:
+            """Fail Main's chat while the outage lasts; answer with a finish afterwards."""
+            if request.method == "POST" and request.url.host == ACME_HOST and request.url.path == "/v1/messages":
+                request.read()
+                root_harness.requests.append(request)
+                if outage["on"]:
+                    return httpx.Response(503, json={"error": {"message": "provider outage"}})
+                return httpx.Response(200, json={
+                    "content": [{"type": "text", "text": json.dumps(
+                        {"action": "finish", "result": "recovered later"}
+                    )}],
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                })
+            return served(request)
+
+        monkeypatch.setattr(root_harness, "_route", route)
+        outcome: dict[str, Any] = {}
+
+        def hold(root: RootHarness) -> None:
+            """Exhaust one request, then run an independent task and a command query."""
+            cards: list[str] = []
+
+            def progress(message: str) -> None:
+                if message.startswith("__LLM_ERROR__:"):
+                    token = message.split(":", 2)[1]
+                    cards.append(token)
+                    root.main_controller.resume_llm_error(token, "cancel")
+
+            try:
+                outcome["first"] = (
+                    root.agent_handler(1, "exhaust me", progress, trace_id="r-0000e001"), None,
+                )
+            except Exception as exc:  # noqa: BLE001 - asserted below
+                outcome["first"] = (None, exc)
+            outcome["cards"] = cards
+            outcome["chat_after_first"] = len(
+                [r for r in root.requests_to(ACME_HOST) if r.url.path == "/v1/messages"]
+            )
+            outage["on"] = False
+            outcome["second"] = _request(root, "independent task", "r-0000e002")
+            outcome["view"] = root.registry.view()
+
+        root_harness.start(saved_default=MAIN_ID, hold=hold)
+        root = root_harness
+
+        first, first_exc = outcome["first"]
+        assert first_exc is None and first.startswith("❌"), (first, first_exc)
+        assert len(outcome["cards"]) == 1
+        assert outcome["chat_after_first"] == 1, "max_retries=0 allows exactly one call"
+        assert outcome["second"] == ("recovered later", None)
+        assert outcome["view"].active_model_id == MAIN_ID
+        assert "telegram:run" in root.events and "scheduler:stop" in root.events
         assert root.unexpected == []
 
     def test_main_request_uses_run_local_pin_and_fresh_catalog_view(

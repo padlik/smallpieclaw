@@ -805,6 +805,34 @@ class TestResolveCompactionThreshold:
         with pytest.raises(ValueError):
             resolve_compaction_threshold({}, 90_000, metadata={"context_window": 8_192})
 
+    def test_pinned_client_config_never_reaches_the_legacy_raw_dict_branch(self):
+        """The production client's ``llm_cfg`` cannot select the legacy branch.
+
+        It exposes no ``context_window``/``max_tokens`` keys and always carries
+        its catalog metadata projection, which is not accepted as raw C/T/O
+        input: without the request budget the helper fails closed instead of
+        falling back. With the pinned preview budget (as ``_prepare_request``
+        supplies it) the threshold follows that budget. The raw-dict branch is
+        kept only for compatibility with dict callers.
+        """
+        from model_request_budget import ModelRequestBudgetError, compaction_threshold
+        from tests.test_run_model_client import _client
+
+        client = _client(metadata=ModelMetadata(context_tokens=8_192, output_tokens=1_024))
+        try:
+            cfg = client.llm_cfg
+            preview = client.preview_request([{"role": "user", "content": "x"}], None)
+        finally:
+            client.close()
+        assert "context_window" not in cfg and "max_tokens" not in cfg
+        assert isinstance(cfg["metadata"], dict)
+        with pytest.raises(ModelRequestBudgetError):
+            resolve_compaction_threshold(cfg, 90_000)
+        assert preview.budget.hard_input_budget == 7_168
+        assert resolve_compaction_threshold(cfg, 90_000, request_budget=preview.budget) == (
+            8_192, compaction_threshold(7_168),
+        )
+
     def test_required_output_budget_uses_actual_cap_without_metadata_recompute(self):
         metadata = ModelMetadata(context_tokens=10_000, output_tokens=12_000)
         budget = compute_request_budget(

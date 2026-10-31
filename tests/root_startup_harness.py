@@ -1028,9 +1028,16 @@ class ScheduledRootProbe:
     The runner is never run a second time.
     """
 
-    def __init__(self, root: RootHarness, monkeypatch: pytest.MonkeyPatch, tag: str = SCHEDULED_TAG) -> None:
-        """Snapshot root state, then wrap the root's real collaborators."""
+    def __init__(
+        self, root: RootHarness, monkeypatch: pytest.MonkeyPatch, tag: str = SCHEDULED_TAG,
+        messages: list[dict] | None = None,
+    ) -> None:
+        """Snapshot root state, then wrap the root's real collaborators.
+
+        ``messages`` replaces the single ``ping`` request the boundary sends.
+        """
         assert root.real_scheduler and isinstance(root.scheduler, Scheduler)
+        self._messages = messages or [{"role": "user", "content": "ping"}]
         assert root.scheduler.builtin_executor is root.builtin, "scheduler not wired to the root executor"
         self.tag = tag
         self._root = root
@@ -1109,7 +1116,7 @@ class ScheduledRootProbe:
         """Request boundary: send one request through the run's pinned client."""
         call = SimpleNamespace(goal=goal, llm=ctx.llm, pin=getattr(ctx.llm, "_run_model", None))
         self.loop_calls.append(call)
-        call.reply = ctx.llm.chat([{"role": "user", "content": "ping"}])
+        call.reply = ctx.llm.chat(self._messages)
         return "scheduled-answer"
 
     def fire(self) -> None:
@@ -1165,13 +1172,14 @@ def run_scheduled_root(
     *,
     saved_default: str | None = MAIN_ID,
     before_fire: Callable[[RootHarness], None] | None = None,
+    messages: list[dict] | None = None,
 ) -> ScheduledRootProbe:
     """Start the actual root with one job, then probe and fire it once inside ``hold``."""
     probes: list[ScheduledRootProbe] = []
 
     def hold(started: RootHarness) -> None:
         """Install the probe, apply the optional pre-fire change, fire once."""
-        probe = ScheduledRootProbe(started, monkeypatch)
+        probe = ScheduledRootProbe(started, monkeypatch, messages=messages)
         probes.append(probe)
         if before_fire is not None:
             before_fire(started)

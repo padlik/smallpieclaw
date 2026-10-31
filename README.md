@@ -81,28 +81,21 @@ allowed_user_ids = []             # add your numeric Telegram user ID
 
 > **Pairing mode:** run `/pair` in the bot to generate a single-use token (expires after `telegram.pairing_timeout`, default 300 seconds); share it with another user who runs `/pair <token>` to gain access. The issuer must remain authorized until redemption. `/unpair <id>` also revokes outstanding tokens issued by that user.
 
-### One model (minimum)
+### Provider connections
+
+Model inventories and selection are managed by the application. You only configure discovery accounts — one `[providers.<id>]` connection per account — and pick the active model with `/models` after the agent discovers what the account offers.
 
 ```toml
-[providers.openai]
-api_key  = "sec:OPENAI_API_KEY"
-base_url = "https://api.openai.com/v1"
-
-[[models]]
-name        = "default"
-provider    = "openai"
-model       = "gpt-4o-mini"
-max_tokens  = 1024
-temperature = 0.2
-
-[agent]
-agent_name    = "myagent"
-default_model = "gpt-4o-mini"    # must match the model = "..." value above
+[providers.openai-main]
+type           = "openai"
+api_key        = "sec:OPENAI_API_KEY"     # literal, env:NAME or sec:NAME; optional
+base_url       = "https://api.openai.com/v1"
+request_timeout = 120
 ```
 
-Additional per-model fields: `vision` (bool), `top_p`, `request_timeout`, `max_retries`, `retry_delay`, `context_window` (optional int — per-model context window in tokens; falls back to `agent.ctx_max_tokens` when unset). When `context_window` is set, the compaction threshold is derived from this value instead of the agent-level default, reserving completion tokens (`max_tokens`) before applying the 85% margin.
+Connection fields are exactly `type`, `api_key` (optional), `base_url` (optional) and `request_timeout` — nothing else is accepted. A credential resolves only when the matching provider client is constructed, never at config load, and per-model keys, endpoints, tuning (`temperature`, `top_p`, `max_tokens`) and retry overrides are rejected with an actionable error. Retries are configured agent-wide with `[agent] max_retries` / `retry_delay`.
 
-Provider-level defaults under `[providers.<name>]` are inherited by all matching model entries.
+There is no default-model setting: the remembered selection lives in the app-managed catalog, is made (and changed) with `/models`, and survives restarts. The agent never switches models on its own — a pinned model that lacks a capability (vision, tool calls) fails the request with an actionable message instead of substituting another model.
 
 ### Embeddings
 
@@ -114,6 +107,20 @@ api_key  = "env:OPENAI_API_KEY"
 ```
 
 Embedding model and provider must be configured explicitly. To inherit a provider connection's key and endpoint, set `provider` to its exact connection name and omit the embedding-specific values; explicit `api_key` and `base_url` override that connection's values. An adapter name without a matching connection requires its own credential. Credentials and endpoint never fall back to the active chat selection.
+
+### Migrating a legacy `[[models]]` configuration
+
+`migrate_models.py` converts an old `[[models]]` configuration to provider connections, preview-first:
+
+```bash
+python migrate_models.py --config config.toml            # preview: writes nothing
+python migrate_models.py --agent-name myagent --apply    # apply the preview
+python migrate_models.py --agent-name myagent --recover  # finish an interrupted apply
+```
+
+The preview reports the proposed connections and model mappings, unresolved `env:`/`sec:` references, discarded tuning/retry values and the candidate configuration without touching any file. `--apply` acts only on the named agent's XDG `config.toml` and `models-config.toml`, refuses while the agent is running (shared PID lock), and refuses incomplete previews: ambiguous accounts, local Ollama and connections whose legacy per-model credential still needs an explicit operator choice are reported for manual resolution, never guessed. Legacy per-model credentials are never transferred to the new connections — you configure each connection's credential yourself.
+
+`--apply` writes byte-exact backups (`<file>.migration.bak`, kept afterwards) before replacing anything and records a recovery manifest. If a run is interrupted, `--recover` restores the files that run changed — but never overwrites a file you edited in the meantime; it reports the conflict and keeps the recovery record instead. The scheduler file, job history, prompts, logs, memories and vectors are never rewritten, and there is no job converter.
 
 ---
 
@@ -249,7 +256,7 @@ Send any file to Telegram to save it to `downloads/`. Photos with a caption are 
 📷 + "Is there anything wrong with this network diagram?"
 ```
 
-Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google Gemini, Ollama (LLaVA, llama3.2-vision). The `vision = true` field in config adds a 👁 badge in `/models`. When images are present and the run's pinned model is not vision-capable, the request fails before anything is sent with an actionable message; select a vision-capable model yourself (for example via `/models`) — the agent never switches models automatically.
+Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google Gemini, Ollama (LLaVA, llama3.2-vision). Vision capability comes from provider discovery metadata only — the `/models` view badges vision-capable models automatically; there is no `vision` config field. When images are present and the run's pinned model is not vision-capable, the request fails before anything is sent with an actionable message; select a vision-capable model yourself (for example via `/models`) — the agent never switches models automatically.
 
 ### Built-in tools reference
 
@@ -490,6 +497,8 @@ One-time reminders: `schedule = "once"` with `run_at = "HH:MM"` — auto-removed
 
 Per-job options: `model`, `preserve_context`, `context_max_messages`, `overlap_policy` (`skip`/`parallel`), `notify`. (A legacy `max_iterations` job key is still accepted and silently ignored.)
 
+**Job model selection.** A job's saved `model` selector is matched against the app-managed catalog when the job runs. A malformed or unknown selector warns and the job inherits only a valid Main selection; without a valid Main the job fails with an actionable error. A legacy per-job `fallback_models` key is ignored with a runtime warning — scheduled jobs never fall back to another model.
+
 Key features: hot-reload without restart (`/jobs reload`), automatic backups before each write (last 5 kept), ±5 min jitter on first cron run, run history in `data/scheduler_state.json`.
 
 Scheduler state stores schedule/enable fields and run-history values, not job definitions or raw model selectors. Definitions remain in `scheduler.toml` or the read-only legacy JSON file. If state serialization fails, the scheduler logs the failure and keeps the previous state file without stopping scheduling.
@@ -519,7 +528,7 @@ Both commands show usage if the `<tag>` or `<execution-id>` argument is missing.
 | Results | `data/results_memory.json` (vector index) | Past task summaries saved on `/reset` |
 | Graph (opt-in) | `data/graph_memory` (LadybugDB) | Entities, relationships, episodes; retrieved per turn |
 
-Context compaction fires automatically when the estimated token count exceeds 85% of the effective context window — older messages are summarised by the LLM without operator intervention. The effective window is the active model's `context_window` field (if set) or `agent.ctx_max_tokens` (default 90,000). Completion tokens (`max_tokens`) are reserved before the margin is applied, then clamped to a 256-token floor as a last-resort guard: `threshold = max(int((effective - max_tokens) * 0.85), 256)`. Config validation rejects `context_window <= max_tokens` at startup. Use `/reset` to start fresh, or `/reset discard` to skip saving.
+Context compaction fires automatically when the estimated token count exceeds 85% of the request input budget — older messages are summarised by the LLM without operator intervention. Compaction uses the pinned model’s request input budget, derived from discovered context/input limits and applicable completion-reserve rules. An input-only limit is used directly, without subtracting completion tokens. When neither context nor input limits are reported, `agent.ctx_max_tokens` (default 90,000) supplies a labelled *assumed local* context ceiling before applicable reservation. The threshold is `max(int(input_budget * 0.85), 256)`. Use `/reset` to start fresh, or `/reset discard` to skip saving.
 
 ### Graph memory (optional)
 
@@ -534,7 +543,6 @@ Add to `config.toml`:
 ```toml
 [graph_memory]
 enabled               = true
-db_path               = "data/graph_memory"
 buffer_pool_mb        = 256          # use 64 on low-memory hosts
 extraction_model      = "graph/graph-model"  # exact catalog model ID; no fallback
 extract_every_n_turns = 3
@@ -542,7 +550,11 @@ min_message_length    = 100
 max_context_entries   = 10
 ```
 
+(The database path is not configurable — it is always derived from `XDG_DATA_HOME`.)
+
 LadybugDB is embedded — it runs in-process with no separate server.
+
+Graph extraction resolves `extraction_model` independently of the Main selection: it never falls back to Main and never changes it. The standalone backfill commands below work from the saved catalog only — no provider discovery refresh and no managed-settings write; an unresolvable graph model or a missing/corrupt catalog fails before any database is constructed. On shutdown, if the graph writer does not stop within its bounded timeout, the failure is reported and the store and worker-used dependencies stay open — shutdown never claims success while they are unclosed.
 
 Seed from existing long-term memory (while agent is stopped):
 
@@ -563,12 +575,13 @@ Key configuration:
 
 ```toml
 [agent]
-background_model           = "gpt-4o-mini"    # default model for sub-agents / scheduler
 step_notify_interval        = 30              # main-agent Telegram ping every N steps (0 = off)
 long_run_warn_minutes      = 30              # Telegram notification threshold (0 = off)
 tool_timeout               = 10              # seconds per tool call
 ctx_max_tokens             = 90000
 ```
+
+There is no sub-agent or scheduler model setting in `config.toml`. A sub-agent or scheduled job without a model selector runs on the operator's selected Main model. An explicit selector — a spawned sub-agent's `model` argument or a job's `model` key — runs on that exact catalog model ID; an unknown sub-agent selector is refused, while an unknown or malformed job selector falls back to Main as described under "Job model selection". Every run still requires an active Main selection.
 
 (The legacy `max_iterations` / `scheduled_max_iterations` / `plan_max_iterations` keys are still accepted in config files but ignored — the step gate is gone; see the security section above.)
 
@@ -578,8 +591,8 @@ Sub-agents cannot spawn further sub-agents (max depth: 1).
 
 ### LLM providers & resilience
 
-| `provider` value | Provider | Notes |
-|-----------------|----------|-------|
+| `type` value | Provider | Notes |
+|--------------|----------|-------|
 | `openai` | OpenAI | GPT-4o, GPT-4o-mini, etc. |
 | `openrouter` | OpenRouter | `base_url = "https://openrouter.ai/api/v1"` |
 | `google` | Google Gemini | Leave `base_url` empty |
@@ -741,7 +754,7 @@ config_schema.py         # Typed config dataclasses (AppConfig, AgentConfig, Mod
 exceptions.py            # Exception hierarchy (AgentError → LLMError, ToolError, MCPError, …)
 prompt_builder.py        # System prompt assembly; re-exports estimate_tokens
 token_estimator.py       # Two-layer token counting (tiktoken + heuristic fallback)
-context_manager.py       # Auto-compaction at 85% of ctx_max_tokens
+context_manager.py       # Auto-compaction at 85% of the request input budget (256-token threshold floor)
 context_monitor.py       # Context-window consumption monitor (push snapshot per turn)
 skills/                  # Agent Skills — skills/<name>/SKILL.md
 data/                    # Runtime state: tool_index, memory, scheduler state, graph DB

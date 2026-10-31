@@ -149,6 +149,29 @@ def test_missing_settings_do_not_infer_selection_and_explicit_admission_is_gated
     assert error.value.code == "model_not_found"
 
 
+@pytest.mark.parametrize(
+    "selector",
+    ["Friendly Name", "P/other", "other", " p/other"],
+    ids=["display-name", "case-variant", "upstream-only", "padded"],
+)
+def test_ordinary_selection_and_admission_use_exact_canonical_ids_only(
+    tmp_path: Path, selector: str,
+) -> None:
+    """Display names, case variants and non-canonical IDs are never selectors."""
+    main, other = model("main"), model("other", display_name="Friendly Name")
+    registry, _, _ = make_registry(tmp_path, models=(main, other))
+    registry.select(main.id)
+
+    with pytest.raises(ModelRegistryError) as error:
+        registry.select(selector)
+    assert error.value.code == "model_not_found"
+    with pytest.raises(ModelRegistryError) as error:
+        registry.admit(selector)
+    assert error.value.code == "model_not_found"
+    assert registry.view().active_model_id == main.id
+    assert registry.admit(other.id).model == other
+
+
 def test_unavailable_saved_id_is_remembered_but_not_restored_or_admitted(tmp_path: Path) -> None:
     registry, _, discovery = make_registry(tmp_path, remembered="p/old/model")
     discovery.responses["p"] = inventory()

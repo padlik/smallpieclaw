@@ -647,6 +647,136 @@ def test_running_scheduled_run_cancelled_during_inflight_request(make_world) -> 
     assert world.settings_path.read_bytes() == world.document
 
 
+def test_agents_cancel_managed_landing_as_admitted_run_registers_cancels_before_any_request(
+    make_world, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/agents cancel managed`` (``cancel_all_managed``) once the run is addressable.
+
+    Operator cancellation of a scheduled run targets registry records
+    (``/agents cancel``; ``/stop`` also performs this ``cancel_all_managed``
+    sweep). Records exist only once admission returns its runner. A cancel
+    landing at that instant ends the run as ``cancelled`` with no provider
+    request, clients closed, and tracking released.
+    """
+    import sub_agent_registry
+
+    real_register = sub_agent_registry.register_run
+    cancelled: list[int] = []
+
+    def register_then_stop(*args: object, **kwargs: object):
+        record = real_register(*args, **kwargs)
+        cancelled.append(get_registry().cancel_all_managed())
+        return record
+
+    monkeypatch.setattr(sub_agent_registry, "register_run", register_then_stop)
+    world = make_world(select=True, job_model=MODEL_B.id)
+
+    world.sched._run_job(TAG)
+    assert world.sched.released_event.wait(_BOUND), ("run never released", world.records())
+
+    run_id = _assert_admitted_at_entry(world, MODEL_B.id)
+    assert cancelled == [1]
+    assert world.resolved == ["pb"] and world.chat_requests == []
+    (terminal,) = world.records()
+    assert terminal["run_id"] == run_id and terminal["status"] == "cancelled", terminal
+    assert terminal["result"] == "[Cancelled]" and terminal["success"] is False
+    assert terminal["model"] == MODEL_B.id
+    assert world.sched.notify.call_count == 0, "notify=false run was notified"
+    assert [(r, n) for r, _t, n in world.sched.released] == [(run_id, 1)]
+    assert world.usage.get_today() == {}
+    (runner,) = world.factory.runners
+    assert get_registry().get(runner.agent_id) is None
+    assert TAG not in world.sched._running_jobs and not world.sched._active_runs.get(TAG)
+    (client,) = world.chats
+    assert client._closed
+    (embedding,) = world.embeddings
+    assert embedding.close_count == 1
+
+
+def test_shutdown_during_admission_is_a_recorded_launch_failure(make_world) -> None:
+    """Executor shutdown while admission resolves credentials on the fire thread.
+
+    The supervisor pool refuses the admitted run, so submission rolls back its
+    registration and the scheduler records a failed launch under the minted
+    run ID, alerts despite ``notify=false``, and releases tracking.
+    """
+    gate = _FireGate()
+    world = make_world(select=True, job_model=MODEL_B.id, gate=gate)
+    managed_before = get_registry().count_managed()
+    fire_errors: list[BaseException] = []
+
+    def fire() -> None:
+        try:
+            world.sched._run_job(TAG)
+        except BaseException as exc:  # noqa: BLE001 - surfaced in the parent below
+            fire_errors.append(exc)
+
+    thread = threading.Thread(target=fire, name=_FIRE_THREAD, daemon=True)
+    thread.start()
+    try:
+        assert gate.entered.wait(_BOUND), ("fire thread never resolved", world.records())
+        assert world.records() == [] and TAG in world.sched._running_jobs
+        world.executor.shutdown(graceful_timeout=0)
+    finally:
+        gate.release.set()
+        thread.join(_BOUND)
+    assert not thread.is_alive() and fire_errors == [] and gate.waits == [True]
+
+    run_id = _assert_admitted_at_entry(world, MODEL_B.id)
+    assert world.chat_requests == []
+    (record,) = world.records()
+    assert record["run_id"] == run_id and record["status"] == "failed"
+    assert record["success"] is False and record["model"] == MODEL_B.id
+    alerts = [c.args[0] for c in world.sched.notify.call_args_list]
+    assert len(alerts) == 1 and TAG in alerts[0] and "failed to spawn" in alerts[0]
+    for text in (record["result"], alerts[0]):
+        assert "secret-" not in text and "env:KEY_" not in text
+    assert [(r, n) for r, _t, n in world.sched.released] == [(run_id, 1)]
+    assert TAG not in world.sched._running_jobs and not world.sched._active_runs.get(TAG)
+    assert get_registry().count_managed() == managed_before
+
+
+def test_run_now_of_agentic_legacy_json_job_uses_normal_admission(make_world) -> None:
+    """A JSON-only agentic job's ``run_now`` takes the same scheduled lifecycle.
+
+    The legacy file is read non-destructively; its raw selector reaches one
+    ``admit_scheduled``, the run finishes on that pin, its terminal record
+    carries the minted run ID, tracking is released, and the file is untouched.
+    """
+    legacy_tag = "legacy_agentic"
+    world = make_world(select=True, job_model=None)
+    legacy_bytes = (json.dumps({legacy_tag: {
+        "schedule_type": "cron", "cron": "0 5 1 1 *", "task": "legacy report",
+        "enabled": True, "notify": False, "model": MODEL_B.id,
+    }}, indent=2) + "\n").encode("utf-8")
+    world.paths.scheduler_jobs.write_bytes(legacy_bytes)
+    assert "error" not in world.sched.reload()
+    assert "legacy, read-only" in world.sched.show_job(legacy_tag)["schedule"]
+
+    assert world.sched.run_now(legacy_tag) == {"success": True}
+    assert world.sched.released_event.wait(_BOUND), ("run never released", world.records())
+
+    assert world.registry.scheduled_calls == [MODEL_B.id]
+    assert world.registry.ordinary_calls == 0
+    (call,) = world.factory.calls
+    assert call["profile"] is RuntimeProfile.SCHEDULED_AGENT
+    assert call["kwargs"]["model"] == MODEL_B.id and call["kwargs"]["label"] == legacy_tag
+    (pin,) = world.factory.pins
+    assert pin.model == MODEL_B and world.resolved == ["pb"]
+    (request,) = world.chat_requests
+    assert str(request.url) == f"{URLS['pb']}/chat/completions"
+    (record,) = [e for e in world.sched.execution_log.read_recent() if e["tag"] == legacy_tag]
+    assert _RUN_ID_RE.match(record["run_id"])
+    assert record["status"] == "done" and record["result"] == RESULT
+    assert record["model"] == MODEL_B.id
+    assert [r for r, _t, _n in world.sched.released] == [record["run_id"]]
+    assert legacy_tag not in world.sched._running_jobs
+    assert not world.sched._active_runs.get(legacy_tag)
+    assert world.sched.show_job(legacy_tag)["last_run"] is not None
+    assert world.paths.scheduler_jobs.read_bytes() == legacy_bytes
+    assert world.registry.view().active_model_id == MODEL_A.id
+
+
 # ---------------------------------------------------------------------------
 # Scheduled tool dispositions through the real ReAct → ScheduledToolDispatch →
 # shared BuiltinExecutor.execute path: executed (allowed read) and refused

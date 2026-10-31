@@ -483,3 +483,26 @@ Verdict: PASS. User-requested `openspec-reviewer` session `ses_e8ad805c2ffelc6na
 ### 🔴 Outstanding
 
 None for the task batch. Revised-planning publication and separate implementation authorization remain pending.
+
+## Implementation coverage reconciliation: 2026-10-31 (task 11.1 deliverable; scope decisions)
+
+This entry is about implementation coverage. It does not unfreeze any artifact. The proposal, design, specs, accepted ADRs and task checkboxes are unchanged. Deliverable: `coverage-review.md`, written by the oracle coverage reviewer.
+
+### User decisions
+- **`/stop` is a separate change.** Ownership-scoped `/stop` behavior is a separate future change and is not part of provider-model-catalog. It cancels only the current Main execution and its owned sub-agents, leaving independent scheduled and background runs running. The briefly implemented patch was selectively removed from this worktree and kept outside the repository. `cmd_stop` again uses the existing `cancel_all_managed()` behavior. No live spec or ADR-0033 conflict remains for this change. The future change needs its own spec deltas and a new ADR that partially supersedes ADR-0033.
+- **F6 keeps the existing cancellation paths.** For the scheduled-job-execution scenario "Cancellation around admission", provider-model-catalog keeps the existing cancellation paths. Cancelling at registration and in flight, and shutdown during admission, keep their record and cleanup semantics and are covered by tests. A new pending-admission (pre-registration) cancel is out of scope here. It is not implemented or claimed. This is a scope ruling, not a waiver.
+
+### Review reconciliation
+- Coverage findings F1–F15 from the oracle coverage review:
+  - Resolved with new tests: F2–F5, F7, F9, F10, F13 and F15 (the serial embedding fallback stays retired on purpose).
+  - Already covered: F8.
+  - Rebutted with source evidence: F1 (no streaming and no in-call effects, so there is nothing to mark).
+  - Accepted as a structural argument: F11.
+  - Kept as compatibility-only and not cited: F12, and the dead `resolve_model_id`.
+  - Fixed in documentation: F14.
+- Final review: the `/stop` change was found correct in code but in conflict with live specs. It is closed because the change was removed.
+- Open observations O1–O4 are left for user triage. They do not violate frozen text.
+
+### Evidence limits
+- The focused test counts (retry 190, gaps 860, post-separation 632) and the Ruff/Vulture passes were reported by the implementer. They were not re-executed for this entry.
+- The full suite (`make check`) and `openspec validate --strict` are still pending. Task 11.1's checkbox, and tasks 11.2–11.4, belong to the parent.

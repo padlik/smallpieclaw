@@ -231,6 +231,47 @@ def test_google_batch_order_and_openai_cache() -> None:
     assert requests[0].headers["x-goog-api-key"] == "google-key"
 
 
+def test_empty_batch_returns_empty_without_request() -> None:
+    requests: list[httpx.Request] = []
+    injected = httpx.Client(transport=httpx.MockTransport(lambda request: (
+        requests.append(request) or httpx.Response(200, json={"data": []})
+    )))
+    client = _client(
+        EmbeddingsConfig(provider="openai", model="embed", api_key="key"), http_client=injected,
+    )
+    try:
+        assert client.embed_batch([]) == []
+    finally:
+        client.close()
+        injected.close()
+    assert requests == []
+
+
+def test_partial_cache_hit_requests_only_missing_inputs_in_order() -> None:
+    import json
+
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read())
+        bodies.append(body)
+        return httpx.Response(200, json={"data": [
+            {"embedding": [float(len(text))]} for text in body["input"]
+        ]} if isinstance(body["input"], list) else {"data": [{"embedding": [9.0]}]})
+
+    injected = httpx.Client(transport=httpx.MockTransport(handler))
+    client = _client(
+        EmbeddingsConfig(provider="openai", model="embed", api_key="key"), http_client=injected,
+    )
+    try:
+        assert client.embed("cached") == [9.0]
+        assert client.embed_batch(["new", "cached", "newer"]) == [[3.0], [9.0], [5.0]]
+    finally:
+        client.close()
+        injected.close()
+    assert [body["input"] for body in bodies] == ["cached", ["new", "newer"]]
+
+
 def test_google_cross_origin_redirect_does_not_forward_credentials_or_input() -> None:
     requests: list[httpx.Request] = []
 

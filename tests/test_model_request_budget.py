@@ -58,6 +58,17 @@ def test_required_cap_uses_remaining_combined_capacity_as_reserve() -> None:
     assert result.hard_input_budget == 7_000
 
 
+@pytest.mark.parametrize("input_tokens", [10_000, 10_001], ids=["C-I=0", "C-I<0"])
+def test_required_cap_without_positive_remaining_combined_capacity_fails(input_tokens: int) -> None:
+    with pytest.raises(ModelRequestBudgetError) as raised:
+        budget(
+            ModelMetadata(context_tokens=10_000, output_tokens=4_000),
+            input_tokens=input_tokens,
+            output_cap_required=True,
+        )
+    assert raised.value.code == "no_input_budget"
+
+
 def test_required_cap_for_input_only_model_does_not_reduce_input_budget() -> None:
     result = budget(
         ModelMetadata(input_tokens=1_000_000, output_tokens=65_536),

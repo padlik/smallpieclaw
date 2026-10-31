@@ -27,21 +27,45 @@ file, resolving any credential or contacting any network:
 Usage::
 
     python migrate_models.py --config config.toml [--scheduler-config scheduler.toml]
+    python migrate_models.py --agent-name NAME            # preview the agent's config
+    python migrate_models.py --agent-name NAME --apply    # apply a complete preview
+    python migrate_models.py --agent-name NAME --recover  # finish an interrupted apply
 
-``--apply`` is not available in this release; the original files always
-remain unchanged.
+Without ``--apply``/``--recover`` nothing is written. ``--apply`` and
+``--recover`` require ``--agent-name``, act only on that agent's XDG
+``config.toml`` and ``models-config.toml``, and hold the agent's PID lock, so
+they refuse while the daemon runs. ``--apply`` refuses (before any write) an
+incomplete or unverified preview, a candidate that fails structural config
+validation, unreadable or invalid managed settings, a symlinked config or
+settings leaf (including a dangling one) and a pending recovery record. It
+then stages and validates both results, writes byte-exact
+owner-only backups (``<file>.migration.bak``, kept afterwards), records a
+recovery manifest (``models-migration.json`` in the config directory) with the
+original, backup and candidate SHA-256 of each file, and replaces each file
+atomically. An existing remembered selection is never overwritten; the old
+effective default is seeded only when none is saved. A failure rolls back
+only files still matching this migration's result; anything else is left
+untouched and reported. ``--recover`` applies the same rule after a crash: a
+completed record whose files do not all match it, or a partially restored
+rollback, is reported as unresolved and its evidence is kept, never cleared.
+Jobs, history, prompts, logs, memories, vectors and conversations are never
+touched.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import math
+import os
 import re
 import sys
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import urlsplit
 
@@ -49,6 +73,13 @@ try:
     import tomli as _toml  # type: ignore[import]
 except ImportError:
     import tomllib as _toml  # type: ignore[no-redef]  # Python 3.11+
+
+from config_schema import _reject_removed_fields, _validate_provider_structure
+from exceptions import ConfigError
+from model_registry import CatalogDocument
+from model_settings import ModelSettings, ModelSettingsError
+from process_lock import PidFileLock
+from xdg import XDGPaths, xdg_paths
 
 logger = logging.getLogger("migrate_models")
 
@@ -505,7 +536,7 @@ def preview_migration(config_text: str, scheduler_text: str | None = None) -> Mi
     """Build the full migration preview from configuration (and job file) text."""
     parsed = _parse(config_text, "configuration")
     scheduler = _parse(scheduler_text, "scheduler configuration") if scheduler_text is not None else {}
-    notes = ["Preview only: no file was written; --apply is not available in this release."]
+    notes = ["Preview only: no file was written; apply a complete preview with --agent-name NAME --apply."]
     job_discards = tuple(_job_fallbacks(scheduler))
     models = parsed.get("models")
     agent = parsed.get("agent") if isinstance(parsed.get("agent"), dict) else {}
@@ -631,6 +662,547 @@ def render_preview(preview: MigrationPreview) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Apply and recovery (task 10.2)
+# ---------------------------------------------------------------------------
+
+_AGENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_MANIFEST_NAME = "models-migration.json"
+_MANIFEST_VERSION = 1
+_BACKUP_SUFFIX = ".migration.bak"
+_PHASES = frozenset({
+    "prepared", "writing_config", "config_written", "writing_settings", "settings_written",
+    "interrupted_rollback", "completed",
+})
+_ITEM_KEYS = frozenset({"path", "original_sha256", "backup_path", "backup_sha256", "candidate_sha256"})
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_UNCHECKED = object()
+
+
+class MigrationApplyError(Exception):
+    """A safe, actionable apply/recovery refusal or failure (never file content)."""
+
+
+@dataclass(frozen=True)
+class _ApplyPlan:
+    """Validated inputs for one apply; nothing has been written yet."""
+
+    config_original: bytes
+    config_candidate: bytes
+    settings_original: bytes | None
+    settings_document: CatalogDocument | None  # None: settings stay as they are
+    seeded: str | None
+
+
+def _sha256(data: bytes | None) -> str | None:
+    """Hex SHA-256 of *data*, or None for an absent file."""
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def _read_optional(path: Path) -> bytes | None:
+    """File bytes, or None when the file does not exist (other errors raise)."""
+    try:
+        with open(path, "rb") as stream:
+            return stream.read()
+    except FileNotFoundError:
+        return None
+
+
+def _targets(paths: XDGPaths) -> dict[str, Path]:
+    """The two protected files, in write order."""
+    return {"config": paths.config_file, "settings": paths.models_config_file}
+
+
+def _backup_path(target: Path) -> Path:
+    """The retained backup location of *target*."""
+    return target.with_name(target.name + _BACKUP_SUFFIX)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Make renames and unlinks in *directory* durable."""
+    fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _discard(path: str | Path) -> None:
+    """Remove a temporary file, tolerating its absence."""
+    try:
+        os.unlink(str(path))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("could not remove temporary file %s", path)
+
+
+def _require_current(target: Path, expected: str | None) -> None:
+    """Refuse to touch *target* unless it still has the expected content."""
+    if _sha256(_read_optional(target)) != expected:
+        raise MigrationApplyError(f"{target} changed during the migration and was left untouched")
+
+
+def _write_new(path: Path, data: bytes) -> None:
+    """Create an owner-only file with *data*, flushed to disk."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _publish(target: Path, data: bytes, *, expected: object = _UNCHECKED) -> None:
+    """Atomically install *data* at *target* (owner-only; file and directory fsynced).
+
+    With *expected* the current content hash is checked immediately before the
+    replacement, so an intervening edit is never overwritten.
+    """
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    pending: str | None = temporary
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if expected is not _UNCHECKED:
+            _require_current(target, expected if isinstance(expected, str) else None)
+        os.replace(temporary, str(target))
+        pending = None
+        _fsync_dir(target.parent)
+    finally:
+        if pending is not None:
+            _discard(pending)
+
+
+def _encode(record: dict[str, Any]) -> bytes:
+    """Serialize the recovery manifest deterministically."""
+    return (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _set_phase(manifest: Path, record: dict[str, Any], phase: str) -> None:
+    """Durably record the next transaction phase."""
+    record["phase"] = phase
+    _publish(manifest, _encode(record))
+
+
+def _mark_interrupted(manifest: Path, record: dict[str, Any]) -> None:
+    """Durably mark the manifest as an interrupted rollback, in place.
+
+    Rewriting the same inode (no rename) keeps every already-open descriptor
+    on the authoritative record, so a ``completed`` phase can never remain on
+    disk while a rollback is running. A crash mid-rewrite can only leave a
+    corrupt record, which ``--recover`` refuses fail-closed.
+    """
+    record["phase"] = "interrupted_rollback"
+    data = _encode(record)
+    fd = os.open(str(manifest), os.O_WRONLY)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _require_real_targets(paths: XDGPaths) -> None:
+    """Refuse symlinked protected leaves (including dangling) before any write.
+
+    Backups bind to the lexical XDG path while the manifest binds to the
+    resolved one, and replacing a leaf would replace the link itself, so a
+    symlinked config or settings file can never be migrated safely.
+    """
+    for key, target in _targets(paths).items():
+        if target.is_symlink():
+            raise MigrationApplyError(
+                f"the {key} file {target} is a symlink; migration never follows or replaces "
+                "symlinks. Replace the link with a real file and rerun."
+            )
+
+
+def _clear_manifest(manifest: Path) -> None:
+    """Remove the active manifest once its transaction is resolved."""
+    try:
+        os.unlink(str(manifest))
+    except FileNotFoundError:
+        return
+    _fsync_dir(manifest.parent)
+
+
+def _classify(item: dict[str, Any], target: Path) -> str:
+    """``original``, ``candidate`` (this migration's result) or ``unresolved``."""
+    current = _sha256(_read_optional(target))
+    if current == item["original_sha256"]:
+        return "original"
+    if current == item["candidate_sha256"]:
+        return "candidate"
+    return "unresolved"
+
+
+def _verified_backup(item: dict[str, Any]) -> bytes:
+    """The backup bytes, only if they still hash to the recorded original."""
+    backup = item["backup_path"]
+    data = _read_optional(Path(backup)) if backup else None
+    if data is None or _sha256(data) != item["original_sha256"] or item["backup_sha256"] != item["original_sha256"]:
+        raise MigrationApplyError(
+            f"backup {backup} is missing or does not match the recorded original; nothing was restored"
+        )
+    return data
+
+
+def _roll_back(record: dict[str, Any], targets: dict[str, Path]) -> list[str]:
+    """Return own-result targets to their originals; report the unresolved ones.
+
+    Every needed backup is verified before the first write. Files matching
+    neither their original nor this migration's result are left untouched.
+    """
+    states = {key: _classify(record["targets"][key], target) for key, target in targets.items()}
+    restore = [key for key, state in states.items() if state == "candidate"]
+    backups = {
+        key: _verified_backup(record["targets"][key])
+        for key in restore if record["targets"][key]["original_sha256"] is not None
+    }
+    for key in restore:
+        item, target = record["targets"][key], targets[key]
+        if key in backups:
+            _publish(target, backups[key], expected=item["candidate_sha256"])
+        else:
+            _require_current(target, item["candidate_sha256"])
+            os.unlink(str(target))
+            _fsync_dir(target.parent)
+        if _sha256(_read_optional(target)) != item["original_sha256"]:
+            raise MigrationApplyError(f"{target} did not verify after restoration")
+    return [str(targets[key]) for key, state in states.items() if state == "unresolved"]
+
+
+def _validate_candidate_config(candidate: dict[str, Any]) -> None:
+    """Structural validation of the new config; never resolves env:/sec: values."""
+    _validate_provider_structure(candidate)
+    _reject_removed_fields(candidate)
+
+
+def _plan_apply(paths: XDGPaths, preview: MigrationPreview, config_original: bytes) -> _ApplyPlan:
+    """Validate everything needed for apply without writing anything."""
+    if preview.candidate_config_text is None:
+        raise MigrationApplyError("the preview produced no candidate configuration")
+    candidate = preview.candidate_config_text.encode("utf-8")
+    _validate_candidate_config(_toml.loads(preview.candidate_config_text))
+
+    settings_path = paths.models_config_file
+    before = _read_optional(settings_path)
+    loaded = ModelSettings(settings_path, read_only=True).load()
+    if _read_optional(settings_path) != before:
+        raise MigrationApplyError(f"managed settings {settings_path} changed while being read; rerun")
+    if loaded.status == "corrupt":
+        raise MigrationApplyError(
+            f"managed settings {settings_path} are not a valid catalog document; "
+            "repair or move the file aside, then rerun"
+        )
+    seed = preview.candidate_default_model
+    document: CatalogDocument | None = None
+    if loaded.status == "missing":
+        if before is not None:
+            raise MigrationApplyError(f"managed settings {settings_path} changed while being read; rerun")
+        if seed is not None:
+            document = CatalogDocument(1, 1, seed, (), (), ())
+    else:
+        if before is None or loaded.document is None:
+            raise MigrationApplyError(f"managed settings {settings_path} changed while being read; rerun")
+        if seed is not None and loaded.document.default_model is None:
+            document = replace(loaded.document, default_model=seed, revision=loaded.document.revision + 1)
+
+    for target, original in ((paths.config_file, config_original), (settings_path, before)):
+        if original is None:
+            continue
+        existing = _read_optional(_backup_path(target))
+        if existing is not None and existing != original:
+            raise MigrationApplyError(
+                f"backup {_backup_path(target)} already exists with other content; move it aside and rerun"
+            )
+    return _ApplyPlan(config_original, candidate, before, document, seed if document is not None else None)
+
+
+def _stage(plan: _ApplyPlan, stage_dir: Path, targets: dict[str, Path]) -> tuple[dict[str, Path | None], dict[str, str | None]]:
+    """Write and re-validate both staged results; return stage paths and candidate hashes."""
+    config_stage = stage_dir / targets["config"].name
+    _write_new(config_stage, plan.config_candidate)
+    staged = _read_optional(config_stage)
+    try:
+        if staged is None or _toml.loads(staged.decode("utf-8")) != _toml.loads(plan.config_candidate.decode("utf-8")):
+            raise MigrationApplyError("the staged configuration did not read back identically")
+    except (UnicodeDecodeError, _toml.TOMLDecodeError):
+        raise MigrationApplyError("the staged configuration is not valid TOML") from None
+    stages: dict[str, Path | None] = {"config": config_stage, "settings": None}
+    settings_candidate = plan.settings_original
+    if plan.settings_document is not None:
+        settings_stage = stage_dir / targets["settings"].name
+        ModelSettings(settings_stage).write(plan.settings_document)
+        reloaded = ModelSettings(settings_stage, read_only=True).load()
+        if reloaded.status != "valid" or reloaded.document != plan.settings_document:
+            raise MigrationApplyError("the staged managed settings did not reload as the expected document")
+        stages["settings"] = settings_stage
+        settings_candidate = _read_optional(settings_stage)
+    return stages, {"config": _sha256(staged), "settings": _sha256(settings_candidate)}
+
+
+def _new_record(
+    agent_name: str, targets: dict[str, Path], originals: dict[str, bytes | None],
+    candidates: dict[str, str | None],
+) -> dict[str, Any]:
+    """The versioned recovery manifest bound to this agent's absolute targets."""
+    items = {}
+    for key, target in targets.items():
+        resolved = target.resolve()
+        original = _sha256(originals[key])
+        items[key] = {
+            "path": str(resolved),
+            "original_sha256": original,
+            "backup_path": None if original is None else str(_backup_path(resolved)),
+            "backup_sha256": original,
+            "candidate_sha256": candidates[key],
+        }
+    return {"version": _MANIFEST_VERSION, "agent_name": agent_name, "phase": "prepared", "targets": items}
+
+
+def _load_manifest(manifest: Path, agent_name: str, targets: dict[str, Path]) -> dict[str, Any]:
+    """Read the active manifest, failing closed on anything unexpected."""
+    with open(manifest, "rb") as stream:
+        content = stream.read()
+    try:
+        record = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise MigrationApplyError("the recovery record is not valid JSON") from None
+    if not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != _MANIFEST_VERSION:
+        raise MigrationApplyError("the recovery record has an unsupported version")
+    if record.get("agent_name") != agent_name:
+        raise MigrationApplyError("the recovery record belongs to a different agent")
+    if record.get("phase") not in _PHASES:
+        raise MigrationApplyError("the recovery record has an unknown phase")
+    items = record.get("targets")
+    if not isinstance(items, dict) or set(items) != set(targets):
+        raise MigrationApplyError("the recovery record names unexpected targets")
+    for key, target in targets.items():
+        item = items[key]
+        if not isinstance(item, dict) or set(item) != _ITEM_KEYS:
+            raise MigrationApplyError(f"the recovery record entry for {key} is malformed")
+        resolved = target.resolve()
+        if item["path"] != str(resolved):
+            raise MigrationApplyError(f"the recovery record path for {key} is not this agent's file")
+        hashes = (item["original_sha256"], item["candidate_sha256"], item["backup_sha256"])
+        if not all(value is None or (isinstance(value, str) and _SHA256.fullmatch(value)) for value in hashes):
+            raise MigrationApplyError(f"the recovery record hashes for {key} are malformed")
+        original = item["original_sha256"]
+        expected_backup = (None, None) if original is None else (str(_backup_path(resolved)), original)
+        if (item["backup_path"], item["backup_sha256"]) != expected_backup:
+            raise MigrationApplyError(f"the recovery record backup for {key} is not the expected file")
+    return record
+
+
+def _abort(
+    exc: BaseException, record: dict[str, Any] | None, manifest: Path, targets: dict[str, Path],
+) -> int:
+    """Roll back after an in-process failure; never touch operator edits."""
+    logger.error("Apply failed: %s", exc)
+    if record is None:
+        logger.error("No configuration or settings file was changed.")
+        return 1
+    if record["phase"] == "completed":
+        # A completed record could stay authoritative over the mixed state an
+        # interrupted rollback leaves behind; durably mark the rollback first.
+        try:
+            _mark_interrupted(manifest, record)
+        except OSError as mark_exc:
+            logger.error(
+                "Automatic rollback was not started (%s): the completed recovery record %s "
+                "could not be marked. Run with --recover; the record was kept.",
+                mark_exc, manifest,
+            )
+            return 1
+    try:
+        unresolved = _roll_back(record, targets)
+    except (OSError, MigrationApplyError) as rollback_exc:
+        logger.error("Automatic rollback stopped (%s); the recovery record %s was kept. "
+                     "Fix the cause, then run with --recover.", rollback_exc, manifest)
+        return 1
+    if unresolved:
+        logger.error("Left untouched because they changed during the migration: %s. Review them, then "
+                     "run with --recover; the recovery record %s was kept.", ", ".join(unresolved), manifest)
+        return 1
+    try:
+        _clear_manifest(manifest)
+    except OSError:
+        logger.warning("Could not remove the recovery record %s; run with --recover to clear it.", manifest)
+    logger.error("Rolled back: the original files are in place; backups were kept.")
+    return 1
+
+
+def _execute(paths: XDGPaths, agent_name: str, plan: _ApplyPlan) -> int:
+    """Stage, back up, record and replace both files; roll back on failure."""
+    manifest = paths.config_home / _MANIFEST_NAME
+    targets = _targets(paths)
+    originals = {"config": plan.config_original, "settings": plan.settings_original}
+    record: dict[str, Any] | None = None
+    stage_dir: Path | None = None
+    try:
+        try:
+            stage_dir = Path(tempfile.mkdtemp(prefix=".models-migration-stage.", dir=paths.config_home))
+            stages, candidates = _stage(plan, stage_dir, targets)
+            for key, data in originals.items():
+                if data is not None:
+                    backup = _backup_path(targets[key])
+                    _publish(backup, data)
+                    if _sha256(_read_optional(backup)) != _sha256(data):
+                        raise MigrationApplyError(f"backup {backup} did not verify")
+            # Set before publishing: once a manifest may exist, failures roll back by hash.
+            record = _new_record(agent_name, targets, originals, candidates)
+            _publish(manifest, _encode(record))
+            for key, target in targets.items():
+                item = record["targets"][key]
+                stage = stages[key]
+                if item["candidate_sha256"] == item["original_sha256"] or stage is None:
+                    continue
+                _set_phase(manifest, record, f"writing_{key}")
+                _require_current(target, item["original_sha256"])
+                os.replace(str(stage), str(target))
+                _fsync_dir(target.parent)
+                _set_phase(manifest, record, f"{key}_written")
+            for key, target in targets.items():
+                if _sha256(_read_optional(target)) != record["targets"][key]["candidate_sha256"]:
+                    raise MigrationApplyError(f"{target} does not match the staged result after writing")
+            _set_phase(manifest, record, "completed")
+        except (OSError, ModelSettingsError, MigrationApplyError) as exc:
+            return _abort(exc, record, manifest, targets)
+        try:
+            _clear_manifest(manifest)
+        except OSError:
+            logger.warning("Migration completed, but the recovery record %s could not be removed; "
+                           "run with --recover to clear it.", manifest)
+    finally:
+        if stage_dir is not None:
+            _remove_stage(stage_dir)
+    return 0
+
+
+def _remove_stage(stage_dir: Path) -> None:
+    """Remove the private staging directory and anything left in it."""
+    try:
+        for name in os.listdir(stage_dir):
+            _discard(stage_dir / name)
+        os.rmdir(stage_dir)
+    except OSError:
+        logger.warning("could not remove staging directory %s", stage_dir)
+
+
+def _apply(paths: XDGPaths, agent_name: str, scheduler_path: str) -> int:
+    """Apply a complete preview under the agent lock; refusals precede any write."""
+    manifest = paths.config_home / _MANIFEST_NAME
+    if os.path.lexists(manifest):
+        logger.error("An earlier migration is pending (%s); run with --agent-name %s --recover first. "
+                     "Nothing was changed.", manifest, agent_name)
+        return 1
+    try:
+        _require_real_targets(paths)
+    except MigrationApplyError as exc:
+        logger.error("Apply refused before any write: %s", exc)
+        return 1
+    config_text, preview = _load_preview(str(paths.config_file), scheduler_path)
+    if preview.complete and preview.candidate_config_text is None:
+        print(f"Nothing to migrate in {paths.config_file}; no file was changed.")
+        return 0
+    if not preview.complete or preview.candidate_config_text is None:
+        print(render_preview(preview), end="")
+        logger.error("Apply refused: the preview requires operator action (see 'Stopped' and 'Notes'). "
+                     "Nothing was changed.")
+        return 1
+    try:
+        plan = _plan_apply(paths, preview, config_text.encode("utf-8"))
+    except (ConfigError, ModelSettingsError, MigrationApplyError, OSError) as exc:
+        logger.error("Apply refused before any write: %s", exc)
+        return 1
+    code = _execute(paths, agent_name, plan)
+    if code == 0:
+        _report_applied(paths, preview, plan)
+    return code
+
+
+def _report_applied(paths: XDGPaths, preview: MigrationPreview, plan: _ApplyPlan) -> None:
+    """Print what the successful apply changed and discarded."""
+    lines = [f"Applied legacy model migration to {paths.config_file} "
+             f"(backup {_backup_path(paths.config_file)})."]
+    if plan.settings_document is None:
+        lines.append(f"Managed settings {paths.models_config_file} unchanged.")
+    else:
+        lines.append(f"Managed settings {paths.models_config_file}: remembered selection seeded "
+                     f"to {plan.seeded}.")
+    if plan.settings_original is not None:
+        lines.append(f"Managed settings backup: {_backup_path(paths.models_config_file)}.")
+    lines.append("Discarded values (not promoted):")
+    lines.extend(f"  {d['key']}: {d['reason']}" for d in preview.discarded_values)
+    print("\n".join(lines))
+
+
+def _refuse_unresolved(
+    record: dict[str, Any], targets: dict[str, Path], manifest: Path, reason: str,
+) -> int:
+    """Fail closed on a state only the operator can resolve, keeping evidence."""
+    states = {
+        key: _classify(record["targets"][key], target) for key, target in targets.items()
+    }
+    detail = ", ".join(f"{key} is at its {state}" for key, state in states.items())
+    logger.error(
+        "Recovery refused (%s): the state is unresolved — %s. Resolve the files manually "
+        "(a verified backup sits beside each one), then rerun with --recover; "
+        "the recovery record %s was kept.", reason, detail, manifest,
+    )
+    return 1
+
+
+def _recover(paths: XDGPaths, agent_name: str) -> int:
+    """Resolve an interrupted apply by content hash, never trusting the phase alone."""
+    manifest = paths.config_home / _MANIFEST_NAME
+    if not os.path.lexists(manifest):
+        print("No pending model migration; nothing to recover.")
+        return 0
+    targets = _targets(paths)
+    try:
+        record = _load_manifest(manifest, agent_name, targets)
+        states = {
+            key: _classify(record["targets"][key], target) for key, target in targets.items()
+        }
+        if record["phase"] == "completed":
+            if any(state != "candidate" for state in states.values()):
+                # Post-rollback residue must never be cleared as committed.
+                return _refuse_unresolved(
+                    record, targets, manifest,
+                    "the completed recovery record does not match the current files",
+                )
+            _clear_manifest(manifest)
+            print("The migration had completed; nothing was rolled back and the recovery record was cleared.")
+            return 0
+        if record["phase"] == "interrupted_rollback" and "original" in states.values():
+            # Some files were already restored when the rollback was interrupted;
+            # the residue is not something recovery should finish silently.
+            return _refuse_unresolved(
+                record, targets, manifest, "an earlier rollback was interrupted part-way",
+            )
+        unresolved = _roll_back(record, targets)
+    except (OSError, MigrationApplyError) as exc:
+        logger.error("Recovery refused: %s. The recovery record %s was kept.", exc, manifest)
+        return 1
+    if unresolved:
+        logger.error("Left untouched (matches neither its original nor this migration's result): %s. "
+                     "Resolve it manually, then rerun --recover; the recovery record %s was kept.",
+                     ", ".join(unresolved), manifest)
+        return 1
+    try:
+        _clear_manifest(manifest)
+    except OSError as exc:
+        logger.error("Files are restored, but the recovery record %s could not be removed (%s).", manifest, exc)
+        return 1
+    print("Recovered: files written by the interrupted migration were restored; backups were kept.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -649,27 +1221,60 @@ def _read_text(path: str, label: str) -> str:
     sys.exit(1)
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Print the migration preview; exit 0 when a report is produced."""
-    parser = argparse.ArgumentParser(
-        description="Preview migrating legacy [[models]] configuration to [providers.<id>] connections.",
-        epilog="Preview only: nothing is written. --apply is not available in this release.",
-    )
-    parser.add_argument("--config", default="config.toml", help="Path to config.toml (default: config.toml)")
-    parser.add_argument("--scheduler-config", default="",
-                        help="Optional scheduler.toml, read only to report per-job fallback_models")
-    args = parser.parse_args(argv)
-
-    config_text = _read_text(args.config, "Config")
-    scheduler_text = _read_text(args.scheduler_config, "Scheduler config") if args.scheduler_config else None
+def _load_preview(config_path: str, scheduler_path: str) -> tuple[str, MigrationPreview]:
+    """Read the inputs and build the preview, or exit 1 naming the bad file."""
+    config_text = _read_text(config_path, "Config")
+    scheduler_text = _read_text(scheduler_path, "Scheduler config") if scheduler_path else None
     try:
-        preview = preview_migration(config_text, scheduler_text)
+        return config_text, preview_migration(config_text, scheduler_text)
     except MigrationInputError as exc:
-        source = args.config if "scheduler" not in str(exc) else args.scheduler_config
+        source = config_path if "scheduler" not in str(exc) else scheduler_path
         logger.error("%s: %s; fix the syntax and rerun", source, exc)
         sys.exit(1)
-    print(render_preview(preview), end="")
-    sys.exit(0)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Preview (default), ``--apply`` or ``--recover``; exit 0 on success."""
+    parser = argparse.ArgumentParser(
+        description="Preview migrating legacy [[models]] configuration to [providers.<id>] connections.",
+        epilog="Without --apply/--recover nothing is written. --apply and --recover need "
+               "--agent-name and refuse while the agent is running.",
+    )
+    parser.add_argument("--agent-name", default=None,
+                        help="Agent whose XDG config.toml/models-config.toml are migrated")
+    parser.add_argument("--config", default=None,
+                        help="Path to config.toml (default: the agent's XDG config with --agent-name, "
+                             "else ./config.toml); with --apply/--recover it must be the agent's config")
+    parser.add_argument("--scheduler-config", default="",
+                        help="Optional scheduler.toml, read only to report per-job fallback_models")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true",
+                      help="Apply a complete preview with backups and a recovery manifest")
+    mode.add_argument("--recover", action="store_true",
+                      help="Roll back or finish an interrupted --apply")
+    args = parser.parse_args(argv)
+    if (args.apply or args.recover) and not args.agent_name:
+        parser.error("--apply and --recover require --agent-name NAME")
+    if args.agent_name is not None and not _AGENT_NAME.fullmatch(args.agent_name):
+        parser.error("--agent-name must match [A-Za-z0-9][A-Za-z0-9._-]*")
+    paths = xdg_paths(args.agent_name) if args.agent_name else None
+    config_path = args.config or (str(paths.config_file) if paths is not None else "config.toml")
+
+    if paths is None or not (args.apply or args.recover):
+        _, preview = _load_preview(config_path, args.scheduler_config)
+        print(render_preview(preview), end="")
+        sys.exit(0)
+
+    if Path(config_path).resolve() != paths.config_file.resolve():
+        logger.error("--config %s is not the config of agent %r (%s); nothing was changed",
+                     config_path, args.agent_name, paths.config_file)
+        sys.exit(1)
+    with PidFileLock(str(paths.pid_file)):
+        if args.apply:
+            code = _apply(paths, args.agent_name, args.scheduler_config)
+        else:
+            code = _recover(paths, args.agent_name)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

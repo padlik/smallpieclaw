@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Iterator
 
+import httpx
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -982,6 +983,72 @@ def test_root_scheduled_provider_failure_is_one_attempt_without_fallback(
     assert (record["run_id"], record["status"], record["success"], record["model"]) == (
         run_id, "failed", False, OTHER_ID,
     )
+    assert after.notices == []
+    assert after.tracked is False and after.active_children == []
+    assert _selector_warnings(caplog) == []
+    assert after.view == probe.view_before and after.settings == probe.settings_before
+    assert after.toml == probe.toml_before
+    assert after.llm_clients == 1 and after.llm_closed == [True] and after.http_open == []
+    assert scheduled_root.unexpected == [] and scheduled_root.open_clients_at_exit == []
+
+
+_GEM_CHAT_PATH = "/v1beta/models/gem-1:generateContent"
+
+
+@pytest.mark.parametrize(
+    ("messages", "provider_context_error", "sent", "error_text"),
+    [
+        pytest.param(
+            [{"role": "user", "content": "describe", "images": ["fake-image"]}], False, 0,
+            "does not have verified vision support", id="capability-vision-unverified",
+        ),
+        pytest.param(
+            [{"role": "user", "content": "word " * 60_000}], False, 0,
+            "rejected by local budget", id="context-exceeds-local-budget",
+        ),
+        pytest.param(
+            [{"role": "user", "content": "ping"}], True, 1,
+            "context_length_exceeded", id="context-rejected-by-provider",
+        ),
+    ],
+)
+def test_root_scheduled_pinned_capability_or_context_failure_has_no_fallback(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    messages: list[dict], provider_context_error: bool, sent: int, error_text: str,
+) -> None:
+    """After the pin, unsupported capability or exceeded context fails that run
+    normally: no Main substitution, no second admission, no cross-model request."""
+    scheduled_root.serve_provider_chat()
+    if provider_context_error:
+        served = scheduled_root._route
+
+        def route(request: httpx.Request) -> httpx.Response:
+            """Reject the pinned model's chat as context-length exceeded."""
+            if request.method == "POST" and request.url.path == _GEM_CHAT_PATH:
+                request.read()
+                scheduled_root.requests.append(request)
+                return httpx.Response(
+                    400, json={"error": {"message": "context_length_exceeded: input too long"}},
+                )
+            return served(request)
+
+        monkeypatch.setattr(scheduled_root, "_route", route)
+
+    probe = run_scheduled_root(scheduled_root, monkeypatch, f'"{OTHER_ID}"', messages=messages)
+
+    after = probe.after
+    assert probe.view_before.active_model_id == MAIN_ID
+    assert probe.admits == {"admit": [], "admit_scheduled": [OTHER_ID]}
+    assert probe.codes == [] and [pin.model.id for pin in probe.pins] == [OTHER_ID]
+    assert probe.resolved == ["gem"] and len(probe.creates) == 1 and len(probe.loop_calls) == 1
+    assert [(r.url.host, r.url.path) for r in after.provider_posts] == [(GEM_HOST, _GEM_CHAT_PATH)] * sent
+    (entry,) = probe.at_admission
+    (run_id,) = entry.run_ids
+    (record,) = after.records
+    assert (record["run_id"], record["status"], record["success"], record["model"]) == (
+        run_id, "failed", False, OTHER_ID,
+    )
+    assert error_text in record["result"]
     assert after.notices == []
     assert after.tracked is False and after.active_children == []
     assert _selector_warnings(caplog) == []

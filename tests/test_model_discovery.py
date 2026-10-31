@@ -497,6 +497,67 @@ def test_pagination_cycle_fails_without_partial_inventory() -> None:
     assert error.value.code == "pagination_cycle"
 
 
+_FIRST_PAGES = {
+    "anthropic": {"data": [{"id": "fresh-a"}], "has_more": True, "last_id": "cursor"},
+    "google": {"models": [{"name": "models/fresh-a", "baseModelId": "fresh-a"}], "nextPageToken": "next"},
+    "openrouter": {"data": [{"id": "fresh-a"}], "links": {"next": "/api/v1/models?offset=1"}},
+}
+_BAD_SECOND_PAGES = {
+    "anthropic": {"data": "not-a-list", "has_more": False},
+    "google": {"models": "not-a-list"},
+    "openrouter": {"data": "not-a-list"},
+}
+
+
+@pytest.mark.parametrize("adapter", ["anthropic", "google", "openrouter"])
+@pytest.mark.parametrize("failure", ["http-503", "malformed"])
+def test_second_page_failure_keeps_last_good_inventory_stale_without_partial_merge(
+    adapter, failure, tmp_path
+) -> None:
+    """A refresh ending on an incomplete page never replaces the prior inventory."""
+    from config_schema import ProviderConfig, ResolvedProviderConnection
+    from model_registry import ModelMetadata, ModelRecord, ModelRegistry
+
+    cached = ModelRecord(
+        "account/cached", "account", "cached", "Cached",
+        ModelMetadata(100, None, None, None, None, None, (("context_tokens", "provider"),)),
+    )
+    settings = ModelSettings(tmp_path / "models-config.toml")
+    settings.write(CatalogDocument(
+        1, 2, None, (ProviderState("account", adapter, "2026-09-01T00:00:00Z", "fresh"),),
+        (cached,), (),
+    ))
+    pages: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pages.append(request)
+        if len(pages) == 1:
+            return httpx.Response(200, json=_FIRST_PAGES[adapter])
+        if failure == "http-503":
+            return httpx.Response(503, text="unavailable")
+        return httpx.Response(200, json=_BAD_SECOND_PAGES[adapter])
+
+    def resolve(config: ProviderConfig) -> ResolvedProviderConnection:
+        return ResolvedProviderConnection(
+            config.name, config.type, config.base_url, config.request_timeout, "test-secret"
+        )
+
+    registry = ModelRegistry(
+        {"account": ProviderConfig("account", adapter, "env:KEY")},
+        settings, _discovery(handler), resolve,
+    )
+    report = registry.refresh()
+
+    assert len(pages) == 2, report
+    view = registry.view()
+    assert view.models == (cached,)
+    assert view.providers[0].status == "stale"
+    assert report.refreshed_provider_ids == ()
+    assert [code for _provider, code in report.error_codes] == [view.providers[0].sanitized_last_error_code]
+    assert settings.load().document.models == (cached,)
+    assert "fresh-a" not in settings.path.read_text(encoding="utf-8")
+
+
 def test_cloud_ollama_empty_api_key_requires_authentication_before_any_request() -> None:
     from config_schema import ResolvedProviderConnection
 

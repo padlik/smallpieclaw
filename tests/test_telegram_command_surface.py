@@ -175,6 +175,13 @@ class TestBotCommandDiscovery:
             "/status must remain in BotCommand registration"
         )
 
+    def test_context_in_bot_commands(self):
+        iface = _make_iface()
+        commands = _collect_bot_commands(iface)
+        assert "context" in commands, (
+            "/context must remain in BotCommand registration"
+        )
+
     def test_models_is_the_only_catalog_command(self):
         """Task 8.1: catalog features extend /models; no second command is added."""
         iface = _make_iface()
@@ -668,6 +675,13 @@ class TestCmdHelpOutput:
         text = _get_help_text(iface)
         assert "/reset" in text, (
             "cmd_help must still list /reset"
+        )
+
+    def test_help_includes_context(self):
+        iface = _make_iface()
+        text = _get_help_text(iface)
+        assert "/context" in text, (
+            "cmd_help must list /context"
         )
 
 
