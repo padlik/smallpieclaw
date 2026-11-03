@@ -263,3 +263,6 @@ opencode.json
 
 .DS_Store
 .venv_test/
+
+#Codegraph
+.codegraph/

@@ -1,0 +1,175 @@
+# context-monitoring Delta
+
+## Purpose
+
+Baseline: canonical `openspec/specs/context-monitoring/spec.md` on `main`; the pending predecessor `provider-model-catalog` does not change this capability. This delta replaces the canonical completion-reserve, effective-window, headroom, danger-level, and capacity-percentage contracts with informational token counts and the configured compaction threshold. `Context snapshot is a reference swap without locking` is unchanged.
+
+Final canonical Purpose (handoff for a later **authorized predecessor-then-follow-up sync**; do not edit the canonical spec during this batch): "Define informational context monitoring of estimated input tokens for system prompt, chat history, and tool definitions by MCP server, with the configured compaction threshold and model identity/liveness visible through `/context` and `context_profile`, without capacity, reserve, headroom, or danger-level calculations."
+
+## MODIFIED Requirements
+
+### Requirement: Context monitor tracks context-window consumption by category
+
+The system SHALL maintain a `ContextMonitor` on the `AgentController` that tracks estimated input tokens in three categories: system prompt, chat history, and tool definitions. The main run's ReAct loop SHALL push a snapshot each turn; sub-agent runs SHALL NOT publish to the main monitor. The monitor SHALL retain the last published snapshot when the agent is idle so that context inspection works between runs. Snapshots SHALL include counts, the configured compaction threshold, turn number, model identity, and `is_live` diagnostic metadata; they SHALL NOT contain a completion reserve, effective context window, inferred model capacity, capacity percentage, headroom, or danger level.
+
+Feature: Context monitoring
+Rule: The monitor is always on and lightweight — a reference-swap snapshot per turn, not a deep copy.
+
+#### Scenario: Monitor receives snapshot each turn during a run
+- **GIVEN** the main ReAct loop is running and the `AgentController` holds a `ContextMonitor`
+- **WHEN** a turn completes
+- **THEN** the loop SHALL publish a `ContextSnapshot` containing token estimates for system prompt, chat history, and tool definitions
+- **AND** the snapshot SHALL include the configured compaction threshold and the current turn number
+- **AND** the snapshot SHALL include the pinned model identity and `is_live` status for consumers
+- **AND** the snapshot SHALL NOT include a completion reserve or effective context window
+
+#### Scenario: Sub-agent runs do not overwrite the main snapshot
+- **GIVEN** a sub-agent run is active while the main snapshot exists
+- **WHEN** the sub-agent completes turns
+- **THEN** the main monitor's snapshot is not replaced by sub-agent counts
+
+#### Scenario: Monitor retains last snapshot when idle
+- **GIVEN** the agent has completed a run and is now idle
+- **WHEN** a context inspection is requested
+- **THEN** the monitor SHALL return the last snapshot published during the run
+- **AND** the snapshot SHALL be marked as not live
+
+#### Scenario: Monitor reports no snapshot before first run
+- **GIVEN** the agent has not yet executed any run
+- **WHEN** a context inspection is requested
+- **THEN** the monitor SHALL report that no snapshot is available
+
+### Requirement: Tool definitions sub-categorised by MCP server
+
+The context monitor SHALL sub-categorise tool-definition token cost by source: built-in tools as one group, and each MCP server as a separate group identified by its server name. The per-server grouping SHALL be seeded from the full list of registered MCP servers (from the MCP manager/registry), so that servers with zero discovered tools still appear with a token cost of zero. This enables identification of MCP servers that contribute a disproportionate share of the estimated input.
+
+Built-in tools SHALL be classified by checking the tool name against the set of known built-in and pseudo-tool schema names (`BUILTIN_TOOL_SCHEMAS` and `PSEUDO_TOOL_SCHEMAS`). This classification SHALL NOT depend on the `ToolRegistry`, which is MCP-only. Tools not found in the registry and not in the builtin name set SHALL be classified as `unknown`.
+
+Feature: Context monitoring
+Rule: Tool definitions arrive in batches per MCP server — the monitor groups them so fat servers are visible. Built-in tools are identified by name, not by registry membership.
+
+#### Scenario: Tool defs grouped by server
+- **GIVEN** the agent has 21 built-in tools and MCP tools from servers "github", "filesystem", and "weather"
+- **WHEN** the monitor publishes a snapshot
+- **THEN** the snapshot SHALL include a per-server token breakdown
+- **AND** built-in tools SHALL be grouped under a "builtin" label
+- **AND** each MCP server's tools SHALL be grouped under that server's name
+- **AND** the total tool-definition token cost SHALL be defined as the sum of all per-server group estimates
+- **AND** this same total SHALL be the tool-definition part of the estimate compared with the compaction threshold
+
+#### Scenario: Built-in tools classified by schema name set, not registry
+- **GIVEN** the `ToolRegistry` contains only MCP tools (no built-in tools are registered)
+- **AND** the tool definitions list includes built-in tools such as "shell" and "memory_store"
+- **WHEN** `group_tool_defs_by_server` classifies each tool definition
+- **THEN** built-in tools whose names appear in `BUILTIN_TOOL_SCHEMAS` or `PSEUDO_TOOL_SCHEMAS` SHALL be grouped under "builtin"
+- **AND** the `unknown` group SHALL NOT contain any built-in tools
+- **AND** the `builtin` group SHALL contain all built-in and pseudo-tool definitions
+
+#### Scenario: MCP server with no tools contributes zero
+- **GIVEN** an MCP server is registered but has discovered zero tools
+- **WHEN** the monitor publishes a snapshot
+- **THEN** that server SHALL appear with a token cost of zero
+- **AND** the server SHALL be listed so the operator can see it is connected but empty
+
+### Requirement: Context snapshot refreshable outside the ReAct loop
+
+The context monitor SHALL support partial snapshot refresh when tool definitions change outside the ReAct loop. After tool-changing Telegram commands (`/mcp on`, `/mcp off`, `/mcp auth`, `/mcp auth revoke`), the system SHALL recompute `tool_defs_by_server` and `tool_defs_tokens` from the current tool definitions and publish an updated snapshot via `dataclass_replace` on the last published snapshot. System prompt tokens, chat history tokens, compaction threshold, turn number, and model identity SHALL be preserved from the last snapshot. The refreshed snapshot SHALL be marked `is_live=False`.
+
+Feature: Context monitoring
+Rule: Tool-defs data should be current even when the agent is idle — the operator needs accurate tool-defs breakdown after MCP changes.
+
+#### Scenario: Snapshot refreshed after /mcp on
+- **GIVEN** the agent is idle and the last snapshot shows `google-workspace: 0` tools
+- **WHEN** the operator runs `/mcp on google-workspace` and the server's tools are registered
+- **THEN** the context monitor SHALL publish an updated snapshot with the current `tool_defs_by_server` grouping
+- **AND** `google-workspace` SHALL show a non-zero token count reflecting its tool definitions
+- **AND** `tool_defs_tokens` SHALL be the sum of all per-server group estimates
+- **AND** `system_prompt_tokens`, `chat_history_tokens`, `compaction_threshold`, and `turn` SHALL be unchanged from the last snapshot
+- **AND** the last snapshot's model identity SHALL be unchanged
+- **AND** `is_live` SHALL be `False`
+
+#### Scenario: Snapshot refreshed after /mcp off
+- **GIVEN** the agent is idle and the last snapshot shows `mcp-atlassian: 33,373` tokens
+- **WHEN** the operator runs `/mcp off mcp-atlassian` and the server's tools are unregistered
+- **THEN** the context monitor SHALL publish an updated snapshot
+- **AND** `mcp-atlassian` SHALL show a token cost of zero
+- **AND** `tool_defs_tokens` SHALL decrease by the removed tools' token cost
+
+#### Scenario: Snapshot refreshed after /mcp auth success
+- **GIVEN** the agent is idle and the last snapshot shows `google-workspace: 0` tools
+- **WHEN** the operator runs `/mcp auth google-workspace` and the OAuth flow completes successfully
+- **THEN** the newly discovered tools SHALL be registered in the `ToolRegistry`
+- **AND** the context monitor SHALL publish an updated snapshot with the tools attributed to `google-workspace`
+- **AND** `google-workspace` SHALL show a non-zero token count
+
+#### Scenario: Snapshot refreshed after /mcp auth revoke
+- **GIVEN** the agent is idle and the last snapshot shows `google-workspace` with a non-zero token count
+- **WHEN** the operator runs `/mcp auth revoke google-workspace`
+- **THEN** the context monitor SHALL publish an updated snapshot
+- **AND** `google-workspace` SHALL show a token cost of zero
+- **AND** `tool_defs_tokens` SHALL decrease by the removed tools' token cost
+
+#### Scenario: No snapshot to refresh
+- **GIVEN** the agent has not yet executed any run and no snapshot has been published
+- **WHEN** a tool-changing command is executed
+- **THEN** no snapshot refresh SHALL be attempted
+- **AND** the next ReAct loop run SHALL publish a fresh snapshot with current tool definitions
+
+### Requirement: /context Telegram command renders summary dashboard
+
+The `/context` command SHALL read the latest snapshot from the context monitor and render a summary showing the pinned model identity, estimated token counts for system prompt, chat history, and tool definitions, their total, the configured compaction threshold, and tool definitions grouped by MCP server. It SHALL NOT show a context window, capacity percentage, completion reserve, headroom, or danger level. The command SHALL work both mid-run (live snapshot) and idle (last snapshot).
+
+Feature: Context monitoring
+Rule: Summary only — key points, not a detailed research view.
+
+#### Scenario: /context shows dashboard with live snapshot
+- **GIVEN** the agent is running and the monitor has a live snapshot
+- **WHEN** an authorized operator runs `/context`
+- **THEN** the response SHALL show the model name and live indicator
+- **AND** the response SHALL show token counts for system prompt, chat history, and tool definitions, their total, and the compaction threshold
+- **AND** the response SHALL show tool definitions grouped by MCP server
+- **AND** the response SHALL NOT show a context window, percentage, completion reserve, headroom, or danger level
+
+#### Scenario: /context shows dashboard with last snapshot when idle
+- **GIVEN** the agent is idle and the monitor retains the last snapshot from the previous run
+- **WHEN** an authorized operator runs `/context`
+- **THEN** the response SHALL show the counts with a not-live indicator
+- **AND** the response SHALL note that the snapshot is from the last run
+
+#### Scenario: /context reports no snapshot available
+- **GIVEN** the agent has not yet executed any run
+- **WHEN** an authorized operator runs `/context`
+- **THEN** the response SHALL state that no context snapshot is available yet
+
+### Requirement: context_profile built-in tool returns JSON snapshot
+
+The `context_profile` built-in tool SHALL return a compact JSON snapshot from the context monitor. The tool is informational only — it does not perform any action or trigger any automatic behavior. The tool is not confirmation-capable.
+
+Feature: Context monitoring
+Rule: The agent can inspect its own context consumption to make informed decisions about finishing early or avoiding sub-agents.
+
+#### Scenario: context_profile returns snapshot
+- **GIVEN** the agent calls the `context_profile` built-in tool
+- **WHEN** the tool executes
+- **THEN** the result SHALL be a JSON object containing total_tokens, compaction_threshold, breakdown by category, tool_defs_by_server, model identity, is_live, and turn
+- **AND** `total_tokens` SHALL be the sum of system_prompt_tokens + chat_history_tokens + tool_defs_tokens
+- **AND** the result SHALL include an `is_live` boolean indicating whether the snapshot is from a running turn
+- **AND** the result SHALL NOT contain danger_level, headroom_real, completion_reserve, or effective_window
+
+#### Scenario: context_profile is not confirmation-capable
+- **GIVEN** the built-in executor
+- **WHEN** the confirmation-capable built-ins are enumerated
+- **THEN** `context_profile` SHALL NOT be in the confirmation-capable set
+
+#### Scenario: context_profile is enumerated as a built-in
+- **GIVEN** the built-in executor
+- **WHEN** a caller queries `is_builtin("context_profile")` or lists `all_tools`
+- **THEN** `context_profile` SHALL be reported as a built-in
+
+## REMOVED Requirements
+
+### Requirement: Danger level computed from real headroom
+
+**Reason**: Danger level and headroom imply a known model capacity; context monitoring becomes informational counts compared only with the configured compaction threshold.
+
+**Migration**: Read the token counts and `compaction_threshold` from `/context` or `context_profile`; no danger or headroom field remains.
