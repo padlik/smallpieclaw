@@ -1654,12 +1654,3 @@ class TestRealGraphContract:
         hits, misses, injections = self._counters(store)
         assert hits + misses == 1
         assert injections == hits
-
-    def test_prepare_is_read_only_until_commit(self, store):
-        before = self._counters(store)
-        prepared = store.prepare_for_prompt("anything", max_entries=3)
-        assert isinstance(prepared.text, str)
-        assert self._counters(store) == before
-        prepared.commit_metrics()
-        after = self._counters(store)
-        assert sum(after) - sum(before) >= 1

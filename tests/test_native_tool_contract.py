@@ -20,7 +20,9 @@ from config_schema import AgentConfig, ResolvedProviderConnection
 from interfaces import ChatResponse, LLMProvider, ToolCall
 from llm_client import LLMClient
 from model_registry import ModelMetadata, ModelRecord, RunModel
-from tests.execution_harness import NativeScriptedLLM, RecordingExecutor, run_react
+from providers._errors import LLMPermanentError
+from react_loop import _LoopState, _prepare_request
+from tests.execution_harness import NativeScriptedLLM, RecordingExecutor, build_context, run_react
 from tests.run_model_fixtures import make_run_model_client
 from tool_registry import Tool
 
@@ -406,6 +408,47 @@ def test_real_loop_reuses_cached_full_definitions_on_every_native_request(
     assert tool_ids == ["call-a", "call-c"]
 
 
+_FAKE_MCP_CANARY = "sk-canary-unregistered-2p2-not-a-vault-value"
+
+
+def test_ordinary_mcp_schema_failure_falls_back_without_leaking_exception_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An ordinary run whose MCP boundary fails while building schemas keeps the
+    built-in definitions on the wire and never renders the failure text, which may
+    carry an arbitrary non-vault credential, in the result or any raw log record."""
+
+    def failing_tools() -> list[Tool]:
+        raise RuntimeError(f"schema listing failed auth={_FAKE_MCP_CANARY}")
+
+    captured: list[httpx.Request] = []
+    client = make_run_model_client(
+        "openai", _scripted_transport([_openai_text(_FINISH_TEXT)], captured),
+        metadata=_NATIVE_META, upstream_id="native-model",
+    )
+    try:
+        with caplog.at_level("DEBUG"):
+            result, _calls, _progress = run_react(
+                client, RecordingExecutor(), "do it",
+                mcp_manager=SimpleNamespace(get_tools=failing_tools),
+            )
+    finally:
+        client.close()
+
+    assert result == "done"
+    assert len(captured) == 1
+    assert json.loads(captured[0].content)["tools"] == _as_wire(build_tool_definitions())
+    assert any(
+        r.levelname == "WARNING" and r.name == "react_loop" and "MCP tools skipped" in r.getMessage()
+        for r in caplog.records
+    )
+    assert _FAKE_MCP_CANARY not in result
+    assert _FAKE_MCP_CANARY not in caplog.text
+    for record in caplog.records:
+        assert _FAKE_MCP_CANARY not in record.getMessage()
+        assert record.exc_info is None or _FAKE_MCP_CANARY not in repr(record.exc_info[1])
+
+
 _CHAT_SIGNATURES = {
     "chat": ((("messages", inspect.Parameter.empty), ("system", None), ("progress_cb", None),
               ("json_mode", False)), "str"),
@@ -475,3 +518,175 @@ def test_compatibility_alias_propagates_failure_from_one_pinned_send(
     wire = json.loads(captured[0].content)
     assert wire["model"] == "native-model"
     assert ("tools" in wire) is native
+
+
+# ---------------------------------------------------------------------------
+# Native group integrity on a real httpx.MockTransport client (relocated from
+# tests/test_request_preparation.py in simplify-model-runtime task 2.2).
+# PHASE2 (tasks 6.7/10.1): the entry point ``_prepare_request`` is the
+# preview-fit preparation slated for removal; rewrite only the call to the
+# ordinary send path, preserving the wire/native/zero-HTTP assertions.
+# ---------------------------------------------------------------------------
+
+FINISH = {"choices": [{"message": {"content": '{"action":"finish","result":"done"}'}}]}
+SUMMARY = {"choices": [{"message": {"content": "- earlier steps summarized"}}]}
+
+
+def _client(handler, metadata, adapter="openai"):
+    return make_run_model_client(
+        adapter, httpx.MockTransport(handler), metadata=metadata, upstream_id="prep-model"
+    )
+
+
+def _recording(requests):
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        body = request.content.decode()
+        return httpx.Response(200, json=SUMMARY if "Summarize these" in body else FINISH)
+
+    return handler
+
+
+TOOL_DEF = {
+    "type": "function",
+    "function": {"name": "probe", "description": "d", "parameters": {"type": "object", "properties": {}}},
+}
+
+
+class TestNativeGroupsOnRealClient:
+    def test_orphan_reproduction_yields_valid_native_wire(self):
+        requests = []
+        client = _client(_recording(requests), ModelMetadata(context_tokens=4_000, output_tokens=200))
+        ctx = build_context(client, RecordingExecutor())
+        ctx._tool_defs = [TOOL_DEF]
+        messages = [
+            {"role": "user", "content": "GOAL"},
+            {"role": "assistant", "content": "thinking " + "t " * 2500},
+            {"role": "assistant", "content": "plan " + "p " * 2500, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "probe", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "probe", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "ra " + "x " * 2500},
+            {"role": "tool", "tool_call_id": "b", "content": "rb " + "y " * 2500},
+        ]
+        state = _LoopState(messages=messages, goal_idx=0, max_steps=3)
+        try:
+            _prepare_request(ctx, state, "s", 4_000, True)
+            out = state.messages
+            assert out[state.goal_idx] == {"role": "user", "content": "GOAL"}
+            ids = [m["tool_call_id"] for m in out if m["role"] == "tool"]
+            calls = [c["id"] for m in out for c in m.get("tool_calls") or []]
+            assert sorted(ids) == sorted(calls)
+            for i, m in enumerate(out):
+                if m["role"] == "tool":
+                    j = i
+                    while out[j]["role"] == "tool":
+                        j -= 1
+                    assert m["tool_call_id"] in [c["id"] for c in out[j].get("tool_calls") or []]
+            assert all("Summarize these" in r.content.decode() for r in requests)
+        finally:
+            client.close()
+
+
+def _bad_groups() -> dict[str, list[dict]]:
+    ok = {"id": "a", "type": "function", "function": {"name": "probe", "arguments": "{}"}}
+
+    def group(call, result):
+        return [{"role": "assistant", "content": None, "tool_calls": [call]}, result]
+
+    tool = {"role": "tool", "tool_call_id": "a", "content": "r"}
+    return {
+        "wrong_type": group({**ok, "type": "not-function"}, tool),
+        "missing_args": group({**ok, "function": {"name": "probe"}}, tool),
+        "invalid_json": group({**ok, "function": {"name": "probe", "arguments": "not-json"}}, tool),
+        "list_id": group(ok, {**tool, "tool_call_id": ["a"]}),
+        "dict_id": group(ok, {**tool, "tool_call_id": {"a": 1}}),
+    }
+
+
+class TestNativeValidationOnRealClient:
+    @pytest.mark.parametrize("case", sorted(_bad_groups()))
+    @pytest.mark.parametrize("forced", [False, True])
+    def test_malformed_group_fails_with_zero_http(self, case, forced):
+        import copy
+
+        requests = []
+        client = _client(_recording(requests), ModelMetadata(context_tokens=4_000, output_tokens=200))
+        ctx = build_context(client, RecordingExecutor())
+        ctx._tool_defs = [TOOL_DEF]
+        messages = [{"role": "user", "content": "GOAL"}] + _bad_groups()[case]
+        if forced:
+            messages += [{"role": "assistant", "content": "z " * 3000}, {"role": "user", "content": "y " * 3000}]
+        before = copy.deepcopy(messages)
+        state = _LoopState(messages=messages, goal_idx=0, max_steps=3)
+        try:
+            with pytest.raises(LLMPermanentError) as info:
+                _prepare_request(ctx, state, "s", 4_000, True)
+            assert info.value.__cause__ is None and info.value.__context__ is None
+            assert requests == []
+            assert state.messages == before
+        finally:
+            client.close()
+
+    def test_reused_supplied_ids_across_complete_groups_send_unchanged(self):
+        import copy
+
+        from interfaces import ToolCall
+        from native_turns import _append_native_tool_result
+
+        requests = []
+        client = _client(_recording(requests), ModelMetadata(context_tokens=4_000, output_tokens=200))
+        ctx = build_context(client, RecordingExecutor())
+        ctx._tool_defs = [TOOL_DEF]
+        messages = [{"role": "user", "content": "GOAL"}]
+        _append_native_tool_result(messages, ToolCall(id="call_0", name="probe", arguments={"n": 1}), "r1")
+        _append_native_tool_result(messages, ToolCall(id="call_0", name="probe", arguments={"n": 2}), "r2")
+        before = copy.deepcopy(messages)
+        state = _LoopState(messages=messages, goal_idx=0, max_steps=3)
+        try:
+            _prepare_request(ctx, state, "s", 4_000, False)
+            assert state.messages == before
+            client.chat([{"role": "system", "content": "s"}] + state.messages)
+            body = requests[-1].content.decode()
+            assert body.count('"call_0"') >= 4
+        finally:
+            client.close()
+
+
+class TestMalformedHistoryRealClient:
+    SECRET = "SECRET-MARK"
+
+    def _state(self, extra_old: bool):
+        a, b = f"a-{self.SECRET}", f"b-{self.SECRET}"
+        messages = []
+        if extra_old:
+            messages.append({"role": "user", "content": "old " + "alpha beta " * 3000})
+        messages += [
+            {"role": "user", "content": "GOAL"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": a, "type": "function", "function": {"name": "probe", "arguments": "{}"}},
+                {"id": b, "type": "function", "function": {"name": "probe", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": a, "content": "result"},
+        ]
+        return messages, 1 if extra_old else 0
+
+    @pytest.mark.parametrize("oversized", [True, False], ids=["oversized", "fits"])
+    def test_incomplete_group_makes_zero_total_http(self, oversized):
+        import copy
+
+        requests = []
+        client = _client(_recording(requests), ModelMetadata(context_tokens=10_000, output_tokens=200))
+        ctx = build_context(client, RecordingExecutor())
+        ctx._tool_defs = [TOOL_DEF]
+        messages, goal_idx = self._state(oversized)
+        before = copy.deepcopy(messages)
+        state = _LoopState(messages=messages, goal_idx=goal_idx, max_steps=3)
+        try:
+            with pytest.raises(LLMPermanentError) as info:
+                _prepare_request(ctx, state, "s", 10_000, True)
+            assert self.SECRET not in str(info.value)
+            assert requests == []
+            assert state.messages == before
+        finally:
+            client.close()

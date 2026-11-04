@@ -1080,7 +1080,10 @@ def _ensure_tool_defs(
     except Exception as _btd_exc:  # noqa: BLE001
         if strict:
             raise
-        logger.warning("build_tool_definitions failed: %s — MCP tools skipped", _btd_exc, )
+        # The exception text may carry provider/MCP credentials; log only its type.
+        logger.warning(
+            "build_tool_definitions failed (%s) — MCP tools skipped", type(_btd_exc).__name__,
+        )
         tool_defs = build_tool_definitions(mcp_manager=None, **view_kwargs)
     ctx._tool_defs = tool_defs
     ctx._tool_defs_view = view

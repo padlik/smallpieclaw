@@ -487,6 +487,44 @@ def test_factory_client_beats_injected_llm_and_self_llm_never_swaps(make_world, 
     assert injected.close_count == 0 and factory.clients[0].close_count == 1
 
 
+
+def test_run_local_client_is_wire_client_and_pin_unchanged(make_world) -> None:
+    """Ordinary real-loop proof (task 2.2, from the guard suite): the run-local client
+    admitted by the root factory is the client on the wire, while the controller pin
+    and its transport stay untouched."""
+    w = make_world()
+    finish = {"choices": [{"message": {"content": '{"action":"finish","result":"done"}'}}],
+              "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+    pinned_requests: list[httpx.Request] = []
+
+    def pinned_wire(request: httpx.Request) -> httpx.Response:
+        pinned_requests.append(request)
+        return httpx.Response(200, json=finish)
+
+    pinned = _TrackedLLM(
+        w.registry.admit(MODEL_A.id), agent_config=AGENT,
+        http_transport=httpx.MockTransport(pinned_wire),
+    )
+    w.stack.callback(lambda: LLMClient.close(pinned))
+
+    def run_wire(request: httpx.Request) -> httpx.Response:
+        w.requests.append(request)
+        return httpx.Response(200, json=finish)
+
+    w._chat = run_wire  # transport for clients the factory admits
+    factory = _Factory(w, model_id=MODEL_B.id)
+    controller = w.controller_with(llm=pinned, run_client_factory=factory)
+    result, exc = _run(w)
+    assert exc is None and result == "done"
+    assert controller.llm is pinned
+    assert len(factory.clients) == 1 and factory.clients[0].llm_cfg["id"] == MODEL_B.id
+    assert w.requests and pinned_requests == []
+    assert {r.url.host for r in w.requests} == {"b.example.test"}
+    assert all(json.loads(r.content)["model"] == "up/b" for r in w.requests)
+    assert factory.clients[0].close_count == 1 and pinned.close_count == 0
+    w.assert_owner_free(TRACE)
+    w.assert_no_events_registered()
+
 # ---------------------------------------------------------------------------
 # Lifecycle cleanup
 # ---------------------------------------------------------------------------
@@ -591,6 +629,120 @@ def test_rejected_resume_closes_owned_client_and_keeps_checkpoint(make_world, lo
     w.assert_owner_free("r-resume001")
     w.assert_no_events_registered()
 
+
+
+def test_checkpoint_resume_keeps_pinned_model_and_saved_attempts(make_world) -> None:
+    """Ordinary real-wire proof (task 2.2, from the guard suite): resuming a checkpoint
+    pinned to B while the active selection is A sends only to B, continues the saved
+    attempt state instead of refilling it, replays no completed tool, and leaves the
+    active selection, controller pin and resumable checkpoint intact."""
+    w = make_world()
+    trace = "r-resume002"
+    messages = [
+        {"role": "user", "content": "resume goal"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call-done", "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call-done", "content": "completed tool output"},
+    ]
+    saved_attempts = {
+        "max_retries": 1, "retry_delay": 0.0, "mode": "json", "outbound_attempts": 2,
+        "automatic_retries_used": 1, "manual_retries_used": 0,
+        "manual_retry_authorized": False, "partial_output": False, "effect": False,
+    }
+    ckpt = {
+        "format_version": 2, "trace_id": trace, "user_goal": "resume goal",
+        "messages": messages, "step": 1, "goal_idx": 0, "max_steps": 8,
+        "json_fail_streak": 0, "model_id": MODEL_B.id, "attempt_state": saved_attempts,
+        "error_info": {"type": "timeout", "message": "t", "retryable": True, "detail": ""},
+        "created_at": "2026-08-21T14:30:00Z",
+    }
+    owner = w.store.acquire_owner(trace)
+    assert owner is not None
+    try:
+        assert w.store.save(trace, ckpt, owner=owner) is True
+    finally:
+        owner.release()
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        w.requests.append(request)
+        return httpx.Response(503, json={"error": {"message": "unavailable"}})
+
+    w._chat = unavailable
+    injected = w.make_client(w.registry.admit(MODEL_A.id))
+    w.requests.clear()
+    factory = _Factory(w, model_id=MODEL_B.id)
+    controller = w.controller_with(llm=injected, run_client_factory=factory)
+    controller._confirmation.request_retry = lambda *_a, **_k: "timeout"
+    result, exc = _run(w, resume_from=trace, trace_id=None)
+
+    assert exc is None and result.startswith("❌")
+    assert w.registry.view().active_model_id == MODEL_A.id
+    assert controller.llm is injected and injected.close_count == 0
+    assert len(w.requests) == 1  # one authorized manual continuation, no refilled retries
+    sent = w.requests[0]
+    assert sent.url.host == "b.example.test"
+    body = json.loads(sent.content)
+    assert body["model"] == "up/b"
+    assert "completed tool output" in sent.content.decode()
+    assert w.executor._supervisor.registered == w.executor._supervisor.unregistered
+    owner = w.store.acquire_owner(trace)
+    assert owner is not None
+    try:
+        resaved = w.store.load(trace, owner=owner)
+    finally:
+        owner.release()
+    assert resaved["model_id"] == MODEL_B.id
+    restored = CallAttemptState.from_dict(resaved["attempt_state"])
+    assert (restored.outbound_attempts, restored.automatic_retries_used, restored.manual_retries_used) == (3, 1, 1)
+    assert factory.clients[0].close_count == 1
+
+
+def test_malformed_resumed_native_group_fails_closed_before_io(make_world) -> None:
+    """Ordinary real-wire proof (task 2.2, from the guard suite): resuming a checkpoint
+    whose native tool group is interleaved fails sanitized before any provider I/O,
+    without repairing the saved history, and the run's lease, client and cancel
+    event are all released. The guard-only claims (unchanged checkpoint bytes and the
+    guard preparation message) are not part of the ordinary contract."""
+    w = make_world(history=False)  # no injected history: the ordinary, unguarded path
+    trace = "r-native002"
+    call = {"id": "c1", "type": "function", "function": {"name": "shell", "arguments": "{}"}}
+    messages = [
+        {"role": "user", "content": "goal"},
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "user", "content": "interleaved before the tool result"},
+        {"role": "tool", "tool_call_id": "c1", "content": "late result"},
+    ]
+    ckpt = {
+        "format_version": 2, "trace_id": trace, "user_goal": "goal", "messages": messages,
+        "step": 1, "goal_idx": 0, "max_steps": 8, "json_fail_streak": 0,
+        "model_id": MODEL_B.id, "attempt_state": CallAttemptState().to_dict(),
+        "error_info": {"type": "timeout", "message": "t", "retryable": True, "detail": ""},
+        "created_at": "2026-08-21T14:30:00Z",
+    }
+    owner = w.store.acquire_owner(trace)
+    assert owner is not None
+    try:
+        assert w.store.save(trace, ckpt, owner=owner) is True
+    finally:
+        owner.release()
+    factory = _Factory(w, model_id=MODEL_B.id)
+    controller = w.controller_with(llm=None, run_client_factory=factory)
+    controller._confirmation.request_retry = lambda *_a, **_k: "timeout"  # operator boundary
+    result, exc = _run(w, resume_from=trace, trace_id=None)
+
+    assert exc is None and result.startswith("❌")
+    assert "late result" not in result and "interleaved" not in result
+    assert w.requests == []
+    owner = w.store.acquire_owner(trace)
+    assert owner is not None, "checkpoint owner lease leaked"
+    try:
+        assert w.store.load(trace, owner=owner)["messages"] == messages
+    finally:
+        owner.release()
+    assert len(factory.clients) == 1 and factory.clients[0].close_count == 1
+    w.assert_no_events_registered()
 
 # ---------------------------------------------------------------------------
 # Cancellation

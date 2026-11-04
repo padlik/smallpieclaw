@@ -14,6 +14,7 @@ from checkpoint_store import CheckpointStore
 from call_attempt_state import CallAttemptState
 from confirmation import ConfirmationManager
 from llm_client import LLMCancelledError, LLMEmptyResponseError, LLMPermanentError
+from model_registry import ModelMetadata
 from react_loop import (
     LLMErrorInfo,
     ReactContext,
@@ -27,7 +28,9 @@ from tests.execution_harness import (
     RecordingExecutor,
     _NullMemory,
     _NullToolIndex,
+    run_react,
 )
+from tests.run_model_fixtures import make_run_model_client
 
 
 # ---------------------------------------------------------------------------
@@ -603,3 +606,64 @@ class TestToolResultsCount:
             and "tool '" in m.get("content", "").lower()
         )
         assert count == 2
+
+
+# ---------------------------------------------------------------------------
+# Preparation-failure checkpoint on a real httpx.MockTransport client
+# (relocated from tests/test_request_preparation.py::TestPreparationFailureState
+# in simplify-model-runtime task 2.2). PHASE2 (task 10.1): the oversized system
+# prompt reaches the failure through the preview-fit ``_prepare_request``; when
+# that entry point is retired, rewrite the trigger while preserving the
+# checkpoint-validity and zero-outbound assertions.
+# ---------------------------------------------------------------------------
+
+
+def run_failing_preparation(tmp_path):
+    """Run one real-client turn whose preparation fails, then time out the retry."""
+    from checkpoint_store import CheckpointStore
+    from confirmation import ConfirmationManager
+
+    store = CheckpointStore(str(tmp_path))
+    owner = store.acquire_owner("r-harness1")
+    assert owner is not None
+    confirmation = ConfirmationManager()
+    confirmation.request_retry = lambda *args, **kwargs: "timeout"
+    requests = []
+
+    finish = {"choices": [{"message": {"content": '{"action":"finish","result":"done"}'}}]}
+    summary = {"choices": [{"message": {"content": "- earlier steps summarized"}}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        body = request.content.decode()
+        return httpx.Response(200, json=summary if "Summarize these" in body else finish)
+
+    client = make_run_model_client(
+        "openai", httpx.MockTransport(handler),
+        metadata=ModelMetadata(context_tokens=2_000, output_tokens=200), upstream_id="prep-model",
+    )
+    try:
+        result, _calls, _progress = run_react(
+            client, RecordingExecutor(), "goal", system="system " * 5000,
+            checkpoint_store=store, checkpoint_owner=owner, checkpoint_enabled=True,
+            confirmation=confirmation,
+        )
+        return result, store, owner, requests
+    finally:
+        client.close()
+
+
+def test_timeout_saves_valid_zero_outbound_state(tmp_path):
+    from call_attempt_state import CallAttemptState
+
+    result, store, owner, requests = run_failing_preparation(tmp_path)
+    try:
+        assert result.startswith("❌")
+        assert requests == []
+        saved = store.load("r-harness1", owner=owner)
+        assert isinstance(saved["attempt_state"], dict)
+        restored = CallAttemptState.from_dict(saved["attempt_state"])
+        assert restored.outbound_attempts == 0
+        assert restored.manual_retry_authorized is False
+    finally:
+        owner.release()

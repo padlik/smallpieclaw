@@ -474,3 +474,36 @@ def test_startup_scan_no_checkpoints_sends_no_notification(tmp_path):
         notify(f"💾 Found unfinished run: '{goal}'. Send /resume to continue.")
 
     assert len(notifications) == 0
+
+
+def test_strict_resume_first_send_is_initial_attempt(tmp_path):
+    """Relocated from tests/test_request_preparation.py (task 2.2).
+
+    PHASE2 (task 10.1): the saved state comes from the preview-fit preparation
+    failure; rewrite that trigger while preserving the initial-attempt assertions.
+    """
+    from call_attempt_state import CallAttemptState
+    from react_loop import _LoopState, _request_turn
+    from tests.execution_harness import RecordingExecutor, build_context
+    from tests.test_react_loop_bounded_retry import ScriptedRequestLLM
+    from tests.test_react_loop_error_recovery import run_failing_preparation
+
+    result, store, owner, _requests = run_failing_preparation(tmp_path)
+    try:
+        saved = store.load("r-harness1", owner=owner)
+        attempt = CallAttemptState.from_dict(saved["attempt_state"])
+        before = attempt.to_dict()
+        llm = ScriptedRequestLLM(json_script=['{"action":"finish","result":"ok"}'])
+        ctx = build_context(llm, RecordingExecutor())
+        state = _LoopState(
+            messages=saved["messages"], goal_idx=saved["goal_idx"],
+            max_steps=saved["max_steps"], attempt_state=attempt,
+        )
+        turn = _request_turn(ctx, state, "system", lambda _m: None)
+        assert turn.early_return is None
+        assert llm.json_calls == 1
+        assert attempt.outbound_attempts == 1
+        assert attempt.automatic_retries_used == 0 and attempt.manual_retries_used == 0
+        assert attempt.to_dict()["max_retries"] == before["max_retries"]
+    finally:
+        owner.release()

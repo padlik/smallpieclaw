@@ -96,6 +96,28 @@ def test_prepare_does_not_touch_counters_until_commit(store):
     assert _counters(store) == (1, 0, 1)
 
 
+def test_prepare_is_read_only_until_commit(tmp_path):
+    """Relocated from tests/test_model_switch_budget_guard.py (task 2.2).
+
+    An empty real graph store (miss path): preparation is read-only until the
+    metrics commit, which then records at least one retrieval.
+    """
+    store = GraphMemoryStore(
+        db_path=str(tmp_path / "graph_guard"), embedder_fn=lambda _text: [0.1, 0.2, 0.3, 0.4],
+        embedding_dim=4, buffer_pool_mb=64,
+    )
+    try:
+        before = _counters(store)
+        prepared = store.prepare_for_prompt("anything", max_entries=3)
+        assert isinstance(prepared.text, str)
+        assert _counters(store) == before
+        prepared.commit_metrics()
+        after = _counters(store)
+        assert sum(after) - sum(before) >= 1
+    finally:
+        store.close()
+
+
 def test_discard_leaves_counters_unchanged(store):
     store.prepare_for_prompt("Alice Python")
     del_target = store.prepare_for_prompt("Alice Python")
