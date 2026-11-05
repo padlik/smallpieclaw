@@ -3,12 +3,13 @@
 Task 2.2 relocated the native-group real-client cases to
 ``tests/test_native_tool_contract.py`` and the preparation-failure checkpoint
 cases to ``tests/test_react_loop_error_recovery.py`` /
-``tests/test_agent_controller_resume.py``.
+``tests/test_agent_controller_resume.py``. Task 2.3 relocated
+``TestSummaryCall::test_cancellation_propagates_through_compaction`` to
+``tests/test_context_manager.py::test_cancellation_propagates_through_compaction``.
 """
 
 from __future__ import annotations
 
-import threading
 from unittest.mock import MagicMock
 
 import httpx
@@ -22,7 +23,6 @@ from model_request_budget import (
     repair_input_ceiling,
 )
 from providers._errors import (
-    LLMCancelledError,
     LLMContextOverflowError,
     LLMPermanentError,
 )
@@ -225,22 +225,6 @@ class TestSummaryCall:
             assert requests == []
         finally:
             client.close()
-
-    def test_cancellation_propagates_through_compaction(self):
-        ctx_cancel = threading.Event()
-        ctx_cancel.set()
-        client = MagicMock()
-        client.llm_cfg = {}
-        messages = [{"role": "user", "content": "x " * 3000} for _ in range(6)]
-
-        def summarize(_prompt):
-            raise LLMCancelledError("cancelled")
-
-        with pytest.raises(LLMCancelledError):
-            maybe_compact(
-                messages, "s", 500, client, force=True, repair_target=200,
-                input_tokens=10_000, summarize=summarize,
-            )
 
     def test_summary_failure_uses_deterministic_fallback(self):
         client = MagicMock()

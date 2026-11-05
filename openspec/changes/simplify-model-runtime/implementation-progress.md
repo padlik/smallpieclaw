@@ -41,9 +41,10 @@ This is the recovery ledger for the apply phase. It is not the frozen review log
 | 1.2 | checked by parent | isolated worktree, status inspected; obligations above continue |
 | 2.1 | complete; scoped re-review PASS for spec compliance and artifact quality; B1–B5 resolved | `test-preservation-ledger.md` / `.json`; audit `live=5399 ledger=5399 problems=[]`, body-level scan 2584 hit nodes; reviewer `ses_e5c308060ffeRxVb49jzG2bHmH` verified mappings and totals |
 | 2.2 | complete; scoped review PASS for spec compliance and task quality; final validation passed | 17 nodes relocated, 4 ordinary owner nodes added, 1 existing node cited (see `test-preservation-ledger.md` § "Task 2.2 ordinary owner proofs"). Evidence: `/private/var/folders/6s/p9xmtzd53wv7jx8zq89wqzmr0000gn/T/opencode/simplify-task-2.2/`, `correction/` and `final-validation/`. Reviewer `ses_e573a36ffffeK6U2zHzuD2sgci` approved the corrections. Audit `live=5403 ledger=5403 problems=[]`; exact ruff/vulture passed; full pytest suite: 5401 passed, 2 baseline skips, 2 warnings. Validation invoked the checks separately rather than the `make check` wrapper. Strict OpenSpec validation passed with four expected predecessor-ordering notices. |
-| 2.3–11.3 | not started | — |
+| 2.3 | complete; review PASS for spec compliance and task quality; full validation passed | 175 nodes relocated (157 `test_p2_compaction.py` keep → new `tests/test_context_manager.py`; 1 summary-cancellation node from `test_request_preparation.py` → same file; 17 `test_p2_graph_memory_admission.py` → `tests/test_graph_memory.py`, emptied source deleted). The 6 rewrite and 24 retire nodes stay in `test_p2_compaction.py`, running. See `test-preservation-ledger.md` § "Task 2.3 relocation record". Evidence: `/private/var/folders/6s/p9xmtzd53wv7jx8zq89wqzmr0000gn/T/opencode/simplify-task-2.3/` (`REPORT.md`, `task-2.3.diff`, AST proof, copied-tree mutation logs and `final-validation/`). Reviewer `ses_e525cf067ffeyTSlTbAHxv7X9R` verified the mapping and assertions. Full `make check`: 5401 passed, 2 baseline skips, 2 warnings; exact ruff/vulture clean; ledger `live=5403 ledger=5403 problems=[]`; strict OpenSpec validation passed with four expected predecessor notices. No production change. |
+| 2.4–11.3 | not started | — |
 
-Paused after task 2.2 as explicitly requested. No commit was created.
+Paused after task 2.3 as explicitly requested. No commit was created.
 
 ### User-approved scope exception (task 2.2)
 
