@@ -68,8 +68,6 @@ def _record(provider: str, upstream: str) -> ModelRecord:
         f"{provider}/{upstream}", provider, upstream, f"{upstream} display",
         ModelMetadata(
             200_000, None, 2048, False, True, None,
-            (("context_tokens", "provider"), ("output_tokens", "provider"),
-             ("tool_calling", "provider"), ("vision", "provider")),
         ),
     )
 
@@ -212,7 +210,7 @@ class _World:
         settings.write(CatalogDocument(
             1, 2, None,
             tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
-            (MODEL_A, MODEL_B), (),
+            (MODEL_A, MODEL_B),
         ))
         self.registry = _Registry(providers, settings, _NoDiscovery(), self._resolve)
         if select:
@@ -316,8 +314,10 @@ def _assert_nothing_allocated(world: _World, active_before: int) -> None:
     assert world.settings_path.read_bytes() == world.document
 
 
-def _assert_one_closed_run_on(world: _World, expected: ModelRecord) -> httpx.Request:
-    """One pinned run on *expected*: wire, usage, closed handles, Main A unchanged."""
+def _assert_one_closed_run_on(
+    world: _World, expected: ModelRecord, main: str | None = MODEL_A.id,
+) -> httpx.Request:
+    """One pinned run on *expected*: wire, usage, closed handles, *main* unchanged."""
     (pin,) = world.factory.pins
     assert pin.model == expected and world.resolved == [expected.provider_id]
     (runner,) = world.factory.runners
@@ -335,7 +335,7 @@ def _assert_one_closed_run_on(world: _World, expected: ModelRecord) -> httpx.Req
     assert not world.embed_http[0].is_closed, "borrowed embedding HTTP closed by runner"
     assert world.embed_requests == []
     assert get_registry().get(runner.agent_id) is None
-    assert world.registry.view().active_model_id == MODEL_A.id
+    assert world.registry.view().active_model_id == main
     assert world.registry.scheduled_calls == 0
     assert world.settings_path.read_bytes() == world.document
     return request
@@ -346,21 +346,20 @@ def _assert_one_closed_run_on(world: _World, expected: ModelRecord) -> httpx.Req
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("profile", ORDINARY, ids=[p.name for p in ORDINARY])
-def test_factory_explicit_b_without_main_is_refused(
+def test_factory_explicit_b_without_main_runs_pinned_b(
     make_world: Callable[..., _World], profile: RuntimeProfile,
 ) -> None:
+    """Task 4.1: an explicit selector needs no active Main; Main stays unset."""
     world = make_world(select=False)
-    active_before = len(get_registry().list_active())
 
-    with pytest.raises(ModelRegistryError) as caught:
-        world.factory(model=MODEL_B.id, runtime_profile=profile, label=f"matrix-{profile.name}")
+    runner = world.factory(model=MODEL_B.id, runtime_profile=profile, label=f"matrix-{profile.name}")
+    try:
+        assert runner.run("matrix task") == RESULT
+    finally:
+        runner.close()
 
-    assert caught.value.code == "no_active_selection"
-    assert str(caught.value) == "model registry no active selection"
-    assert world.registry.admits == [MODEL_B.id]
-    assert world.registry.errors == ["no_active_selection"]
-    _assert_nothing_allocated(world, active_before)
-    assert world.registry.view().active_model_id is None
+    assert world.registry.admits == [MODEL_B.id] and world.registry.errors == []
+    _assert_one_closed_run_on(world, MODEL_B, main=None)
 
 
 @pytest.mark.parametrize("profile", ORDINARY, ids=[p.name for p in ORDINARY])
@@ -389,27 +388,26 @@ def test_factory_explicit_b_with_main_a_runs_pinned_b(
 # B. Actual ordinary spawn path: real executor shim + real supervisor
 # ---------------------------------------------------------------------------
 
-def test_spawn_explicit_b_without_main_is_refused_before_allocation(
+def test_spawn_explicit_b_without_main_completes_on_its_own_pin(
     make_world: Callable[..., _World],
 ) -> None:
+    """Task 4.1: real spawn path admits an explicit selector with no Main selected."""
     world = make_world(select=False)
-    active_before = len(get_registry().list_active())
+    finished = threading.Event()
 
-    result = world.executor._exec_spawn_agent(
+    spawned = world.executor._exec_spawn_agent(
         {"task": "do work", "model": MODEL_B.id}, caller_depth=0, trace_id=TURN,
+        options=SupervisionOptions(finish_cb=lambda _tag: finished.set()),
     )
+    assert spawned["success"] is True and read_execution(spawned) == "executed", spawned
+    assert finished.wait(_BOUND), "finish_cb never fired"
+    assert world.executor._supervisor.drain_owned_children(TURN, cancel=False, timeout=_BOUND) == []
 
-    assert result["success"] is False and "agent_id" not in result
-    assert result["error"] == "spawn_agent: model registry no active selection"
-    assert read_execution(result) == "refused"
     (call,) = world.factory.calls
-    assert call["model"] == MODEL_B.id
-    assert call["profile"] is RuntimeProfile.ON_DEMAND_SUBAGENT
-    assert world.registry.admits == [MODEL_B.id]
-    assert world.registry.errors == ["no_active_selection"]
-    _assert_nothing_allocated(world, active_before)
+    assert call["model"] == MODEL_B.id and call["profile"] is RuntimeProfile.ON_DEMAND_SUBAGENT
     assert world.executor._supervisor.unaccounted_children(TURN) == []
-    assert world.registry.view().active_model_id is None
+    assert world.registry.admits == [MODEL_B.id] and world.registry.errors == []
+    _assert_one_closed_run_on(world, MODEL_B, main=None)
 
 
 def test_spawn_explicit_b_with_main_a_completes_through_supervisor(
@@ -472,7 +470,7 @@ def test_spawn_explicit_b_with_main_a_completes_through_supervisor(
     _assert_one_closed_run_on(world, MODEL_B)
 
 
-def test_spawn_padded_canonical_selector_is_admitted_verbatim(
+def test_spawn_padded_connection_selector_is_rejected_without_normalizing(
     make_world: Callable[..., _World],
 ) -> None:
     world = make_world(select=True)
@@ -483,12 +481,12 @@ def test_spawn_padded_canonical_selector_is_admitted_verbatim(
         {"task": "do work", "model": padded}, caller_depth=0, trace_id=TURN,
     )
 
-    assert result["error"] == "spawn_agent: model registry model not found"
+    assert result["error"] == f"spawn_agent: {ModelRegistryError('unknown_connection')}"
     assert result["success"] is False and read_execution(result) == "refused"
     (call,) = world.factory.calls
     assert call["model"] == padded
     assert world.registry.admits == [padded]
-    assert world.registry.errors == ["model_not_found"]
+    assert world.registry.errors == ["unknown_connection"]
     _assert_nothing_allocated(world, active_before)
     assert world.registry.view().active_model_id == MODEL_A.id
 

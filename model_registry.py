@@ -8,22 +8,14 @@ import re
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 if TYPE_CHECKING:
     from config_schema import ProviderConfig, ResolvedProviderConnection
     from model_discovery import ModelDiscovery, ProviderInventory
-    from model_settings import ModelSettings
+    from model_settings import ModelCache, ModelPreference, ModelSettings
 
-MetadataField = Literal[
-    "context_tokens",
-    "input_tokens",
-    "output_tokens",
-    "vision",
-    "tool_calling",
-    "reasoning",
-]
-MetadataSource = Literal["provider", "models.dev"]
 ProviderStatus = Literal["fresh", "stale"]
 SelectionStatus = Literal["active", "no_selection", "saved_selection_unavailable"]
 logger = logging.getLogger(__name__)
@@ -41,14 +33,38 @@ _SAFE_ERROR_CODES = frozenset(
         "invalid_connection",
         "invalid_inventory",
         "invalid_request",
+        "malformed_selector",
         "model_not_found",
         "no_active_selection",
         "persistence_failed",
         "selection_changed",
         "settings_load_failed",
+        "unknown_connection",
     }
 )
+_ERROR_MESSAGES = {
+    "malformed_selector": (
+        "model selector must be '<connection>/<model>' with a non-empty connection and model"
+    ),
+    "unknown_connection": (
+        "model selector names a connection that is not configured; the connection must match "
+        "a [providers.<id>] entry exactly"
+    ),
+}
 _SELECTOR_EVIDENCE_BOUND = 256
+_CACHE_UNUSABLE_NOTICE = (
+    "The model cache could not be read and is treated as empty; it is not rewritten at startup. "
+    "Use /models to refresh it."
+)
+_SELECTION_INVALID_NOTICE = (
+    "The saved model selection is invalid or unreadable; no model is active and none was chosen "
+    "automatically. The file is left unchanged. Fix or delete it, or choose a model with /models."
+)
+_SELECTION_UNCONFIGURED_NOTICE = (
+    "The saved model selection names a connection that is not configured; no model is active and "
+    "none was chosen automatically. The file is left unchanged. Restore the connection in the "
+    "configuration, or choose a model with /models."
+)
 
 
 def bounded_selector_evidence(raw: object, *, redact: Callable[[str], str] | None = None) -> str:
@@ -72,7 +88,7 @@ def bounded_selector_evidence(raw: object, *, redact: Callable[[str], str] | Non
 
 @dataclass(frozen=True)
 class ModelMetadata:
-    """Known model limits/capabilities and the source for each known field."""
+    """Provider-reported limits used by current budgeting, and display-only capabilities."""
 
     context_tokens: int | None = None
     input_tokens: int | None = None
@@ -80,11 +96,6 @@ class ModelMetadata:
     vision: bool | None = None
     tool_calling: bool | None = None
     reasoning: bool | None = None
-    sources: tuple[tuple[MetadataField, MetadataSource], ...] = ()
-
-    def __post_init__(self) -> None:
-        """Copy nested source collections into immutable tuple values."""
-        object.__setattr__(self, "sources", tuple(tuple(source) for source in self.sources))
 
 
 @dataclass(frozen=True)
@@ -110,16 +121,6 @@ class ProviderState:
 
 
 @dataclass(frozen=True)
-class SupplementRecord:
-    """Normalized supplemental metadata, kept separate from inventory."""
-
-    adapter: str
-    upstream_id: str
-    fetched_at: str
-    metadata: ModelMetadata = field(default_factory=ModelMetadata)
-
-
-@dataclass(frozen=True)
 class CatalogDocument:
     """Versioned persisted catalog and remembered model selection."""
 
@@ -128,13 +129,11 @@ class CatalogDocument:
     default_model: str | None = None
     providers: tuple[ProviderState, ...] = ()
     models: tuple[ModelRecord, ...] = ()
-    supplemental: tuple[SupplementRecord, ...] = ()
 
     def __post_init__(self) -> None:
         """Copy nested record collections into immutable tuples."""
         object.__setattr__(self, "providers", tuple(self.providers))
         object.__setattr__(self, "models", tuple(self.models))
-        object.__setattr__(self, "supplemental", tuple(self.supplemental))
 
 
 @dataclass(frozen=True)
@@ -178,7 +177,7 @@ class ModelRegistryError(ValueError):
     def __init__(self, code: str) -> None:
         """Expose a stable error code without selectors or secret details."""
         self.code = code if code in _SAFE_ERROR_CODES else "invalid_request"
-        super().__init__(f"model registry {self.code.replace('_', ' ')}")
+        super().__init__(_ERROR_MESSAGES.get(self.code, f"model registry {self.code.replace('_', ' ')}"))
 
 
 class ModelRegistry:
@@ -187,29 +186,41 @@ class ModelRegistry:
     def __init__(
         self,
         connections: Mapping[str, ProviderConfig],
-        settings: ModelSettings,
+        settings: ModelSettings | ModelCache,
         discovery: ModelDiscovery,
         credential_resolver: Callable[[ProviderConfig], ResolvedProviderConnection],
         *,
         selector_redactor: Callable[[str], str] | None = None,
+        preference: ModelPreference | None = None,
     ) -> None:
         """Load cached settings and bind injected connection/discovery services.
 
         ``selector_redactor`` optionally redacts saved scheduled selector strings
         before they are bounded into a scheduled-selector warning.
+        ``preference`` is the durable deliberate selection (ADR-0040): when
+        given, it is the only selection source and sink, and the catalog's
+        ``default_model`` is neither read nor written for selection. A
+        corrupt preference leaves no remembered selection and its bytes are
+        never rewritten except by a deliberate ``select``.
         """
         self._lock = threading.RLock()
         self._selector_redactor = selector_redactor
         self._settings = settings
         self._discovery = discovery
         self._credential_resolver = credential_resolver
-        self._connections: dict[str, ProviderConfig] = dict(connections)
-        self._fingerprints = {key: _connection_fingerprint(key, value) for key, value in self._connections.items()}
-        self._configuration_generation = {key: 0 for key in self._connections}
+        # Fixed for the process lifetime (ADR-0040): a read-only private copy;
+        # connection edits take effect only when a restarted process rebuilds it.
+        fixed = dict(connections)
+        for provider_id, value in fixed.items():
+            _validate_connection(provider_id, value)
+        self._connections: Mapping[str, ProviderConfig] = MappingProxyType(fixed)
         self._refresh_generation = {key: 0 for key in self._connections}
         self._completed_generation: dict[str, int] = {}
         self._restore_called = False
         self._settings_error_code: str | None = None
+        self._cache_notice: str | None = None
+        self._selection_notice: str | None = None
+        self._preference_status: str | None = None
         self._active_model_id: str | None = None
         self._selection_revision = 0
         document = CatalogDocument()
@@ -220,19 +231,67 @@ class ModelRegistry:
         else:
             if getattr(loaded, "status", None) == "valid" and isinstance(getattr(loaded, "document", None), CatalogDocument):
                 document = loaded.document
-            elif getattr(loaded, "status", None) not in {"missing", "corrupt"}:
+            elif getattr(loaded, "status", None) == "corrupt":
+                self._cache_notice = _CACHE_UNUSABLE_NOTICE
+            elif getattr(loaded, "status", None) != "missing":
                 self._settings_error_code = "settings_load_failed"
         self._document = _filter_document_to_connections(document, self._connections)
-        self._remembered_model_id = document.default_model
-        if self._remembered_model_id is not None:
-            self._selection_revision = document.revision
+        self._preference = preference
+        if preference is None:
+            self._remembered_model_id = document.default_model
+            if self._remembered_model_id is not None:
+                self._selection_revision = document.revision
+        else:
+            saved = preference.load()
+            self._preference_status = saved.status
+            self._remembered_model_id = saved.model if saved.status == "valid" else None
+            if saved.status == "corrupt":
+                self._selection_notice = _SELECTION_INVALID_NOTICE
+            elif saved.model is not None and saved.model.partition("/")[0] not in self._connections:
+                self._selection_notice = _SELECTION_UNCONFIGURED_NOTICE
         self._models = {record.id: record for record in self._document.models}
         self._provider_states = {item.provider_id: item for item in self._document.providers}
+        # The automatic choice is made from the cache as loaded (connection-filtered),
+        # so a later refresh that replaces the catalog cannot change it.
+        self._initial_automatic_choice: str | None = min(self._models) if self._models else None
+
+    @property
+    def cache_notice(self) -> str | None:
+        """Bounded, content-free notice when the cache was unreadable at construction."""
+        return self._cache_notice
+
+    @property
+    def selection_notice(self) -> str | None:
+        """Bounded, content-free notice when the saved selection cannot be used.
+
+        Set when the preference file is invalid/unreadable or names a connection
+        that is not configured; never contains the saved text or a path.
+        """
+        return self._selection_notice
+
+    @property
+    def needs_first_start_discovery(self) -> bool:
+        """Whether startup should run its single discovery pass (nothing is known).
+
+        True only when no preference file exists (a corrupt or unreadable one
+        counts as existing) and the connection-filtered cache loaded at
+        construction had zero candidates (an unreadable cache counts as empty).
+        """
+        if self._preference is not None and self._preference_status != "missing":
+            return False
+        return self._remembered_model_id is None and self._initial_automatic_choice is None
+
+    @property
+    def saved_selection_unusable(self) -> bool:
+        """Whether a saved selection exists but is invalid, unreadable or unconfigured."""
+        return self._selection_notice is not None
 
     def view(self, pinned: RunModel | None = None) -> CatalogView:
         """Return immutable catalog data without connections or credentials."""
         with self._lock:
-            active_id = self._active_model_id if self._active_model_id in self._models else None
+            # Honest selector: after a failed cache write the active choice can name
+            # a candidate the (unsaved) discovery no longer lists.
+            active_id = self._active_model_id
             remembered = self._remembered_model_id
             selection_status: SelectionStatus
             if active_id is not None:
@@ -283,6 +342,17 @@ class ModelRegistry:
                 raise ModelRegistryError("model_not_found")
             if model.provider_id not in self._connections:
                 raise ModelRegistryError("connection_changed")
+            if self._preference is not None:
+                # Durable before published: a failed write leaves prior bytes
+                # and the prior active choice untouched.
+                try:
+                    self._preference.write(canonical_id)
+                except (OSError, ValueError):
+                    raise ModelRegistryError("persistence_failed") from None
+                self._remembered_model_id = canonical_id
+                self._active_model_id = canonical_id
+                self._selection_revision += 1
+                return self.view()
             candidate = replace(
                 self._document,
                 revision=self._document.revision + 1,
@@ -304,112 +374,103 @@ class ModelRegistry:
                 return self.view()
             self._restore_called = True
             remembered = self._remembered_model_id
-            self._active_model_id = remembered if remembered in self._models else None
+            if self._preference is None:
+                self._active_model_id = remembered if remembered in self._models else None
+            elif self._selection_notice is not None:
+                self._active_model_id = None  # actionable unset: never an automatic replacement
+            elif remembered is not None:
+                # Saved and configured: active as saved, independent of cache membership.
+                self._active_model_id = remembered
+            elif self._preference_status == "missing" and (self._initial_automatic_choice or self._models):
+                # Deterministic in-memory choice (ordinal order); never saved. Taken from the
+                # initially loaded cache; only an empty initial cache uses refreshed candidates.
+                self._active_model_id = self._initial_automatic_choice or min(self._models)
+            else:
+                self._active_model_id = None
             return self.view()
 
     def admit(self, selector: str | None = None) -> RunModel:
-        """Resolve one model/connection snapshot, requiring an active main choice."""
+        """Resolve one exact target and its credential once, without catalog membership.
+
+        An explicit ``selector`` is split at its first ``/`` and resolved against
+        the fixed connection map; it needs neither an active Main nor a cached
+        candidate. ``None`` snapshots the active Main and fails with
+        ``no_active_selection`` when none exists. Selectors are never trimmed,
+        case-folded or aliased: a malformed shape fails ``malformed_selector``
+        and an absent or padded connection ``unknown_connection``, both before
+        any credential resolution or provider I/O. Credentials are resolved once
+        outside the lock; no catalog, selection or Main recheck follows, so a
+        concurrent refresh or ``select`` cannot invalidate the admitted target.
+        """
         with self._lock:
-            active_id = self._active_model_id
-            if active_id is None or active_id not in self._models:
-                raise ModelRegistryError("no_active_selection")
-            model_id = active_id if selector is None else selector
-            model = self._models.get(model_id)
-            if model is None:
-                raise ModelRegistryError("model_not_found")
-            provider_id = model.provider_id
-            config = self._connections.get(provider_id)
-            if config is None:
-                raise ModelRegistryError("connection_changed")
-            fingerprint = self._fingerprints[provider_id]
-            configuration_generation = self._configuration_generation[provider_id]
+            if selector is None:
+                selector = self._active_model_id
+                if selector is None:
+                    raise ModelRegistryError("no_active_selection")
+            model, config = self._route(selector)
             catalog_revision = self._document.revision
             selection_revision = self._selection_revision
-
-        try:
-            connection = self._credential_resolver(config)
-        except Exception:
-            raise ModelRegistryError("credential_resolution_failed") from None
-
-        with self._lock:
-            if (
-                provider_id not in self._connections
-                or self._fingerprints.get(provider_id) != fingerprint
-                or self._configuration_generation.get(provider_id) != configuration_generation
-                or self._models.get(model_id) != model
-            ):
-                raise ModelRegistryError("connection_changed")
-            if self._active_model_id is None or self._active_model_id not in self._models:
-                raise ModelRegistryError("no_active_selection")
-        if not _resolved_connection_matches(provider_id, config, connection):
-            raise ModelRegistryError("credential_resolution_failed")
-        return RunModel(model, connection, catalog_revision, selection_revision)
+        return self._pin(model, config, catalog_revision, selection_revision)
 
     def admit_scheduled(self, raw_selector: object = None) -> RunModel:
         """Pin a scheduled run to its saved selector, inheriting Main otherwise.
 
-        Requires a valid active Main first. ``None`` inherits Main silently; a
-        blank, whitespace-only or non-string selector, or an exact string that
-        is not in the catalog, inherits Main with one bounded warning. A known
-        selector (fresh or stale provider) is used verbatim with no fallback.
-        Credentials are resolved once outside the lock; any connection change
-        during resolution fails with ``connection_changed`` and any Main,
-        selection or catalog-document change with ``selection_changed``.
+        Requires an active Main first. ``None`` inherits Main silently; a
+        blank, whitespace-only or non-string selector, or one that is malformed
+        or names an unconfigured connection, inherits Main with one bounded
+        warning. A well-formed selector on a configured connection is used
+        verbatim, cached or not, with no fallback. Credentials are resolved once
+        outside the lock and nothing is rechecked afterwards.
         """
-        warning: tuple[str, tuple[object, ...]] | None = None
+        warning: str | None = None
         with self._lock:
             main_id = self._active_model_id
-            if main_id is None or main_id not in self._models:
+            if main_id is None:
                 raise ModelRegistryError("no_active_selection")
+            target = main_id
             if raw_selector is None:
-                model_id = main_id
+                pass
             elif not isinstance(raw_selector, str) or not raw_selector.strip():
-                model_id = main_id
-                warning = (
-                    f"Scheduled selector {bounded_selector_evidence(raw_selector)}; inheriting Main",
-                    (),
-                )
-            elif raw_selector in self._models:
-                model_id = raw_selector
+                warning = f"Scheduled selector {bounded_selector_evidence(raw_selector)}; inheriting Main"
             else:
-                model_id = main_id
-                evidence = bounded_selector_evidence(raw_selector, redact=self._selector_redactor)
-                warning = (f"Scheduled selector unknown; inheriting Main: '{evidence}'", ())
-            model = self._models[model_id]
-            provider_id = model.provider_id
-            config = self._connections.get(provider_id)
-            if config is None:
-                raise ModelRegistryError("connection_changed")
-            fingerprint = self._fingerprints[provider_id]
-            configuration_generation = self._configuration_generation[provider_id]
+                try:
+                    self._route(raw_selector)
+                except ModelRegistryError:
+                    evidence = bounded_selector_evidence(raw_selector, redact=self._selector_redactor)
+                    warning = f"Scheduled selector unknown; inheriting Main: '{evidence}'"
+                else:
+                    target = raw_selector
+            model, config = self._route(target)
             catalog_revision = self._document.revision
             selection_revision = self._selection_revision
-            document = self._document
 
         if warning is not None:
-            logger.warning(warning[0], *warning[1], extra={"scheduled_selector_warning": True})
+            logger.warning(warning, extra={"scheduled_selector_warning": True})
+        return self._pin(model, config, catalog_revision, selection_revision)
 
+    def _route(self, selector: object) -> tuple[ModelRecord, ProviderConfig]:
+        """Resolve ``selector`` to its record and configured connection (lock held).
+
+        A cached candidate supplies its provider-reported record; any other
+        well-formed selector gets a minimal identity with unknown metadata. The
+        cache is never consulted for permission and never written.
+        """
+        connection_id, upstream_id = parse_selector(selector, self._connections)
+        canonical_id = f"{connection_id}/{upstream_id}"
+        record = self._models.get(canonical_id)
+        if record is None:
+            record = ModelRecord(canonical_id, connection_id, upstream_id, upstream_id)
+        return record, self._connections[connection_id]
+
+    def _pin(
+        self, model: ModelRecord, config: ProviderConfig, catalog_revision: int, selection_revision: int
+    ) -> RunModel:
+        """Resolve the connection credential once and return the immutable pin."""
         try:
             connection = self._credential_resolver(config)
         except Exception:
             raise ModelRegistryError("credential_resolution_failed") from None
-
-        with self._lock:
-            if (
-                provider_id not in self._connections
-                or self._fingerprints.get(provider_id) != fingerprint
-                or self._configuration_generation.get(provider_id) != configuration_generation
-                or self._models.get(model_id) != model
-            ):
-                raise ModelRegistryError("connection_changed")
-            if (
-                self._active_model_id != main_id
-                or self._selection_revision != selection_revision
-                or main_id not in self._models
-                or self._document is not document
-            ):
-                raise ModelRegistryError("selection_changed")
-        if not _resolved_connection_matches(provider_id, config, connection):
+        if not _resolved_connection_matches(model.provider_id, config, connection):
             raise ModelRegistryError("credential_resolution_failed")
         return RunModel(model, connection, catalog_revision, selection_revision)
 
@@ -423,10 +484,10 @@ class ModelRegistry:
         is neither required nor consulted. Credentials are resolved once
         outside the lock; a resolver failure or a connection that does not
         match the configured route fails with ``credential_resolution_failed``.
-        Only the target is rechecked afterwards: removal or reconfiguration of
-        its provider (including an ABA restore) or a change or removal of its
-        record fails with ``connection_changed``; unrelated Main selection,
-        catalog refresh or other-provider changes do not. The returned pin
+        Connections are fixed for the process lifetime, so only the target
+        record is rechecked afterwards: a change or removal of its record fails
+        with ``connection_changed``; unrelated Main selection or catalog
+        refresh does not. The returned pin
         carries the catalog and selection revisions current at that final
         recheck as read-only provenance. This method is read-only: it never
         selects, restores, refreshes, persists or changes revisions.
@@ -441,8 +502,6 @@ class ModelRegistry:
             config = self._connections.get(provider_id)
             if config is None:
                 raise ModelRegistryError("connection_changed")
-            fingerprint = self._fingerprints[provider_id]
-            configuration_generation = self._configuration_generation[provider_id]
 
         try:
             connection = self._credential_resolver(config)
@@ -450,12 +509,7 @@ class ModelRegistry:
             raise ModelRegistryError("credential_resolution_failed") from None
 
         with self._lock:
-            if (
-                provider_id not in self._connections
-                or self._fingerprints.get(provider_id) != fingerprint
-                or self._configuration_generation.get(provider_id) != configuration_generation
-                or self._models.get(selector) != model
-            ):
+            if self._models.get(selector) != model:
                 raise ModelRegistryError("connection_changed")
             catalog_revision = self._document.revision
             selection_revision = self._selection_revision
@@ -463,90 +517,41 @@ class ModelRegistry:
             raise ModelRegistryError("credential_resolution_failed")
         return RunModel(model, connection, catalog_revision, selection_revision)
 
-    def replace_connections(self, connections: Mapping[str, ProviderConfig]) -> None:
-        """Replace provider configs and immediately purge changed/deleted caches."""
-        copied = dict(connections)
-        new_fingerprints = {key: _connection_fingerprint(key, value) for key, value in copied.items()}
-        with self._lock:
-            changed = {
-                key
-                for key in set(self._connections) | set(copied)
-                if self._fingerprints.get(key) != new_fingerprints.get(key)
-            }
-            if not changed:
-                self._connections = copied
-                return
-            for provider_id in changed:
-                self._configuration_generation[provider_id] = self._configuration_generation.get(provider_id, 0) + 1
-                self._refresh_generation.pop(provider_id, None)
-                self._completed_generation.pop(provider_id, None)
-                self._provider_states.pop(provider_id, None)
-            self._connections = copied
-            self._fingerprints = new_fingerprints
-            self._provider_states = {
-                key: state for key, state in self._provider_states.items() if key in copied
-            }
-            self._models = {
-                model_id: model for model_id, model in self._models.items() if model.provider_id not in changed
-            }
-            if self._active_model_id not in self._models:
-                self._active_model_id = None
-            candidate = replace(
-                self._document,
-                revision=self._document.revision + 1,
-                providers=tuple(self._provider_states[key] for key in sorted(self._provider_states)),
-                models=tuple(self._models[key] for key in sorted(self._models)),
-            )
-            self._publish_document(candidate)
-            try:
-                self._settings.write(candidate)
-            except (OSError, ValueError):
-                self._settings_error_code = "persistence_failed"
-                raise ModelRegistryError("persistence_failed") from None
-            self._settings_error_code = None
-
     def refresh(self) -> RefreshReport:
         """Fetch providers outside the lock and merge only validated current results."""
         with self._lock:
-            captures: list[tuple[str, ProviderConfig, tuple[object, ...], int, int]] = []
+            captures: list[tuple[str, ProviderConfig, int]] = []
             for provider_id, config in self._connections.items():
                 generation = self._refresh_generation.get(provider_id, 0) + 1
                 self._refresh_generation[provider_id] = generation
-                captures.append(
-                    (
-                        provider_id,
-                        config,
-                        self._fingerprints[provider_id],
-                        self._configuration_generation.get(provider_id, 0),
-                        generation,
-                    )
-                )
+                captures.append((provider_id, config, generation))
 
-        outcomes: list[tuple[str, tuple[object, ...], int, int, object | None, str | None]] = []
-        for provider_id, config, fingerprint, config_generation, generation in captures:
+        outcomes: list[tuple[str, int, object | None, str | None]] = []
+        for provider_id, config, generation in captures:
             try:
                 connection = self._credential_resolver(config)
             except Exception:
                 outcomes.append(
-                    (provider_id, fingerprint, config_generation, generation, None, "credential_resolution_failed")
+                    (provider_id, generation, None, "credential_resolution_failed")
                 )
                 continue
             if not _resolved_connection_matches(provider_id, config, connection):
                 outcomes.append(
-                    (provider_id, fingerprint, config_generation, generation, None, "credential_resolution_failed")
+                    (provider_id, generation, None, "credential_resolution_failed")
                 )
                 continue
             try:
                 inventory = self._discovery.fetch(connection)
                 _validate_inventory(provider_id, _adapter(config), inventory)
-                outcomes.append((provider_id, fingerprint, config_generation, generation, inventory, None))
+                _reject_reflected_credential(connection, inventory)
+                outcomes.append((provider_id, generation, inventory, None))
             except (OSError, ValueError, RuntimeError) as exc:
                 code = _safe_code(getattr(exc, "code", None), "discovery_failed")
                 if code not in {"incomplete_inventory", "invalid_inventory"}:
                     code = "discovery_failed"
-                outcomes.append((provider_id, fingerprint, config_generation, generation, None, code))
+                outcomes.append((provider_id, generation, None, code))
             except (AttributeError, TypeError, KeyError):
-                outcomes.append((provider_id, fingerprint, config_generation, generation, None, "invalid_inventory"))
+                outcomes.append((provider_id, generation, None, "invalid_inventory"))
 
         with self._lock:
             refreshed: list[str] = []
@@ -555,17 +560,10 @@ class ModelRegistry:
             errors: list[tuple[str, str]] = []
             candidate_models = dict(self._models)
             candidate_states = dict(self._provider_states)
-            candidate_supplements = {
-                (item.adapter, item.upstream_id): item
-                for item in self._document.supplemental
-            }
-            for provider_id, fingerprint, config_generation, generation, inventory, error in outcomes:
-                if (
-                    provider_id not in self._connections
-                    or self._fingerprints.get(provider_id) != fingerprint
-                    or self._configuration_generation.get(provider_id) != config_generation
-                    or self._completed_generation.get(provider_id, 0) > generation
-                ):
+            for provider_id, generation, inventory, error in outcomes:
+                # Concurrent refresh ordering only: a newer completed refresh
+                # of the same fixed connection supersedes an older late result.
+                if self._completed_generation.get(provider_id, 0) > generation:
                     discarded.append(provider_id)
                     continue
                 self._completed_generation[provider_id] = generation
@@ -602,27 +600,17 @@ class ModelRegistry:
                     "fresh",
                     None,
                 )
-                candidate_supplements = {
-                    key: item
-                    for key, item in candidate_supplements.items()
-                    if item.adapter != _adapter(config)
-                }
-                candidate_supplements.update(
-                    {(item.adapter, item.upstream_id): item for item in inventory.supplemental}
-                )
 
             if refreshed or stale:
                 candidate = replace(
                     self._document,
                     revision=self._document.revision + 1,
-                    default_model=self._remembered_model_id,
+                    default_model=(
+                        self._remembered_model_id if self._preference is None else self._document.default_model
+                    ),
                     providers=tuple(candidate_states[key] for key in sorted(candidate_states)),
                     models=tuple(candidate_models[key] for key in sorted(candidate_models)),
-                    supplemental=tuple(
-                        candidate_supplements[key] for key in sorted(candidate_supplements)
-                    ),
                 )
-                write_failed = False
                 try:
                     from model_settings import _validate_document
 
@@ -632,61 +620,73 @@ class ModelRegistry:
                     errors.append(("catalog", "invalid_inventory"))
                     persisted = False
                 else:
+                    # The cache is advisory and best-effort: a failed write is
+                    # reported but never rolls back usable in-memory discovery,
+                    # and never touches the preference or the active choice.
                     try:
                         self._settings.write(candidate)
                     except (OSError, ValueError):
                         self._settings_error_code = "persistence_failed"
                         errors.append(("catalog", "persistence_failed"))
                         persisted = False
-                        write_failed = True
                     else:
                         self._settings_error_code = None
-                        self._publish_document(candidate)
-                        if self._active_model_id not in self._models:
-                            self._active_model_id = None
                         persisted = True
-
-                if write_failed:
-                    # A successful complete inventory is authoritative about
-                    # removals even when persistence fails. Apply only this
-                    # fail-closed invalidation; do not publish additions,
-                    # metadata, freshness, supplements, or a new revision.
-                    removed_ids = set(self._models) - set(candidate_models)
-                    if removed_ids:
-                        safe_models = {
-                            model_id: record
-                            for model_id, record in self._models.items()
-                            if model_id not in removed_ids
-                        }
-                        safe_document = replace(
-                            self._document,
-                            models=tuple(safe_models[key] for key in sorted(safe_models)),
-                        )
-                        self._publish_document(safe_document)
-                        if self._active_model_id not in self._models:
-                            self._active_model_id = None
+                    # Refresh never changes the selection or issued pins: an
+                    # active choice missing from the new inventory stays as is
+                    # and the view reports it truthfully.
+                    self._publish_document(candidate)
             else:
                 persisted = self._settings_error_code is None
             return RefreshReport(tuple(refreshed), tuple(stale), tuple(discarded), tuple(errors), persisted)
 
 
-def _connection_fingerprint(provider_id: str, config: ProviderConfig) -> tuple[object, ...]:
-    """Return a non-presentational identity for connection-change detection."""
+def parse_selector(selector: object, connections: Mapping[str, object]) -> tuple[str, str]:
+    """Split ``<connection>/<upstream>`` at the first slash against configured connections.
+
+    The connection must equal a configured identifier exactly (no trimming or
+    case folding); the upstream is every character after the first slash,
+    preserved verbatim including slashes and whitespace. Raises
+    ``malformed_selector`` for a non-string, a missing slash, or an empty part,
+    and ``unknown_connection`` for a connection that is not configured.
+    """
+    if not isinstance(selector, str):
+        raise ModelRegistryError("malformed_selector")
+    connection_id, separator, upstream_id = selector.partition("/")
+    if not separator or not connection_id or not upstream_id:
+        raise ModelRegistryError("malformed_selector")
+    if connection_id not in connections:
+        raise ModelRegistryError("unknown_connection")
+    return connection_id, upstream_id
+
+
+def _reject_reflected_credential(connection: object, inventory: ProviderInventory) -> None:
+    """Fail closed when provider-supplied text contains the resolved credential.
+
+    Pattern heuristics cannot recognise an opaque credential, so the exact
+    resolved value (any non-empty length) is compared with every string that
+    would be published or persisted. The error is detail-free.
+    """
+    secret = getattr(connection, "api_key", None)
+    if not isinstance(secret, str) or not secret:
+        return
+    texts = [inventory.provider_id, inventory.adapter, inventory.last_success_at]
+    for record in inventory.models:
+        texts.extend((record.id, record.provider_id, record.upstream_id, record.display_name))
+    if any(secret in text for text in texts):
+        raise ModelRegistryError("invalid_inventory")
+
+
+def _validate_connection(provider_id: str, config: ProviderConfig) -> None:
+    """Reject a structurally invalid connection entry with a detail-free error."""
     if not isinstance(provider_id, str) or not _SAFE_ID.fullmatch(provider_id):
         raise ModelRegistryError("invalid_connection")
     if getattr(config, "name", provider_id) != provider_id:
         raise ModelRegistryError("invalid_connection")
-    adapter = _adapter(config)
-    try:
-        return (
-            provider_id,
-            adapter,
-            getattr(config, "api_key"),
-            getattr(config, "base_url"),
-            getattr(config, "request_timeout"),
-        )
-    except AttributeError:
-        raise ModelRegistryError("invalid_connection") from None
+    _adapter(config)
+    for attribute in ("api_key", "base_url", "request_timeout"):
+        if not hasattr(config, attribute):
+            raise ModelRegistryError("invalid_connection")
 
 
 def _adapter(config: ProviderConfig) -> str:
@@ -740,7 +740,6 @@ def _validate_inventory(provider_id: str, adapter: str, inventory: ProviderInven
         getattr(inventory, "provider_id", None) != provider_id
         or getattr(inventory, "adapter", None) != adapter
         or not isinstance(getattr(inventory, "models", None), tuple)
-        or not isinstance(getattr(inventory, "supplemental", None), tuple)
     ):
         raise ModelRegistryError("invalid_inventory")
     timestamp = getattr(inventory, "last_success_at", None)
@@ -762,51 +761,20 @@ def _validate_inventory(provider_id: str, adapter: str, inventory: ProviderInven
             raise ModelRegistryError("invalid_inventory")
         model_ids.add(model.id)
         _validate_metadata(model.metadata)
-    supplement_keys: set[tuple[str, str]] = set()
-    for item in inventory.supplemental:
-        if (
-            not isinstance(item, SupplementRecord)
-            or item.adapter != adapter
-            or not _safe_catalog_text(item.upstream_id)
-            or not _valid_timestamp(item.fetched_at)
-        ):
-            raise ModelRegistryError("invalid_inventory")
-        key = (item.adapter, item.upstream_id)
-        if key in supplement_keys:
-            raise ModelRegistryError("invalid_inventory")
-        supplement_keys.add(key)
-        _validate_metadata(item.metadata, supplemental=True)
 
 
-def _validate_metadata(metadata: ModelMetadata, *, supplemental: bool = False) -> None:
-    """Validate tri-state metadata, positive limits, and provenance completeness."""
+def _validate_metadata(metadata: ModelMetadata) -> None:
+    """Validate tri-state metadata types and positive limits."""
     if not isinstance(metadata, ModelMetadata):
         raise ModelRegistryError("invalid_inventory")
-    populated: set[str] = set()
     for name in ("context_tokens", "input_tokens", "output_tokens"):
         value = getattr(metadata, name)
-        if value is not None:
-            if type(value) is not int or value <= 0:
-                raise ModelRegistryError("invalid_inventory")
-            populated.add(name)
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ModelRegistryError("invalid_inventory")
     for name in ("vision", "tool_calling", "reasoning"):
         value = getattr(metadata, name)
-        if value is not None:
-            if type(value) is not bool:
-                raise ModelRegistryError("invalid_inventory")
-            populated.add(name)
-    sources: dict[str, str] = {}
-    for pair in metadata.sources:
-        if not isinstance(pair, tuple) or len(pair) != 2:
+        if value is not None and type(value) is not bool:
             raise ModelRegistryError("invalid_inventory")
-        name, source = pair
-        if name in sources or name not in populated or source not in {"provider", "models.dev"}:
-            raise ModelRegistryError("invalid_inventory")
-        sources[name] = source
-    if set(sources) != populated:
-        raise ModelRegistryError("invalid_inventory")
-    if supplemental and any(source != "models.dev" for source in sources.values()):
-        raise ModelRegistryError("invalid_inventory")
 
 
 def _safe_catalog_text(value: object, *, presentation: bool = False) -> bool:

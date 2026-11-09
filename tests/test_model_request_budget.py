@@ -133,3 +133,37 @@ def test_threshold_helper_preserves_floor_without_claiming_it_is_hard_fit() -> N
 
     assert compaction_threshold(100) == 256
     assert compaction_threshold(1_000) == 850
+
+
+# --- user-approved 6.1/6.3 slice under task 4.1: configured mandatory output cap ---------------------
+
+def test_configured_required_cap_needs_no_discovered_output_metadata() -> None:
+    result = budget(ModelMetadata(), output_cap_required=True, required_output_cap=1_024)
+    assert result.output_cap == 1_024 and result.completion_reserve == 1_024
+    assert result.assumed_context is True and result.hard_input_budget == 12_000 - 1_024
+
+
+@pytest.mark.parametrize("output_tokens", [None, 100, 65_536])
+def test_configured_required_cap_is_not_sized_from_discovered_limits_or_remaining_context(
+    output_tokens: int | None,
+) -> None:
+    result = budget(
+        ModelMetadata(context_tokens=10_000, output_tokens=output_tokens),
+        input_tokens=2_000, output_cap_required=True, required_output_cap=777,
+    )
+    assert result.output_cap == 777 and result.completion_reserve == 777
+
+
+def test_configured_required_cap_keeps_the_local_input_guard() -> None:
+    with pytest.raises(ModelRequestBudgetError) as raised:
+        budget(ModelMetadata(context_tokens=10_000), input_tokens=9_500,
+               output_cap_required=True, required_output_cap=1_024)
+    assert raised.value.code == "input_exceeds_budget"
+    with pytest.raises(ModelRequestBudgetError) as raised:
+        budget(ModelMetadata(context_tokens=1_000), output_cap_required=True, required_output_cap=1_024)
+    assert raised.value.code == "no_input_budget"
+
+
+def test_configured_required_cap_is_ignored_when_graph_fixed_cap_is_used() -> None:
+    result = budget(ModelMetadata(), fixed_output_cap=512, output_cap_required=True, required_output_cap=9_999)
+    assert result.output_cap == 512

@@ -54,21 +54,20 @@ def _one_line(text: str) -> str:
 def _format_model_entry(model: ModelRecord) -> str:
     """Render one model as a single line: id, display name, limits, capabilities."""
     metadata = model.metadata
-    sources = dict(metadata.sources)
     parts: list[str] = []
     for field_name, label in _LIMIT_FIELDS:
         value = getattr(metadata, field_name)
         if value is None:
             parts.append(f"{label} unknown")
         else:
-            parts.append(f"{label} {value:,} [{sources.get(field_name, 'provider')}]")
+            parts.append(f"{label} {value:,}")
     for field_name, label in _CAPABILITY_FIELDS:
         value = getattr(metadata, field_name)
         if value is None:
             parts.append(f"{label} unknown")
         else:
             state = "supported" if value else "unsupported"
-            parts.append(f"{label} {state} [{sources.get(field_name, 'provider')}]")
+            parts.append(f"{label} {state}")
     display = _one_line(model.display_name)
     name = f"{model.id} ({display})" if display and display != model.upstream_id else model.id
     return f"{name}: {'; '.join(parts)}"
@@ -139,7 +138,7 @@ def format_model_catalog_summary(view: CatalogView | None, *, max_models: int = 
 
     Carries the historical pin (admission-time metadata), the current active
     record and a capped projection of other current records, each with its own
-    current limits, capabilities, sources and stale-provider marker.
+    current limits, capabilities and stale-provider marker.
     """
     if view is None:
         return ""

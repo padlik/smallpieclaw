@@ -697,13 +697,8 @@ _REAL_HTTPX_CLIENT = httpx.Client
 
 
 def _meta(context: int | None = None, output: int | None = None) -> ModelMetadata:
-    """Return valid provider-sourced metadata for the populated token limits."""
-    sources = tuple(
-        (name, "provider")
-        for name, value in (("context_tokens", context), ("output_tokens", output))
-        if value is not None
-    )
-    return ModelMetadata(context_tokens=context, output_tokens=output, sources=sources)
+    """Return provider-reported metadata for the populated token limits."""
+    return ModelMetadata(context_tokens=context, output_tokens=output)
 
 
 def _prereq_providers() -> dict[str, ProviderConfig]:
@@ -818,7 +813,6 @@ def prereq_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..
                 ProviderState("p", "openai", _PREREQ_SEEDED_AT, "fresh"),
             ),
             (graph, main_record),
-            (),
         )
         settings = _ObservedSettings(tmp_path / "models-config.toml")
         settings.write(document)
@@ -957,11 +951,11 @@ def test_prerequisites_pin_exact_graph_record_independent_of_main(
 
 
 def test_prerequisites_do_not_open_ordinary_admission(prereq_world: Callable[..., _PrereqWorld]) -> None:
-    """A graph pin never activates Main: ordinary admission stays closed."""
+    """A graph pin never activates Main: implicit ordinary admission stays closed."""
     world = prereq_world()
     _resolve_ok(world)
     with pytest.raises(ModelRegistryError) as error:
-        world.registry.admit(_PREREQ_GRAPH_ID)
+        world.registry.admit()
     assert error.value.code == "no_active_selection"
     assert world.registry.view().active_model_id is None
 

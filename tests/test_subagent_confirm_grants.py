@@ -854,8 +854,6 @@ def runtime_runner(tmp_path):
         "pa/model-a", "pa", "model-a", "model-a display",
         ModelMetadata(
             5000, None, 2048, False, True, None,
-            (("context_tokens", "provider"), ("vision", "provider"),
-             ("output_tokens", "provider"), ("tool_calling", "provider")),
         ),
     )
     provider = ProviderConfig("pa", "openai", "env:KEY_pa", "https://a.example.test/v1", 9)
@@ -863,7 +861,7 @@ def runtime_runner(tmp_path):
     settings.write(CatalogDocument(
         1, 2, None,
         (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),),
-        (model,), (),
+        (model,),
     ))
 
     def resolve(config: ProviderConfig) -> ResolvedProviderConnection:

@@ -16,7 +16,7 @@ A lightweight autonomous Telegram bot that controls and queries your server usin
 - **Streaming responses** — bot edits its message in real time as the agent works
 - **MCP server support** — [Model Context Protocol](https://modelcontextprotocol.io) via `stdio` (subprocess) and `http` transports
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama Cloud
-- **Multimodal vision** — send a photo with a caption; image + text forwarded to vision-capable models
+- **Multimodal vision** — send a photo with a caption; image + text sent to the pinned model (provider support determines whether it succeeds)
 - **File uploads** — any Telegram file saved to `downloads/`
 - **Context compaction** — auto-summarises at 85% of token budget; no manual intervention
 - **Agent Skills** — reusable task guides per [agentskills.io](https://agentskills.io/specification)
@@ -95,7 +95,9 @@ request_timeout = 120
 
 Connection fields are exactly `type`, `api_key` (optional), `base_url` (optional) and `request_timeout` — nothing else is accepted. A credential resolves only when the matching provider client is constructed, never at config load, and per-model keys, endpoints, tuning (`temperature`, `top_p`, `max_tokens`) and retry overrides are rejected with an actionable error. Retries are configured agent-wide with `[agent] max_retries` / `retry_delay`.
 
-There is no default-model setting: the remembered selection lives in the app-managed catalog, is made (and changed) with `/models`, and survives restarts. The agent never switches models on its own — a pinned model that lacks a capability (vision, tool calls) fails the request with an actionable message instead of substituting another model.
+Provider connections are read once at startup and stay fixed for the life of the process: editing a `[providers.<id>]` section (adding, removing or changing `type`, `api_key` reference, `base_url` or `request_timeout`) takes effect only after a restart. Until then, `/models` refresh and new runs keep using the connections the process started with. The value behind an `env:`/`sec:` reference is still read when a provider client is constructed.
+
+There is no default-model setting: the remembered selection is made (and changed) with `/models` and survives restarts. It is stored on its own in `$XDG_CONFIG_HOME/<agent>/model-selection.toml` as a single line `model = "<connection-id>/<upstream-id>"` — never a key, key reference or endpoint. A `/models` choice is written there (temporary file, then atomic replace) before it becomes active; if the write fails you get an error and the previous choice and file stay as they were. A preference file that cannot be read or parsed is left byte-for-byte untouched (nothing is remembered) until you pick a model with `/models`, which replaces it immediately. The `default_model` of the older `models-config.toml` is no longer read or written for the selection. Discovered models are kept apart from that choice, in a disposable cache at `$XDG_CACHE_HOME/<agent>/models-cache.json` (candidate ids, per-provider fresh/stale state and provider-reported display data only — no selection, key, key reference or endpoint). The cache is written atomically but best-effort: if it cannot be saved, `/models` and the startup log say so, the models just discovered stay usable for the session, and your saved choice is unchanged. A cache that cannot be read or parsed is treated as empty (a startup warning is logged), is not rewritten at startup, and is replaced by the next successful refresh; it can always be deleted safely. The retired `models-config.toml` is neither read nor written for the cache. Discovery contacts only your configured provider endpoints (no public model-metadata service). Provider-reported vision and tool-calling flags are display-only: false or unknown flags do not locally block image or native-tool requests. **Token limits still affect the current request budget and compaction policy and can reject requests locally**; that policy is not changed by this step. The agent never switches models on its own — a pinned model the provider rejects fails that request with the provider's sanitized error instead of substituting another model.
 
 ### Embeddings
 
@@ -117,6 +119,8 @@ python migrate_models.py --config config.toml            # preview: writes nothi
 python migrate_models.py --agent-name myagent --apply    # apply the preview
 python migrate_models.py --agent-name myagent --recover  # finish an interrupted apply
 ```
+
+> **Note:** the converter writes the old combined `models-config.toml`, including its legacy `default_model` field. The agent no longer reads that field, so a migration does not set the model the agent uses. After migrating, start the agent and choose a model explicitly with `/models`; that choice is saved in `model-selection.toml`.
 
 The preview reports the proposed connections and model mappings, unresolved `env:`/`sec:` references, discarded tuning/retry values and the candidate configuration without touching any file. `--apply` acts only on the named agent's XDG `config.toml` and `models-config.toml`, refuses while the agent is running (shared PID lock), and refuses incomplete previews: ambiguous accounts, local Ollama and connections whose legacy per-model credential still needs an explicit operator choice are reported for manual resolution, never guessed. Legacy per-model credentials are never transferred to the new connections — you configure each connection's credential yourself.
 
@@ -180,7 +184,7 @@ systemctl --user enable --now telegram-agent
 | `/context` | Context window consumption profile — tokens by category, danger level, per-MCP-server tool-def breakdown |
 | `/tools` | List all built-in and MCP tools |
 | `/skills` | List available agent skills |
-| `/models` | List LLM models and switch active one (👁 = vision-capable) |
+| `/models` | List LLM models and switch active one (👁 = provider reports vision) |
 | `/jobs` | Scheduled jobs; sub-commands: `reload`, `pause <tag>`, `resume <tag>`, `remove <tag>`; read-only views: `history <tag>`, `result <execution-id>` |
 | `/agents` | Active sub-agents, scheduled jobs, and plan-step agents (with source category); `/agents cancel <id>` to stop one |
 | `/prompts` | Recent prompts with status and elapsed time; `/prompts search <query> [Nd/Nh] [--status=<S>] [--trace=<T>] [--since=<ISO>] [--until=<ISO>] [--page=<N>]` to search history; `/prompts show <id>` for full record |
@@ -203,9 +207,11 @@ When a provider model catalog is injected, `/models` instead lists a sanitized
 view of up to 20 discovered models with refresh and selection buttons:
 each provider's fresh/stale status, the current selection state
 (active, no selection, or a saved choice that's no longer available), and each
-model's known/unknown/unsupported capabilities and token limits with their
-source (provider-reported vs. models.dev). Appearing in this list reflects
-what a provider advertises, not a guarantee the model is currently callable.
+model's provider-reported capabilities and token limits (known/unknown/unsupported).
+Vision and tool-calling flags are display-only and never locally block requests.
+Token limits still drive the current request budget and may cause a local rejection.
+Appearing in this list reflects what a provider advertises, not a guarantee the
+model is currently callable.
 Selection buttons use opaque tokens bound to your user and chat for five minutes.
 Expired buttons, a bot restart, or token-cache eviction require reopening `/models`.
 A selection is rechecked against the current inventory and saved before success
@@ -219,11 +225,50 @@ admission-time snapshot from the selection for future runs and current discovery
 metadata. The caller supplies this view; rendering does not acquire the registry
 or perform model admission, and discovery still does not guarantee callability.
 
-At startup the agent refreshes every configured provider (all pages) through
-the same path as `/models`, then restores the remembered main model only if it
-is still in the catalog. If none is saved or it disappeared, the bot and its
-commands still start, but tasks and sub-agents are refused until you pick a
-model with `/models`; no default is chosen. There is no standing chat client:
+At startup the main model comes from the saved selection, independent of the
+cache: a well-formed `model-selection.toml` naming a configured connection is
+reported as the active selection even when that model is not cached, and a run
+admitted on it sends that exact upstream model ID once to its connection; a
+provider rejection of an unknown ID is reported as a normal failure, with no
+fallback to another model. Likewise an explicit `<connection-id>/<model>`
+selector (split at the first `/`; the connection must match a configured
+`[providers.<id>]` exactly, and everything after the slash is sent verbatim)
+needs neither an active selection nor a cached candidate. An Anthropic
+connection sends the configured `agent.required_output_cap_tokens` (positive
+integer, default 1024) as `max_tokens`, so an uncached Anthropic model is sent
+without any discovered limit; other adapters send no output cap. Graph
+extraction keeps its own fixed cap. Not yet changed (tasks 6.x): the local
+`ctx_max_tokens` context guard still applies and the cap is checked against it.
+With no selection
+file, the first model of the cache as loaded at startup, in ascending ordinal
+order of its full `<connection-id>/<upstream-id>` (code-point order, so
+uppercase sorts before lowercase), is active in memory only, even if the
+startup refresh then replaces the catalog and that model is no longer listed
+(it is then subject to the same limitation); only an empty cache uses the
+refreshed models. Nothing is saved and the choice is derived again at every
+restart. Cached candidates of connections that are no longer configured are
+ignored. If the selection file is invalid, unreadable or
+names a connection that is not configured, a startup warning says so, no
+model is active, none is chosen automatically and the file is left
+byte-for-byte untouched; the bot and its commands still start and tasks and
+sub-agents are refused until you pick a model with `/models` (which replaces
+the file) or fix the file.
+
+Startup discovers models only when nothing is known: there is no selection
+file (an invalid or unreadable one counts as present) and no cached candidate
+of a configured connection (an unreadable cache counts as empty). Then every
+configured provider is fetched once (all pages, the same path as `/models`),
+with no retry or background loop; a provider that fails keeps its last-good
+entries as stale, and if nothing could be discovered the bot still starts, no
+model is active and tasks are refused with a message to use `/models`. In every
+other case startup makes no model-discovery request, so cached entries are used
+as they are until you press Refresh in `/models`. A refresh publishes a
+provider's inventory only when all of its pages are valid; a malformed or
+incomplete page keeps that provider's previous inventory (marked stale). A
+refresh that returns an empty inventory clears that provider's candidates but
+never changes your selection or the models already running a task. A selection
+that is no longer in the catalog (uncached or removed by a refresh) still runs
+as saved. There is no standing chat client:
 each task admits the active model once and uses a client pinned to it, so a
 `/models` change mid-task affects only later tasks, and the task's prompt shows
 both its pinned model and the current selection. Tool search and results recall
@@ -256,7 +301,7 @@ Send any file to Telegram to save it to `downloads/`. Photos with a caption are 
 📷 + "Is there anything wrong with this network diagram?"
 ```
 
-Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google Gemini, Ollama (LLaVA, llama3.2-vision). Vision capability comes from provider discovery metadata only — the `/models` view badges vision-capable models automatically; there is no `vision` config field. When images are present and the run's pinned model is not vision-capable, the request fails before anything is sent with an actionable message; select a vision-capable model yourself (for example via `/models`) — the agent never switches models automatically.
+Supported vision providers: OpenAI (`gpt-4o`), Anthropic (`claude-3+`), Google Gemini, Ollama (LLaVA, llama3.2-vision). The `/models` view badges models whose provider reports vision support; that badge is advisory (there is no `vision` config field) and never blocks a request. Images are always sent to the run's pinned model on its own route; if that model cannot accept images the provider's sanitized rejection is reported as a normal failure — select a vision-capable model yourself (for example via `/models`); the agent never switches models automatically.
 
 ### Built-in tools reference
 

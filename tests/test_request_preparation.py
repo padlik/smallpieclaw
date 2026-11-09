@@ -24,7 +24,6 @@ from model_request_budget import (
 )
 from providers._errors import (
     LLMContextOverflowError,
-    LLMPermanentError,
 )
 from react_loop import _LoopState, _prepare_request, _summarize_on_pin
 from tests.execution_harness import RecordingExecutor, build_context, run_react
@@ -109,14 +108,15 @@ class TestOverflowAttributes:
         assert LLMContextOverflowError("x").input_tokens is None
         assert LLMContextOverflowError("x", input_tokens=5, repair_input_ceiling=9).input_tokens is None
 
-    def test_unknown_required_output_stays_plain_permanent(self):
+    def test_unknown_required_output_uses_the_configured_cap_in_the_local_guard(self):
+        """Task 4.1 cap slice: no discovered output limit is needed; the configured 1024 cap is the reserve."""
         client = _client(
             lambda r: pytest.fail("no I/O"), ModelMetadata(context_tokens=2_000), adapter="anthropic"
         )
         try:
-            with pytest.raises(LLMPermanentError) as info:
+            with pytest.raises(LLMContextOverflowError) as info:
                 client.chat([{"role": "user", "content": "word " * 4000}])
-            assert not isinstance(info.value, LLMContextOverflowError)
+            assert info.value.repair_input_ceiling == 2_000 - 1_024
         finally:
             client.close()
 

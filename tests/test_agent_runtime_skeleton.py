@@ -79,8 +79,6 @@ def _record(provider: str, upstream: str, context: int) -> ModelRecord:
         f"{provider}/{upstream}", provider, upstream, f"{upstream} display",
         ModelMetadata(
             context, None, 2048, False, True, None,
-            (("context_tokens", "provider"), ("vision", "provider"),
-             ("output_tokens", "provider"), ("tool_calling", "provider")),
         ),
     )
 
@@ -112,7 +110,7 @@ def registry(tmp_path: Path) -> ModelRegistry:
     settings.write(CatalogDocument(
         1, 2, None,
         tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
-        (MODEL_A, MODEL_B), (),
+        (MODEL_A, MODEL_B),
     ))
     reg = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
     reg.select(MODEL_A.id)
@@ -454,8 +452,8 @@ class TestAgentRuntimeCreateSubAgent:
         # Admission happens outside the runtime; a failed admission yields no pin,
         # so nothing can reach create() and nothing is allocated.
         with pytest.raises(ModelRegistryError) as excinfo:
-            registry.admit("pa/not-a-model")
-        assert excinfo.value.code == "model_not_found"
+            registry.admit("not-a-model")  # no connection part: malformed, never an uncached send
+        assert excinfo.value.code == "malformed_selector"
         assert events == []
         assert chat_allocations == []
         assert registry.view().active_model_id == MODEL_A.id

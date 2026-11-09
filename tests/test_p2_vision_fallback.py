@@ -1,4 +1,4 @@
-"""Vision capability is explicit and requests remain pinned to one model."""
+"""Image requests are sent on the pinned model's own route; vision metadata never gates them."""
 
 from __future__ import annotations
 
@@ -20,9 +20,12 @@ def _response() -> httpx.Response:
     )
 
 
-@pytest.mark.parametrize("vision", [False, None], ids=["verified-false", "unknown"])
-def test_unverified_pinned_model_rejects_images_before_io(vision: bool | None) -> None:
+@pytest.mark.parametrize("vision", [False, None], ids=["cached-false", "unknown"])
+def test_unverified_pinned_model_sends_images_on_its_pinned_route(tmp_path, vision: bool | None) -> None:
+    """False/unknown vision metadata is display only: the image reaches one provider call."""
     captured: list[httpx.Request] = []
+    image = tmp_path / "fake.png"
+    image.write_bytes(b"fake-image-bytes")
     client = make_run_model_client(
         "openai",
         httpx.MockTransport(lambda request: captured.append(request) or _response()),
@@ -35,13 +38,15 @@ def test_unverified_pinned_model_rejects_images_before_io(vision: bool | None) -
         upstream_id="text-only-model",
     )
     try:
-        with pytest.raises(LLMPermanentError, match="verified vision support"):
-            client.chat([{
-                "role": "user",
-                "content": "what is this?",
-                "images": ["does-not-need-to-exist.png"],
-            }])
-        assert captured == []
+        assert client.chat([{
+            "role": "user",
+            "content": "what is this?",
+            "images": [str(image)],
+        }]) == "ok"
+        (request,) = captured
+        body = json.loads(request.content)
+        assert body["model"] == "text-only-model"
+        assert body["messages"][0]["content"][1]["type"] == "image_url"
         assert client.llm_cfg["model"] == "text-only-model"
     finally:
         client.close()
@@ -102,8 +107,8 @@ def test_text_request_uses_same_pinned_model_without_vision_routing() -> None:
         client.close()
 
 
-@pytest.mark.parametrize("vision", [False, None], ids=["verified-false", "unknown"])
-def test_provider_style_image_content_is_gated_by_pinned_metadata(
+@pytest.mark.parametrize("vision", [False, None], ids=["cached-false", "unknown"])
+def test_provider_style_image_content_is_not_gated_by_pinned_metadata(
     vision: bool | None,
 ) -> None:
     captured: list[httpx.Request] = []
@@ -119,15 +124,16 @@ def test_provider_style_image_content_is_gated_by_pinned_metadata(
         upstream_id="multimodal-model",
     )
     try:
-        with pytest.raises(LLMPermanentError, match="verified vision support"):
-            client.chat([{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "hi"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZmFrZQ=="}},
-                ],
-            }])
-        assert captured == []
+        assert client.chat([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZmFrZQ=="}},
+            ],
+        }]) == "ok"
+        (request,) = captured
+        content = json.loads(request.content)["messages"][0]["content"]
+        assert content[1]["image_url"]["url"] == "data:image/png;base64,ZmFrZQ=="
         assert client.llm_cfg["model"] == "multimodal-model"
     finally:
         client.close()

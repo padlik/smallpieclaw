@@ -49,6 +49,7 @@ def compute_request_budget(
     local_context_tokens: int,
     output_cap_required: bool = False,
     fixed_output_cap: int | None = None,
+    required_output_cap: int | None = None,
 ) -> ModelRequestBudget:
     """Compute hard input fit from documented combined/input/output limits.
 
@@ -80,6 +81,12 @@ def compute_request_budget(
             raise ModelRequestBudgetError("output_limit_too_small")
         output_cap = fixed_output_cap
         reserve = fixed_output_cap
+        assumed_reserve = False
+    elif output_cap_required and required_output_cap is not None:
+        # Configured mandatory cap: sent as-is, never sized from discovered limits,
+        # context or input; the local context guard below still applies to it.
+        output_cap = required_output_cap
+        reserve = required_output_cap
         assumed_reserve = False
     elif output_cap_required:
         if output_limit is None:
@@ -136,6 +143,7 @@ def repair_input_ceiling(
     local_context_tokens: int,
     output_cap_required: bool = False,
     fixed_output_cap: int | None = None,
+    required_output_cap: int | None = None,
 ) -> int:
     """Return the largest input that could still fit; a repair target only.
 
@@ -165,6 +173,8 @@ def repair_input_ceiling(
         if output_limit is not None and output_limit < fixed_output_cap:
             raise ModelRequestBudgetError("output_limit_too_small")
         reserve = fixed_output_cap
+    elif output_cap_required and required_output_cap is not None:
+        reserve = required_output_cap
     elif output_cap_required:
         if output_limit is None:
             raise ModelRequestBudgetError("output_cap_unavailable")

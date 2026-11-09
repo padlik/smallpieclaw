@@ -27,7 +27,9 @@ import scheduler as scheduler_module
 from builtin_tools.schedule import exec_schedule
 from config_schema import parse_config
 from exceptions import ConfigError
+from outcome_utils import read_execution
 from scheduler import Scheduler
+from tests import scheduler_legacy_fixtures as legacy_fx
 from xdg import XDGPaths
 
 
@@ -39,6 +41,8 @@ def _paths_for(state_dir) -> XDGPaths:
         config_home=state_dir, data_home=state_dir, state_home=state_dir,
         cache_home=state_dir, runtime_dir=state_dir,
         config_file=state_dir / "config.toml",
+        model_selection_file=state_dir / "model-selection.toml",
+        models_cache_file=state_dir / "models-cache.json",
         models_config_file=state_dir / "models.toml",
         scheduler_config=state_dir / "scheduler.toml",
         memory_file=state_dir / "memory.json",
@@ -785,3 +789,58 @@ def test_legacy_daily_single_digit_minute_derives_cron(
     """Legacy daily times with a one-digit minute stay accepted as by the baseline parser."""
     env = make_env(_TOML + f'\n[jobs.legacy]\nschedule = "daily"\ntime = "{time_str}"\ntask = "t"\n')
     assert (env.sched.show_job("legacy") or {}).get("cron") == "3 2 * * *"
+
+
+# ---------------------------------------------------------------------------
+# TOML origin decides treatment (legacy lookalike values)
+#
+# Relocated by task 2.4 from tests/test_scheduler_legacy_readonly.py (ledger
+# provenance in openspec/changes/simplify-model-runtime/test-preservation-ledger).
+# Deferred rewrite (task 8.3, ledger 449/450): obsolete legacy-lookalike fields
+# become a visible per-job config_error instead of legacy marking.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_legacy_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[legacy_fx.MakeLegacyScheduler]:
+    """Real legacy-beside-TOML schedulers (shared factory, see the support module)."""
+    yield from legacy_fx.legacy_scheduler_factory(tmp_path, monkeypatch)
+
+
+# A scheduler.toml job whose raw values imitate legacy origin markers.
+_SPOOF_TOML = legacy_fx.TOML + """
+[jobs.spoofed]
+enabled = true
+schedule = "cron"
+cron = "0 6 1 1 *"
+task = "spoofed task"
+notify = false
+source = "dynamic"
+_legacy_read_only = true
+"""
+
+
+class TestOriginSpoofGuard:
+    """Read-only origin comes from the legacy file, never from raw values."""
+
+    def test_toml_job_with_legacy_lookalike_values_is_writable(
+        self, make_legacy_scheduler: legacy_fx.MakeLegacyScheduler,
+    ) -> None:
+        """``source = "dynamic"`` plus a raw private flag in scheduler.toml stays writable."""
+        env = make_legacy_scheduler(_SPOOF_TOML, legacy=legacy_fx.UNRELATED_LEGACY)
+
+        out = exec_schedule(env.sched, {"action": "modify", "tag": "spoofed", "task": "edited"})
+
+        assert out["success"] is True, out
+        assert read_execution(out) == "executed"
+        assert legacy_fx.parse_toml(env.toml_path)["jobs"]["spoofed"]["task"] == "edited"
+
+    def test_toml_job_with_legacy_lookalike_values_is_unmarked(
+        self, make_legacy_scheduler: legacy_fx.MakeLegacyScheduler,
+    ) -> None:
+        """The lookalike scheduler.toml job carries no read-only marker."""
+        env = make_legacy_scheduler(_SPOOF_TOML, legacy=legacy_fx.UNRELATED_LEGACY)
+
+        assert env.sched.show_job("spoofed")["schedule"] == "cron: 0 6 1 1 *"

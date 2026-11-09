@@ -36,7 +36,7 @@ import token_usage
 from embedding_client import EmbeddingClient
 from llm_client import LLMClient
 from model_registry import CatalogView, ModelRegistry, ModelRegistryError, RunModel
-from model_settings import ModelSettings
+from model_settings import ModelCache, ModelPreference
 from prompt_builder import format_model_catalog_section
 from react_loop import ReactContext
 from scheduler import Scheduler
@@ -49,6 +49,9 @@ from tests.root_startup_harness import (
     EMBED_HOST,
     GEM_HOST,
     GONE_ID,
+    INVALID_SAVED,
+    UNCONFIGURED_ID,
+    remembered_for,
     GRAPH_ENABLED_DISCOVERED,
     GRAPH_HOST,
     GRAPH_ID,
@@ -440,8 +443,8 @@ class TestRootStartupComposition:
     def test_startup_refreshes_every_provider_through_all_pages_then_restores_main(
         self, root_harness: RootHarness,
     ) -> None:
-        """Startup fully refreshes every provider, then restores the valid Main."""
-        root_harness.start(saved_default=MAIN_ID)
+        """First start (no preference, no cache) discovers every provider once, then restores Main."""
+        root_harness.start(saved_default=None, write_cache=False)
         root = root_harness
         events = root.events
 
@@ -475,8 +478,10 @@ class TestRootStartupComposition:
         assert view.active_model_id == MAIN_ID and view.selection_status == "active"
         assert tuple(m.id for m in view.models) == DISCOVERED
         assert {p.provider_id: p.status for p in view.providers} == {"acme": "fresh", "gem": "fresh"}
-        saved = ModelSettings(root.paths.models_config_file).load()
-        assert saved.status == "valid" and saved.document.default_model == MAIN_ID
+        saved = ModelCache(root.paths.models_cache_file).load()
+        assert saved.status == "valid" and saved.document.default_model is None
+        assert not root.paths.model_selection_file.exists()  # the automatic choice is never saved
+        assert view.remembered_model_id is None
         assert tuple(m.id for m in saved.document.models) == DISCOVERED
 
         # No standing inference client; graph memory stays disabled (12.25 scope).
@@ -484,7 +489,35 @@ class TestRootStartupComposition:
         assert root.main_controller.llm is None
         assert root.main_controller._graph_memory is None
 
-    @pytest.mark.parametrize("saved_default", [None, GONE_ID], ids=["absent", "removed"])
+    def test_discovery_cache_lands_at_cache_path_and_legacy_catalog_stays_untouched(
+        self, root_harness: RootHarness,
+    ) -> None:
+        """Task 3.4: the root writes the disposable cache to ``models_cache_file`` only."""
+        legacy = b'schema_version = 1\nrevision = 9\n# legacy-canary sk-legacycanary0123456789\n'
+        root_harness.start(saved_default=None, write_cache=False, legacy_settings=legacy)
+        root = root_harness
+
+        paths = root.paths
+        assert paths.models_cache_file.parent == paths.cache_home
+        cached = json.loads(paths.models_cache_file.read_text(encoding="utf-8"))
+        assert set(cached) == {"schema_version", "providers", "models"}
+        assert tuple(m["id"] for m in cached["models"]) == DISCOVERED
+        assert {p["status"] for p in cached["providers"].values()} == {"fresh"}
+        text = paths.models_cache_file.read_text(encoding="utf-8")
+        for secret in SECRETS.values():
+            assert secret not in text
+        assert "https://" not in text and "sec:" not in text and "env:" not in text
+        assert ModelCache(paths.models_cache_file).load().status == "valid"
+        # The retired combined file is neither read, adopted, rewritten nor backed up.
+        assert paths.models_config_file.read_bytes() == legacy
+        assert sorted(p.name for p in paths.models_config_file.parent.iterdir() if "models-config" in p.name) == [
+            "models-config.toml"
+        ]
+        # Discovery never writes the deliberate preference.
+        assert not paths.model_selection_file.exists()
+        assert root.registry.view().active_model_id == MAIN_ID
+
+    @pytest.mark.parametrize("saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["absent", "removed"])
     def test_missing_main_keeps_commands_available_without_default_or_model_work(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
         saved_default: str | None,
@@ -504,7 +537,7 @@ class TestRootStartupComposition:
             codes: list[str] = []
             for profile, selector in (
                 (RuntimeProfile.ON_DEMAND_SUBAGENT, None),
-                (RuntimeProfile.PLAN_STEP_AGENT, OTHER_ID),
+                (RuntimeProfile.PLAN_STEP_AGENT, None),  # implicit; explicit needs no Main (task 4.1)
                 (RuntimeProfile.SCHEDULED_AGENT, OTHER_ID),
             ):
                 with pytest.raises(ModelRegistryError) as info:
@@ -531,14 +564,167 @@ class TestRootStartupComposition:
         assert root.llm_clients == [] and root.main_controller.llm is None
         view = root.registry.view()
         assert view.active_model_id is None
-        assert view.remembered_model_id == saved_default
+        assert view.remembered_model_id == remembered_for(saved_default)
         assert view.selection_status == (
-            "no_selection" if saved_default is None else "saved_selection_unavailable"
+            "no_selection" if remembered_for(saved_default) is None else "saved_selection_unavailable"
         )
-        saved = ModelSettings(root.paths.models_config_file).load().document
-        assert saved.default_model == saved_default
-        assert tuple(m.id for m in saved.models) == DISCOVERED
+        saved = ModelCache(root.paths.models_cache_file).load().document
+        assert saved.default_model is None
+        preference = ModelPreference(root.paths.model_selection_file).load()
+        assert preference.model == remembered_for(saved_default)
+        assert preference.status == ("corrupt" if saved_default == INVALID_SAVED else "valid")
+        # An unusable saved selection means no startup discovery: the stale cache is untouched.
+        assert tuple(m.id for m in saved.models) == tuple(sorted((MAIN_ID, OTHER_ID)))
+        assert root.refresh_reports == []
         assert root.unexpected == []
+
+    def test_first_start_all_provider_failure_keeps_commands_and_refuses_work_locally(
+        self, tmp_xdg: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Task 3.6 regression guard: no preference + no cache + every provider down.
+
+        Through the real ``main._run``: exactly one logical discovery pass per configured
+        provider (one failed page each, no retry), the bot still reaches command handling,
+        a real non-model command works, and an implicit task fails locally with /models
+        guidance and no inference HTTP. An explicit selector is admitted at the registry (task 4.1)
+        without Main or cache; full root wiring of explicit targets is task 4.2.
+        """
+        import telegram_interface
+        from telegram_commands import cmd_jobs
+
+        boundary = _ReactBoundary()
+        monkeypatch.setattr(agent_controller, "react_loop", boundary)
+        root_harness = RootHarness(tmp_xdg, monkeypatch, real_scheduler=True)  # real Scheduler for the real interface
+        root_harness.serve_provider_chat(failing_discovery_hosts=(ACME_HOST, GEM_HOST))
+        outcome: dict[str, Any] = {}
+
+        def hold(started: RootHarness) -> None:
+            """Drive a real non-model command and an implicit task, then an explicit-admission attempt."""
+            iface = telegram_interface.TelegramInterface(*started.telegram.args, **started.telegram.kwargs)
+            iface.agent = started.main_controller
+            iface._prompt_registry = started.telegram._prompt_registry
+            chat = _TelegramMessage()
+            outcome["chat"] = chat
+            outcome["requests_before"] = len(started.requests)
+            ctx = SimpleNamespace(args=[], bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+            async def drive() -> None:
+                """``/jobs`` (no model needed), then one ordinary request through the real handler."""
+                await cmd_jobs(iface, _message_update(chat), ctx)
+                outcome["replies_after_jobs"] = len(chat.replies)
+                await iface._run_agent_task(_message_update(chat), ctx, "ordinary request")
+                await asyncio.gather(*list(iface._flush_tasks))
+
+            _run_on_inline_loop(drive())
+            outcome["explicit_pin"] = started.registry.admit(OTHER_ID).model.id
+            outcome["requests_after"] = len(started.requests)
+
+        try:
+            root_harness.start(saved_default=None, write_cache=False, hold=hold)
+            root = root_harness
+
+            # Exactly one logical pass per configured provider: one (failed) page each, no retry.
+            discovery = [(r.url.host, r.url.path) for r in root.requests if r.method == "GET"]
+            assert sorted(discovery) == [(ACME_HOST, "/v1/models"), (GEM_HOST, "/v1beta/models")]
+            (report,) = root.refresh_reports
+            assert report.refreshed_provider_ids == () and sorted(report.stale_provider_ids) == ["acme", "gem"]
+            view = root.registry.view()
+            assert view.models == () and view.active_model_id is None and view.selection_status == "no_selection"
+            assert not root.paths.model_selection_file.exists()
+
+            # Startup reached command handling; a real non-model command answered.
+            assert "telegram:init" in root.events and "telegram:run" in root.events
+            chat: _TelegramMessage = outcome["chat"]
+            assert outcome["replies_after_jobs"] >= 1
+            # The implicit task failed locally with guidance, with no inference or any new HTTP.
+            texts = [m.text for m in chat.replies] + [edit for m in chat.replies for edit in m.edits]
+            assert any("No model is selected" in t and "/models" in t for t in texts), texts
+            assert outcome["requests_after"] == outcome["requests_before"]
+            assert not [r for r in root.requests if r.method == "POST" and r.url.host in (ACME_HOST, GEM_HOST)]
+            assert boundary.calls == [] and root.llm_clients == []
+            # Task 4.1: an explicit selector needs neither Main nor cache; admission makes no HTTP call.
+            assert outcome["explicit_pin"] == OTHER_ID and outcome["requests_after"] == outcome["requests_before"]
+            assert root.registry.view().models == () and root.registry.view().active_model_id is None
+            assert root.unexpected == []
+        finally:
+            root_harness.release_leftovers()
+
+    def test_first_start_discovery_makes_no_supplement_call_and_unknown_vision_does_not_block_images(
+        self, root_harness: RootHarness, tmp_path: Path,
+    ) -> None:
+        """Real root: first-start discovery contacts only providers, and an image request
+        for a model whose discovered vision flag is false goes out on its pinned route.
+
+        The harness router is the only network boundary; a ``models.dev`` request is an
+        unexpected destination. Main's discovered row reports ``vision`` unsupported, which
+        is display metadata: the image reaches the one provider call unchanged.
+        """
+        root_harness.serve_provider_chat()
+        served = root_harness._route
+        chat_bodies: list[dict[str, Any]] = []
+
+        def route(request: httpx.Request) -> httpx.Response:
+            """Report vision unsupported for Main's row; answer Main's chat with a finish."""
+            if request.method == "GET" and request.url.host == ACME_HOST and request.url.path == "/v1/models":
+                response = served(request)
+                if response.status_code == 200:
+                    payload = json.loads(response.content)
+                    for row in payload["data"]:
+                        row["capabilities"] = {"image_input": {"supported": False}}
+                    return httpx.Response(200, json=payload)
+                return response
+            if request.method == "POST" and request.url.host == ACME_HOST and request.url.path == "/v1/messages":
+                request.read()
+                root_harness.requests.append(request)
+                chat_bodies.append(json.loads(request.content))
+                return httpx.Response(200, json={
+                    "content": [{"type": "text", "text": json.dumps({"action": "finish", "result": "saw it"})}],
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                })
+            return served(request)
+
+        root_harness.monkeypatch.setattr(root_harness, "_route", route)
+        image = tmp_path / "picture.png"
+        image.write_bytes(b"fake-image-bytes")
+        outcome: dict[str, Any] = {}
+
+        def hold(root: RootHarness) -> None:
+            """Send one ordinary image-bearing request on Main."""
+            outcome["view"] = root.registry.view()
+            cards: list[str] = []
+
+            def progress(message: str) -> None:
+                """Record an LLM error card and answer it with Cancel (no operator exists)."""
+                if message.startswith("__LLM_ERROR__:"):
+                    cards.append(message)
+                    root.main_controller.resume_llm_error(message.split(":", 2)[1], "cancel")
+
+            outcome["reply"] = root.agent_handler(
+                1, "what is this?", progress, [str(image)], trace_id="r-0000e0a1",
+            )
+            outcome["cards"] = cards
+
+        root_harness.start(saved_default=None, write_cache=False, hold=hold)
+
+        assert root_harness.requests_to("models.dev") == []
+        assert root_harness.unexpected == []
+        assert outcome["view"].active_model_id == MAIN_ID
+        cached = {m.id: m for m in ModelCache(root_harness.paths.models_cache_file).load().document.models}
+        assert cached[MAIN_ID].metadata.vision is False
+        assert outcome["cards"] == []
+        assert outcome["reply"] == "saw it"
+        # The request itself is the first provider call; later bodies are post-run summaries.
+        # Every call stays on Main's pinned upstream (no model switch, no fallback).
+        assert {body["model"] for body in chat_bodies} == {"claude-a"}
+        carrying_images = [
+            body for body in chat_bodies
+            if any(
+                part.get("type") == "image"
+                for message in body["messages"] if isinstance(message["content"], list)
+                for part in message["content"]
+            )
+        ]
+        assert carrying_images == [chat_bodies[0]]
 
     def test_exhausted_request_keeps_commands_and_next_task_available(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
@@ -596,7 +782,7 @@ class TestRootStartupComposition:
             outcome["second"] = _request(root, "independent task", "r-0000e002")
             outcome["view"] = root.registry.view()
 
-        root_harness.start(saved_default=MAIN_ID, hold=hold)
+        root_harness.start(saved_default=None, write_cache=False, hold=hold)
         root = root_harness
 
         first, first_exc = outcome["first"]
@@ -631,7 +817,7 @@ class TestRootStartupComposition:
             outcome["first"] = _request(root, "first request", "r-0000b001")
             outcome["second"] = _request(root, "second request", "r-0000b002")
 
-        root_harness.start(saved_default=MAIN_ID, hold=hold)
+        root_harness.start(saved_default=None, write_cache=False, hold=hold)
         root = root_harness
 
         assert outcome["first"] == ("answer-1", None)
@@ -765,13 +951,81 @@ class TestRootStartupComposition:
         assert outcome["distinct"] is True
         assert root.unexpected == []
 
+    def test_edited_provider_connection_takes_effect_only_after_restart(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Task 3.1: the root's chat connection map is fixed until the process restarts.
+
+        While running, the operator edits ``[providers.acme]`` (endpoint and
+        credential reference) in ``config.toml`` and in-process code tries to
+        replace the parsed connection. Refresh and admission still use the
+        original endpoint and credential. A restarted root reads the edit.
+        """
+        import dataclasses
+
+        moved_host = "anthropic.moved.root.test"
+        moved_canary = "sk-moved-canary-task31-000999"
+        monkeypatch.setenv("KEY_ACME_MOVED", moved_canary)
+        outcome: dict[str, Any] = {}
+
+        def hold(root: RootHarness) -> None:
+            """Edit the config file, try to replace the live connection, then refresh and admit."""
+            text = root.paths.config_file.read_text()
+            edited = text.replace(f'base_url = "https://{ACME_HOST}"', f'base_url = "https://{moved_host}"')
+            edited = edited.replace('api_key = "env:KEY_ACME"', 'api_key = "env:KEY_ACME_MOVED"')
+            assert edited != text
+            root.paths.config_file.write_text(edited)
+            providers = root.app_cfg.providers
+            try:
+                providers["acme"] = dataclasses.replace(  # type: ignore[index]
+                    providers["acme"], base_url=f"https://{moved_host}", api_key="env:KEY_ACME_MOVED",
+                )
+            except TypeError:
+                outcome["mutation_rejected"] = True
+            else:
+                outcome["mutation_rejected"] = False
+            outcome["mark"] = len(root.requests)
+            outcome["report"] = root.registry.refresh()
+            pin = root.registry.admit()
+            outcome["pin"] = (pin.connection.base_url, pin.connection.api_key == SECRETS["KEY_ACME"])
+
+        root_harness.start(saved_default=None, write_cache=False, hold=hold)
+        root = root_harness
+        during = root.requests[outcome["mark"]:]
+        assert [r.url.host for r in during if r.url.path == "/v1/models"].count(ACME_HOST) == 2
+        assert root.requests_to(moved_host) == []
+        assert all(moved_canary not in str(r.headers) for r in root.requests)
+        assert {r.headers["x-api-key"] for r in during if r.url.host == ACME_HOST} == {SECRETS["KEY_ACME"]}
+        assert "acme" in outcome["report"].refreshed_provider_ids
+        assert outcome["pin"] == (f"https://{ACME_HOST}", True)
+        assert outcome["mutation_rejected"] is True
+        assert root.app_cfg.providers["acme"].base_url == f"https://{ACME_HOST}"
+
+        # Restart: a new process parses the edited file and uses the new connection.
+        root.hold = None
+        cfg, app_cfg = main_mod.load_config(
+            root.paths.config_file, vault_file=str(root.paths.secrets_file), agent_name="rootagent",
+        )
+        assert app_cfg.providers["acme"].base_url == f"https://{moved_host}"
+        # A restart with a populated cache would not discover; drop it to make this a first start.
+        root.paths.models_cache_file.unlink()
+        mark = len(root.requests)
+        main_mod._run(
+            cfg=cfg, app_cfg=app_cfg, paths=root.paths,
+            downloads_dir=str(root.workspace / "downloads"), tmp_dir=str(root.tmp_dir),
+            workspace_dir=str(root.workspace), agent_name="rootagent",
+        )
+        restarted = [r for r in root.requests[mark:] if r.url.path == "/v1/models"]
+        assert {r.url.host for r in restarted} == {moved_host}
+        assert {r.headers["x-api-key"] for r in restarted} == {moved_canary}
+
     def test_root_owned_clients_close_on_normal_exit(self, root_harness: RootHarness) -> None:
         """Root-owned discovery and embedding clients are closed when ``_run`` returns."""
         root_harness.start(saved_default=MAIN_ID)
         root = root_harness
         assert root.discoveries, "root never constructed ModelDiscovery"
         for discovery in root.discoveries:
-            assert discovery._client.is_closed and discovery._public_client.is_closed
+            assert discovery._client.is_closed
         assert root.root_embedding._http.is_closed
         assert root.open_clients_at_exit == []
         assert "scheduler:stop" in root.events
@@ -788,59 +1042,40 @@ class TestRootStartupComposition:
         root = root_harness
         assert root.discoveries, "root never constructed ModelDiscovery"
         for discovery in root.discoveries:
-            assert discovery._client.is_closed and discovery._public_client.is_closed
+            assert discovery._client.is_closed
         assert root.root_embedding._http.is_closed
         assert root.open_clients_at_exit == []
         assert "scheduler:stop" in root.events
 
-    @pytest.mark.parametrize("fault", ["second_discovery_client", "interrupt_during_refresh"])
     def test_early_model_setup_failure_releases_each_allocated_model_resource_once(
-        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch, fault: str,
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A fault after one discovery client or inside registry setup closes every
-        allocated root model resource exactly once, before any fixture hygiene."""
+        """A fault inside the startup refresh closes every allocated root model resource
+        exactly once, before any fixture hygiene."""
         releases = _track_client_releases(monkeypatch)
-        if fault == "second_discovery_client":
-            spy_init = httpx.Client.__init__
-            discovery_allocations: list[httpx.Client] = []
+        original_route = root_harness._route
 
-            def failing_init(client: httpx.Client, *args: Any, **kwargs: Any) -> None:
-                """Fail the second discovery-shaped client allocation (external boundary)."""
-                if kwargs == {"follow_redirects": False, "trust_env": False}:
-                    discovery_allocations.append(client)
-                    if len(discovery_allocations) == 2:
-                        raise _StartupFault("second discovery client allocation failed")
-                spy_init(client, *args, **kwargs)
+        def interrupting_route(request: httpx.Request) -> httpx.Response:
+            """Interrupt startup at the first provider discovery request."""
+            if request.url.host in (ACME_HOST, GEM_HOST):
+                raise _StartupFault("interrupted during startup refresh")
+            return original_route(request)
 
-            monkeypatch.setattr(httpx.Client, "__init__", failing_init)
-        else:
-            original_route = root_harness._route
-
-            def interrupting_route(request: httpx.Request) -> httpx.Response:
-                """Interrupt startup at the first provider discovery request."""
-                if request.url.host in (ACME_HOST, GEM_HOST):
-                    raise _StartupFault("interrupted during startup refresh")
-                return original_route(request)
-
-            monkeypatch.setattr(root_harness, "_route", interrupting_route)
+        monkeypatch.setattr(root_harness, "_route", interrupting_route)
 
         with pytest.raises(_StartupFault):
-            root_harness.start(saved_default=MAIN_ID)
+            root_harness.start(saved_default=None, write_cache=False)
         root = root_harness
 
         # Ownership is judged now, before the fixture's release_leftovers hygiene.
         allocated = list(root.http_clients)
         (embedding,) = root.embedding_clients
         assert embedding._http in allocated
-        if fault == "second_discovery_client":
-            assert len(allocated) == 2  # root embedding + the first discovery client
-            assert root.registries == [] and root.discoveries == []
-        else:
-            assert len(allocated) == 3
-            (discovery,) = root.discoveries
-            assert discovery._client in allocated and discovery._public_client in allocated
-            assert len(root.registries) == 1
-            assert "refresh:start" in root.events and "refresh:end" not in root.events
+        assert len(allocated) == 2  # root embedding + the one discovery client
+        (discovery,) = root.discoveries
+        assert discovery._client in allocated
+        assert len(root.registries) == 1
+        assert "refresh:start" in root.events and "refresh:end" not in root.events
         assert root.open_clients_at_exit == []
         assert {id(c): releases.get(id(c), 0) for c in allocated} == {id(c): 1 for c in allocated}
         assert root.llm_clients == []
@@ -911,7 +1146,7 @@ class TestRootStartupComposition:
 
             _run_on_inline_loop(drive())
 
-        root_harness.start(saved_default=None, hold=hold)
+        root_harness.start(saved_default=INVALID_SAVED, hold=hold)
         root = root_harness
 
         # The interface was wired from the actual startup kwargs: same registry,
@@ -936,8 +1171,10 @@ class TestRootStartupComposition:
         assert query.events == ["answer", "edit"]
         assert "Switched" in query.edits[-1] and MAIN_ID in query.edits[-1]
         assert outcome["active_after_select"] == MAIN_ID
-        saved = ModelSettings(root.paths.models_config_file).load().document
-        assert saved.default_model == MAIN_ID
+        # The deliberate /models choice is durable only in the XDG preference file.
+        assert root.paths.model_selection_file.read_bytes() == f'model = "{MAIN_ID}"\n'.encode()
+        saved = ModelCache(root.paths.models_cache_file).load().document
+        assert saved.default_model is None
 
         # After selection: one run on the explicitly selected pin, one upstream request.
         (call,) = boundary.calls
@@ -984,8 +1221,8 @@ class TestRootStartupGraphMemory:
     def test_graph_enabled_constructs_store_and_writer_with_resolved_pin(
         self, root_harness: RootHarness,
     ) -> None:
-        """Valid graph selector builds store/writer independently of active Main."""
-        root_harness.start(saved_default=None, graph_enabled=True)
+        """Valid graph selector builds store/writer independently of Main (here the in-memory first)."""
+        root_harness.start(saved_default=None, graph_enabled=True, write_cache=False)
         root = root_harness
 
         # Provider refresh completed before any graph construction.
@@ -1025,7 +1262,7 @@ class TestRootStartupGraphMemory:
         assert probes[0]._http.is_closed
         assert root.unexpected == []
 
-    @pytest.mark.parametrize("saved_default", [None, GONE_ID], ids=["no_selection", "main_gone"])
+    @pytest.mark.parametrize("saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no_selection", "main_gone"])
     def test_graph_enabled_works_without_active_main(
         self, root_harness: RootHarness, saved_default: str | None,
     ) -> None:
@@ -1064,7 +1301,7 @@ class TestRootStartupGraphMemory:
 
         monkeypatch.setattr(rsh, "_config_text", config_with_bad_selector)
 
-        root_harness.start(saved_default=None, graph_enabled=True)
+        root_harness.start(saved_default=INVALID_SAVED, graph_enabled=True)
         root = root_harness
 
         assert root.graph_store_instances == []
@@ -1097,7 +1334,7 @@ class TestRootStartupGraphMemory:
 
         monkeypatch.setattr(root_harness, "_route", route_with_failing_embed)
 
-        root_harness.start(saved_default=None, graph_enabled=True)
+        root_harness.start(saved_default=INVALID_SAVED, graph_enabled=True)
         root = root_harness
 
         # Graph disabled before store construction.
@@ -1126,7 +1363,7 @@ class TestRootStartupGraphMemory:
 
         monkeypatch.setattr(rsh, "_config_text", config_with_small_budget)
 
-        root_harness.start(saved_default=None, graph_enabled=True)
+        root_harness.start(saved_default=INVALID_SAVED, graph_enabled=True)
         root = root_harness
 
         assert root.app_cfg.agent.ctx_max_tokens == 512
@@ -1159,7 +1396,7 @@ class TestRootStartupGraphMemory:
         monkeypatch.setattr(rsh, "_config_text", config_with_missing_graph_key)
         monkeypatch.delenv("MISSING_GRAPH_KEY", raising=False)
 
-        root_harness.start(saved_default=None, graph_enabled=True)
+        root_harness.start(saved_default=INVALID_SAVED, graph_enabled=True)
         root = root_harness
 
         self._assert_prerequisite_rejection(root, caplog, "extraction model is unusable")
@@ -1189,7 +1426,7 @@ class TestRootStartupGraphMemory:
             )
 
         monkeypatch.setattr(rsh, "_config_text", config_with_unknown_embeddings)
-        root_harness.start(saved_default=None, graph_enabled=True)
+        root_harness.start(saved_default=INVALID_SAVED, graph_enabled=True)
         root = root_harness
 
         assert 'provider = "unsupported-embedding-provider"' in root.paths.config_file.read_text()
@@ -1334,7 +1571,7 @@ def _assert_failed_shutdown_retained(root: RootHarness, probe: str) -> list[dict
     assert embedding.embed("retained embedding probe") == [0.25, 0.75]
     assert root.discoveries, "root never constructed ModelDiscovery"
     for discovery in root.discoveries:
-        assert discovery._client.is_closed and discovery._public_client.is_closed
+        assert discovery._client.is_closed
     rows = _assert_logging_retained(root, probe)
     assert "Agent stopped." not in [row["msg"] for row in rows]
     return rows
@@ -1364,7 +1601,7 @@ class TestRootGraphShutdown:
             seen["worker_requests"] = list(barrier.worker_requests)
 
         try:
-            root.start(saved_default=None, graph_enabled=True, hold=hold)
+            root.start(saved_default=INVALID_SAVED, graph_enabled=True, hold=hold)
             writer, store = root.graph_writer, root.graph_store
 
             assert seen == {"pending": 1, "worker_requests": []}
@@ -1426,7 +1663,7 @@ class TestRootGraphShutdown:
 
         try:
             with pytest.raises(RuntimeError, match=re.escape(_STOP_TIMEOUT_MESSAGE)) as caught:
-                root.start(saved_default=None, graph_enabled=True, hold=hold)
+                root.start(saved_default=INVALID_SAVED, graph_enabled=True, hold=hold)
 
             # Observed at _run exit with the worker still blocked, before any hygiene.
             assert seen == {"held": True}
@@ -1480,7 +1717,7 @@ class TestRootGraphShutdown:
 
         try:
             with pytest.raises(RuntimeError, match=re.escape(_STOP_TIMEOUT_MESSAGE)) as caught:
-                root.start(saved_default=None, graph_enabled=True, hold=hold)
+                root.start(saved_default=INVALID_SAVED, graph_enabled=True, hold=hold)
 
             # Observed at _run exit with the worker still blocked, before any hygiene.
             assert seen == {"extraction_closed": [True]}
@@ -1539,7 +1776,7 @@ class TestRootGraphShutdown:
 
         try:
             with pytest.raises(RuntimeError, match=re.escape(_STOP_FAILED_MESSAGE)) as caught:
-                root.start(saved_default=None, graph_enabled=True, hold=hold)
+                root.start(saved_default=INVALID_SAVED, graph_enabled=True, hold=hold)
 
             # Observed at _run exit with the worker still blocked, before any hygiene.
             assert len(tripped) == 1
@@ -1675,19 +1912,19 @@ class TestRealLoggingHarnessIsolation:
 
 
 class TestRootDiagnosticMainGate:
-    """Task 12.20: the diagnostic profile is gated by an active Main like the other three.
+    """Task 4.1: a diagnostic run's explicit selector needs neither Main nor cache membership.
 
-    Separate from ``test_missing_main_keeps_commands_available_without_default_or_model_work``
-    (on-demand/plan-step/scheduled), which stays unchanged.
+    Implicit and scheduled refusal without Main stays in
+    ``test_missing_main_keeps_commands_available_without_default_or_model_work``.
     """
 
-    @pytest.mark.parametrize("saved_default", [None, GONE_ID], ids=["absent", "removed"])
-    def test_diagnostic_profile_refuses_valid_explicit_selector_without_active_main(
+    @pytest.mark.parametrize("saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["absent", "removed"])
+    def test_diagnostic_profile_admits_valid_explicit_selector_without_active_main(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
         saved_default: str | None,
     ) -> None:
-        """A valid explicit OTHER_ID is refused with no_active_selection before any
-        credential, runtime, client, request or usage work; Main/settings unchanged."""
+        """A valid explicit OTHER_ID is admitted once, resolving one credential and pinning
+        its route; Main, the preference and the cache stay unchanged and no request is sent."""
         from agent_runtime import RuntimeProfile
 
         usage = TokenUsageRegistry()
@@ -1703,7 +1940,7 @@ class TestRootDiagnosticMainGate:
                 root.builtin._sub_agent_factory is factory,
             )
             outcome["view_before"] = root.registry.view()
-            outcome["settings_before"] = root.paths.models_config_file.read_bytes()
+            outcome["settings_before"] = root.paths.models_cache_file.read_bytes()
             marks = (len(root.requests), len(root.llm_clients), len(root.http_clients))
             outcome["admissions"] = _spy_admissions(monkeypatch, root.registry)
             resolved: list[str] = []
@@ -1724,28 +1961,27 @@ class TestRootDiagnosticMainGate:
                 return create(profile, options, **kwargs)
 
             monkeypatch.setattr(root.runtime, "create", create_spy)
-            with pytest.raises(ModelRegistryError) as info:
-                factory(model=OTHER_ID, runtime_profile=RuntimeProfile.DIAGNOSTIC_AGENT)
-            outcome["code"] = info.value.code
+            runner = factory(model=OTHER_ID, runtime_profile=RuntimeProfile.DIAGNOSTIC_AGENT)
+            outcome["runner_model"] = runner.model_id
+            runner.close()  # the run never starts; release its owned clients
             outcome["resolved"], outcome["creates"] = resolved, creates
             requests, llm_clients, http_clients = marks
             outcome["new_requests"] = root.requests[requests:]
             outcome["new_llm_clients"] = root.llm_clients[llm_clients:]
             outcome["new_http_clients"] = root.http_clients[http_clients:]
             outcome["view_after"] = root.registry.view()
-            outcome["settings_after"] = root.paths.models_config_file.read_bytes()
+            outcome["settings_after"] = root.paths.models_cache_file.read_bytes()
 
         root_harness.start(saved_default=saved_default, hold=hold)
         root = root_harness
 
         assert outcome["binding"] == (True, True, True)
         before = outcome["view_before"]
-        assert before.active_model_id is None and before.remembered_model_id == saved_default
+        assert before.active_model_id is None and before.remembered_model_id == remembered_for(saved_default)
         assert OTHER_ID in {m.id for m in before.models}
-        assert outcome["code"] == "no_active_selection"
+        assert outcome["runner_model"] == OTHER_ID
         assert outcome["admissions"] == {"admit": [OTHER_ID], "admit_scheduled": []}
-        assert outcome["resolved"] == [] and outcome["creates"] == []
-        assert outcome["new_llm_clients"] == [] and outcome["new_http_clients"] == []
+        assert outcome["resolved"] == [OTHER_ID.split("/", 1)[0]] and len(outcome["creates"]) == 1
         assert outcome["new_requests"] == []
         assert usage.get_today() == {}
         assert outcome["view_after"] == before
@@ -1758,34 +1994,27 @@ class TestRootGraphStartupContainment:
     """Task 12.24: graph startup after a partly failed refresh, and independent
     containment of scheduler and graph failures with real bot commands."""
 
-    def test_graph_resolves_stale_last_good_entry_after_failed_provider_refresh(
+    def test_graph_resolves_cached_stale_entry_without_any_startup_discovery(
         self, root_harness: RootHarness,
     ) -> None:
-        """The graph provider's discovery fails; after the complete refresh its saved
-        last-good entry stays stale yet resolves to the graph pin, with no Main."""
+        """Task 3.6: a cached (stale) graph entry means nothing is re-discovered at startup, yet
+        the graph selector resolves to its pin; Main is only the in-memory first cached candidate."""
         root_harness.serve_provider_chat(failing_discovery_hosts=(GRAPH_HOST,))
         root_harness.start(saved_default=None, graph_enabled=True)
         root = root_harness
 
-        # The complete refresh ran once: acme/gem refreshed, graph failed and kept last-good.
-        (report,) = root.refresh_reports
-        assert sorted(report.refreshed_provider_ids) == ["acme", "gem"]
-        assert report.stale_provider_ids == ("graph",)
-        assert [provider for provider, _code in report.error_codes] == ["graph"]
-        graph_discovery = root.requests_to(GRAPH_HOST)
-        assert graph_discovery and all(
-            r.method == "GET" and r.url.path == "/v1/models" for r in graph_discovery
-        )
+        assert root.refresh_reports == [] and not [e for e in root.events if e.startswith("fetch:")]
+        assert not [r for r in root.requests if r.url.path.endswith("/models")]
         view = root.registry.view()
         assert {p.provider_id: p.status for p in view.providers} == {
-            "acme": "fresh", "gem": "fresh", "graph": "stale",
+            "acme": "stale", "gem": "stale", "graph": "stale",
         }
         assert GRAPH_ID in {m.id for m in view.models}
 
-        # Graph resolution, helper and store only after the whole refresh.
-        refresh_end = root.events.index("refresh:end")
-        assert root.events.index("graph:build_extraction_call") > refresh_end
-        assert root.events.index("graph:store:init") > refresh_end
+        # Graph pin is resolved after the selection restore (no rediscovery) and before store, writer and polling.
+        ev = root.events
+        assert ev.index("restore") < ev.index("graph:build_extraction_call") < ev.index("graph:store:init")
+        assert ev.index("graph:store:init") < ev.index("graph:writer:init") < ev.index("telegram:run")
         ((args, kwargs),) = root.graph_extraction_calls
         pin, agent_config = args
         assert isinstance(pin, RunModel) and pin.model.id == GRAPH_ID
@@ -1805,9 +2034,10 @@ class TestRootGraphStartupContainment:
         assert root.telegram._graph_memory_store is root.graph_store
         assert root.telegram._graph_memory_writer is root.graph_writer
 
-        # No Main: none invented, no default persisted, no Main chat client, no inference.
-        assert view.active_model_id is None and view.remembered_model_id is None
-        saved = ModelSettings(root.paths.models_config_file).load().document
+        # Main is the in-memory first candidate: never remembered or persisted, no Main chat client, no inference.
+        assert view.active_model_id == MAIN_ID and view.remembered_model_id is None
+        assert not root.paths.model_selection_file.exists()
+        saved = ModelCache(root.paths.models_cache_file).load().document
         assert saved.default_model is None and GRAPH_ID in {m.id for m in saved.models}
         assert root.llm_clients == [] and root.main_controller.llm is None
         assert [r for r in root.requests if r.method == "POST" and r.url.host != EMBED_HOST] == []
@@ -1862,7 +2092,7 @@ class TestRootGraphStartupContainment:
                 _run_on_inline_loop(drive())
                 outcome["clients_at_hold"] = len(started.llm_clients)
 
-            root.start(saved_default=None, graph_enabled=True, hold=hold)
+            root.start(saved_default=INVALID_SAVED, graph_enabled=True, hold=hold)
 
             # The real Scheduler was built and contained its whole-file failure.
             scheduler = root.scheduler
@@ -1917,7 +2147,7 @@ class TestRootGraphStartupContainment:
             # Main stays inactive: no fallback, no default, no chat client, no inference.
             view = root.registry.view()
             assert view.active_model_id is None and view.remembered_model_id is None
-            saved = ModelSettings(root.paths.models_config_file).load().document
+            saved = ModelCache(root.paths.models_cache_file).load().document
             assert saved.default_model is None
             assert outcome["clients_at_hold"] == 0 and root.llm_clients == []
             assert root.main_controller.llm is None
@@ -1926,7 +2156,7 @@ class TestRootGraphStartupContainment:
             # Root-owned resources were released by production before fixture hygiene.
             assert root.discoveries
             for discovery in root.discoveries:
-                assert discovery._client.is_closed and discovery._public_client.is_closed
+                assert discovery._client.is_closed
             assert root.root_embedding._http.is_closed
             assert root.open_clients_at_exit == []
             assert root.unexpected == []
@@ -1938,8 +2168,8 @@ class TestRootGraphStartupContainment:
 _SETTINGS_LEAK = "sk-settingsleak12345"
 _STARTUP_SETTINGS: dict[str, bytes | None] = {
     "absent": None,
-    "corrupt-toml": f"schema_version = 1\nrevision = [\n# {_SETTINGS_LEAK}\n".encode(),
-    "invalid-schema": f'schema_version = 2\nrevision = 1\nnote = "{_SETTINGS_LEAK}"\n'.encode(),
+    "corrupt-toml": f'{{"schema_version": 1, "models": [\n"{_SETTINGS_LEAK}"'.encode(),
+    "invalid-schema": f'{{"schema_version": 2, "note": "{_SETTINGS_LEAK}"}}'.encode(),
 }
 
 
@@ -1960,8 +2190,8 @@ class TestRootManagedSettingsStartup:
         caplog: pytest.LogCaptureFixture, state: str, graph_enabled: bool,
     ) -> None:
         """Corrupt input is preserved before the first production overwrite; startup
-        persists a fresh catalog without a Main; commands answer while ordinary model
-        work is refused; graph resolves independently in the same run."""
+        persists a fresh catalog; with no preference the first candidate is the in-memory Main
+        (task 3.5) and is never saved; commands answer; graph resolves in the same run."""
         import telegram_interface
         from telegram_commands import cmd_models
         from tests import root_startup_harness as rsh
@@ -1984,9 +2214,9 @@ class TestRootManagedSettingsStartup:
                 else:
                     self.path.write_bytes(raw)
 
-        monkeypatch.setattr(rsh, "ModelSettings", _SetupWriter)
+        monkeypatch.setattr(rsh, "ModelCache", _SetupWriter)
         root = RootHarness(tmp_xdg, monkeypatch, real_scheduler=True)
-        settings_path = root.paths.models_config_file
+        settings_path = root.paths.models_cache_file
 
         def backups() -> dict[str, bytes]:
             """Every ``.corrupt*`` sibling of the managed file and its bytes."""
@@ -1997,17 +2227,16 @@ class TestRootManagedSettingsStartup:
 
         # Delegating observers on the real ModelSettings read and the real FS replace.
         loads: list[SimpleNamespace] = []
-        real_load = ModelSettings.load
+        real_load = ModelCache.load
 
-        def load_spy(settings: ModelSettings) -> Any:
+        def load_spy(settings: ModelCache) -> Any:
             """Record the input state around the real load, then return its result."""
             seen = SimpleNamespace(
                 path=settings.path, events=list(root.events),
                 before=settings.path.read_bytes() if settings.path.exists() else None,
             )
             result = real_load(settings)
-            seen.status, seen.preserved = result.status, result.preserved_path
-            seen.preserved_bytes = result.preserved_path.read_bytes() if result.preserved_path else None
+            seen.status = result.status
             seen.after = settings.path.read_bytes() if settings.path.exists() else None
             loads.append(seen)
             return result
@@ -2024,7 +2253,7 @@ class TestRootManagedSettingsStartup:
                 ))
             real_replace(src, dst, *args, **kwargs)
 
-        monkeypatch.setattr(ModelSettings, "load", load_spy)
+        monkeypatch.setattr(ModelCache, "load", load_spy)
         monkeypatch.setattr(os, "replace", replace_spy)
         outcome: dict[str, Any] = {}
 
@@ -2066,9 +2295,6 @@ class TestRootManagedSettingsStartup:
                 await asyncio.gather(*list(iface._flush_tasks))
 
             _run_on_inline_loop(drive())
-            with pytest.raises(ModelRegistryError) as info:
-                started.builtin._sub_agent_factory(model=OTHER_ID)
-            outcome["factory_code"] = info.value.code
             requests, llm_clients, http_clients = marks
             outcome["new_requests"] = started.requests[requests:]
             outcome["new_llm"] = started.llm_clients[llm_clients:]
@@ -2077,17 +2303,15 @@ class TestRootManagedSettingsStartup:
 
         try:
             root.start(saved_default=None, graph_enabled=graph_enabled, hold=hold)
-            name = settings_path.name
 
             # Startup input: the real registry load saw the genuine absent/corrupt file first.
             first = loads[0]
             assert first.path == settings_path and "refresh:start" not in first.events
             if raw is None:
-                assert (first.before, first.status, first.preserved) == (None, "missing", None)
+                assert (first.before, first.status) == (None, "missing")
             else:
-                assert first.before == raw and first.status == "corrupt"
-                assert first.preserved == settings_path.with_name(f"{name}.corrupt")
-                assert first.preserved_bytes == raw and first.after == raw
+                # Disposable cache: treated as absent, bytes untouched, never quarantined.
+                assert first.before == raw and first.status == "corrupt" and first.after == raw
 
             # Two production refreshes write the managed file: startup
             # (main._refresh_model_catalog) and the real /models command
@@ -2100,8 +2324,7 @@ class TestRootManagedSettingsStartup:
             if raw is None:
                 assert write.target is None and write.backups == {}
             else:
-                assert write.target == raw
-                assert write.backups == {f"{name}.corrupt": raw}
+                assert write.target == raw and write.backups == {}
             # The command refresh overwrites only the startup payload; backups untouched.
             assert "telegram:run" in command_write.events
             assert command_write.events.count("refresh:start") == 2
@@ -2111,10 +2334,10 @@ class TestRootManagedSettingsStartup:
             # The first (startup) payload, parsed by the real ModelSettings off the
             # production path, is a valid fresh catalog with no Main/default.
             expected = GRAPH_ENABLED_DISCOVERED if graph_enabled else DISCOVERED
-            startup_copy = tmp_path / "phase-check" / "startup-payload.toml"
+            startup_copy = tmp_path / "phase-check" / "startup-payload.json"
             startup_copy.parent.mkdir()
             startup_copy.write_bytes(write.incoming)
-            startup = ModelSettings(startup_copy, read_only=True).load()
+            startup = ModelCache(startup_copy).load()
             assert startup.status == "valid" and startup.document.default_model is None
             assert tuple(m.id for m in startup.document.models) == expected
             assert {p.status for p in startup.document.providers} == {"fresh"}
@@ -2122,18 +2345,20 @@ class TestRootManagedSettingsStartup:
             # Final managed document = the LAST production payload: valid, fresh,
             # one revision after startup, still no Main/default.
             assert settings_path.read_bytes() == command_write.incoming
-            final = ModelSettings(settings_path).load()
+            final = ModelCache(settings_path).load()
             assert final.status == "valid" and final.document.default_model is None
-            assert final.document.revision == startup.document.revision + 1
+            assert final.document.models == startup.document.models
             assert tuple(m.id for m in final.document.models) == expected
             assert {p.status for p in final.document.providers} == {"fresh"}
-            assert backups() == ({} if raw is None else {f"{name}.corrupt": raw})
+            assert backups() == {}
+            assert _SETTINGS_LEAK not in settings_path.read_text(encoding="utf-8")
 
-            # Main stays inactive: nothing remembered, nothing active, no Main client.
+            # Main is the in-memory first candidate (task 3.5): active, never remembered or saved.
             for view in (outcome["view_after_models"], outcome["view"], root.registry.view()):
-                assert view.active_model_id is None and view.remembered_model_id is None
-                assert view.selection_status == "no_selection"
-            assert root.llm_clients == [] and root.main_controller.llm is None
+                assert view.active_model_id == MAIN_ID and view.remembered_model_id is None
+                assert view.selection_status == "active"
+            assert not root.paths.model_selection_file.exists()
+            assert root.main_controller.llm is None
 
             # Actual commands answer from the same root registry.
             iface = outcome["iface"]
@@ -2141,23 +2366,18 @@ class TestRootManagedSettingsStartup:
             chat: _TelegramMessage = outcome["chat"]
             (listing,) = [m for m in chat.replies if "Model Catalog" in m.text]
             assert MAIN_ID in listing.text and OTHER_ID in listing.text
-            # Ordinary work is refused at the Main gate before credential/client/chat I/O.
+            # Ordinary work runs once on the in-memory Main pin; no other provider is touched.
             assert [m.text for m in chat.replies].count("🔄 Processing…") == 1
             prompts = {r.text: r.status for r in root.telegram._prompt_registry.list_recent(10)}
-            assert prompts == {"ordinary request": "failed"}
-            assert boundary.calls == []
-            assert outcome["admissions"] == {"admit": [None, OTHER_ID], "admit_scheduled": []}
-            assert outcome["factory_code"] == "no_active_selection"
-            assert outcome["resolved"] == []
-            # Marks were taken after /models: the ordinary phase made no request at all.
-            assert outcome["new_llm"] == [] and outcome["new_http"] == []
+            assert prompts == {"ordinary request": "done"}
+            (call,) = boundary.calls
+            assert call.pin.model.id == MAIN_ID and call.pin.connection.provider_id == "acme"
+            assert outcome["admissions"] == {"admit": [None], "admit_scheduled": []}
+            assert outcome["resolved"] == ["acme"]
             assert outcome["new_requests"] == []
 
-            # Actionable no-Main warning; no input bytes leak anywhere observable.
+            # No input bytes leak anywhere observable.
             messages = [r.getMessage() for r in caplog.records]
-            assert any(
-                m.startswith("No main model is active (no_selection); select one with /models") for m in messages
-            ), messages
             observable = "\n".join(messages + root.notices + [m.text for m in chat.replies] + [
                 edit for m in chat.replies for edit in m.edits
             ])
@@ -2184,9 +2404,150 @@ class TestRootManagedSettingsStartup:
             # Root-owned resources were released by production before hygiene.
             assert root.discoveries
             for discovery in root.discoveries:
-                assert discovery._client.is_closed and discovery._public_client.is_closed
+                assert discovery._client.is_closed
             assert root.root_embedding._http.is_closed
             assert root.open_clients_at_exit == []
             assert root.unexpected == []
         finally:
             root.release_leftovers()
+
+
+_DISCOVERY_HOSTS = (ACME_HOST, GEM_HOST)
+_ROOT_PREF_CANARY = "sk-rootprefcanary0123456789"
+
+
+class TestRootStartupSelection:
+    """Task 3.5: the real ``main._run`` selects at startup from the saved preference or memory."""
+
+    @staticmethod
+    def _discovery_calls(root: RootHarness) -> list[str]:
+        return [e for e in root.events if e.startswith("fetch:")] + [
+            f"http:{r.url.host}" for r in root.requests if r.url.host in _DISCOVERY_HOSTS
+        ]
+
+    @pytest.mark.parametrize("with_cache", [True, False], ids=["cached", "empty-cache"])
+    @pytest.mark.parametrize(
+        "variant",
+        ["wrong-type", "toml", "extra-key", "unreadable", "removed-connection"],
+    )
+    def test_invalid_or_unreadable_saved_selection_is_unset_without_discovery_or_writes(
+        self, root_harness: RootHarness, caplog: pytest.LogCaptureFixture, variant: str, with_cache: bool,
+    ) -> None:
+        raw = {
+            "wrong-type": b"model = 7\n",
+            "toml": b"model = [broken\n",
+            "extra-key": f'model = "{MAIN_ID}"\napi_key = "{_ROOT_PREF_CANARY}"\n'.encode(),
+            "unreadable": None,
+            "removed-connection": b'model = "oldconn/m"\n',
+        }[variant]
+        with caplog.at_level(logging.WARNING):
+            root_harness.start(
+                saved_default=None, preference_bytes=raw,
+                preference_unreadable=variant == "unreadable", write_cache=with_cache,
+            )
+        root = root_harness
+        cache = root.paths.models_cache_file
+        pref = root.paths.model_selection_file
+
+        assert "telegram:run" in root.events  # commands stay available
+        view = root.registry.view()
+        assert view.active_model_id is None  # no automatic choice, even with a known cache
+        assert self._discovery_calls(root) == [] and root.refresh_reports == []
+        assert root.unexpected == []
+        if raw is None:
+            assert pref.is_dir()
+        else:
+            assert pref.read_bytes() == raw  # preserved exactly, never quarantined or replaced
+        assert sorted(p.name for p in pref.parent.iterdir() if "model-selection" in p.name) == [pref.name]
+        assert cache.exists() is with_cache
+        if with_cache:
+            assert tuple(m.id for m in ModelCache(cache).load().document.models) == tuple(
+                sorted((MAIN_ID, OTHER_ID))
+            )  # the stale cache is not refreshed
+        messages = [r.getMessage() for r in caplog.records]
+        notice = [m for m in messages if "saved model selection" in m]
+        assert len(notice) == 1 and "/models" in notice[0]
+        assert _ROOT_PREF_CANARY not in "\n".join(messages)
+
+    def test_saved_configured_uncached_selector_stays_active_and_unmodified(
+        self, root_harness: RootHarness,
+    ) -> None:
+        root_harness.start(saved_default=GONE_ID, write_cache=False)
+        root = root_harness
+        view = root.registry.view()
+        assert view.active_model_id == GONE_ID and view.selection_status == "active"
+        assert view.remembered_model_id == GONE_ID
+        assert GONE_ID not in {m.id for m in view.models}  # active independent of cache membership
+        assert root.paths.model_selection_file.read_bytes() == f'model = "{GONE_ID}"\n'.encode()
+
+    def test_without_preference_first_ordinal_candidate_is_active_in_memory_and_rederived(
+        self, root_harness: RootHarness,
+    ) -> None:
+        root_harness.start(saved_default=None, removed_connection="oldconn")
+        root = root_harness
+        view = root.registry.view()
+        assert view.active_model_id == MAIN_ID == min(DISCOVERED)  # not the removed "oldconn/aaa-first"
+        assert view.remembered_model_id is None
+        assert "oldconn/aaa-first" not in {m.id for m in view.models}
+        assert not root.paths.model_selection_file.exists()
+        assert all(p.provider_id != "oldconn" for p in view.providers)
+
+
+class TestRootInitialCacheChoice:
+    """Task 3.5 correction: the automatic choice is the minimum of the INITIAL cache, not of the refresh."""
+
+    def test_cached_minimum_is_active_without_any_startup_discovery(
+        self, root_harness: RootHarness,
+    ) -> None:
+        cached = "acme/aaa-cached"
+        root_harness.start(saved_default=None, removed_connection="oldconn", extra_cached=(cached,))
+        root = root_harness
+        view = root.registry.view()
+        assert view.active_model_id == cached and view.remembered_model_id is None
+        assert view.selection_status == "active"
+        assert cached in {m.id for m in view.models} and "oldconn/aaa-first" not in {m.id for m in view.models}
+        assert not root.paths.model_selection_file.exists()
+        assert root.refresh_reports == [] and not [r for r in root.requests if r.url.path.endswith("/models")]
+
+    def test_valid_empty_refresh_after_first_start_keeps_the_choice_and_preference(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        original = root_harness._route
+        outcome: dict[str, Any] = {}
+
+        def route(request: httpx.Request) -> httpx.Response:
+            if outcome.get("empty") and request.method == "GET" and request.url.path == "/v1/models" \
+                    and request.url.host == ACME_HOST:
+                request.read()
+                root_harness.requests.append(request)
+                return httpx.Response(200, json={"data": [], "has_more": False})
+            if outcome.get("empty") and request.method == "GET" and request.url.path == "/v1beta/models" \
+                    and request.url.host == GEM_HOST:
+                request.read()
+                root_harness.requests.append(request)
+                return httpx.Response(200, json={"models": []})
+            return original(request)
+
+        monkeypatch.setattr(root_harness, "_route", route)
+
+        def hold(root: RootHarness) -> None:
+            """The deliberate /models-style refresh after a first-start discovery returns nothing."""
+            root.registry.select(OTHER_ID)
+            outcome["before"] = root.registry.view()
+            outcome["pref"] = root.paths.model_selection_file.read_bytes()
+            outcome["empty"] = True
+            root.registry.refresh()
+
+        root_harness.start(saved_default=None, write_cache=False, hold=hold)
+        root = root_harness
+        view, before = root.registry.view(), outcome["before"]
+        assert view.models == ()  # the empty inventory is really published
+        assert view.active_model_id == before.active_model_id == OTHER_ID
+        assert view.remembered_model_id == OTHER_ID and view.selection_revision == before.selection_revision
+        assert root.paths.model_selection_file.read_bytes() == outcome["pref"]
+
+    def test_empty_initial_cache_uses_the_refreshed_candidates(self, root_harness: RootHarness) -> None:
+        root_harness.start(saved_default=None, write_cache=False)
+        root = root_harness
+        assert root.registry.view().active_model_id == min(DISCOVERED)
+        assert not root.paths.model_selection_file.exists()

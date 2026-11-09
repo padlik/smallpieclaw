@@ -52,7 +52,7 @@ def record(upstream_id: str, provider_id: str, *, context: int = 100) -> ModelRe
         provider_id,
         upstream_id,
         upstream_id,
-        ModelMetadata(context, None, None, False, None, None, (("context_tokens", "provider"), ("vision", "provider"))),
+        ModelMetadata(context, None, None, False, None, None),
     )
 
 
@@ -62,7 +62,7 @@ GRAPH_RECORD = record("org/graph-model", "g")
 
 
 def inventory(provider_id: str, models: tuple[ModelRecord, ...]) -> ProviderInventory:
-    return ProviderInventory(provider_id, "openai", models, (), REFRESHED_AT)
+    return ProviderInventory(provider_id, "openai", models, REFRESHED_AT)
 
 
 class FakeDiscovery:
@@ -160,7 +160,6 @@ def build(tmp_path: Path, *, remembered: str | None = None) -> GraphFixture:
             remembered,
             tuple(ProviderState(item.name, item.type, SEEDED_AT, "fresh") for item in providers),
             tuple(sorted((MAIN_RECORD, SIBLING_RECORD, GRAPH_RECORD), key=lambda item: item.id)),
-            (),
         )
     )
     discovery = FakeDiscovery()
@@ -251,7 +250,7 @@ def test_graph_pin_is_not_retargeted_by_later_main_change_or_target_removal(tmp_
 
     pin = fixture.registry.resolve_graph_model(GRAPH_RECORD.id)
     fixture.registry.select(SIBLING_RECORD.id)
-    fixture.registry.replace_connections({"p": provider("p")})
+    fixture.refresh_with(graph=inventory("g", ()))
 
     assert GRAPH_RECORD not in fixture.registry.view().models
     assert pin.model == GRAPH_RECORD
@@ -263,17 +262,21 @@ def test_graph_pin_is_not_retargeted_by_later_main_change_or_target_removal(tmp_
 @pytest.mark.parametrize("entry", ["admit", "admit_scheduled"])
 @pytest.mark.parametrize("main_state", ["unselected", "remembered-missing"])
 def test_graph_resolution_does_not_open_ordinary_admission(tmp_path: Path, entry: str, main_state: str) -> None:
+    """Graph resolution never activates Main: implicit and scheduled admission stay closed."""
     fixture = arrange(tmp_path, main_state, "fresh")
-    ordinary = getattr(fixture.registry, entry)
+    ordinary = (
+        fixture.registry.admit if entry == "admit"
+        else (lambda: fixture.registry.admit_scheduled(GRAPH_RECORD.id))
+    )
     with pytest.raises(ModelRegistryError) as before:
-        ordinary(GRAPH_RECORD.id)
+        ordinary()
     assert before.value.code == "no_active_selection"
     assert fixture.boundary.providers() == []
 
     fixture.registry.resolve_graph_model(GRAPH_RECORD.id)
 
     with pytest.raises(ModelRegistryError) as after:
-        ordinary(GRAPH_RECORD.id)
+        ordinary()
     assert after.value.code == "no_active_selection"
     assert fixture.boundary.providers() == ["g"]
 
@@ -366,7 +369,7 @@ def test_unusable_graph_credential_resolution_fails_typed_once(
 
 @pytest.mark.parametrize(
     "mutation",
-    ["target-endpoint-replaced", "target-provider-removed", "graph-record-metadata-changed", "graph-record-removed"],
+    ["graph-record-metadata-changed", "graph-record-removed"],
 )
 def test_graph_target_change_during_credential_resolution_fails_connection_changed(
     tmp_path: Path, mutation: str
@@ -375,11 +378,7 @@ def test_graph_target_change_during_credential_resolution_fails_connection_chang
     observed: list[Observed] = []
 
     def mutate() -> None:
-        if mutation == "target-endpoint-replaced":
-            fixture.registry.replace_connections({"g": provider("g", url="https://moved.invalid/v1"), "p": provider("p")})
-        elif mutation == "target-provider-removed":
-            fixture.registry.replace_connections({"p": provider("p")})
-        elif mutation == "graph-record-metadata-changed":
+        if mutation == "graph-record-metadata-changed":
             fixture.refresh_with(graph=inventory("g", (record("org/graph-model", "g", context=200),)))
         else:
             fixture.refresh_with(graph=inventory("g", ()))
@@ -394,34 +393,12 @@ def test_graph_target_change_during_credential_resolution_fails_connection_chang
     assert fixture.observe() == observed[0]
 
 
-def test_graph_target_aba_restoration_still_fails_generation_recheck(tmp_path: Path) -> None:
-    fixture = arrange(tmp_path, "unselected", "fresh")
-    observed: list[Observed] = []
-
-    def mutate() -> None:
-        fixture.registry.replace_connections({"g": provider("g", url="https://moved.invalid/v1"), "p": provider("p")})
-        fixture.registry.replace_connections({"g": provider("g"), "p": provider("p")})
-        fixture.refresh_with(graph=inventory("g", (GRAPH_RECORD,)))
-        observed.append(fixture.observe())
-        assert GRAPH_RECORD in observed[0].view.models
-
-    result, _ = resolve_graph_during(fixture, GRAPH_RECORD.id, mutate)
-
-    assert isinstance(result, ModelRegistryError)
-    assert result.code == "connection_changed"
-    assert fixture.boundary.providers(GRAPH_WORKER) == ["g"]
-    assert sorted(fixture.boundary.providers()) == ["g", "g", "p"]
-    assert fixture.observe() == observed[0]
-
-
 @pytest.mark.parametrize(
     ("mutation", "preselect"),
     [
         pytest.param("main-selected", False, id="main-selected"),
         pytest.param("main-switched", True, id="main-switched"),
         pytest.param("catalog-refreshed-same-graph-record", True, id="catalog-refreshed-same-graph-record"),
-        pytest.param("main-provider-removed", True, id="main-provider-removed"),
-        pytest.param("main-provider-reconfigured", True, id="main-provider-reconfigured"),
     ],
 )
 def test_unrelated_change_during_credential_resolution_keeps_graph_pin_with_current_provenance(
@@ -439,12 +416,8 @@ def test_unrelated_change_during_credential_resolution_keeps_graph_pin_with_curr
             fixture.registry.select(MAIN_RECORD.id)
         elif mutation == "main-switched":
             fixture.registry.select(SIBLING_RECORD.id)
-        elif mutation == "catalog-refreshed-same-graph-record":
-            fixture.refresh_with(graph=inventory("g", (GRAPH_RECORD,)))
-        elif mutation == "main-provider-removed":
-            fixture.registry.replace_connections({"g": provider("g")})
         else:
-            fixture.registry.replace_connections({"g": provider("g"), "p": provider("p", url="https://p2.invalid/v1")})
+            fixture.refresh_with(graph=inventory("g", (GRAPH_RECORD,)))
         observed.append(fixture.observe())
 
     pin, _ = resolve_graph_during(fixture, GRAPH_RECORD.id, mutate)

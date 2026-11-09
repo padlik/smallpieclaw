@@ -312,14 +312,14 @@ def _assert_one_warning_before_resolve(seeded: _Registry) -> None:
 
 
 def test_registry_unknown_short_selector_warns_before_resolve(tmp_path: Path, sinks: _Sinks) -> None:
-    """A benign unknown selector inherits Main; warning renders first."""
+    """A benign unconfigured-connection selector inherits Main; warning renders first."""
     seeded = _seeded_registry(tmp_path, sinks)
     with _route_registry_logger(sinks):
-        run = seeded.registry.admit_scheduled("p/not-known")
+        run = seeded.registry.admit_scheduled("ghost/not-known")
 
     assert run.model.id == "p/main"
     _assert_one_warning_before_resolve(seeded)
-    assert _registry_msg(sinks) == _KIND + repr("p/not-known")
+    assert _registry_msg(sinks) == _KIND + repr("ghost/not-known")
 
 
 class _EmissionObserver(logging.Filter):

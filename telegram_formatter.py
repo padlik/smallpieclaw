@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Callable
 from model_registry import bounded_selector_evidence
 
 if TYPE_CHECKING:
-    from model_registry import CatalogView, ModelMetadata, ModelRecord, ProviderState
+    from model_registry import CatalogView, ModelRecord, ProviderState
 
 # ---------------------------------------------------------------------------
 # HTML tag sanitisation
@@ -496,18 +496,9 @@ def _capability_label(value: bool | None) -> str:
     return "unknown"
 
 
-def _metadata_source(metadata, field_name: str) -> str | None:
-    for name, source in metadata.sources:
-        if name == field_name:
-            return source
-    return None
-
-
-def _catalog_field_line(metadata: "ModelMetadata", field_name: str, value_text: str) -> str:
-    """One verbose "<field>: <value> (source: ...)" line; no source means unknown."""
-    source = _metadata_source(metadata, field_name)
-    suffix = f" (source: {html.escape(source)})" if source else ""
-    return f"  {html.escape(field_name)}: {html.escape(value_text)}{suffix}"
+def _catalog_field_line(field_name: str, value_text: str) -> str:
+    """One verbose "<field>: <value>" line of provider-reported display metadata."""
+    return f"  {html.escape(field_name)}: {html.escape(value_text)}"
 
 
 def _format_catalog_model(record: "ModelRecord", active_model_id: str | None) -> list[str]:
@@ -518,27 +509,27 @@ def _format_catalog_model(record: "ModelRecord", active_model_id: str | None) ->
         f"{active_mark} <code>{html.escape(_bound_catalog_text(record.id))}</code> — "
         f"{html.escape(_bound_catalog_text(record.display_name))}",
         _catalog_field_line(
-            metadata, "context_tokens",
+            "context_tokens",
             "unknown" if metadata.context_tokens is None else str(metadata.context_tokens),
         ),
         _catalog_field_line(
-            metadata, "input_tokens",
+            "input_tokens",
             "unknown" if metadata.input_tokens is None else str(metadata.input_tokens),
         ),
         _catalog_field_line(
-            metadata, "output_tokens",
+            "output_tokens",
             "unknown" if metadata.output_tokens is None else str(metadata.output_tokens),
         ),
-        _catalog_field_line(metadata, "vision", _capability_label(metadata.vision)),
-        _catalog_field_line(metadata, "tool_calling", _capability_label(metadata.tool_calling)),
-        _catalog_field_line(metadata, "reasoning", _capability_label(metadata.reasoning)),
+        _catalog_field_line("vision", _capability_label(metadata.vision)),
+        _catalog_field_line("tool_calling", _capability_label(metadata.tool_calling)),
+        _catalog_field_line("reasoning", _capability_label(metadata.reasoning)),
     ]
 
 
 #: Legend for the dense one-line-per-model layout used once the fully
 #: labeled layout cannot fit every ~20 capped entries in one message.
 _COMPACT_LEGEND = (
-    "<i>y=known-yes n=known-no ?=unknown · (p)=provider (m)=models.dev</i>"
+    "<i>y=known-yes n=known-no ?=unknown · provider-reported, advisory only</i>"
 )
 
 
@@ -554,15 +545,6 @@ def _compact_capability(value: bool | None) -> str:
     return "?"
 
 
-def _compact_source_tag(metadata: "ModelMetadata", field_name: str) -> str:
-    source = _metadata_source(metadata, field_name)
-    if source == "provider":
-        return "(p)"
-    if source == "models.dev":
-        return "(m)"
-    return ""
-
-
 def _format_catalog_model_compact(record: "ModelRecord", active_model_id: str | None) -> str:
     """One dense line carrying every field's literal name, value, and source.
 
@@ -572,12 +554,12 @@ def _format_catalog_model_compact(record: "ModelRecord", active_model_id: str | 
     active_mark = "✅" if record.id == active_model_id else "⬜"
     metadata = record.metadata
     fields = " ".join([
-        f"context_tokens:{_compact_numeric(metadata.context_tokens)}{_compact_source_tag(metadata, 'context_tokens')}",
-        f"input_tokens:{_compact_numeric(metadata.input_tokens)}{_compact_source_tag(metadata, 'input_tokens')}",
-        f"output_tokens:{_compact_numeric(metadata.output_tokens)}{_compact_source_tag(metadata, 'output_tokens')}",
-        f"vision:{_compact_capability(metadata.vision)}{_compact_source_tag(metadata, 'vision')}",
-        f"tool_calling:{_compact_capability(metadata.tool_calling)}{_compact_source_tag(metadata, 'tool_calling')}",
-        f"reasoning:{_compact_capability(metadata.reasoning)}{_compact_source_tag(metadata, 'reasoning')}",
+        f"context_tokens:{_compact_numeric(metadata.context_tokens)}",
+        f"input_tokens:{_compact_numeric(metadata.input_tokens)}",
+        f"output_tokens:{_compact_numeric(metadata.output_tokens)}",
+        f"vision:{_compact_capability(metadata.vision)}",
+        f"tool_calling:{_compact_capability(metadata.tool_calling)}",
+        f"reasoning:{_compact_capability(metadata.reasoning)}",
     ])
     return (
         f"{active_mark} <code>{html.escape(_bound_catalog_text(record.id))}</code> "
@@ -606,7 +588,7 @@ def _catalog_header_lines(
     if refresh_failed:
         lines.append("⚠️ <i>Refresh failed unexpectedly — showing the last known catalog.</i>\n")
     elif refresh_not_saved:
-        lines.append("⚠️ <i>Refresh was not saved — showing the last known catalog.</i>\n")
+        lines.append("⚠️ <i>Refresh was not saved to the model cache — showing this session's results only.</i>\n")
 
     selection_label = _SELECTION_STATUS_LABELS.get(view.selection_status, view.selection_status)
     lines.append(f"Selection: {html.escape(selection_label)}")

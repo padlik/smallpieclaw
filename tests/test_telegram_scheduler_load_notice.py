@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import html
+import io
+import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,6 +19,7 @@ import pytest
 from scheduler import Scheduler
 from telegram_commands import cmd_jobs
 from telegram_interface import TelegramInterface
+from tests import scheduler_legacy_fixtures as legacy_fx
 from xdg import xdg_paths
 
 
@@ -107,3 +113,125 @@ def test_jobs_mutation_displays_file_refusal(
     text = _run_jobs(sched, [action, "healthy"])
     assert "not found" not in text.lower()
     _assert_html_notice(text, path, status)
+
+
+# ---------------------------------------------------------------------------
+# Legacy state-home job file notices
+#
+# Relocated by task 2.4 from tests/test_scheduler_legacy_readonly.py (ledger
+# provenance in openspec/changes/simplify-model-runtime/test-preservation-ledger).
+# Deferred rewrite (task 8.4, ledger 444/445/456/457/459): keep the startup/
+# reload notice and byte preservation; detection becomes existence-only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_legacy_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[legacy_fx.MakeLegacyScheduler]:
+    """Real legacy-beside-TOML schedulers (shared factory, see the support module)."""
+    yield from legacy_fx.legacy_scheduler_factory(tmp_path, monkeypatch)
+
+
+class TestNonDestructiveLoad:
+    """Loading and reloading legacy jobs never writes either file."""
+
+    @pytest.mark.parametrize("toml", [legacy_fx.TOML, None], ids=["toml_present", "toml_missing"])
+    def test_load_and_reload_keep_legacy_bytes_without_adoption(
+        self, make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, toml: Optional[str],
+    ) -> None:
+        """Legacy jobs are visible; both files keep their bytes; no TOML is created."""
+        env = make_legacy_scheduler(toml, legacy=legacy_fx.LEGACY)
+
+        reloaded = env.sched.reload()
+
+        assert "error" not in reloaded, reloaded
+        assert {"legacyjob", "legacypaused"} <= set(legacy_fx.tags(env.sched))
+        assert env.legacy_path.read_bytes() == legacy_fx.legacy_bytes(legacy_fx.LEGACY)
+        if toml is None:
+            assert not env.toml_path.exists()
+        else:
+            assert env.toml_path.read_text(encoding="utf-8") == toml
+        assert list(env.toml_path.parent.glob(env.toml_path.name + ".bak.*")) == []
+
+
+_BAD_LEGACY = {
+    "malformed": legacy_fx.MALFORMED_LEGACY,
+    "unreadable_directory": legacy_fx.LEGACY_DIR,
+}
+
+
+@pytest.mark.parametrize("bad", sorted(_BAD_LEGACY))
+def test_bad_legacy_file_sends_startup_notice(
+    make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, bad: str,
+) -> None:
+    """Startup notifies the operator with the legacy path and repair steps, no content."""
+    env = make_legacy_scheduler(legacy_fx.TOML, legacy=_BAD_LEGACY[bad], enabled=True)
+
+    env.sched.start()
+
+    sent = [call.args[0] for call in env.notify.call_args_list]
+    naming = [m for m in sent if html.escape(str(env.legacy_path)) in m]
+    assert naming, f"no startup notice names the legacy file: {sent!r}"
+    text = naming[0].lower()
+    assert "reload" in text
+    assert "repair" in text or "fix" in text or "edit" in text
+    assert legacy_fx.SECRET not in naming[0]
+
+
+def test_uninspectable_legacy_file_sends_startup_notice(
+    make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing legacy file that cannot be inspected is read, not treated as missing.
+
+    A real valid legacy file exists, but while the scheduler is constructed
+    and started the external ``os.stat`` and ``open`` on that one path raise
+    ``PermissionError`` (an inaccessible parent directory) without host
+    permission changes; every other path and file descriptor delegates.
+    """
+    paths = xdg_paths("legacy-readonly-test")  # the fixture's own stable paths
+    paths.state_home.mkdir(parents=True, exist_ok=True)
+    legacy_path = paths.scheduler_jobs
+    legacy_path.write_bytes(legacy_fx.legacy_bytes(legacy_fx.LEGACY))
+    assert legacy_path.is_file()
+    target = os.path.abspath(legacy_path)
+    real_stat = os.stat
+    real_open = builtins.open
+    open_attempts: list[str] = []
+
+    def _is_target(file: object) -> bool:
+        if not isinstance(file, (str, bytes, os.PathLike)):
+            return False
+        return os.path.abspath(os.fsdecode(os.fspath(file))) == target
+
+    def faulting_stat(path: object, *args: object, **kwargs: object) -> object:
+        if not args and kwargs.get("dir_fd") is None and _is_target(path):
+            raise PermissionError(13, "Permission denied", os.fsdecode(os.fspath(path)))
+        return real_stat(path, *args, **kwargs)
+
+    def faulting_open(file: object, *args: object, **kwargs: object) -> object:
+        if _is_target(file):
+            open_attempts.append(threading.current_thread().name)
+            raise PermissionError(13, "Permission denied", os.fsdecode(os.fspath(file)))
+        return real_open(file, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "stat", faulting_stat)
+        fault.setattr(builtins, "open", faulting_open)
+        fault.setattr(io, "open", faulting_open)
+        assert os.path.exists(legacy_path) is False, "the stat fault is not in effect"
+        env = make_legacy_scheduler(legacy_fx.TOML, legacy=None, enabled=True)
+        env.sched.start()
+        attempts = list(open_attempts)
+
+    sent = [call.args[0] for call in env.notify.call_args_list]
+    naming = [m for m in sent if html.escape(str(legacy_path)) in m]
+    assert naming, f"no startup notice names the uninspectable legacy file: {sent!r}"
+    text = naming[0].lower()
+    assert "reload" in text
+    assert "repair" in text or "fix" in text or "edit" in text
+    assert legacy_fx.SECRET not in naming[0]
+    assert attempts, "the legacy file was assumed missing instead of being read"
+    assert env.sched.show_job("alpha")["next_run"] is not None
+    assert env.legacy_path == legacy_path
+    assert legacy_path.read_bytes() == legacy_fx.legacy_bytes(legacy_fx.LEGACY)

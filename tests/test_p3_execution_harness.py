@@ -24,7 +24,7 @@ import pytest
 
 from config_schema import AgentConfig, ProviderConfig, ResolvedProviderConnection
 from confirmation import RETRY_PREFIX
-from llm_client import LLMClient, LLMPermanentError
+from llm_client import LLMClient
 from model_registry import (
     CatalogDocument,
     ModelMetadata,
@@ -111,13 +111,11 @@ _IMAGE_BYTES = b"\x89PNG\r\n\x1a\nfixture-image-bytes"
 
 
 def _vision_record(provider: str, upstream: str, vision: Optional[bool]) -> ModelRecord:
-    """Build a catalog record whose provenance covers exactly its known fields."""
+    """Build a catalog record whose provider-reported fields are exactly its known fields."""
     values = {"context_tokens": 128_000, "output_tokens": 2048,
               "vision": vision, "tool_calling": True}
-    sources = tuple(sorted((name, "provider") for name, value in values.items()
-                           if value is not None))
     return ModelRecord(f"{provider}/{upstream}", provider, upstream, f"{upstream} display",
-                       ModelMetadata(**values, sources=sources))
+                       ModelMetadata(**values))
 
 
 def _vision_resolve(config: ProviderConfig) -> ResolvedProviderConnection:
@@ -150,17 +148,21 @@ class _VisionWorld:
         ModelSettings(self.settings_path).write(CatalogDocument(
             1, 1, None,
             tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
-            (self.text, self.vision), (),
+            (self.text, self.vision),
         ))
         self.registry = ModelRegistry(providers, ModelSettings(self.settings_path),
                                       _NoDiscovery(), _vision_resolve)
         self.image = tmp_path / "pic.png"
         self.image.write_bytes(_IMAGE_BYTES)
         self.requests: list[httpx.Request] = []
+        self.reject_next = False
 
     def _answer(self, request: httpx.Request) -> httpx.Response:
         """Record the wire request and answer with an OpenAI-compatible finish."""
         self.requests.append(request)
+        if self.reject_next:
+            self.reject_next = False
+            return httpx.Response(400, json={"error": {"message": "image input is not supported"}})
         return httpx.Response(200, json={
             "choices": [{"message": {
                 "content": '{"action": "finish", "result": "saw the image"}'}}],
@@ -191,12 +193,13 @@ def _image_urls(body: dict) -> list[str]:
 
 
 class TestVisionRouting:
-    """Image requests run only on an explicitly selected verified-vision pin.
+    """Image requests always go to the pinned model's own route; vision metadata never gates them.
 
     Replaces the retired ``test_image_request_uses_vision_fallback_not_primary``
     (raw-config automatic vision fallback): its image success and exact result
-    are kept on an explicit verified-vision selection, and the non-vision model
-    now fails before I/O instead of being silently substituted.
+    are kept on an explicit vision selection, and a model with false/unknown
+    vision metadata is sent the image itself instead of being refused locally or
+    silently substituted.
     """
 
     def test_selected_verified_vision_pin_sends_image_and_finishes(self, vision_world):
@@ -223,30 +226,46 @@ class TestVisionRouting:
         assert vision_world.settings_path.read_bytes() == settings_bytes
 
     @pytest.mark.parametrize("vision_world", [False, None], indirect=True,
-                             ids=["verified-false", "unknown"])
-    def test_unverified_pin_fails_before_io_without_substitution(self, vision_world):
-        """Direct chat and the loop both fail with zero HTTP and no alternate model."""
+                             ids=["cached-false", "unknown"])
+    def test_unverified_pin_sends_image_on_its_own_route_without_substitution(self, vision_world):
+        """False/unknown cached vision is display metadata: direct chat and the loop both
+        send the image once each to the pinned model, with no alternate model."""
         client = vision_world.admit_selected(vision_world.text)
         settings_bytes = vision_world.settings_path.read_bytes()
         images = [str(vision_world.image)]
-        with pytest.raises(LLMPermanentError, match="verified vision support"):
-            client.chat([{"role": "user", "content": _VISION_GOAL, "images": images}])
-        assert vision_world.requests == []
+        client.chat([{"role": "user", "content": _VISION_GOAL, "images": images}])
+        assert len(vision_world.requests) == 1
 
         result, calls, progress = run_react(
             client, RecordingExecutor(), _VISION_GOAL, images=images,
-            retry_timeout_seconds=0,
         )
-        assert result == "❌ ❌ Provider rejected the request"
-        prompts = [m for m in progress if m.startswith(f"{RETRY_PREFIX}:")]
-        assert len(prompts) == 1
-        info = json.loads(prompts[0].split(":", 2)[2])
-        assert (info["type"], info["retryable"], info["model"]) == (
-            "permanent", False, "text-x")
-        assert calls == [] and vision_world.requests == []
+        assert result == "saw the image"
+        assert calls == [] and not [m for m in progress if m.startswith(f"{RETRY_PREFIX}:")]
+        assert len(vision_world.requests) == 2  # one provider call per request
+        expected_url = "data:image/png;base64," + base64.b64encode(_IMAGE_BYTES).decode("ascii")
+        for request in vision_world.requests:
+            assert (request.url.host, request.url.path) == ("text.example.test", "/v1/chat/completions")
+            body = json.loads(request.content)
+            assert body["model"] == "text-x" and _image_urls(body) == [expected_url]
         assert client.llm_cfg["id"] == vision_world.text.id
         assert vision_world.registry.view().active_model_id == vision_world.text.id
         assert vision_world.settings_path.read_bytes() == settings_bytes
+
+    def test_provider_image_rejection_is_a_normal_failure_without_substitution(self, vision_world):
+        """A text-only model's genuine provider rejection surfaces once, sanitized, with
+        no retry on another model: the loop reports the provider failure."""
+        client = vision_world.admit_selected(vision_world.text)
+        vision_world.reject_next = True
+        result, calls, progress = run_react(
+            client, RecordingExecutor(), _VISION_GOAL, images=[str(vision_world.image)],
+            retry_timeout_seconds=0,
+        )
+        assert result.startswith("❌")
+        assert calls == [] and len(vision_world.requests) == 1
+        assert {r.url.host for r in vision_world.requests} == {"text.example.test"}
+        assert client.llm_cfg["id"] == vision_world.text.id
+        assert vision_world.registry.view().active_model_id == vision_world.text.id
+        assert "image input is not supported" not in result  # raw provider body is not echoed
 
 
 class TestTraceCorrelation:

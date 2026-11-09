@@ -186,7 +186,6 @@ def test_parsed_unavailable_embeddings_reject_graph_prerequisites(
     metadata = ModelMetadata(
         context_tokens=8192,
         output_tokens=2048,
-        sources=(("context_tokens", "provider"), ("output_tokens", "provider")),
     )
     document = CatalogDocument(
         1,
@@ -194,7 +193,6 @@ def test_parsed_unavailable_embeddings_reject_graph_prerequisites(
         None,
         (ProviderState("openai-main", "openai", "2026-09-01T00:00:00Z", "fresh"),),
         (ModelRecord(_GRAPH_MODEL_ID, "openai-main", "gpt-graph", "Graph", metadata),),
-        (),
     )
     settings = ModelSettings(tmp_path / "models-config.toml")
     settings.write(document)

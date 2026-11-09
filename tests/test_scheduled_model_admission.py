@@ -58,7 +58,7 @@ from sub_agent_registry import SOURCE_SCHEDULED
 from tests.root_startup_harness import (
     ACME_HOST,
     GEM_HOST,
-    GONE_ID,
+    UNCONFIGURED_ID,
     MAIN_ID,
     OTHER_ID,
     SCHEDULED_TAG,
@@ -82,6 +82,8 @@ def _paths_for(state_dir: Path) -> XDGPaths:
         config_home=state_dir, data_home=state_dir, state_home=state_dir,
         cache_home=state_dir, runtime_dir=state_dir,
         config_file=state_dir / "config.toml",
+        model_selection_file=state_dir / "model-selection.toml",
+        models_cache_file=state_dir / "models-cache.json",
         models_config_file=state_dir / "models.toml",
         scheduler_config=state_dir / "scheduler.toml",
         memory_file=state_dir / "memory.json",
@@ -534,8 +536,10 @@ def _assert_scheduled_root_run(
 _ROOT_SELECTORS = [
     pytest.param(None, _ABSENT, MAIN_ID, None, id="absent"),
     pytest.param(f'"{OTHER_ID}"', OTHER_ID, OTHER_ID, None, id="known"),
-    pytest.param('"acme/claude-zzz"', "acme/claude-zzz", MAIN_ID, "acme/claude-zzz", id="unknown"),
-    pytest.param(f'"{GONE_ID}"', GONE_ID, MAIN_ID, GONE_ID, id="obsolete"),
+    # An unconfigured connection (task 4.1: a configured connection's uncached model is pinned
+    # exactly, not substituted; scheduled classification of these inputs is task 8.x).
+    pytest.param('"ghost/claude-zzz"', "ghost/claude-zzz", MAIN_ID, "ghost/claude-zzz", id="unknown"),
+    pytest.param(f'"{UNCONFIGURED_ID}"', UNCONFIGURED_ID, MAIN_ID, UNCONFIGURED_ID, id="obsolete"),
     pytest.param(f'" {OTHER_ID} "', f" {OTHER_ID} ", MAIN_ID, f" {OTHER_ID} ", id="padded"),
     pytest.param(f'"{OTHER_ID.upper()}"', OTHER_ID.upper(), MAIN_ID, OTHER_ID.upper(), id="case-variant"),
     pytest.param("42", 42, MAIN_ID, "malformed (not a string)", id="integer"),
@@ -587,7 +591,7 @@ def test_root_scheduled_unknown_selector_warning_is_bounded_and_redacted(
 ) -> None:
     """The emitted WARN uses the bounded representation redacted by the root's own
     redactor; the raw value stays verbatim in the human-edited scheduler file."""
-    raw = "acme/" + "b" * 200 + VAULT_SECRET + "-public-suffix" * 50 + "-TAILQZX"
+    raw = "ghost/" + "b" * 200 + VAULT_SECRET + "-public-suffix" * 50 + "-TAILQZX"
     scheduled_root.serve_provider_chat()
 
     probe = run_scheduled_root(scheduled_root, monkeypatch, f'"{raw}"')

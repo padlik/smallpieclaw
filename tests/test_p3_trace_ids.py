@@ -553,8 +553,6 @@ class TestSubAgentTracePropagation:
             "pa/up/m", "pa", "up/m", "up/m display",
             ModelMetadata(
                 5000, None, 2048, False, True, None,
-                (("context_tokens", "provider"), ("vision", "provider"),
-                 ("output_tokens", "provider"), ("tool_calling", "provider")),
             ),
         )
         providers = {
@@ -564,7 +562,7 @@ class TestSubAgentTracePropagation:
         settings.write(CatalogDocument(
             1, 2, None,
             (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),),
-            (record,), (),
+            (record,),
         ))
         registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
         registry.select(record.id)

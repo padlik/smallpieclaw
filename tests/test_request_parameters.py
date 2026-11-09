@@ -158,5 +158,5 @@ def test_anthropic_ordinary_request_carries_only_mandatory_output_cap() -> None:
 
     assert len(requests) == 1
     payload = json.loads(requests[0].content)
-    assert payload["max_tokens"] == 2048
+    assert payload["max_tokens"] == 1024  # configured required cap, not the discovered 2048
     assert not {"max_completion_tokens", "temperature", "top_p", "options"} & payload.keys()

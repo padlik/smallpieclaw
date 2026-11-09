@@ -1,4 +1,4 @@
-"""``vision_query`` routes only through the pinned run model's verified vision.
+"""``vision_query`` routes only through the pinned run model; vision metadata never gates it.
 
 Drives the real ``react_loop._exec_vision_query`` with a real pinned
 ``LLMClient`` over ``httpx.MockTransport``. Only the external HTTP boundary and
@@ -94,30 +94,57 @@ def _record_chat_errors(client: LLMClient, monkeypatch: pytest.MonkeyPatch) -> l
     return raised
 
 
-@pytest.mark.parametrize("vision", [False, None], ids=["verified-false", "unknown"])
-def test_vision_query_without_verified_vision_fails_before_provider_io(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vision: bool | None,
+@pytest.mark.parametrize("vision", [False, None], ids=["cached-false", "unknown"])
+def test_vision_query_with_unverified_vision_still_sends_image_on_pinned_route(
+    tmp_path: Path, vision: bool | None,
 ) -> None:
-    """False/unknown pinned vision rejects the tool's image request locally: the pinned
-    client raises the actionable permanent error, nothing is sent, the model is unchanged."""
+    """False/unknown vision metadata is display only: the tool's image request goes out
+    once on the pinned route, carrying the pinned upstream model and the encoded image."""
     captured: list[httpx.Request] = []
     client = _pinned(vision, captured)
     policy = _AllowAllPolicy()
     image = _image(tmp_path)
     try:
-        raised = _record_chat_errors(client, monkeypatch)
         outcome = _exec_vision_query(_context(client, policy), {"path": str(image), "question": _QUESTION})
-
-        (error,) = raised
-        assert isinstance(error, LLMPermanentError)
-        assert "verified vision support" in str(error) and "/models" in str(error)
-        assert outcome["success"] is False
-        assert outcome["error"] == f"vision_query LLM call failed: {error}"
-        assert captured == []
-        assert client.llm_cfg["model"] == "pinned-model"
-        assert policy.calls == [(str(image.resolve()), "read")]
     finally:
         client.close()
+
+    assert (outcome["success"], outcome["output"]) == (True, "a fake picture")
+    (request,) = captured
+    assert str(request.url) == _PINNED_URL
+    body = json.loads(request.content)
+    assert body["model"] == "pinned-model"
+    (message,) = body["messages"]
+    assert message["content"][1]["type"] == "image_url"
+    assert client.llm_cfg["model"] == "pinned-model"
+    assert policy.calls == [(str(image.resolve()), "read")]
+
+
+def test_vision_query_provider_rejection_is_a_normal_tool_failure_without_retarget(
+    tmp_path: Path,
+) -> None:
+    """A genuine provider rejection of the image request fails the tool once with a
+    sanitized message: one request, no second model, raw provider body not echoed."""
+    captured: list[httpx.Request] = []
+    client = make_run_model_client(
+        "openai",
+        httpx.MockTransport(lambda request: captured.append(request) or httpx.Response(
+            400, json={"error": {"message": "raw-provider-body-canary: no image input"}},
+        )),
+        metadata=ModelMetadata(vision=False, tool_calling=True, context_tokens=8192, output_tokens=1024),
+        upstream_id="pinned-model",
+    )
+    image = _image(tmp_path)
+    try:
+        outcome = _exec_vision_query(_context(client, _AllowAllPolicy()), {"path": str(image), "question": _QUESTION})
+        assert client.llm_cfg["model"] == "pinned-model"
+    finally:
+        client.close()
+
+    assert outcome["success"] is False
+    assert outcome["error"].startswith("vision_query LLM call failed:")
+    assert "raw-provider-body-canary" not in outcome["error"]
+    assert len(captured) == 1
 
 
 def test_vision_query_with_verified_vision_sends_image_on_pinned_route(tmp_path: Path) -> None:

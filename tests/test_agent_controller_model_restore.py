@@ -49,8 +49,6 @@ def _record(provider: str, upstream: str, context: int) -> ModelRecord:
         f"{provider}/{upstream}", provider, upstream, f"{upstream} display",
         ModelMetadata(
             context, None, 2048, False, True, None,
-            (("context_tokens", "provider"), ("vision", "provider"),
-             ("output_tokens", "provider"), ("tool_calling", "provider")),
         ),
     )
 
@@ -100,7 +98,7 @@ class _World:
         settings.write(CatalogDocument(
             1, 2, None,
             tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
-            (MODEL_A, MODEL_B), (),
+            (MODEL_A, MODEL_B),
         ))
         self.registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
         self.registry.select(MODEL_A.id)

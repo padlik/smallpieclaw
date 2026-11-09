@@ -225,10 +225,6 @@ class _World:
                 f"p/{name}", "p", name, name,
                 ModelMetadata(
                     context_tokens=ctx, output_tokens=100, vision=True, tool_calling=True,
-                    sources=tuple(
-                        (name, "provider")
-                        for name in ("context_tokens", "output_tokens", "vision", "tool_calling")
-                    ),
                 ),
             )
             for name, ctx in metas.items()
@@ -239,7 +235,7 @@ class _World:
             CatalogDocument(
                 1, 2, "p/A",
                 (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
-                models, (),
+                models,
             )
         )
         self.registry = ModelRegistry(
@@ -400,16 +396,17 @@ class TestSelectionIdentity:
             client.close()
 
     def test_required_output_larger_than_context_is_c_minus_one(self):
+        """Task 4.1 cap slice: the reserve is the configured 1024 cap, whatever the discovered output limit."""
         client = self._client("anthropic", ModelMetadata(context_tokens=10_000, output_tokens=12_000))
         try:
-            assert client.selection_identity().input_ceiling == 9_999
+            assert client.selection_identity().input_ceiling == 10_000 - 1_024
         finally:
             client.close()
 
-    def test_required_unknown_output_is_unavailable(self):
+    def test_required_unknown_output_uses_the_configured_cap(self):
         client = self._client("anthropic", ModelMetadata(context_tokens=10_000))
         try:
-            assert client.selection_identity().input_ceiling is None
+            assert client.selection_identity().input_ceiling == 10_000 - 1_024
         finally:
             client.close()
 
@@ -908,8 +905,6 @@ class TestAnthropicSelectedJson:
     def test_json_selected_request_is_staged_without_native_count(self, tmp_path):
         w = _World(tmp_path, big_history=False)
         try:
-            provider = _FakeProviderConfig("q", "anthropic", "env:K", "https://anthropic.example.test")
-            w.registry.replace_connections({"p": w.registry._connections["p"], "q": provider})
             wire = _Wire()
             client = make_run_model_client(
                 "anthropic", httpx.MockTransport(wire),
@@ -1453,10 +1448,11 @@ class TestFailClosedPreflight:
         finally:
             client.close()
 
-    def test_required_unknown_output_is_permanent_not_overflow(self, small_world):
+    def test_required_output_equal_to_context_is_permanent_not_overflow(self, small_world):
+        """Cap slice: with the 1024 configured cap, a 1024-token context leaves no input budget."""
         w = small_world
         _prime_grants(w)
-        client = self._fixed_client("anthropic", _Wire(), ModelMetadata(context_tokens=60_000))
+        client = self._fixed_client("anthropic", _Wire(), ModelMetadata(context_tokens=1_000))
         try:
             with pytest.raises(LLMPermanentError):
                 client.preview_request([{"role": "user", "content": "x"}], "s", json_mode=True)

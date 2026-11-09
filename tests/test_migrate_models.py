@@ -30,7 +30,7 @@ from migrate_models import (
     render_preview,
     resolve_effective_default,
 )
-from model_registry import CatalogDocument, ModelMetadata, ModelRecord, ProviderState, SupplementRecord
+from model_registry import CatalogDocument, ModelMetadata, ModelRecord, ProviderState
 from model_settings import ModelSettings
 from xdg import XDGPaths, xdg_paths
 
@@ -660,14 +660,12 @@ def _legacy_file(paths: XDGPaths, *, entry: str | None = None, agent: str = "") 
 
 
 def _existing_catalog(paths: XDGPaths, *, selection: str | None = "saved/model") -> CatalogDocument:
-    """Real managed settings with provenance, supplements and operator selection."""
+    """Real managed settings with provider-reported metadata and operator selection."""
     document = CatalogDocument(
         1, 7, selection,
         (ProviderState("saved", "anthropic", "2026-01-01T00:00:00Z", "stale", "rate_limited"),),
         (ModelRecord("saved/model", "saved", "model", "Operator model",
-                     ModelMetadata(context_tokens=4000, sources=(("context_tokens", "provider"),))),),
-        (SupplementRecord("anthropic", "other", "2026-01-01T00:00:00Z",
-                          ModelMetadata(vision=True, sources=(("vision", "models.dev"),))),),
+                     ModelMetadata(context_tokens=4000)),),
     )
     ModelSettings(paths.models_config_file).write(document)
     return document
@@ -816,7 +814,9 @@ def test_apply_seeds_missing_selection_without_losing_catalog(
     assert loaded.document == replace(original, default_model="a/gpt-x", revision=8)
 
 
-def test_apply_seeds_absent_settings_with_empty_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_apply_seeds_absent_settings_with_empty_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
     """A canonical default without discovered models survives real schema reload."""
     paths = _isolated_paths(tmp_path, monkeypatch)
     _legacy_file(paths)
@@ -824,7 +824,13 @@ def test_apply_seeds_absent_settings_with_empty_catalog(tmp_path: Path, monkeypa
     assert _run_apply(paths, "--apply") == 0
     loaded = ModelSettings(paths.models_config_file, read_only=True).load()
     assert loaded.status == "valid"
-    assert loaded.document == CatalogDocument(1, 1, "a/gpt-x", (), (), ())
+    assert loaded.document == CatalogDocument(1, 1, "a/gpt-x", (), ())
+    # The report names the legacy field and does not claim a runtime selection (task 3.3).
+    out = capsys.readouterr().out
+    assert "remembered selection seeded" not in out
+    assert "legacy default_model" in out and "a/gpt-x" in out
+    assert "does NOT set the runtime model selection" in out and "/models" in out
+    assert not paths.model_selection_file.exists()
 
 
 def test_apply_without_seed_leaves_absent_settings_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

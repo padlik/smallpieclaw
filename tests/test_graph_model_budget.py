@@ -460,7 +460,7 @@ def test_discovered_google_methods_infer_no_limits_and_rejection_stays_single_se
     connection = ResolvedProviderConnection("acct", "google", "", 15, _KEY)
     try:
         inventory = ModelDiscovery(
-            provider, public, lambda: datetime(2026, 10, 26, tzinfo=timezone.utc)
+            provider, lambda: datetime(2026, 10, 26, tzinfo=timezone.utc)
         ).fetch(connection)
     finally:
         provider.close()
@@ -474,7 +474,6 @@ def test_discovered_google_methods_infer_no_limits_and_rejection_stays_single_se
     assert (metadata.context_tokens, metadata.input_tokens, metadata.output_tokens) == (
         None, None, None
     )
-    assert not {"context_tokens", "input_tokens", "output_tokens"} & set(dict(metadata.sources))
 
     transport = _CountingTransport(lambda request: httpx.Response(400, json={"error": {
         "code": 400,
@@ -488,8 +487,8 @@ def test_discovered_google_methods_infer_no_limits_and_rejection_stays_single_se
     )
 
 
-def test_ordinary_required_cap_still_needs_known_output_while_graph_does_not() -> None:
-    """The graph exception never lets ordinary Anthropic requests send without a cap."""
+def test_ordinary_required_cap_comes_from_config_while_graph_keeps_its_fixed_cap() -> None:
+    """Ordinary Anthropic sends the configured cap without discovered output; the graph cap is separate."""
     metadata = ModelMetadata(context_tokens=200_000)
     with pytest.raises(ModelRequestBudgetError) as caught:
         compute_request_budget(
@@ -504,17 +503,16 @@ def test_ordinary_required_cap_still_needs_known_output_while_graph_does_not() -
     ordinary_transport = _CountingTransport(
         lambda request: httpx.Response(200, json=_reply_body("anthropic", "json"))
     )
-    ordinary = LLMClient(pin, agent_config=_config(), http_transport=ordinary_transport)
+    ordinary = LLMClient(
+        pin, agent_config=AgentConfig(ctx_max_tokens=4096, max_retries=0, required_output_cap_tokens=2000),
+        http_transport=ordinary_transport,
+    )
     try:
-        with pytest.raises(LLMPermanentError) as rejected:
-            ordinary.chat([{"role": "user", "content": "hello"}])
-        ordinary_usage = ordinary.get_today_usage()
+        assert ordinary.chat([{"role": "user", "content": "hello"}]) == _REPLY
     finally:
         ordinary.close()
-    assert type(rejected.value) is LLMPermanentError
-    assert "output_cap_unavailable" in str(rejected.value)
-    assert ordinary_transport.requests == []
-    assert ordinary_usage["total_tokens"] == 0
+    assert len(ordinary_transport.requests) == 1
+    assert json.loads(ordinary_transport.requests[0].content)["max_tokens"] == 2000
 
     graph_transport = _CountingTransport(
         lambda request: httpx.Response(200, json=_reply_body("anthropic", "json"))

@@ -13,7 +13,7 @@ Planned (not yet implemented) symbols these tests exercise:
   - `cmd_models` (telegram_commands.py) gains a registry-backed branch,
     calling `registry.refresh()` then `registry.view()`, rendering at most
     ~20 entries with fresh/stale, selection, capability (known-yes /
-    known-no / unknown), and metadata-source labels, HTML-escaped, capped
+    known-no / unknown), HTML-escaped, capped
     at 4096 chars, with a single "Refresh" inline button
     (`callback_data="models_refresh"`) and no other buttons.
   - `cb_models_refresh` (telegram_callbacks.py), `@_require_cb_auth`,
@@ -23,8 +23,8 @@ Planned (not yet implemented) symbols these tests exercise:
 Label conventions asserted below (fixed by this test file as the contract
 for the implementation phase):
   - capability fields render "<field>: known-yes" / "known-no" / "unknown"
-  - numeric fields render "<field>: <value> (source: provider|models.dev)"
-    when known, "<field>: unknown" when None
+  - numeric fields render "<field>: <value>" when known (provider-reported
+    display data, no source label), "<field>: unknown" when None
   - provider freshness renders the literal words "fresh" / "stale"
   - selection status renders one of "active" / "no selection" /
     "saved selection unavailable"
@@ -84,7 +84,6 @@ class FakeInventory:
     provider_id: str
     adapter: str
     models: tuple
-    supplemental: tuple
     last_success_at: str
 
 
@@ -122,32 +121,13 @@ def _model(
     tool_calling: bool | None = None,
     reasoning: bool | None = None,
     display_name: str | None = None,
-    context_source: str = "provider",
-    input_source: str = "provider",
-    output_source: str = "provider",
-    vision_source: str = "models.dev",
-    tool_calling_source: str = "provider",
-    reasoning_source: str = "provider",
 ) -> ModelRecord:
-    sources: list[tuple[str, str]] = []
-    if context_tokens is not None:
-        sources.append(("context_tokens", context_source))
-    if input_tokens is not None:
-        sources.append(("input_tokens", input_source))
-    if output_tokens is not None:
-        sources.append(("output_tokens", output_source))
-    if vision is not None:
-        sources.append(("vision", vision_source))
-    if tool_calling is not None:
-        sources.append(("tool_calling", tool_calling_source))
-    if reasoning is not None:
-        sources.append(("reasoning", reasoning_source))
     return ModelRecord(
         f"{provider_id}/{upstream_id}",
         provider_id,
         upstream_id,
         display_name or upstream_id,
-        ModelMetadata(context_tokens, input_tokens, output_tokens, vision, tool_calling, reasoning, tuple(sources)),
+        ModelMetadata(context_tokens, input_tokens, output_tokens, vision, tool_calling, reasoning),
     )
 
 
@@ -158,7 +138,7 @@ def _inventory(
     adapter: str = "openai",
     last_success_at: str = "2026-10-01T12:00:00Z",
 ) -> FakeInventory:
-    return FakeInventory(provider_id, adapter, tuple(models), (), last_success_at)
+    return FakeInventory(provider_id, adapter, tuple(models), last_success_at)
 
 
 def _make_registry(
@@ -381,7 +361,6 @@ class TestRegistryBackedCatalog:
             1, 1, None,
             (ProviderState("pb", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (_model("old-model", "pb", context_tokens=1000),),
-            (),
         )
         registry, _, discovery = _make_registry(tmp_path, (pa, pb), seed_document=seed)
         discovery.responses["pa"] = _inventory("pa", (_model("new-model", "pa", context_tokens=2000),))
@@ -412,13 +391,9 @@ class TestRegistryBackedCatalog:
         assert "tool_calling: known-no" in text
         assert "reasoning: unknown" in text
 
-    def test_metadata_source_distinguishes_provider_from_models_dev(self, tmp_path: Path):
+    def test_metadata_is_shown_as_advisory_values_without_provenance_labels(self, tmp_path: Path):
         p = _provider_config("p")
-        m = _model(
-            "m1", "p",
-            context_tokens=4096, context_source="provider",
-            vision=True, vision_source="models.dev",
-        )
+        m = _model("m1", "p", context_tokens=4096, vision=True)
         registry, _, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (m,))
 
@@ -427,8 +402,8 @@ class TestRegistryBackedCatalog:
         asyncio.run(cmd_models(iface, update, ctx))
 
         text = captured["text"]
-        assert "context_tokens: 4096 (source: provider)" in text
-        assert "vision: known-yes (source: models.dev)" in text
+        assert "context_tokens: 4096" in text and "vision: known-yes" in text
+        assert "source" not in text and "models.dev" not in text
 
     def test_unknown_numeric_field_is_shown_as_unknown_not_inferred(self, tmp_path: Path):
         p = _provider_config("p")
@@ -456,7 +431,7 @@ class TestRegistryBackedCatalog:
     def test_selection_status_states(self, tmp_path: Path, remembered, active_after_refresh, expected):
         p = _provider_config("p")
         m = _model("m1", "p", context_tokens=100)
-        seed = CatalogDocument(1, 1, remembered, (), (), ())
+        seed = CatalogDocument(1, 1, remembered, (), ())
         registry, _, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
         discovery.responses["p"] = _inventory("p", (m,))
         registry.refresh()
@@ -796,7 +771,6 @@ class TestUnexpectedRefreshExceptionSafety:
             1, 1, None,
             (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (_model("last-good", "p", context_tokens=100),),
-            (),
         )
         registry, _, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
         secret = "fake-secret-ABCDEF1234567890"
@@ -832,7 +806,6 @@ class TestRefreshPersistenceHonesty:
             1, 1, None,
             (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (_model("seed-model", "p", context_tokens=100),),
-            (),
         )
         registry, settings, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
         discovery.responses["p"] = _inventory("p", (_model("new-model", "p", context_tokens=200),))
@@ -856,11 +829,12 @@ class TestRefreshPersistenceHonesty:
             asyncio.run(cb_models_refresh(iface, update, MagicMock()))
             text = query.edit_message_text.call_args.args[0]
 
-        assert "p/new-model" not in text, "unpersisted new data must never be shown as the current catalog"
+        assert "p/new-model" in text, "successful discovery stays usable in memory when only the cache write fails"
         assert any(
             phrase in text.lower()
             for phrase in ("not saved", "not persisted", "unsaved", "failed to save", "could not save")
         ), "a failed-to-persist refresh must say so explicitly, not silently reuse the old 'fresh' label"
+        assert "session" in text.lower() and "last known" not in text.lower()
         assert settings_path.read_bytes() == original_bytes, (
             "a failed write must never partially touch the on-disk settings file"
         )
@@ -876,7 +850,6 @@ class TestCompleteEntriesUnderMessageLimit:
                 f"model-{i:02d}", "p",
                 context_tokens=4096, input_tokens=2048, output_tokens=1024,
                 vision=bool(i % 2), tool_calling=bool((i + 1) % 2), reasoning=bool(i % 3 == 0),
-                vision_source="models.dev" if i % 2 else "provider",
             )
             for i in range(25)
         )
@@ -1047,7 +1020,6 @@ class TestModelSelectionCallback:
             1, 1, "p/old-model",
             (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (old,),
-            (),
         )
         registry, settings, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
         registry.restore_selection()
@@ -1082,7 +1054,6 @@ class TestModelSelectionCallback:
             1, 1, None,
             (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (target,),
-            (),
         )
         registry, settings, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
         discovery.responses["p"] = RuntimeError("provider down")
@@ -1109,8 +1080,7 @@ class TestModelSelectionCallback:
         _text, markup = _mint_via_cmd_models(iface)
         token = _button_callback_data(markup, label_contains="Target-Model")
 
-        other = _provider_config("other")
-        registry.replace_connections({p.name: p, other.name: other})  # bumps catalog revision; target untouched
+        registry.refresh()  # same inventory again: bumps catalog revision; target untouched
 
         update, query = _make_callback_update(token)
         asyncio.run(cb_model_select(iface, update, MagicMock()))

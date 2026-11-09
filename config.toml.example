@@ -46,6 +46,12 @@ pairing_timeout = 300
 # inventories and selection are managed by the application; use /models to
 # discover and select a model. Credentials resolve when the matching client is
 # constructed, not while this file is parsed.
+# Connections are read once at startup; edits take effect after a restart.
+# Discovery contacts only configured provider endpoints, not public model
+# metadata services. Provider-reported vision and tool-calling flags are
+# display-only; false or unknown flags do not locally block image/native-tool
+# requests. Token limits still affect the current request budget and can
+# reject an oversized request locally (the later context-policy change is separate).
 # ---------------------------------------------------------------------------
 # api_key is optional for adapters that support unauthenticated connections;
 # it may be a literal, env:NAME, or sec:NAME reference.
@@ -110,6 +116,9 @@ top_tools      = 3
 # Maximum estimated context tokens per LLM request (4 chars ≈ 1 token).
 # When 85% is reached the agent auto-summarises older messages before the next call.
 ctx_max_tokens = 90000
+# Output-token cap sent only to adapters whose API requires one (currently Anthropic); other
+# adapters omit it. Positive integer; it is not sized from context or discovered model limits.
+required_output_cap_tokens = 1024
 # Enable verbose diagnostics when the LLM returns empty content (default: false).
 # Logs full HTTP response, checks stream/non-stream mismatch, finish_reason, and runs a curl probe.
 diagnose_empty_responses = false

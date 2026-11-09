@@ -74,7 +74,7 @@ from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
 from model_discovery import ModelDiscovery  # noqa: E402
 from model_registry import CatalogView, ModelRegistry  # noqa: E402
-from model_settings import ModelSettings  # noqa: E402
+from model_settings import ModelCache, ModelPreference  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
 from path_policy import PathPolicy  # noqa: E402
 from prompt_registry import PromptRegistry  # noqa: E402
@@ -707,18 +707,22 @@ def _run(
         discovery_http = root_resources.enter_context(
             httpx.Client(follow_redirects=False, trust_env=False)
         )
-        public_http = root_resources.enter_context(
-            httpx.Client(follow_redirects=False, trust_env=False)
-        )
         # One model catalog/selection owner (distinct from the MCP ToolRegistry).
         model_registry = ModelRegistry(
             app_cfg.providers,
-            ModelSettings(paths.models_config_file),
-            ModelDiscovery(discovery_http, public_http),
+            ModelCache(paths.models_cache_file),
+            ModelDiscovery(discovery_http),
             functools.partial(resolve_provider_connection, vault_file=vault_file),
             selector_redactor=selector_redactor,
+            preference=ModelPreference(paths.model_selection_file),
         )
-        _refresh_model_catalog(model_registry)
+        if model_registry.cache_notice is not None:
+            logger.warning("%s Cache file: %s", model_registry.cache_notice, paths.models_cache_file)
+        if model_registry.selection_notice is not None:
+            logger.warning(
+                "%s Selection file: %s", model_registry.selection_notice, paths.model_selection_file,
+            )
+        _refresh_model_catalog(model_registry, paths.models_cache_file)
         try:
             _run_with_model_services(
                 cfg=cfg, app_cfg=app_cfg, paths=paths,
@@ -743,23 +747,33 @@ def _run(
             raise
 
 
-def _refresh_model_catalog(model_registry: ModelRegistry) -> None:
-    """Refresh every provider, then restore only a valid remembered Main.
+def _refresh_model_catalog(model_registry: ModelRegistry, cache_file: Path) -> None:
+    """Select the startup Main: the saved selection, else the first cached candidate.
 
-    Uses the same reusable refresh path as ``/models``. Failed providers keep
-    their last-good entries as stale. When no valid Main is restored, startup
+    Discovery runs at most once, and only when nothing is known: no preference
+    file (a corrupt, unreadable or unconfigured one counts as present) and zero
+    cached candidates of configured connections. It is the same reusable
+    refresh as ``/models`` (one logical pass, no retry); failed providers keep
+    their last-good entries as stale. A saved selection that is invalid,
+    unreadable or unconfigured leaves Main unset with no automatic choice
+    (the registry already reported why). When no Main results, startup
     continues (commands stay available) but model work is refused until an
-    explicit ``/models`` selection; no default is chosen.
+    explicit ``/models`` selection.
     """
-    report = model_registry.refresh()
-    for provider_id, code in report.error_codes:
-        if provider_id in report.stale_provider_ids:
+    if model_registry.needs_first_start_discovery:
+        report = model_registry.refresh()
+        for provider_id, code in report.error_codes:
+            if provider_id in report.stale_provider_ids:
+                logger.warning(
+                    "Model catalog refresh failed for provider %s (%s); keeping last-good entries as stale.",
+                    provider_id, code,
+                )
+        if not report.persisted:
             logger.warning(
-                "Model catalog refresh failed for provider %s (%s); keeping last-good entries as stale.",
-                provider_id, code,
+                "Model cache could not be saved to %s; continuing with this session's discovery. "
+                "Selection and preference are unchanged; use /models to retry.",
+                cache_file,
             )
-    if not report.persisted:
-        logger.warning("Model catalog refresh could not be saved; continuing with in-memory state")
     view = model_registry.restore_selection()
     if view.active_model_id is None:
         logger.warning(

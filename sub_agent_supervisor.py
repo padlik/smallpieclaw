@@ -352,8 +352,11 @@ class SubAgentSupervisor:
         try:
             runner = request.factory(**factory_kwargs)
         except ValueError as exc:
-            # An inactive Main refuses every selector until the operator selects one.
+            # An inactive Main refuses implicit requests until the operator selects one.
             no_main = isinstance(exc, ModelRegistryError) and exc.code == "no_active_selection"
+            bad_selector = isinstance(exc, ModelRegistryError) and exc.code in {
+                "malformed_selector", "unknown_connection",
+            }
             return {
                 "success": False,
                 "output": "",
@@ -364,7 +367,11 @@ class SubAgentSupervisor:
                 "suggestion": (
                     "Use /models to select a main model, then retry this request."
                     if no_main
-                    else "Choose a model that exists in the configured model list."
+                    else (
+                        "Use '<connection>/<model>' where <connection> is a configured provider connection."
+                        if bad_selector
+                        else "Choose a model that exists in the configured model list."
+                    )
                 ),
             }
 

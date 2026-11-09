@@ -67,8 +67,6 @@ def _record(provider: str, upstream: str) -> ModelRecord:
         f"{provider}/{upstream}", provider, upstream, f"{upstream} display",
         ModelMetadata(
             200_000, None, 2048, False, True, None,
-            (("context_tokens", "provider"), ("output_tokens", "provider"),
-             ("tool_calling", "provider"), ("vision", "provider")),
         ),
     )
 
@@ -94,7 +92,7 @@ class _SameInventoryDiscovery:
     def fetch(self, connection: ResolvedProviderConnection) -> ProviderInventory:
         self.calls.append((connection.provider_id, threading.current_thread().name))
         models = tuple(m for m in (MODEL_A, MODEL_B) if m.provider_id == connection.provider_id)
-        return ProviderInventory(connection.provider_id, "openai", models, (),
+        return ProviderInventory(connection.provider_id, "openai", models,
                                  "2026-10-01T12:00:00Z")
 
 
@@ -276,7 +274,7 @@ class _World:
                               "stale" if stale_provider and n == "pb" else "fresh")
                 for n in providers
             ),
-            (MODEL_A, MODEL_B), (),
+            (MODEL_A, MODEL_B),
         ))
         self.registry = _Registry(providers, settings, discovery or _NoDiscovery(), self._resolve)
         if select:
@@ -415,9 +413,10 @@ def _pb_status(world: _World) -> str:
 
 
 # (raw saved selector, stale pb provider) shared by both gates.
-_SELECTORS = [(None, False), (MODEL_B.id, False), ("pb/not-known", False),
+_UNCACHED_B = ModelRecord("pb/not-cached", "pb", "not-cached", "not-cached")
+_SELECTORS = [(None, False), (MODEL_B.id, False), ("ghost/not-known", False),
               (123, False), (MODEL_B.id, True)]
-_SELECTOR_IDS = ["inherit-main", "explicit-b", "unknown-exact", "malformed-int",
+_SELECTOR_IDS = ["inherit-main", "explicit-b", "unknown-connection", "malformed-int",
                  "explicit-b-stale"]
 
 
@@ -426,8 +425,8 @@ _SELECTOR_IDS = ["inherit-main", "explicit-b", "unknown-exact", "malformed-int",
     [(raw, stale, expected, warns) for (raw, stale), (expected, warns) in zip(
         _SELECTORS,
         [(MODEL_A, 0), (MODEL_B, 0), (MODEL_A, 1), (MODEL_A, 1), (MODEL_B, 0)],
-    )],
-    ids=_SELECTOR_IDS,
+    )] + [(_UNCACHED_B.id, False, _UNCACHED_B, 0)],  # task 4.1: uncached exact target is pinned
+    ids=[*_SELECTOR_IDS, "uncached-exact"],
 )
 def test_cron_fire_admits_once_and_completes_on_pinned_model(
     make_world, caplog: pytest.LogCaptureFixture, raw: str | int | None, stale: bool,
@@ -479,7 +478,7 @@ def test_cron_fire_admits_once_and_completes_on_pinned_model(
     ("raw", "stale", "evidence"),
     [(raw, stale, evidence) for (raw, stale), evidence in zip(
         _SELECTORS,
-        ["inherit", MODEL_B.id, "pb/not-known", "malformed (not a string)", MODEL_B.id],
+        ["inherit", MODEL_B.id, "ghost/not-known", "malformed (not a string)", MODEL_B.id],
     )],
     ids=_SELECTOR_IDS,
 )
@@ -517,17 +516,16 @@ def test_selector_does_not_bypass_missing_main(
     assert world.settings_path.read_bytes() == world.document
 
 
-def test_same_entry_refresh_during_admission_credentials_fails_launch(
+def test_same_entry_refresh_during_admission_credentials_does_not_fail_launch(
     make_world, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A real refresh publishing a new document while the fire thread resolves fails closed."""
+    """Task 4.1: a real refresh publishing a new document while the fire thread resolves
+    credentials does not invalidate the explicit scheduled target (no document recheck)."""
     caplog.set_level(logging.WARNING, logger="model_registry")
     discovery, gate = _SameInventoryDiscovery(), _FireGate()
     world = make_world(select=True, job_model=MODEL_B.id, discovery=discovery, gate=gate)
     registry = world.registry
     before_view = registry.view()
-    fingerprints = dict(registry._fingerprints)
-    generations = dict(registry._configuration_generation)
     fire_errors: list[BaseException] = []
     fired = threading.Event()
 
@@ -564,30 +562,23 @@ def test_same_entry_refresh_during_admission_credentials_fails_launch(
     assert not thread.is_alive() and fired.is_set()
     assert fire_errors == [] and gate.waits == [True]
 
+    assert world.sched.released_event.wait(_BOUND), ("run never released", world.records())
     run_id = _assert_admitted_at_entry(world, MODEL_B.id)
-    assert registry.scheduled_errors == ["selection_changed"]
+    assert registry.scheduled_errors == []
+    (pin,) = world.factory.pins
+    assert pin.model == MODEL_B and pin.catalog_revision == before_view.revision
     assert world.fire_resolved == ["pb"] and world.other_resolved == ["pa", "pb"]
     assert discovery.calls == [("pa", "MainThread"), ("pb", "MainThread")]
-    assert world.factory.pins == [] and world.factory.runners == []
-    assert world.chats == [] and world.embeddings == []
-    assert world.chat_requests == [] and world.embed_requests == []
+    (request,) = world.chat_requests
+    assert json.loads(request.content)["model"] == MODEL_B.upstream_id
     assert _registry_warnings(caplog) == []
 
     (record,) = world.records()
-    assert record["run_id"] == run_id and record["status"] == "failed"
-    assert record["success"] is False
-    assert "selection changed" in record["result"]
+    assert record["run_id"] == run_id and record["status"] == "done" and record["success"] is True
     assert record["model"] == MODEL_B.id
-    alerts = [c.args[0] for c in world.sched.notify.call_args_list]
-    assert len(alerts) == 1 and TAG in alerts[0] and "failed to spawn" in alerts[0]
-    for text in (record["result"], alerts[0]):
-        assert "secret-" not in text and "env:KEY_" not in text
-    assert [(r, n) for r, _t, n in world.sched.released] == [(run_id, 1)]
     assert TAG not in world.sched._running_jobs and not world.sched._active_runs.get(TAG)
     assert registry.view() == after_view
     assert world.settings_path.read_bytes() == after_bytes
-    assert registry._fingerprints == fingerprints
-    assert registry._configuration_generation == generations
 
 
 def test_running_scheduled_run_cancelled_during_inflight_request(make_world) -> None:

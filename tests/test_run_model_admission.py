@@ -47,7 +47,7 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from model_settings import ModelCache, ModelSettings
 from providers._errors import LLMCancelledError
 from react_loop import ReactContext
 from sub_agent_registry import get_registry
@@ -55,7 +55,9 @@ from tests.root_startup_harness import (
     ACME_HOST,
     DISCOVERED,
     GEM_HOST,
-    GONE_ID,
+    INVALID_SAVED,
+    UNCONFIGURED_ID,
+    remembered_for,
     MAIN_ID,
     OTHER_ID,
     SECRETS,
@@ -83,8 +85,6 @@ def _record(provider: str, upstream: str, context: int) -> ModelRecord:
         f"{upstream} display",
         ModelMetadata(
             context, None, 2048, False, True, None,
-            (("context_tokens", "provider"), ("vision", "provider"),
-             ("output_tokens", "provider"), ("tool_calling", "provider")),
         ),
     )
 
@@ -121,7 +121,6 @@ def _registry(tmp_path: Path, *, select: ModelRecord | None = MODEL_A) -> ModelR
             1, 2, None,
             tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
             (MODEL_A, MODEL_B),
-            (),
         )
     )
     registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
@@ -395,7 +394,7 @@ def test_explicit_b_pin_while_main_a_is_active(harness: Harness, tmp_path: Path)
     assert registry.view().active_model_id == MODEL_A.id
 
 
-def test_selection_and_connection_refresh_never_retarget_existing_runners(
+def test_selection_change_never_retargets_existing_runners(
     harness: Harness, tmp_path: Path
 ) -> None:
     registry = _registry(tmp_path)
@@ -404,10 +403,6 @@ def test_selection_and_connection_refresh_never_retarget_existing_runners(
     runner_b = _create(runtime, "DIAGNOSTIC_AGENT", run_model=registry.admit(MODEL_B.id))
 
     registry.select(MODEL_B.id)
-    registry.replace_connections({
-        "pa": _provider("pa", "https://moved-a.example.test/v1"),
-        "pb": _provider("pb", "https://moved-b.example.test/v1"),
-    })
     try:
         _send(runner_a._llm)
         _send(runner_b._llm)
@@ -789,7 +784,7 @@ class _RootAttemptSpies:
         """Snapshot root state, then wrap the root's real collaborators."""
         self._root = root
         self.view_before = root.registry.view()
-        self.settings_before = root.paths.models_config_file.read_bytes()
+        self.settings_before = root.paths.models_cache_file.read_bytes()
         self._requests = len(root.requests)
         self._llm_clients = len(root.llm_clients)
         self._http_clients = len(root.http_clients)
@@ -899,14 +894,15 @@ def _root_binding(root: RootHarness) -> tuple[bool, bool, bool]:
 
 @pytest.mark.parametrize("profile", ROOT_ORDINARY_PROFILES)
 @pytest.mark.parametrize(
-    "saved_default", [None, GONE_ID], ids=["no-saved-selection", "saved-model-missing"],
+    "saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no-saved-selection", "saved-model-missing"],
 )
-def test_root_factory_refuses_explicit_selector_without_active_main(
+def test_root_factory_admits_explicit_selector_without_active_main(
     production_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
     saved_default: str | None, profile: str,
 ) -> None:
-    """The actual root factory refuses a valid explicit selector at the Main gate,
-    before credential resolution, runtime/client construction, HTTP or registration."""
+    """Task 4.1: the actual root factory admits a valid explicit selector with no active Main
+    (cached or not), resolving one credential and sending no request; Main, preference and
+    cache stay unchanged. Full explicit-run wiring ownership is task 4.2."""
     outcome: dict[str, Any] = {}
 
     def hold(root: RootHarness) -> None:
@@ -914,15 +910,16 @@ def test_root_factory_refuses_explicit_selector_without_active_main(
         outcome["binding"] = _root_binding(root)
         spies = _RootAttemptSpies(root, monkeypatch)
         outcome["spies"] = spies
+        runner = root.builtin._sub_agent_factory(
+            model=OTHER_ID, label="gate-probe",
+            runtime_profile=agent_runtime.RuntimeProfile[profile],
+        )
         try:
-            root.builtin._sub_agent_factory(
-                model=OTHER_ID, label="gate-probe",
-                runtime_profile=agent_runtime.RuntimeProfile[profile],
-            )
-        except ModelRegistryError as exc:
-            outcome["error"] = exc
+            outcome["runner_model"] = runner.model_id
+        finally:
+            runner.close()  # the run never starts; release its owned clients
         outcome["view_after"] = root.registry.view()
-        outcome["settings_after"] = root.paths.models_config_file.read_bytes()
+        outcome["settings_after"] = root.paths.models_cache_file.read_bytes()
 
     production_root.start(saved_default=saved_default, hold=hold)
     root = production_root
@@ -930,18 +927,14 @@ def test_root_factory_refuses_explicit_selector_without_active_main(
 
     assert outcome["binding"] == (True, True, True)
     before = spies.view_before
-    assert before.active_model_id is None and before.remembered_model_id == saved_default
+    assert before.active_model_id is None and before.remembered_model_id == remembered_for(saved_default)
     assert OTHER_ID in {m.id for m in before.models}
-    error = outcome.get("error")
-    assert isinstance(error, ModelRegistryError), "explicit selector bypassed the Main gate"
-    assert error.code == "no_active_selection"
-    assert str(error) == "model registry no active selection"
-    assert all(secret not in str(error) for secret in SECRETS.values())
+    cached_other = next(m for m in before.models if m.id == OTHER_ID)
+    assert outcome["runner_model"] == OTHER_ID
     assert spies.admits == {"admit": [OTHER_ID], "admit_scheduled": []}
-    assert spies.codes == ["no_active_selection"] and spies.pins == []
-    assert spies.resolved == [] and spies.creates == [] and spies.registered == []
-    assert spies.new_llm_clients() == [] and spies.new_http_clients() == []
-    assert spies.provider_requests() == []
+    assert spies.codes == [] and [pin.model for pin in spies.pins] == [cached_other]
+    assert spies.resolved == [OTHER_ID.split("/", 1)[0]] and len(spies.creates) == 1
+    assert len(spies.new_llm_clients()) == 1 and spies.provider_requests() == []
     assert outcome["view_after"] == before
     assert outcome["settings_after"] == spies.settings_before
     assert root.unexpected == [] and root.open_clients_at_exit == []
@@ -973,6 +966,7 @@ def test_root_pins_survive_later_main_selection_and_real_refresh(
 
     def hold(root: RootHarness) -> None:
         """Admit two pins, run them across the change, then admit again."""
+        root.registry.refresh()  # the deliberate /models refresh: startup no longer discovers a cached catalog
         outcome["binding"] = _root_binding(root)
         spies = _RootAttemptSpies(root, monkeypatch)
         outcome["spies"] = spies
@@ -997,16 +991,16 @@ def test_root_pins_survive_later_main_selection_and_real_refresh(
             )
             runners.append(next_explicit)
             outcome["next_answers"] = [next_main.run("next main run"), next_explicit.run("next explicit run")]
-            try:
-                factory(model=ROOT_REMOVED_ID, label="removed", runtime_profile=profiles.ON_DEMAND_SUBAGENT)
-            except ModelRegistryError as exc:
-                outcome["removed_error"] = exc
+            # Task 4.1: a candidate the refresh removed is still a valid explicit target.
+            removed = factory(model=ROOT_REMOVED_ID, label="removed", runtime_profile=profiles.ON_DEMAND_SUBAGENT)
+            runners.append(removed)
         finally:
             for runner in runners:
                 runner.close()
         outcome["llm_closed"] = [client._closed for client in spies.new_llm_clients()]
         outcome["http_open"] = [c for c in spies.new_http_clients() if not c.is_closed]
-        outcome["saved_after"] = ModelSettings(root.paths.models_config_file).load()
+        outcome["saved_after"] = ModelCache(root.paths.models_cache_file).load()
+        outcome["preference_after"] = root.paths.model_selection_file.read_bytes()
 
     production_root.start(saved_default=MAIN_ID, hold=hold)
     root = production_root
@@ -1046,8 +1040,10 @@ def test_root_pins_survive_later_main_selection_and_real_refresh(
     assert after_models[MAIN_ID].metadata.output_tokens == 1024
     assert after_models[MAIN_ID].metadata.input_tokens == 50_000
     saved = outcome["saved_after"]
-    assert saved.status == "valid" and saved.document.default_model == OTHER_ID
-    assert saved.document.revision == after.revision
+    assert saved.status == "valid" and saved.document.default_model is None
+    assert outcome["preference_after"] == f'model = "{OTHER_ID}"\n'.encode()
+    # The disposable cache stores no revision; it holds the refreshed Main limits.
+    assert {m.id: m.metadata.output_tokens for m in saved.document.models}[MAIN_ID] == 1024
 
     # Existing pins are the same immutable snapshots after the change.
     assert outcome["pins_after_runs"][0] is pin_a and outcome["pins_after_runs"][1] is pin_b
@@ -1069,37 +1065,39 @@ def test_root_pins_survive_later_main_selection_and_real_refresh(
         assert request.headers["x-api-key"] == SECRETS["KEY_ACME"]
     assert third.headers["x-goog-api-key"] == SECRETS["KEY_GEM"]
     first_body, second_body, fourth_body = (json.loads(r.content) for r in (first, second, fourth))
-    assert (first_body["model"], first_body["max_tokens"]) == ("claude-a", 4096)
-    assert (second_body["model"], second_body["max_tokens"]) == ("claude-b", 4096)
+    # The wire cap is the configured required cap (default 1024), not the discovered output limit.
+    assert (first_body["model"], first_body["max_tokens"]) == ("claude-a", 1024)
+    assert (second_body["model"], second_body["max_tokens"]) == ("claude-b", 1024)
     assert (fourth_body["model"], fourth_body["max_tokens"]) == ("claude-a", 1024)
 
     # Subsequent admissions observe the current selection, inventory and metadata.
-    assert len(spies.pins) == 4
-    next_main, next_a = spies.pins[2:]
+    assert len(spies.pins) == 5
+    next_main, next_a, uncached = spies.pins[2:]
     assert next_main.model == after_models[OTHER_ID]
     assert next_a.model == after_models[MAIN_ID]
     for pin in (next_main, next_a):
         assert pin.catalog_revision == after.revision
         assert pin.selection_revision == after.selection_revision
     assert outcome["next_answers"] == ["pinned-answer-3", "pinned-answer-4"]
-    removed = outcome.get("removed_error")
-    assert isinstance(removed, ModelRegistryError) and removed.code == "model_not_found"
+    assert (uncached.model.id, uncached.model.upstream_id) == (ROOT_REMOVED_ID, "claude-b")
+    assert uncached.model.metadata == ModelMetadata()  # removed from the cache; nothing is invented
+    assert uncached.connection.provider_id == "acme"
 
     # One ordinary admission per run; each pin reached the runtime exactly once.
     assert spies.admits == {
         "admit": [None, ROOT_REMOVED_ID, None, MAIN_ID, ROOT_REMOVED_ID],
         "admit_scheduled": [],
     }
-    assert spies.codes == ["model_not_found"]
-    assert len(spies.creates) == 4
+    assert spies.codes == []
+    assert len(spies.creates) == 5
     assert all(options.run_model is pin for (_p, options), pin in zip(spies.creates, spies.pins))
     assert len(boundary.calls) == 4
     assert all(call.pin is pin for call, pin in zip(boundary.calls, spies.pins))
     # Credentials: two admissions, the refresh (both providers), two admissions.
     assert spies.resolved[:2] == ["acme", "acme"]
     assert sorted(spies.resolved[2:4]) == ["acme", "gem"]
-    assert spies.resolved[4:] == ["gem", "acme"]
+    assert spies.resolved[4:] == ["gem", "acme", "acme"]
     assert spies.registered == []
     # Run-owned clients were closed by their runners before fixture hygiene.
-    assert outcome["llm_closed"] == [True] * 4 and outcome["http_open"] == []
+    assert outcome["llm_closed"] == [True] * 5 and outcome["http_open"] == []
     assert root.unexpected == [] and root.open_clients_at_exit == []

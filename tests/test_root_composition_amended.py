@@ -273,7 +273,7 @@ def _execute_root_plan(
     outcome["llm_closed"] = [client._closed for client in spies.new_llm_clients()]
     outcome["http_open"] = [c for c in spies.new_http_clients() if not c.is_closed]
     outcome["view_after"] = root.registry.view()
-    outcome["settings_after"] = root.paths.models_config_file.read_bytes()
+    outcome["settings_after"] = root.paths.models_cache_file.read_bytes()
 
 
 def test_on_demand_explicit_selector_runs_supervised_on_its_pin(
@@ -307,7 +307,7 @@ def test_on_demand_explicit_selector_runs_supervised_on_its_pin(
         )
         outcome["drain_errors"] = supervisor.drain_owned_children(SPAWN_TRACE, cancel=False, timeout=5)
         outcome["view_after"] = started.registry.view()
-        outcome["settings_after"] = started.paths.models_config_file.read_bytes()
+        outcome["settings_after"] = started.paths.models_cache_file.read_bytes()
 
     root.start(saved_default=MAIN_ID, hold=hold)
     spies: _RootAttemptSpies = outcome["spies"]
@@ -492,7 +492,14 @@ def test_plan_step_inherits_main_through_real_plan_executor(
     closes = _spy_runner_closes(monkeypatch)
     outcome: dict[str, Any] = {}
 
-    root.start(saved_default=MAIN_ID, hold=lambda r: _execute_root_plan(r, monkeypatch, outcome, closes))
+
+    def hold(r: RootHarness) -> None:
+        """Deliberate /models-style refresh first (startup no longer rediscovers a cached catalog;
+        Anthropic budgeting needs the provider-reported max_tokens), then the plan run."""
+        r.registry.refresh()
+        _execute_root_plan(r, monkeypatch, outcome, closes)
+
+    root.start(saved_default=MAIN_ID, hold=hold)
     spies: _RootAttemptSpies = outcome["spies"]
 
     assert outcome["binding"] == (True, True, True) and outcome["late_bound"] == (True, True)
@@ -549,7 +556,14 @@ def test_failed_plan_step_triggers_real_diagnostic_on_inherited_main(
     closes = _spy_runner_closes(monkeypatch)
     outcome: dict[str, Any] = {}
 
-    root.start(saved_default=MAIN_ID, hold=lambda r: _execute_root_plan(r, monkeypatch, outcome, closes))
+
+    def hold(r: RootHarness) -> None:
+        """Deliberate /models-style refresh first (startup no longer rediscovers a cached catalog;
+        Anthropic budgeting needs the provider-reported max_tokens), then the plan run."""
+        r.registry.refresh()
+        _execute_root_plan(r, monkeypatch, outcome, closes)
+
+    root.start(saved_default=MAIN_ID, hold=hold)
     spies: _RootAttemptSpies = outcome["spies"]
 
     assert outcome["binding"] == (True, True, True) and outcome["late_bound"] == (True, True)

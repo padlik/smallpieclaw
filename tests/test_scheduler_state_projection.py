@@ -36,6 +36,7 @@ except ModuleNotFoundError:  # Python < 3.11
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scheduler import Scheduler
+from tests import scheduler_legacy_fixtures as legacy_fx
 from xdg import XDGPaths
 
 # A secret-like sentinel that must never surface in the saved state.
@@ -70,6 +71,8 @@ def _paths_for(state_dir: Path) -> XDGPaths:
         config_home=state_dir, data_home=state_dir, state_home=state_dir,
         cache_home=state_dir, runtime_dir=state_dir,
         config_file=state_dir / "config.toml",
+        model_selection_file=state_dir / "model-selection.toml",
+        models_cache_file=state_dir / "models-cache.json",
         models_config_file=state_dir / "models.toml",
         scheduler_config=state_dir / "scheduler.toml",
         memory_file=state_dir / "memory.json",
@@ -549,3 +552,32 @@ def test_saved_state_excludes_invalid_schedule_values(
         assert shown["config_error"] == job["config_error"]
     finally:
         sched.stop()
+
+
+# ---------------------------------------------------------------------------
+# Healthy TOML schedule prose
+#
+# Relocated by task 2.4 from tests/test_scheduler_legacy_readonly.py (ledger
+# provenance in openspec/changes/simplify-model-runtime/test-preservation-ledger).
+# Keep (ledger 448).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_legacy_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[legacy_fx.MakeLegacyScheduler]:
+    """Real legacy-beside-TOML schedulers (shared factory, see the support module)."""
+    yield from legacy_fx.legacy_scheduler_factory(tmp_path, monkeypatch)
+
+
+def test_healthy_toml_schedule_prose_is_unmarked(
+    make_legacy_scheduler: legacy_fx.MakeLegacyScheduler,
+) -> None:
+    """A scheduler.toml job keeps its compact native prose beside legacy jobs."""
+    env = make_legacy_scheduler(legacy_fx.TOML, legacy=legacy_fx.LEGACY)
+
+    listed = next(job for job in env.sched.list_jobs() if job["tag"] == "alpha")
+
+    assert env.sched.show_job("alpha")["schedule"] == "cron: 0 2 1 1 *"
+    assert listed["schedule"] == "cron: 0 2 1 1 *"

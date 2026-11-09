@@ -23,13 +23,19 @@ observation snapshots). Every test runs on an isolated
 ``schedule.default_scheduler`` (and ``schedule.jobs``) with every XDG
 directory under ``tmp_path``. Every wait and join is bounded, every gate is
 released in ``finally``, and an expired gate fails the test.
+
+Task 2.4 (simplify-model-runtime) relocated this module's keep/rewrite nodes
+to their owner suites (Telegram load notices, atomic mutations, load
+containment, schedule tool surface, state projection); their shared data and
+scheduler factory live in ``tests/scheduler_legacy_fixtures.py``. What remains
+here is legacy-only behavior the test-preservation ledger retires with the JSON
+runtime (tasks 8.4/10.3).
 """
 
 from __future__ import annotations
 
 import asyncio
 import builtins
-import copy
 import html
 import io
 import json
@@ -42,7 +48,6 @@ from typing import Callable, Iterator, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import schedule
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -50,89 +55,27 @@ import scheduler as scheduler_module
 from builtin_tools.schedule import exec_schedule
 from outcome_utils import read_execution
 from scheduler import Scheduler
-from xdg import xdg_paths
+from tests.scheduler_legacy_fixtures import LEGACY as _LEGACY
+from tests.scheduler_legacy_fixtures import LEGACY_DIR as _LEGACY_DIR
+from tests.scheduler_legacy_fixtures import MALFORMED_LEGACY as _MALFORMED_LEGACY
+from tests.scheduler_legacy_fixtures import SECRET as _SECRET
+from tests.scheduler_legacy_fixtures import SHADOW_ENTRY as _SHADOW_ENTRY
+from tests.scheduler_legacy_fixtures import SHADOW_LEGACY as _SHADOW_LEGACY
+from tests.scheduler_legacy_fixtures import TOML as _TOML
+from tests.scheduler_legacy_fixtures import UNRELATED_LEGACY as _UNRELATED_LEGACY
+from tests.scheduler_legacy_fixtures import LegacyEnv as _Env
+from tests.scheduler_legacy_fixtures import MakeLegacyScheduler as MakeScheduler
+from tests.scheduler_legacy_fixtures import file_state as _file_state
+from tests.scheduler_legacy_fixtures import legacy_bytes as _legacy_bytes
+from tests.scheduler_legacy_fixtures import legacy_scheduler_factory
+from tests.scheduler_legacy_fixtures import parse_toml as _parse_toml
+from tests.scheduler_legacy_fixtures import tags as _tags
+from tests.scheduler_legacy_fixtures import write_legacy as _write_legacy
 
 
 _BOUND = 10.0
-_SECRET = "fake-secret-sentinel-legacy-4c1e"
 _MARKER = "legacy, read-only"
 _REMOVE_WORKER = "legacy-removal-worker"
-
-# Sentinel: create the legacy path as a directory (unreadable as a file).
-_LEGACY_DIR = object()
-
-# Far-future crons (1 January) so nothing fires during a test.
-_TOML = """\
-[jobs.alpha]
-enabled = true
-schedule = "cron"
-cron = "0 2 1 1 *"
-task = "toml alpha"
-notify = false
-
-[jobs.dormant]
-enabled = false
-schedule = "cron"
-cron = "0 3 1 1 *"
-task = "toml dormant"
-notify = false
-"""
-
-# A scheduler.toml job whose raw values imitate legacy origin markers.
-_SPOOF_TOML = _TOML + """
-[jobs.spoofed]
-enabled = true
-schedule = "cron"
-cron = "0 6 1 1 *"
-task = "spoofed task"
-notify = false
-source = "dynamic"
-_legacy_read_only = true
-"""
-
-_LEGACY = {
-    "legacyjob": {
-        "schedule_type": "cron",
-        "cron": "0 4 1 1 *",
-        "task": f"legacy task {_SECRET}",
-        "enabled": True,
-        "notify": False,
-    },
-    "legacypaused": {
-        "schedule_type": "cron",
-        "cron": "0 5 1 1 *",
-        "task": "legacy paused",
-        "enabled": False,
-        "notify": False,
-    },
-}
-
-_UNRELATED_LEGACY = {"legacyjob": _LEGACY["legacyjob"]}
-
-_SHADOW_ENTRY = {
-    "schedule_type": "cron",
-    "cron": "0 7 1 1 *",
-    "task": f"legacy shadow {_SECRET}",
-    "enabled": True,
-    "notify": False,
-}
-
-_SHADOW_LEGACY = {"alpha": _SHADOW_ENTRY, "dormant": _SHADOW_ENTRY}
-
-_MALFORMED_LEGACY = b'{"legacyjob": {"task": "' + _SECRET.encode() + b'"'
-
-_SHOW_FIELDS = frozenset({
-    "tag", "task", "schedule", "schedule_type", "cron", "run_at", "next_run",
-    "last_run", "last_error", "notify", "model", "preserve_context",
-    "context_max_messages", "overlap_policy", "source", "enabled", "is_running",
-    "created_at",
-})
-
-_LIST_FIELDS = frozenset({
-    "tag", "schedule", "schedule_type", "cron", "next_run", "enabled", "last_run",
-    "last_error", "task", "notify", "source", "model", "preserve_context",
-    "is_running", "config_error",
-})
 
 
 # ---------------------------------------------------------------------------
@@ -140,79 +83,9 @@ _LIST_FIELDS = frozenset({
 # ---------------------------------------------------------------------------
 
 
-def _legacy_bytes(jobs: dict) -> bytes:
-    """Return operator-formatted legacy JSON bytes (two-space indent)."""
-    return (json.dumps(jobs, indent=2) + "\n").encode("utf-8")
-
-
 def _whitespace_variant(jobs: dict) -> bytes:
     """Return different bytes that parse to the identical legacy JSON value."""
     return (json.dumps(jobs, indent=4) + "\n\n").encode("utf-8")
-
-
-def _write_legacy(path: Path, legacy: object) -> None:
-    """Write *legacy* (None: absent, dict: JSON, bytes: raw, _LEGACY_DIR: directory)."""
-    if legacy is None:
-        return
-    if legacy is _LEGACY_DIR:
-        path.mkdir()
-    elif isinstance(legacy, bytes):
-        path.write_bytes(legacy)
-    else:
-        path.write_bytes(_legacy_bytes(legacy))
-
-
-def _file_state(path: Path) -> tuple:
-    """Return the kind of *path* and, for a regular file, its exact bytes."""
-    if path.is_dir():
-        return ("dir",)
-    if not path.exists():
-        return ("missing",)
-    return ("file", path.read_bytes())
-
-
-def _parse_toml(path: Path) -> dict:
-    """Parse the scheduler file with the scheduler's own parser."""
-    return scheduler_module.tomli.loads(path.read_text(encoding="utf-8"))
-
-
-def _tags(sched: Scheduler) -> list[str]:
-    """Return the public list of job tags."""
-    return [job["tag"] for job in sched.list_jobs()]
-
-
-class _Env:
-    """A real scheduler with its scheduler.toml path, legacy path, and notify mock."""
-
-    def __init__(
-        self, sched: Scheduler, toml_path: Path, legacy_path: Path, notify: MagicMock,
-    ) -> None:
-        self.sched = sched
-        self.toml_path = toml_path
-        self.legacy_path = legacy_path
-        self.notify = notify
-
-    def snapshot(self) -> dict:
-        """Capture map, document, hash, registrations, generation, and both files."""
-        sched = self.sched
-        with sched._running_lock:
-            state = {
-                "meta": copy.deepcopy(sched._jobs_meta),
-                "status": sched._load_result.status,
-                "document": copy.deepcopy(sched._load_result.document),
-                "hash": sched._load_result.content_hash,
-                "registrations": list(schedule.default_scheduler.jobs),
-                "generation": sched._config_generation,
-            }
-        state["toml"] = _file_state(self.toml_path)
-        state["legacy"] = _file_state(self.legacy_path)
-        state["backups"] = sorted(
-            p.name for p in self.toml_path.parent.glob(self.toml_path.name + ".bak.*")
-        )
-        return state
-
-
-MakeScheduler = Callable[..., _Env]
 
 
 def _start(
@@ -283,56 +156,11 @@ def _run_telegram_jobs(sched: Scheduler, args: list[str]) -> str:
 
 
 @pytest.fixture
-def isolated_schedule(monkeypatch: pytest.MonkeyPatch) -> schedule.Scheduler:
-    """Replace the external library's global scheduler (and its ``jobs`` alias)."""
-    isolated = schedule.Scheduler()
-    monkeypatch.setattr(schedule, "default_scheduler", isolated)
-    monkeypatch.setattr(schedule, "jobs", isolated.jobs)
-    return isolated
-
-
-@pytest.fixture
 def make_scheduler(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_schedule: schedule.Scheduler,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[MakeScheduler]:
-    """Construct real Schedulers over temporary XDG paths (loop off unless *enabled*).
-
-    ``toml=None`` leaves scheduler.toml missing; *legacy* is written as
-    described by :func:`_write_legacy`. Started loops are stopped and joined.
-    """
-    assert schedule.default_scheduler is isolated_schedule
-    for var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
-        monkeypatch.setenv(var, str(tmp_path / var.lower()))
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    paths = xdg_paths("legacy-readonly-test")
-    assert str(paths.models_config_file).startswith(str(tmp_path))
-    assert str(paths.scheduler_jobs).startswith(str(tmp_path))
-    created: list[Scheduler] = []
-
-    def _make(
-        toml: Optional[str] = _TOML, *, legacy: object = None, enabled: bool = False,
-    ) -> _Env:
-        paths.config_home.mkdir(parents=True, exist_ok=True)
-        paths.state_home.mkdir(parents=True, exist_ok=True)
-        if toml is not None:
-            paths.scheduler_config.write_text(toml, encoding="utf-8")
-        _write_legacy(paths.scheduler_jobs, legacy)
-        notify = MagicMock()
-        sched = Scheduler(
-            config={"scheduler": {"enabled": enabled}, "agent": {"long_run_warn_minutes": 0}},
-            notify_fn=notify,
-            agent_fn=MagicMock(),
-            paths=paths,
-            scheduler_config_path=str(paths.scheduler_config),
-        )
-        created.append(sched)
-        return _Env(sched, paths.scheduler_config, paths.scheduler_jobs, notify)
-
-    yield _make
-    for sched in created:
-        if sched._thread is not None:
-            sched.stop()
-            assert not sched._thread.is_alive(), "the scheduler loop did not stop"
+    """Real legacy-beside-TOML schedulers (shared factory, see the support module)."""
+    yield from legacy_scheduler_factory(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -342,24 +170,6 @@ def make_scheduler(
 
 class TestNonDestructiveLoad:
     """Loading and reloading legacy jobs never writes either file."""
-
-    @pytest.mark.parametrize("toml", [_TOML, None], ids=["toml_present", "toml_missing"])
-    def test_load_and_reload_keep_legacy_bytes_without_adoption(
-        self, make_scheduler: MakeScheduler, toml: Optional[str],
-    ) -> None:
-        """Legacy jobs are visible; both files keep their bytes; no TOML is created."""
-        env = make_scheduler(toml, legacy=_LEGACY)
-
-        reloaded = env.sched.reload()
-
-        assert "error" not in reloaded, reloaded
-        assert {"legacyjob", "legacypaused"} <= set(_tags(env.sched))
-        assert env.legacy_path.read_bytes() == _legacy_bytes(_LEGACY)
-        if toml is None:
-            assert not env.toml_path.exists()
-        else:
-            assert env.toml_path.read_text(encoding="utf-8") == toml
-        assert list(env.toml_path.parent.glob(env.toml_path.name + ".bak.*")) == []
 
     def test_toml_job_wins_duplicate_tag(self, make_scheduler: MakeScheduler) -> None:
         """The scheduler.toml definition is the only one visible, unmarked."""
@@ -442,49 +252,8 @@ def test_json_only_job_schedule_prose_carries_marker(
     assert _MARKER in rendered
 
 
-@pytest.mark.parametrize("tag", ["alpha", "legacyjob"])
-def test_public_job_field_sets_are_unchanged(make_scheduler: MakeScheduler, tag: str) -> None:
-    """No new public list/show fields are introduced for either origin."""
-    env = make_scheduler(_TOML, legacy=_LEGACY)
-
-    listed = next(job for job in env.sched.list_jobs() if job["tag"] == tag)
-
-    assert set(env.sched.show_job(tag)) == _SHOW_FIELDS
-    assert set(listed) == _LIST_FIELDS
-
-
-def test_healthy_toml_schedule_prose_is_unmarked(make_scheduler: MakeScheduler) -> None:
-    """A scheduler.toml job keeps its compact native prose beside legacy jobs."""
-    env = make_scheduler(_TOML, legacy=_LEGACY)
-
-    listed = next(job for job in env.sched.list_jobs() if job["tag"] == "alpha")
-
-    assert env.sched.show_job("alpha")["schedule"] == "cron: 0 2 1 1 *"
-    assert listed["schedule"] == "cron: 0 2 1 1 *"
-
-
 class TestOriginSpoofGuard:
     """Read-only origin comes from the legacy file, never from raw values."""
-
-    def test_toml_job_with_legacy_lookalike_values_is_writable(
-        self, make_scheduler: MakeScheduler,
-    ) -> None:
-        """``source = "dynamic"`` plus a raw private flag in scheduler.toml stays writable."""
-        env = make_scheduler(_SPOOF_TOML, legacy=_UNRELATED_LEGACY)
-
-        out = exec_schedule(env.sched, {"action": "modify", "tag": "spoofed", "task": "edited"})
-
-        assert out["success"] is True, out
-        assert read_execution(out) == "executed"
-        assert _parse_toml(env.toml_path)["jobs"]["spoofed"]["task"] == "edited"
-
-    def test_toml_job_with_legacy_lookalike_values_is_unmarked(
-        self, make_scheduler: MakeScheduler,
-    ) -> None:
-        """The lookalike scheduler.toml job carries no read-only marker."""
-        env = make_scheduler(_SPOOF_TOML, legacy=_UNRELATED_LEGACY)
-
-        assert env.sched.show_job("spoofed")["schedule"] == "cron: 0 6 1 1 *"
 
     def test_legacy_raw_flag_cannot_disable_protection(
         self, make_scheduler: MakeScheduler,
@@ -594,11 +363,6 @@ def test_telegram_remove_of_json_only_job_reports_legacy_guidance(
 # ---------------------------------------------------------------------------
 
 # name -> (legacy at construction, legacy written after construction)
-_REMOVAL_ALLOWED = {
-    "legacy_missing": (None, None),
-    "unrelated_legacy_job": (_UNRELATED_LEGACY, None),
-}
-
 _REMOVAL_REFUSED = {
     "matching_tag_at_load": (_SHADOW_LEGACY, None),
     "matching_tag_added_after_load": (None, {"alpha": _SHADOW_ENTRY}),
@@ -612,24 +376,6 @@ _SHADOW_REFUSALS = {"matching_tag_at_load", "matching_tag_added_after_load", "ma
 
 class TestTomlRemovalShadowPreflight:
     """The removal preflight reads the legacy file on disk, never the cached map."""
-
-    @pytest.mark.parametrize("case", sorted(_REMOVAL_ALLOWED))
-    def test_removal_proceeds_without_current_shadow(
-        self, make_scheduler: MakeScheduler, case: str,
-    ) -> None:
-        """A missing legacy file or an unrelated legacy job allows a normal removal."""
-        initial, late = _REMOVAL_ALLOWED[case]
-        env = make_scheduler(_TOML, legacy=initial)
-        _write_legacy(env.legacy_path, late)
-        legacy_before = _file_state(env.legacy_path)
-
-        out = exec_schedule(env.sched, {"action": "remove", "tag": "alpha"})
-
-        assert out["success"] is True, out
-        assert read_execution(out) == "executed"
-        assert "alpha" not in _parse_toml(env.toml_path)["jobs"]
-        assert "alpha" not in _tags(env.sched)
-        assert _file_state(env.legacy_path) == legacy_before
 
     @pytest.mark.parametrize("case", sorted(_REMOVAL_REFUSED))
     def test_removal_refused_by_current_legacy_file(
@@ -661,28 +407,6 @@ class TestTomlRemovalShadowPreflight:
 
         assert env.sched.remove_job("alpha") is False
         assert env.snapshot() == before
-
-
-_SHADOW_CHANGES = {
-    "modify": ({"action": "modify", "tag": "alpha", "task": "shadow modified"},
-               ("alpha", "task", "shadow modified")),
-    "pause": ({"action": "pause", "tag": "alpha"}, ("alpha", "enabled", False)),
-    "resume": ({"action": "resume", "tag": "dormant"}, ("dormant", "enabled", True)),
-}
-
-
-@pytest.mark.parametrize("change", sorted(_SHADOW_CHANGES))
-def test_shadowing_toml_job_change_proceeds(make_scheduler: MakeScheduler, change: str) -> None:
-    """Modify, pause, and resume of a shadowing scheduler.toml job are applied normally."""
-    args, (tag, field, value) = _SHADOW_CHANGES[change]
-    env = make_scheduler(_TOML, legacy=_SHADOW_LEGACY)
-
-    out = exec_schedule(env.sched, args)
-
-    assert out["success"] is True, out
-    assert read_execution(out) == "executed"
-    assert _parse_toml(env.toml_path)["jobs"][tag][field] == value
-    assert env.legacy_path.read_bytes() == _legacy_bytes(_SHADOW_LEGACY)
 
 
 # ---------------------------------------------------------------------------
@@ -872,42 +596,6 @@ def test_generation_retry_keeps_original_legacy_proof(
 # E. A bad legacy file is contained; reload keeps last-good legacy jobs
 # ---------------------------------------------------------------------------
 
-_BAD_LEGACY = {
-    "malformed": _MALFORMED_LEGACY,
-    "unreadable_directory": _LEGACY_DIR,
-}
-
-
-@pytest.mark.parametrize("bad", sorted(_BAD_LEGACY))
-def test_bad_legacy_file_sends_startup_notice(make_scheduler: MakeScheduler, bad: str) -> None:
-    """Startup notifies the operator with the legacy path and repair steps, no content."""
-    env = make_scheduler(_TOML, legacy=_BAD_LEGACY[bad], enabled=True)
-
-    env.sched.start()
-
-    sent = [call.args[0] for call in env.notify.call_args_list]
-    naming = [m for m in sent if html.escape(str(env.legacy_path)) in m]
-    assert naming, f"no startup notice names the legacy file: {sent!r}"
-    text = naming[0].lower()
-    assert "reload" in text
-    assert "repair" in text or "fix" in text or "edit" in text
-    assert _SECRET not in naming[0]
-
-
-def test_toml_change_succeeds_beside_bad_legacy_file(make_scheduler: MakeScheduler) -> None:
-    """A legacy warning never blocks an ordinary scheduler.toml modify."""
-    env = make_scheduler(_TOML, legacy=_MALFORMED_LEGACY, enabled=True)
-    env.sched.start()
-
-    out = exec_schedule(env.sched, {"action": "modify", "tag": "alpha", "task": "still editable"})
-
-    assert out["success"] is True, out
-    assert read_execution(out) == "executed"
-    assert _parse_toml(env.toml_path)["jobs"]["alpha"]["task"] == "still editable"
-    assert env.sched.show_job("alpha")["next_run"] is not None
-    assert env.legacy_path.read_bytes() == _MALFORMED_LEGACY
-
-
 _BETA_TOML = _TOML + """
 [jobs.beta]
 enabled = true
@@ -963,61 +651,3 @@ def test_operator_cleanup_reload_drops_legacy_job(
     assert env.sched.load_notice() is None
     assert env.toml_path.read_bytes() == toml_bytes
     assert _file_state(env.legacy_path) == legacy_after
-
-
-def test_uninspectable_legacy_file_sends_startup_notice(
-    make_scheduler: MakeScheduler, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An existing legacy file that cannot be inspected is read, not treated as missing.
-
-    A real valid legacy file exists, but while the scheduler is constructed
-    and started the external ``os.stat`` and ``open`` on that one path raise
-    ``PermissionError`` (an inaccessible parent directory) without host
-    permission changes; every other path and file descriptor delegates.
-    """
-    paths = xdg_paths("legacy-readonly-test")  # the fixture's own stable paths
-    paths.state_home.mkdir(parents=True, exist_ok=True)
-    legacy_path = paths.scheduler_jobs
-    legacy_path.write_bytes(_legacy_bytes(_LEGACY))
-    assert legacy_path.is_file()
-    target = os.path.abspath(legacy_path)
-    real_stat = os.stat
-    real_open = builtins.open
-    open_attempts: list[str] = []
-
-    def _is_target(file: object) -> bool:
-        if not isinstance(file, (str, bytes, os.PathLike)):
-            return False
-        return os.path.abspath(os.fsdecode(os.fspath(file))) == target
-
-    def faulting_stat(path: object, *args: object, **kwargs: object) -> object:
-        if not args and kwargs.get("dir_fd") is None and _is_target(path):
-            raise PermissionError(13, "Permission denied", os.fsdecode(os.fspath(path)))
-        return real_stat(path, *args, **kwargs)
-
-    def faulting_open(file: object, *args: object, **kwargs: object) -> object:
-        if _is_target(file):
-            open_attempts.append(threading.current_thread().name)
-            raise PermissionError(13, "Permission denied", os.fsdecode(os.fspath(file)))
-        return real_open(file, *args, **kwargs)
-
-    with monkeypatch.context() as fault:
-        fault.setattr(os, "stat", faulting_stat)
-        fault.setattr(builtins, "open", faulting_open)
-        fault.setattr(io, "open", faulting_open)
-        assert os.path.exists(legacy_path) is False, "the stat fault is not in effect"
-        env = make_scheduler(_TOML, legacy=None, enabled=True)
-        env.sched.start()
-        attempts = list(open_attempts)
-
-    sent = [call.args[0] for call in env.notify.call_args_list]
-    naming = [m for m in sent if html.escape(str(legacy_path)) in m]
-    assert naming, f"no startup notice names the uninspectable legacy file: {sent!r}"
-    text = naming[0].lower()
-    assert "reload" in text
-    assert "repair" in text or "fix" in text or "edit" in text
-    assert _SECRET not in naming[0]
-    assert attempts, "the legacy file was assumed missing instead of being read"
-    assert env.sched.show_job("alpha")["next_run"] is not None
-    assert env.legacy_path == legacy_path
-    assert legacy_path.read_bytes() == _legacy_bytes(_LEGACY)

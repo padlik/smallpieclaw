@@ -60,8 +60,6 @@ def _record(provider: str, upstream: str, context: int) -> ModelRecord:
         f"{provider}/{upstream}", provider, upstream, f"{upstream} display",
         ModelMetadata(
             context, None, 2048, False, True, None,
-            (("context_tokens", "provider"), ("output_tokens", "provider"),
-             ("tool_calling", "provider"), ("vision", "provider")),
         ),
     )
 
@@ -154,7 +152,7 @@ def build(tmp_path: Path) -> Iterator[Callable[[str], _Wiring]]:
         ModelSettings(settings_path).write(CatalogDocument(
             1, 2, _REMEMBERED[state],
             tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
-            (MODEL_A, MODEL_B), (),
+            (MODEL_A, MODEL_B),
         ))
         registry = ModelRegistry(providers, ModelSettings(settings_path), _NoDiscovery(), _resolve)
         registry.restore_selection()
@@ -312,17 +310,29 @@ def test_supported_arguments_forwarded(
     assert runner.model_id == MODEL_B.id
 
 
-@pytest.mark.parametrize("profile", [RuntimeProfile.ON_DEMAND_SUBAGENT, _SCHEDULED],
-                         ids=["ordinary", "scheduled"])
 @pytest.mark.parametrize("state", ["no-selection", "remembered-missing"])
-def test_inactive_main_rejects_explicit_selector_before_allocation(
-    build: Callable[[str], _Wiring], state: str, profile: RuntimeProfile,
+def test_ordinary_explicit_selector_is_admitted_once_without_active_main(
+    build: Callable[[str], _Wiring], state: str,
 ) -> None:
-    """Inactive Main fails ``no_active_selection`` before any runner allocation."""
+    """Task 4.1: an ordinary explicit selector needs neither Main nor cache membership."""
+    wiring = build(state)
+    before = wiring.settings_path.read_bytes()
+    runner = wiring.factory()(model=MODEL_B.id, runtime_profile=RuntimeProfile.ON_DEMAND_SUBAGENT)
+    assert wiring.admissions() == 1 and [pin.model.id for pin in wiring.pins] == [MODEL_B.id]
+    assert wiring.resolver.call_count == 1 and runner.model_id == MODEL_B.id
+    assert wiring.registry.view().active_model_id is None
+    assert wiring.settings_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("state", ["no-selection", "remembered-missing"])
+def test_inactive_main_rejects_scheduled_selector_before_allocation(
+    build: Callable[[str], _Wiring], state: str,
+) -> None:
+    """Scheduled admission still requires Main (scheduled handling is task 8.x)."""
     wiring = build(state)
     before = wiring.settings_path.read_bytes()
     with pytest.raises(ModelRegistryError) as caught:
-        wiring.factory()(model=MODEL_B.id, runtime_profile=profile)
+        wiring.factory()(model=MODEL_B.id, runtime_profile=_SCHEDULED)
     assert caught.value.code == "no_active_selection"
     assert wiring.admissions() == 1 and wiring.pins == []
     assert wiring.resolver.call_count == wiring.create.call_count == 0

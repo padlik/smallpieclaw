@@ -146,22 +146,27 @@ def test_preview_uses_final_wire_estimate_without_sending_or_counting() -> None:
     client.close()
 
 
-def test_unknown_vision_and_unsupported_native_are_rejected_before_send() -> None:
+def test_unsupported_native_adapter_is_rejected_before_send_but_unknown_vision_images_are_sent() -> None:
+    """A genuine adapter limitation (no native tools on Anthropic) still fails locally
+    before any I/O; unknown vision metadata never blocks an image request."""
     requests: list[httpx.Request] = []
     client = _client(
         "anthropic",
-        transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200, json={})),
+        transport=httpx.MockTransport(
+            lambda request: requests.append(request)
+            or httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}], "usage": {}})
+        ),
     )
     state = CallAttemptState(max_retries=2, retry_delay=0)
 
     with client.bind_attempt(state):
         with pytest.raises(NotImplementedError, match="unsupported"):
             client.chat_with_tools([{"role": "user", "content": "x"}], [])
-        with pytest.raises(Exception, match="verified vision"):
-            client.chat([{"role": "user", "content": "x", "images": ["fake-image"]}])
+    assert requests == [] and state.outbound_attempts == 0
 
-    assert requests == []
-    assert state.outbound_attempts == 0
+    with client.bind_attempt(state):
+        client.chat([{"role": "user", "content": "x", "images": ["fake-image"]}])
+    assert len(requests) == 1 and state.outbound_attempts == 1
     client.close()
 
 

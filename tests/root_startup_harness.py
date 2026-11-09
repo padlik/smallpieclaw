@@ -7,7 +7,8 @@ wiring). Both drive the same actual startup path, so the boundary setup lives
 here once instead of being duplicated.
 
 REAL (never replaced): ``main.load_config`` parsing, XDG paths, the managed
-``models-config.toml`` file, ``ModelSettings``, ``ModelRegistry`` (refresh,
+``models-cache.json`` disposable cache (``ModelCache``), the ``model-selection.toml``
+preference (``ModelPreference``), ``ModelRegistry`` (refresh,
 restore, admission), ``ModelDiscovery`` pagination, provider credential
 resolution from environment references, ``EmbeddingClient``, ``ToolIndex``,
 memories, ``BuiltinExecutor``, ``AgentController``, ``AgentRuntime``,
@@ -105,7 +106,7 @@ from model_registry import (
     RefreshReport,
     RunModel,
 )
-from model_settings import ModelSettings
+from model_settings import ModelCache, ModelPreference
 from scheduler import Scheduler
 from sub_agent_registry import SubAgentRegistry
 from token_usage import TokenUsageRegistry
@@ -126,6 +127,10 @@ SECRETS = {
 MAIN_ID = "acme/claude-a"
 OTHER_ID = "gem/gem-1"
 GONE_ID = "acme/claude-gone"
+# A well-formed selector whose connection is not configured (a "removed" connection).
+UNCONFIGURED_ID = "oldconn/claude-gone"
+# Harness sentinel: write an invalid preference file (Main stays unset, no auto-choice).
+INVALID_SAVED = "<invalid saved selection>"
 GRAPH_ID = "graph/graph-model"
 GRAPH_UPSTREAM = "graph-model"
 DISCOVERED = ("acme/claude-a", "acme/claude-b", "gem/gem-1", "gem/gem-2")
@@ -148,6 +153,11 @@ def restore_structlog_state(config: dict[str, Any], configured: bool, context: d
         structlog._config._CONFIG.is_configured = False
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(**context)
+
+
+def remembered_for(saved_default: str | None) -> str | None:
+    """Return the selector the registry remembers for a harness ``saved_default``."""
+    return None if saved_default in (None, INVALID_SAVED) else saved_default
 
 
 def _config_text(workspace: Path, *, graph_enabled: bool = False) -> str:
@@ -204,9 +214,19 @@ base_url = "https://{EMBED_HOST}/v1"
 {graph_memory_section}"""
 
 
-def _saved_document(default_model: str | None, *, graph_enabled: bool = False) -> CatalogDocument:
-    """Return a stale saved catalog lacking each provider's second page."""
+def _saved_document(
+    default_model: str | None, *, graph_enabled: bool = False, removed_connection: str | None = None,
+    extra_cached: tuple[str, ...] = (),
+) -> CatalogDocument:
+    """Return a stale saved catalog lacking each provider's second page.
+
+    ``removed_connection`` adds a cached candidate of a connection that is no
+    longer configured (it must be filtered out at startup).
+    """
     ids = {MAIN_ID, OTHER_ID} | ({GONE_ID} if default_model == GONE_ID else set())
+    if removed_connection is not None:
+        ids.add(f"{removed_connection}/aaa-first")
+    ids.update(extra_cached)  # cached candidates of configured connections that discovery will not return
     providers = [
         ProviderState("acme", "anthropic", "2026-09-01T00:00:00Z", "stale"),
         ProviderState("gem", "google", "2026-09-01T00:00:00Z", "stale"),
@@ -214,11 +234,14 @@ def _saved_document(default_model: str | None, *, graph_enabled: bool = False) -
     if graph_enabled:
         ids.add(GRAPH_ID)
         providers.append(ProviderState("graph", "openai", "2026-09-01T00:00:00Z", "stale"))
+    if removed_connection is not None:
+        providers.append(ProviderState(removed_connection, "openai", "2026-09-01T00:00:00Z", "stale"))
     models = tuple(
         ModelRecord(model_id, *model_id.split("/", 1), model_id.split("/", 1)[1])
         for model_id in sorted(ids)
     )
-    return CatalogDocument(1, 3, default_model, tuple(providers), models, ())
+    # Selection lives only in the separate preference file (task 3.3, ADR-0040).
+    return CatalogDocument(1, 3, None, tuple(providers), models)
 
 
 def _acme_row(upstream: str) -> dict[str, Any]:
@@ -711,7 +734,7 @@ class RootHarness:
     # ------------------------------------------------------------------
 
     def _route(self, request: httpx.Request) -> httpx.Response:
-        """Serve discovery pages, models.dev and embeddings; record anything else."""
+        """Serve discovery pages and embeddings; any other destination (models.dev included) is unexpected."""
         request.read()
         self.requests.append(request)
         host, path, method = request.url.host, request.url.path, request.method
@@ -728,8 +751,6 @@ class RootHarness:
                 return httpx.Response(200, json={"models": [_gem_row("gem-1")], "nextPageToken": "tok-2"})
             if params == {"pageToken": "tok-2"}:
                 return httpx.Response(200, json={"models": [_gem_row("gem-2")]})
-        elif method == "GET" and host == "models.dev" and path == "/api.json":
-            return httpx.Response(200, json={})
         elif method == "POST" and host == EMBED_HOST and path == "/v1/embeddings":
             body = json.loads(request.content)
             inputs = body["input"] if isinstance(body["input"], list) else [body["input"]]
@@ -795,9 +816,24 @@ class RootHarness:
         graph_enabled: bool = False,
         hold: Callable[[RootHarness], None] | None = None,
         scheduler_toml: str | None = None,
+        legacy_settings: bytes | None = None,
+        preference_bytes: bytes | None = None,
+        preference_unreadable: bool = False,
+        write_cache: bool = True,
+        removed_connection: str | None = None,
+        extra_cached: tuple[str, ...] = (),
     ) -> None:
-        """Write config + saved catalog (+ optional scheduler file) and run ``main._run``."""
+        """Write config + saved catalog (+ optional scheduler file) and run ``main._run``.
+
+        ``preference_bytes`` writes raw preference bytes (invalid content);
+        ``preference_unreadable`` makes the preference path a directory (a real
+        OS read failure); ``write_cache=False`` leaves the cache absent;
+        ``removed_connection`` caches a candidate of an unconfigured connection;
+        ``extra_cached`` caches extra candidates of configured connections.
+        """
         self.hold = hold
+        if saved_default == INVALID_SAVED:
+            saved_default, preference_bytes = None, b"model = 7\n"
         main_mod._create_xdg_dirs(self.paths)
         self.workspace.mkdir(parents=True, exist_ok=True)
         config_text = _config_text(self.workspace, graph_enabled=graph_enabled)
@@ -807,9 +843,21 @@ class RootHarness:
         self.paths.config_file.write_text(config_text)
         if scheduler_toml is not None:
             self.paths.scheduler_config.write_text(scheduler_toml, encoding="utf-8")
-        ModelSettings(self.paths.models_config_file).write(
-            _saved_document(saved_default, graph_enabled=graph_enabled)
-        )
+        if write_cache:
+            ModelCache(self.paths.models_cache_file).write(
+                _saved_document(
+                    saved_default, graph_enabled=graph_enabled, removed_connection=removed_connection,
+                    extra_cached=extra_cached,
+                )
+            )
+        if legacy_settings is not None:
+            self.paths.models_config_file.write_bytes(legacy_settings)
+        if saved_default is not None:
+            ModelPreference(self.paths.model_selection_file).write(saved_default)
+        if preference_bytes is not None:
+            self.paths.model_selection_file.write_bytes(preference_bytes)
+        if preference_unreadable:
+            self.paths.model_selection_file.mkdir()
         cfg, app_cfg = main_mod.load_config(
             self.paths.config_file, vault_file=str(self.paths.secrets_file), agent_name=AGENT_NAME,
         )
@@ -1043,7 +1091,7 @@ class ScheduledRootProbe:
         self._root = root
         self._mp = monkeypatch
         self.view_before = root.registry.view()
-        self.settings_before = root.paths.models_config_file.read_bytes()
+        self.settings_before = root.paths.models_cache_file.read_bytes()
         self.toml_before = root.paths.scheduler_config.read_bytes()
         self._marks = (len(root.requests), len(root.llm_clients), len(root.http_clients), len(root.notices))
         self.admits: dict[str, list[object]] = {"admit": [], "admit_scheduled": []}
@@ -1146,7 +1194,7 @@ class ScheduledRootProbe:
         new_llm = root.llm_clients[llm_clients:]
         self.after = SimpleNamespace(
             view=root.registry.view(),
-            settings=root.paths.models_config_file.read_bytes(),
+            settings=root.paths.models_cache_file.read_bytes(),
             toml=root.paths.scheduler_config.read_bytes(),
             records=self.records(),
             state=self._state(),
@@ -1179,6 +1227,7 @@ def run_scheduled_root(
 
     def hold(started: RootHarness) -> None:
         """Install the probe, apply the optional pre-fire change, fire once."""
+        started.registry.refresh()  # the deliberate /models refresh: startup no longer discovers a cached catalog
         probe = ScheduledRootProbe(started, monkeypatch, messages=messages)
         probes.append(probe)
         if before_fire is not None:

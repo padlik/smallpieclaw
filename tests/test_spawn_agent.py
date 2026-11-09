@@ -24,7 +24,9 @@ from sub_agent_registry import SOURCE_ON_DEMAND, get_registry
 from tests.root_startup_harness import (
     ACME_HOST,
     GEM_HOST,
-    GONE_ID,
+    INVALID_SAVED,
+    UNCONFIGURED_ID,
+    remembered_for,
     MAIN_ID,
     OTHER_ID,
     SECRETS,
@@ -840,7 +842,7 @@ class _RootAttemptSpies:
         """Snapshot root state, then wrap the root's real collaborators."""
         self._root = root
         self.view_before = root.registry.view()
-        self.settings_before = root.paths.models_config_file.read_bytes()
+        self.settings_before = root.paths.models_cache_file.read_bytes()
         self._requests = len(root.requests)
         self._llm_clients = len(root.llm_clients)
         self._http_clients = len(root.http_clients)
@@ -941,16 +943,17 @@ def _root_binding(root: RootHarness) -> tuple[bool, bool, bool]:
 
 
 class TestProductionRootSpawnAdmission:
-    """Task 7.2: actual root spawn route; explicit selectors never bypass the Main gate."""
+    """Actual root spawn route; explicit selectors need no Main (task 4.1), implicit ones do."""
 
     @pytest.mark.parametrize(
-        "saved_default", [None, GONE_ID], ids=["no-saved-selection", "saved-model-missing"],
+        "saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no-saved-selection", "saved-model-missing"],
     )
-    def test_explicit_selector_cannot_bypass_inactive_main(
+    def test_explicit_selector_runs_exact_pin_without_active_main(
         self, production_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
         saved_default: str | None,
     ) -> None:
-        """A valid explicit OTHER_ID is refused before any resolver/runtime/client/HTTP/registration."""
+        """Task 4.1: a valid explicit OTHER_ID needs no active Main; it admits once and reaches only gem."""
+        _serve_inference(production_root, monkeypatch)
         boundary = _RootReactBoundary(ROOT_SPAWN_RESULT)
         monkeypatch.setattr(agent_controller, "react_loop", boundary)
         outcome: dict[str, Any] = {}
@@ -960,53 +963,45 @@ class TestProductionRootSpawnAdmission:
             outcome["binding"] = _root_binding(root)
             spies = _RootAttemptSpies(root, monkeypatch)
             outcome["spies"] = spies
-            outcome["result"] = root.builtin._exec_spawn_agent(
+            supervisor = root.builtin._supervisor
+            monkeypatch.setattr(supervisor, "_pool", _InlineExecutor())
+            spawned = root.builtin._exec_spawn_agent(
                 {"task": "explicit work", "model": OTHER_ID}, caller_depth=0, trace_id=ROOT_TURN,
             )
-            supervisor = root.builtin._supervisor
-            outcome["children"] = (
-                supervisor.unaccounted_children(ROOT_TURN), supervisor.draining_children(ROOT_TURN),
+            outcome["spawned"] = spawned
+            outcome["fetched"] = root.builtin._exec_get_agent_result(
+                {"agent_id": spawned.get("agent_id", ""), "timeout": 5}, caller_tag=f"main {ROOT_TURN}",
             )
+            outcome["drain_errors"] = supervisor.drain_owned_children(ROOT_TURN, cancel=False, timeout=5)
+            outcome["llm_closed"] = [client._closed for client in spies.new_llm_clients()]
+            outcome["http_open"] = [c for c in spies.new_http_clients() if not c.is_closed]
             outcome["view_after"] = root.registry.view()
-            outcome["settings_after"] = root.paths.models_config_file.read_bytes()
+            outcome["settings_after"] = root.paths.models_cache_file.read_bytes()
 
         production_root.start(saved_default=saved_default, hold=hold)
         root = production_root
         spies: _RootAttemptSpies = outcome["spies"]
 
-        # The real root factory, runtime and registry are the ones exercised.
         assert outcome["binding"] == (True, True, True)
-        # Precondition: Main is inactive while OTHER_ID is a valid catalog selector.
         before = spies.view_before
-        assert before.active_model_id is None and before.remembered_model_id == saved_default
+        assert before.active_model_id is None and before.remembered_model_id == remembered_for(saved_default)
         assert before.selection_status == (
-            "no_selection" if saved_default is None else "saved_selection_unavailable"
+            "no_selection" if remembered_for(saved_default) is None else "saved_selection_unavailable"
         )
         assert OTHER_ID in {m.id for m in before.models}
-        assert GONE_ID not in {m.id for m in before.models}
-        # Public refusal: contained, actionable, no child, no secrets.
-        result = outcome["result"]
-        assert result["success"] is False and "agent_id" not in result
-        assert result["error"] == "spawn_agent: model registry no active selection"
-        assert result["error_type"] == "wrong_model_for_task" and result["recoverable"] is False
-        # Actionable guidance for an inactive Main: select one via /models, then retry.
-        guidance = result["suggestion"].lower()
-        for token in ("/models", "select", "main", "retry"):
-            assert token in guidance, (token, result["suggestion"])
-        assert outcome_utils.read_execution(result) == "refused"
-        serialized = json.dumps(result, default=str)
-        assert all(secret not in serialized for secret in SECRETS.values())
-        # Exactly one ordinary admission, refused at the Main gate.
-        assert spies.admits == {"admit": [OTHER_ID], "admit_scheduled": []}
-        assert spies.codes == ["no_active_selection"] and spies.pins == []
-        # Nothing after the gate: credentials, runtime, clients, inference, registration.
-        assert spies.resolved == [] and spies.creates == [] and spies.registered == []
-        assert spies.new_llm_clients() == [] and spies.new_http_clients() == []
-        assert spies.provider_requests() == [] and boundary.calls == []
-        assert outcome["children"] == ([], [])
-        # Selection and persisted settings are unchanged.
-        assert outcome["view_after"] == before
-        assert outcome["settings_after"] == spies.settings_before
+        spawned = outcome["spawned"]
+        assert all(secret not in json.dumps(spawned, default=str) for secret in SECRETS.values())
+        assert spawned["success"] is True and outcome_utils.read_execution(spawned) == "executed", spawned
+        assert outcome["fetched"]["status"] == "done" and outcome["fetched"]["result"] == ROOT_SPAWN_RESULT
+        assert spies.admits == {"admit": [OTHER_ID], "admit_scheduled": []} and spies.codes == []
+        (pin,) = spies.pins
+        assert pin.model.id == OTHER_ID and pin.connection.provider_id == "gem"
+        assert spies.resolved == ["gem"] and len(spies.creates) == 1
+        (post,) = [r for r in spies.provider_requests() if r.method == "POST"]
+        assert str(post.url) == f"https://{GEM_HOST}/v1beta/models/gem-1:generateContent"
+        assert post.headers["x-goog-api-key"] == SECRETS["KEY_GEM"]
+        assert outcome["drain_errors"] == [] and outcome["llm_closed"] == [True] and outcome["http_open"] == []
+        assert outcome["view_after"] == before and outcome["settings_after"] == spies.settings_before
         assert root.unexpected == [] and root.open_clients_at_exit == []
 
     def test_explicit_selector_under_active_main_runs_exact_pin_once(
@@ -1037,7 +1032,7 @@ class TestProductionRootSpawnAdmission:
             outcome["llm_closed"] = [client._closed for client in spies.new_llm_clients()]
             outcome["http_open"] = [c for c in spies.new_http_clients() if not c.is_closed]
             outcome["view_after"] = root.registry.view()
-            outcome["settings_after"] = root.paths.models_config_file.read_bytes()
+            outcome["settings_after"] = root.paths.models_cache_file.read_bytes()
 
         production_root.start(saved_default=MAIN_ID, hold=hold)
         root = production_root

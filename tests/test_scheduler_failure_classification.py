@@ -24,7 +24,9 @@ from agent_runtime import RuntimeProfile
 from scheduler import JobExecutionLog, _classify_job_failure
 from tests.root_startup_harness import (
     GEM_HOST,
-    GONE_ID,
+    INVALID_SAVED,
+    UNCONFIGURED_ID,
+    remembered_for,
     MAIN_ID,
     OTHER_ID,
     SCHEDULED_TAG,
@@ -904,7 +906,7 @@ _INACTIVE_MAIN_SELECTORS = [
 
 @pytest.mark.parametrize(("literal", "forwarded", "evidence"), _INACTIVE_MAIN_SELECTORS)
 @pytest.mark.parametrize(
-    "saved_default", [None, GONE_ID], ids=["no-saved-selection", "saved-model-missing"],
+    "saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no-saved-selection", "saved-model-missing"],
 )
 def test_root_scheduled_job_without_valid_main_fails_before_model_work(
     scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
@@ -917,7 +919,7 @@ def test_root_scheduled_job_without_valid_main_fails_before_model_work(
     probe = run_scheduled_root(scheduled_root, monkeypatch, literal, saved_default=saved_default)
 
     before = probe.view_before
-    assert before.active_model_id is None and before.remembered_model_id == saved_default
+    assert before.active_model_id is None and before.remembered_model_id == remembered_for(saved_default)
     assert OTHER_ID in {model.id for model in before.models}
     assert probe.admits == {"admit": [], "admit_scheduled": [forwarded]}
     assert probe.codes == ["no_active_selection"] and probe.resolved == []
@@ -931,7 +933,7 @@ def test_root_scheduled_job_without_valid_main_fails_before_model_work(
     ("selector", "missing_key", "provider", "warnings"),
     [
         pytest.param(OTHER_ID, "KEY_GEM", "gem", 0, id="known-selector"),
-        pytest.param("acme/claude-zzz", "KEY_ACME", "acme", 1, id="inherited-main"),
+        pytest.param("ghost/claude-zzz", "KEY_ACME", "acme", 1, id="inherited-main"),
     ],
 )
 def test_root_scheduled_credential_failure_stays_on_effective_model(
@@ -999,10 +1001,6 @@ _GEM_CHAT_PATH = "/v1beta/models/gem-1:generateContent"
     ("messages", "provider_context_error", "sent", "error_text"),
     [
         pytest.param(
-            [{"role": "user", "content": "describe", "images": ["fake-image"]}], False, 0,
-            "does not have verified vision support", id="capability-vision-unverified",
-        ),
-        pytest.param(
             [{"role": "user", "content": "word " * 60_000}], False, 0,
             "rejected by local budget", id="context-exceeds-local-budget",
         ),
@@ -1016,8 +1014,8 @@ def test_root_scheduled_pinned_capability_or_context_failure_has_no_fallback(
     scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
     messages: list[dict], provider_context_error: bool, sent: int, error_text: str,
 ) -> None:
-    """After the pin, unsupported capability or exceeded context fails that run
-    normally: no Main substitution, no second admission, no cross-model request."""
+    """After the pin, exceeded context fails that run normally: no Main
+    substitution, no second admission, no cross-model request."""
     scheduled_root.serve_provider_chat()
     if provider_context_error:
         served = scheduled_root._route

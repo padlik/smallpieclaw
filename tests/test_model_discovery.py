@@ -26,18 +26,13 @@ class Connection:
 
 def _discovery(
     handler,
-    public_handler=None,
-    public_headers=None,
     *,
     provider_headers=None,
     provider_cookies=None,
     provider_params=None,
     provider_auth=None,
-    public_cookies=None,
-    public_params=None,
-    public_auth=None,
 ):
-    """Build independent mocked provider/public clients and a deterministic clock."""
+    """Build a mocked provider client and a deterministic clock."""
     provider = httpx.Client(
         transport=httpx.MockTransport(handler),
         headers=provider_headers,
@@ -45,23 +40,8 @@ def _discovery(
         params=provider_params,
         auth=provider_auth,
     )
-    public = httpx.Client(
-        transport=httpx.MockTransport(public_handler or _empty_public),
-        headers=public_headers,
-        cookies=public_cookies,
-        params=public_params,
-        auth=public_auth,
-    )
     timestamp = datetime(2026, 10, 13, tzinfo=timezone.utc)
-    return ModelDiscovery(provider, public, lambda: timestamp)
-
-
-def _empty_public(request: httpx.Request) -> httpx.Response:
-    assert request.url == "https://models.dev/api.json"
-    assert "authorization" not in request.headers
-    assert "cookie" not in request.headers
-    assert request.content == b""
-    return httpx.Response(200, json={})
+    return ModelDiscovery(provider, lambda: timestamp)
 
 
 def _write_catalog(inventory, path) -> None:
@@ -69,7 +49,6 @@ def _write_catalog(inventory, path) -> None:
     document = CatalogDocument(
         providers=(ProviderState(inventory.provider_id, inventory.adapter, inventory.last_success_at, "fresh"),),
         models=inventory.models,
-        supplemental=inventory.supplemental,
     )
     settings = ModelSettings(path / "models.toml")
     settings.write(document)
@@ -213,57 +192,6 @@ def test_foreign_pagination_is_rejected_before_credentialed_request() -> None:
     assert [request.url.host for request in captured] == ["openrouter.ai"]
 
 
-def test_models_dev_exact_match_fills_unknown_fields_only_and_is_credential_free(tmp_path) -> None:
-    captured = []
-
-    def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": [
-            {"id": "known", "architecture": {"input_modalities": ["text"]}}, {"id": "absent"}
-        ]})
-
-    def public(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        assert request.url == "https://models.dev/api.json"
-        assert request.url.query == b""
-        assert request.content == b""
-        assert dict(request.headers) == {"accept": "application/json", "host": "models.dev"}
-        return httpx.Response(200, json={"openrouter": {"models": {
-            "known": {"id": "known", "limit": {"context": 100, "output": 10},
-                      "modalities": {"input": ["text", "image"]}, "tool_call": False, "reasoning": True},
-            "absent": {"id": "other", "limit": {"context": 1}},
-            "fuzzy-alias": {"id": "known", "limit": {"context": 2}},
-        }}})
-
-    inventory = _discovery(handler, public, public_headers={"Authorization": "private-secret",
-                                                            "x-api-key": "private-secret",
-                                                            "X-Account-Id": "fake-private-account",
-                                                            "X-Private": "fake-private-header"},
-                         public_cookies={"session": "fake-private-cookie"},
-                         public_params={"account": "fake-private-account", "api_key": "fake-param-key"},
-                         public_auth=("fake-user", "fake-password")).fetch(Connection(adapter="openrouter"))
-    assert len(captured) == 1
-    assert len(inventory.supplemental) == 1
-    metadata = inventory.models[0].metadata
-    assert metadata.context_tokens == 100
-    assert metadata.output_tokens == 10
-    assert metadata.vision is False  # provider value overrides public true
-    assert metadata.tool_calling is False
-    assert metadata.reasoning is True
-    assert dict(metadata.sources) == {
-        "context_tokens": "models.dev", "output_tokens": "models.dev", "vision": "provider",
-        "tool_calling": "models.dev", "reasoning": "models.dev",
-    }
-    assert [model.upstream_id for model in inventory.models] == ["known", "absent"]
-    _write_catalog(inventory, tmp_path)
-
-
-def test_supplement_failure_does_not_invalidate_provider_inventory() -> None:
-    inventory = _discovery(lambda _: httpx.Response(200, json={"data": [{"id": "ok"}]}),
-                           lambda _: httpx.Response(403)).fetch(Connection())
-    assert [model.upstream_id for model in inventory.models] == ["ok"]
-    assert inventory.supplemental == ()
-
-
 @pytest.mark.parametrize(
     ("methods", "expected"),
     [
@@ -319,7 +247,7 @@ def test_google_descriptor_collections_are_immutable_and_inventory_copies_inputs
     descriptor = GoogleModelDescriptor("account/upstream", "models/resource", methods)
     methods.append("mutated")
     descriptors = [descriptor]
-    inventory = ProviderInventory("account", "google", (), (), "stamp", descriptors)
+    inventory = ProviderInventory("account", "google", (), "stamp", descriptors)
     descriptors.clear()
     assert descriptor.generation_methods == ("generateContent",)
     assert inventory.descriptors == (descriptor,)
@@ -520,12 +448,12 @@ def test_second_page_failure_keeps_last_good_inventory_stale_without_partial_mer
 
     cached = ModelRecord(
         "account/cached", "account", "cached", "Cached",
-        ModelMetadata(100, None, None, None, None, None, (("context_tokens", "provider"),)),
+        ModelMetadata(100, None, None, None, None, None),
     )
     settings = ModelSettings(tmp_path / "models-config.toml")
     settings.write(CatalogDocument(
         1, 2, None, (ProviderState("account", adapter, "2026-09-01T00:00:00Z", "fresh"),),
-        (cached,), (),
+        (cached,),
     ))
     pages: list[httpx.Request] = []
 
@@ -562,19 +490,55 @@ def test_cloud_ollama_empty_api_key_requires_authentication_before_any_request()
     from config_schema import ResolvedProviderConnection
 
     provider_requests: list[httpx.Request] = []
-    public_requests: list[httpx.Request] = []
 
     def provider(request: httpx.Request) -> httpx.Response:
         provider_requests.append(request)
         return httpx.Response(200, json={"models": [{"name": "m"}]})
 
-    def public(request: httpx.Request) -> httpx.Response:
-        public_requests.append(request)
-        return httpx.Response(200, json={})
-
     connection = ResolvedProviderConnection("cloud", "ollama", "https://ollama.com", 3.0, "")
     with pytest.raises(ModelDiscoveryError) as error:
-        _discovery(provider, public).fetch(connection)
+        _discovery(provider).fetch(connection)
     assert error.value.code == "authentication_required"
     assert provider_requests == []
-    assert public_requests == []
+
+
+@pytest.mark.parametrize("adapter", ["openai", "anthropic", "google", "openrouter", "ollama"])
+def test_no_supplement_network_call_occurs(adapter: str) -> None:
+    """Discovery contacts only the owning provider endpoint: no public supplement service.
+
+    The transport is the real ``httpx.MockTransport`` boundary shared by the one
+    discovery client; every request URL is checked against an allowlist and any
+    other destination (``models.dev`` included) is a recorded canary failure.
+    """
+    allowed = {
+        "openai": "https://api.openai.com/v1/models",
+        "anthropic": "https://api.anthropic.com/v1/models",
+        "google": "https://generativelanguage.googleapis.com/v1beta/models",
+        "openrouter": "https://openrouter.ai/api/v1/models",
+        "ollama": "https://ollama.com/api/tags",
+    }[adapter]
+    payloads = {
+        "openai": {"data": [{"id": "m"}]},
+        "anthropic": {"data": [{"id": "m"}], "has_more": False},
+        "google": {"models": [{"name": "models/m", "baseModelId": "m"}]},
+        "openrouter": {"data": [{"id": "m"}]},
+        "ollama": {"models": [{"name": "m"}]},
+    }
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if str(request.url) != allowed:
+            return httpx.Response(200, json={"canary": "unexpected destination"})
+        return httpx.Response(200, json=payloads[adapter])
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    timestamp = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    discovery = ModelDiscovery(client, clock=lambda: timestamp)
+
+    inventory = discovery.fetch(Connection(adapter=adapter))
+
+    assert seen == [allowed]
+    assert [model.upstream_id for model in inventory.models] == ["m"]
+    assert not hasattr(inventory, "supplemental")
+    assert "models.dev" not in repr(inventory)

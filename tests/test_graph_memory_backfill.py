@@ -2452,13 +2452,8 @@ _BF_REAL_HTTPX_CLIENT = httpx.Client
 
 
 def _bf_meta(context: int | None = None, output: int | None = None) -> ModelMetadata:
-    """Return valid provider-sourced metadata for the populated token limits."""
-    sources = tuple(
-        (name, "provider")
-        for name, value in (("context_tokens", context), ("output_tokens", output))
-        if value is not None
-    )
-    return ModelMetadata(context_tokens=context, output_tokens=output, sources=sources)
+    """Return provider-reported metadata for the populated token limits."""
+    return ModelMetadata(context_tokens=context, output_tokens=output)
 
 
 def _bf_document(remembered: str | None, freshness: str, metadata: ModelMetadata) -> CatalogDocument:
@@ -2475,7 +2470,6 @@ def _bf_document(remembered: str | None, freshness: str, metadata: ModelMetadata
             ModelRecord(_BF_GRAPH_ID, "g", "org/graph-model", "Graph Model", metadata),
             ModelRecord("p/main", "p", "main", "Main", _bf_meta(8192, 1024)),
         ),
-        (),
     )
 
 

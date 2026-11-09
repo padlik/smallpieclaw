@@ -60,8 +60,6 @@ def _record(provider: str, upstream: str, context: int) -> ModelRecord:
         f"{provider}/{upstream}", provider, upstream, f"{upstream} display",
         ModelMetadata(
             context, None, 2048, False, True, None,
-            (("context_tokens", "provider"), ("vision", "provider"),
-             ("output_tokens", "provider"), ("tool_calling", "provider")),
         ),
     )
 
@@ -249,7 +247,7 @@ class _World:
             CatalogDocument(
                 1, 2, None,
                 tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
-                (MODEL_A, MODEL_B), (),
+                (MODEL_A, MODEL_B),
             )
         )
         self.registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
@@ -572,7 +570,9 @@ def test_close_failure_of_owned_client_still_releases_lease_and_event(make_world
 def test_factory_admission_failure_preserves_protected_state(make_world, loop, injected) -> None:
     w = make_world()
     expected = ModelRegistryError("model_not_found") if injected else None
-    factory = _Factory(w, model_id="pa/not-in-catalog", fail=expected)
+    # Real registry: a selector without a connection part is malformed (an uncached
+    # well-formed one would be sent, task 4.1); the injected error keeps its own code.
+    factory = _Factory(w, model_id="pa/not-in-catalog" if injected else "no-connection-part", fail=expected)
     w.controller_with(llm=None, run_client_factory=factory)
     w.prime_grants()
     path = w.save_checkpoint(TRACE, MODEL_A.id)
@@ -581,7 +581,8 @@ def test_factory_admission_failure_preserves_protected_state(make_world, loop, i
     assert before["ckpt"][path.name] == saved
     result, exc = _run(w, resume_from=TRACE, trace_id=None)
     assert result is None
-    assert isinstance(exc, ModelRegistryError) and exc.code == "model_not_found"
+    assert isinstance(exc, ModelRegistryError)
+    assert exc.code == ("model_not_found" if injected else "malformed_selector")
     if injected:
         assert exc is expected
     assert len(factory.events) == 1 and loop.calls == []

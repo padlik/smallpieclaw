@@ -432,26 +432,53 @@ class TestTurnOwnershipObligations:
     def test_timeout_cancellation_accounts_while_cleanup_is_pending(
         self, make_builtin_executor, tmp_path
     ):
-        runner = FakeRunner(agent_id="sa-timeout-draining", block=True)
-        exc = make_builtin_executor(
-            sub_agent_factory=_seq_factory([runner]),
-            data_dir=str(tmp_path),
-        )
-        result = exc._exec_spawn_agent(
-            {"task": "long child work"},
-            trace_id="r-owner",
-        )
+        class GatedRunner(FakeRunner):
+            """Observes cancellation, then stays inside run() until released.
 
-        outcome = exc._exec_get_agent_result(
-            {"agent_id": result["agent_id"], "timeout": 0},
-            caller_tag="main r-owner",
-        )
+            This makes the advertised 'cleanup pending' state a real precondition
+            instead of a race against the worker returning and finishing cleanup.
+            """
 
-        assert outcome["status"] == "timeout"
-        assert exc._supervisor.unaccounted_children("r-owner") == []
-        assert exc._supervisor.draining_children("r-owner") == [
-            (runner.agent_id, "running")
-        ]
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.entered = threading.Event()
+                self.cancel_seen = threading.Event()
+                self.release = threading.Event()
+
+            def run(self, task):
+                self.entered.set()
+                self._cancel_event.wait(timeout=5.0)
+                self.saw_cancel = self._cancel_event.is_set()
+                self.cancel_seen.set()
+                self.release.wait(timeout=5.0)  # after cancellation, before run() returns
+                return "[Cancelled]"
+
+        runner = GatedRunner(agent_id="sa-timeout-draining", block=True)
+        try:
+            exc = make_builtin_executor(
+                sub_agent_factory=_seq_factory([runner]),
+                data_dir=str(tmp_path),
+            )
+            result = exc._exec_spawn_agent(
+                {"task": "long child work"},
+                trace_id="r-owner",
+            )
+            assert runner.entered.wait(timeout=5.0)
+
+            outcome = exc._exec_get_agent_result(
+                {"agent_id": result["agent_id"], "timeout": 0},
+                caller_tag="main r-owner",
+            )
+
+            assert outcome["status"] == "timeout"
+            assert runner.cancel_seen.wait(timeout=5.0)
+            # The worker is held inside run(): cleanup is genuinely pending here.
+            assert exc._supervisor.unaccounted_children("r-owner") == []
+            assert exc._supervisor.draining_children("r-owner") == [
+                (runner.agent_id, "running")
+            ]
+        finally:
+            runner.release.set()
         assert runner._done_event.wait(timeout=5.0)
 
     def test_operator_cancellation_accounts_child_before_cleanup(
@@ -1316,3 +1343,21 @@ class TestSubmitRejectionCompatibility:
         assert read_execution(res) == "refused"
         # finish_cb must NOT fire on synchronous admission failure.
         assert finish_calls == []
+
+    @pytest.mark.parametrize("code", ["malformed_selector", "unknown_connection"])
+    def test_selector_shape_errors_give_actionable_connection_guidance(
+        self, make_builtin_executor, tmp_path, code: str,
+    ) -> None:
+        """Task 4.1: a bad selector shape/connection says how to write one, with no selector echo."""
+        from model_registry import ModelRegistryError
+
+        def factory(**_kwargs: object) -> None:
+            raise ModelRegistryError(code)
+
+        exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
+
+        res = exc._exec_spawn_agent({"task": "x", "model": " secret-conn/m"}, caller_depth=0)
+
+        assert res["success"] is False and res["error_type"] == "wrong_model_for_task"
+        assert "<connection>/<model>" in res["suggestion"] and "configured" in res["suggestion"]
+        assert "secret-conn" not in res["error"] and res["recoverable"] is False

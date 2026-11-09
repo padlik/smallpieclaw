@@ -903,7 +903,7 @@ def _plan_apply(paths: XDGPaths, preview: MigrationPreview, config_original: byt
         if before is not None:
             raise MigrationApplyError(f"managed settings {settings_path} changed while being read; rerun")
         if seed is not None:
-            document = CatalogDocument(1, 1, seed, (), (), ())
+            document = CatalogDocument(1, 1, seed, (), ())
     else:
         if before is None or loaded.document is None:
             raise MigrationApplyError(f"managed settings {settings_path} changed while being read; rerun")
@@ -1131,8 +1131,9 @@ def _report_applied(paths: XDGPaths, preview: MigrationPreview, plan: _ApplyPlan
     if plan.settings_document is None:
         lines.append(f"Managed settings {paths.models_config_file} unchanged.")
     else:
-        lines.append(f"Managed settings {paths.models_config_file}: remembered selection seeded "
-                     f"to {plan.seeded}.")
+        lines.append(f"Managed settings {paths.models_config_file}: legacy default_model field set "
+                     f"to {plan.seeded}. This does NOT set the runtime model selection; choose a model "
+                     "explicitly with /models after starting the agent.")
     if plan.settings_original is not None:
         lines.append(f"Managed settings backup: {_backup_path(paths.models_config_file)}.")
     lines.append("Discarded values (not promoted):")

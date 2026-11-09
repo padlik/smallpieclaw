@@ -17,7 +17,9 @@ import logging
 import copy
 import math
 from urllib.parse import urlsplit, urlunsplit
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal, cast
 
 try:
@@ -299,6 +301,20 @@ def _parse_float(value: Any, default: float, field_path: str) -> float:
         ) from None
 
 
+def _parse_positive_int(value: Any, default: int, field_path: str) -> int:
+    """Return *value* as a strictly positive ``int``; reject bool, float and string.
+
+    Absent (``None``) yields *default*. The error names the key and the accepted shape.
+    """
+    if value is None:
+        return default
+    if type(value) is not int or value <= 0:
+        raise ConfigError(
+            f"Config field '{field_path}' must be a positive integer (for example 1024), got {value!r}"
+        )
+    return value
+
+
 def _parse_int_list(value: Any, field_path: str) -> list[int]:
     """Return *value* as a list of ints, rejecting env-resolved string items."""
     if value is None:
@@ -385,6 +401,9 @@ class AgentConfig:
     max_output_size: int = 4000  # chars: stdout/stderr per-stream limit for shell/tools
     top_tools: int = 3
     ctx_max_tokens: int = 90_000
+    # Output-token parameter sent only to adapters whose API requires one (Anthropic);
+    # never sized from context, discovered limits or the input estimate.
+    required_output_cap_tokens: int = 1024
     max_retries: int = 4
     retry_delay: float = 2.0
     max_subagents: int = 6
@@ -617,13 +636,19 @@ class AppConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     graph_memory: GraphMemoryConfig = field(default_factory=GraphMemoryConfig)
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
-    providers: dict[str, ProviderConfig] = field(default_factory=dict)
+    # Chat provider connections, fixed for the process lifetime (ADR-0040):
+    # a read-only copy taken at construction; edits take effect after restart.
+    providers: Mapping[str, ProviderConfig] = field(default_factory=dict)
     llm_error_handling: LLMErrorHandlingConfig = field(default_factory=LLMErrorHandlingConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
 
     # Keep reference to raw dict for incremental migration — consumers that
     # haven't been updated yet can use this temporarily.
     _raw: dict = field(default_factory=dict, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Freeze the chat connection map into a read-only private copy."""
+        object.__setattr__(self, "providers", MappingProxyType(dict(self.providers)))
 
 
 def _parse_vault(raw: dict) -> VaultConfig:
@@ -776,6 +801,9 @@ def _parse_agent(raw: dict) -> AgentConfig:
         max_output_size=_parse_int(section.get("max_output_size"), 4000, "agent.max_output_size"),
         top_tools=_parse_int(section.get("top_tools"), 3, "agent.top_tools"),
         ctx_max_tokens=_parse_int(section.get("ctx_max_tokens"), 90_000, "agent.ctx_max_tokens"),
+        required_output_cap_tokens=_parse_positive_int(
+            section.get("required_output_cap_tokens"), 1024, "agent.required_output_cap_tokens"
+        ),
         max_retries=max_retries,
         retry_delay=retry_delay_value,
         max_subagents=_parse_int(section.get("max_subagents"), 6, "agent.max_subagents"),

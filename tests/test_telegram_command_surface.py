@@ -1511,7 +1511,6 @@ def _selection_registry(tmp_path: Path, state: str):
         1, 1, default,
         (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
         (alpha, gone),
-        (),
     )
     registry, _settings, discovery = _make_registry(tmp_path, (provider,), seed_document=seed)
     discovery.responses["p"] = _inventory("p", (alpha,))  # the refresh drops p/gone

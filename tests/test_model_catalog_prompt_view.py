@@ -8,8 +8,8 @@ of the built-in ``spawn_agent`` and ``schedule`` tools.
 Renderer output contract exercised here: every model entry is a single line
 containing its canonical id; integers render with optional thousands
 separators; provider and model state use the words ``fresh``/``stale``,
-``pinned``, ``active``, ``supported``/``unsupported``/``unknown`` and the source
-names ``provider``/``models.dev``; hidden inventory is reported on a line that
+``pinned``, ``active`` and ``supported``/``unsupported``/``unknown`` (no
+per-field source labels: provider-reported values are advisory display data); hidden inventory is reported on a line that
 contains the word ``omitted`` and the omitted count.
 
 Only the external boundaries are faked: provider discovery and credential
@@ -110,25 +110,14 @@ def _model(
     vision: bool | None = None,
     tools: bool | None = None,
     reasoning: bool | None = None,
-    sources: dict[str, str] | None = None,
     display: str | None = None,
 ) -> ModelRecord:
-    values = {
-        "context_tokens": context,
-        "input_tokens": input_tokens,
-        "output_tokens": output,
-        "vision": vision,
-        "tool_calling": tools,
-        "reasoning": reasoning,
-    }
-    chosen = sources or {}
-    provenance = tuple((name, chosen.get(name, "provider")) for name, value in values.items() if value is not None)
-    metadata = ModelMetadata(context, input_tokens, output, vision, tools, reasoning, provenance)
+    metadata = ModelMetadata(context, input_tokens, output, vision, tools, reasoning)
     return ModelRecord(f"{provider}/{upstream}", provider, upstream, display or upstream, metadata)
 
 
 def _inventory(provider: str, adapter: str, models: tuple[ModelRecord, ...]) -> ProviderInventory:
-    return ProviderInventory(provider, adapter, tuple(models), (), "2026-10-01T12:00:00Z")
+    return ProviderInventory(provider, adapter, tuple(models), "2026-10-01T12:00:00Z")
 
 
 @dataclass(frozen=True)
@@ -160,7 +149,7 @@ def _build_world(
     )
     seeded = tuple(sorted((removed, *alpha_models, *bravo_models), key=lambda item: item.id))
     settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(1, 2, None, states, seeded, ()))
+    settings.write(CatalogDocument(1, 2, None, states, seeded))
     discovery = _Discovery()
     registry = ModelRegistry(connections, settings, discovery, _resolve)
 
@@ -210,7 +199,6 @@ _RICH = _model(
     output=7777,
     vision=True,
     tools=False,
-    sources={"context_tokens": "models.dev"},
     display="Rich Model",
 )
 _BLANK = _model("blank")
@@ -386,15 +374,12 @@ def test_unreported_fields_render_unknown_and_never_unsupported(meta_world: _Wor
     assert not re.search(r"(?<!un)supported", text)
 
 
-def test_field_sources_follow_each_models_actual_provenance(meta_world: _World) -> None:
+def test_rendered_metadata_carries_no_provenance_labels(meta_world: _World) -> None:
+    """Provider-reported values are display facts: no per-field source label is rendered."""
     section = _render(meta_world.view)
-    rich = _joined(section, _RICH.id).lower()
-    blank = _joined(section, _BLANK.id).lower()
-    legacy = _joined(section, _LEGACY.id).lower()
-
-    assert "models.dev" in rich and "provider" in rich
-    assert "models.dev" not in blank
-    assert "provider" in legacy and "models.dev" not in legacy
+    for model_id in (_RICH.id, _BLANK.id, _LEGACY.id):
+        facts = _joined(section, model_id).lower()
+        assert "models.dev" not in facts and "[provider]" not in facts
 
 
 def test_provider_freshness_lists_stale_and_fresh_providers(meta_world: _World) -> None:
@@ -933,9 +918,9 @@ def test_tool_summary_projects_current_facts_of_available_models(
     description = _tool_description(surface, name, view)
 
     rich = _model_facts(description, _RICH.id, view)
-    assert re.search(r"123[,_]?456", rich) and "models.dev" in rich
+    assert re.search(r"123[,_]?456", rich) and "models.dev" not in rich
     assert re.search(r"7[,_]?777", rich)
-    assert "unsupported" in rich and re.search(r"(?<!un)supported", rich) and "provider" in rich
+    assert "unsupported" in rich and re.search(r"(?<!un)supported", rich)
     assert "unknown" in rich
     legacy = _model_facts(description, _LEGACY.id, view)
     assert re.search(r"32[,_]?768", legacy) and "stale" in legacy
@@ -955,8 +940,8 @@ def test_tool_summary_projects_current_facts_of_the_active_model(
     description = _tool_description(surface, "spawn_agent", view)
 
     active = _model_facts(description, _RICH.id, view)
-    assert re.search(r"123[,_]?456", active) and "models.dev" in active
-    assert "unsupported" in active and "provider" in active
+    assert re.search(r"123[,_]?456", active) and "models.dev" not in active
+    assert "unsupported" in active
     assert "unknown" in active
 
 
@@ -976,14 +961,12 @@ class _ChangedPinWorld:
 def changed_pin_world(tmp_path: Path) -> _ChangedPinWorld:
     """Pin A through real admission; a later refresh re-lists A with different metadata."""
     historical = _model("pin-a", context=4096)
-    current = _model(
-        "pin-a", context=16384, vision=False, sources={"context_tokens": "models.dev"}
-    )
+    current = _model("pin-a", context=16384, vision=False)
     other = _model("zeta-b", context=2000)
     connections = {"alpha": ProviderConfig("alpha", "openai", ALPHA_REF, ALPHA_URL)}
     states = (ProviderState("alpha", "openai", "2026-09-01T00:00:00Z", "fresh"),)
     settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(1, 2, None, states, (historical, other), ()))
+    settings.write(CatalogDocument(1, 2, None, states, (historical, other)))
     discovery = _Discovery()
     registry = ModelRegistry(connections, settings, discovery, _resolve)
     registry.select(historical.id)
@@ -1017,7 +1000,7 @@ def test_pin_still_in_inventory_keeps_admission_label_apart_from_current_metadat
     assert not any(re.search(r"16[,_]?384", line) for line in admission)
     current = [line for line in mentions if re.search(r"16[,_]?384", line)]
     for line in current:
-        assert "models.dev" in line and "unsupported" in line.lower()
+        assert "models.dev" not in line and "unsupported" in line.lower()
         assert not re.search(r"4[,_]?096", line)
     if cap == 0:
         assert current or 1 in _omitted_numbers(section)

@@ -9,18 +9,12 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
-from model_registry import (
-    MetadataField,
-    ModelMetadata,
-    ModelRecord,
-    SupplementRecord,
-)
+from model_registry import ModelMetadata, ModelRecord
 from model_settings import ModelSettingsError, _identity, _provider_id, _safe_string
 
 if TYPE_CHECKING:
     from config_schema import ResolvedProviderConnection
 
-_MODELS_DEV_URL = "https://models.dev/api.json"
 _OLLAMA_ORIGIN = "https://ollama.com"
 
 
@@ -49,26 +43,24 @@ class GoogleModelDescriptor:
 
 @dataclass(frozen=True)
 class ProviderInventory:
-    """A fully fetched immutable inventory, supplement, and adapter descriptors."""
+    """A fully fetched immutable inventory and adapter descriptors."""
 
     provider_id: str
     adapter: str
     models: tuple[ModelRecord, ...]
-    supplemental: tuple[SupplementRecord, ...]
     last_success_at: str
     descriptors: tuple[GoogleModelDescriptor, ...] = ()
 
     def __post_init__(self) -> None:
         """Copy inventory collections to prevent retaining mutable caller aliases."""
         object.__setattr__(self, "models", tuple(self.models))
-        object.__setattr__(self, "supplemental", tuple(self.supplemental))
         object.__setattr__(self, "descriptors", tuple(self.descriptors))
 
     def __repr__(self) -> str:
         """Return inventory identity without any connection or credential fields."""
         return (
             f"ProviderInventory(provider_id={self.provider_id!r}, adapter={self.adapter!r}, "
-            f"models={self.models!r}, supplemental={self.supplemental!r}, "
+            f"models={self.models!r}, "
             f"last_success_at={self.last_success_at!r}, descriptors={self.descriptors!r})"
         )
 
@@ -79,12 +71,10 @@ class ModelDiscovery:
     def __init__(
         self,
         client: httpx.Client,
-        public_client: httpx.Client,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        """Inject separate authenticated and credential-free HTTP clients and a clock."""
+        """Inject the provider HTTP client and a clock; only provider endpoints are contacted."""
         self._client = client
-        self._public_client = public_client
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def fetch(self, connection: ResolvedProviderConnection) -> ProviderInventory:
@@ -123,14 +113,7 @@ class ModelDiscovery:
         if len({model.id for model in models}) != len(models):
             raise ModelDiscoveryError("duplicate_model")
         fetched_at = _timestamp(self._clock)
-        supplements: tuple[SupplementRecord, ...] = ()
-        try:
-            supplements = self._supplement(adapter, models, fetched_at)
-            models = _apply_supplement(models, supplements)
-        except Exception:
-            # The public catalog is advisory; a complete provider result remains usable.
-            supplements = ()
-        return ProviderInventory(provider_id, adapter, models, supplements, fetched_at, descriptors)
+        return ProviderInventory(provider_id, adapter, models, fetched_at, descriptors)
 
     def _fetch_pages(
         self, adapter: str, endpoint: str, headers: dict[str, str], timeout: float | None
@@ -213,39 +196,6 @@ class ModelDiscovery:
                 break
         return rows
 
-    def _supplement(
-        self, adapter: str, models: tuple[ModelRecord, ...], fetched_at: str
-    ) -> tuple[SupplementRecord, ...]:
-        request = httpx.Request(
-            "GET",
-            _MODELS_DEV_URL,
-            headers={"Accept": "application/json"},
-            extensions={"timeout": _timeout_extensions(10.0)},
-        )
-        response = self._public_client.send(request, follow_redirects=False, auth=None)
-        response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, dict):
-            raise ModelDiscoveryError("invalid_supplement")
-        provider = data.get(adapter)
-        if not isinstance(provider, dict) or not isinstance(provider.get("models"), dict):
-            return ()
-        raw_models = provider["models"]
-        found: list[SupplementRecord] = []
-        for model in models:
-            raw = raw_models.get(model.upstream_id)
-            if not isinstance(raw, dict) or raw.get("id") != model.upstream_id:
-                continue
-            metadata = _supplement_metadata(raw)
-            if any(getattr(metadata, name) is not None for name in _METADATA_FIELDS):
-                found.append(SupplementRecord(adapter, model.upstream_id, fetched_at, metadata))
-        return tuple(found)
-
-
-_METADATA_FIELDS: tuple[MetadataField, ...] = (
-    "context_tokens", "input_tokens", "output_tokens", "vision", "tool_calling", "reasoning"
-)
-
 
 def _normalize_model(provider_id: str, adapter: str, row: dict[str, Any]) -> ModelRecord:
     upstream_id = row.get("id")
@@ -292,7 +242,7 @@ def _normalize_model(provider_id: str, adapter: str, row: dict[str, Any]) -> Mod
         if not isinstance(top_provider, dict):
             raise ModelDiscoveryError("invalid_response")
         _positive_optional(top_provider, "max_completion_tokens", values, "output_tokens")
-    metadata = ModelMetadata(**values, sources=tuple((name, "provider") for name in values))
+    metadata = ModelMetadata(**values)
     if "display_name" in row:
         raw_display = row["display_name"]
     elif "name" in row:
@@ -320,47 +270,6 @@ def _google_descriptor(provider_id: str, row: dict[str, Any]) -> GoogleModelDesc
             raise ModelDiscoveryError("invalid_response")
         methods = tuple(_safe_response_string(method, "generation_method") for method in raw_methods)
     return GoogleModelDescriptor(f"{provider_id}/{upstream_id}", resource_name, methods)
-
-
-def _supplement_metadata(row: dict[str, Any]) -> ModelMetadata:
-    values: dict[str, Any] = {}
-    limit = row.get("limit", {})
-    if isinstance(limit, dict):
-        for key, field in (("context", "context_tokens"), ("input", "input_tokens"), ("output", "output_tokens")):
-            value = limit.get(key)
-            if _positive(value):
-                values[field] = value
-    modalities = row.get("modalities", {})
-    if isinstance(modalities, dict):
-        inputs = modalities.get("input")
-        if isinstance(inputs, list) and all(isinstance(item, str) for item in inputs):
-            values["vision"] = "image" in inputs
-    for key in ("tool_call", "reasoning"):
-        if type(row.get(key)) is bool:
-            values["tool_calling" if key == "tool_call" else key] = row[key]
-    return ModelMetadata(**values, sources=tuple(sorted((name, "models.dev") for name in values)))
-
-
-def _apply_supplement(
-    models: tuple[ModelRecord, ...], supplements: tuple[SupplementRecord, ...]
-) -> tuple[ModelRecord, ...]:
-    by_id = {item.upstream_id: item.metadata for item in supplements}
-    merged: list[ModelRecord] = []
-    for model in models:
-        extra = by_id.get(model.upstream_id)
-        if extra is None:
-            merged.append(model)
-            continue
-        values = {name: getattr(model.metadata, name) for name in _METADATA_FIELDS}
-        sources = dict(model.metadata.sources)
-        supplemental_sources = dict(extra.sources)
-        for name in _METADATA_FIELDS:
-            if values[name] is None and getattr(extra, name) is not None:
-                values[name] = getattr(extra, name)
-                sources[name] = supplemental_sources[name]
-        metadata = ModelMetadata(**values, sources=tuple(sorted(sources.items())))
-        merged.append(ModelRecord(model.id, model.provider_id, model.upstream_id, model.display_name, metadata))
-    return tuple(merged)
 
 
 def _positive_optional(row: dict[str, Any], key: str, values: dict[str, Any], target: str) -> None:

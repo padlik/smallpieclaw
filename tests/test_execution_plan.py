@@ -41,7 +41,9 @@ from sub_agent_registry import SOURCE_PLAN_STEP, get_registry
 from tests.root_startup_harness import (
     ACME_HOST,
     GEM_HOST,
-    GONE_ID,
+    INVALID_SAVED,
+    UNCONFIGURED_ID,
+    remembered_for,
     MAIN_ID,
     OTHER_ID,
     SECRETS,
@@ -1073,7 +1075,7 @@ class _RootAttemptSpies:
         """Snapshot root state, then wrap the root's real collaborators."""
         self._root = root
         self.view_before = root.registry.view()
-        self.settings_before = root.paths.models_config_file.read_bytes()
+        self.settings_before = root.paths.models_cache_file.read_bytes()
         self._requests = len(root.requests)
         self._llm_clients = len(root.llm_clients)
         self._http_clients = len(root.http_clients)
@@ -1193,10 +1195,10 @@ class TestProductionRootPlanAdmission:
         outcome["llm_closed"] = [client._closed for client in spies.new_llm_clients()]
         outcome["http_open"] = [c for c in spies.new_http_clients() if not c.is_closed]
         outcome["view_after"] = root.registry.view()
-        outcome["settings_after"] = root.paths.models_config_file.read_bytes()
+        outcome["settings_after"] = root.paths.models_cache_file.read_bytes()
 
     @pytest.mark.parametrize(
-        "saved_default", [None, GONE_ID], ids=["no-saved-selection", "saved-model-missing"],
+        "saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no-saved-selection", "saved-model-missing"],
     )
     def test_plan_step_fails_normally_without_active_main(
         self, production_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
@@ -1217,7 +1219,7 @@ class TestProductionRootPlanAdmission:
         assert outcome["binding"] == (True, True, True)
         assert outcome["late_bound"] == (True, True)
         before = spies.view_before
-        assert before.active_model_id is None and before.remembered_model_id == saved_default
+        assert before.active_model_id is None and before.remembered_model_id == remembered_for(saved_default)
         assert OTHER_ID in {m.id for m in before.models}
         # Normal failed step and error list; no diagnostic retry.
         error = "Failed to create sub-agent: model registry no active selection"
@@ -1253,10 +1255,13 @@ class TestProductionRootPlanAdmission:
         monkeypatch.setattr(agent_controller, "react_loop", boundary)
         outcome: dict[str, Any] = {}
 
-        production_root.start(
-            saved_default=MAIN_ID,
-            hold=lambda root: self._execute_root_plan(root, monkeypatch, outcome),
-        )
+        def hold(root: RootHarness) -> None:
+            """Deliberate /models-style refresh first: startup no longer rediscovers a cached catalog,
+            and Anthropic budgeting needs the provider-reported max_tokens. Spies start after it."""
+            root.registry.refresh()
+            self._execute_root_plan(root, monkeypatch, outcome)
+
+        production_root.start(saved_default=MAIN_ID, hold=hold)
         root = production_root
         spies: _RootAttemptSpies = outcome["spies"]
 

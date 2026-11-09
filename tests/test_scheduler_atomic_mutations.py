@@ -59,7 +59,10 @@ import schedule
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import scheduler as scheduler_module
+from builtin_tools.schedule import exec_schedule
+from outcome_utils import read_execution
 from scheduler import Scheduler
+from tests import scheduler_legacy_fixtures as legacy_fx
 from xdg import XDGPaths
 
 
@@ -75,6 +78,8 @@ def _paths_for(state_dir: Path) -> XDGPaths:
         config_home=state_dir, data_home=state_dir, state_home=state_dir,
         cache_home=state_dir, runtime_dir=state_dir,
         config_file=state_dir / "config.toml",
+        model_selection_file=state_dir / "model-selection.toml",
+        models_cache_file=state_dir / "models-cache.json",
         models_config_file=state_dir / "models.toml",
         scheduler_config=state_dir / "scheduler.toml",
         memory_file=state_dir / "memory.json",
@@ -1154,3 +1159,90 @@ def test_mutation_on_dormant_keeps_unrelated_registration_identity(
     after = schedule.get_jobs("fresh")
     assert len(after) == 1 and after[0] is before[0]
     assert sched.show_job("dormant")["next_run"] is not None
+
+
+# ---------------------------------------------------------------------------
+# TOML mutations beside a legacy job file
+#
+# Relocated by task 2.4 from tests/test_scheduler_legacy_readonly.py (ledger
+# provenance in openspec/changes/simplify-model-runtime/test-preservation-ledger).
+# Deferred rewrite (task 8.4, ledger 451-455/458): keep the atomic TOML change
+# and legacy byte preservation; the legacy shadow preflight goes away.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_legacy_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[legacy_fx.MakeLegacyScheduler]:
+    """Real legacy-beside-TOML schedulers (shared factory, see the support module)."""
+    yield from legacy_fx.legacy_scheduler_factory(tmp_path, monkeypatch)
+
+
+# name -> (legacy at construction, legacy written after construction)
+_REMOVAL_ALLOWED = {
+    "legacy_missing": (None, None),
+    "unrelated_legacy_job": (legacy_fx.UNRELATED_LEGACY, None),
+}
+
+
+class TestTomlRemovalShadowPreflight:
+    """The removal preflight reads the legacy file on disk, never the cached map."""
+
+    @pytest.mark.parametrize("case", sorted(_REMOVAL_ALLOWED))
+    def test_removal_proceeds_without_current_shadow(
+        self, make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, case: str,
+    ) -> None:
+        """A missing legacy file or an unrelated legacy job allows a normal removal."""
+        initial, late = _REMOVAL_ALLOWED[case]
+        env = make_legacy_scheduler(legacy_fx.TOML, legacy=initial)
+        legacy_fx.write_legacy(env.legacy_path, late)
+        legacy_before = legacy_fx.file_state(env.legacy_path)
+
+        out = exec_schedule(env.sched, {"action": "remove", "tag": "alpha"})
+
+        assert out["success"] is True, out
+        assert read_execution(out) == "executed"
+        assert "alpha" not in legacy_fx.parse_toml(env.toml_path)["jobs"]
+        assert "alpha" not in legacy_fx.tags(env.sched)
+        assert legacy_fx.file_state(env.legacy_path) == legacy_before
+
+
+_SHADOW_CHANGES = {
+    "modify": ({"action": "modify", "tag": "alpha", "task": "shadow modified"},
+               ("alpha", "task", "shadow modified")),
+    "pause": ({"action": "pause", "tag": "alpha"}, ("alpha", "enabled", False)),
+    "resume": ({"action": "resume", "tag": "dormant"}, ("dormant", "enabled", True)),
+}
+
+
+@pytest.mark.parametrize("change", sorted(_SHADOW_CHANGES))
+def test_shadowing_toml_job_change_proceeds(
+    make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, change: str,
+) -> None:
+    """Modify, pause, and resume of a shadowing scheduler.toml job are applied normally."""
+    args, (tag, field, value) = _SHADOW_CHANGES[change]
+    env = make_legacy_scheduler(legacy_fx.TOML, legacy=legacy_fx.SHADOW_LEGACY)
+
+    out = exec_schedule(env.sched, args)
+
+    assert out["success"] is True, out
+    assert read_execution(out) == "executed"
+    assert legacy_fx.parse_toml(env.toml_path)["jobs"][tag][field] == value
+    assert env.legacy_path.read_bytes() == legacy_fx.legacy_bytes(legacy_fx.SHADOW_LEGACY)
+
+
+def test_toml_change_succeeds_beside_bad_legacy_file(
+    make_legacy_scheduler: legacy_fx.MakeLegacyScheduler,
+) -> None:
+    """A legacy warning never blocks an ordinary scheduler.toml modify."""
+    env = make_legacy_scheduler(legacy_fx.TOML, legacy=legacy_fx.MALFORMED_LEGACY, enabled=True)
+    env.sched.start()
+
+    out = exec_schedule(env.sched, {"action": "modify", "tag": "alpha", "task": "still editable"})
+
+    assert out["success"] is True, out
+    assert read_execution(out) == "executed"
+    assert legacy_fx.parse_toml(env.toml_path)["jobs"]["alpha"]["task"] == "still editable"
+    assert env.sched.show_job("alpha")["next_run"] is not None
+    assert env.legacy_path.read_bytes() == legacy_fx.MALFORMED_LEGACY

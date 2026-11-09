@@ -1224,3 +1224,70 @@ def test_provider_base_url_preserves_terminal_fragment_slash(minimal_config):
     assert connection.base_url == "https://gw.test/v1#frg/"
     resolved = resolve_provider_connection(connection, vault_file=None)
     assert resolved.base_url == "https://gw.test/v1#frg/"
+
+
+def test_provider_connection_map_is_immutable_after_parse(minimal_config):
+    """Task 3.1: ``[providers.<id>]`` is a startup-fixed, read-only connection map."""
+    import dataclasses
+
+    cfg = parse_config(minimal_config)
+    original = cfg.providers["openai-main"]
+    replacement = dataclasses.replace(original, base_url="https://moved.invalid/v1")
+
+    with pytest.raises(TypeError):
+        cfg.providers["openai-main"] = replacement  # type: ignore[index]
+    with pytest.raises(TypeError):
+        cfg.providers["other"] = replacement  # type: ignore[index]
+    with pytest.raises(TypeError):
+        del cfg.providers["openai-main"]  # type: ignore[attr-defined]
+    for mutator in ("pop", "clear", "update", "setdefault", "popitem"):
+        assert not hasattr(cfg.providers, mutator), mutator
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        original.base_url = "https://moved.invalid/v1"  # type: ignore[misc]
+
+    # Editing the source document after parsing never reaches the parsed map.
+    minimal_config["providers"]["openai-main"]["base_url"] = "https://moved.invalid/v1"
+    minimal_config["providers"]["late"] = {"type": "openai", "api_key": "x"}
+    assert list(cfg.providers) == ["openai-main"]
+    assert cfg.providers["openai-main"] is original
+    assert original.base_url == "https://api.openai.com/v1"
+
+
+def test_directly_constructed_app_config_freezes_provider_map(minimal_config):
+    """A caller-supplied dict is copied into a read-only map at construction."""
+    import dataclasses
+
+    parsed = parse_config(minimal_config)
+    source = dict(parsed.providers)
+    cfg = dataclasses.replace(parsed, providers=source)
+    source["late"] = parsed.providers["openai-main"]
+
+    assert list(cfg.providers) == ["openai-main"]
+    with pytest.raises(TypeError):
+        cfg.providers["late"] = parsed.providers["openai-main"]  # type: ignore[index]
+
+
+class TestRequiredOutputCapSetting:
+    """Pulled-forward 6.1 slice (user-approved under 4.1): ``agent.required_output_cap_tokens``."""
+
+    def test_default_is_1024_and_obsolete_ctx_key_is_untouched(self, minimal_config):
+        cfg = parse_config(minimal_config)
+        assert cfg.agent.required_output_cap_tokens == 1024
+        assert cfg.agent.ctx_max_tokens == 90_000  # removal belongs to task 6.1 proper
+
+    @pytest.mark.parametrize("value", [1, 4096, 128_000])
+    def test_positive_integer_is_used(self, minimal_config, value):
+        minimal_config["agent"]["required_output_cap_tokens"] = value
+        assert parse_config(minimal_config).agent.required_output_cap_tokens == value
+
+    @pytest.mark.parametrize(
+        "value", [True, False, 0, -1, 1.5, 1024.0, "1024", ""],
+        ids=["true", "false", "zero", "negative", "float", "integral-float", "string", "empty-string"],
+    )
+    def test_invalid_values_fail_with_actionable_error_naming_the_key(self, minimal_config, value):
+        minimal_config["agent"]["required_output_cap_tokens"] = value
+        with pytest.raises(ConfigError) as caught:
+            parse_config(minimal_config)
+        message = str(caught.value)
+        assert "agent.required_output_cap_tokens" in message and "positive integer" in message
+        assert "ctx_max_tokens" not in message

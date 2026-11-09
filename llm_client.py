@@ -199,6 +199,7 @@ class LLMClient:
 
         self._run_model = run_model
         self._ctx_max_tokens = int(agent_config.ctx_max_tokens)
+        self._required_output_cap = int(agent_config.required_output_cap_tokens)
         self._max_retries = int(agent_config.max_retries)
         self._retry_delay = float(agent_config.retry_delay)
         self._diagnose_empty = bool(agent_config.diagnose_empty_responses)
@@ -318,6 +319,7 @@ class LLMClient:
                 metadata,
                 local_context_tokens=self._ctx_max_tokens,
                 output_cap_required=ordinary_output_cap_required(adapter),
+                required_output_cap=self._required_output_cap,
             )
         except ModelRequestBudgetError:
             ceiling = None
@@ -349,7 +351,6 @@ class LLMClient:
                 "vision": metadata.vision,
                 "tool_calling": metadata.tool_calling,
                 "reasoning": metadata.reasoning,
-                "sources": dict(metadata.sources),
             },
             "catalog_revision": self._run_model.catalog_revision,
             "selection_revision": self._run_model.selection_revision,
@@ -502,7 +503,6 @@ class LLMClient:
         json_mode: bool = False,
         progress_cb=None,
     ) -> str | ChatResponse:
-        self._validate_vision(messages)
         mode = "native" if tools is not None else "json"
         binding = self._binding_var.get()
         if binding is None:
@@ -571,25 +571,6 @@ class LLMClient:
             ollama_client=self._ollama_client,
             graph_extraction=self._graph_policy is not None,
         )
-
-    @staticmethod
-    def _messages_have_images(messages: list[dict]) -> bool:
-        for message in messages:
-            if message.get("images"):
-                return True
-            content = message.get("content")
-            if isinstance(content, list) and any(
-                isinstance(part, dict) and part.get("type") in {"image", "image_url"}
-                for part in content
-            ):
-                return True
-        return False
-
-    def _validate_vision(self, messages: list[dict]) -> None:
-        if self._messages_have_images(messages) and self._run_model.model.metadata.vision is not True:
-            raise LLMPermanentError(
-                "The pinned model does not have verified vision support; select a verified vision model with /models or start a new task."
-            )
 
     def _send_json(self, payload: dict[str, Any], mode: str) -> httpx.Response:
         if self._run_model.connection.adapter == "ollama":
@@ -780,6 +761,7 @@ class LLMClient:
                 local_context_tokens=self._ctx_max_tokens,
                 output_cap_required=output_cap_required,
                 fixed_output_cap=fixed_output_cap,
+                required_output_cap=self._required_output_cap,
             )
         except ModelRequestBudgetError as exc:
             message = f"Provider request rejected by local budget ({exc.code})"
@@ -790,6 +772,7 @@ class LLMClient:
                         local_context_tokens=self._ctx_max_tokens,
                         output_cap_required=output_cap_required,
                         fixed_output_cap=fixed_output_cap,
+                        required_output_cap=self._required_output_cap,
                     )
                 except ModelRequestBudgetError:
                     ceiling = None
@@ -952,7 +935,6 @@ class LLMClient:
         definition_revision: str | int = 0,
     ) -> RequestPreview:
         """Assemble and budget the final provider wire request without sending."""
-        self._validate_vision(messages)
         if tools is not None and self._run_model.connection.adapter not in _NATIVE_TOOL_PROVIDERS:
             raise NotImplementedError(
                 f"Native tool calling is unsupported for {self._run_model.connection.adapter}"
