@@ -160,7 +160,7 @@ def build(tmp_path: Path) -> Iterator[Callable[[str], _Wiring]]:
 
         def embedding_factory(event: threading.Event) -> EmbeddingClient:
             http = stack.enter_context(httpx.Client(transport=httpx.MockTransport(_refuse)))
-            client = EmbeddingClient(EmbeddingsConfig(), {}, http_client=http, cancel_event=event)
+            client = EmbeddingClient(EmbeddingsConfig(), http_client=http, cancel_event=event)
             embeddings.append(client)
             return client
 

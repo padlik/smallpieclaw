@@ -27,7 +27,12 @@ def minimal_config():
         "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [12345], "security_mode": "allowlist"},
         "agent": {"max_iterations": 8, "scheduled_max_iterations": 100, "tool_timeout": 10, "max_output_size": 4000, "top_tools": 3, "ctx_max_tokens": 90000},
         "providers": {"openai-main": {"type": "openai", "api_key": "test-provider-key", "base_url": "https://api.openai.com/v1"}},
-        "embeddings": {"provider": "openai-main", "model": "test-embedding"},
+        "embeddings": {
+            "provider": "openai",
+            "base_url": "https://embedding.example.test/v1",
+            "api_key": "fake-embedding-key",
+            "model": "test-embedding",
+        },
         "paths": {},
     }
 
@@ -968,7 +973,7 @@ class TestProviderCredentialInheritance:
 
         assert cfg.embeddings.provider == ""
         assert cfg.embeddings.model == ""
-        assert "supported adapter or configured provider connection" in cfg.embeddings.unavailable_reason
+        assert "supported adapter type" in cfg.embeddings.unavailable_reason
 
     def test_explicit_adapter_credentials_do_not_require_matching_chat_connection(self, minimal_config):
         minimal_config["providers"] = {
@@ -991,6 +996,7 @@ class TestProviderCredentialInheritance:
         assert "embedding_key" not in repr(cfg.embeddings)
 
     def test_explicit_adapter_uses_normal_endpoint_default_when_url_omitted(self, minimal_config):
+        """Rewritten for 5.1: there is no endpoint default; a missing ``base_url`` is unavailable."""
         minimal_config["providers"] = {
             "chat-account": {"type": "anthropic", "api_key": "fake-chat-key"}
         }
@@ -1000,23 +1006,8 @@ class TestProviderCredentialInheritance:
 
         cfg = parse_config(minimal_config)
 
-        assert cfg.embeddings.provider == "openai"
+        assert cfg.embeddings.unavailable_reason == "embeddings.base_url must be configured explicitly"
         assert cfg.embeddings.base_url == ""
-        assert cfg.embeddings.unavailable_reason == ""
-
-    def test_connection_id_embedding_selection_inherits_connection_transport(self, minimal_config):
-        minimal_config["providers"]["openai-main"]["api_key"] = "sec:shared_embedding_key"
-        minimal_config["providers"]["openai-main"]["base_url"] = "https://connection.example.test/v1"
-        minimal_config["embeddings"] = {
-            "provider": "openai-main", "model": "explicit-embedding-model"
-        }
-
-        cfg = parse_config(minimal_config)
-
-        assert cfg.embeddings.provider == "openai-main"
-        assert cfg.embeddings.api_key == "sec:shared_embedding_key"
-        assert cfg.embeddings.base_url == "https://connection.example.test/v1"
-        assert "shared_embedding_key" not in repr(cfg.embeddings)
 
     def test_unknown_embedding_adapter_is_unavailable_and_sanitized(self, minimal_config):
         minimal_config["embeddings"] = {

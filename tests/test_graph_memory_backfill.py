@@ -1580,7 +1580,7 @@ class TestBackfillMainLiveAndDryRun:
             "request_timeout = 20\n"
             "\n"
             "[embeddings]\n"
-            'provider = "e"\n'
+            'provider = "openai"\n'
             'model = "text-embed"\n'
             'api_key = "env:BF_EMBED_KEY"\n'
             'base_url = "https://e.backfill.test/v1"\n'
@@ -2447,7 +2447,9 @@ _BF_VAULT_EMBED_KEY = "fake-backfill-vault-embed-key"
 _BF_LEAK = "sk-backfillleak12345"
 _BF_SECRETS = (_BF_GRAPH_KEY, _BF_MAIN_KEY, _BF_EMBED_KEY, _BF_VAULT_GRAPH_KEY, _BF_VAULT_EMBED_KEY, _BF_LEAK)
 _BF_LOCAL_CONTEXT = 3000
-_BF_EMBEDDINGS = EmbeddingsConfig(provider="e", model="text-embed", api_key="env:BF_EMBED_KEY")
+_BF_EMBEDDINGS = EmbeddingsConfig(
+    provider="openai", model="text-embed", api_key="env:BF_EMBED_KEY", base_url="https://e.backfill.test/v1"
+)
 _BF_REAL_HTTPX_CLIENT = httpx.Client
 
 
@@ -2672,7 +2674,7 @@ class TestPrepareBackfillPrerequisites:
             graph.metadata, input_tokens=0, local_context_tokens=_BF_LOCAL_CONTEXT, fixed_output_cap=1024
         )
         assert (result.budget.output_cap, result.budget.hard_input_budget) == (1024, 4096 - 1024)
-        assert (result.embedding_provider, result.embedding_model) == ("e", "text-embed")
+        assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
 
     def test_disabled_graph_memory_is_still_prepared(self, backfill_world: Callable[..., _BackfillWorld]) -> None:
         """The enabled gate belongs to the caller; invoking preparation always validates."""
@@ -2694,11 +2696,14 @@ class TestPrepareBackfillPrerequisites:
         """sec: references resolve through the supplied vault, not a default home vault."""
         world = backfill_world(
             graph_key="sec:graph_key",
-            embeddings=EmbeddingsConfig(provider="e", model="text-embed", api_key="sec:embed_key"),
+            embeddings=EmbeddingsConfig(
+                provider="openai", model="text-embed", api_key="sec:embed_key",
+                base_url="https://e.backfill.test/v1",
+            ),
         )
         result = _prepare_ok(world, vault_file=world.vault_file)
         assert result.pin.connection.api_key == _BF_VAULT_GRAPH_KEY
-        assert (result.embedding_provider, result.embedding_model) == ("e", "text-embed")
+        assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
 
     @pytest.mark.parametrize("parent_exists", [True, False], ids=["file-missing", "parent-missing"])
     def test_missing_catalog_fails_with_refresh_guidance(
@@ -2764,8 +2769,14 @@ class TestPrepareBackfillPrerequisites:
     @pytest.mark.parametrize(
         "embeddings",
         [
-            pytest.param(EmbeddingsConfig(provider="e", api_key="env:BF_EMBED_KEY"), id="model-missing"),
-            pytest.param(EmbeddingsConfig(provider="e", model="text-embed"), id="no-graph-credential-inheritance"),
+            pytest.param(
+                EmbeddingsConfig(provider="openai", api_key="env:BF_EMBED_KEY", base_url="https://e.backfill.test/v1"),
+                id="model-missing",
+            ),
+            pytest.param(
+                EmbeddingsConfig(provider="openai", model="text-embed", base_url="https://e.backfill.test/v1"),
+                id="no-graph-credential-inheritance",
+            ),
         ],
     )
     def test_unavailable_embeddings_fail_actionably(

@@ -714,7 +714,10 @@ def _prereq_providers() -> dict[str, ProviderConfig]:
     }
 
 
-_DEFAULT_EMBEDDINGS = EmbeddingsConfig(provider="e", model="text-embed", api_key="env:PREREQ_EMBED_KEY")
+_PREREQ_EMBED_URL = "https://embed.prereq.test/v1"
+_DEFAULT_EMBEDDINGS = EmbeddingsConfig(
+    provider="openai", base_url=_PREREQ_EMBED_URL, model="text-embed", api_key="env:PREREQ_EMBED_KEY"
+)
 
 
 class _GraphCredentials:
@@ -945,7 +948,7 @@ def test_prerequisites_pin_exact_graph_record_independent_of_main(
         result.pin.model.metadata, input_tokens=0, local_context_tokens=_PREREQ_LOCAL_CONTEXT, fixed_output_cap=1024
     )
     assert (result.budget.output_cap, result.budget.hard_input_budget) == (1024, 4096 - 1024)
-    assert (result.embedding_provider, result.embedding_model) == ("e", "text-embed")
+    assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.embedding_model = "other"  # type: ignore[misc]
 
@@ -1047,20 +1050,35 @@ def test_graph_budget_with_unknown_limits_succeeds(
 @pytest.mark.parametrize(
     "embeddings",
     [
-        pytest.param(EmbeddingsConfig(model="text-embed", api_key="env:PREREQ_EMBED_KEY"), id="provider-missing"),
-        pytest.param(EmbeddingsConfig(provider="e", api_key="env:PREREQ_EMBED_KEY"), id="model-missing"),
         pytest.param(
-            EmbeddingsConfig(provider="a", model="text-embed", api_key="env:PREREQ_EMBED_KEY"), id="unsupported-adapter"
+            EmbeddingsConfig(base_url=_PREREQ_EMBED_URL, model="text-embed", api_key="env:PREREQ_EMBED_KEY"),
+            id="provider-missing",
         ),
-        pytest.param(EmbeddingsConfig(provider="e", model="text-embed"), id="connection-credential-unavailable"),
-        pytest.param(EmbeddingsConfig(provider="openai", model="text-embed"), id="no-graph-credential-fallback"),
         pytest.param(
-            EmbeddingsConfig(unavailable_reason="embeddings.provider and embeddings.model must be configured explicitly"),
+            EmbeddingsConfig(provider="openai", base_url=_PREREQ_EMBED_URL, api_key="env:PREREQ_EMBED_KEY"),
+            id="model-missing",
+        ),
+        pytest.param(
+            EmbeddingsConfig(
+                provider="anthropic", base_url=_PREREQ_EMBED_URL, model="text-embed", api_key="env:PREREQ_EMBED_KEY"
+            ),
+            id="unsupported-adapter",
+        ),
+        pytest.param(
+            EmbeddingsConfig(provider="openai", base_url=_PREREQ_EMBED_URL, model="text-embed"),
+            id="api-key-missing",
+        ),
+        pytest.param(
+            EmbeddingsConfig(provider="openai", model="text-embed", api_key="env:PREREQ_EMBED_KEY"),
+            id="base-url-missing",
+        ),
+        pytest.param(
+            EmbeddingsConfig(unavailable_reason="embeddings.base_url must be configured explicitly"),
             id="parse-unavailable",
         ),
         pytest.param(
             EmbeddingsConfig(
-                provider="e", model="text-embed", api_key="env:PREREQ_EMBED_KEY",
+                provider="openai", model="text-embed", api_key="env:PREREQ_EMBED_KEY",
                 base_url=f"https://user:{_PREREQ_LEAK}@embed.prereq.test/v1",
             ),
             id="invalid-endpoint",
@@ -1082,7 +1100,7 @@ def test_unavailable_embeddings_fail_actionably_and_close_client(
     ("embeddings", "connection_key"),
     [
         pytest.param(_DEFAULT_EMBEDDINGS, None, id="explicit-key-overrides-unavailable-connection-key"),
-        pytest.param(EmbeddingsConfig(provider="e", model="text-embed"), _PREREQ_CONN_KEY, id="matching-connection-key"),
+        pytest.param(_DEFAULT_EMBEDDINGS, _PREREQ_CONN_KEY, id="explicit-key-wins-over-set-connection-key"),
     ],
 )
 def test_embedding_credential_comes_only_from_embedding_config(
@@ -1091,9 +1109,9 @@ def test_embedding_credential_comes_only_from_embedding_config(
     embeddings: EmbeddingsConfig,
     connection_key: str | None,
 ) -> None:
-    """Explicit key wins; otherwise only the matching [embeddings] connection key is inherited."""
+    """The explicit [embeddings] key is used; a chat connection key is never consulted."""
     world = prereq_world(embeddings=embeddings)
     if connection_key is not None:
         monkeypatch.setenv("PREREQ_CONN_KEY", connection_key)
     result = _resolve_ok(world)
-    assert (result.embedding_provider, result.embedding_model) == ("e", "text-embed")
+    assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")

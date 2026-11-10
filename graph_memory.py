@@ -1544,9 +1544,7 @@ def resolve_graph_prerequisites(
     The temporary embedding client used for the availability check is always
     closed and never returned. Raises ``GraphPrerequisiteError`` on failure.
     """
-    from embedding_client import EmbeddingClient
     from model_registry import ModelRegistryError
-    from model_request_budget import ModelRequestBudgetError, compute_request_budget
 
     try:
         pin = registry.resolve_graph_model(app_cfg.graph_memory.extraction_model)
@@ -1558,8 +1556,17 @@ def resolve_graph_prerequisites(
             "and check the provider credentials",
         ) from None
 
+    budget = _graph_budget(pin, app_cfg)
+    _require_embeddings(app_cfg, vault_file)
+    return GraphPrerequisites(pin, budget, app_cfg.embeddings.provider, app_cfg.embeddings.model)
+
+
+def _graph_budget(pin: RunModel, app_cfg: AppConfig) -> ModelRequestBudget:
+    """Compute the fixed-cap request budget for *pin* or raise a safe error."""
+    from model_request_budget import ModelRequestBudgetError, compute_request_budget
+
     try:
-        budget = compute_request_budget(
+        return compute_request_budget(
             pin.model.metadata,
             input_tokens=0,
             local_context_tokens=app_cfg.agent.ctx_max_tokens,
@@ -1573,8 +1580,12 @@ def resolve_graph_prerequisites(
             "output cap plus input; choose another graph_memory.extraction_model",
         ) from None
 
-    embeddings = app_cfg.embeddings
-    client = EmbeddingClient(embeddings, app_cfg.providers, vault_file=vault_file)
+
+def _require_embeddings(app_cfg: AppConfig, vault_file: str | None) -> None:
+    """Verify with a short-lived client that explicit embeddings are available."""
+    from embedding_client import EmbeddingClient
+
+    client = EmbeddingClient(app_cfg.embeddings, vault_file=vault_file)
     try:
         available = client.available
     finally:
@@ -1582,10 +1593,81 @@ def resolve_graph_prerequisites(
     if not available:
         raise GraphPrerequisiteError(
             "embedding_unavailable",
-            "graph memory requires embeddings: check the [embeddings] provider/model/"
-            "credential and matching provider connection",
+            "graph memory requires embeddings: configure [embeddings] provider, "
+            "base_url, api_key and model explicitly",
         )
-    return GraphPrerequisites(pin, budget, embeddings.provider, embeddings.model)
+
+
+# Provider id of the private graph extraction route (never a chat connection).
+_GRAPH_PROVIDER_ID = "graph-extraction"
+_GRAPH_REQUEST_TIMEOUT = 120.0
+
+
+def _resolve_extraction_credential(source: str, vault_file: str | None) -> str:
+    """Resolve the extraction API key reference for the graph client only.
+
+    Errors name the config field and never the reference, variable or value.
+    """
+    from config_schema import _expand_value, _load_vault
+
+    unavailable = GraphPrerequisiteError(
+        "extraction_credential_unavailable",
+        "graph memory extraction credential is unavailable: check "
+        "graph_memory.extraction_api_key and its environment variable or vault entry",
+    )
+    try:
+        vault = _load_vault(vault_file) if source.startswith("sec:") and vault_file else None
+        resolved = _expand_value(source, path="graph_memory.extraction_api_key", vault=vault)
+    except Exception:  # noqa: BLE001 - resolver errors may embed a reference or path
+        raise unavailable from None
+    if not isinstance(resolved, str) or not resolved.strip():
+        raise unavailable
+    return resolved
+
+
+def resolve_graph_startup(
+    app_cfg: AppConfig,
+    *,
+    vault_file: str | None = None,
+) -> GraphPrerequisites:
+    """Build the private graph extraction pin from explicit settings only.
+
+    Requires the four ``[graph_memory]`` extraction fields (ADR-0042); nothing
+    comes from a chat connection, the catalog, Main or ``[embeddings]``. The
+    credential is resolved here for the graph extraction client alone. This
+    preparation checks no ``enabled`` flag, creates no graph client, store or
+    writer, and closes its temporary embedding probe. Raises
+    ``GraphPrerequisiteError`` with secret-free guidance on any failure.
+    """
+    from config_schema import ResolvedProviderConnection
+    from model_registry import ModelMetadata, ModelRecord, RunModel
+
+    graph = app_cfg.graph_memory
+    if graph.extraction_unavailable_reason:
+        raise GraphPrerequisiteError(
+            "extraction_config_invalid",
+            f"{graph.extraction_unavailable_reason}; graph memory needs its own explicit "
+            "extraction_provider, extraction_base_url, extraction_api_key and extraction_model",
+        )
+    api_key = _resolve_extraction_credential(graph.extraction_api_key, vault_file)
+    record = ModelRecord(
+        id=graph.extraction_model,
+        provider_id=_GRAPH_PROVIDER_ID,
+        upstream_id=graph.extraction_model,
+        display_name=graph.extraction_model,
+        metadata=ModelMetadata(),
+    )
+    connection = ResolvedProviderConnection(
+        provider_id=_GRAPH_PROVIDER_ID,
+        adapter=graph.extraction_provider,  # type: ignore[arg-type]
+        base_url=graph.extraction_base_url.rstrip("/"),
+        request_timeout=_GRAPH_REQUEST_TIMEOUT,
+        api_key=api_key,
+    )
+    pin = RunModel(record, connection, 0, 0)
+    budget = _graph_budget(pin, app_cfg)
+    _require_embeddings(app_cfg, vault_file)
+    return GraphPrerequisites(pin, budget, app_cfg.embeddings.provider, app_cfg.embeddings.model)
 
 
 # ---------------------------------------------------------------------------

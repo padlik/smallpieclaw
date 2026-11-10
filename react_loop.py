@@ -1377,6 +1377,9 @@ def _request_turn(
             # not eligible for protocol conversion.
             raise
         except (LLMError, httpx.HTTPError, LLMEmptyResponseError) as exc:
+            if ctx.cancel_event.is_set():
+                # Cancellation tears down the transport; that error is not a model failure.
+                return _Turn([], "", False, "[Cancelled]")
             info = _classify_llm_error(exc)
             transient = isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
             if isinstance(exc, httpx.HTTPStatusError):
@@ -1402,6 +1405,8 @@ def _request_turn(
                 continue
             return _Turn([], "", False, result)
         except Exception as exc:
+            if ctx.cancel_event.is_set():
+                return _Turn([], "", False, "[Cancelled]")
             info = _classify_llm_error(exc)
             result = _handle_llm_error(ctx, state, info, progress, _get_user_goal(state))
             if result is None:
@@ -2112,7 +2117,12 @@ def _run_plan(
     ``on_disposition`` receives the plan's derived execution disposition
     (never the plan's success flag) after the private markers are stripped.
     """
-    from execution_plan import ExecutionPlan, PlanExecutor, PlanStep  # noqa: PLC0415
+    from execution_plan import (  # noqa: PLC0415
+        ExecutionPlan,
+        PlanExecutor,
+        PlanStep,
+        reject_generation_controls,
+    )
     old_max_steps = max_steps
     plan_limit = ctx.plan_max_iterations or (ctx.max_iterations + 20)
     if plan_limit > _ABSOLUTE_PLAN_CEILING:
@@ -2128,6 +2138,7 @@ def _run_plan(
     progress("📋 Executing plan…")
     logger.info("plan | description: %s", plan_data.get("description", "")[:60])
     try:
+        reject_generation_controls(plan_data)
         steps_raw = plan_data.get("steps", [])
         steps = [
             PlanStep(

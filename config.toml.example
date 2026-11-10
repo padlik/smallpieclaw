@@ -75,13 +75,15 @@ request_timeout = 120
 # request_timeout = 120
 
 [embeddings]
-# Embeddings are independent of chat selection and require explicit model and
-# provider. Credentials/endpoint may come from this section or its matching
-# provider connection; they never fall back to the active chat model.
-provider = "openai-main"
+# Embeddings are independent of chat selection and graph extraction: all four
+# fields are required and nothing is inherited from a [providers.<id>] chat
+# connection, even one of the same adapter type. A missing/invalid field keeps
+# chat working but degrades tool search and disables graph memory (the startup
+# warning names the field).
+provider = "openai"                      # adapter type: openai, openrouter or google
+base_url = "https://api.openai.com/v1"   # embedding endpoint
+api_key = "sec:OPENAI_EMBEDDING_KEY"     # env:/sec: reference to the embedding credential
 model = "text-embedding-3-small"
-# api_key = "sec:OPENAI_API_KEY"  # optional explicit embedding credential
-# base_url = "https://api.openai.com/v1"  # optional embedding endpoint
 
 [agent]
 # Logical agent name used to derive default shared state locations.
@@ -217,15 +219,20 @@ type = "file"
 # ─────────────────────────────────────────────────────────────────────────────
 # Graph-Based Memory (opt-in — disabled by default)
 # Requires: pip install ladybug  (LadybugDB — community fork of KuzuDB)
-# Also requires explicit [embeddings] settings and graph extraction model.
+# Also requires explicit [embeddings] settings and all four extraction_* settings
+# below. Nothing is inherited from [providers.*], the model catalog, the Main
+# model or [embeddings]; if any is missing/invalid, graph memory stays disabled
+# (warning at startup) while chat and indexing keep working.
 # ─────────────────────────────────────────────────────────────────────────────
 # [graph_memory]
 # enabled               = false        # set to true to enable
 # # db_path is not configurable — always <XDG_DATA_HOME>/<agent_name>/graph_memory
 # buffer_pool_mb        = 256          # RAM for DB buffer pool (lower on Pi 3/4)
-# # extraction_model: model to use for triplet extraction (LLM call per batch).
-# # Canonical ID of an explicitly selected/discovered provider model.
-# extraction_model = "openai-main/gpt-example"
+# # Graph extraction's own route (one LLM call per batch, fixed 1024-token output cap).
+# extraction_provider = "openai"                     # adapter: openai|openrouter|anthropic|google|ollama
+# extraction_base_url = "https://api.openai.com/v1"  # endpoint that receives the extraction key
+# extraction_api_key  = "sec:graph_extraction_key"   # literal, env:VAR or sec:KEY; extraction only
+# extraction_model    = "gpt-example-mini"           # upstream model string, sent verbatim
 # extract_every_n_turns = 3            # batch: extract every N user turns (cost control)
 # min_message_length    = 100          # skip short messages / chatter
 # max_context_entries   = 10           # max entities/facts injected into prompt

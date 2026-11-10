@@ -874,7 +874,7 @@ def runtime_runner(tmp_path):
     registry.select(model.id)
 
     def unavailable_embedding(event: threading.Event) -> EmbeddingClient:
-        return EmbeddingClient(EmbeddingsConfig(), {}, cancel_event=event)
+        return EmbeddingClient(EmbeddingsConfig(), cancel_event=event)
 
     runners: list = []
 

@@ -344,7 +344,8 @@ class _World:
         http_client = httpx.Client(transport=httpx.MockTransport(self._embed))
         self.embed_http.append(http_client)
         client = _TrackedEmbedding(
-            EmbeddingsConfig(provider="openai", model="embed-1", api_key="embed-key"), {},
+            EmbeddingsConfig(provider="openai", model="embed-1", api_key="embed-key",
+                base_url="https://embed.example.test/v1"),
             http_client=http_client, cancel_event=event,
         )
         self.embeddings.append(client)

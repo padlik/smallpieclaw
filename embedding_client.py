@@ -4,24 +4,18 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Mapping
 from urllib.parse import urlsplit
 
 import httpx
 
 from config_schema import (
     EmbeddingsConfig,
-    ProviderConfig,
     _expand_value,
     _load_vault,
 )
 
-_DEFAULT_ENDPOINTS = {
-    "openai": "https://api.openai.com/v1",
-    "openrouter": "https://openrouter.ai/api/v1",
-    "google": "https://generativelanguage.googleapis.com/v1beta",
-}
-_SUPPORTED = frozenset(_DEFAULT_ENDPOINTS)
+_SUPPORTED = frozenset({"openai", "openrouter", "google"})
+_REQUEST_TIMEOUT = 120.0
 _CACHE_MAX = 512
 
 
@@ -35,7 +29,6 @@ class _ResolvedSettings:
     model: str
     endpoint: str = field(repr=False)
     api_key: str = field(repr=False)
-    timeout: float
 
 
 class _NoInheritedAuth(httpx.Auth):
@@ -56,23 +49,22 @@ class EmbeddingClient:
     def __init__(
         self,
         embeddings: EmbeddingsConfig,
-        providers: Mapping[str, ProviderConfig],
         *,
         vault_file: str | None = None,
         http_client: httpx.Client | None = None,
         cancel_event: threading.Event | None = None,
     ) -> None:
-        """Resolve explicit/matching settings and create an isolated transport."""
+        """Resolve the four explicit settings and create an isolated transport."""
         self._cancel_event = cancel_event
         self._cache: dict[str, list[float]] = {}
         self._cache_lock = threading.Lock()
         self._owns_client = http_client is None
         self._http = http_client or httpx.Client()
         self._settings: _ResolvedSettings | None = None
-        self._timeout = 120.0
+        self._timeout = _REQUEST_TIMEOUT
         self._unavailable_reason = ""
         try:
-            self._settings, self._timeout = self._resolve(embeddings, providers, vault_file)
+            self._settings = self._resolve(embeddings, vault_file)
         except ValueError as exc:
             self._unavailable_reason = str(exc)
         except Exception:
@@ -138,32 +130,31 @@ class EmbeddingClient:
     def _resolve(
         self,
         embeddings: EmbeddingsConfig,
-        providers: Mapping[str, ProviderConfig],
         vault_file: str | None,
-    ) -> tuple[_ResolvedSettings, float]:
+    ) -> _ResolvedSettings:
         if embeddings.unavailable_reason:
             raise ValueError("embedding configuration unavailable")
-        provider = embeddings.provider
-        model = embeddings.model
-        if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
-            raise ValueError("embedding provider and model must be configured explicitly")
-
-        connection = providers.get(provider)
-        adapter = connection.type if connection else provider
-        if adapter not in _SUPPORTED:
+        missing = [
+            name for name, value in (
+                ("provider", embeddings.provider),
+                ("base_url", embeddings.base_url),
+                ("api_key", embeddings.api_key),
+                ("model", embeddings.model),
+            )
+            if not isinstance(value, str) or not value.strip()
+        ]
+        if missing:
+            names = ", ".join(f"embeddings.{name}" for name in missing)
+            raise ValueError(f"{names} must be configured explicitly")
+        if embeddings.provider not in _SUPPORTED:
             raise ValueError("unsupported embedding adapter; configure a supported provider")
-        explicit_key = embeddings.api_key
-        inherited_key = connection.api_key if connection else ""
-        key_source = explicit_key or inherited_key
-        api_key = _resolve_credential(key_source, vault_file)
+        api_key = _resolve_credential(embeddings.api_key, vault_file)
         if not api_key:
             raise ValueError("embedding credential required")
-
-        endpoint = embeddings.base_url or (connection.base_url if connection else "")
-        endpoint = endpoint or _DEFAULT_ENDPOINTS[adapter]
-        _validate_endpoint(endpoint)
-        timeout = float(connection.request_timeout) if connection else 120.0
-        return _ResolvedSettings(adapter, model, endpoint.rstrip("/"), api_key, timeout), timeout
+        _validate_endpoint(embeddings.base_url)
+        return _ResolvedSettings(
+            embeddings.provider, embeddings.model, embeddings.base_url.rstrip("/"), api_key
+        )
 
     def _require_available(self) -> _ResolvedSettings:
         if self._cancel_event is not None and self._cancel_event.is_set():

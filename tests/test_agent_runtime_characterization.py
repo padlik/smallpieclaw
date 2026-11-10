@@ -174,7 +174,7 @@ def pin_b(registry: ModelRegistry) -> RunModel:
 
 def _unavailable_embedding(event: threading.Event) -> EmbeddingClient:
     """Real independent EmbeddingClient with no configuration (unavailable)."""
-    return EmbeddingClient(EmbeddingsConfig(), {}, cancel_event=event)
+    return EmbeddingClient(EmbeddingsConfig(), cancel_event=event)
 
 
 def _runner_kwargs(run_model: object, **overrides) -> dict:

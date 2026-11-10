@@ -68,7 +68,7 @@ from graph_memory import (  # noqa: E402
     GraphMemoryWriter,
     GraphPrerequisiteError,
     create_graph_memory,
-    resolve_graph_prerequisites,
+    resolve_graph_startup,
 )
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
@@ -364,8 +364,7 @@ def _make_embedding_factory(
     def embedding_factory(event: threading.Event) -> EmbeddingClient:
         """Build an embedding client bound to *event* from explicit settings."""
         return EmbeddingClient(
-            app_cfg.embeddings, app_cfg.providers,
-            vault_file=vault_file, cancel_event=event,
+            app_cfg.embeddings, vault_file=vault_file, cancel_event=event,
         )
 
     return embedding_factory
@@ -484,7 +483,6 @@ def _build_graph_memory(
     paths: XDGPaths,
     agent: AgentController,
     builtin: BuiltinExecutor,
-    model_registry: ModelRegistry,
     vault_file: str,
     embedder_fn: Callable[[str], list[float]],
 ) -> tuple[GraphMemoryStore | None, GraphMemoryWriter | None]:
@@ -498,9 +496,7 @@ def _build_graph_memory(
         return None, None
 
     try:
-        prepared = resolve_graph_prerequisites(
-            app_cfg, model_registry, vault_file=vault_file
-        )
+        prepared = resolve_graph_startup(app_cfg, vault_file=vault_file)
     except GraphPrerequisiteError as exc:
         logger.warning(
             "Graph memory initialisation failed (continuing without it): %s",
@@ -536,9 +532,10 @@ def _build_graph_memory(
             )
         return graph_memory_store, graph_memory_writer
     except Exception as _gm_init_exc:
+        # Class name only: provider/SDK messages may embed endpoints or credentials.
         logger.warning(
             "Graph memory initialisation failed (continuing without it): %s",
-            _gm_init_exc,
+            type(_gm_init_exc).__name__,
         )
         return None, None
 
@@ -696,13 +693,13 @@ def _run(
 
     with contextlib.ExitStack() as root_resources:
         root_embedding = EmbeddingClient(
-            app_cfg.embeddings, app_cfg.providers, vault_file=vault_file,
+            app_cfg.embeddings, vault_file=vault_file,
         )
         root_resources.callback(close_root_embedding)
         if not root_embedding.available:
             logger.warning(
                 "Embeddings unavailable (%s); tool search and results recall run degraded.",
-                root_embedding.unavailable_reason,
+                app_cfg.embeddings.unavailable_reason or root_embedding.unavailable_reason,
             )
         discovery_http = root_resources.enter_context(
             httpx.Client(follow_redirects=False, trust_env=False)
@@ -990,11 +987,11 @@ def _run_with_model_services(
     # design decision 2): it stays in job-owned history, not the operator prompt.
 
     # Initialise graph memory (opt-in) and wire it into agent + executor.
-    # The model registry already completed a full provider refresh; graph
-    # prerequisites resolve the explicit extraction pin independently of Main.
+    # Graph extraction uses only its own explicit [graph_memory] route (ADR-0042);
+    # it consults neither the model catalog nor Main.
     _embedder_fn = _build_embedder(root_embedding)
     graph_memory_store, graph_memory_writer = _build_graph_memory(
-        app_cfg, paths, agent, builtin, model_registry, vault_file, _embedder_fn,
+        app_cfg, paths, agent, builtin, vault_file, _embedder_fn,
     )
 
     logger.info("Starting Telegram bot...")

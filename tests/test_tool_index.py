@@ -202,7 +202,7 @@ def real_unavailable_client():
         raise AssertionError(f"unexpected network I/O: {request.url}")
 
     http = httpx.Client(transport=httpx.MockTransport(handler))
-    client = EmbeddingClient(EmbeddingsConfig(), {}, http_client=http)
+    client = EmbeddingClient(EmbeddingsConfig(), http_client=http)
     assert client.available is False
     try:
         yield client

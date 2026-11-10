@@ -547,7 +547,7 @@ class TestSubAgentTracePropagation:
             )
 
         def _unavailable_embedding(event: threading.Event) -> EmbeddingClient:
-            return EmbeddingClient(EmbeddingsConfig(), {}, cancel_event=event)
+            return EmbeddingClient(EmbeddingsConfig(), cancel_event=event)
 
         record = ModelRecord(
             "pa/up/m", "pa", "up/m", "up/m display",

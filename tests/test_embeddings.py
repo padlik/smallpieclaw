@@ -73,10 +73,13 @@ def test_closing_chat_client_does_not_close_borrowed_embedding_client() -> None:
 
 _CHAT_KEY = "fake-valid-chat-key"
 _EMBEDDING_CASES = {
-    "missing": (None, "embeddings.provider and embeddings.model must be configured explicitly"),
+    "missing": (None, "embeddings.provider, embeddings.base_url, embeddings.api_key, embeddings.model must be configured explicitly"),
     "invalid-provider": (
-        {"provider": "not-a-provider", "model": "text-embed"},
-        "embeddings.provider must name a supported adapter or configured provider connection",
+        {
+            "provider": "not-a-provider", "model": "text-embed",
+            "base_url": "https://embed.example.invalid/v1", "api_key": "fake-embedding-key",
+        },
+        "embeddings.provider must name a supported adapter type",
     ),
 }
 
@@ -128,7 +131,7 @@ def test_parsed_unavailable_embeddings_degrade_client_and_tool_index(
     chat_requests: list[httpx.Request] = []
     with ExitStack() as stack:
         http = stack.enter_context(httpx.Client(transport=_counting_transport(embedding_requests)))
-        embedding = EmbeddingClient(app_cfg.embeddings, app_cfg.providers, http_client=http)
+        embedding = EmbeddingClient(app_cfg.embeddings, http_client=http)
         stack.callback(embedding.close)
         assert embedding.available is False
         assert embedding.unavailable_reason == "embedding configuration unavailable"

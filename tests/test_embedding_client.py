@@ -6,17 +6,16 @@ import httpx
 import pytest
 
 import embedding_client
-from config_schema import EmbeddingsConfig, ProviderConfig
+from config_schema import EmbeddingsConfig
 from embedding_client import EmbeddingClient, EmbeddingUnavailableError
 
 
 def _client(
     embedding: EmbeddingsConfig,
-    providers: dict[str, ProviderConfig] | None = None,
     *,
     http_client: httpx.Client | None = None,
 ) -> EmbeddingClient:
-    return EmbeddingClient(embedding, providers or {}, http_client=http_client)
+    return EmbeddingClient(embedding, http_client=http_client)
 
 
 def test_openai_embeddings_are_explicit_and_do_not_inherit_chat_state() -> None:
@@ -35,7 +34,7 @@ def test_openai_embeddings_are_explicit_and_do_not_inherit_chat_state() -> None:
         params={"injected": "yes"},
     )
     client = _client(
-        EmbeddingsConfig(provider="openai", model="text-embedding-3-small", api_key="embedding-key"),
+        EmbeddingsConfig(provider="openai", model="text-embedding-3-small", api_key="embedding-key", base_url="https://api.openai.com/v1"),
         http_client=injected,
     )
     try:
@@ -52,67 +51,13 @@ def test_openai_embeddings_are_explicit_and_do_not_inherit_chat_state() -> None:
     assert request.read() == b'{"model":"text-embedding-3-small","input":"hello"}'
 
 
-def test_matching_connection_supplies_endpoint_key_and_timeout() -> None:
-    requests: list[httpx.Request] = []
-    injected = httpx.Client(transport=httpx.MockTransport(lambda request: (
-        requests.append(request)
-        or httpx.Response(200, json={"data": [{"embedding": [1.0]}]})
-    )))
-    config = EmbeddingsConfig(provider="research-openai", model="embed-v1")
-    providers = {
-        "research-openai": ProviderConfig(
-            name="research-openai", type="openai", api_key="connection-key",
-            base_url="https://embedding.example/v1", request_timeout=9,
-        ),
-        "chat-anthropic": ProviderConfig(
-            name="chat-anthropic", type="anthropic", api_key="chat-key",
-            base_url="https://chat.example", request_timeout=3,
-        ),
-    }
-    client = _client(config, providers, http_client=injected)
-    try:
-        assert client.embed("independent") == [1.0]
-        assert client._timeout == 9
-    finally:
-        client.close()
-        injected.close()
-    assert str(requests[0].url) == "https://embedding.example/v1/embeddings"
-    assert requests[0].headers["authorization"] == "Bearer connection-key"
-
-
-def test_explicit_settings_override_matching_connection() -> None:
-    requests: list[httpx.Request] = []
-    injected = httpx.Client(transport=httpx.MockTransport(lambda request: (
-        requests.append(request)
-        or httpx.Response(200, json={"data": [{"embedding": [2.0]}]})
-    )))
-    client = _client(
-        EmbeddingsConfig(
-            provider="named-openai", model="custom-embed", api_key="own-key",
-            base_url="https://own.example/v1",
-        ),
-        {"named-openai": ProviderConfig(
-            name="named-openai", type="openai", api_key="connection-key",
-            base_url="https://connection.example/v1",
-        )},
-        http_client=injected,
-    )
-    try:
-        assert client.embed("override") == [2.0]
-    finally:
-        client.close()
-        injected.close()
-    assert str(requests[0].url) == "https://own.example/v1/embeddings"
-    assert requests[0].headers["authorization"] == "Bearer own-key"
-
-
 @pytest.mark.parametrize(
     ("config", "reason"),
     [
         (EmbeddingsConfig(), "explicitly"),
-        (EmbeddingsConfig(provider="openai", model="embed"), "credential"),
-        (EmbeddingsConfig(provider="anthropic", model="embed", api_key="key"), "unsupported"),
-        (EmbeddingsConfig(provider="unknown", model="embed", api_key="key"), "supported"),
+        (EmbeddingsConfig(provider="openai", model="embed", base_url="https://api.openai.com/v1"), "api_key"),
+        (EmbeddingsConfig(provider="anthropic", model="embed", api_key="key", base_url="https://a.example.test"), "unsupported"),
+        (EmbeddingsConfig(provider="unknown", model="embed", api_key="key", base_url="https://a.example.test"), "supported"),
         (EmbeddingsConfig(provider="openai", model="embed", api_key="key", base_url="file:///secret"), "URL"),
     ],
 )
@@ -128,18 +73,15 @@ def test_unavailable_configuration_is_safe_and_fails_actionably(
     client.close()
 
 
-def test_missing_credential_does_not_borrow_unrelated_chat_connection() -> None:
-    chat = ProviderConfig(
-        name="chat-anthropic", type="anthropic", api_key="chat-secret",
-        base_url="https://chat.example",
-    )
+def test_client_takes_no_chat_connections_so_a_missing_key_cannot_be_borrowed() -> None:
+    import inspect
+
+    assert "providers" not in inspect.signature(EmbeddingClient).parameters
     client = _client(
-        EmbeddingsConfig(provider="openai", model="embed-model"),
-        {"chat-anthropic": chat},
+        EmbeddingsConfig(provider="openai", model="embed-model", base_url="https://api.openai.com/v1")
     )
     assert not client.available
-    assert "credential" in client.unavailable_reason
-    assert "chat-secret" not in repr(client)
+    assert "embeddings.api_key" in client.unavailable_reason
     client.close()
 
 
@@ -157,8 +99,7 @@ def test_credential_references_resolve_only_inside_embedding_client(
         or httpx.Response(200, json={"data": [{"embedding": [6.0]}]})
     )))
     client = EmbeddingClient(
-        EmbeddingsConfig(provider="openai", model="embed", api_key=source),
-        {},
+        EmbeddingsConfig(provider="openai", model="embed", api_key=source, base_url="https://api.openai.com/v1"),
         vault_file="mock-vault-path",
         http_client=injected,
     )
@@ -181,8 +122,7 @@ def test_cancelled_request_is_rejected_before_transport() -> None:
     event = threading.Event()
     event.set()
     client = EmbeddingClient(
-        EmbeddingsConfig(provider="openai", model="embed", api_key="key"),
-        {},
+        EmbeddingsConfig(provider="openai", model="embed", api_key="key", base_url="https://api.openai.com/v1"),
         cancel_event=event,
     )
     with pytest.raises(EmbeddingUnavailableError, match="cancelled"):
@@ -208,11 +148,11 @@ def test_google_batch_order_and_openai_cache() -> None:
 
     injected = httpx.Client(transport=httpx.MockTransport(handler))
     google = _client(
-        EmbeddingsConfig(provider="google", model="gemini-embedding-001", api_key="google-key"),
+        EmbeddingsConfig(provider="google", model="gemini-embedding-001", api_key="google-key", base_url="https://generativelanguage.googleapis.com/v1beta"),
         http_client=injected,
     )
     openai = _client(
-        EmbeddingsConfig(provider="openai", model="embed", api_key="openai-key"),
+        EmbeddingsConfig(provider="openai", model="embed", api_key="openai-key", base_url="https://api.openai.com/v1"),
         http_client=injected,
     )
     try:
@@ -237,7 +177,7 @@ def test_empty_batch_returns_empty_without_request() -> None:
         requests.append(request) or httpx.Response(200, json={"data": []})
     )))
     client = _client(
-        EmbeddingsConfig(provider="openai", model="embed", api_key="key"), http_client=injected,
+        EmbeddingsConfig(provider="openai", model="embed", api_key="key", base_url="https://api.openai.com/v1"), http_client=injected,
     )
     try:
         assert client.embed_batch([]) == []
@@ -261,7 +201,7 @@ def test_partial_cache_hit_requests_only_missing_inputs_in_order() -> None:
 
     injected = httpx.Client(transport=httpx.MockTransport(handler))
     client = _client(
-        EmbeddingsConfig(provider="openai", model="embed", api_key="key"), http_client=injected,
+        EmbeddingsConfig(provider="openai", model="embed", api_key="key", base_url="https://api.openai.com/v1"), http_client=injected,
     )
     try:
         assert client.embed("cached") == [9.0]
@@ -283,7 +223,7 @@ def test_google_cross_origin_redirect_does_not_forward_credentials_or_input() ->
         transport=httpx.MockTransport(handler), follow_redirects=True
     )
     client = _client(
-        EmbeddingsConfig(provider="google", model="gemini-embedding-001", api_key="google-secret"),
+        EmbeddingsConfig(provider="google", model="gemini-embedding-001", api_key="google-secret", base_url="https://generativelanguage.googleapis.com/v1beta"),
         http_client=injected,
     )
     try:
@@ -309,7 +249,7 @@ def test_provider_errors_are_sanitized_and_bad_batch_cardinality_fails() -> None
         lambda request: httpx.Response(200, json={"data": []})
     ))
     client = _client(
-        EmbeddingsConfig(provider="openai", model="embed", api_key="top-secret"),
+        EmbeddingsConfig(provider="openai", model="embed", api_key="top-secret", base_url="https://api.openai.com/v1"),
         http_client=injected,
     )
     try:

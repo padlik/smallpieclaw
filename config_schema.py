@@ -472,6 +472,16 @@ class GraphMemoryConfig:
     extract_every_n_turns: int = 3
     min_message_length: int = 100
     max_context_entries: int = 10
+    # Explicit graph extraction route (ADR-0042): nothing is inherited from chat,
+    # the catalog, Main or [embeddings]. ``extraction_api_key`` keeps the
+    # unresolved value (a literal or a whole-string ``env:``/``sec:`` reference);
+    # it is resolved only when the graph extraction client is built.
+    extraction_provider: str = ""
+    extraction_base_url: str = field(default="", repr=False)
+    extraction_api_key: str = field(default="", repr=False)
+    # Sanitized, field-names-only reason; non-empty only for an enabled graph
+    # whose extraction settings are unusable (graph memory is then disabled).
+    extraction_unavailable_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -738,10 +748,17 @@ def _parse_embeddings(raw: dict, unavailable_reason: str = "") -> EmbeddingsConf
     )
 
 
+_EMBEDDING_FIELDS = ("provider", "base_url", "api_key", "model")
+
+
 def _resolve_embedding_settings(section: Any) -> tuple[dict[str, Any], str]:
-    """Expand non-secret embedding settings without making them startup-fatal."""
+    """Expand non-secret embedding settings without making them startup-fatal.
+
+    All four fields must be explicit, non-blank strings; the reason names the
+    offending fields only (never their values) so the operator can fix them.
+    """
     if section is None:
-        return {}, "embeddings.provider and embeddings.model must be configured explicitly"
+        section = {}
     if not isinstance(section, dict):
         return {}, "embeddings must be a table"
 
@@ -762,15 +779,17 @@ def _resolve_embedding_settings(section: Any) -> tuple[dict[str, Any], str]:
     if not isinstance(api_key, str):
         return result, "embeddings.api_key must be a string credential or reference"
 
-    for key in ("provider", "model"):
-        if not result.get(key):
-            return result, f"embeddings.{key} must be configured explicitly"
-    base_url = result.get("base_url", "")
-    if base_url:
-        try:
-            _validate_http_url(base_url, "embeddings.base_url")
-        except ConfigError:
-            return result, "embeddings.base_url must be a valid HTTP(S) URL"
+    missing = [
+        key for key in _EMBEDDING_FIELDS
+        if not isinstance(result.get(key), str) or not result[key].strip()
+    ]
+    if missing:
+        names = ", ".join(f"embeddings.{key}" for key in missing)
+        return result, f"{names} must be configured explicitly"
+    try:
+        _validate_http_url(result["base_url"], "embeddings.base_url")
+    except ConfigError:
+        return result, "embeddings.base_url must be a valid HTTP(S) URL"
     return result, ""
 
 
@@ -861,12 +880,71 @@ def _parse_paths(raw: dict, agent_name: str = "piclaw") -> PathsConfig:
     return PathsConfig(**expanded)
 
 
-def _parse_graph_memory(raw: dict) -> GraphMemoryConfig:
+_GRAPH_EXTRACTION_FIELDS = (
+    "extraction_provider", "extraction_base_url", "extraction_api_key", "extraction_model",
+)
+
+
+def _resolve_graph_extraction_settings(section: dict[str, Any]) -> tuple[dict[str, str], str]:
+    """Validate the four explicit extraction settings of an *enabled* graph.
+
+    Returns ``(values, reason)``. ``reason`` names offending fields only (never
+    their values or reference names); the caller degrades graph memory with it
+    instead of failing startup. Values are kept verbatim (no stripping). The
+    API key stays an unresolved reference: availability is checked when the
+    graph extraction client is built.
+    """
+    values: dict[str, str] = {}
+    for key in ("extraction_provider", "extraction_base_url", "extraction_model"):
+        value = section.get(key)
+        if not isinstance(value, str):
+            continue
+        try:
+            values[key] = _expand_value(value, path=f"graph_memory.{key}")
+        except ConfigError:
+            return values, f"graph_memory.{key} has an unavailable or invalid reference"
+    api_key = section.get("extraction_api_key")
+    if isinstance(api_key, str):
+        values["extraction_api_key"] = api_key
+
+    missing = [
+        key for key in _GRAPH_EXTRACTION_FIELDS
+        if not isinstance(values.get(key), str) or not values[key].strip()
+    ]
+    if missing:
+        names = ", ".join(f"graph_memory.{key}" for key in missing)
+        return values, f"{names} must be configured explicitly"
+    if values["extraction_provider"] not in _PROVIDER_TYPES:
+        return values, "graph_memory.extraction_provider must name a supported adapter type"
+    try:
+        _validate_http_url(values["extraction_base_url"], "graph_memory.extraction_base_url")
+    except ConfigError:
+        return values, "graph_memory.extraction_base_url must be a valid HTTP(S) URL"
+    source = values["extraction_api_key"]
+    for prefix in (_ENV_PREFIX, _SEC_PREFIX):
+        if source.startswith(prefix) and not _ENV_VAR_NAME.fullmatch(source[len(prefix):]):
+            return values, "graph_memory.extraction_api_key has an invalid credential reference"
+    return values, ""
+
+
+def _parse_graph_memory(raw: dict, extraction_source: dict[str, Any] | None = None) -> GraphMemoryConfig:
     section = raw.get("graph_memory") or {}
+    enabled = _parse_bool(section.get("enabled", False), "graph_memory.enabled")
+    extraction: dict[str, str] = {}
+    reason = ""
+    source = extraction_source or {}
+    if enabled:
+        extraction, reason = _resolve_graph_extraction_settings(source)
+    else:
+        extraction = {k: v for k, v in source.items() if k in _GRAPH_EXTRACTION_FIELDS and isinstance(v, str)}
     return GraphMemoryConfig(
-        enabled=_parse_bool(section.get("enabled", False), "graph_memory.enabled"),
+        enabled=enabled,
         buffer_pool_mb=_parse_int(section.get("buffer_pool_mb"), 256, "graph_memory.buffer_pool_mb"),
-        extraction_model=section.get("extraction_model", ""),
+        extraction_provider=extraction.get("extraction_provider", ""),
+        extraction_base_url=extraction.get("extraction_base_url", ""),
+        extraction_api_key=extraction.get("extraction_api_key", ""),
+        extraction_unavailable_reason=reason,
+        extraction_model=extraction.get("extraction_model", ""),
         extract_every_n_turns=_parse_int(section.get("extract_every_n_turns"), 3, "graph_memory.extract_every_n_turns"),
         min_message_length=_parse_int(section.get("min_message_length"), 100, "graph_memory.min_message_length"),
         max_context_entries=_parse_int(section.get("max_context_entries"), 10, "graph_memory.max_context_entries"),
@@ -1246,6 +1324,14 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
     provider_source = raw.pop("providers", {})
     embedding_present = "embeddings" in raw
     embedding_source = raw.pop("embeddings", None)
+    # Graph extraction settings are validated and degraded on their own, so an
+    # unresolved reference there never aborts startup (nor is a vault required).
+    graph_extraction_source: dict[str, Any] = {}
+    graph_section = raw.get("graph_memory")
+    if isinstance(graph_section, dict):
+        for key in _GRAPH_EXTRACTION_FIELDS:
+            if key in graph_section:
+                graph_extraction_source[key] = graph_section.pop(key)
 
     vault: dict | None = None
     if _has_sec_reference(raw):
@@ -1281,31 +1367,13 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
 
     providers = _parse_providers(raw)
     embeddings_config = _parse_embeddings(raw, embedding_reason)
-    if not embeddings_config.unavailable_reason:
-        embedding_provider = embeddings_config.provider
-        if embedding_provider in providers:
-            connection = providers[embedding_provider]
-            embeddings_config = EmbeddingsConfig(
-                provider=embedding_provider,
-                api_key=embeddings_config.api_key or connection.api_key,
-                model=embeddings_config.model,
-                base_url=embeddings_config.base_url or connection.base_url,
-            )
-        elif embedding_provider in _PROVIDER_TYPES:
-            if not embeddings_config.api_key:
-                embeddings_config = EmbeddingsConfig(
-                    unavailable_reason=(
-                        "embeddings.api_key must be configured explicitly for an "
-                        "adapter provider without a matching connection"
-                    )
-                )
-        else:
-            embeddings_config = EmbeddingsConfig(
-                unavailable_reason=(
-                    "embeddings.provider must name a supported adapter or "
-                    "configured provider connection"
-                )
-            )
+    if (
+        not embeddings_config.unavailable_reason
+        and embeddings_config.provider not in _PROVIDER_TYPES
+    ):
+        embeddings_config = EmbeddingsConfig(
+            unavailable_reason="embeddings.provider must name a supported adapter type"
+        )
     models: list[ModelConfig] = []
 
     mcp_raw = raw.get("mcp_servers") or []
@@ -1319,7 +1387,7 @@ def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "pi
         scheduler=_parse_scheduler(raw),
         paths=_parse_paths(raw, agent_name=agent_name),
         vault=_parse_vault(raw),
-        graph_memory=_parse_graph_memory(raw),
+        graph_memory=_parse_graph_memory(raw, graph_extraction_source),
         mcp_servers=mcp_servers,
         providers=providers,
         llm_error_handling=_parse_llm_error_handling(raw),

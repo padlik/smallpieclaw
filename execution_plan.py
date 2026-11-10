@@ -85,6 +85,43 @@ class ExecutionPlan:
     timeout: int = 300
 
 
+_GENERATION_CONTROL_KEYS = ("max_tokens", "temperature", "top_p")
+
+
+def reject_generation_controls(plan_data: dict) -> None:
+    """Reject per-call generation controls in a model-supplied plan.
+
+    Checks the plan's top-level keys and each step's top-level keys by key
+    presence (any value, including ``None``). Step ``args`` stay opaque and
+    are never scanned.
+
+    Raises:
+        PlanValidationError: Naming the offending fields and where they sit.
+    """
+    def _found(container: object) -> list[str]:
+        if not isinstance(container, dict):
+            return []
+        return [key for key in _GENERATION_CONTROL_KEYS if key in container]
+
+    problems: list[str] = []
+    top = _found(plan_data)
+    if top:
+        problems.append("plan: " + ", ".join(top))
+    steps = plan_data.get("steps") if isinstance(plan_data, dict) else None
+    for index, step in enumerate(steps if isinstance(steps, list) else []):
+        names = _found(step)
+        if names:
+            label = step.get("id", index) if isinstance(step, dict) else index
+            problems.append(f"step '{label}': " + ", ".join(names))
+    if problems:
+        raise PlanValidationError(
+            "unsupported per-call generation field(s) ("
+            + "; ".join(problems)
+            + "). Remove max_tokens, temperature and top_p; "
+            "models use their configured settings."
+        )
+
+
 def validate_plan(plan: ExecutionPlan) -> None:
     """Validate an execution plan.
 

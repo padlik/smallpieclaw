@@ -52,9 +52,9 @@ from tests.root_startup_harness import (
     INVALID_SAVED,
     UNCONFIGURED_ID,
     remembered_for,
-    GRAPH_ENABLED_DISCOVERED,
     GRAPH_HOST,
     GRAPH_ID,
+    GRAPH_UPSTREAM,
     MAIN_ID,
     OTHER_ID,
     SECRETS,
@@ -1221,7 +1221,7 @@ class TestRootStartupGraphMemory:
     def test_graph_enabled_constructs_store_and_writer_with_resolved_pin(
         self, root_harness: RootHarness,
     ) -> None:
-        """Valid graph selector builds store/writer independently of Main (here the in-memory first)."""
+        """Explicit graph extraction builds store/writer independently of Main and the catalog."""
         root_harness.start(saved_default=None, graph_enabled=True, write_cache=False)
         root = root_harness
 
@@ -1238,8 +1238,9 @@ class TestRootStartupGraphMemory:
         assert isinstance(pin, RunModel)
         assert pin.model.id == GRAPH_ID
         assert pin.model.upstream_id == "graph-model"
-        assert pin.connection.provider_id == "graph"
+        assert pin.connection.provider_id == "graph-extraction"
         assert pin.connection.adapter == "openai"
+        assert pin.connection.base_url == f"https://{GRAPH_HOST}"
         assert pin.connection.api_key == SECRETS["GRAPH_KEY"]
         assert agent_config is root.app_cfg.agent
         assert kwargs.get("caller_tag", "graph-extract") == "graph-extract"
@@ -1282,24 +1283,20 @@ class TestRootStartupGraphMemory:
         assert "telegram:run" in root.events
         assert root.unexpected == []
 
-    def test_graph_disabled_when_selector_unresolvable(
+    def test_graph_disabled_when_extraction_field_missing(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """An invalid graph selector disables graph alone; Telegram/indexing survive."""
+        """A missing extraction field disables graph alone; Telegram/indexing survive."""
         from tests import root_startup_harness as rsh
 
         original_config_text = rsh._config_text
 
-        def config_with_bad_selector(workspace: Path, *, graph_enabled: bool = False) -> str:
+        def config_with_missing_model(workspace: Path, *, graph_enabled: bool = False) -> str:
             text = original_config_text(workspace, graph_enabled=graph_enabled)
-            if graph_enabled:
-                text = text.replace(
-                    f'extraction_model = "{GRAPH_ID}"', 'extraction_model = "graph/missing"'
-                )
-            return text
+            return text.replace(f'extraction_model = "{GRAPH_UPSTREAM}"\n', "")
 
-        monkeypatch.setattr(rsh, "_config_text", config_with_bad_selector)
+        monkeypatch.setattr(rsh, "_config_text", config_with_missing_model)
 
         root_harness.start(saved_default=INVALID_SAVED, graph_enabled=True)
         root = root_harness
@@ -1310,7 +1307,7 @@ class TestRootStartupGraphMemory:
         assert root.main_controller._graph_memory_writer is None
         assert "graph:store:init" not in root.events
         assert "graph:writer:init" not in root.events
-        self._assert_prerequisite_rejection(root, caplog, "extraction model is unusable")
+        self._assert_prerequisite_rejection(root, caplog, "graph_memory.extraction_model")
         assert "telegram:run" in root.events
         assert len(root.tool_indexes) == 1
         assert root.unexpected == []
@@ -1382,7 +1379,7 @@ class TestRootStartupGraphMemory:
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Missing graph provider credential disables graph alone after config parse."""
+        """An unresolvable extraction credential reference disables graph alone, with no fallback."""
         from tests import root_startup_harness as rsh
 
         original_config_text = rsh._config_text
@@ -1390,7 +1387,7 @@ class TestRootStartupGraphMemory:
         def config_with_missing_graph_key(workspace: Path, *, graph_enabled: bool = False) -> str:
             text = original_config_text(workspace, graph_enabled=graph_enabled)
             if graph_enabled:
-                text = text.replace('api_key = "env:GRAPH_KEY"', 'api_key = "env:MISSING_GRAPH_KEY"')
+                text = text.replace('extraction_api_key = "env:GRAPH_KEY"', 'extraction_api_key = "env:MISSING_GRAPH_KEY"')
             return text
 
         monkeypatch.setattr(rsh, "_config_text", config_with_missing_graph_key)
@@ -1399,7 +1396,7 @@ class TestRootStartupGraphMemory:
         root_harness.start(saved_default=INVALID_SAVED, graph_enabled=True)
         root = root_harness
 
-        self._assert_prerequisite_rejection(root, caplog, "extraction model is unusable")
+        self._assert_prerequisite_rejection(root, caplog, "graph_memory.extraction_api_key")
         assert root.graph_store_instances == []
         assert root.graph_writer_instances == []
         assert root.main_controller._graph_memory is None
@@ -1431,7 +1428,7 @@ class TestRootStartupGraphMemory:
 
         assert 'provider = "unsupported-embedding-provider"' in root.paths.config_file.read_text()
         assert root.app_cfg.embeddings.unavailable_reason == (
-            "embeddings.provider must name a supported adapter or configured provider connection"
+            "embeddings.provider must name a supported adapter type"
         )
         self._assert_prerequisite_rejection(root, caplog, "graph memory requires embeddings")
         assert root.graph_store_instances == []
@@ -1994,11 +1991,12 @@ class TestRootGraphStartupContainment:
     """Task 12.24: graph startup after a partly failed refresh, and independent
     containment of scheduler and graph failures with real bot commands."""
 
-    def test_graph_resolves_cached_stale_entry_without_any_startup_discovery(
+    def test_graph_uses_explicit_config_without_catalog_or_startup_discovery(
         self, root_harness: RootHarness,
     ) -> None:
-        """Task 3.6: a cached (stale) graph entry means nothing is re-discovered at startup, yet
-        the graph selector resolves to its pin; Main is only the in-memory first cached candidate."""
+        """Task 5.2: graph extraction builds its pin from its own explicit settings: the catalog has
+        no graph record or provider, nothing is discovered for it, and Main is only the in-memory
+        first cached candidate."""
         root_harness.serve_provider_chat(failing_discovery_hosts=(GRAPH_HOST,))
         root_harness.start(saved_default=None, graph_enabled=True)
         root = root_harness
@@ -2006,10 +2004,8 @@ class TestRootGraphStartupContainment:
         assert root.refresh_reports == [] and not [e for e in root.events if e.startswith("fetch:")]
         assert not [r for r in root.requests if r.url.path.endswith("/models")]
         view = root.registry.view()
-        assert {p.provider_id: p.status for p in view.providers} == {
-            "acme": "stale", "gem": "stale", "graph": "stale",
-        }
-        assert GRAPH_ID in {m.id for m in view.models}
+        assert {p.provider_id: p.status for p in view.providers} == {"acme": "stale", "gem": "stale"}
+        assert GRAPH_ID not in {m.id for m in view.models}
 
         # Graph pin is resolved after the selection restore (no rediscovery) and before store, writer and polling.
         ev = root.events
@@ -2019,7 +2015,7 @@ class TestRootGraphStartupContainment:
         pin, agent_config = args
         assert isinstance(pin, RunModel) and pin.model.id == GRAPH_ID
         assert pin.model.upstream_id == "graph-model"
-        assert pin.connection.provider_id == "graph" and pin.connection.adapter == "openai"
+        assert pin.connection.provider_id == "graph-extraction" and pin.connection.adapter == "openai"
         assert pin.connection.base_url == f"https://{GRAPH_HOST}"
         assert pin.connection.api_key == SECRETS["GRAPH_KEY"]
         assert agent_config is root.app_cfg.agent
@@ -2038,17 +2034,17 @@ class TestRootGraphStartupContainment:
         assert view.active_model_id == MAIN_ID and view.remembered_model_id is None
         assert not root.paths.model_selection_file.exists()
         saved = ModelCache(root.paths.models_cache_file).load().document
-        assert saved.default_model is None and GRAPH_ID in {m.id for m in saved.models}
+        assert saved.default_model is None and GRAPH_ID not in {m.id for m in saved.models}
         assert root.llm_clients == [] and root.main_controller.llm is None
         assert [r for r in root.requests if r.method == "POST" and r.url.host != EMBED_HOST] == []
         assert root.unexpected == [] and root.open_clients_at_exit == []
 
     @pytest.mark.parametrize("scheduler_state", ["unparseable", "unreadable"])
-    def test_invalid_scheduler_and_graph_selector_fail_independently_while_commands_work(
+    def test_invalid_scheduler_and_graph_extraction_fail_independently_while_commands_work(
         self, tmp_xdg: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
         scheduler_state: str,
     ) -> None:
-        """An unparseable/unreadable scheduler file and an unknown graph selector each fail
+        """An unparseable/unreadable scheduler file and a graph config missing its extraction model each fail
         alone: the real Scheduler is contained, graph is disabled, and the real bot
         ``/models`` and ``/jobs`` commands answer from the same root."""
         import telegram_interface
@@ -2058,9 +2054,9 @@ class TestRootGraphStartupContainment:
         original_config_text = rsh._config_text
 
         def config_with_bad_selector(workspace: Path, *, graph_enabled: bool = False) -> str:
-            """Real config parsing with an unknown graph selector."""
+            """Real config parsing with the graph extraction model removed."""
             text = original_config_text(workspace, graph_enabled=graph_enabled)
-            return text.replace(f'extraction_model = "{GRAPH_ID}"', 'extraction_model = "graph/missing"')
+            return text.replace(f'extraction_model = "{GRAPH_UPSTREAM}"\n', "")
 
         monkeypatch.setattr(rsh, "_config_text", config_with_bad_selector)
         root = RootHarness(tmp_xdg, monkeypatch, real_scheduler=True)
@@ -2115,7 +2111,7 @@ class TestRootGraphStartupContainment:
 
             # Graph prerequisite failure disabled graph alone, before helper/store/dimension work.
             TestRootStartupGraphMemory._assert_prerequisite_rejection(
-                root, caplog, "extraction model is unusable",
+                root, caplog, "graph_memory.extraction_model must be configured explicitly",
             )
             assert root.graph_store_instances == [] and root.graph_writer_instances == []
             assert "graph:store:init" not in root.events and "graph:writer:init" not in root.events
@@ -2333,7 +2329,7 @@ class TestRootManagedSettingsStartup:
 
             # The first (startup) payload, parsed by the real ModelSettings off the
             # production path, is a valid fresh catalog with no Main/default.
-            expected = GRAPH_ENABLED_DISCOVERED if graph_enabled else DISCOVERED
+            expected = DISCOVERED  # graph extraction is never a catalog record (task 5.2)
             startup_copy = tmp_path / "phase-check" / "startup-payload.json"
             startup_copy.parent.mkdir()
             startup_copy.write_bytes(write.incoming)
@@ -2393,7 +2389,7 @@ class TestRootManagedSettingsStartup:
                 ((args, _kwargs),) = root.graph_extraction_calls
                 pin = args[0]
                 assert isinstance(pin, RunModel) and pin.model.id == GRAPH_ID
-                assert pin.model.upstream_id == "graph-model" and pin.connection.provider_id == "graph"
+                assert pin.model.upstream_id == "graph-model" and pin.connection.provider_id == "graph-extraction"
                 assert pin.connection.api_key == SECRETS["GRAPH_KEY"]
                 assert root.main_controller._graph_memory is root.graph_store is not None
                 assert root.main_controller._graph_memory_writer is root.graph_writer is not None

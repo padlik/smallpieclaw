@@ -715,7 +715,7 @@ def main() -> None:
 
     # One independent embedding client for this CLI invocation.
     embed_client = EmbeddingClient(
-        app_cfg.embeddings, app_cfg.providers, vault_file=str(xdg.secrets_file)
+        app_cfg.embeddings, vault_file=str(xdg.secrets_file)
     )
     try:
         logger.info("Opening graph store at %s", db_path)

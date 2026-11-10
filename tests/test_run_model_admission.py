@@ -209,8 +209,8 @@ class Harness:
         http_client = httpx.Client(transport=httpx.MockTransport(self._embed))
         self.external_embed_http.append(http_client)
         client = _TrackedEmbedding(
-            EmbeddingsConfig(provider="openai", model="embed-1", api_key="embed-key"),
-            {},
+            EmbeddingsConfig(provider="openai", model="embed-1", api_key="embed-key",
+                base_url="https://embed.example.test/v1"),
             http_client=http_client,
             cancel_event=event,
         )
@@ -221,8 +221,8 @@ class Harness:
         """Real EmbeddingClient that creates and therefore owns its HTTP client."""
         self.factory_events.append(event)
         client = _TrackedEmbedding(
-            EmbeddingsConfig(provider="openai", model="embed-1", api_key="embed-key"),
-            {},
+            EmbeddingsConfig(provider="openai", model="embed-1", api_key="embed-key",
+                base_url="https://embed.example.test/v1"),
             cancel_event=event,
         )
         self.embeddings.append(client)
@@ -596,7 +596,7 @@ def test_missing_embedding_configuration_keeps_unavailable_behavior(
     harness: Harness, tmp_path: Path
 ) -> None:
     def unavailable(event: threading.Event) -> EmbeddingClient:
-        return EmbeddingClient(EmbeddingsConfig(), {}, cancel_event=event)
+        return EmbeddingClient(EmbeddingsConfig(), cancel_event=event)
 
     runner = _create(
         _runtime(harness, embedding_factory=unavailable), "ON_DEMAND_SUBAGENT",

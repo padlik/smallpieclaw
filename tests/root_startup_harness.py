@@ -131,10 +131,11 @@ GONE_ID = "acme/claude-gone"
 UNCONFIGURED_ID = "oldconn/claude-gone"
 # Harness sentinel: write an invalid preference file (Main stays unset, no auto-choice).
 INVALID_SAVED = "<invalid saved selection>"
-GRAPH_ID = "graph/graph-model"
+# Graph extraction is configured explicitly (task 5.2): it is never a catalog
+# record, so its model id is the configured upstream model string itself.
 GRAPH_UPSTREAM = "graph-model"
+GRAPH_ID = GRAPH_UPSTREAM
 DISCOVERED = ("acme/claude-a", "acme/claude-b", "gem/gem-1", "gem/gem-2")
-GRAPH_ENABLED_DISCOVERED = DISCOVERED + (GRAPH_ID,)
 # Loggers whose handlers/propagation/level the real logging setup mutates.
 _REAL_LOGGING_NAMED_LOGGERS = ("graph_memory", "sqlite_log_writer", "httpx", "telegram", "telegram.ext")
 # The real store's embedder resolution, captured before any boundary patch.
@@ -162,22 +163,14 @@ def remembered_for(saved_default: str | None) -> str | None:
 
 def _config_text(workspace: Path, *, graph_enabled: bool = False) -> str:
     """Return a providers/embeddings-only config (no legacy ``[[models]]``)."""
-    graph_provider_section = (
-        f"""
-[providers.graph]
-type = "openai"
-api_key = "env:GRAPH_KEY"
-base_url = "https://{GRAPH_HOST}"
-request_timeout = 7
-"""
-        if graph_enabled
-        else ""
-    )
     graph_memory_section = (
         f"""
 [graph_memory]
 enabled = true
-extraction_model = "{GRAPH_ID}"
+extraction_provider = "openai"
+extraction_base_url = "https://{GRAPH_HOST}"
+extraction_api_key = "env:GRAPH_KEY"
+extraction_model = "{GRAPH_UPSTREAM}"
 """
         if graph_enabled
         else ""
@@ -205,7 +198,7 @@ type = "google"
 api_key = "env:KEY_GEM"
 base_url = "https://{GEM_HOST}"
 request_timeout = 7
-{graph_provider_section}
+
 [embeddings]
 provider = "openai"
 model = "embed-small"
@@ -215,7 +208,7 @@ base_url = "https://{EMBED_HOST}/v1"
 
 
 def _saved_document(
-    default_model: str | None, *, graph_enabled: bool = False, removed_connection: str | None = None,
+    default_model: str | None, *, removed_connection: str | None = None,
     extra_cached: tuple[str, ...] = (),
 ) -> CatalogDocument:
     """Return a stale saved catalog lacking each provider's second page.
@@ -231,9 +224,6 @@ def _saved_document(
         ProviderState("acme", "anthropic", "2026-09-01T00:00:00Z", "stale"),
         ProviderState("gem", "google", "2026-09-01T00:00:00Z", "stale"),
     ]
-    if graph_enabled:
-        ids.add(GRAPH_ID)
-        providers.append(ProviderState("graph", "openai", "2026-09-01T00:00:00Z", "stale"))
     if removed_connection is not None:
         providers.append(ProviderState(removed_connection, "openai", "2026-09-01T00:00:00Z", "stale"))
     models = tuple(
@@ -757,8 +747,6 @@ class RootHarness:
             return httpx.Response(200, json={"data": [{"embedding": [0.25, 0.75]} for _ in inputs]})
         elif method == "POST" and host == GRAPH_HOST and path == "/v1/chat/completions":
             return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
-        elif method == "GET" and host == GRAPH_HOST and path == "/v1/models":
-            return httpx.Response(200, json={"data": [{"id": GRAPH_UPSTREAM}], "has_more": False})
         self.unexpected.append(f"{method} {request.url}")
         return httpx.Response(404, json={"error": "not served by the root harness"})
 
@@ -846,7 +834,7 @@ class RootHarness:
         if write_cache:
             ModelCache(self.paths.models_cache_file).write(
                 _saved_document(
-                    saved_default, graph_enabled=graph_enabled, removed_connection=removed_connection,
+                    saved_default, removed_connection=removed_connection,
                     extra_cached=extra_cached,
                 )
             )

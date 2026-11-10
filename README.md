@@ -103,12 +103,15 @@ There is no default-model setting: the remembered selection is made (and changed
 
 ```toml
 [embeddings]
-provider = "openai"
+provider = "openai"                       # adapter type: openai, openrouter or google
+base_url = "https://api.openai.com/v1"    # endpoint of the embedding service
+api_key  = "env:OPENAI_API_KEY"           # env:/sec: reference (or a literal key)
 model    = "text-embedding-3-small"
-api_key  = "env:OPENAI_API_KEY"
 ```
 
-Embedding model and provider must be configured explicitly. To inherit a provider connection's key and endpoint, set `provider` to its exact connection name and omit the embedding-specific values; explicit `api_key` and `base_url` override that connection's values. An adapter name without a matching connection requires its own credential. Credentials and endpoint never fall back to the active chat selection.
+All four fields are required. Embeddings never inherit anything from a `[providers.<id>]` chat connection (not even one of the same adapter type), from the active chat selection, or from graph extraction settings, so `provider` names an adapter type rather than a connection id, and there is no default endpoint. A local service still needs all four fields (`api_key` may be a placeholder value it ignores). The `api_key` reference is resolved only when the embedding client is created, and only for this endpoint.
+
+If any field is missing, blank, not a string, or invalid, the bot still starts and chat keeps working: tool search runs in its degraded text fallback, no embedding request is sent, and graph memory is disabled. The startup log names the offending fields (for example `embeddings.base_url, embeddings.api_key must be configured explicitly`) and never prints their values. Tool indexing and graph vectors share the one embedding service built from these settings.
 
 ### Migrating a legacy `[[models]]` configuration
 
@@ -323,6 +326,8 @@ The `shell` tool has three backends, selected by `shell_backend` in `[agent]`:
 | `memory_graph_search` | Search graph memory (requires graph memory enabled) | No |
 | `memory_graph_store` | Store a fact/episode in graph memory | No |
 | `context_profile` | Return a JSON snapshot of context-window consumption by category | No |
+
+`spawn_agent` and `plan` calls do not accept per-call generation settings. A `spawn_agent` argument, or a top-level key of a `plan` or one of its steps, named `max_tokens`, `temperature` or `top_p` (any value, including `null`) is rejected before any sub-agent, client or credential is set up; the call returns an error naming the field. Models use their configured settings; to change model, pass `model` to `spawn_agent`. A plan step's `args` are the opaque arguments of its tool and are not interpreted as generation settings.
 
 ### File access policy
 
@@ -589,7 +594,10 @@ Add to `config.toml`:
 [graph_memory]
 enabled               = true
 buffer_pool_mb        = 256          # use 64 on low-memory hosts
-extraction_model      = "graph/graph-model"  # exact catalog model ID; no fallback
+extraction_provider   = "openai"                    # adapter type: openai, openrouter, anthropic, google or ollama
+extraction_base_url   = "https://api.openai.com/v1"  # graph extraction's own endpoint
+extraction_api_key    = "sec:graph_extraction_key"   # literal, env:VAR or sec:KEY — used only for extraction
+extraction_model      = "gpt-example-mini"           # upstream model string, sent verbatim
 extract_every_n_turns = 3
 min_message_length    = 100
 max_context_entries   = 10
@@ -599,7 +607,9 @@ max_context_entries   = 10
 
 LadybugDB is embedded — it runs in-process with no separate server.
 
-Graph extraction resolves `extraction_model` independently of the Main selection: it never falls back to Main and never changes it. The standalone backfill commands below work from the saved catalog only — no provider discovery refresh and no managed-settings write; an unresolvable graph model or a missing/corrupt catalog fails before any database is constructed. On shutdown, if the graph writer does not stop within its bounded timeout, the failure is reported and the store and worker-used dependencies stay open — shutdown never claims success while they are unclosed.
+When graph memory is enabled, all four `extraction_*` settings are required and are used exactly as written: nothing is inherited from a chat connection (even one of the same adapter type), the model catalog, the Main selection or `[embeddings]`, and the extraction credential is sent only to `extraction_base_url`. Extraction always uses a fixed 1024-token output cap and does not use `agent.required_output_cap_tokens`. If any of the four is missing, blank, not a string, or invalid (unsupported `extraction_provider`, malformed URL, unresolvable credential reference), the bot logs a warning naming the field and starts with graph memory disabled; chat and indexing keep working. Graph vectors use the explicit `[embeddings]` settings. Unused `extraction_*` values are not checked while `enabled = false`.
+
+The standalone backfill commands below have not been migrated to these settings yet: they still read `extraction_model` as a saved-catalog model ID (no provider discovery refresh and no managed-settings write), and an unresolvable graph model or a missing/corrupt catalog fails before any database is constructed. On shutdown, if the graph writer does not stop within its bounded timeout, the failure is reported and the store and worker-used dependencies stay open — shutdown never claims success while they are unclosed.
 
 Seed from existing long-term memory (while agent is stopped):
 

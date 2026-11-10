@@ -129,7 +129,7 @@ def pin_b(registry: ModelRegistry) -> RunModel:
 
 def _unavailable_embedding(event: threading.Event) -> EmbeddingClient:
     """Real independent EmbeddingClient with no configuration (unavailable)."""
-    return EmbeddingClient(EmbeddingsConfig(), {}, cancel_event=event)
+    return EmbeddingClient(EmbeddingsConfig(), cancel_event=event)
 
 
 def _runtime(*, notify_fn=None, scheduled_max_iterations: int = 100,
