@@ -70,6 +70,7 @@ class ControllerDeps:
     max_iterations: int = 8
     top_tools: int = 3
     ctx_max_tokens: int = 90_000
+    compaction_threshold_tokens: int = 60_000
     tmp_dir: str = "/tmp/agent"
     downloads_dir: str = "downloads"
     workspace_dir: str = "~/Documents"

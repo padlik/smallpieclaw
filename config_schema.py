@@ -309,8 +309,11 @@ def _parse_positive_int(value: Any, default: int, field_path: str) -> int:
     if value is None:
         return default
     if type(value) is not int or value <= 0:
+        # Only integers are echoed; any other value (possibly a resolved secret) is
+        # reported by type name alone.
+        got = repr(value) if type(value) is int else type(value).__name__
         raise ConfigError(
-            f"Config field '{field_path}' must be a positive integer (for example 1024), got {value!r}"
+            f"Config field '{field_path}' must be a positive integer (for example 1024), got {got}"
         )
     return value
 
@@ -400,6 +403,14 @@ class AgentConfig:
     tool_timeout: int = 10
     max_output_size: int = 4000  # chars: stdout/stderr per-stream limit for shell/tools
     top_tools: int = 3
+    # Estimated-input-token threshold for automatic compaction (model-independent):
+    # system prompt + chat history/images + complete tool definitions are compared with
+    # it, never with model limits.
+    compaction_threshold_tokens: int = 60_000
+    # INTERNAL, not configurable: ``agent.ctx_max_tokens`` is rejected by
+    # ``parse_config`` and no config path populates this attribute. It no longer
+    # drives compaction or any live send decision; it remains only for the legacy
+    # selection-identity/preview machinery and is deleted with it in task 10.1.
     ctx_max_tokens: int = 90_000
     # Output-token parameter sent only to adapters whose API requires one (Anthropic);
     # never sized from context, discovered limits or the input estimate.
@@ -819,7 +830,9 @@ def _parse_agent(raw: dict) -> AgentConfig:
         tool_timeout=_parse_int(section.get("tool_timeout"), 10, "agent.tool_timeout"),
         max_output_size=_parse_int(section.get("max_output_size"), 4000, "agent.max_output_size"),
         top_tools=_parse_int(section.get("top_tools"), 3, "agent.top_tools"),
-        ctx_max_tokens=_parse_int(section.get("ctx_max_tokens"), 90_000, "agent.ctx_max_tokens"),
+        compaction_threshold_tokens=_parse_positive_int(
+            section.get("compaction_threshold_tokens"), 60_000, "agent.compaction_threshold_tokens"
+        ),
         required_output_cap_tokens=_parse_positive_int(
             section.get("required_output_cap_tokens"), 1024, "agent.required_output_cap_tokens"
         ),
@@ -1297,6 +1310,11 @@ def _reject_removed_fields(raw: dict) -> None:
         for key in ("default_model", "background_model", "fallback_models", "fallback_model"):
             if key in agent:
                 raise ConfigError(f"agent.{key} is no longer supported; select a discovered model with /models")
+        if "ctx_max_tokens" in agent:
+            raise ConfigError(
+                "agent.ctx_max_tokens is no longer supported; use agent.compaction_threshold_tokens "
+                "(a positive integer of estimated input tokens, default 60000) instead"
+            )
 
 
 def parse_config(raw: dict, vault_file: str | None = None, agent_name: str = "piclaw") -> AppConfig:

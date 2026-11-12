@@ -24,7 +24,7 @@ def _make_config(extra: dict[str, Any]) -> dict[str, Any]:
             "tool_timeout": 10,
             "max_output_size": 4000,
             "top_tools": 3,
-            "ctx_max_tokens": 90000,
+            "compaction_threshold_tokens": 60000,
         },
         "providers": {
             "openai-main": {

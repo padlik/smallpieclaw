@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from context_monitor import ContextSnapshot, compute_danger_level, compute_headroom_real
+from context_monitor import ContextSnapshot
 from telegram_mcp_commands import _refresh_tool_defs_snapshot
 
 
@@ -26,14 +26,10 @@ def test_refresh_publishes_updated_snapshot() -> None:
         chat_history_tokens=200,
         tool_defs_tokens=0,
         tool_defs_by_server={},
-        completion_reserve=512,
-        effective_window=4096,
         compaction_threshold=3072,
-        headroom_nominal=1000,
-        headroom_real=0,
-        danger_level="safe",
         is_live=True,
         turn=7,
+        model_id="pinned/model",
     )
     iface = _make_iface(last)
 
@@ -48,19 +44,10 @@ def test_refresh_publishes_updated_snapshot() -> None:
 
     assert updated.system_prompt_tokens == last.system_prompt_tokens
     assert updated.chat_history_tokens == last.chat_history_tokens
-    assert updated.completion_reserve == last.completion_reserve
-    assert updated.effective_window == last.effective_window
     assert updated.compaction_threshold == last.compaction_threshold
     assert updated.turn == last.turn
-
-    total = last.system_prompt_tokens + last.chat_history_tokens + updated.tool_defs_tokens
-    assert updated.danger_level == compute_danger_level(total, last.compaction_threshold)
-    assert updated.headroom_real == compute_headroom_real(
-        last.compaction_threshold,
-        last.system_prompt_tokens,
-        last.chat_history_tokens,
-        updated.tool_defs_tokens,
-    )
+    assert updated.model_id == last.model_id == "pinned/model"
+    assert not hasattr(updated, "danger_level") and not hasattr(updated, "headroom_real")
 
 
 def test_refresh_no_snapshot_no_publish() -> None:
@@ -114,12 +101,7 @@ def test_refresh_guard_mcp_manager_none() -> None:
         chat_history_tokens=10,
         tool_defs_tokens=0,
         tool_defs_by_server={},
-        completion_reserve=1,
-        effective_window=100,
         compaction_threshold=80,
-        headroom_nominal=10,
-        headroom_real=10,
-        danger_level="safe",
         is_live=True,
         turn=0,
     )
@@ -153,12 +135,7 @@ def test_refresh_attributes_mcp_server_tools() -> None:
         chat_history_tokens=200,
         tool_defs_tokens=0,
         tool_defs_by_server={"builtin": 0, "github": 0},
-        completion_reserve=512,
-        effective_window=4096,
         compaction_threshold=3072,
-        headroom_nominal=2772,
-        headroom_real=2772,
-        danger_level="safe",
         is_live=True,
         turn=5,
     )

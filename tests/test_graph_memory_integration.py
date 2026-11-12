@@ -41,7 +41,6 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_request_budget import compute_request_budget
 from model_settings import ModelSettings, SettingsLoadResult
 from providers._errors import LLMCancelledError, LLMPermanentError
 from react_loop import ReactContext
@@ -835,11 +834,13 @@ def prereq_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..
         assert registry.restore_selection().selection_status == _MAIN_STATUS[main]
         base = parse_config({
             "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [12345]},
-            "agent": {"ctx_max_tokens": _PREREQ_LOCAL_CONTEXT},
+            "agent": {"compaction_threshold_tokens": _PREREQ_LOCAL_CONTEXT},
             "paths": {},
         })
         app_cfg = dataclasses.replace(
             base,
+            # Retained internal attribute (no longer configurable; removed in 6.2).
+            agent=dataclasses.replace(base.agent, ctx_max_tokens=_PREREQ_LOCAL_CONTEXT),
             providers=providers,
             embeddings=embeddings,
             graph_memory=GraphMemoryConfig(enabled=enabled, extraction_model=selector),  # type: ignore[arg-type]
@@ -938,16 +939,12 @@ def test_prerequisites_pin_exact_graph_record_independent_of_main(
 
     assert isinstance(result, GraphPrerequisites)
     assert {item.name for item in dataclasses.fields(result)} == {
-        "pin", "budget", "embedding_provider", "embedding_model"
+        "pin", "embedding_provider", "embedding_model"
     }
     assert result.pin.model == next(item for item in view.models if item.id == _PREREQ_GRAPH_ID)
     assert result.pin.connection.provider_id == "g"
     assert result.pin.connection.api_key == _PREREQ_GRAPH_KEY
     assert (result.pin.catalog_revision, result.pin.selection_revision) == (view.revision, view.selection_revision)
-    assert result.budget == compute_request_budget(
-        result.pin.model.metadata, input_tokens=0, local_context_tokens=_PREREQ_LOCAL_CONTEXT, fixed_output_cap=1024
-    )
-    assert (result.budget.output_cap, result.budget.hard_input_budget) == (1024, 4096 - 1024)
     assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.embedding_model = "other"  # type: ignore[misc]
@@ -1007,44 +1004,25 @@ def test_disabled_config_is_still_validated_when_invoked(
 
 
 @pytest.mark.parametrize(
-    ("metadata", "unvalidated", "code"),
+    ("metadata", "unvalidated"),
     [
-        pytest.param(_meta(4096, 1023), None, "output_limit_too_small", id="output-below-fixed-cap"),
-        pytest.param(_meta(1024), None, "no_input_budget", id="no-headroom"),
+        pytest.param(_meta(4096, 1023), None, id="output-below-fixed-cap"),
+        pytest.param(_meta(1024), None, id="no-headroom"),
+        pytest.param(_meta(), None, id="no-limits"),
         pytest.param(
-            None, ModelMetadata(context_tokens=4096, output_tokens="2048"), "invalid_limit",  # type: ignore[arg-type]
-            id="raw-string-output",
+            None, ModelMetadata(context_tokens=4096, output_tokens="2048"), id="raw-string-output",  # type: ignore[arg-type]
         ),
-        pytest.param(None, ModelMetadata(context_tokens=True), "invalid_limit", id="bool-context"),
+        pytest.param(None, ModelMetadata(context_tokens=True), id="bool-context"),
     ],
 )
-def test_graph_budget_failure_uses_kernel_code_before_any_graph_client(
+def test_graph_prerequisites_have_no_budget_or_limit_gate(
     prereq_world: Callable[..., _PrereqWorld],
     metadata: ModelMetadata | None,
     unvalidated: ModelMetadata | None,
-    code: str,
 ) -> None:
-    """The fixed 1024 cap is checked by the kernel; no graph client or store is built."""
-    world = prereq_world(metadata=metadata, unvalidated=unvalidated)
-    _resolve_fails(world, code)
-    assert world.credentials.calls == ["g"]
-
-
-@pytest.mark.parametrize(
-    ("metadata", "hard_budget", "assumed_context"),
-    [
-        pytest.param(_meta(4096), 4096 - 1024, False, id="unknown-output"),
-        pytest.param(_meta(), _PREREQ_LOCAL_CONTEXT - 1024, True, id="no-context-or-input-uses-local"),
-    ],
-)
-def test_graph_budget_with_unknown_limits_succeeds(
-    prereq_world: Callable[..., _PrereqWorld], metadata: ModelMetadata, hard_budget: int, assumed_context: bool
-) -> None:
-    """Unknown output fits the fixed cap; missing context falls back to the labelled local window."""
-    result = _resolve_ok(prereq_world(metadata=metadata))
-    assert result.budget.output_cap == 1024
-    assert result.budget.hard_input_budget == hard_budget
-    assert result.budget.assumed_context is assumed_context
+    """Discovered limits (even malformed) never fail graph prerequisites; no budget is computed."""
+    result = _resolve_ok(prereq_world(metadata=metadata, unvalidated=unvalidated))
+    assert not hasattr(result, "budget")
 
 
 @pytest.mark.parametrize(

@@ -138,7 +138,7 @@ def test_native_tool_wire_preserves_full_schema_and_snapshots_caller_tools() -> 
     client.close()
 
 
-def test_large_native_schema_is_rejected_before_network_and_attempt_count() -> None:
+def test_large_native_schema_is_sent_unchanged_and_counted_once() -> None:
     captured: list[httpx.Request] = []
     client = _client(lambda request: captured.append(request) or _ollama_response())
     state = CallAttemptState(1, 0)
@@ -153,11 +153,11 @@ def test_large_native_schema_is_rejected_before_network_and_attempt_count() -> N
         },
     }]
     with client.bind_attempt(state):
-        with pytest.raises(Exception, match="budget"):
-            client.chat_with_tools([{"role": "user", "content": "call"}], tools)
+        client.chat_with_tools([{"role": "user", "content": "call"}], tools)
 
-    assert captured == []
-    assert state.outbound_attempts == 0
+    assert len(captured) == 1
+    assert json.loads(captured[0].content)["tools"] == tools
+    assert state.outbound_attempts == 1
     client.close()
 
 

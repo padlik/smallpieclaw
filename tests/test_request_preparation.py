@@ -25,7 +25,7 @@ from model_request_budget import (
 from providers._errors import (
     LLMContextOverflowError,
 )
-from react_loop import _LoopState, _prepare_request, _summarize_on_pin
+from react_loop import _LoopState, _summarize_on_pin
 from tests.execution_harness import RecordingExecutor, build_context, run_react
 from tests.run_model_fixtures import make_run_model_client
 
@@ -90,35 +90,9 @@ class TestRepairInputCeiling:
 
 
 class TestOverflowAttributes:
-    def test_recoverable_oversize_carries_numbers_only(self):
-        requests = []
-        client = _client(_recording(requests), ModelMetadata(context_tokens=2_000, output_tokens=200))
-        try:
-            with pytest.raises(LLMContextOverflowError) as info:
-                client.chat([{"role": "user", "content": "secret-marker " * 4000}])
-            exc = info.value
-            assert exc.repair_input_ceiling == 1_800
-            assert exc.input_tokens > 1_800
-            assert "secret-marker" not in str(exc) and "prep-model" not in str(exc)
-            assert requests == []
-        finally:
-            client.close()
-
     def test_provider_reported_overflow_has_no_numbers(self):
         assert LLMContextOverflowError("x").input_tokens is None
         assert LLMContextOverflowError("x", input_tokens=5, repair_input_ceiling=9).input_tokens is None
-
-    def test_unknown_required_output_uses_the_configured_cap_in_the_local_guard(self):
-        """Task 4.1 cap slice: no discovered output limit is needed; the configured 1024 cap is the reserve."""
-        client = _client(
-            lambda r: pytest.fail("no I/O"), ModelMetadata(context_tokens=2_000), adapter="anthropic"
-        )
-        try:
-            with pytest.raises(LLMContextOverflowError) as info:
-                client.chat([{"role": "user", "content": "word " * 4000}])
-            assert info.value.repair_input_ceiling == 2_000 - 1_024
-        finally:
-            client.close()
 
     def test_preview_exposes_budget_and_metadata_is_typed(self):
         client = _client(lambda r: pytest.fail("no I/O"), ModelMetadata(context_tokens=8_192, output_tokens=1_024))
@@ -151,49 +125,16 @@ class TestRealReactPreparation:
             for i in range(6)
         ]
         try:
-            result, _calls, _progress = run_react(client, RecordingExecutor(), "GOAL", short_term=short_term)
+            result, _calls, _progress = run_react(
+                client, RecordingExecutor(), "GOAL", short_term=short_term,
+                compaction_threshold_tokens=9_000,
+            )
             assert result == "done"
             bodies = [r.content.decode() for r in requests]
             assert any("Summarize these" in b for b in bodies[:-1])
             assert "Compacted context" in bodies[-1] and "GOAL" in bodies[-1]
         finally:
             client.close()
-
-    def test_irreducible_system_prompt_fails_with_zero_io(self):
-        requests = []
-        client = _client(_recording(requests), ModelMetadata(context_tokens=2_000, output_tokens=200))
-        ctx = build_context(client, RecordingExecutor())
-        state = _LoopState(messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=3)
-        try:
-            with pytest.raises(LLMContextOverflowError):
-                _prepare_request(ctx, state, "system " * 5000, 2_000, False)
-            assert requests == []
-        finally:
-            client.close()
-
-    def test_sub_256_budget_gets_forced_repair_or_final_reject(self):
-        requests = []
-        client = _client(_recording(requests), ModelMetadata(context_tokens=300, output_tokens=100))
-        ctx = build_context(client, RecordingExecutor())
-        messages = [
-            {"role": "user", "content": "GOAL"},
-            {"role": "assistant", "content": "a " * 2000},
-            {"role": "user", "content": "b " * 2000},
-            {"role": "assistant", "content": "c " * 2000},
-            {"role": "user", "content": "d " * 2000},
-        ]
-        state = _LoopState(messages=messages, goal_idx=0, max_steps=3)
-        try:
-            try:
-                _prepare_request(ctx, state, "s", 300, False)
-            except LLMContextOverflowError:
-                pass
-            else:
-                assert state.last_budget is not None
-            assert state.messages is not messages
-        finally:
-            client.close()
-
 
 class TestSummaryCall:
     def test_summary_has_own_budget_and_main_state_untouched(self):
@@ -212,17 +153,6 @@ class TestSummaryCall:
             assert _summarize_on_pin(ctx, "summarize me") == "- earlier steps summarized"
             assert len(calls) == 2
             assert state.attempt_state is None
-        finally:
-            client.close()
-
-    def test_oversized_summary_prompt_has_zero_io(self):
-        requests = []
-        client = _client(_recording(requests), ModelMetadata(context_tokens=300, output_tokens=100))
-        ctx = build_context(client, RecordingExecutor())
-        try:
-            with pytest.raises(LLMContextOverflowError):
-                _summarize_on_pin(ctx, "word " * 5000)
-            assert requests == []
         finally:
             client.close()
 
@@ -253,23 +183,6 @@ class TestSummaryCall:
         assert sum(len(str(m["content"])) for m in out) < sum(len(str(m["content"])) for m in messages)
 
 
-def test_snapshot_publication_uses_preview_budget_with_real_client():
-    from context_monitor import ContextMonitor
-
-    monitor = ContextMonitor()
-    client = _client(_recording([]), ModelMetadata(context_tokens=8_192, output_tokens=1_024))
-    try:
-        result, _calls, _progress = run_react(
-            client, RecordingExecutor(), "do it", context_monitor=monitor
-        )
-        snapshot = monitor.read()
-        assert result == "done"
-        assert snapshot.effective_window == 8_192
-        assert snapshot.completion_reserve == 1_024
-    finally:
-        client.close()
-
-
 TOOL_DEF = {
     "type": "function",
     "function": {"name": "probe", "description": "d", "parameters": {"type": "object", "properties": {}}},
@@ -287,54 +200,3 @@ def _history(goal: str, n: int = 6) -> list[dict]:
         for i in range(n)
     ]
     return msgs + [{"role": "user", "content": goal}]
-
-
-class TestIndispensableDiagnostic:
-    @pytest.mark.parametrize(
-        "goal, system, defs_words",
-        [
-            ("goal " * 4000, "s", 5),
-            ("goal", "system " * 4000, 5),
-            ("goal", "s", 4000),
-            ("goal " * 700, "system " * 700, 700),
-        ],
-        ids=["goal", "system", "definitions", "combined"],
-    )
-    def test_irreducible_part_makes_zero_http(self, goal, system, defs_words):
-        requests = []
-        client = _client(_recording(requests), ModelMetadata(context_tokens=2_000, output_tokens=200))
-        ctx = build_context(client, RecordingExecutor())
-        ctx._tool_defs = _big_tool_defs(defs_words)
-        messages = _history(goal)
-        state = _LoopState(messages=messages, goal_idx=len(messages) - 1, max_steps=3)
-        before = list(messages)
-        try:
-            with pytest.raises(LLMContextOverflowError):
-                _prepare_request(ctx, state, system, 2_000, True)
-            assert requests == []
-            assert state.messages == before
-        finally:
-            client.close()
-
-    def test_fitting_diagnostic_but_failing_final_never_sends_diagnostic(self):
-        requests = []
-        client = _client(_recording(requests), ModelMetadata(context_tokens=2_000, output_tokens=200))
-        ctx = build_context(client, RecordingExecutor())
-        ctx._tool_defs = []
-        try:
-            budget = client.preview_request([{"role": "user", "content": "x"}], "s").hard_input_budget
-            words = 1
-            while client.preview_request(
-                [{"role": "user", "content": "goal " * (words + 5)}], "s"
-            ).input_tokens <= budget - 30:
-                words += 5
-            goal = "goal " * words
-            assert client.preview_request([{"role": "user", "content": goal}], "s").input_tokens <= budget
-            messages = _history(goal)
-            state = _LoopState(messages=messages, goal_idx=len(messages) - 1, max_steps=3)
-            with pytest.raises(LLMContextOverflowError):
-                _prepare_request(ctx, state, "s", 2_000, False)
-            bodies = [r.content.decode() for r in requests]
-            assert all("Summarize these" in body for body in bodies)
-        finally:
-            client.close()

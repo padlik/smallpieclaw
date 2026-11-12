@@ -19,14 +19,10 @@ def _make_snapshot(**overrides) -> ContextSnapshot:
         "chat_history_tokens": 20,
         "tool_defs_tokens": 30,
         "tool_defs_by_server": {"builtin": 30},
-        "completion_reserve": 512,
-        "effective_window": 4096,
         "compaction_threshold": 3000,
-        "headroom_nominal": 100,
-        "headroom_real": 70,
-        "danger_level": "approaching",
         "is_live": True,
         "turn": 2,
+        "model_id": "pinned/model",
     }
     defaults.update(overrides)
     return ContextSnapshot(**defaults)
@@ -40,17 +36,16 @@ def test_exec_context_profile_returns_expected_fields() -> None:
     result = exec_context_profile(monitor)
 
     assert result["success"] is True
-    assert result["danger_level"] == "approaching"
     assert result["total_tokens"] == 10 + 20 + 30
     assert result["system_prompt_tokens"] == 10
     assert result["chat_history_tokens"] == 20
     assert result["tool_defs_tokens"] == 30
     assert result["tool_defs_by_server"] == {"builtin": 30}
-    assert result["completion_reserve"] == 512
-    assert result["effective_window"] == 4096
     assert result["compaction_threshold"] == 3000
-    assert result["headroom_nominal"] == 100
-    assert result["headroom_real"] == 70
+    assert result["model_id"] == "pinned/model"
+    for retired in ("danger_level", "completion_reserve", "effective_window",
+                    "headroom_nominal", "headroom_real"):
+        assert retired not in result
     assert result["is_live"] is True
     assert result["turn"] == 2
 

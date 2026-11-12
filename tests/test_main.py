@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import html
 import io
 import json
@@ -1259,8 +1260,8 @@ class TestRootStartupGraphMemory:
         assert len(root.tool_indexes) == 1
         assert root.tool_indexes[0].llm is root.root_embedding
         probes = [client for client in root.embedding_clients_at_hold if client is not root.root_embedding]
-        assert len(probes) == 1
-        assert probes[0]._http.is_closed
+        # Graph validation is pure: no temporary embedding probe client is ever built.
+        assert probes == []
         assert root.unexpected == []
 
     @pytest.mark.parametrize("saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no_selection", "main_gone"])
@@ -1278,8 +1279,8 @@ class TestRootStartupGraphMemory:
         # No ordinary Main admission happened.
         assert root.registry.view().active_model_id is None
         probes = [client for client in root.embedding_clients_at_hold if client is not root.root_embedding]
-        assert len(probes) == 1
-        assert probes[0]._http.is_closed
+        # Graph validation is pure: no temporary embedding probe client is ever built.
+        assert probes == []
         assert "telegram:run" in root.events
         assert root.unexpected == []
 
@@ -1344,35 +1345,48 @@ class TestRootStartupGraphMemory:
         assert "telegram:run" in root.events
         assert root.unexpected == []
 
-    def test_graph_disabled_when_extraction_budget_too_small(
+    def test_graph_starts_with_local_context_below_the_fixed_extraction_cap(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A local context below the fixed extraction cap disables graph alone."""
+        """Graph extraction has no fit gate: a tiny internal context window (512) leaves graph enabled."""
         from tests import root_startup_harness as rsh
 
         original_config_text = rsh._config_text
 
-        def config_with_small_budget(workspace: Path, *, graph_enabled: bool = False) -> str:
-            """Set the generated agent budget without bypassing real startup."""
+        def config_with_small_context(workspace: Path, *, graph_enabled: bool = False) -> str:
+            """Set the generated agent context without bypassing real startup."""
             text = original_config_text(workspace, graph_enabled=graph_enabled)
-            return text.replace("[agent]\n", "[agent]\nctx_max_tokens = 512\n")
+            return text.replace("[agent]\n", "[agent]\ncompaction_threshold_tokens = 512\n")
 
-        monkeypatch.setattr(rsh, "_config_text", config_with_small_budget)
+        monkeypatch.setattr(rsh, "_config_text", config_with_small_context)
+
+        # ``agent.ctx_max_tokens`` can no longer be written in TOML. Delegate to the REAL
+        # ``main.load_config`` (real TOML parse + validation, threshold 512 asserted below)
+        # and swap only the typed agent section of its result to inject the retained
+        # internal attribute (removed in task 6.2), so the effective tiny window is 512.
+        real_load_config = main_mod.load_config
+        injected: list[int] = []
+
+        def load_config_with_tiny_internal_context(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], Any]:
+            """Return the real ``(cfg, app_cfg)`` with only ``agent.ctx_max_tokens`` replaced."""
+            cfg, app_cfg = real_load_config(*args, **kwargs)
+            assert app_cfg.agent.ctx_max_tokens == 90_000  # real parse never sets it
+            agent = dataclasses.replace(app_cfg.agent, ctx_max_tokens=512)
+            injected.append(agent.ctx_max_tokens)
+            return cfg, dataclasses.replace(app_cfg, agent=agent)
+
+        monkeypatch.setattr(main_mod, "load_config", load_config_with_tiny_internal_context)
 
         root_harness.start(saved_default=INVALID_SAVED, graph_enabled=True)
         root = root_harness
 
+        assert injected == [512]
+        assert root.app_cfg.agent.compaction_threshold_tokens == 512
         assert root.app_cfg.agent.ctx_max_tokens == 512
-        self._assert_prerequisite_rejection(root, caplog, "cannot fit a request")
-        assert root.registry.view().active_model_id is None
-        assert root.graph_store_instances == []
-        assert root.graph_writer_instances == []
-        assert root.main_controller._graph_memory is None
-        assert root.main_controller._graph_memory_writer is None
-        assert "graph:store:init" not in root.events
+        assert len(root.graph_store_instances) == 1
+        assert len(root.graph_writer_instances) == 1
+        assert "graph:store:init" in root.events
         assert "telegram:run" in root.events
-        assert len(root.tool_indexes) == 1
         assert root.unexpected == []
 
     def test_graph_disabled_when_extraction_credentials_unresolvable(

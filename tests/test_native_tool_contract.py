@@ -394,10 +394,10 @@ def test_real_loop_reuses_cached_full_definitions_on_every_native_request(
     (built,) = builds
     assert built == build_tool_definitions()
     expected_revision = react_loop._definition_revision(SimpleNamespace(_tool_defs=built))
-    # Every binding (pre-fit and send) carries the same full-definition revision.
-    assert [b.revision for b in binds] == [expected_revision] * 6
-    # Per turn: a pre-fit preview with no attempt and no request, then exactly one send.
-    assert [(b.attempts, b.requests) for b in binds] == [(0, 0), (1, 1)] * 3
+    # Every send carries the same full-definition revision.
+    assert [b.revision for b in binds] == [expected_revision] * 3
+    # Per turn exactly one send: there is no pre-send preview binding any more.
+    assert [(b.attempts, b.requests) for b in binds] == [(1, 1)] * 3
     assert len(captured) == 3
     bodies = [json.loads(r.content) for r in captured]
     for body in bodies:
@@ -570,8 +570,9 @@ class TestNativeGroupsOnRealClient:
             {"role": "tool", "tool_call_id": "b", "content": "rb " + "y " * 2500},
         ]
         state = _LoopState(messages=messages, goal_idx=0, max_steps=3)
+        ctx.compaction_threshold_tokens = 3_000
         try:
-            _prepare_request(ctx, state, "s", 4_000, True)
+            _prepare_request(ctx, state, "s", 0)
             out = state.messages
             assert out[state.goal_idx] == {"role": "user", "content": "GOAL"}
             ids = [m["tool_call_id"] for m in out if m["role"] == "tool"]
@@ -621,7 +622,7 @@ class TestNativeValidationOnRealClient:
         state = _LoopState(messages=messages, goal_idx=0, max_steps=3)
         try:
             with pytest.raises(LLMPermanentError) as info:
-                _prepare_request(ctx, state, "s", 4_000, True)
+                _prepare_request(ctx, state, "s", 0)
             assert info.value.__cause__ is None and info.value.__context__ is None
             assert requests == []
             assert state.messages == before
@@ -644,7 +645,7 @@ class TestNativeValidationOnRealClient:
         before = copy.deepcopy(messages)
         state = _LoopState(messages=messages, goal_idx=0, max_steps=3)
         try:
-            _prepare_request(ctx, state, "s", 4_000, False)
+            _prepare_request(ctx, state, "s", 0)
             assert state.messages == before
             client.chat([{"role": "system", "content": "s"}] + state.messages)
             body = requests[-1].content.decode()
@@ -684,7 +685,7 @@ class TestMalformedHistoryRealClient:
         state = _LoopState(messages=messages, goal_idx=goal_idx, max_steps=3)
         try:
             with pytest.raises(LLMPermanentError) as info:
-                _prepare_request(ctx, state, "s", 10_000, True)
+                _prepare_request(ctx, state, "s", 0)
             assert self.SECRET not in str(info.value)
             assert requests == []
             assert state.messages == before

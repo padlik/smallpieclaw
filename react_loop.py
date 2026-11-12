@@ -30,19 +30,22 @@ from builtin_tools.schemas import (
     builtin_tool_names,
 )
 from confirmation import ConfirmationManager
-from context_manager import maybe_compact, resolve_compaction_threshold, validate_native_history
+from context_manager import (
+    CompactionFailedError,
+    _active_model,
+    maybe_compact,
+    validate_native_history,
+)
 from context_monitor import (
     ContextMonitor,
     ContextSnapshot,
-    compute_danger_level,
-    compute_headroom_real,
     group_tool_defs_by_server,
 )
 from interfaces import ToolCall
 from call_attempt_state import CallAttemptState
 from checkpoint_store import CheckpointRetireStatus
 from llm_client import LLMClient, LLMCancelledError, LLMContextOverflowError, LLMEmptyResponseError, LLMError, LLMPermanentError, _encode_images
-from model_request_budget import ModelRequestBudget
+from prompt_builder import estimate_messages_tokens, estimate_tokens
 from model_selection_guard import GUARD_PREPARATION_FAILED_MESSAGE, GUARD_REJECTION_MESSAGE
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from outcome_utils import (
@@ -240,6 +243,7 @@ class ReactContext:
     max_subagents: int = 6
     top_tools: int = 3
     ctx_max_tokens: int = 90_000
+    compaction_threshold_tokens: int = 60_000
     tmp_dir: str = "/tmp/agent"
     downloads_dir: str = "downloads"
     workspace_dir: str = "~/Documents"
@@ -675,12 +679,15 @@ class _LoopState:
     step: int = 0
     json_fail_streak: int = 0
     attempt_state: CallAttemptState | None = None
-    last_budget: ModelRequestBudget | None = None
     action_accepted: bool = False
     # Set only by dispatch of an actually executed, usable action; the guard's
     # one-shot completion fires from this and never from action_accepted.
     guard_eligible: bool = False
     operator_cancelled: bool = False
+    # Set when an automatic compaction attempt fails; skips further automatic attempts
+    # for this run only. Run state: a new run constructs a new _LoopState, and a resumed
+    # run does not persist it (like the doom-loop counters below).
+    auto_compaction_disabled: bool = False
     last_action_time: float = field(default_factory=time.time)
     warned_inactivity: bool = False
     # Doom-loop detection (T2): last failure key + consecutive repeat count.
@@ -882,15 +889,45 @@ def _get_tool_registry_for_grouping(ctx: ReactContext):
         return None
 
 
+def _ownerless_tool_defs_by_server(ctx: ReactContext, builtin_names: set[str]) -> dict[str, int]:
+    """Count the complete definition array without any ownership registry.
+
+    Used when the registry lookup fails: built-in/pseudo names stay ``builtin``,
+    the rest ``unknown``, registered MCP servers are still seeded. If even that
+    fails the whole array is counted as one ``unknown`` group; an empty array is
+    a legitimate zero. A count is never skipped, truncated or turned into a
+    rejection.
+    """
+    try:
+        return group_tool_defs_by_server(ctx._tool_defs, None, ctx.mcp_manager, builtin_names)
+    except Exception:  # noqa: BLE001 — a count must always be produced
+        definitions = ctx._tool_defs or []
+        if not definitions:
+            return {"builtin": 0}
+        return {"unknown": estimate_tokens(json.dumps(definitions, default=str))}
+
+
 def _tool_defs_by_server_for_context(ctx: ReactContext) -> dict[str, int]:
-    """Group current tool definitions by server and return per-server token counts."""
+    """Group current tool definitions by server and return per-server token counts.
+
+    An ownership-lookup failure degrades to ownerless grouping of the same complete
+    schema array, so the compaction decision and the snapshot never see zero for
+    existing tools. Only the exception type is logged (messages may carry secrets).
+    """
     builtin_names = builtin_tool_names()
-    return group_tool_defs_by_server(
-        ctx._tool_defs,
-        _get_tool_registry_for_grouping(ctx),
-        ctx.mcp_manager,
-        builtin_names,
-    )
+    try:
+        return group_tool_defs_by_server(
+            ctx._tool_defs,
+            _get_tool_registry_for_grouping(ctx),
+            ctx.mcp_manager,
+            builtin_names,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "tool-def ownership grouping failed (%s); counting the complete definitions "
+            "without ownership lookup", type(exc).__name__,
+        )
+        return _ownerless_tool_defs_by_server(ctx, builtin_names)
 
 
 def _publish_context_snapshot(
@@ -898,20 +935,18 @@ def _publish_context_snapshot(
     state: _LoopState,
     system: str,
     tool_defs_by_server: dict[str, int] | None = None,
-    tool_defs_tokens: int | None = None,
 ) -> None:
     """Build and publish a ContextSnapshot from current turn data.
 
-    *tool_defs_by_server* and *tool_defs_tokens* may be supplied when the caller
-    has already computed them (e.g. the main ReAct loop). When omitted, the
-    helper computes them fresh. Token estimation mirrors
+    *tool_defs_by_server* may be supplied when the caller has already computed
+    it (e.g. the main ReAct loop); otherwise it is computed fresh. The tool
+    total is always the sum of the per-server estimates, the same figure the
+    compaction decision uses. Token estimation mirrors
     :func:`context_manager.maybe_compact`: the active model name drives the
     encoder selection and the system prompt is folded into the messages total.
     """
     if ctx.context_monitor is None:
         return
-
-    from prompt_builder import estimate_tokens, estimate_messages_tokens
 
     _model = ctx.llm.llm_cfg.get("model")
     _total_with_system = estimate_messages_tokens(state.messages, system, model=_model)
@@ -919,36 +954,20 @@ def _publish_context_snapshot(
     chat_history_tokens = max(0, _total_with_system - system_prompt_tokens)
     if tool_defs_by_server is None:
         tool_defs_by_server = _tool_defs_by_server_for_context(ctx)
-    if tool_defs_tokens is None:
-        tool_defs_tokens = sum(tool_defs_by_server.values())
-    effective_window, compaction_threshold = resolve_compaction_threshold(
-        ctx.llm.llm_cfg, ctx.ctx_max_tokens, request_budget=state.last_budget,
-    )
-    completion_reserve = (
-        state.last_budget.completion_reserve
-        if state.last_budget is not None
-        else ctx.llm.llm_cfg.get("max_tokens", 1024)
-    )
-    headroom_nominal = compaction_threshold - system_prompt_tokens - chat_history_tokens
-    headroom_real = compute_headroom_real(
-        compaction_threshold, system_prompt_tokens, chat_history_tokens, tool_defs_tokens,
-    )
-    total = system_prompt_tokens + chat_history_tokens + tool_defs_tokens
-    danger_level = compute_danger_level(total, compaction_threshold)
+    # Copy: the per-run grouping cache must never be a live alias of a published snapshot.
+    tool_defs_by_server = dict(tool_defs_by_server)
+    tool_defs_tokens = sum(tool_defs_by_server.values())
+    model_id = ctx.llm.llm_cfg.get("id")
 
     snapshot = ContextSnapshot(
         system_prompt_tokens=system_prompt_tokens,
         chat_history_tokens=chat_history_tokens,
         tool_defs_tokens=tool_defs_tokens,
         tool_defs_by_server=tool_defs_by_server,
-        completion_reserve=completion_reserve,
-        effective_window=effective_window,
-        compaction_threshold=compaction_threshold,
-        headroom_nominal=headroom_nominal,
-        headroom_real=headroom_real,
-        danger_level=danger_level,
+        compaction_threshold=ctx.compaction_threshold_tokens,
         is_live=True,
         turn=state.step,
+        model_id=model_id if isinstance(model_id, str) else "",
     )
     ctx.context_monitor.publish(snapshot)
 
@@ -1198,95 +1217,83 @@ def _is_transient_llm_error(exc: BaseException) -> bool:
 def _summarize_on_pin(ctx: ReactContext, prompt: str) -> str:
     """Summarize on the pinned model with its own bounded attempt state.
 
-    The summary prompt is previewed first so an oversized prompt costs no I/O and
-    falls back deterministically in the caller. Waits are cancel-responsive and
-    cancellation propagates; the main request's attempt state and pending
-    checkpoint are never touched.
+    The summary is sent without any size preview or fit check. Waits are
+    cancel-responsive and cancellation propagates; the main request's attempt
+    state and pending checkpoint are never touched.
     """
     messages = [{"role": "user", "content": prompt}]
-    ctx.llm.preview_request(messages, None)
     attempt = CallAttemptState(ctx.max_retries, ctx.retry_delay)
     wait = ctx.retry_wait or (lambda event, seconds: event.wait(seconds))
     while True:
         if ctx.cancel_event.is_set():
             raise LLMCancelledError("cancelled")
         try:
-            with ctx.llm.bind_attempt(attempt, manual=attempt.manual_retry_authorized):
-                return ctx.llm.chat(messages)
+            bind_cancel = getattr(ctx.llm, "bind_cancel_event", None)
+            with (
+                bind_cancel(ctx.cancel_event) if callable(bind_cancel) else nullcontext(),
+                ctx.llm.bind_attempt(attempt, manual=attempt.manual_retry_authorized),
+            ):
+                text = ctx.llm.chat(messages)
         except LLMCancelledError:
             raise
-        except (LLMError, httpx.HTTPError) as exc:
+        except (LLMError, LLMEmptyResponseError, httpx.HTTPError) as exc:
+            if ctx.cancel_event.is_set():  # a cancel racing the failure is a cancel
+                raise LLMCancelledError("cancelled") from None
             if not _is_transient_llm_error(exc) or not attempt.can_retry_automatically():
                 raise
             if wait(ctx.cancel_event, attempt.next_retry_delay()) or ctx.cancel_event.is_set():
                 raise LLMCancelledError("cancelled") from None
+        else:
+            if ctx.cancel_event.is_set():  # a reply (even blank) after a cancel is a cancel
+                raise LLMCancelledError("cancelled")
+            return text
 
 
 def _prepare_request(
     ctx: ReactContext,
     state: _LoopState,
     system: str,
-    effective_ctx: int,
-    supports_native_fallback: bool,
+    tool_defs_tokens: int,
 ) -> None:
-    """Preview the exact selected request and compact before any send.
+    """Compact before a send when the estimated input exceeds the threshold.
 
-    A fitting request goes through ordinary threshold compaction using the
-    preview's budget. A recoverable oversize request gets one forced bounded
-    compaction toward the repair ceiling. Either way a strict re-preview must
-    pass; otherwise the error propagates with no provider I/O.
+    The estimate is the system prompt, the full chat history (including image
+    allowances) and the complete current tool definitions
+    (``tool_defs_tokens``, the sum of the per-server estimates). It is compared
+    only with ``agent.compaction_threshold_tokens``; cached model limits, output
+    caps and previews take no part, and nothing here rejects a send for size.
+    Malformed native tool-call history still raises before any provider I/O.
     """
-    attempt = state.attempt_state
-    native = bool(
-        ctx._tool_defs and supports_native_fallback
-        and (attempt is None or attempt.mode == "native")
-    )
-    revision = _definition_revision(ctx)
-
-    def preview(messages: list[dict] | None = None):
-        nonlocal native
-        messages = state.messages if messages is None else messages
-        if native:
-            try:
-                return ctx.llm.preview_request(
-                    messages, system, tools=ctx._tool_defs,
-                    definition_revision=revision,
-                )
-            except NotImplementedError:
-                native = False
-        return ctx.llm.preview_request(
-            _linearize_native_turns(messages), system, json_mode=True,
-            definition_revision=revision,
-        )
-
-    summarize = lambda prompt: _summarize_on_pin(ctx, prompt)  # noqa: E731
-    forced = False
-    try:
-        first = preview()
-    except LLMContextOverflowError as exc:
-        if exc.repair_input_ceiling is None or exc.input_tokens is None:
-            raise
-        forced = True
-        if state.messages:
-            # Diagnostic only: the intact goal with the full system and definitions
-            # must fit before any summary I/O. Its budget is never used.
-            preview([state.messages[min(max(0, state.goal_idx), len(state.messages) - 1)]])
-        compacted, goal_idx = maybe_compact(
-            state.messages, system, effective_ctx, ctx.llm, goal_idx=state.goal_idx,
-            input_tokens=exc.input_tokens, repair_target=exc.repair_input_ceiling,
-            force=True, summarize=summarize,
-        )
-    else:
-        state.last_budget = first.budget
-        compacted, goal_idx = maybe_compact(
-            state.messages, system, effective_ctx, ctx.llm, goal_idx=state.goal_idx,
-            input_tokens=first.input_tokens, request_budget=first.budget,
-            summarize=summarize,
-        )
-    if compacted is state.messages and not forced:
+    if state.auto_compaction_disabled:
+        # Only compaction is skipped: the source history is still validated before any send
+        # (the enabled path validates it inside maybe_compact).
+        validate_native_history(state.messages)
         return
-    state.messages, state.goal_idx = compacted, goal_idx
-    state.last_budget = preview().budget
+    summarize = lambda prompt: _summarize_on_pin(ctx, prompt)  # noqa: E731
+    total = estimate_messages_tokens(
+        state.messages, system, model=_active_model(ctx.llm),
+    ) + tool_defs_tokens
+    try:
+        compacted, goal_idx = maybe_compact(
+            state.messages, system, ctx.compaction_threshold_tokens, ctx.llm,
+            goal_idx=state.goal_idx, input_tokens=total,
+            threshold=ctx.compaction_threshold_tokens, summarize=summarize,
+        )
+    except CompactionFailedError as failure:
+        if ctx.cancel_event.is_set():
+            raise LLMCancelledError("cancelled") from None
+        # The original history is sent; further automatic attempts are off for this run.
+        state.auto_compaction_disabled = True
+        logger.warning(
+            "Automatic compaction failed (%s, %s): the original history is sent "
+            "unchanged and automatic compaction is disabled for the rest of this run",
+            failure.reason, failure.cause_type,
+        )
+        return
+    if compacted is not state.messages:
+        if ctx.cancel_event.is_set():  # cancelled before publication: publish nothing
+            raise LLMCancelledError("cancelled")
+        state.messages, state.goal_idx = compacted, goal_idx
 
 
 def _request_turn(
@@ -1653,29 +1660,24 @@ def _run_single_step(
             logger.debug("on_step callback failed", exc_info=True)
     progress(f"⚙️ Thinking… (step {state.step})")
 
-    # Per-model context window: effective limit from the active model's
-    # context_window, falling back to agent.ctx_max_tokens. Completion tokens
-    # (max_tokens) are reserved before the 85% margin is applied inside
-    # maybe_compact().
-    _effective_ctx = ctx.llm.llm_cfg.get("context_window") or ctx.ctx_max_tokens
     if ctx._tool_defs_by_server is None:
         try:
             ctx._tool_defs_by_server = _tool_defs_by_server_for_context(ctx)
             ctx._tool_defs_tokens = sum(ctx._tool_defs_by_server.values())
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "tool-def grouping failed; compaction falls back to tool_defs_tokens=0",
-                exc_info=True,
+                "tool-def grouping failed (%s); counting the complete definitions "
+                "without ownership lookup", type(exc).__name__,
             )
-            ctx._tool_defs_by_server = {}
-            ctx._tool_defs_tokens = 0
+            ctx._tool_defs_by_server = _ownerless_tool_defs_by_server(ctx, set())
+            ctx._tool_defs_tokens = sum(ctx._tool_defs_by_server.values())
     _tool_defs_by_server = ctx._tool_defs_by_server
     _tool_defs_tokens = ctx._tool_defs_tokens
     if state.attempt_state is None:
         state.attempt_state = CallAttemptState(ctx.max_retries, ctx.retry_delay)
     while True:
         try:
-            _prepare_request(ctx, state, system, _effective_ctx, supports_native_fallback)
+            _prepare_request(ctx, state, system, _tool_defs_tokens)
             break
         except LLMCancelledError:
             return _StepResult(early_return="[Cancelled]")
@@ -1718,7 +1720,6 @@ def _run_single_step(
             _publish_context_snapshot(
                 ctx, state, system,
                 tool_defs_by_server=_tool_defs_by_server,
-                tool_defs_tokens=_tool_defs_tokens,
             )
         except Exception:
             logger.warning("context snapshot publication failed", exc_info=True)
@@ -1741,7 +1742,6 @@ def _run_single_step(
         _publish_context_snapshot(
             ctx, state, system,
             tool_defs_by_server=_tool_defs_by_server,
-            tool_defs_tokens=_tool_defs_tokens,
         )
     except Exception:
         logger.warning("context snapshot publication failed", exc_info=True)
@@ -1803,21 +1803,20 @@ def _stage_guarded_first_request(
     user_goal: str,
     images: Optional[list[str]],
     initial_state: Optional[_LoopState],
-    supports_native_fallback: bool,
-) -> _StagedFirstRequest:
-    """Stage and strictly preview the exact first request without side effects.
 
-    Only an overflow of the selected model rejects; every other preview error
-    proceeds to activation so the ordinary path reports it.
+) -> _StagedFirstRequest:
+    """Stage the exact first request without side effects.
+
+    Nothing is previewed or size-checked against cached model limits, so staging
+    never rejects; malformed native history and tool-definition build failures
+    still raise to the caller.
     """
     if initial_state is not None:
         messages = copy.deepcopy(initial_state.messages)
         goal_idx = initial_state.goal_idx
-        attempt = initial_state.attempt_state
     else:
         messages, goal_idx = _init_messages(ctx, user_goal, images)
         messages = copy.deepcopy(messages)
-        attempt = None
 
     validate_native_history(messages)
     ctx._tool_defs = None
@@ -1845,30 +1844,6 @@ def _stage_guarded_first_request(
         ctx, user_goal, graph_text, model_catalog_view=staged_view
     )
 
-    # Fail closed: only an overflow rejects, only a local native-unsupported signal
-    # converts to the JSON form, and every other error terminates the preflight.
-    preview_messages = copy.deepcopy(messages)
-    native = bool(
-        tool_defs and supports_native_fallback
-        and (attempt is None or attempt.mode == "native")
-    )
-    revision = _definition_revision(ctx)
-    try:
-        if native:
-            try:
-                ctx.llm.preview_request(
-                    preview_messages, system, tools=tool_defs,
-                    definition_revision=revision,
-                )
-            except NotImplementedError:
-                native = False
-        if not native:
-            ctx.llm.preview_request(
-                _linearize_native_turns(preview_messages), system, json_mode=True,
-                definition_revision=revision,
-            )
-    except LLMContextOverflowError:
-        return _StagedFirstRequest(rejected=True)
     return _StagedFirstRequest(
         system=system, messages=messages, goal_idx=goal_idx, tool_defs=tool_defs,
         graph_commit=graph_commit, graph_injected=bool(graph_text),
@@ -1911,7 +1886,7 @@ def _react_loop_owned(
                 return "⚠️ Task stopped by operator."
             try:
                 staged = _stage_guarded_first_request(
-                    ctx, user_goal, images, initial_state, _supports_native_fallback
+                    ctx, user_goal, images, initial_state
                 )
             except LLMCancelledError:
                 return "⚠️ Task stopped by operator."

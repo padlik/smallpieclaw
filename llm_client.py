@@ -77,6 +77,28 @@ _DEFAULT_ENDPOINTS = {
 }
 
 
+def is_official_ollama_origin(base_url: str) -> bool:
+    """Return whether *base_url* is exactly the official cloud Ollama origin.
+
+    Pure string check shared by ``LLMClient`` construction and graph startup
+    validation, so no client has to be built to find an unsupported endpoint.
+    """
+    try:
+        parsed = urlsplit(base_url)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "ollama.com"
+            and parsed.port is None
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path in ("", "/")
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+
+
 def _safe_llm_failure_category(exc: Exception) -> str:
     """Map classified chat failures to fixed, non-sensitive log categories."""
     if isinstance(exc, LLMCancelledError):
@@ -213,6 +235,9 @@ class LLMClient:
         self._binding_var: contextvars.ContextVar[_AttemptBinding | None] = contextvars.ContextVar(
             f"llm_client_attempt_{id(self)}", default=None
         )
+        self._cancel_var: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+            f"llm_client_cancel_{id(self)}", default=None
+        )
         self._ollama_invocation_var: contextvars.ContextVar[_OllamaInvocation | None] = (
             contextvars.ContextVar(f"llm_client_ollama_invocation_{id(self)}", default=None)
         )
@@ -270,8 +295,6 @@ class LLMClient:
         caller_tag: str | None = None,
     ) -> LLMClient:
         """Build the private fixed-policy graph extraction client."""
-        if run_model.model.metadata.output_tokens is not None and run_model.model.metadata.output_tokens < 1024:
-            raise LLMPermanentError("Pinned model output capacity is below the graph extraction allowance")
         client = cls(
             run_model,
             agent_config=agent_config,
@@ -287,21 +310,7 @@ class LLMClient:
     @staticmethod
     def _validate_ollama_connection(run_model: RunModel) -> None:
         """Fail closed unless the admitted Ollama connection is official cloud."""
-        try:
-            parsed = urlsplit(run_model.connection.base_url)
-            valid = (
-                parsed.scheme == "https"
-                and parsed.hostname == "ollama.com"
-                and parsed.port is None
-                and parsed.username is None
-                and parsed.password is None
-                and parsed.path in ("", "/")
-                and not parsed.query
-                and not parsed.fragment
-            )
-        except ValueError:
-            valid = False
-        if not valid:
+        if not is_official_ollama_origin(run_model.connection.base_url):
             raise LLMPermanentError("Cloud Ollama requires the official https://ollama.com origin")
 
     @property
@@ -382,6 +391,26 @@ class LLMClient:
         """Reject retargeting: an admitted client cannot change models."""
         del name
         raise LLMPermanentError("LLMClient is pinned; start a new run to select another model")
+
+    @contextmanager
+    def bind_cancel_event(self, event: threading.Event) -> Iterator[None]:
+        """Let a caller-owned cancel event take precedence over failure classification.
+
+        Context-local: nothing is stored on the shared client, the event is never set or
+        cleared here, and the binding is reset on exit.
+        """
+        token = self._cancel_var.set(event)
+        try:
+            yield
+        finally:
+            self._cancel_var.reset(token)
+
+    def _cancel_requested(self) -> bool:
+        """Whether the client's own or the bound caller's cancel event is set."""
+        bound = self._cancel_var.get()
+        return (self._cancel_event is not None and self._cancel_event.is_set()) or (
+            bound is not None and bound.is_set()
+        )
 
     @contextmanager
     def bind_attempt(
@@ -472,6 +501,9 @@ class LLMClient:
         try:
             return invoke()
         except _LLM_CHAT_ERRORS as exc:
+            if not isinstance(exc, LLMCancelledError) and self._cancel_requested():
+                # A cancel that raced a failed reply is a cancellation, never a request failure.
+                raise LLMCancelledError("LLM request cancelled") from None
             duration_ms = max(0, int((time.monotonic() - started) * 1000))
             agent_logging.log_event(
                 agent_logging.LogEvent.LLM_FAILED,
@@ -580,7 +612,7 @@ class LLMClient:
             raise LLMPermanentError("Provider send is missing an attempt binding")
         if binding.sent:
             raise LLMPermanentError("A public provider invocation may send only once")
-        request = self._prepare_request(payload, mode, binding.definition_revision)
+        request = self._prepare_request(payload, mode)
         if self._preview_var.get():
             raise _PreviewCaptured(
                 self._preview_for_request(request, mode, binding.definition_revision)
@@ -657,9 +689,13 @@ class LLMClient:
         self,
         payload: dict[str, Any],
         mode: str,
-        definition_revision: str | int | None,
     ) -> httpx.Request:
-        """Validate, fit, and serialize the complete final request before send."""
+        """Validate and serialize the complete final request before send.
+
+        Nothing here sizes, rejects or repairs a request from cached model limits.
+        The only budget-era field kept is the configured mandatory output cap for
+        adapters whose API requires one (currently Anthropic).
+        """
         adapter = self._run_model.connection.adapter
         body = json.loads(json.dumps(payload, ensure_ascii=False))
         if not isinstance(body, dict):
@@ -668,25 +704,13 @@ class LLMClient:
         if "model" in body and body["model"] != upstream:
             raise LLMPermanentError("Provider payload model does not match the pinned model")
         if self._graph_policy is not None:
+            # Graph extraction: fixed wire policy, no fit/reserve/output-limit gate.
             self._apply_graph_policy(body, adapter, mode)
+            return self._make_http_request(body, mode)
 
-        initial_request = self._make_http_request(body, mode)
-        initial_tokens = self._estimate_wire_input(initial_request, definition_revision)
-        fixed_cap = self._graph_policy.output_cap if self._graph_policy else None
-        required = ordinary_output_cap_required(adapter) and fixed_cap is None
-        initial_budget = self._compute_budget(
-            initial_tokens, output_cap_required=required, fixed_output_cap=fixed_cap
-        )
-        if required:
-            body["max_tokens"] = initial_budget.output_cap
-        final_request = self._make_http_request(body, mode)
-        final_tokens = self._estimate_wire_input(final_request, definition_revision)
-        self._compute_budget(
-            final_tokens,
-            output_cap_required=required,
-            fixed_output_cap=fixed_cap,
-        )
-        return final_request
+        if ordinary_output_cap_required(adapter):
+            body["max_tokens"] = self._required_output_cap
+        return self._make_http_request(body, mode)
 
     def _make_http_request(self, payload: dict[str, Any], mode: str) -> httpx.Request:
         adapter = self._run_model.connection.adapter
@@ -861,13 +885,6 @@ class LLMClient:
             headers=headers,
             json=payload,
             extensions=dict(request.extensions),
-        )
-        input_tokens = self._estimate_wire_input(final_request, binding.definition_revision)
-        fixed_cap = self._graph_policy.output_cap if self._graph_policy else None
-        self._compute_budget(
-            input_tokens,
-            output_cap_required=False,
-            fixed_output_cap=fixed_cap,
         )
         self._check_cancelled()
         if self._preview_var.get():

@@ -64,7 +64,7 @@ class EmbeddingClient:
         self._timeout = _REQUEST_TIMEOUT
         self._unavailable_reason = ""
         try:
-            self._settings = self._resolve(embeddings, vault_file)
+            self._settings = validate_embedding_settings(embeddings, vault_file)
         except ValueError as exc:
             self._unavailable_reason = str(exc)
         except Exception:
@@ -126,35 +126,6 @@ class EmbeddingClient:
         """Close the HTTP client only when this instance created it."""
         if self._owns_client:
             self._http.close()
-
-    def _resolve(
-        self,
-        embeddings: EmbeddingsConfig,
-        vault_file: str | None,
-    ) -> _ResolvedSettings:
-        if embeddings.unavailable_reason:
-            raise ValueError("embedding configuration unavailable")
-        missing = [
-            name for name, value in (
-                ("provider", embeddings.provider),
-                ("base_url", embeddings.base_url),
-                ("api_key", embeddings.api_key),
-                ("model", embeddings.model),
-            )
-            if not isinstance(value, str) or not value.strip()
-        ]
-        if missing:
-            names = ", ".join(f"embeddings.{name}" for name in missing)
-            raise ValueError(f"{names} must be configured explicitly")
-        if embeddings.provider not in _SUPPORTED:
-            raise ValueError("unsupported embedding adapter; configure a supported provider")
-        api_key = _resolve_credential(embeddings.api_key, vault_file)
-        if not api_key:
-            raise ValueError("embedding credential required")
-        _validate_endpoint(embeddings.base_url)
-        return _ResolvedSettings(
-            embeddings.provider, embeddings.model, embeddings.base_url.rstrip("/"), api_key
-        )
 
     def _require_available(self) -> _ResolvedSettings:
         if self._cancel_event is not None and self._cancel_event.is_set():
@@ -244,6 +215,42 @@ class EmbeddingClient:
 
     def __repr__(self) -> str:
         return f"EmbeddingClient(available={self.available}, model_name={self.model_name!r})"
+
+
+def validate_embedding_settings(
+    embeddings: EmbeddingsConfig,
+    vault_file: str | None = None,
+) -> _ResolvedSettings:
+    """Validate the four explicit embedding settings without creating any client.
+
+    Pure configuration check (the credential reference is read from the
+    environment or vault, nothing else): returns the resolved private settings
+    or raises ``ValueError`` with a fixed message that never contains a value,
+    URL or credential reference.
+    """
+    if embeddings.unavailable_reason:
+        raise ValueError("embedding configuration unavailable")
+    missing = [
+        name for name, value in (
+            ("provider", embeddings.provider),
+            ("base_url", embeddings.base_url),
+            ("api_key", embeddings.api_key),
+            ("model", embeddings.model),
+        )
+        if not isinstance(value, str) or not value.strip()
+    ]
+    if missing:
+        names = ", ".join(f"embeddings.{name}" for name in missing)
+        raise ValueError(f"{names} must be configured explicitly")
+    if embeddings.provider not in _SUPPORTED:
+        raise ValueError("unsupported embedding adapter; configure a supported provider")
+    api_key = _resolve_credential(embeddings.api_key, vault_file)
+    if not api_key.strip():
+        raise ValueError("embedding credential required")
+    _validate_endpoint(embeddings.base_url)
+    return _ResolvedSettings(
+        embeddings.provider, embeddings.model, embeddings.base_url.rstrip("/"), api_key
+    )
 
 
 def _resolve_credential(source: str, vault_file: str | None) -> str:

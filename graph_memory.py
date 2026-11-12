@@ -18,7 +18,7 @@ Architecture
 - parse_extraction()  : JSON triplet parser (no Pydantic required)
 - format_for_prompt() : assemble graph context string for system prompt injection
 - resolve_graph_prerequisites() : data-only startup check that pins the graph
-  extraction model, computes its fixed-cap request budget and verifies the
+  extraction model and verifies the
   embedding configuration; it creates no graph client, store or writer
 
 Three-layer schema
@@ -50,7 +50,6 @@ from providers._errors import LLMError
 if TYPE_CHECKING:
     from config_schema import AgentConfig, AppConfig
     from model_registry import ModelRegistry, RunModel
-    from model_request_budget import ModelRequestBudget
 
 logger = logging.getLogger(__name__)
 
@@ -1507,10 +1506,6 @@ class GraphMemoryWriter:
 # Graph prerequisites
 # ---------------------------------------------------------------------------
 
-# Fixed policy output cap for one graph extraction request.
-_GRAPH_OUTPUT_CAP = 1024
-
-
 class GraphPrerequisiteError(ValueError):
     """A safe, categorized graph-memory prerequisite failure."""
 
@@ -1525,7 +1520,6 @@ class GraphPrerequisites:
     """Validated, immutable inputs for graph memory; owns no live resources."""
 
     pin: RunModel
-    budget: ModelRequestBudget
     embedding_provider: str
     embedding_model: str
 
@@ -1536,7 +1530,7 @@ def resolve_graph_prerequisites(
     *,
     vault_file: str | None = None,
 ) -> GraphPrerequisites:
-    """Pin the graph model, compute its budget and verify embeddings once.
+    """Pin the graph model and verify embeddings once.
 
     This is data-only preparation: it never checks ``graph_memory.enabled``
     (the caller decides whether graph memory runs), refreshes no catalog,
@@ -1556,33 +1550,16 @@ def resolve_graph_prerequisites(
             "and check the provider credentials",
         ) from None
 
-    budget = _graph_budget(pin, app_cfg)
-    _require_embeddings(app_cfg, vault_file)
-    return GraphPrerequisites(pin, budget, app_cfg.embeddings.provider, app_cfg.embeddings.model)
+    _probe_embeddings_with_client(app_cfg, vault_file)
+    return GraphPrerequisites(pin, app_cfg.embeddings.provider, app_cfg.embeddings.model)
 
 
-def _graph_budget(pin: RunModel, app_cfg: AppConfig) -> ModelRequestBudget:
-    """Compute the fixed-cap request budget for *pin* or raise a safe error."""
-    from model_request_budget import ModelRequestBudgetError, compute_request_budget
+def _probe_embeddings_with_client(app_cfg: AppConfig, vault_file: str | None) -> None:
+    """Legacy catalog-path check: verify embeddings with a short-lived client.
 
-    try:
-        return compute_request_budget(
-            pin.model.metadata,
-            input_tokens=0,
-            local_context_tokens=app_cfg.agent.ctx_max_tokens,
-            fixed_output_cap=_GRAPH_OUTPUT_CAP,
-        )
-    except ModelRequestBudgetError as exc:
-        raise GraphPrerequisiteError(
-            exc.code,
-            "graph memory extraction model cannot fit a request: its token limits "
-            f"(or agent.ctx_max_tokens) must allow the required {_GRAPH_OUTPUT_CAP}-token "
-            "output cap plus input; choose another graph_memory.extraction_model",
-        ) from None
-
-
-def _require_embeddings(app_cfg: AppConfig, vault_file: str | None) -> None:
-    """Verify with a short-lived client that explicit embeddings are available."""
+    Used only by ``resolve_graph_prerequisites`` (retired with the legacy registry
+    helpers); graph startup and live backfill use the pure ``_require_embeddings``.
+    """
     from embedding_client import EmbeddingClient
 
     client = EmbeddingClient(app_cfg.embeddings, vault_file=vault_file)
@@ -1596,6 +1573,20 @@ def _require_embeddings(app_cfg: AppConfig, vault_file: str | None) -> None:
             "graph memory requires embeddings: configure [embeddings] provider, "
             "base_url, api_key and model explicitly",
         )
+
+
+def _require_embeddings(app_cfg: AppConfig, vault_file: str | None) -> None:
+    """Validate explicit embedding settings purely; builds no client or transport."""
+    from embedding_client import validate_embedding_settings
+
+    try:
+        validate_embedding_settings(app_cfg.embeddings, vault_file)
+    except ValueError as exc:
+        raise GraphPrerequisiteError(
+            "embedding_unavailable",
+            f"graph memory requires embeddings ({exc}): configure [embeddings] provider, "
+            "base_url, api_key and model explicitly",
+        ) from None
 
 
 # Provider id of the private graph extraction route (never a chat connection).
@@ -1635,8 +1626,8 @@ def resolve_graph_startup(
     Requires the four ``[graph_memory]`` extraction fields (ADR-0042); nothing
     comes from a chat connection, the catalog, Main or ``[embeddings]``. The
     credential is resolved here for the graph extraction client alone. This
-    preparation checks no ``enabled`` flag, creates no graph client, store or
-    writer, and closes its temporary embedding probe. Raises
+    preparation checks no ``enabled`` flag and creates no client, transport,
+    store or writer: validation is pure (ADR-0039/0042). Raises
     ``GraphPrerequisiteError`` with secret-free guidance on any failure.
     """
     from config_schema import ResolvedProviderConnection
@@ -1649,6 +1640,15 @@ def resolve_graph_startup(
             f"{graph.extraction_unavailable_reason}; graph memory needs its own explicit "
             "extraction_provider, extraction_base_url, extraction_api_key and extraction_model",
         )
+    if graph.extraction_provider == "ollama":
+        from llm_client import is_official_ollama_origin
+
+        if not is_official_ollama_origin(graph.extraction_base_url):
+            raise GraphPrerequisiteError(
+                "extraction_config_invalid",
+                "graph_memory.extraction_base_url must be the official https://ollama.com "
+                "origin when graph_memory.extraction_provider is ollama",
+            )
     api_key = _resolve_extraction_credential(graph.extraction_api_key, vault_file)
     record = ModelRecord(
         id=graph.extraction_model,
@@ -1665,9 +1665,8 @@ def resolve_graph_startup(
         api_key=api_key,
     )
     pin = RunModel(record, connection, 0, 0)
-    budget = _graph_budget(pin, app_cfg)
     _require_embeddings(app_cfg, vault_file)
-    return GraphPrerequisites(pin, budget, app_cfg.embeddings.provider, app_cfg.embeddings.model)
+    return GraphPrerequisites(pin, app_cfg.embeddings.provider, app_cfg.embeddings.model)
 
 
 # ---------------------------------------------------------------------------

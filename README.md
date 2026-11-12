@@ -184,7 +184,7 @@ systemctl --user enable --now telegram-agent
 | `/start` | Introduction and usage examples |
 | `/help` | Full command reference |
 | `/status` | Uptime, model, tools, scheduler state, graph memory health, per-model token usage |
-| `/context` | Context window consumption profile — tokens by category, danger level, per-MCP-server tool-def breakdown |
+| `/context` | Estimated input tokens by category (system prompt, chat history, tool definitions), the compaction threshold, and the per-MCP-server tool-def breakdown |
 | `/tools` | List all built-in and MCP tools |
 | `/skills` | List available agent skills |
 | `/models` | List LLM models and switch active one (👁 = provider reports vision) |
@@ -240,8 +240,8 @@ needs neither an active selection nor a cached candidate. An Anthropic
 connection sends the configured `agent.required_output_cap_tokens` (positive
 integer, default 1024) as `max_tokens`, so an uncached Anthropic model is sent
 without any discovered limit; other adapters send no output cap. Graph
-extraction keeps its own fixed cap. Not yet changed (tasks 6.x): the local
-`ctx_max_tokens` context guard still applies and the cap is checked against it.
+extraction keeps its own fixed cap. Not yet changed (tasks 6.x): the runtime's
+internal context guard (no longer configurable) still applies and the cap is checked against it.
 With no selection
 file, the first model of the cache as loaded at startup, in ascending ordinal
 order of its full `<connection-id>/<upstream-id>` (code-point order, so
@@ -325,7 +325,7 @@ The `shell` tool has three backends, selected by `shell_backend` in `[agent]`:
 | `memory_write` | Read/write persistent key-value memory (`data/memory.json`) | No |
 | `memory_graph_search` | Search graph memory (requires graph memory enabled) | No |
 | `memory_graph_store` | Store a fact/episode in graph memory | No |
-| `context_profile` | Return a JSON snapshot of context-window consumption by category | No |
+| `context_profile` | Return a JSON snapshot of estimated input tokens by category, compaction threshold, model identity, turn and liveness | No |
 
 `spawn_agent` and `plan` calls do not accept per-call generation settings. A `spawn_agent` argument, or a top-level key of a `plan` or one of its steps, named `max_tokens`, `temperature` or `top_p` (any value, including `null`) is rejected before any sub-agent, client or credential is set up; the call returns an error naming the field. Models use their configured settings; to change model, pass `model` to `spawn_agent`. A plan step's `args` are the opaque arguments of its tool and are not interpreted as generation settings.
 
@@ -578,7 +578,7 @@ Both commands show usage if the `<tag>` or `<execution-id>` argument is missing.
 | Results | `data/results_memory.json` (vector index) | Past task summaries saved on `/reset` |
 | Graph (opt-in) | `data/graph_memory` (LadybugDB) | Entities, relationships, episodes; retrieved per turn |
 
-Context compaction fires automatically when the estimated token count exceeds 85% of the request input budget — older messages are summarised by the LLM without operator intervention. Compaction uses the pinned model’s request input budget, derived from discovered context/input limits and applicable completion-reserve rules. An input-only limit is used directly, without subtracting completion tokens. When neither context nor input limits are reported, `agent.ctx_max_tokens` (default 90,000) supplies a labelled *assumed local* context ceiling before applicable reservation. The threshold is `max(int(input_budget * 0.85), 256)`. Use `/reset` to start fresh, or `/reset discard` to skip saving.
+Context compaction fires automatically when the estimated input (system prompt, full chat history including images, and the complete current tool definitions) exceeds `agent.compaction_threshold_tokens` (default 60000) — older messages are summarised by the LLM without operator intervention, once per over-threshold request. The current goal and the last two messages (extended to whole tool-call/result groups) are kept unchanged and only the messages between them are summarised; when there is nothing between them, nothing is changed or truncated. The summary is requested through the run's own model connection with its own retry state, separate from the main request. The threshold is model-independent: discovered context or input limits never trigger, shrink or reject a request. Use `/reset` to start fresh, or `/reset discard` to skip saving.
 
 ### Graph memory (optional)
 
@@ -607,9 +607,9 @@ max_context_entries   = 10
 
 LadybugDB is embedded — it runs in-process with no separate server.
 
-When graph memory is enabled, all four `extraction_*` settings are required and are used exactly as written: nothing is inherited from a chat connection (even one of the same adapter type), the model catalog, the Main selection or `[embeddings]`, and the extraction credential is sent only to `extraction_base_url`. Extraction always uses a fixed 1024-token output cap and does not use `agent.required_output_cap_tokens`. If any of the four is missing, blank, not a string, or invalid (unsupported `extraction_provider`, malformed URL, unresolvable credential reference), the bot logs a warning naming the field and starts with graph memory disabled; chat and indexing keep working. Graph vectors use the explicit `[embeddings]` settings. Unused `extraction_*` values are not checked while `enabled = false`.
+When graph memory is enabled, all four `extraction_*` settings are required and are used exactly as written: nothing is inherited from a chat connection (even one of the same adapter type), the model catalog, the Main selection or `[embeddings]`, and the extraction credential is sent only to `extraction_base_url`. Extraction always uses a fixed 1024-token output cap and does not use `agent.required_output_cap_tokens`; temperature `0.1` is sent where the adapter accepts it. No local fit, reserve or output-limit check runs for graph extraction (neither at startup nor per request, whatever the local context default or any discovered limit says): an oversized input is sent and a provider rejection fails only that extraction. Each extraction builds and closes its own client. If any of the four is missing, blank, not a string, or invalid (unsupported `extraction_provider`, malformed URL, unresolvable credential reference), the bot logs a warning naming the field and starts with graph memory disabled; chat and indexing keep working. Graph vectors use the explicit `[embeddings]` settings. Unused `extraction_*` values are not checked while `enabled = false`.
 
-The standalone backfill commands below have not been migrated to these settings yet: they still read `extraction_model` as a saved-catalog model ID (no provider discovery refresh and no managed-settings write), and an unresolvable graph model or a missing/corrupt catalog fails before any database is constructed. On shutdown, if the graph writer does not stop within its bounded timeout, the failure is reported and the store and worker-used dependencies stay open — shutdown never claims success while they are unclosed.
+Graph startup and the live `backfill_graph_memory.py` each validate their own settings — the four `extraction_*` fields, the `[embeddings]` fields, adapter/endpoint compatibility (for example `ollama` requires the official `https://ollama.com` origin) and both credential references — before any graph database, embedding client or extraction client is created, without provider discovery, the saved model catalog or the model preference. Live backfill needs no chat `[providers.*]` connection and fails with an actionable message (field names only, never values, URLs or reference names) and a non-zero exit before touching the database. `--dry-run` reads only `longterm_memory.json` and the backfill state file: it resolves no credential and creates no client, database, embedding or inference, so it works even when those settings are invalid. On shutdown, if the graph writer does not stop within its bounded timeout, the failure is reported and the store and worker-used dependencies stay open — shutdown never claims success while they are unclosed.
 
 Seed from existing long-term memory (while agent is stopped):
 
@@ -633,7 +633,7 @@ Key configuration:
 step_notify_interval        = 30              # main-agent Telegram ping every N steps (0 = off)
 long_run_warn_minutes      = 30              # Telegram notification threshold (0 = off)
 tool_timeout               = 10              # seconds per tool call
-ctx_max_tokens             = 90000
+compaction_threshold_tokens = 60000          # estimated input tokens that trigger automatic compaction
 ```
 
 There is no sub-agent or scheduler model setting in `config.toml`. A sub-agent or scheduled job without a model selector runs on the operator's selected Main model. An explicit selector — a spawned sub-agent's `model` argument or a job's `model` key — runs on that exact catalog model ID; an unknown sub-agent selector is refused, while an unknown or malformed job selector falls back to Main as described under "Job model selection". Every run still requires an active Main selection.

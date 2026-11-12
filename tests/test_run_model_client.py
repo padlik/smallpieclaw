@@ -170,23 +170,23 @@ def test_unsupported_native_adapter_is_rejected_before_send_but_unknown_vision_i
     client.close()
 
 
-def test_required_cap_without_remaining_combined_capacity_fails_before_send() -> None:
-    from llm_client import LLMContextOverflowError, LLMPermanentError
-
+def test_required_cap_is_configuration_and_never_blocks_the_send() -> None:
     requests: list[httpx.Request] = []
     client = _client(
         "anthropic",
-        transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200, json={})),
+        transport=httpx.MockTransport(
+            lambda request: requests.append(request)
+            or httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+        ),
         metadata=ModelMetadata(context_tokens=200, output_tokens=50),
     )
     state = CallAttemptState(max_retries=2, retry_delay=0)
 
     with client.bind_attempt(state):
-        with pytest.raises((LLMContextOverflowError, LLMPermanentError), match="local budget"):
-            client.chat([{"role": "user", "content": "x " * 2_000}])
+        assert client.chat([{"role": "user", "content": "x " * 2_000}]) == "ok"
 
-    assert requests == []
-    assert state.outbound_attempts == 0
+    assert len(requests) == 1 and state.outbound_attempts == 1
+    assert json.loads(requests[0].content)["max_tokens"] == 1024
     client.close()
 
 

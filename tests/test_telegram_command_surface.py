@@ -1550,10 +1550,8 @@ def _published_monitor():
     monitor = ContextMonitor()
     monitor.publish(ContextSnapshot(
         system_prompt_tokens=1_000, chat_history_tokens=2_000, tool_defs_tokens=500,
-        tool_defs_by_server={"builtin": 500}, completion_reserve=4_096,
-        effective_window=100_000, compaction_threshold=85_000,
-        headroom_nominal=92_404, headroom_real=7_404,
-        danger_level="safe", is_live=False, turn=3,
+        tool_defs_by_server={"builtin": 500}, compaction_threshold=85_000,
+        is_live=False, turn=3,
     ))
     return monitor
 
@@ -1632,9 +1630,9 @@ class TestRegistryBackedContext:
     """/context labels the current selection without attributing the snapshot to it."""
 
     _LAYOUT = (
-        "<b>Context Profile</b>", "Window: 100,000 tokens", "⚪ idle (last run turn 3)",
-        "<pre>", "System prompt", "Chat history", "Tool defs", "Completion reserve",
-        "Danger: 🟢 safe", "Headroom: 7,404 tokens", "<b>Tool defs by server:</b>", "builtin: 500",
+        "<b>Context Profile</b>", "Compaction threshold: 85,000 tokens", "⚪ idle (last run turn 3)",
+        "<pre>", "System prompt", "Chat history", "Tool defs", "Total",
+        "<b>Tool defs by server:</b>", "builtin: 500",
     )
 
     @pytest.mark.parametrize("state", _SEL_STATES)

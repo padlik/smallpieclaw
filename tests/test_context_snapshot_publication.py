@@ -61,19 +61,10 @@ def test_publish_context_snapshot_writes_all_fields() -> None:
     )
     assert snapshot.tool_defs_tokens == 0
     assert snapshot.tool_defs_by_server == {"builtin": 0}
-    assert snapshot.completion_reserve == 512
-    assert snapshot.effective_window == 4096
-    assert snapshot.compaction_threshold == max(int((4096 - 512) * 0.85), 256)
-    assert snapshot.headroom_nominal == (
-        snapshot.compaction_threshold - snapshot.system_prompt_tokens - snapshot.chat_history_tokens
-    )
-    assert snapshot.headroom_real == (
-        snapshot.compaction_threshold
-        - snapshot.system_prompt_tokens
-        - snapshot.chat_history_tokens
-        - snapshot.tool_defs_tokens
-    )
-    assert snapshot.danger_level in {"safe", "approaching", "danger"}
+    assert snapshot.compaction_threshold == ctx.compaction_threshold_tokens == 60_000
+    assert snapshot.model_id == ""  # the stub client has no pinned canonical ID
+    assert not {"completion_reserve", "effective_window", "headroom_nominal",
+                "headroom_real", "danger_level"} & set(vars(snapshot))
     assert snapshot.is_live is True
     assert snapshot.turn == 1
 
@@ -97,12 +88,7 @@ def test_run_ending_sets_is_live_false() -> None:
         chat_history_tokens=20,
         tool_defs_tokens=30,
         tool_defs_by_server={"builtin": 30},
-        completion_reserve=512,
-        effective_window=4096,
         compaction_threshold=3000,
-        headroom_nominal=100,
-        headroom_real=70,
-        danger_level="approaching",
         is_live=True,
         turn=3,
     )
@@ -165,7 +151,6 @@ def test_snapshot_passed_tool_defs_avoids_recompute() -> None:
     _publish_context_snapshot(
         ctx, state, "sys",
         tool_defs_by_server={"builtin": 42, "mcp": 100},
-        tool_defs_tokens=142,
     )
 
     snapshot = monitor.read()
@@ -228,7 +213,6 @@ def test_tool_defs_grouping_cache_reused_across_turns() -> None:
     _publish_context_snapshot(
         ctx, state1, "sys",
         tool_defs_by_server={"builtin": 7, "mcp": 3},
-        tool_defs_tokens=10,
     )
 
     snapshot1 = monitor.read()
@@ -253,14 +237,14 @@ def test_tool_defs_grouping_cache_reused_across_turns() -> None:
     assert snapshot2.turn == 2
 
 
-def test_tool_defs_grouping_failure_degrades_to_zero_in_loop() -> None:
-    """When the loop's grouping computation fails, it degrades to 0 tokens."""
+def test_tool_defs_grouping_failure_still_completes_with_a_real_count_in_loop() -> None:
+    """A grouping failure neither crashes the run nor drops/zeroes existing definitions."""
     from unittest.mock import MagicMock, patch
     from react_loop import react_loop
 
     monitor = ContextMonitor()
     ctx = _make_context(monitor)
-    ctx._tool_defs = []
+    ctx._tool_defs = [{"type": "function", "function": {"name": "shell", "description": "d", "parameters": {"type": "object"}}}]
     ctx._tool_defs_by_server = None
     ctx._tool_defs_tokens = 0
     ctx.context_monitor = monitor
@@ -296,13 +280,12 @@ def test_tool_defs_grouping_failure_degrades_to_zero_in_loop() -> None:
 
     # The run should complete despite the grouping failure.
     assert result == "done"
-    # The cache should have been populated with the degraded zero values.
-    assert ctx._tool_defs_by_server == {}
-    assert ctx._tool_defs_tokens == 0
-    # A snapshot should still have been published with tool_defs_tokens=0.
+    # Even when every grouping call fails, the existing definition is counted (not zeroed).
+    assert ctx._tool_defs_by_server and ctx._tool_defs_tokens > 0
+    assert ctx._tool_defs_tokens == sum(ctx._tool_defs_by_server.values())
     snapshot = monitor.read()
     assert snapshot is not None
-    assert snapshot.tool_defs_tokens == 0
+    assert snapshot.tool_defs_tokens > 0
     assert snapshot.is_live is False
 
 
@@ -381,3 +364,63 @@ class _NullMemory:
 
     def as_prompt_text(self, *_a, **_k):
         return ""
+
+
+def test_snapshot_publication_counts_with_real_client() -> None:
+    """Real LLMClient + httpx.MockTransport loop: counts, configured threshold, pinned id, idle at end.
+
+    Replaces the retired ``test_request_preparation`` node that asserted the preview
+    budget (effective window / completion reserve); the generic proof that a real
+    client's turn publishes its counts is kept with the new snapshot semantics.
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    from model_registry import ModelMetadata
+    from tests.execution_harness import RecordingExecutor, run_react
+    from tests.run_model_fixtures import make_run_model_client
+
+    requests: list[httpx.Request] = []
+    finish = {"choices": [{"message": {"content": '{"action":"finish","result":"done"}'}}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=finish)
+
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"history {i} " + "alpha beta " * 200}
+        for i in range(4)
+    ]
+    short_term = MagicMock()
+    short_term.get_messages.return_value = history
+    monitor = ContextMonitor()
+    client = make_run_model_client(
+        "openai", httpx.MockTransport(handler),
+        metadata=ModelMetadata(context_tokens=8_192, output_tokens=1_024), upstream_id="pinned-model",
+    )
+    try:
+        result, _calls, _progress = run_react(
+            client, RecordingExecutor(), "do it", short_term=short_term,
+            compaction_threshold_tokens=12_345, context_monitor=monitor,
+        )
+    finally:
+        client.close()
+
+    snap = monitor.read()
+    assert result == "done" and len(requests) == 1  # the real client/transport was entered
+    assert snap is not None
+    assert snap.compaction_threshold == 12_345
+    assert snap.model_id == "test-connection/pinned-model"  # the pinned run model, not a selection
+    assert snap.is_live is False and snap.turn == 1  # idle after the run ends
+    # Published after the accepted finish turn: the loop has appended the model's reply.
+    messages = history + [
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": '{"action":"finish","result":"done"}'},
+    ]
+    assert snap.system_prompt_tokens + snap.chat_history_tokens == estimate_messages_tokens(
+        messages, "sys-prompt", model="pinned-model",
+    )
+    assert snap.tool_defs_tokens == sum(snap.tool_defs_by_server.values()) > 0
+    assert len(json.loads(requests[0].content)["tools"]) > 0  # counted definitions are the sent ones

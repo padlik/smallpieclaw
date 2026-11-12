@@ -20,7 +20,7 @@ import pytest
 
 from builtin_tools.descriptors import BUILTIN_TOOLS
 from builtin_tools.schemas import BUILTIN_TOOL_SCHEMAS, build_tool_definitions
-from llm_client import LLMClient, LLMPermanentError
+from llm_client import LLMClient
 from model_registry import ModelMetadata
 from path_policy import PathVerdict
 from react_loop import ReactContext, _exec_vision_query
@@ -205,26 +205,17 @@ def test_vision_query_has_no_model_override(tmp_path: Path) -> None:
     assert client.llm_cfg["model"] == "pinned-model"
 
 
-def test_vision_query_image_estimate_counts_toward_hard_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+def test_vision_query_is_sent_even_when_cached_limits_are_below_the_image_estimate(
+    tmp_path: Path,
 ) -> None:
-    """With verified vision, a question that fits alone exceeds the hard input budget
-    once the image allowance is counted, and is rejected locally before any send."""
+    """Task 6.2: cached limits never reject a vision request locally; it is sent."""
     captured: list[httpx.Request] = []
     client = _pinned(True, captured, context_tokens=1500, output_tokens=1024)
     image = _image(tmp_path)
     try:
-        text_only = client.preview_request([{"role": "user", "content": _QUESTION}])
-        assert text_only.input_tokens < text_only.hard_input_budget
-        assert text_only.input_tokens + _IMAGE_TOKENS > text_only.hard_input_budget
-
-        raised = _record_chat_errors(client, monkeypatch)
         outcome = _exec_vision_query(_context(client, _AllowAllPolicy()), {"path": str(image), "question": _QUESTION})
 
-        (error,) = raised
-        assert isinstance(error, LLMPermanentError)
-        assert "local budget" in str(error)
-        assert outcome["success"] is False and outcome["error"] == f"vision_query LLM call failed: {error}"
-        assert captured == []
+        assert outcome["success"] is True
+        assert len(captured) == 1
     finally:
         client.close()

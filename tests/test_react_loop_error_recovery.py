@@ -28,7 +28,6 @@ from tests.execution_harness import (
     RecordingExecutor,
     _NullMemory,
     _NullToolIndex,
-    run_react,
 )
 from tests.run_model_fixtures import make_run_model_client
 
@@ -611,10 +610,10 @@ class TestToolResultsCount:
 # ---------------------------------------------------------------------------
 # Preparation-failure checkpoint on a real httpx.MockTransport client
 # (relocated from tests/test_request_preparation.py::TestPreparationFailureState
-# in simplify-model-runtime task 2.2). PHASE2 (task 10.1): the oversized system
-# prompt reaches the failure through the preview-fit ``_prepare_request``; when
-# that entry point is retired, rewrite the trigger while preserving the
-# checkpoint-validity and zero-outbound assertions.
+# in simplify-model-runtime task 2.2). Task 6.2 retired the oversized-system
+# trigger (no local size rejection); the failure is now a malformed native
+# tool-call group rejected by ``_prepare_request`` before any provider I/O, with
+# the checkpoint-validity and zero-outbound assertions unchanged.
 # ---------------------------------------------------------------------------
 
 
@@ -643,11 +642,28 @@ def run_failing_preparation(tmp_path):
         metadata=ModelMetadata(context_tokens=2_000, output_tokens=200), upstream_id="prep-model",
     )
     try:
-        result, _calls, _progress = run_react(
-            client, RecordingExecutor(), "goal", system="system " * 5000,
+        from unittest.mock import patch
+
+        from react_loop import _LoopState, react_loop
+        from tests.execution_harness import build_context
+
+        malformed = _LoopState(
+            messages=[
+                {"role": "user", "content": "goal"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "a", "type": "function",
+                     "function": {"name": "probe", "arguments": "{}"}},
+                ]},
+            ],
+            goal_idx=0, max_steps=3,
+        )
+        ctx = build_context(
+            client, RecordingExecutor(),
             checkpoint_store=store, checkpoint_owner=owner, checkpoint_enabled=True,
             confirmation=confirmation,
         )
+        with patch("react_loop._build_system_prompt", return_value=("sys-prompt", None)):
+            result = react_loop(ctx, "goal", progress_callback=lambda _m: None, initial_state=malformed)
         return result, store, owner, requests
     finally:
         client.close()

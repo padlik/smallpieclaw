@@ -142,10 +142,9 @@ def world(make_builtin_executor, tmp_path):
     scheduler = MagicMock()
     scheduler.list_jobs.return_value = []
     snapshot = SimpleNamespace(
-        danger_level="ok", system_prompt_tokens=1, chat_history_tokens=2,
-        tool_defs_tokens=3, tool_defs_by_server={}, completion_reserve=4,
-        effective_window=5, compaction_threshold=6, headroom_nominal=7,
-        headroom_real=8, is_live=True, turn=1,
+        system_prompt_tokens=1, chat_history_tokens=2,
+        tool_defs_tokens=3, tool_defs_by_server={}, compaction_threshold=6,
+        model_id="pinned/model", is_live=True, turn=1,
     )
     monitor = MagicMock()
     monitor.read.return_value = snapshot

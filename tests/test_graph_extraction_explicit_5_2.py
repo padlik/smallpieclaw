@@ -72,7 +72,7 @@ def _raw_config(graph: dict[str, Any] | None = None, **extra: Any) -> dict[str, 
     """Valid chat + embeddings config whose chat/embedding values are all plausible fallbacks."""
     raw: dict[str, Any] = {
         "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [1], "security_mode": "allowlist"},
-        "agent": {"ctx_max_tokens": 90000, "required_output_cap_tokens": 5000},
+        "agent": {"compaction_threshold_tokens": 60000, "required_output_cap_tokens": 5000},
         "paths": {},
         "providers": {
             "chat": {"type": "openai", "api_key": CHAT_KEY, "base_url": f"https://{CHAT_HOST}/v1"},
@@ -223,7 +223,6 @@ class TestResolveGraphStartup:
         assert pin.connection.base_url == f"https://{GRAPH_HOST}/v1"
         assert pin.connection.api_key == GRAPH_KEY
         assert pin.connection.provider_id != "chat"
-        assert prepared.budget.output_cap == 1024
 
 
 # ---------------------------------------------------------------------------

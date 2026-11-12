@@ -45,7 +45,7 @@ stays open until its own verification):
 
 from __future__ import annotations
 
-import copy
+import dataclasses
 import json
 import threading
 from contextlib import ExitStack
@@ -68,7 +68,7 @@ from config_schema import (
     ResolvedProviderConnection,
 )
 from confirmation import GrantLifetime
-from llm_client import LLMClient, LLMPermanentError
+from llm_client import LLMClient
 from memory_store import ShortTermMemory, WorkingMemory
 from model_registry import (
     CatalogDocument,
@@ -81,7 +81,6 @@ from model_registry import (
 )
 from model_selection_guard import (
     GUARD_PREPARATION_FAILED_MESSAGE,
-    GUARD_REJECTION_MESSAGE,
     ConversationSelectionGuard,
     SelectionBudgetIdentity,
 )
@@ -663,48 +662,6 @@ def _prime_state(world):
 
 
 class TestGuardedRejection:
-    def test_reject_before_any_http_or_mutation(self, world, tmp_path):
-        _prime_state(world)
-        image = tmp_path / "image-a.png"
-        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
-        client_b = world.switch("B")
-        assert world.controller.selection_guard_armed
-        before = world.snapshot()
-        history_objects = copy.deepcopy(world.short_term.get_messages())
-        images = [str(image)]
-        images_before = list(images)
-
-        with patch("react_loop.maybe_compact", side_effect=AssertionError("compactor")), \
-             patch.object(react_loop, "_summarize_on_pin", side_effect=AssertionError("summary")):
-            result = world.controller.run("next question", images=images, admitted_llm=client_b)
-
-        assert result == GUARD_REJECTION_MESSAGE
-        assert "/models" in result and "/reset" in result
-        assert world.wires["B"].requests == []
-        assert all(not w.requests for w in world.wires.values())
-        assert world.executor.calls == []
-        assert world.memory.events == []
-        world.graph_writer.enqueue.assert_not_called()
-        assert world.executor._supervisor.registered == []
-        assert world.executor._supervisor.unregistered == []
-        assert world.executor._supervisor.drains == 0
-        assert "tok-1" in world.executor._pending_confirmations._pending
-        assert world.controller._confirmation.grant_ledger.check("file_write", "/tmp")
-        assert world.executor._coordinator is None
-        after = world.snapshot()
-        assert after == before
-        assert world.short_term.get_messages() == history_objects
-        assert images == images_before
-        assert world.working.goal == "previous goal"
-        assert world.controller.selection_guard_armed
-
-    def test_reject_repeats_until_larger_model_or_reset(self, world):
-        client_b = world.switch("B")
-        assert world.controller.run("q", admitted_llm=client_b) == GUARD_REJECTION_MESSAGE
-        assert world.controller.run("q", admitted_llm=client_b) == GUARD_REJECTION_MESSAGE
-        world.controller.reset_task(save=False)
-        assert not world.controller.selection_guard_armed
-
     def test_larger_selection_clears_and_runs_normally(self, world):
         world.switch("B")
         client_c = world.switch("C")
@@ -712,33 +669,11 @@ class TestGuardedRejection:
         assert world.controller.run("q", admitted_llm=client_c) == "done"
         assert len(world.wires["C"].requests) >= 1
 
-    def test_reject_with_checkpoint_resume_keeps_checkpoint(self, world):
-        client_b = world.switch("B")
-        ckpt = {
-            "format_version": 2, "trace_id": "r-resume01", "user_goal": "alpha beta " * 9000,
-            "messages": [{"role": "user", "content": "alpha beta " * 9000}],
-            "step": 1, "goal_idx": 0, "max_steps": 8, "json_fail_streak": 0,
-            "model_id": client_b.llm_cfg["id"],
-            "attempt_state": CallAttemptState().to_dict(),
-            "error_info": {"type": "timeout", "message": "t", "retryable": True, "detail": ""},
-            "created_at": "2026-08-21T14:30:00Z",
-        }
-        owner = world.store.acquire_owner("r-resume01")
-        world.store.save("r-resume01", ckpt, owner=owner)
-        owner.release()
-        before = world.snapshot()
-        result = world.controller.run("ignored", resume_from="r-resume01", admitted_llm=client_b)
-        assert result == GUARD_REJECTION_MESSAGE
-        assert world.wires["B"].requests == []
-        assert world.snapshot() == before
-        owner = world.store.acquire_owner("r-resume01")
-        try:
-            assert world.store.load("r-resume01", owner=owner)["messages"] == ckpt["messages"]
-        finally:
-            owner.release()
-
     def test_unguarded_oversize_still_compacts(self, world):
-        # no switch: guard unarmed, A pinned but history sized for a small model
+        # Task 6.2: the configured threshold, not the pinned model's limits, triggers it.
+        world.controller._agent_cfg = dataclasses.replace(
+            world.controller._agent_cfg, compaction_threshold_tokens=8_000,
+        )
         small = world.registry.admit("p/B")
         client = LLMClient(
             small, agent_config=AgentConfig(ctx_max_tokens=4096, max_retries=3, retry_delay=0),
@@ -993,13 +928,6 @@ class TestGraphPreparation:
             w.controller.run("graph goal", admitted_llm=client)
         return seen
 
-    def test_reject_prepares_once_and_never_commits(self, world):
-        graph = _FakeGraph("KNOWLEDGE GRAPH CONTEXT: x")
-        world.controller._graph_memory = graph
-        client = world.switch("B")
-        assert world.controller.run("graph goal", admitted_llm=client) == GUARD_REJECTION_MESSAGE
-        assert graph.log == ["prepare"]
-
     def test_fit_commits_once_after_activation(self, small_world):
         w = small_world
         graph = _FakeGraph("KNOWLEDGE GRAPH CONTEXT: x")
@@ -1127,16 +1055,6 @@ class TestUnknownHistoryProtection:
         finally:
             w.close()
 
-    def test_undersized_pin_rejects_without_manual_setup_or_compaction(self, world):
-        client = world.client("B")
-        before = _deferred_state(world)
-        with patch("react_loop.maybe_compact", side_effect=AssertionError("compactor")), \
-             patch.object(react_loop, "_summarize_on_pin", side_effect=AssertionError("summary")):
-            assert world.controller.run("q", admitted_llm=client) == GUARD_REJECTION_MESSAGE
-        assert world.wires["B"].requests == []
-        assert _deferred_state(world) == before
-        assert world.controller.selection_guard_armed
-
     def test_fitting_accepted_response_after_unknown_restore_clears(self, small_world):
         w = small_world
         assert w.controller.selection_guard_armed
@@ -1217,36 +1135,10 @@ class TestExplicitAdmissionDoesNotBorrowExemption:
     """R2: ticket decisions check the actual canonical ID and revision."""
 
     def _cleared_at_c(self, w):
-        client_b = w.switch("B")
-        assert w.controller.run("q", admitted_llm=client_b) == GUARD_REJECTION_MESSAGE
+        w.switch("B")
         client_c = w.switch("C")
         assert not w.controller.selection_guard_armed
         return client_c
-
-    def test_explicit_b_checkpoint_resume_at_c_revision_is_rejected_untouched(self, world):
-        client_c = self._cleared_at_c(world)
-        assert world.controller.run("q", admitted_llm=client_c) == "done"
-        goal = "alpha beta " * 9000
-        _save_checkpoint(world, "r-bresume01", "p/B", goal)
-        run_model = world.registry.admit("p/B")
-        assert run_model.selection_revision == client_c.llm_cfg["selection_revision"]
-        client_b = LLMClient(
-            run_model, agent_config=AgentConfig(ctx_max_tokens=4096, max_retries=3, retry_delay=0),
-            http_transport=httpx.MockTransport(world.wires["B"]),
-        )
-        try:
-            before = _ckpt_bytes(world)
-            requests_before = len(world.wires["B"].requests)
-            with patch("react_loop.maybe_compact", side_effect=AssertionError("compactor")), \
-                 patch.object(react_loop, "_summarize_on_pin", side_effect=AssertionError("summary")):
-                result = world.controller.run("ignored", resume_from="r-bresume01", admitted_llm=client_b)
-            assert result == GUARD_REJECTION_MESSAGE
-            assert len(world.wires["B"].requests) == requests_before
-            assert _ckpt_bytes(world) == before
-            _assert_owner_released(world, "r-bresume01")
-            assert not world.controller.selection_guard_armed  # global C state preserved
-        finally:
-            client_b.close()
 
     def test_fitting_explicit_b_checkpoint_resume_at_c_keeps_b_ticket_and_main_c(self, world):
         client_c = self._cleared_at_c(world)
@@ -1294,16 +1186,6 @@ class TestExplicitAdmissionDoesNotBorrowExemption:
                 http_transport=httpx.MockTransport(wire_b),
             )
             stack.callback(client_b.close)
-            real_preview = client_b.preview_request
-
-            def preview(*args, **kwargs):
-                events.append((
-                    "preview", len(wire_b.requests) - requests_before["B"],
-                    world.executor._coordinator is None,
-                    list(world.executor._supervisor.registered),
-                ))
-                return real_preview(*args, **kwargs)
-
             wire_b.on_request = lambda n: events.append("send")
             stack.callback(setattr, wire_b, "on_request", None)
             stack.enter_context(patch.object(guard, "begin", side_effect=begin))
@@ -1311,7 +1193,6 @@ class TestExplicitAdmissionDoesNotBorrowExemption:
             stack.enter_context(patch.object(
                 guard, "notify_manual_selection", side_effect=AssertionError("no B notification"),
             ))
-            stack.enter_context(patch.object(client_b, "preview_request", side_effect=preview))
             result = world.controller.run("ignored", resume_from="r-bfit0001", admitted_llm=client_b)
 
         assert result == "done"
@@ -1322,12 +1203,9 @@ class TestExplicitAdmissionDoesNotBorrowExemption:
         assert ticket.guarded
         assert (ticket.model_id, ticket.selection_revision) == ("p/B", c_revision)
         assert (ticket.generation, ticket.token) == (generation, token)
-        # read-only strict preview before the first send and before activation
-        assert events[0] == "begin"
-        previews = [i for i, event in enumerate(events) if isinstance(event, tuple)]
-        assert previews and previews[0] < events.index("send")
-        assert events[previews[0]][1:] == (0, True, registered_before)
-        assert world.executor._supervisor.registered != registered_before  # activated after the fit
+        # no preview gates the send: begin first, activation happens, then B is sent
+        assert events[0] == "begin" and "send" in events
+        assert world.executor._supervisor.registered != registered_before  # activated for the send
         # only B was contacted
         assert len(wire_b.requests) > requests_before["B"]
         for name, wire in world.wires.items():
@@ -1433,35 +1311,6 @@ class TestFailClosedPreflight:
     def _fixed_client(self, adapter, wire, metadata):
         return make_run_model_client(adapter, httpx.MockTransport(wire), metadata=metadata)
 
-    def test_optional_output_not_less_than_context_is_permanent_not_overflow(self, small_world):
-        w = small_world
-        _prime_grants(w)
-        client = self._fixed_client(
-            "openai", _Wire(), ModelMetadata(context_tokens=8_000, output_tokens=9_000)
-        )
-        try:
-            with pytest.raises(LLMPermanentError):
-                client.preview_request([{"role": "user", "content": "x"}], "s", json_mode=True)
-            before = _deferred_state(w)
-            result = w.controller.run("q", admitted_llm=client)
-            self._assert_nothing_started(w, before, result)
-        finally:
-            client.close()
-
-    def test_required_output_equal_to_context_is_permanent_not_overflow(self, small_world):
-        """Cap slice: with the 1024 configured cap, a 1024-token context leaves no input budget."""
-        w = small_world
-        _prime_grants(w)
-        client = self._fixed_client("anthropic", _Wire(), ModelMetadata(context_tokens=1_000))
-        try:
-            with pytest.raises(LLMPermanentError):
-                client.preview_request([{"role": "user", "content": "x"}], "s", json_mode=True)
-            before = _deferred_state(w)
-            result = w.controller.run("q", admitted_llm=client)
-            self._assert_nothing_started(w, before, result)
-        finally:
-            client.close()
-
     def test_malformed_resumed_native_group_on_json_selected_pin_fails_closed(self, small_world):
         w = small_world
         wire = _Wire()
@@ -1542,18 +1391,6 @@ class TestCancellationBeforeActivation:
         assert not w.wires["B"].requests
         _assert_owner_released(w, "r-cancel001")
 
-    def test_cancel_during_retrieval_then_overflow_preserves_checkpoint(self, world):
-        client = world.client("B")
-        goal = "alpha beta " * 9000
-        _save_checkpoint(world, "r-cancel002", client.llm_cfg["id"], goal)
-        graph, _calls = self._graph_cancelling(world)
-        world.controller._graph_memory = graph
-        before = _deferred_state(world)
-        result = world.controller.run("ignored", resume_from="r-cancel002", admitted_llm=client)
-        assert result == GUARD_REJECTION_MESSAGE
-        assert _deferred_state(world) == before
-        _assert_owner_released(world, "r-cancel002")
-
     def test_already_cancelled_external_event_starts_no_retrieval(self, tmp_path):
         event = threading.Event()
         w = _World(tmp_path, big_history=False, cancel_event=event)
@@ -1585,26 +1422,6 @@ class TestCancellationBeforeActivation:
 class TestRejectionWording:
     """R7: the message makes no promise about preparation cost or embeddings."""
 
-    def test_rejection_after_embedding_invocation_is_truthful(self, world):
-        embeds: list[str] = []
-
-        def prepare(query, max_entries=10):
-            embeds.append(query)  # an existing retrieval embedding runs before the guard
-            return _Prepared("", [])
-
-        world.controller._graph_memory = SimpleNamespace(prepare_for_prompt=prepare)
-        client = world.switch("B")
-        result = world.controller.run("graph goal", admitted_llm=client)
-        assert embeds == ["graph goal"]
-        assert result == GUARD_REJECTION_MESSAGE
-        assert "not sent" in result and "history is preserved" in result
-        assert "/models" in result and "/reset" in result
-        lowered = result.lower()
-        assert "nothing was sent or changed" not in lowered
-        for promise in ("free", "no cost", "zero", "nothing was"):
-            assert promise not in lowered
-        assert world.wires["B"].requests == []
-
     def test_preparation_failure_wording_has_the_same_properties(self):
         lowered = GUARD_PREPARATION_FAILED_MESSAGE.lower()
         assert "not sent" in lowered and "history is preserved" in lowered
@@ -1634,12 +1451,6 @@ class TestRealGraphContract:
     @staticmethod
     def _counters(store) -> tuple[int, int, int]:
         return (store._retrieval_hits, store._retrieval_misses, store._context_injections)
-
-    def test_rejected_guarded_run_leaves_graph_counters_zero(self, world, store):
-        world.controller._graph_memory = store
-        client = world.switch("B")
-        assert world.controller.run("graph goal", admitted_llm=client) == GUARD_REJECTION_MESSAGE
-        assert self._counters(store) == (0, 0, 0)
 
     def test_fitting_guarded_run_commits_exactly_once(self, small_world, store):
         w = small_world

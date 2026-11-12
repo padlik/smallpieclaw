@@ -9,10 +9,18 @@ is summarised by the LLM to keep the context window within bounds.
 
 Compaction is content-aware: tool-result messages (shell/file output) are
 trimmed head+tail so both the command/header and the trailing error region
-survive, while model prose is bounded with a simple head cap. On LLM failure a
-deterministic fallback summary is produced instead of returning the oversized
-original messages, and the most recent (verbatim) messages are capped so a
-single huge tool result cannot overflow the real model context.
+survive, while model prose is bounded with a simple head cap. On the legacy path
+an LLM failure produces a deterministic fallback summary; the automatic path never
+does (see below).
+
+Recent-message capping, short-context capping and the tightening loop apply
+ONLY to the legacy path (``threshold=None`` or ``force``), retained until 10.1.
+The automatic path (``threshold`` supplied by the ReAct loop) makes one attempt
+per request: the goal and the last two messages (whole native call/result
+spans) are never capped, only a nonempty middle is summarized, and an empty
+middle changes and truncates nothing. A failed or empty summary and an invalid
+candidate raise ``CompactionFailedError``: the caller keeps the original history
+and disables further automatic attempts for that run. Cancellation propagates.
 """
 
 from __future__ import annotations
@@ -22,9 +30,16 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import httpx
+
 from prompt_builder import estimate_messages_tokens
 from model_registry import ModelMetadata
-from providers._errors import LLMCancelledError, LLMPermanentError
+from providers._errors import (
+    LLMCancelledError,
+    LLMEmptyResponseError,
+    LLMError,
+    LLMPermanentError,
+)
 from model_request_budget import (
     ModelRequestBudget,
     ModelRequestBudgetError,
@@ -55,6 +70,20 @@ _SUMMARY_CAP = 6000
 # Floor (characters) below which deterministic budget-tightening stops shrinking
 # content — going further would discard information without meaningfully helping.
 _SHRINK_FLOOR = 400
+
+
+class CompactionFailedError(Exception):
+    """An automatic compaction attempt failed; the caller keeps the original history.
+
+    Carries only fixed labels (never provider, prompt, summary or history text):
+    ``reason`` is ``summary_failed``, ``empty_summary`` or ``invalid_candidate`` and
+    ``cause_type`` the failing exception's class name (``"-"`` when none).
+    """
+
+    def __init__(self, reason: str, cause_type: str = "-") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.cause_type = cause_type
 
 
 def _active_model(llm: "LLMClient") -> str | None:
@@ -258,10 +287,15 @@ def _assemble(
     last: list[int],
     goal: int,
     summary: str,
-    summary_cap: int,
-    recent_cap: int,
+    summary_cap: int | None,
+    recent_cap: int | None,
 ) -> tuple[list[dict], int]:
-    """Build the compacted list from original indices; the goal is never capped."""
+    """Build the compacted list from original indices; the goal is never capped.
+
+    ``recent_cap=None`` keeps every retained message unchanged and ``summary_cap=None``
+    publishes the summary whole (automatic path). The input list and its messages are
+    never mutated; the result is a new list.
+    """
     out: list[dict] = []
     goal_pos = 0
 
@@ -270,13 +304,18 @@ def _assemble(
         if i == goal:
             goal_pos = len(out)
             out.append(messages[i])
+        elif recent_cap is None:
+            out.append(messages[i])
         else:
             out.append(_cap_string_message(messages[i], recent_cap))
 
     for i in first:
         emit(i)
     if middle:
-        bounded = _truncate_head_tail(summary, summary_cap // 2, summary_cap // 2)
+        bounded = (
+            summary if summary_cap is None
+            else _truncate_head_tail(summary, summary_cap // 2, summary_cap // 2)
+        )
         out.append({
             "role": "user",
             "content": f"[Compacted context — earlier steps summary]\n{bounded}",
@@ -382,6 +421,70 @@ def _fallback_summary(middle: list[dict]) -> str:
     return _truncate_head_tail(rendered, _SUMMARY_CAP // 2, _SUMMARY_CAP // 2)
 
 
+def _summary_prompt(messages: list[dict], middle: list[int]) -> str:
+    """Render the compaction prompt for the eligible middle."""
+    middle_text = "\n".join(_format_middle_message(messages[i]) for i in middle)
+    return (
+        "Summarize these intermediate agent steps concisely in bullet points "
+        "(preserve tool names, key outputs, errors, and decisions):\n\n" + middle_text
+    )
+
+
+def _summarize_middle(
+    messages: list[dict],
+    middle: list[int],
+    llm: "LLMClient",
+    summarize: Callable[[str], str] | None,
+) -> str:
+    """Legacy-path summary: cancellation propagates, other failures fall back.
+
+    A blank (whitespace-only) reply is a failure that falls back. The automatic path
+    uses :func:`_summarize_automatic` instead and never falls back.
+    """
+    summary_prompt = _summary_prompt(messages, middle)
+    try:
+        if summarize is not None:
+            text = summarize(summary_prompt)
+        else:
+            text = llm.chat([{"role": "user", "content": summary_prompt}])
+        if not (text or "").strip():
+            raise ValueError("empty compaction summary")
+        return text
+    except LLMCancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Compaction LLM call failed (%s) — using deterministic fallback",
+            type(exc).__name__,
+        )
+        return _fallback_summary([messages[i] for i in middle])
+
+
+def _summarize_automatic(
+    messages: list[dict],
+    middle: list[int],
+    llm: "LLMClient",
+    summarize: Callable[[str], str] | None,
+) -> str:
+    """Return the stripped, non-empty summary or raise :class:`CompactionFailedError`.
+
+    Only provider failures (``LLMError``, ``LLMEmptyResponseError``, ``httpx.HTTPError``)
+    and blank text are compaction failures. Cancellation (``LLMCancelledError``) and
+    unexpected programmer errors propagate unchanged.
+    """
+    prompt = _summary_prompt(messages, middle)
+    try:
+        if summarize is not None:
+            text = summarize(prompt)
+        else:
+            text = llm.chat([{"role": "user", "content": prompt}])
+    except (LLMError, LLMEmptyResponseError, httpx.HTTPError) as exc:
+        raise CompactionFailedError("summary_failed", type(exc).__name__) from exc
+    if not isinstance(text, str) or not text.strip():
+        raise CompactionFailedError("empty_summary")
+    return text.strip()
+
+
 def maybe_compact(
     messages: list[dict],
     system: str,
@@ -396,8 +499,17 @@ def maybe_compact(
     repair_target: int | None = None,
     force: bool = False,
     summarize: Callable[[str], str] | None = None,
+    threshold: int | None = None,
 ) -> tuple[list[dict], int]:
     """Return a (possibly compacted) copy of *messages* and the goal's new index.
+
+    ``threshold`` is the model-independent ``agent.compaction_threshold_tokens``.
+    When given (the ReAct loop always supplies it) it is the only trigger: the
+    complete estimated input (``input_tokens``, or messages + system +
+    ``tool_defs_tokens``) is compared with it, and ``ctx_max_tokens``,
+    ``metadata`` and ``request_budget`` are ignored. Without it the legacy
+    model-derived threshold below applies (retained for pre-6.2 callers until the
+    budget machinery is retired).
 
     Optional repair inputs: ``input_tokens`` is the complete request estimate
     (messages, system, tool definitions and framing); the part beyond the
@@ -407,8 +519,10 @@ def maybe_compact(
     budget is consulted, so it also works for budgets below the 256 floor. The
     caller must re-preview the result; nothing here approves a send.
     ``summarize`` replaces the default ``llm.chat`` summary call; a
-    ``LLMCancelledError`` it raises propagates, any other failure falls back to
-    the deterministic summary.
+    ``LLMCancelledError`` it raises propagates. On the legacy path any other failure
+    falls back to the deterministic summary; on the automatic path a provider failure
+    (``LLMError``, ``LLMEmptyResponseError``, ``httpx.HTTPError``), a blank summary or
+    an invalid candidate raises ``CompactionFailedError`` and nothing is published.
 
     If the estimated token count of *messages* plus *system* plus
     ``tool_defs_tokens`` exceeds 85 % of the effective context window (after
@@ -432,17 +546,21 @@ def maybe_compact(
     for the compaction threshold. This heuristic is not approval that the final
     request fits: the client must recompute its budget after any payload changes.
 
-    The current active goal and the two most recent messages are preserved, but
-    very large recent tool-result content is capped head+tail so it cannot
-    overflow the real model context. If the compaction LLM call fails, a
-    deterministic fallback summary is returned rather than the un-compacted
-    oversized messages.
+    The current active goal and the two most recent messages are preserved. On
+    the automatic path (``threshold`` given, not ``force``) they are kept
+    unchanged and uncapped, one attempt is made per request, an empty eligible
+    middle changes and truncates nothing, and a still-over-threshold result is
+    returned without tightening. On the legacy path only (``threshold=None`` or
+    ``force``), very large recent tool-result content is capped head+tail and the
+    tightening loop below applies. If the compaction LLM call fails on the legacy
+    path, a deterministic fallback summary is returned rather than the un-compacted
+    oversized messages; the automatic path never substitutes one.
 
     The goal message is preserved unchanged (every field, never capped) on every
     path; its position is returned precisely. Compaction works on whole spans: an
     assistant ``tool_calls`` message and all its matching tool results are kept or
-    summarized together. At the shrink floor the oldest retained non-goal span is
-    demoted into a deterministically rebuilt summary.
+    summarized together. On the legacy path only, at the shrink floor the oldest
+    retained non-goal span is demoted into a deterministically rebuilt summary.
 
     Args:
         messages: Conversation history to (potentially) compact.
@@ -472,6 +590,7 @@ def maybe_compact(
         return messages, goal_idx
     message_total = estimate_messages_tokens(messages, system, model=_active_model(llm))
     overhead = 0
+    legacy_threshold = False
     if input_tokens is not None:
         total = input_tokens
         overhead = max(0, input_tokens - message_total)
@@ -479,8 +598,9 @@ def maybe_compact(
         total = message_total + tool_defs_tokens
     if force and type(repair_target) is int and repair_target > 0:
         threshold = repair_target
-    else:
+    elif threshold is None:
         force = False
+        legacy_threshold = True
         _, threshold = resolve_compaction_threshold(
             llm.llm_cfg, ctx_max_tokens, metadata=metadata, request_budget=request_budget,
         )
@@ -490,6 +610,30 @@ def maybe_compact(
     # Message-level limit once the fixed non-message overhead is accounted for.
     limit = max(1, threshold - overhead)
     goal = min(max(0, goal_idx), len(messages) - 1)
+    automatic = not force and not legacy_threshold
+    if automatic:
+        first, middle, last = _partition_compaction(messages, goal)
+        if not middle:
+            # Nothing eligible: the goal and recent spans are never truncated.
+            return messages, goal_idx
+        logger.warning(
+            "Context size ~%d tokens exceeds threshold %d — compacting…",
+            total, threshold,
+        )
+        summary = _summarize_automatic(messages, middle, llm, summarize)
+        # Candidate on a copy; published (with its goal index) only once it validates.
+        compacted, new_goal_idx = _assemble(
+            messages, first, middle, last, goal, summary, None, None,
+        )
+        try:
+            validate_native_history(compacted)
+        except LLMPermanentError as exc:
+            raise CompactionFailedError("invalid_candidate", type(exc).__name__) from exc
+        logger.info(
+            "Compacted context: %d → ~%d tokens", total,
+            estimate_messages_tokens(compacted, system, model=_active_model(llm)) + overhead,
+        )
+        return compacted, new_goal_idx
     if len(messages) <= 3:
         capped, capped_total = _cap_short_overbudget_context(messages, system, limit, llm, goal)
         if capped_total <= limit:
@@ -502,30 +646,7 @@ def maybe_compact(
 
     first, middle, last = _partition_compaction(messages, goal)
 
-    def summarize_middle() -> str:
-        middle_text = "\n".join(_format_middle_message(messages[i]) for i in middle)
-        summary_prompt = (
-            "Summarize these intermediate agent steps concisely in bullet points "
-            "(preserve tool names, key outputs, errors, and decisions):\n\n" + middle_text
-        )
-        try:
-            if summarize is not None:
-                text = summarize(summary_prompt)
-            else:
-                text = llm.chat([{"role": "user", "content": summary_prompt}])
-            if not (text or "").strip():
-                raise ValueError("empty compaction summary")
-            return text
-        except LLMCancelledError:
-            raise
-        except Exception as exc:
-            logger.error(
-                "Compaction LLM call failed (%s) — using deterministic fallback",
-                type(exc).__name__,
-            )
-            return _fallback_summary([messages[i] for i in middle])
-
-    summary = summarize_middle() if middle else ""
+    summary = _summarize_middle(messages, middle, llm, summarize) if middle else ""
     summary_cap = _SUMMARY_CAP
     recent_cap = _RECENT_HEAD + _RECENT_TAIL
     compacted, new_goal_idx = _assemble(

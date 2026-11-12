@@ -8,7 +8,6 @@ backfill and admission wiring are not exercised here.
 
 from __future__ import annotations
 
-import copy
 import json
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -26,7 +25,7 @@ from model_request_budget import (
     compute_request_budget,
     repair_input_ceiling,
 )
-from providers._errors import LLMContextOverflowError, LLMPermanentError
+from providers._errors import LLMPermanentError
 from token_usage import TokenUsageRegistry
 
 _CAP = 1024
@@ -242,97 +241,6 @@ def test_kernel_rejects_invalid_input_and_local_context(input_tokens: object, lo
             fixed_output_cap=_CAP,
         )
     assert caught.value.code == "invalid_limit"
-
-
-@pytest.mark.parametrize("output_tokens", [1023, 1024, None], ids=["1023", "1024", "unknown"])
-def test_factory_checks_known_output_threshold_before_any_io(output_tokens: int | None) -> None:
-    """The factory rejects only a known output limit below 1024, without sending."""
-    transport = _CountingTransport(lambda request: httpx.Response(500))
-    pin = _pin(ModelMetadata(context_tokens=8192, output_tokens=output_tokens))
-    if output_tokens == 1023:
-        with pytest.raises(LLMPermanentError) as caught:
-            LLMClient.for_graph_extraction(pin, agent_config=_config(), http_transport=transport)
-        assert type(caught.value) is LLMPermanentError
-    else:
-        client = LLMClient.for_graph_extraction(pin, agent_config=_config(), http_transport=transport)
-        client.close()
-    assert transport.requests == []
-
-
-@pytest.mark.parametrize(
-    ("metadata", "local", "ceiling"),
-    [
-        pytest.param(ModelMetadata(context_tokens=8192), 4096, 7168, id="context_only"),
-        pytest.param(ModelMetadata(input_tokens=8000), 1, 8000, id="input_only"),
-        pytest.param(ModelMetadata(context_tokens=10_000, input_tokens=9000), 4096, 8976,
-                     id="context_and_input"),
-        pytest.param(ModelMetadata(), 12_000, 10_976, id="no_limits_local"),
-    ],
-)
-def test_graph_client_prefit_overflow_raises_before_any_send(
-    metadata: ModelMetadata, local: int, ceiling: int
-) -> None:
-    """Oversized real messages fail with a repair target and leave no side effects."""
-    pin = _pin(metadata)
-    transport = _CountingTransport(lambda request: httpx.Response(200, json=_reply_body("openai", "json")))
-    registry = TokenUsageRegistry()
-    messages = [{"role": "user", "content": _LONG_TEXT}]
-    snapshot = copy.deepcopy(messages)
-    client = LLMClient.for_graph_extraction(
-        pin, agent_config=_config(local), http_transport=transport, usage_registry=registry
-    )
-    try:
-        before = client.get_today_usage()
-        with pytest.raises(LLMContextOverflowError) as caught:
-            client.chat(messages, json_mode=True)
-        after = client.get_today_usage()
-    finally:
-        client.close()
-
-    assert type(caught.value) is LLMContextOverflowError
-    assert caught.value.status_code is None
-    assert caught.value.repair_input_ceiling == ceiling
-    assert ceiling == repair_input_ceiling(
-        metadata, local_context_tokens=local, fixed_output_cap=_CAP
-    )
-    assert caught.value.input_tokens is not None
-    assert caught.value.input_tokens > ceiling
-    assert transport.requests == []
-    assert before == after
-    assert after["total_tokens"] == 0
-    assert registry.get_today() == {}
-    assert messages == snapshot
-    assert pin == _pin(metadata)
-
-
-@pytest.mark.parametrize(
-    ("metadata", "local"),
-    [
-        pytest.param(ModelMetadata(context_tokens=1024), 4096, id="context_1024"),
-        pytest.param(ModelMetadata(), 1024, id="local_1024_no_limits"),
-    ],
-)
-def test_graph_client_without_headroom_fails_permanently_before_io(
-    metadata: ModelMetadata, local: int
-) -> None:
-    """No positive input headroom is a permanent local failure, not an overflow."""
-    transport = _CountingTransport(lambda request: httpx.Response(500))
-    registry = TokenUsageRegistry()
-    client = LLMClient.for_graph_extraction(
-        _pin(metadata), agent_config=_config(local), http_transport=transport,
-        usage_registry=registry,
-    )
-    try:
-        with pytest.raises(LLMPermanentError) as caught:
-            client.chat([{"role": "user", "content": "extract"}], json_mode=True)
-        usage = client.get_today_usage()
-    finally:
-        client.close()
-    assert type(caught.value) is LLMPermanentError
-    assert "no_input_budget" in str(caught.value)
-    assert transport.requests == []
-    assert usage["total_tokens"] == 0
-    assert registry.get_today() == {}
 
 
 _WIRE_CASES = [

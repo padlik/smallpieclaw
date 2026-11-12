@@ -1001,10 +1001,6 @@ _GEM_CHAT_PATH = "/v1beta/models/gem-1:generateContent"
     ("messages", "provider_context_error", "sent", "error_text"),
     [
         pytest.param(
-            [{"role": "user", "content": "word " * 60_000}], False, 0,
-            "rejected by local budget", id="context-exceeds-local-budget",
-        ),
-        pytest.param(
             [{"role": "user", "content": "ping"}], True, 1,
             "context_length_exceeded", id="context-rejected-by-provider",
         ),

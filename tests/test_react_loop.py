@@ -1068,10 +1068,10 @@ class TestCompactionGoalAnchoring:
             context_manager, "estimate_messages_tokens",
             lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10,
         )
-        import tests.execution_harness as harness
+        import react_loop as react_loop_module
         monkeypatch.setattr(
-            harness, "estimate_messages_tokens",
-            lambda m, s, model=None: 900_000 if len(m) > 3 else 10,
+            react_loop_module, "estimate_messages_tokens",
+            lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10,
         )
 
         goal = "CURRENT GOAL: reconcile the ledger end to end"

@@ -475,7 +475,7 @@ class TestSubAgentModelConfiguration:
         caller_cfg = AgentConfig(
             agent_name="caller-agent", max_iterations=3, scheduled_max_iterations=55,
             tool_timeout=21, max_output_size=1234, top_tools=9,
-            ctx_max_tokens=23456, max_retries=7, retry_delay=0.25, max_subagents=2,
+            ctx_max_tokens=23456, compaction_threshold_tokens=33333, max_retries=7, retry_delay=0.25, max_subagents=2,
             subagent_result_timeout=45, long_run_warn_minutes=12,
             diagnose_empty_responses=True, default_model="pa/up/a",
             background_model="pb/up/b", fallback_models=["pb/up/b", "pa/up/a"],
@@ -500,6 +500,7 @@ class TestSubAgentModelConfiguration:
             assert runner._agent.max_iterations == 3
             assert runner._agent.top_tools == 9
             assert runner._agent.ctx_max_tokens == 23456
+            assert runner._agent.compaction_threshold_tokens == 33333
             assert runner._agent.creativity_mode == "planner"
             assert runner._agent.plan_max_iterations == 17
             assert runner._agent.inactivity_warn_minutes == 4

@@ -228,7 +228,7 @@ system prompt before each turn.
 **File:** `context_manager.py` → `maybe_compact()`
 
 The ReAct loop calls `maybe_compact()` before each LLM call. If the estimated
-token count of the current message list exceeds **85 % of `ctx_max_tokens`**, the
+estimated input (system prompt, messages and tool definitions) exceeds **`agent.compaction_threshold_tokens`**, the
 algorithm fires:
 
 ### Short-history path (≤ 3 messages)
@@ -333,7 +333,7 @@ to shrink the context window without losing the current task.
 
 `/compress` is a **hidden command** — it is not shown in Telegram's command
 menu or in `/help`. Normal users do not need it: automatic context compaction
-fires at 85% of `ctx_max_tokens` without any manual trigger. For task lifecycle
+fires above `agent.compaction_threshold_tokens` without any manual trigger. For task lifecycle
 management, use `/reset` (save and clear) or `/reset discard` (clear without saving).
 `/compress` remains available as an advanced escape hatch by typing it directly.
 

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import os
 
 import pytest
 
 from config_schema import (
+    AgentConfig,
     AppConfig,
     ConfigError,
     VaultConfig,
@@ -25,7 +27,7 @@ def minimal_config():
     """Minimal valid connection-oriented configuration."""
     return {
         "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [12345], "security_mode": "allowlist"},
-        "agent": {"max_iterations": 8, "scheduled_max_iterations": 100, "tool_timeout": 10, "max_output_size": 4000, "top_tools": 3, "ctx_max_tokens": 90000},
+        "agent": {"max_iterations": 8, "scheduled_max_iterations": 100, "tool_timeout": 10, "max_output_size": 4000, "top_tools": 3, "compaction_threshold_tokens": 60000},
         "providers": {"openai-main": {"type": "openai", "api_key": "test-provider-key", "base_url": "https://api.openai.com/v1"}},
         "embeddings": {
             "provider": "openai",
@@ -54,7 +56,8 @@ class TestParseConfig:
         cfg = parse_config(minimal_config)
         assert cfg.agent.tool_timeout == 10
         assert cfg.agent.max_output_size == 4000
-        assert cfg.agent.ctx_max_tokens == 90_000
+        assert cfg.agent.compaction_threshold_tokens == 60_000
+        assert cfg.agent.required_output_cap_tokens == 1024
         assert cfg.scheduler.enabled is True
 
     def test_legacy_models_key_is_rejected_even_when_empty(self, minimal_config):
@@ -1261,10 +1264,9 @@ def test_directly_constructed_app_config_freezes_provider_map(minimal_config):
 class TestRequiredOutputCapSetting:
     """Pulled-forward 6.1 slice (user-approved under 4.1): ``agent.required_output_cap_tokens``."""
 
-    def test_default_is_1024_and_obsolete_ctx_key_is_untouched(self, minimal_config):
+    def test_default_is_1024(self, minimal_config):
         cfg = parse_config(minimal_config)
         assert cfg.agent.required_output_cap_tokens == 1024
-        assert cfg.agent.ctx_max_tokens == 90_000  # removal belongs to task 6.1 proper
 
     @pytest.mark.parametrize("value", [1, 4096, 128_000])
     def test_positive_integer_is_used(self, minimal_config, value):
@@ -1282,3 +1284,132 @@ class TestRequiredOutputCapSetting:
         message = str(caught.value)
         assert "agent.required_output_cap_tokens" in message and "positive integer" in message
         assert "ctx_max_tokens" not in message
+
+
+_INVALID_POSITIVE_INTS = [True, False, 0, -1, 1.5, 60000.0, "60000", ""]
+_INVALID_POSITIVE_INT_IDS = [
+    "true", "false", "zero", "negative", "float", "integral-float", "string", "empty-string",
+]
+
+
+def test_compaction_threshold_and_required_cap_positive_int_defaults(minimal_config):
+    """Both settings default (60000 / 1024) with or without an ``[agent]`` section."""
+    minimal_config["agent"].pop("compaction_threshold_tokens")
+    cfg = parse_config(minimal_config)
+    assert (cfg.agent.compaction_threshold_tokens, cfg.agent.required_output_cap_tokens) == (60_000, 1024)
+
+    del minimal_config["agent"]
+    cfg = parse_config(minimal_config)
+    assert (cfg.agent.compaction_threshold_tokens, cfg.agent.required_output_cap_tokens) == (60_000, 1024)
+
+    assert AgentConfig().compaction_threshold_tokens == 60_000
+
+
+class TestCompactionThresholdSetting:
+    """``agent.compaction_threshold_tokens``: positive ``int`` of estimated input tokens."""
+
+    @pytest.mark.parametrize("value", [1, 256, 60_000, 1_000_000])
+    def test_positive_integer_is_used(self, minimal_config, value):
+        minimal_config["agent"]["compaction_threshold_tokens"] = value
+        assert parse_config(minimal_config).agent.compaction_threshold_tokens == value
+
+    @pytest.mark.parametrize("value", _INVALID_POSITIVE_INTS, ids=_INVALID_POSITIVE_INT_IDS)
+    def test_invalid_values_fail_naming_the_key(self, minimal_config, value):
+        minimal_config["agent"]["compaction_threshold_tokens"] = value
+        with pytest.raises(ConfigError) as caught:
+            parse_config(minimal_config)
+        message = str(caught.value)
+        assert "agent.compaction_threshold_tokens" in message and "positive integer" in message
+        assert "ctx_max_tokens" not in message and "required_output_cap" not in message
+
+    def test_rejected_value_is_never_echoed(self, minimal_config):
+        minimal_config["agent"]["compaction_threshold_tokens"] = "SECRET-SENTINEL-VALUE"
+        minimal_config["agent"]["required_output_cap_tokens"] = 2048
+        with pytest.raises(ConfigError) as caught:
+            parse_config(minimal_config)
+        assert "SECRET-SENTINEL-VALUE" not in str(caught.value)
+
+    def test_cap_error_never_echoes_value_either(self, minimal_config):
+        minimal_config["agent"]["required_output_cap_tokens"] = "SECRET-SENTINEL-VALUE"
+        with pytest.raises(ConfigError) as caught:
+            parse_config(minimal_config)
+        assert "SECRET-SENTINEL-VALUE" not in str(caught.value)
+
+    def test_threshold_and_cap_are_independent_settings(self, minimal_config):
+        minimal_config["agent"]["compaction_threshold_tokens"] = 1500
+        minimal_config["agent"]["required_output_cap_tokens"] = 4096
+        cfg = parse_config(minimal_config)
+        assert (cfg.agent.compaction_threshold_tokens, cfg.agent.required_output_cap_tokens) == (1500, 4096)
+
+    def test_threshold_is_not_derived_from_provider_connections(self, minimal_config):
+        baseline = parse_config(copy.deepcopy(minimal_config)).agent.compaction_threshold_tokens
+        minimal_config["providers"]["anthropic-main"] = {
+            "type": "anthropic", "api_key": "k", "base_url": "https://api.anthropic.com/v1",
+        }
+        minimal_config["providers"]["local"] = {
+            "type": "ollama", "api_key": "k", "base_url": "https://ollama.com",
+        }
+        assert parse_config(minimal_config).agent.compaction_threshold_tokens == baseline == 60_000
+
+
+class TestAgentRetryControlsStayIndependent:
+    """Agent-level retries keep their schema, defaults and validation (not generation controls)."""
+
+    def test_defaults_and_values_unchanged_by_new_settings(self, minimal_config):
+        cfg = parse_config(copy.deepcopy(minimal_config))
+        assert (cfg.agent.max_retries, cfg.agent.retry_delay) == (4, 2.0)
+
+        minimal_config["agent"].update(
+            max_retries=0, retry_delay=0.5, compaction_threshold_tokens=777, required_output_cap_tokens=333,
+        )
+        agent = parse_config(minimal_config).agent
+        assert (agent.max_retries, agent.retry_delay) == (0, 0.5)
+        assert (agent.compaction_threshold_tokens, agent.required_output_cap_tokens) == (777, 333)
+
+    @pytest.mark.parametrize("key", ["max_retries", "retry_delay"])
+    def test_retry_keys_do_not_replace_or_alias_generation_settings(self, minimal_config, key):
+        minimal_config["agent"][key] = -1
+        with pytest.raises(ConfigError, match=f"agent.{key}") as caught:
+            parse_config(minimal_config)
+        assert "compaction_threshold_tokens" not in str(caught.value)
+
+    def test_invalid_new_setting_does_not_mention_retry_keys(self, minimal_config):
+        minimal_config["agent"]["required_output_cap_tokens"] = 0
+        with pytest.raises(ConfigError) as caught:
+            parse_config(minimal_config)
+        assert "max_retries" not in str(caught.value) and "retry_delay" not in str(caught.value)
+
+
+class TestObsoleteContextLimitKeyIsRejected:
+    """``agent.ctx_max_tokens`` is rejected with replacement guidance, never read or aliased."""
+
+    @pytest.mark.parametrize(
+        "value", [90_000, 0, -5, None, False, "SECRET-SENTINEL-VALUE", 1.5],
+        ids=["int", "zero", "negative", "none", "false", "string", "float"],
+    )
+    def test_ctx_max_tokens_rejected_with_replacement_guidance(self, minimal_config, value):
+        minimal_config["agent"].pop("compaction_threshold_tokens", None)
+        minimal_config["agent"]["ctx_max_tokens"] = value
+        with pytest.raises(ConfigError) as caught:
+            parse_config(minimal_config)
+        message = str(caught.value)
+        assert "agent.ctx_max_tokens" in message
+        assert "agent.compaction_threshold_tokens" in message
+        assert "SECRET-SENTINEL-VALUE" not in message
+
+    def test_rejected_even_alongside_the_new_key(self, minimal_config):
+        minimal_config["agent"]["ctx_max_tokens"] = 90_000
+        minimal_config["agent"]["compaction_threshold_tokens"] = 60_000
+        with pytest.raises(ConfigError, match=r"agent\.ctx_max_tokens.*agent\.compaction_threshold_tokens"):
+            parse_config(minimal_config)
+
+    def test_obsolete_key_is_not_an_alias_for_the_threshold(self, minimal_config):
+        minimal_config["agent"]["ctx_max_tokens"] = 5000
+        with pytest.raises(ConfigError):
+            parse_config(minimal_config)
+        minimal_config["agent"].pop("ctx_max_tokens")
+        assert parse_config(minimal_config).agent.compaction_threshold_tokens == 60_000
+
+    def test_config_without_the_obsolete_key_never_sets_the_internal_attribute(self, minimal_config):
+        # Task 6.2 removes the attribute; until then no config path may populate it.
+        assert parse_config(minimal_config).agent.ctx_max_tokens == AgentConfig().ctx_max_tokens

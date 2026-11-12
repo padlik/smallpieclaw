@@ -29,7 +29,7 @@ _EXAMPLE = Path(__file__).resolve().parent.parent / "config.toml.example"
 # per-model tuning. None of these keys may appear anywhere in the example.
 _FORBIDDEN_KEYS = frozenset({
     "models", "default_model", "background_model", "fallback_model", "fallback_models",
-    "temperature", "max_tokens", "vision", "aliases",
+    "temperature", "max_tokens", "vision", "aliases", "ctx_max_tokens",
 })
 
 
@@ -93,6 +93,11 @@ def test_example_config_has_no_legacy_model_keys() -> None:
             r"agent\.default_model",
             id="agent-default-model",
         ),
+        pytest.param(
+            lambda example: example["agent"].update(ctx_max_tokens=90000),
+            r"agent\.ctx_max_tokens.*agent\.compaction_threshold_tokens",
+            id="agent-ctx-max-tokens",
+        ),
     ],
 )
 def test_example_config_rejects_appended_legacy_keys(
@@ -104,6 +109,16 @@ def test_example_config_rejects_appended_legacy_keys(
 
     with pytest.raises(ConfigError, match=message):
         parse_config(example, vault_file=_temp_vault(tmp_path), agent_name="piclaw")
+
+
+def test_example_sets_the_default_compaction_threshold(tmp_path: Path) -> None:
+    """The example carries the documented default threshold; the cap keeps its default."""
+    app_config = parse_config(
+        _parsed_example(), vault_file=_temp_vault(tmp_path), agent_name="piclaw",
+    )
+
+    assert app_config.agent.compaction_threshold_tokens == 60000
+    assert app_config.agent.required_output_cap_tokens == 1024
 
 
 def test_example_provider_credentials_stay_unresolved(tmp_path: Path) -> None:

@@ -370,6 +370,10 @@ class AgentController:
         return self._agent_cfg.ctx_max_tokens
 
     @property
+    def compaction_threshold_tokens(self) -> int:
+        return self._agent_cfg.compaction_threshold_tokens
+
+    @property
     def creativity_mode(self) -> str:
         return self._agent_cfg.creativity_mode
 
@@ -421,6 +425,7 @@ class AgentController:
             max_iterations=self.max_iterations,
             top_tools=self.top_tools,
             ctx_max_tokens=self.ctx_max_tokens,
+            compaction_threshold_tokens=self.compaction_threshold_tokens,
             tmp_dir=self.tmp_dir,
             downloads_dir=self.downloads_dir,
             workspace_dir=self.workspace_dir,

@@ -80,17 +80,6 @@ def _fmt_stat(val: object, suffix: str = "") -> str:
     )
 
 
-def _fmt_signed_stat(val: object, suffix: str = "") -> str:
-    """Format a signed int stat, preserving negative values as actual numbers.
-
-    Use this for values such as ``headroom_real`` where a negative number is
-    meaningful and should be displayed (e.g. ``-5,120`` tokens).
-    """
-    if isinstance(val, int):
-        return f"{val:,}{suffix}"
-    return f"{html.escape(str(val) if val is not None else 'N/A')}{suffix}"
-
-
 def _registry_selection_label(iface: "TelegramInterface") -> str | None:
     """Return the root registry's current selection as plain (unescaped) text.
 
@@ -295,42 +284,16 @@ async def cmd_status(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     )
 
 
-_DANGER_EMOJI = {
-    "safe": "🟢",
-    "approaching": "🟡",
-    "danger": "🔴",
-}
-
-
-def _bar_chart(percentage: float, width: int = 10) -> str:
-    """Return a Unicode block bar chart string for a 0-100 percentage."""
-    if percentage < 0:
-        percentage = 0
-    elif percentage > 100:
-        percentage = 100
-    filled = int(round(percentage / (100 / width)))
-    filled = max(0, min(width, filled))
-    return "█" * filled + "░" * (width - filled)
-
-
-def _fmt_context_row(label: str, tokens: int, window: int) -> str:
-    """Format a context-window category row with aligned bar chart."""
-    if window > 0:
-        percentage = tokens / window * 100
-    else:
-        percentage = 0.0
-    bar = _bar_chart(percentage)
-    # Right-align numbers for a fixed-width look inside <pre>
-    return (
-        f"{label:<18} {_fmt_stat(tokens):>12} ({percentage:>4.1f}%) {bar}"
-    )
+def _fmt_context_row(label: str, tokens: int) -> str:
+    """Format one estimated-input category row for the ``/context`` table."""
+    return f"{label:<14} {_fmt_stat(tokens):>10}"
 
 
 @_require_auth
 async def cmd_context(
     iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Show context window consumption profile."""
+    """Show the estimated input token profile against the compaction threshold."""
     monitor = getattr(iface.agent, "context_monitor", None) if iface.agent else None
     snapshot = monitor.read() if monitor is not None else None
 
@@ -342,17 +305,19 @@ async def cmd_context(
         )
         return
 
-    # The snapshot carries no model ID: with a registry, label the *current*
-    # selection rather than attributing the measurements to it.
-    selection_label = _registry_selection_label(iface)
-    if selection_label is not None:
-        heading_label = f"current selection: {html.escape(selection_label)}"
-    elif iface.llm_client:
-        active = iface.llm_client.llm_cfg
-        model_name = f"{active.get('name', '')} / {active.get('model', 'N/A')}".lstrip("/ ")
-        heading_label = f"model: {html.escape(model_name)}"
+    if snapshot.model_id:
+        # The run's own pinned identity, never the registry's current selection.
+        heading_label = f"model: {html.escape(snapshot.model_id)}"
     else:
-        heading_label = "model: N/A"
+        selection_label = _registry_selection_label(iface)
+        if selection_label is not None:
+            heading_label = f"current selection: {html.escape(selection_label)}"
+        elif iface.llm_client:
+            active = iface.llm_client.llm_cfg
+            model_name = f"{active.get('name', '')} / {active.get('model', 'N/A')}".lstrip("/ ")
+            heading_label = f"model: {html.escape(model_name)}"
+        else:
+            heading_label = "model: N/A"
 
     live_indicator = (
         f"🔴 LIVE (turn {snapshot.turn})"
@@ -360,17 +325,13 @@ async def cmd_context(
         else f"⚪ idle (last run turn {snapshot.turn})"
     )
 
-    rows = [
-        _fmt_context_row("System prompt", snapshot.system_prompt_tokens, snapshot.effective_window),
-        _fmt_context_row("Chat history", snapshot.chat_history_tokens, snapshot.effective_window),
-        _fmt_context_row("Tool defs", snapshot.tool_defs_tokens, snapshot.effective_window),
-        _fmt_context_row(
-            "Completion reserve", snapshot.completion_reserve, snapshot.effective_window
-        ),
-    ]
-    chart = "\n".join(rows)
-
-    danger_emoji = _DANGER_EMOJI.get(snapshot.danger_level, "⚪")
+    total = snapshot.system_prompt_tokens + snapshot.chat_history_tokens + snapshot.tool_defs_tokens
+    rows = "\n".join([
+        _fmt_context_row("System prompt", snapshot.system_prompt_tokens),
+        _fmt_context_row("Chat history", snapshot.chat_history_tokens),
+        _fmt_context_row("Tool defs", snapshot.tool_defs_tokens),
+        _fmt_context_row("Total", total),
+    ])
 
     server_lines = []
     for server, tokens in sorted(snapshot.tool_defs_by_server.items()):
@@ -379,10 +340,9 @@ async def cmd_context(
 
     message = (
         f"<b>Context Profile</b> — {heading_label}\n"
-        f"Window: {_fmt_stat(snapshot.effective_window)} tokens | {live_indicator}\n\n"
-        f"<pre>{chart}</pre>\n\n"
-        f"Danger: {danger_emoji} {html.escape(snapshot.danger_level)} | "
-        f"Headroom: {_fmt_signed_stat(snapshot.headroom_real)} tokens\n\n"
+        f"{live_indicator}\n\n"
+        f"<pre>{rows}</pre>\n\n"
+        f"Compaction threshold: {_fmt_stat(snapshot.compaction_threshold)} tokens\n\n"
         f"<b>Tool defs by server:</b>\n{servers_block}"
     )
 

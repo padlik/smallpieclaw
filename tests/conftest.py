@@ -38,7 +38,7 @@ def minimal_config() -> dict:
             "tool_timeout": 10,
             "max_output_size": 4000,
             "top_tools": 3,
-            "ctx_max_tokens": 90000,
+            "compaction_threshold_tokens": 60000,
         },
         "models": [
             {
@@ -179,6 +179,7 @@ def make_builtin_executor(tmp_path):
     _AGENT_FIELDS: set[str] = {
         "agent_name", "max_iterations", "scheduled_max_iterations",
         "tool_timeout", "max_output_size", "top_tools", "ctx_max_tokens",
+        "compaction_threshold_tokens", "required_output_cap_tokens",
         "max_subagents", "subagent_result_timeout", "long_run_warn_minutes",
         "diagnose_empty_responses", "default_model", "background_model",
         "fallback_models", "shell_backend", "shell_pty_cols",

@@ -67,12 +67,7 @@ async def test_cmd_context_dashboard_live() -> None:
         chat_history_tokens=45000,
         tool_defs_tokens=18000,
         tool_defs_by_server={"builtin": 12000, "github": 4000, "filesystem": 2000},
-        completion_reserve=1024,
-        effective_window=128000,
         compaction_threshold=108800,
-        headroom_nominal=61776,
-        headroom_real=61776,
-        danger_level="approaching",
         is_live=True,
         turn=5,
     )
@@ -86,20 +81,18 @@ async def test_cmd_context_dashboard_live() -> None:
     assert sent_texts, "Expected a reply"
     assert "Context Profile" in text
     assert "gpt-4" in text
-    assert "128,000" in text
+    assert "Compaction threshold: 108,800 tokens" in text
+    assert "66,200" in text  # total = 3,200 + 45,000 + 18,000
     assert "LIVE" in text
     assert "turn 5" in text
     assert "3,200" in text
     assert "45,000" in text
     assert "18,000" in text
-    assert "1,024" in text
-    assert "approaching" in text
-    assert "61,776" in text
+    for obsolete in ("Window", "reserve", "Headroom", "Danger", "approaching", "%", "█", "░"):
+        assert obsolete.lower() not in text.lower()
     assert "builtin" in text
     assert "github" in text
     assert "filesystem" in text
-    assert "█" in text
-    assert "░" in text
     assert sent_kwargs[0].get("parse_mode") == "HTML"
 
 
@@ -113,12 +106,7 @@ async def test_cmd_context_dashboard_idle() -> None:
         chat_history_tokens=2000,
         tool_defs_tokens=500,
         tool_defs_by_server={"builtin": 500},
-        completion_reserve=256,
-        effective_window=8000,
         compaction_threshold=6800,
-        headroom_nominal=4244,
-        headroom_real=4244,
-        danger_level="safe",
         is_live=False,
         turn=3,
     )
@@ -135,8 +123,8 @@ async def test_cmd_context_dashboard_idle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cmd_context_negative_headroom() -> None:
-    """Negative headroom_real renders as a signed number, not 'N/A'."""
+async def test_cmd_context_total_over_threshold_is_plain_counts() -> None:
+    """A total above the threshold is shown as counts only: no signed headroom or danger."""
     from telegram_commands import cmd_context
 
     snapshot = ContextSnapshot(
@@ -144,26 +132,41 @@ async def test_cmd_context_negative_headroom() -> None:
         chat_history_tokens=45000,
         tool_defs_tokens=18000,
         tool_defs_by_server={"builtin": 12000},
-        completion_reserve=1024,
-        effective_window=128000,
-        compaction_threshold=108800,
-        headroom_nominal=-5120,
-        headroom_real=-5120,
-        danger_level="danger",
+        compaction_threshold=60000,
         is_live=True,
         turn=7,
     )
     iface = _make_iface(snapshot)
     update, sent_texts, _sent_kwargs = _make_update()
-    ctx = MagicMock()
 
-    await cmd_context(iface, update, ctx)
+    await cmd_context(iface, update, MagicMock())
 
     text = "\n".join(sent_texts)
-    assert "Headroom: -5,120 tokens" in text
-    assert "danger" in text
+    assert "66,200" in text and "Compaction threshold: 60,000 tokens" in text
+    assert "headroom" not in text.lower() and "danger" not in text.lower()
 
 
+@pytest.mark.asyncio
+async def test_cmd_context_labels_the_snapshots_pinned_model_not_the_current_selection() -> None:
+    """The snapshot's own identity is shown even when the registry selects another model."""
+    from telegram_commands import cmd_context
+
+    snapshot = ContextSnapshot(
+        system_prompt_tokens=1, chat_history_tokens=2, tool_defs_tokens=3,
+        tool_defs_by_server={"builtin": 3}, compaction_threshold=10, is_live=False,
+        turn=1, model_id="pinned/run-model",
+    )
+    iface = _make_iface(snapshot)
+    iface.model_registry = MagicMock()
+    iface.model_registry.view.return_value = MagicMock(
+        selection_status="active", active_model_id="other/current-model"
+    )
+    update, sent_texts, _sent_kwargs = _make_update()
+
+    await cmd_context(iface, update, MagicMock())
+
+    text = "\n".join(sent_texts)
+    assert "pinned/run-model" in text and "other/current-model" not in text
 @pytest.mark.asyncio
 async def test_cmd_context_no_snapshot() -> None:
     """When no snapshot is published, a clear fallback message is shown."""

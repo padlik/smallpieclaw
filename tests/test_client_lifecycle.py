@@ -221,7 +221,7 @@ def test_each_public_retry_invocation_gets_its_own_event_pair(monkeypatch):
         client.close()
 
 
-def test_local_budget_failure_is_logged_without_network_send(monkeypatch):
+def test_tiny_cached_limits_do_not_block_a_send_or_log_a_failure(monkeypatch):
     requests: list[httpx.Request] = []
     client = _client(
         lambda request: requests.append(request) or _response(),
@@ -229,13 +229,9 @@ def test_local_budget_failure_is_logged_without_network_send(monkeypatch):
     )
     events = _capture_events(monkeypatch)
     try:
-        with pytest.raises(LLMPermanentError, match="local budget"):
-            client.chat([{"role": "user", "content": "word " * 4000}])
-        assert requests == []
-        assert [event for event, _message, _fields in events] == [
-            LogEvent.LLM_CALL, LogEvent.LLM_FAILED
-        ]
-        assert events[1][2]["err"] == "permanent"
+        client.chat([{"role": "user", "content": "word " * 4000}])
+        assert len(requests) == 1
+        assert LogEvent.LLM_FAILED not in [event for event, _message, _fields in events]
     finally:
         client.close()
 

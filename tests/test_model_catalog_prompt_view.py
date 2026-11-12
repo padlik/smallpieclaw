@@ -19,7 +19,7 @@ Phase 2 (runtime seam): the same view travels through ``ControllerDeps``,
 ``AgentController`` and ``ReactContext``; ``_assemble_system_prompt`` and
 ``_ensure_tool_defs`` consume the exact provided object, a replaced view
 invalidates cached definitions and their token grouping, and a guarded first
-request previews and dispatches one captured bundle.
+request stages and dispatches one captured bundle.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from unittest.mock import patch
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -795,19 +796,25 @@ def test_next_run_with_replaced_view_reports_recomputed_definition_tokens(meta_w
 # Phase 2: guarded first request is one coherent bundle
 # ---------------------------------------------------------------------------
 
-def test_guarded_first_request_previews_and_dispatches_one_captured_view(meta_world: _World) -> None:
+def test_guarded_first_request_dispatches_one_staged_captured_view(meta_world: _World) -> None:
+    import react_loop as react_loop_module
+
     view_b = _other_pin_view(meta_world)
     llm = _RecordingNativeLLM([ChatResponse(text=_FINISH)])
     ctx = _loop_ctx(llm, meta_world.view, guarded_first_request=True)
-    llm.on_first_preview = lambda: setattr(ctx, "model_catalog_view", view_b)
+    real_stage = react_loop_module._stage_guarded_first_request
 
-    assert react_loop(ctx, "goal") == "done"
+    def stage_then_swap(*args, **kwargs):
+        staged = real_stage(*args, **kwargs)
+        ctx.model_catalog_view = view_b  # a swap between staging and the send
+        return staged
+
+    with patch.object(react_loop_module, "_stage_guarded_first_request", stage_then_swap):
+        assert react_loop(ctx, "goal") == "done"
 
     assert ctx.model_catalog_view is view_b
-    assert len(llm.previews) >= 2 and len(llm.dispatches) == 1
-    bundles = [*llm.previews, *llm.dispatches]
-    staged_system, staged_tools = bundles[0]
-    assert all(bundle == (staged_system, staged_tools) for bundle in bundles)
+    assert llm.previews == [] and len(llm.dispatches) == 1
+    staged_system, staged_tools = llm.dispatches[0]
     assert staged_system.count(_render(meta_world.view).strip()) == 1
     assert meta_world.removed.id in _spawn_description(staged_tools)
 

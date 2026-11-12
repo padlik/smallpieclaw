@@ -25,7 +25,10 @@ python backfill_graph_memory.py --config config.toml --agent-name piclaw \\
 
 Prerequisites
 -------------
-- Graph memory must be enabled in config.toml: [graph_memory] enabled = true
+- Graph memory must be enabled in config.toml: [graph_memory] enabled = true,
+  with the four explicit extraction_* fields and the [embeddings] fields. A live
+  run validates them (no catalog, discovery or chat provider involved) before
+  any database or client is created; --dry-run validates and resolves nothing.
 - ladybug package must be installed: pip install ladybug
 - The main agent process must NOT be running against the same graph DB at the
   same time (LadybugDB embedded; single process access).
@@ -667,6 +670,17 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Pure validation of this CLI's own graph configuration (explicit extraction
+    # and embedding fields, credential references) before any database or client.
+    # No catalog, preference, discovery or chat connection is consulted (ADR-0039/0042).
+    from graph_memory import GraphPrerequisiteError, resolve_graph_startup
+
+    try:
+        prepared = resolve_graph_startup(app_cfg, vault_file=str(xdg.secrets_file))
+    except GraphPrerequisiteError as exc:
+        logger.error("Backfill prerequisites failed: %s", exc)
+        sys.exit(1)
+
     try:
         import ladybug  # type: ignore[import-untyped]  # noqa: F401
     except ImportError:
@@ -701,17 +715,6 @@ def main() -> None:
         str(args.force),
         state_file,
     )
-
-    # Saved-catalog preparation before any database or live embedding HTTP.
-    from graph_memory import GraphPrerequisiteError
-
-    try:
-        prepared = prepare_backfill_prerequisites(
-            app_cfg, xdg.models_config_file, vault_file=str(xdg.secrets_file)
-        )
-    except GraphPrerequisiteError as exc:
-        logger.error("Backfill prerequisites failed: %s", exc)
-        sys.exit(1)
 
     # One independent embedding client for this CLI invocation.
     embed_client = EmbeddingClient(

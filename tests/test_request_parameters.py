@@ -55,7 +55,7 @@ def test_ordinary_chat_request_contains_no_generation_tuning_fields(mode: str) -
     assert not {"max_tokens", "max_completion_tokens", "temperature", "top_p", "options"} & payload.keys()
 
 
-def test_graph_extraction_policy_is_fixed_and_rejects_known_small_output_limit() -> None:
+def test_graph_extraction_policy_is_fixed_without_an_output_limit_gate() -> None:
     requests: list[httpx.Request] = []
     transport = httpx.MockTransport(
         lambda request: requests.append(request)
@@ -72,10 +72,10 @@ def test_graph_extraction_policy_is_fixed_and_rejects_known_small_output_limit()
     assert payload["temperature"] == 0.1
     client.close()
 
-    with pytest.raises(Exception, match="output capacity"):
-        LLMClient.for_graph_extraction(
-            _run_model(output_tokens=512), agent_config=AgentConfig()
-        )
+    # Discovered output metadata is not a gate: a small known limit still builds.
+    LLMClient.for_graph_extraction(
+        _run_model(output_tokens=512), agent_config=AgentConfig()
+    ).close()
 
 
 def test_public_llm_provider_protocol_signatures_are_unchanged() -> None:
