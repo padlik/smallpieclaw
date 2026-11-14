@@ -8,7 +8,7 @@ Baseline: canonical `openspec/specs/telegram-command-surface/spec.md` as already
 
 ### Requirement: `/models` lists, refreshes, and selects discovered models
 
-Authorized `/models` SHALL list about 20 cached candidates simply, offer a refresh of every configured provider, and show per-provider fresh/stale status, the active selection, and whether it is saved or an unsaved automatic choice, including an active or saved selector that is not in the cache. Displayed capabilities and limits SHALL be labelled advisory and SHALL NOT be presented as budgets or as a promise of callability. Refresh SHALL update only the cache. Candidate buttons SHALL use opaque callbacks no longer than 64 bytes and reject expired or unknown tokens. The textual `/models select <connection-id>/<upstream-id>` command SHALL also accept deliberate selectors without cached candidates or an active Main selection; it SHALL validate only first-slash non-empty selector shape and the configured connection, never cache membership or upstream existence. Both selection routes SHALL atomically persist the preference before publishing the active selection or reporting success. When the preference is corrupt or invalid, `/models` SHALL say so without showing file content, and a deliberate selection by either route SHALL replace it without restart.
+Authorized `/models` SHALL list about 20 cached candidates simply, offer a refresh of every configured provider, and show per-provider fresh/stale status, the active selection, and whether it is saved or an unsaved automatic choice, including an active or saved selector that is not in the cache. Displayed capabilities and limits SHALL be labelled advisory and SHALL NOT be presented as budgets or as a promise of callability. Refresh SHALL update only the cache. Candidate buttons SHALL use opaque callbacks no longer than 64 bytes and reject expired or unknown tokens. Selection SHALL be made only through these candidate buttons; no typed `/models` selection command SHALL exist, and `/models` arguments SHALL NOT select a model. A button selection SHALL need no active Main selection and SHALL validate only the captured selector's non-empty first-slash shape and configured connection, never cache membership or upstream existence; an unexpired token SHALL NOT be rejected merely because a refresh removed its candidate from the cache. It SHALL atomically persist the preference before publishing the active selection or reporting success. When the preference is corrupt or invalid, `/models` SHALL say so without showing file content, SHALL NOT fall back to an automatic selection, and a deliberate button selection SHALL replace the preference without restart; with an empty cache the operator refreshes until candidates exist (or waits for providers to recover) before selecting, and an existing valid saved selector remains active and displayed whether cached or not.
 
 #### Scenario: `/models` presents a concise catalog
 - **GIVEN** a cache contains about 20 candidates with fresh and stale providers
@@ -25,26 +25,20 @@ Authorized `/models` SHALL list about 20 cached candidates simply, offer a refre
 #### Scenario: Empty cache leaves commands usable
 - **GIVEN** the cache has no candidates and every provider failed
 - **WHEN** an authorized user invokes `/models`
-- **THEN** the response states that no candidates are cached and offers refresh and `/models select <connection-id>/<upstream-id>` for direct selection
+- **THEN** the response states that no candidates are cached and offers refresh only; it names no typed selection command
 - **AND** unrelated commands remain available
 
-#### Scenario: Textual selection recovers without candidates or main selection
-- **GIVEN** the cache is empty, no Main model is active, and connection `openai-prod` is configured
+#### Scenario: Typed select text is not a selection route
+- **GIVEN** a saved active selection with known preference bytes, or an automatic active selection with no preference file
 - **WHEN** the authorized operator sends `/models select openai-prod/gpt-new`
-- **THEN** the uncached selector is accepted without discovery or an upstream membership check
-- **AND** `model-selection.toml` is atomically replaced before `openai-prod/gpt-new` becomes active and success is reported
+- **THEN** the catalog is shown as for `/models` and no selection is made
+- **AND** neither the preference (bytes or absence) nor the active selection change
 
-#### Scenario: Textual selection rejects malformed or unknown connection
-- **GIVEN** the preference and active selection have their previous values
-- **WHEN** the authorized operator sends `/models select openai-prod/` or `/models select staging/gpt-x` with no `staging` connection
-- **THEN** the command reports an actionable malformed-shape or unknown-connection error before provider I/O
-- **AND** neither the preference nor active selection changes
-
-#### Scenario: Textual selection recovers a corrupt preference
-- **GIVEN** `model-selection.toml` is corrupt and the cache has no candidates
-- **WHEN** the authorized operator sends `/models select openai-prod/gpt-x` with `openai-prod` configured
-- **THEN** the corrupt preference is atomically replaced before the selection is published without restarting
-- **AND** no cached candidate or active Main selection is required
+#### Scenario: Corrupt preference with an empty cache recovers after a successful refresh
+- **GIVEN** `model-selection.toml` is corrupt, the cache has no candidates, and no automatic selection was made
+- **WHEN** the operator refreshes and a provider returns candidates, then selects one with its button
+- **THEN** the corrupt preference is atomically replaced before the selection is published and active without a restart
+- **AND** until then `/models` reports the corrupt preference without file content, offers refresh only, and refresh updates only the cache and never writes or repairs the preference
 
 #### Scenario: Refresh failure preserves stale inventory
 - **GIVEN** a provider refresh fails
@@ -58,7 +52,7 @@ Authorized `/models` SHALL list about 20 cached candidates simply, offer a refre
 - **THEN** it carries only an opaque token of at most 64 bytes
 - **AND** the token resolves to the selector server-side
 
-#### Scenario: Expired or removed selection token is rejected
+#### Scenario: Expired or unknown selection token is rejected
 - **GIVEN** a selection callback token expired or is unknown
 - **WHEN** the callback is used
 - **THEN** active selection and preference are unchanged
@@ -66,7 +60,7 @@ Authorized `/models` SHALL list about 20 cached candidates simply, offer a refre
 - **AND** an unexpired token whose candidate was later removed from the cache is not rejected for that reason
 
 #### Scenario: Selection persistence fails
-- **GIVEN** a candidate button or textual selector is chosen but the preference cannot be persisted
+- **GIVEN** a candidate button is chosen but the preference cannot be persisted
 - **WHEN** selection is attempted
 - **THEN** the old active selection remains
 - **AND** prior preference bytes remain unchanged and no success is reported
