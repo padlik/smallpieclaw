@@ -123,3 +123,78 @@ Current batch: `tasks.md` and its glossary companion. Frozen baselines: proposal
 ### 🔴 Outstanding
 
 None. **PASS: `tasks.md` and its glossary companion are frozen.** Planning is complete, subject to final focused validation. No implementation, commits, merges, archive, synchronization or publication is authorized by this review; the agreed exact-planning-on-`main` gate still precedes any separately authorized apply.
+
+## design Round 1 — 2026-11-14 — list-only selection revision
+
+Current batch: `design.md`. Frozen baselines: unchanged proposal and `explore-brief.md`, plus the user's approved list-only Telegram selection decision. Design and downstream ADR/spec/task artifacts were unfrozen for this decision-level revision; downstream edits await their own reviewed batches.
+
+### 🔴 Fixed
+- No blocking findings. Typed selection is replaced by candidate buttons in both normal correction and corrupt-preference recovery; the discovery-dependent empty-cache trade-off is explicit.
+
+### 🟡 Addressed
+- Preserved atomic persistence before publication, failed-save preservation, no automatic fallback while preferences are corrupt, valid uncached saved selectors and independent runtime/service/scheduled selector paths.
+- No glossary terms were introduced. The optional clarification of “other hidden route” was not required: the reviewer confirmed its Telegram recovery context.
+
+### 🔴 Outstanding
+
+None. **PASS: revised `design.md` is frozen.** ADR-0045 will partially supersede only ADR-0040's typed Telegram selection route; accepted ADR-0040 remains unchanged. Specs and tasks await their own batches. No implementation or commits authorized by this review.
+
+## adr Round 1 — 2026-11-14 — list-only selection revision
+
+Current batch: ADR-0045, its glossary companion and `adr.md`. Frozen baselines: unchanged proposal and explore brief, plus the revised design.
+
+### 🔴 Fixed
+- No blocking findings. ADR-0045 partially supersedes only the typed Telegram entry; ADR-0040's body and status remain unchanged.
+
+### 🟡 Addressed
+- Preserved button token scope/expiry, atomic write-before-publish, failed-save state, corrupt-preference recovery, uncached saved selectors and independent runtime/service/scheduled admission.
+- Documented discovery-dependent empty-cache recovery and refresh-only guidance. No new glossary terms; existing house style retained.
+
+### 🔴 Outstanding
+
+None. **PASS: ADR-0045, its glossary companion and revised `adr.md` are frozen.** Specs and tasks await their own reviewed batches. No implementation or commits.
+
+## specs Round 1 — 2026-11-14 — list-only selection revision
+
+Current batch: `specs/telegram-command-surface/spec.md`. Frozen baselines: proposal, explore brief, revised design and ADR-0045/manifest.
+
+### 🔴 Fixed
+- None in this round.
+
+### 🟡 Addressed
+- Reviewer confirmed button-only selection, cache-only refresh, atomic corrupt-preference recovery, token rules and uncached saved-selector behavior.
+
+### 🔴 Outstanding
+
+- The typed-text non-selection scenario combines an automatic choice with an existing preference file. Separate saved selection with known bytes from automatic selection with no file; preserve bytes or absence in the outcome.
+
+**FAIL: spec remains unfrozen pending this bounded correction and re-review.** Tasks remain pending; no code changes.
+
+## specs Round 2 — 2026-11-14 — list-only selection revision
+
+Current batch: bounded recheck of the Telegram spec against the same frozen baselines.
+
+### 🔴 Fixed
+- The typed-text non-selection scenario now distinguishes saved selection with known preference bytes from automatic selection with no preference file, and preserves bytes or absence respectively.
+
+### 🟡 Addressed
+- Renamed the existing token-rejection scenario to “Expired or unknown selection token is rejected”, without changing its behavior.
+
+### 🔴 Outstanding
+
+None. **PASS: revised Telegram spec is frozen.** Round 1's remaining checks still apply; the reviewer confirmed the corrected file hash. Tasks await their own batch. No code changes or commits.
+
+## tasks Round 1 — 2026-11-14 — list-only selection revision
+
+Current batch: task 9.2 repurposed in place and task 11.1 documentation wording. Frozen baselines: proposal, explore brief, revised design, ADR-0045/manifest and revised Telegram spec.
+
+### 🔴 Fixed
+- No blocking findings. The reviewer confirmed button-only selection coverage, corrupt-preference recovery, cache-only refresh and preservation of generic assertions when guidance tests change.
+
+### 🟡 Addressed
+- The reviewer recommended spelling out persistence before active-selection publication or success reporting in task 9.2. This is a declarative alignment with the already-frozen spec, not a new policy.
+- Task count remains 46 with 37 complete. Completed 9.1 history and task 9.3 remain unchanged.
+
+### 🔴 Outstanding
+
+None. **PASS: revised tasks are frozen**, with the publication-order wording clarification recorded above to be applied before final validation. Planning revision review is complete; code still contains the old guidance until repurposed 9.2 is applied. Revised planning must reach `main` before apply. No commits, merges or implementation authorized by this review.
