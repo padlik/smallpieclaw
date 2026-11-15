@@ -201,6 +201,11 @@ def format_jobs_list(jobs: list, redactor: Callable[[str], str] | None = None) -
             lines.append("   🧠 Context: preserved between runs")
         if job.get("last_error"):
             lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
+        if job.get("config_error"):
+            error = str(job["config_error"])
+            if redactor is not None:
+                error = redactor(error)
+            lines.append(f"   ⚠️ config_error: {html.escape(error[:400])}")
         lines.append(f"   {task_label}: {task_display}\n")
     lines.append(
         "<i>Tip: /jobs reload · /jobs remove &lt;tag&gt; · /jobs pause &lt;tag&gt; · /jobs resume &lt;tag&gt;\n"
@@ -572,6 +577,7 @@ _SHOWN_PLACEHOLDER = "{SHOWN}"
 
 def _catalog_header_lines(
     view: "CatalogView", *, refresh_failed: bool, refresh_not_saved: bool,
+    cache_notice: str | None = None, selection_notice: str | None = None,
 ) -> list[str]:
     """Title, refresh-outcome warning, and selection lines.
 
@@ -589,12 +595,22 @@ def _catalog_header_lines(
         lines.append("⚠️ <i>Refresh failed unexpectedly — showing the last known catalog.</i>\n")
     elif refresh_not_saved:
         lines.append("⚠️ <i>Refresh was not saved to the model cache — showing this session's results only.</i>\n")
+    # Standing file-state notices (fixed, content-free registry sentences) follow the
+    # transient refresh outcome: the saved-selection notice, then the cache notice.
+    for notice in (selection_notice, cache_notice):
+        if notice:
+            lines.append(f"⚠️ <i>{html.escape(notice)}</i>\n")
 
     selection_label = _SELECTION_STATUS_LABELS.get(view.selection_status, view.selection_status)
+    if view.selection_status == "active":
+        # An active selector equal to the saved one is "saved"; otherwise it is the
+        # in-memory automatic choice, which is never written to the preference.
+        saved = view.remembered_model_id == view.active_model_id
+        selection_label += " (saved)" if saved else " (automatic, unsaved)"
     lines.append(f"Selection: {html.escape(selection_label)}")
     shown_id = view.active_model_id or view.remembered_model_id
     if shown_id:
-        kind = "Active" if view.active_model_id else "Remembered"
+        kind = "Active" if view.active_model_id else "Saved"
         lines.append(f"{kind}: <code>{html.escape(_bound_catalog_text(shown_id))}</code>")
     return lines
 
@@ -629,10 +645,15 @@ def _providers_header_line(total: int, shown: int) -> str:
     return "<b>Providers</b>"
 
 
+_MODELS_ADVISORY = "(advisory, provider-reported)"
+_EMPTY_CACHE_GUIDANCE = "No models are cached yet. Tap 🔄 Refresh, then choose one with its button."
+
+
 def _models_header_template(total: int) -> str:
+    """Model-section header: always advisory-labelled; empty cache adds static guidance."""
     if not total:
-        return "<b>Models</b> (none discovered)"
-    return f"<b>Models</b> ({_SHOWN_PLACEHOLDER} shown of {total} total)"
+        return f"<b>Models</b> {_MODELS_ADVISORY} (none discovered)\n{_EMPTY_CACHE_GUIDANCE}"
+    return f"<b>Models</b> {_MODELS_ADVISORY} ({_SHOWN_PLACEHOLDER} shown of {total} total)"
 
 
 def _fit_lines(lines: list[str], budget: int) -> list[str]:
@@ -664,17 +685,22 @@ class CatalogRenderResult:
 
 def format_models_catalog(
     view: "CatalogView", *, refresh_failed: bool = False, refresh_not_saved: bool = False,
+    cache_notice: str | None = None, selection_notice: str | None = None,
 ) -> str:
     """Render a sanitized `CatalogView` as read-only HTML (task 8.1).
 
     Thin wrapper over `render_models_catalog` kept for existing callers that
     only need text, not the shown-model-id list.
     """
-    return render_models_catalog(view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved).text
+    return render_models_catalog(
+        view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved,
+        cache_notice=cache_notice, selection_notice=selection_notice,
+    ).text
 
 
 def render_models_catalog(
     view: "CatalogView", *, refresh_failed: bool = False, refresh_not_saved: bool = False,
+    cache_notice: str | None = None, selection_notice: str | None = None,
 ) -> CatalogRenderResult:
     """Render a sanitized `CatalogView` as read-only HTML, and report which
     model ids were actually displayed (task 8.2 shared seam).
@@ -698,7 +724,10 @@ def render_models_catalog(
     but drops verbose wording, so ordinary catalogs can still show the full
     ~20-entry cap within one message even when many providers are present.
     """
-    header_lines = _catalog_header_lines(view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved)
+    header_lines = _catalog_header_lines(
+        view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved,
+        cache_notice=cache_notice, selection_notice=selection_notice,
+    )
 
     provider_total = len(view.providers)
     provider_lines_all = [_provider_line(state) for state in view.providers]

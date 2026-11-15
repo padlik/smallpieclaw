@@ -14,9 +14,9 @@ or through ``run_now``):
   failure: no spawn, a direct alert even with ``notify = false``, tracking
   released; only a blank STRING task takes the empty-task reminder path;
 * a well-typed ``max_iterations`` stays silently ignored;
-* a legacy per-job ``fallback_models`` key is silent at load and reload and
-  stays in the document; at fire it yields one warning naming the job and the
-  key (never its value) and is never passed to the spawn call.
+* a per-job ``fallback_models`` key (task 8.3) is a visible removal ``config_error`` at load
+  and reload and stays raw in the document; at fire it is one recorded launch failure with the
+  direct alert and nothing is spawned or passed to a model (never its value in any message).
 
 Overlap ``skip``/``parallel`` with valid values, the ``""`` reminder with
 ``notify = true``, and failed-spawn records are owned by
@@ -54,7 +54,6 @@ _RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
 _SECRET = "sk-fake-secret-fallback-7d41"
 _FALLBACK_TAG = "legacy_fallback_job"
 _FALLBACK_VALUE = ["provider/alt-model", _SECRET]
-_MISSING = object()
 
 
 def _job(tag: str, extra: str = "", task: str = '"write report"') -> str:
@@ -309,25 +308,26 @@ def test_healthy_job_spawns_without_fallback_warning(
 # ---------------------------------------------------------------------------
 
 
-def test_load_is_silent_about_fallback_models(
+def test_load_exposes_fallback_models_as_a_removal_config_error(
     make_scheduler: Callable[[str], _Env], caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Startup logs nothing about the key and keeps it raw in the document."""
+    """Startup names the key (never the value), keeps it raw in the document and the file untouched."""
     caplog.set_level(logging.DEBUG, logger="scheduler")
 
     env = make_scheduler(_FALLBACK_TOML)
 
-    assert [r for r in caplog.records if "fallback_models" in r.getMessage()] == []
+    error = (env.sched.show_job(_FALLBACK_TAG) or {}).get("config_error")
+    assert error and "fallback_models" in error and "remove" in error.lower() and _SECRET not in error
     assert _SECRET not in caplog.text
     document = env.sched._load_result.document
     assert document["jobs"][_FALLBACK_TAG]["fallback_models"] == _FALLBACK_VALUE
     assert env.toml_path.read_text(encoding="utf-8") == _FALLBACK_TOML
 
 
-def test_reload_is_silent_about_fallback_models(
+def test_reload_exposes_fallback_models_as_a_removal_config_error(
     make_scheduler: Callable[[str], _Env], caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A reload logs nothing about the key and does not rewrite the file."""
+    """A reload keeps the removal config_error visible, logs no value and does not rewrite the file."""
     env = make_scheduler(_FALLBACK_TOML)
     caplog.clear()
     caplog.set_level(logging.DEBUG, logger="scheduler")
@@ -335,58 +335,56 @@ def test_reload_is_silent_about_fallback_models(
     result = env.sched.reload()
 
     assert "error" not in result, result
-    assert [r for r in caplog.records if "fallback_models" in r.getMessage()] == []
+    assert "fallback_models" in (env.sched.show_job(_FALLBACK_TAG) or {}).get("config_error", "")
     assert _SECRET not in caplog.text
     assert env.toml_path.read_text(encoding="utf-8") == _FALLBACK_TOML
 
 
-def test_fire_warns_once_about_fallback_models(
-    make_scheduler: Callable[[str], _Env], caplog: pytest.LogCaptureFixture,
+def test_fire_is_one_recorded_launch_failure_for_fallback_models(
+    make_scheduler: Callable[[str], _Env],
 ) -> None:
-    """One warning names the job and the ignored key."""
+    """One failed record naming the key and one direct alert; tracking released; nothing spawned."""
     env = make_scheduler(_FALLBACK_TOML)
-    caplog.clear()
-    caplog.set_level(logging.DEBUG, logger="scheduler")
 
     env.sched._run_job(_FALLBACK_TAG)
 
-    warnings = [
-        r for r in caplog.records
-        if r.levelno >= logging.WARNING and "fallback_models" in r.getMessage()
-    ]
-    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
-    assert _FALLBACK_TAG in warnings[0].getMessage()
+    (record,) = env.records(_FALLBACK_TAG)
+    assert (record["status"], record["success"]) == ("failed", False)
+    assert "fallback_models" in record["result"]
+    (alert,) = env.alerts()
+    assert _FALLBACK_TAG in alert and "fallback_models" in alert
+    assert _FALLBACK_TAG not in env.sched._running_jobs and not env.sched._active_runs.get(_FALLBACK_TAG)
+    assert env.spawns == []
 
 
 def test_fire_never_reveals_fallback_models_value(
     make_scheduler: Callable[[str], _Env], caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The secret-bearing value is in no log record, alert, or spawn argument."""
+    """The secret-bearing value is in no log record, alert, execution record or spawn argument."""
     env = make_scheduler(_FALLBACK_TOML)
     caplog.clear()
     caplog.set_level(logging.DEBUG, logger="scheduler")
 
     env.sched._run_job(_FALLBACK_TAG)
 
-    assert [r for r in caplog.records if r.levelno >= logging.WARNING], "no fire warning"
+    assert env.alerts(), "the launch-failure alert did not go out"
     assert all(_SECRET not in r.getMessage() for r in caplog.records)
     assert _SECRET not in caplog.text
     assert all(_SECRET not in message for message in env.alerts())
+    assert all(_SECRET not in json.dumps(r) for r in env.records(_FALLBACK_TAG))
     assert all(_SECRET not in repr(args) for args, _options in env.spawns)
 
 
-def test_fire_spawns_once_without_fallback_models(
+def test_fire_spawns_nothing_for_fallback_models(
     make_scheduler: Callable[[str], _Env],
 ) -> None:
-    """Exactly one spawn; the key is absent from its arguments and options."""
+    """No spawn at all: the key can reach neither the arguments nor any model."""
     env = make_scheduler(_FALLBACK_TOML)
 
     env.sched._run_job(_FALLBACK_TAG)
 
-    assert len(env.spawns) == 1
-    args, options = env.spawns[0]
-    assert "fallback_models" not in args
-    assert getattr(options, "fallback_models", _MISSING) is _MISSING
+    assert env.spawns == []
+    env.sched.agent.assert_not_called()
 
 
 def test_fire_leaves_fallback_models_file_bytes_unchanged(

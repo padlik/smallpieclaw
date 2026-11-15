@@ -2,9 +2,10 @@
 
 Real ``AgentController`` + real ``ShortTermMemory``/``WorkingMemory`` + a real
 ``LLMClient`` on ``httpx.MockTransport``; the real ``cmd_compress`` handler is
-bound to the real ``compress_context``. The success path uses an existing live
-configured client (``llm=``); independent admission is task 7.2, and failure
-semantics are task 7.3 -- neither is asserted here.
+bound to the real ``compress_context``. The success path obtains its summary client
+from an injected admission factory (task 7.2 contract); independent-admission
+ownership is asserted in ``test_manual_compress_7_2``, and failure semantics are
+task 7.3 -- neither is asserted here.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -67,16 +69,25 @@ class _Rig:
         ))
         registry = ModelRegistry({"pa": provider}, settings, _NoDiscovery(), _resolve)
         registry.select(MODEL.id)
-        self.llm = LLMClient(
-            registry.admit(), agent_config=AGENT, http_transport=httpx.MockTransport(self._chat),
-        )
+        self.registry = registry
+        self.clients: list[LLMClient] = []
         self.short_term = ShortTermMemory(max_turns=80)
         self.working = WorkingMemory()
         self.controller = AgentController(
             AGENT, ExecutorPaths(tmp_dir=str(tmp_path / "t")),
-            tool_index=object(), memory=object(), llm=self.llm,
+            tool_index=object(), memory=object(), llm=None,
             short_term=self.short_term, working=self.working,
+            run_client_factory=self._admit_client,
         )
+
+    def _admit_client(self, event: threading.Event) -> LLMClient:
+        """Admit the active selection into a fresh owned client (task 7.2 contract)."""
+        client = LLMClient(
+            self.registry.admit(), agent_config=AGENT, cancel_event=event,
+            http_transport=httpx.MockTransport(self._chat),
+        )
+        self.clients.append(client)
+        return client
 
     def _chat(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -96,7 +107,8 @@ class _Rig:
 def rig(tmp_path: Path):
     r = _Rig(tmp_path)
     yield r
-    r.llm.close()
+    for client in r.clients:
+        client.close()
 
 
 def _trap_automatic(monkeypatch: pytest.MonkeyPatch) -> None:

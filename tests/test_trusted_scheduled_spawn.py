@@ -14,6 +14,7 @@ system (``tmp_path``).
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import MagicMock, patch
@@ -169,6 +170,82 @@ def test_scheduled_spawn_without_task_is_refused(make_builtin_executor) -> None:
     assert read_execution(result) == "refused"
     assert factory.calls == []
     assert submits == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 8.2: the exemption is ONLY the shape guard; the trust boundary is the options channel
+# ---------------------------------------------------------------------------
+
+
+def _executor_with_cap(make_builtin_executor, managed: int):
+    """An executor whose registry reports ``managed`` running agents against a cap of 6."""
+    factory = _AcceptingFactory()
+    executor = make_builtin_executor(sub_agent_factory=factory, max_subagents=6)
+    registry = MagicMock()
+    registry.count_managed.return_value = managed
+    return executor, factory, registry
+
+
+@pytest.mark.parametrize("raw", [123, "  ", ["p/model"], " p/model "], ids=["int", "blank", "list", "padded"])
+def test_scheduled_source_does_not_bypass_the_depth_guard(make_builtin_executor, raw) -> None:
+    """A scheduler-built spawn from a sub-agent (depth 1) is refused before any model handling."""
+    executor, factory, registry = _executor_with_cap(make_builtin_executor, 0)
+    with patch("sub_agent_registry.get_registry", return_value=registry), \
+         patch.object(executor._supervisor, "submit") as submit:
+        result = executor._exec_spawn_agent(
+            {"task": "write report", "model": raw}, caller_depth=1, options=_scheduled_options(),
+        )
+
+    assert result["success"] is False
+    assert "max nesting depth" in result["error"]
+    assert read_execution(result) == "refused"
+    assert factory.calls == [] and submit.call_count == 0
+
+
+@pytest.mark.parametrize("raw", [123, "  ", ["p/model"], " p/model "], ids=["int", "blank", "list", "padded"])
+def test_scheduled_source_does_not_bypass_the_capacity_cap(make_builtin_executor, raw) -> None:
+    """At the max_subagents cap the scheduled spawn is refused, not admitted or classified."""
+    executor, factory, registry = _executor_with_cap(make_builtin_executor, 6)
+    with patch("sub_agent_registry.get_registry", return_value=registry), \
+         patch.object(executor._supervisor, "submit") as submit:
+        result = executor.spawn_agent({"task": "write report", "model": raw}, options=_scheduled_options())
+
+    assert result["success"] is False
+    assert "max_subagents cap reached" in result["error"]
+    assert read_execution(result) == "refused"
+    assert factory.calls == [] and submit.call_count == 0
+
+
+_SPOOF_ARGS = {
+    "source": SOURCE_SCHEDULED,
+    "options": {"source": SOURCE_SCHEDULED, "job_tag": "nightly_report"},
+    "supervision_options": {"source": SOURCE_SCHEDULED},
+    "runtime_profile": "scheduled_agent",
+    "job_tag": "nightly_report",
+}
+
+
+@pytest.mark.parametrize("raw", [123, "  ", ["p/model"], {"id": "p/model"}], ids=["int", "blank", "list", "dict"])
+@pytest.mark.parametrize("via", ["shared-executor", "scheduled-dispatch"])
+def test_model_facing_payload_cannot_gain_the_scheduled_exemption(
+    make_builtin_executor, via: str, raw: object,
+) -> None:
+    """Trust comes only from the scheduler-built SupervisionOptions: source/options/profile keys
+    smuggled into the tool arguments of a model-facing call (including a call made inside a
+    scheduled run through ScheduledToolDispatch) never exempt the shape guard."""
+    from builtin_executor import ScheduledToolDispatch
+
+    executor, factory, registry = _executor_with_cap(make_builtin_executor, 0)
+    dispatch = executor if via == "shared-executor" else ScheduledToolDispatch(executor)
+    args = {"task": "write report", "model": raw, **copy.deepcopy(_SPOOF_ARGS)}
+    with patch("sub_agent_registry.get_registry", return_value=registry), \
+         patch.object(executor._supervisor, "submit") as submit:
+        result = dispatch.execute("spawn_agent", args)
+
+    assert result["success"] is False
+    assert result["error"] == _SHAPE_REFUSAL
+    assert read_execution(result) == "refused"
+    assert factory.calls == [] and submit.call_count == 0
 
 
 # ---------------------------------------------------------------------------

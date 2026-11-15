@@ -8,6 +8,7 @@ actual production root with ``tests/root_startup_harness.py``.
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -888,6 +889,8 @@ def _assert_failed_launch(
     assert after.state["last_error"] == record["result"]
     (alert,) = after.notices
     assert f"Job {SCHEDULED_TAG} failed to spawn" in alert
+    # The alert carries the same bounded, redacted selector evidence, HTML-escaped.
+    assert f"Model: {html.escape(evidence)}" in alert
     assert after.tracked is False and after.active_children == []
     assert probe.pins == [] and probe.creates == [] and probe.registered == [] and probe.loop_calls == []
     assert after.llm_clients == 0 and after.http_clients == 0 and after.provider_requests == []
@@ -897,23 +900,23 @@ def _assert_failed_launch(
 
 
 _INACTIVE_MAIN_SELECTORS = [
-    pytest.param(None, None, "inherit", id="absent"),
-    pytest.param(f'"{OTHER_ID}"', OTHER_ID, OTHER_ID, id="explicit-known"),
-    pytest.param('"acme/claude-zzz"', "acme/claude-zzz", "acme/claude-zzz", id="unknown"),
-    pytest.param("42", 42, "malformed (not a string)", id="integer"),
+    pytest.param(None, None, "inherit", "no_active_selection", id="absent"),
+    pytest.param("42", 42, "malformed (not a string)", "malformed_selector", id="integer"),
 ]
 
 
-@pytest.mark.parametrize(("literal", "forwarded", "evidence"), _INACTIVE_MAIN_SELECTORS)
+@pytest.mark.parametrize(("literal", "forwarded", "evidence", "code"), _INACTIVE_MAIN_SELECTORS)
 @pytest.mark.parametrize(
     "saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no-saved-selection", "saved-model-missing"],
 )
 def test_root_scheduled_job_without_valid_main_fails_before_model_work(
     scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-    saved_default: str | None, literal: str | None, forwarded: object, evidence: str,
+    saved_default: str | None, literal: str | None, forwarded: object, evidence: str, code: str,
 ) -> None:
-    """No valid Main fails every selector — a valid explicit one included — before
-    selector warnings, credentials, runtime, clients or provider I/O."""
+    """Without a valid Main only an inheriting job (absent selector) or an invalid
+    saved value fails, each with its own code, before warnings, credentials,
+    runtime, clients or provider I/O. A valid explicit selector needs no Main
+    (see ``test_scheduled_model_admission``)."""
     scheduled_root.serve_provider_chat()
 
     probe = run_scheduled_root(scheduled_root, monkeypatch, literal, saved_default=saved_default)
@@ -922,26 +925,31 @@ def test_root_scheduled_job_without_valid_main_fails_before_model_work(
     assert before.active_model_id is None and before.remembered_model_id == remembered_for(saved_default)
     assert OTHER_ID in {model.id for model in before.models}
     assert probe.admits == {"admit": [], "admit_scheduled": [forwarded]}
-    assert probe.codes == ["no_active_selection"] and probe.resolved == []
+    assert probe.codes == [code] and probe.resolved == []
     assert _selector_warnings(caplog) == []
-    _assert_failed_launch(
-        scheduled_root, probe, evidence=evidence, error_text="model registry no active selection",
+    error_text = (
+        "model registry no active selection" if code == "no_active_selection"
+        else "model selector must be '<connection>/<model>'"
     )
+    _assert_failed_launch(scheduled_root, probe, evidence=evidence, error_text=error_text)
 
 
 @pytest.mark.parametrize(
-    ("selector", "missing_key", "provider", "warnings"),
+    ("selector", "missing_key", "provider", "code", "resolved"),
     [
-        pytest.param(OTHER_ID, "KEY_GEM", "gem", 0, id="known-selector"),
-        pytest.param("ghost/claude-zzz", "KEY_ACME", "acme", 1, id="inherited-main"),
+        pytest.param(OTHER_ID, "KEY_GEM", "gem", "credential_resolution_failed", ["gem"], id="known-selector"),
+        pytest.param(
+            "ghost/claude-zzz", "KEY_ACME", "acme", "unknown_connection", [], id="unknown-connection-no-main-fallback",
+        ),
     ],
 )
 def test_root_scheduled_credential_failure_stays_on_effective_model(
     scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-    selector: str, missing_key: str, provider: str, warnings: int,
+    selector: str, missing_key: str, provider: str, code: str, resolved: list[str],
 ) -> None:
-    """Once the effective model is chosen, its credential failure fails the job:
-    one admission, one resolution, no other provider substituted or retried."""
+    """A valid selector's credential failure fails the job on that model (one
+    resolution, nothing substituted). An unknown connection fails its own job
+    with no credential work at all: Main's provider is never consulted."""
     scheduled_root.serve_provider_chat()
 
     probe = run_scheduled_root(
@@ -951,11 +959,14 @@ def test_root_scheduled_credential_failure_stays_on_effective_model(
 
     assert probe.view_before.active_model_id == MAIN_ID
     assert probe.admits == {"admit": [], "admit_scheduled": [selector]}
-    assert probe.codes == ["credential_resolution_failed"] and probe.resolved == [provider]
-    assert len(_selector_warnings(caplog)) == warnings
+    assert probe.codes == [code] and probe.resolved == resolved
+    assert _selector_warnings(caplog) == []
     _assert_failed_launch(
         scheduled_root, probe, evidence=selector,
-        error_text="model registry credential resolution failed",
+        error_text=(
+            "model registry credential resolution failed" if code == "credential_resolution_failed"
+            else "connection that is not configured"
+        ),
     )
 
 

@@ -479,7 +479,7 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "context_profile": {
-        "description": "Return a JSON snapshot of the current context-window consumption by category (system prompt, chat history, tool definitions, completion reserve), with per-MCP-server tool-def grouping, danger level, and headroom.",
+        "description": "Return a JSON snapshot of the estimated input tokens: counts by category (system prompt, chat history, tool definitions) and their total, compaction_threshold, tool_defs_by_server (built-in and each MCP server, zero for servers with no tools), model_id, is_live and turn.",
         "parameters": {
             "type": "object",
             "properties": {},

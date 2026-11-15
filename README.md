@@ -209,17 +209,25 @@ Hidden diagnostic commands (not in menu, available to authorised users): `/show_
 When a provider model catalog is injected, `/models` instead lists a sanitized
 view of up to 20 discovered models with refresh and selection buttons:
 each provider's fresh/stale status, the current selection state
-(active, no selection, or a saved choice that's no longer available), and each
+(active and saved, active as an unsaved automatic choice, no selection, or a saved
+choice that's no longer available — an active selector is shown even when it is
+not in the cache), and each
 model's provider-reported capabilities and token limits (known/unknown/unsupported).
-Vision and tool-calling flags are display-only and never locally block requests.
-Token limits still drive the current request budget and may cause a local rejection.
+Everything shown is advisory, provider-reported display data: capability flags and
+context/token limits never cause a local admission decision or rejection, although the
+provider or its adapter can still reject a request.
 Appearing in this list reflects what a provider advertises, not a guarantee the
 model is currently callable.
+An unreadable model cache or an invalid saved selection is reported in `/models`
+with a fixed message and never shows file content. With an empty cache the list
+tells you to tap Refresh (which updates only the cache, never your selection)
+and choose a model with its button once candidates appear.
 Selection buttons use opaque tokens bound to your user and chat for five minutes.
 Expired buttons, a bot restart, or token-cache eviction require reopening `/models`.
-A selection is rechecked against the current inventory and saved before success
-is shown; a failed save leaves the previous selection unchanged. Retained stale
-entries remain selectable. Without an injected catalog, `/models` keeps its
+A pressed button is not rechecked against the cache or the provider: it still
+selects a model that a later refresh removed from the list, as long as its
+provider connection remains configured. The choice is saved before success is
+shown; a failed save leaves the previous selection unchanged. Without an injected catalog, `/models` keeps its
 existing list-and-switch behavior.
 
 Prompt-building components and model-selecting tool descriptions also accept an
@@ -282,6 +290,17 @@ agent logs a warning and runs with degraded tool search.
 wait for it to finish or `/stop` it first. A message you send while one of these
 commands is running is not run automatically; it is saved and offered back with
 Run / Discard controls once the command finishes.
+
+`/compress` admits its own summary client from the currently selected Main model
+each time it runs (it never reuses a finished run's client) and closes it
+afterwards. If no model is selected or admission fails, it reports a short fixed
+reason (never provider or credential details) and leaves the short-term history
+unchanged; select a model with `/models` and retry.
+A failed, cancelled, empty or invalid summary likewise reports a short fixed
+failure, never truncates the history and leaves it unchanged; retry `/compress`
+later. Only a validated non-empty summary replaces the history (with one entry).
+Cancellation is cooperative: a request already on the wire is not aborted, but a
+cancel seen before the call or before the reply is used keeps the history unchanged.
 
 ### Natural-language interaction
 
@@ -528,6 +547,8 @@ minute  hour  day  month  weekday
 */30    *      *     *       *     → every 30 minutes
 ```
 
+Old-style schedules are **not converted**: `schedule = "daily"`/`"interval"` and any `time`, `hours` or `minutes` field leave that one job unscheduled with a visible `config_error` (shown by `/jobs` and the `schedule` tool) telling you to rewrite it with `schedule = "cron"` + `cron`, or `schedule = "once"` + `run_at`; the file is never rewritten, and other jobs keep running. The `schedule` tool refuses these fields (and `fallback_models`) on add and modify before changing anything.
+
 ```toml
 [jobs.nightly_health]
 enabled  = true
@@ -547,13 +568,13 @@ One-time reminders: `schedule = "once"` with `run_at = "HH:MM"` — auto-removed
 
 Per-job options: `model`, `preserve_context`, `context_max_messages`, `overlap_policy` (`skip`/`parallel`), `notify`. (A legacy `max_iterations` job key is still accepted and silently ignored.)
 
-**Job model selection.** A job's saved `model` selector is matched against the app-managed catalog when the job runs. A malformed or unknown selector warns and the job inherits only a valid Main selection; without a valid Main the job fails with an actionable error. A legacy per-job `fallback_models` key is ignored with a runtime warning — scheduled jobs never fall back to another model.
+**Job model selection.** A job's saved `model` selector is read once, when the job runs. A job without a `model` key inherits the active Main selection at launch (and fails with an actionable error if there is none). A `model` key is used exactly as saved: it needs neither an active Main nor a cached catalog entry, and only the connection part must match a configured connection exactly (no trimming; the part after the first `/` is used verbatim). A blank, non-string, malformed or unknown-connection selector fails only that job's run — a failed run record plus a direct alert (even with `notify = false`) showing the bounded, redacted selector — and never falls back to Main or another model; the saved value is left untouched. A per-job `fallback_models` key is obsolete: the job stays visible with a `config_error` (remove the key), and every launch of it fails as a recorded launch failure with an alert until you remove it — scheduled jobs never fall back to another model.
 
 Key features: hot-reload without restart (`/jobs reload`), automatic backups before each write (last 5 kept), ±5 min jitter on first cron run, run history in `data/scheduler_state.json`.
 
-Scheduler state stores schedule/enable fields and run-history values, not job definitions or raw model selectors. Definitions remain in `scheduler.toml` or the read-only legacy JSON file. If state serialization fails, the scheduler logs the failure and keeps the previous state file without stopping scheduling.
+Scheduler state stores schedule/enable fields and run-history values, not job definitions or raw model selectors. Definitions remain in `scheduler.toml`. If state serialization fails, the scheduler logs the failure and keeps the previous state file without stopping scheduling.
 
-**Legacy `scheduler_jobs.json` (read-only).** Jobs from an existing `scheduler_jobs.json` in the agent's state directory keep running. Their schedule in `/jobs` and the `schedule` tool's list/show output is marked `legacy, read-only`. If `scheduler.toml` has a job with the same tag, the `scheduler.toml` job wins. The scheduler never writes, converts or adopts this file. You can't modify, remove, pause or resume a job that exists only in the JSON file from chat or tools; the refusal names the file. To change such a job, edit or delete its entry in the file by hand, then run `/jobs reload`. If a `scheduler.toml` job shares its tag with a JSON entry, removing it is refused until you delete the JSON entry, because the legacy job would otherwise come back. If the file can't be read or parsed, you get a warning with its path and repair steps, and `scheduler.toml` jobs keep running. Removing `scheduler.toml` jobs stays refused until the file is fixed. A reload that can't read the file fails and keeps the current jobs.
+**Legacy `scheduler_jobs.json` (detected, never loaded).** If a `scheduler_jobs.json` exists in the agent's state directory, the scheduler only checks that it exists, at startup and on every `/jobs reload` attempt (even one that fails). It is never read, run, converted, written, renamed or deleted, so none of its jobs are listed, scheduled or run. While it exists, one notice names its path and tells you to recreate any job you still need by hand as a `cron` or `once` job in `scheduler.toml`; the notice is shown in `/jobs`, the `schedule` tool's list output and at startup, and disappears at the next reload after you delete the file. It never blocks `scheduler.toml` jobs, changes or removals, even when it holds the same tag as a `scheduler.toml` job.
 
 **Run results and notices.** Every scheduled run gets its own execution ID (`run-<32 hex>`) and a complete result record in `job_execution_log.jsonl` in the state directory. Records are kept for `[scheduler] execution_log_max_age_hours` (default 48) and at most `execution_log_max_per_job` (default 10) per job; older records expire and their results become unavailable. A scheduled run uses its own job context only — it does not read or write operator memory, and a run's result never enters your chat context.
 
@@ -636,7 +657,7 @@ tool_timeout               = 10              # seconds per tool call
 compaction_threshold_tokens = 60000          # estimated input tokens that trigger automatic compaction
 ```
 
-There is no sub-agent or scheduler model setting in `config.toml`. A sub-agent or scheduled job without a model selector runs on the operator's selected Main model. An explicit selector — a spawned sub-agent's `model` argument or a job's `model` key — runs on that exact catalog model ID; an unknown sub-agent selector is refused, while an unknown or malformed job selector falls back to Main as described under "Job model selection". Every run still requires an active Main selection.
+There is no sub-agent or scheduler model setting in `config.toml`. A sub-agent or scheduled job without a model selector runs on the operator's selected Main model. An explicit selector — a spawned sub-agent's `model` argument or a job's `model` key — runs on that exact catalog model ID; a malformed or unknown-connection sub-agent or job selector is refused (for a job, that run fails as described under "Job model selection"). Only runs that inherit — no selector given — require an active Main selection.
 
 (The legacy `max_iterations` / `scheduled_max_iterations` / `plan_max_iterations` keys are still accepted in config files but ignored — the step gate is gone; see the security section above.)
 

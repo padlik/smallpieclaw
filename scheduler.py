@@ -7,13 +7,13 @@ Runs in a daemon thread so it does not block the Telegram bot.
 Job sources:
   - scheduler.toml         writable job definitions; every add/modify/remove/
                            pause/resume is saved here
-  - scheduler_jobs.json    legacy jobs (XDG state home), read-only: loaded and
-                           run, never written, deleted, or adopted; a
-                           scheduler.toml job wins a duplicate tag
+  - scheduler_jobs.json    legacy job file (XDG state home): only its existence
+                           is checked (a notice); it is never read, loaded, run,
+                           written, renamed, or deleted
 
 Scheduling uses cron expressions (5-field: minute hour day month weekday).
-Old-style config fields (schedule=daily/interval, time=, hours=, minutes=) are
-converted to equivalent cron expressions in memory on load; the file is not rewritten.
+Old-style scheduler.toml fields (schedule=daily/interval, time, hours, minutes)
+leave the job unscheduled with rewrite guidance; no cron is derived or written.
 
 Examples:
   cron = "0 2 * * *"     → daily at 02:00
@@ -277,32 +277,18 @@ def _input_fingerprint(path: str) -> Optional[str]:
 _LEGACY_MARKER = "legacy, read-only"
 
 
-@dataclass(frozen=True)
-class _LegacyRead:
-    """One non-destructive read of the legacy JSON job file.
+def _legacy_file_notice(path: str) -> str:
+    """Return the operator notice for an existing state-home legacy job file.
 
-    ``fingerprint`` is the SHA-256 of the bytes read, ``_INPUT_MISSING`` for
-    an absent file, or None when the file could not be read. ``raw_tags`` are
-    every top-level key of a parsed JSON object (including entries that are
-    not job objects) and ``views`` the runtime views built from it (None when
-    views were not requested); both are None when the file is absent,
-    unreadable, or malformed. ``notice`` is the operator notice for an
-    unreadable or malformed file and never carries file content.
+    The file is only ever detected, never opened: the notice names its path
+    and the manual conversion into ``scheduler.toml`` jobs and carries no
+    file content.
     """
-
-    fingerprint: Optional[str]
-    views: Optional[dict] = None
-    raw_tags: Optional[frozenset] = None
-    notice: Optional[str] = None
-
-
-def _legacy_file_notice(path: str, problem: str) -> str:
-    """Return the operator notice for a legacy job file that could not be loaded."""
     return (
-        f"Legacy job file {path} {problem}, so its jobs could not be loaded (any "
-        "previously loaded legacy jobs are kept; scheduler.toml jobs are unaffected) "
-        "and removing a scheduler.toml job is refused until it is fixed. The file is "
-        "left unchanged: repair or remove it, then reload the scheduler with /jobs reload."
+        f"Legacy job file {path} exists but is not loaded: its jobs are not listed, "
+        "scheduled or run. To keep a job, recreate it by hand as a `cron` or `once` "
+        "job in scheduler.toml (/jobs reload applies it). The file is left unchanged; "
+        "you can delete it once its jobs are converted."
     )
 
 
@@ -467,6 +453,61 @@ _RUN_AT_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?")
 _DAILY_TIME_RE = re.compile(r"([01]?\d|2[0-3]):[0-5]?\d")
 
 
+# Obsolete job fields (ADR-0044): never converted, derived or ignored; they become per-job config errors.
+_OBSOLETE_SCHEDULE_TYPES = ("daily", "interval")
+_OBSOLETE_SCHEDULE_FIELDS = ("time", "hours", "minutes")
+
+
+class _OmittedLegacyField:
+    """Distinguish an omitted add argument from an explicitly supplied null."""
+
+
+_OMITTED_LEGACY_FIELD = _OmittedLegacyField()
+_OBSOLETE_SCHEDULE_GUIDANCE = (
+    'Rewrite the schedule as schedule = "cron" with a cron expression, or schedule = "once" with '
+    'run_at = "HH:MM", then reload.'
+)
+_FALLBACK_MODELS_ERROR = (
+    "fallback_models is obsolete and a scheduled job never falls back to another model. "
+    "Remove the fallback_models key from this job in scheduler.toml, then reload."
+)
+
+
+def _obsolete_schedule_names(schedule_type: object, present_fields: "list[str]") -> "list[str]":
+    """Name the obsolete scheduling settings only (never any raw value)."""
+    names = [f'schedule = "{schedule_type}"'] if schedule_type in _OBSOLETE_SCHEDULE_TYPES else []
+    return names + [field for field in _OBSOLETE_SCHEDULE_FIELDS if field in present_fields]
+
+
+def _obsolete_schedule_error(names: "list[str]") -> str:
+    """The field-naming, cron/once-guiding config error for obsolete scheduling settings."""
+    return (
+        f"obsolete scheduling setting(s): {', '.join(names)}. They are never converted into a cron "
+        f"or ignored. {_OBSOLETE_SCHEDULE_GUIDANCE}"
+    )
+
+
+def obsolete_mutation_error(supplied: "dict") -> Optional[str]:
+    """Return refusal guidance when an add/modify supplies an obsolete field, else ``None``.
+
+    Presence decides (any value, including ``None``, ``[]`` or ``False``): ``time``, ``hours``,
+    ``minutes``, ``fallback_models`` keys and a ``schedule_type``/``schedule`` of ``daily`` or
+    ``interval``. Only field names appear in the message, never values.
+    """
+    names = _obsolete_schedule_names(
+        next((supplied[k] for k in ("schedule_type", "schedule") if supplied.get(k) in _OBSOLETE_SCHEDULE_TYPES), None),
+        [field for field in _OBSOLETE_SCHEDULE_FIELDS if field in supplied],
+    )
+    if names:
+        return f"schedule: obsolete input refused, nothing changed: {', '.join(names)}. {_OBSOLETE_SCHEDULE_GUIDANCE}"
+    if "fallback_models" in supplied:
+        return (
+            "schedule: fallback_models is obsolete and refused, nothing changed: scheduled jobs never "
+            "fall back to another model. Remove fallback_models from the request."
+        )
+    return None
+
+
 def _strict_legacy_cron(stype: str, job_cfg: dict) -> tuple[Optional[str], Optional[str]]:
     """Derive a cron from legacy ``daily``/``interval`` fields without coercion.
 
@@ -489,20 +530,28 @@ def _strict_legacy_cron(stype: str, job_cfg: dict) -> tuple[Optional[str], Optio
 
 
 def _classify_schedule(
-    job_cfg: dict,
+    job_cfg: dict, *, reject_obsolete: bool = True,
 ) -> tuple[object, Optional[str], Optional[str], Optional[str], bool]:
     """Type-strictly derive one job's schedule from its raw TOML fields.
 
     Returns ``(schedule_type, cron, run_at, config_error, migrated)``.
     ``config_error`` is set when the job cannot be scheduled; ``migrated`` is
     True when a legacy ``daily``/``interval`` job derived its cron in memory.
-    Nothing is coerced with ``int()`` or ``bool()``.
+    Nothing is coerced with ``int()`` or ``bool()``. With ``reject_obsolete`` (the TOML path) a
+    ``daily``/``interval`` schedule or any present ``time``/``hours``/``minutes`` field is a
+    config error and nothing is derived; the legacy JSON reader (task 8.4) passes ``False`` and
+    keeps its in-memory derivation until that task is authorized.
     """
     stype = job_cfg.get("schedule", "cron")
     raw_cron = job_cfg.get("cron")
     cron = raw_cron if isinstance(raw_cron, str) else None
     if not isinstance(stype, str) or stype not in _SCHEDULE_TYPES:
-        return stype, cron, None, "schedule must be one of: cron, once, daily, interval", False
+        allowed = "cron, once" if reject_obsolete else "cron, once, daily, interval"
+        return stype, cron, None, f"schedule must be one of: {allowed}", False
+    if reject_obsolete:
+        names = _obsolete_schedule_names(stype, [field for field in _OBSOLETE_SCHEDULE_FIELDS if field in job_cfg])
+        if names:
+            return stype, cron, None, _obsolete_schedule_error(names), False
     if raw_cron is not None and cron is None:
         return stype, None, None, "cron must be a string", False
     if stype == "once":
@@ -811,16 +860,13 @@ class _MutationPlan:
     ``patch`` edits a deep copy of the raw document and returns False when
     the file needs no write. ``registration`` says how the job's trigger
     changes; with ``publish_registration`` False a ``register`` trigger is
-    prepared (and so validated) but not published. ``legacy_proof`` is the
-    legacy JSON fingerprint read by a removal's single preflight; when set,
-    the legacy file must still match it under the commit locks.
+    prepared (and so validated) but not published.
     """
 
     meta: Optional[dict]
     patch: Callable[[dict], bool]
     registration: _RegistrationChange = "keep"
     publish_registration: bool = True
-    legacy_proof: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -834,7 +880,6 @@ class _PreparedMutation:
     view keep their identity; ``new_meta`` is inserted only for a new job and
     ``remove`` drops the job. ``registrations`` are detached ``schedule``
     jobs that replace the tag's registrations when ``replace_registration``.
-    ``legacy_proof`` is carried unchanged from the plan.
     """
 
     generation: int
@@ -846,7 +891,6 @@ class _PreparedMutation:
     remove: bool
     replace_registration: bool
     registrations: tuple
-    legacy_proof: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -940,8 +984,8 @@ class Scheduler:
         # reload leaves it exactly as it was.
         self._reload_required = False
         self._load_notice_sent = False
-        # Benign notice for an unreadable/malformed legacy JSON file: shown to
-        # the operator, but it never refuses scheduler.toml changes by itself.
+        # Notice that the (never loaded) legacy JSON job file exists: shown to
+        # the operator, but it never refuses scheduler.toml changes.
         self._legacy_notice: Optional[str] = None
 
         try:
@@ -953,7 +997,7 @@ class Scheduler:
                 paths.state_home, type(exc).__name__,
             )
         self._load_config_jobs(scheduler_config_path, sched_cfg)
-        self._load_dynamic_jobs()   # legacy JSON jobs, read-only into the runtime view
+        self._legacy_notice = self._detect_legacy_file()  # existence only; never read
         self._load_state()          # overlay last_run/last_error onto active jobs from history
         self._save_state()
 
@@ -1009,7 +1053,7 @@ class Scheduler:
         Set while the scheduler file is known unreadable or unparseable (at
         startup or after a failed reload); a missing file has no notice. The
         RELOAD_REQUIRED latch takes precedence over every file notice. A
-        separate legacy JSON file notice (unreadable or malformed) follows
+        separate notice for an existing (never loaded) legacy JSON file follows
         those; it is informational and never refuses changes by itself.
         """
         notices = [n for n in (self._hard_notice(), self._legacy_notice) if n]
@@ -1098,12 +1142,12 @@ class Scheduler:
         self,
         schedule_type: str,
         cron: Optional[str],
-        time_str: Optional[str],
-        hours,
-        minutes,
         run_at: Optional[str],
     ) -> tuple[Optional[str], str, Optional[str]]:
         """Resolve the cron expression and effective run_at for a new job.
+
+        Obsolete ``daily``/``interval``/``time``/``hours``/``minutes`` input is refused by the
+        callers before this point and is never converted here.
 
         Returns ``(expr, schedule_type, effective_run_at)`` or raises
         ``ValueError`` with a user-facing message on invalid input.
@@ -1114,14 +1158,10 @@ class Scheduler:
         elif schedule_type == "once":
             expr = None  # once jobs don't use cron
         else:
-            # Convert legacy style to cron
-            expr = _legacy_to_cron(schedule_type, time_str, hours, minutes)
-            if not expr:
-                raise ValueError(
-                    "Could not determine schedule. Provide a 'cron' expression "
-                    "(e.g. '0 */6 * * *') or legacy fields."
-                )
-            schedule_type = "cron"
+            raise ValueError(
+                "Could not determine schedule. Provide a 'cron' expression "
+                "(e.g. '0 */6 * * *') or schedule_type 'once' with run_at (HH:MM)."
+            )
 
         # Validate cron expression
         if expr:
@@ -1130,11 +1170,10 @@ class Scheduler:
             except (CroniterBadCronError, ValueError) as exc:
                 raise ValueError(f"Invalid cron expression '{expr}': {exc}") from exc
 
-        if schedule_type == "once" and not (run_at or time_str):
+        if schedule_type == "once" and not run_at:
             raise ValueError("'run_at' (HH:MM) is required for once jobs")
 
-        effective_run_at = run_at or time_str
-        return expr, schedule_type, effective_run_at
+        return expr, schedule_type, run_at
 
     @staticmethod
     def _build_job_meta(
@@ -1179,9 +1218,9 @@ class Scheduler:
         schedule_type: str,
         task: str,
         notify: bool = True,
-        hours: Optional[int] = None,
-        minutes: Optional[int] = None,
-        time_str: Optional[str] = None,
+        hours: Optional[int] | _OmittedLegacyField = _OMITTED_LEGACY_FIELD,
+        minutes: Optional[int] | _OmittedLegacyField = _OMITTED_LEGACY_FIELD,
+        time_str: Optional[str] | _OmittedLegacyField = _OMITTED_LEGACY_FIELD,
         run_at: Optional[str] = None,
         cron: Optional[str] = None,
         source: str = "dynamic",
@@ -1192,22 +1231,27 @@ class Scheduler:
         *,
         _on_attempt: Optional[Callable[[], None]] = None,
     ) -> dict:
+        """Add a job, refusing supplied obsolete fields before the attempt hook.
+
+        ``hours``, ``minutes`` and ``time_str`` may be omitted; explicitly
+        supplying any of them, including ``None``, is a validation refusal.
+        """
         # A known-bad scheduler file is never overwritten: refuse before the attempt.
         refusal = self._file_refusal()
         if refusal is not None:
             return refusal
+        # Obsolete scheduling input is known-bad: refuse before any coercion or the attempt hook.
+        obsolete = obsolete_mutation_error({
+            "schedule_type": schedule_type,
+            **{
+                key: value for key, value in (("hours", hours), ("minutes", minutes), ("time", time_str))
+                if value is not _OMITTED_LEGACY_FIELD
+            },
+        })
+        if obsolete is not None:
+            return {"success": False, "error": obsolete}
         # Normalize tag to underscore-separated lowercase (TOML-safe bare key)
         tag = _normalize_context_key(tag)
-        # Coerce hours/minutes to int — LLM may pass them as strings
-        try:
-            hours = int(hours) if hours is not None else None
-        except (ValueError, TypeError):
-            hours = None
-        try:
-            minutes = int(minutes) if minutes is not None else None
-        except (ValueError, TypeError):
-            minutes = None
-
         if tag in self._jobs_meta:
             if _on_attempt is not None:
                 _on_attempt()
@@ -1216,7 +1260,7 @@ class Scheduler:
         # Resolve and validate schedule
         try:
             expr, schedule_type, effective_run_at = self._resolve_schedule(
-                schedule_type, cron, time_str, hours, minutes, run_at,
+                schedule_type, cron, run_at,
             )
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
@@ -1311,18 +1355,12 @@ class Scheduler:
                 return False, "", True
             if self._legacy_only_locked(canonical, meta):
                 return False, self._legacy_job_refusal(canonical), False
-        legacy_proof: Optional[str] = None
         if action == "remove":
-            legacy_proof, shadow = self._removal_preflight(canonical)
-            if shadow is not None:
-                return False, shadow, False
             build = self._removal_builder(canonical)
         else:
             build = self._enabled_builder(canonical, action == "resume")
         verb = self._CHANGE_VERBS[action]
-        failure = self._commit_mutation(
-            canonical, self._user_change_builder(canonical, build, legacy_proof),
-        )
+        failure = self._commit_mutation(canonical, self._user_change_builder(canonical, build))
         if failure is not None:
             if isinstance(failure, _ReloadRequiredReason):
                 logger.warning("Job '%s' change needs a reload: %s", canonical, failure)
@@ -1356,51 +1394,21 @@ class Scheduler:
             "the scheduler (/jobs reload)."
         )
 
-    def _removal_preflight(self, tag: str) -> tuple[Optional[str], Optional[str]]:
-        """Read the CURRENT legacy file once before removing scheduler.toml job *tag*.
-
-        Returns ``(fingerprint, refusal)``: a missing file or a valid file
-        without the tag yields its fingerprint and no refusal; a file whose
-        raw top-level keys contain the tag (whatever its entry holds), or one
-        that cannot be read or parsed, yields a refusal, since removing the
-        scheduler.toml job could bring a legacy job back.
-        """
-        legacy = self._dynamic_jobs_file
-        read = self._read_legacy_input(set(), views=False)
-        if read.notice is not None:
-            return None, (
-                f"Job '{tag}' was not removed: the legacy job file {legacy} could not "
-                "be read or parsed, so a legacy job with this tag cannot be ruled out "
-                f"and {self._scheduler_config_path} was not written. Check and repair "
-                "that file, then reload the scheduler (/jobs reload) and retry."
-            )
-        if read.raw_tags is not None and tag in read.raw_tags:
-            return None, (
-                f"Job '{tag}' was not removed: the legacy job file {legacy} also "
-                f"defines this tag, so removing it from {self._scheduler_config_path} "
-                "would bring the legacy job back. Edit that file manually to delete "
-                "the entry, then reload the scheduler (/jobs reload) and retry."
-            )
-        return read.fingerprint, None
-
     def _user_change_builder(
         self,
         tag: str,
         build: Callable[[Optional[dict]], _MutationPlan],
-        legacy_proof: Optional[str] = None,
     ) -> Callable[[Optional[dict]], _MutationPlan]:
         """Wrap an operator change's plan builder with the read-only legacy guards.
 
         Every (re)preparation checks the job's origin against the same
         snapshot it is prepared from: a job that is now legacy-only fails the
-        change (after the attempt, an executed failure). *legacy_proof*, the
-        removal preflight's fingerprint, is carried unchanged into every
-        re-prepared plan and is never re-read here.
+        change (after the attempt, an executed failure).
         """
         def guarded(base: Optional[dict]) -> _MutationPlan:
             plan = build(base)
             legacy_view = base is not None and base.get("_legacy_read_only") is True
-            if not legacy_view and legacy_proof is None:
+            if not legacy_view:
                 return plan
             patch = plan.patch
 
@@ -1416,7 +1424,7 @@ class Scheduler:
 
             return _MutationPlan(
                 meta=plan.meta, patch=checked, registration=plan.registration,
-                publish_registration=plan.publish_registration, legacy_proof=legacy_proof,
+                publish_registration=plan.publish_registration,
             )
 
         return guarded
@@ -1454,7 +1462,8 @@ class Scheduler:
         ``last_run``, ``last_error``, ``notify``, ``model``,
         ``preserve_context``, ``context_max_messages``, ``overlap_policy``,
         ``source``, ``enabled``, ``is_running``, ``created_at``, and
-        ``config_error`` (present only when the job's scheduling fields are invalid).
+        ``config_error`` (present only when the job carries a config error;
+        :meth:`config_blocks_schedule` tells whether it also leaves the job unscheduled).
         """
         canonical = self._resolve_tag(tag)
         if not canonical:
@@ -1487,8 +1496,8 @@ class Scheduler:
         }
         # Only a job with invalid scheduling fields carries config_error, so a
         # healthy job keeps the compact field set.
-        if meta.get("config_error"):
-            job["config_error"] = meta["config_error"]
+        if self._visible_config_error(meta):
+            job["config_error"] = self._visible_config_error(meta)
         return job
 
     def modify_job(
@@ -1515,6 +1524,9 @@ class Scheduler:
         refusal = self._file_refusal()
         if refusal is not None:
             return refusal
+        obsolete = obsolete_mutation_error(updates)
+        if obsolete is not None:
+            return {"success": False, "error": obsolete}
         canonical = self._resolve_tag(tag) or tag
         with self._running_lock:
             if canonical not in self._jobs_meta:
@@ -1577,9 +1589,6 @@ class Scheduler:
                     expr, schedule_type, effective_run_at = self._resolve_schedule(
                         schedule_type=merged_schedule_type,
                         cron=merged_cron,
-                        time_str=None,
-                        hours=None,
-                        minutes=None,
                         run_at=merged_run_at,
                     )
                 except ValueError as exc:
@@ -1690,9 +1699,6 @@ class Scheduler:
             expr, schedule_type, effective_run_at = self._resolve_schedule(
                 schedule_type=requested.get("schedule_type", base.get("schedule_type", "cron")),
                 cron=requested.get("cron", base.get("cron")),
-                time_str=None,
-                hours=None,
-                minutes=None,
                 run_at=requested.get("run_at", base.get("run_at")),
             )
         except ValueError as exc:
@@ -1712,6 +1718,17 @@ class Scheduler:
         updates["run_at"] = effective_run_at if schedule_type == "once" else None
         provided |= {"cron", "schedule_type", "run_at"}
         return updates, provided
+
+    @staticmethod
+    def _visible_config_error(meta: dict) -> Optional[str]:
+        """The operator-visible config error: scheduling error and/or the launch-time fallback error."""
+        parts = [e for e in (meta.get("config_error"), meta.get("launch_config_error")) if e]
+        return "; ".join(parts) or None
+
+    def config_blocks_schedule(self, tag: str) -> bool:
+        """True when ``tag``'s config error leaves it unscheduled (a ``fallback_models``-only error does not)."""
+        meta = self._jobs_meta.get(self._resolve_tag(tag) or tag) or {}
+        return bool(meta.get("config_error"))
 
     def list_jobs(self) -> list:
         with self._running_lock:
@@ -1733,7 +1750,7 @@ class Scheduler:
                 "model": meta.get("model"),
                 "preserve_context": meta.get("preserve_context", False),
                 "is_running": tag in running,
-                "config_error": meta.get("config_error"),
+                "config_error": self._visible_config_error(meta),
             }
             result.append(entry)
         return result
@@ -1910,6 +1927,8 @@ class Scheduler:
         bad_fields: list[str] = []
         if not isinstance(raw_task, str):
             bad_fields.append("task must be a string")
+        if meta.get("launch_config_error"):
+            bad_fields.append(meta["launch_config_error"])
         if type(meta.get("notify", True)) is not bool:
             bad_fields.append("notify must be true or false")
         if type(meta.get("preserve_context", False)) is not bool:
@@ -1935,7 +1954,6 @@ class Scheduler:
         if policy_invalid:
             bad_fields.append("overlap_policy must be 'skip' or 'parallel'")
         run_id: Optional[str] = None
-        document: Optional[dict] = None
         with self._running_lock:
             if not manual and self._reload_required:
                 return  # latched after the early check: still admit nothing
@@ -1957,7 +1975,6 @@ class Scheduler:
             self._running_jobs.add(tag)
             if run_id is not None:
                 self._active_runs.setdefault(tag, set()).add(run_id)
-            document = self._load_result.document
 
         # Every present raw value (including ``""`` and falsey non-strings)
         # forwards verbatim for the trusted scheduled admission to classify.
@@ -1970,18 +1987,6 @@ class Scheduler:
         logger.info("Running scheduled job %s%s", tag, _log_extra)
         now = datetime.now(timezone.utc).isoformat()
         is_once = meta.get("schedule_type") == "once"
-
-        # A legacy per-job fallback_models key never reaches the spawn call;
-        # execution warns once, naming the job and the key, never the value.
-        # Read-only: the authoritative document is never mutated here.
-        if document is not None:
-            jobs_section = document.get("jobs")
-            job_table = jobs_section.get(tag) if type(jobs_section) is dict else None
-            if isinstance(job_table, dict) and "fallback_models" in job_table:
-                logger.warning(
-                    "Job %s: legacy fallback_models is ignored; remove the key from %s.",
-                    tag, self._scheduler_config_path,
-                )
 
         # A wrong-typed field is a normal recorded launch failure: the run
         # was admitted, so last_run is persisted, the failure is recorded
@@ -2244,7 +2249,9 @@ class Scheduler:
         """Record a launch failure, alert directly (independent of notify), release the run.
 
         The admitted run's failed execution record carries its run ID and the
-        launch error, with failure classification and next-run metadata.
+        launch error, with failure classification and next-run metadata. The
+        alert repeats the record's bounded, redacted ``model`` evidence
+        (computed once by the caller, HTML-escaped here).
         """
         try:
             meta["last_error"] = error_message
@@ -2262,6 +2269,7 @@ class Scheduler:
                 f"⚠️ <b>Job {_html.escape(tag)} {headline}</b>"
                 f" ({_html.escape(error_type)})\n"
                 f"Next run: {_html.escape(next_run)}\n"
+                f"Model: {_html.escape(model)}\n"
                 f"{_html.escape(error_message)}"
             )
         finally:
@@ -2287,18 +2295,18 @@ class Scheduler:
             try:
                 if action == "add":
                     stype = cmd.get("schedule", "interval")
-                    hours = int(cmd["hours"]) if "hours" in cmd else None
-                    mins = int(cmd["minutes"]) if "minutes" in cmd else None
-                    t = cmd.get("time")
+                    legacy_kwargs = {
+                        **({"hours": int(cmd["hours"])} if "hours" in cmd else {}),
+                        **({"minutes": int(cmd["minutes"])} if "minutes" in cmd else {}),
+                        **({"time_str": cmd["time"]} if "time" in cmd else {}),
+                    }
                     notify = str(cmd.get("notify", "true")).lower() != "false"
                     res = self.add_job(
                         tag=tag,
                         schedule_type=stype,
                         task=cmd.get("task", ""),
                         notify=notify,
-                        hours=hours,
-                        minutes=mins,
-                        time_str=t,
+                        **legacy_kwargs,
                     )
                     logger.info("Command add job '%s': %s", tag, res)
                 elif action == "remove":
@@ -2452,85 +2460,15 @@ class Scheduler:
         if loaded:
             logger.debug("Restored run history for %d jobs from %s", loaded, self._state_file)
 
-    def _load_dynamic_jobs(self) -> None:
-        """Read legacy scheduled_jobs.json into the runtime view (startup path).
+    def _detect_legacy_file(self) -> Optional[str]:
+        """Return the legacy-file notice when the state-home job file exists, else None.
 
-        The legacy file is read non-destructively: it is never deleted, and its
-        jobs are never written into scheduler.toml by a load. An unreadable or
-        malformed file sets the legacy notice sent once at start.
+        The only contact with the legacy file: a metadata existence check.
+        It is never opened, read, hashed, written, renamed or deleted.
         """
-        if self._file_refusal() is not None:
-            logger.warning(
-                "Skipped loading %s: the scheduler file failed to load.",
-                self._dynamic_jobs_file,
-            )
-            return
-        read = self._read_legacy_input(set(self._jobs_meta))
-        self._legacy_notice = read.notice
-        if read.views:
-            with self._running_lock:
-                self._jobs_meta.update(read.views)
-
-    def _read_legacy_input(self, taken: set, *, views: bool = True) -> _LegacyRead:
-        """Read the legacy JSON once; return its fingerprint, raw tags, and job views.
-
-        Everything comes from the same single read (see ``_LegacyRead``).
-        With *views*, runtime views are built for jobs whose tag is not in
-        *taken*: each is classified like a scheduler.toml job (its
-        ``schedule_type`` read as ``schedule``), so a bad scheduling field
-        carries ``config_error`` while other raw values are kept as read, and
-        each carries the trusted read-only origin flag. Never writes.
-        """
-        path = self._dynamic_jobs_file
-        try:
-            with open(path, "rb") as f:
-                raw = f.read()
-        except FileNotFoundError:
-            return _LegacyRead(_INPUT_MISSING)
-        except OSError as exc:
-            logger.warning("Could not read legacy jobs from %s (%s); file kept.",
-                           path, type(exc).__name__)
-            return _LegacyRead(None, notice=_legacy_file_notice(path, "could not be read"))
-        fingerprint = _hash_input(raw)
-        try:
-            jobs = json.loads(raw)
-        except ValueError as exc:
-            logger.warning("Could not read legacy jobs from %s (%s); file kept.",
-                           path, type(exc).__name__)
-            return _LegacyRead(fingerprint, notice=_legacy_file_notice(path, "is not valid JSON"))
-        if not isinstance(jobs, dict):
-            logger.warning(
-                "Could not read legacy jobs: %s is not a JSON object; file kept.", path,
-            )
-            return _LegacyRead(
-                fingerprint, notice=_legacy_file_notice(path, "is not a JSON object of jobs"),
-            )
-        raw_tags = frozenset(jobs)
-        if not views:
-            return _LegacyRead(fingerprint, raw_tags=raw_tags)
-        legacy: dict = {}
-        malformed = 0
-        for tag, entry in jobs.items():
-            if not isinstance(entry, dict):
-                malformed += 1
-                continue
-            if tag in taken:
-                continue  # the scheduler.toml job wins
-            job_cfg = dict(entry)
-            job_cfg["schedule"] = entry.get("schedule_type", entry.get("schedule", "cron"))
-            job_cfg["source"] = "dynamic"
-            meta = self._build_loaded_job(tag, job_cfg, path)
-            meta.pop("_migrated", None)
-            meta["_legacy_read_only"] = True  # trusted origin: set only by this reader
-            legacy[tag] = meta
-        if legacy:
-            logger.info("Loaded %d legacy jobs from %s", len(legacy), path)
-        if malformed:
-            logger.warning(
-                "Skipped %d entries in %s that are not JSON objects; fix or remove them manually.",
-                malformed, path,
-            )
-        return _LegacyRead(fingerprint, views=legacy, raw_tags=raw_tags)
+        if os.path.exists(self._dynamic_jobs_file):
+            return _legacy_file_notice(self._dynamic_jobs_file)
+        return None
 
     _MAX_BACKUPS = 5
 
@@ -2550,12 +2488,12 @@ class Scheduler:
 
     def reload(self) -> dict:
         """
-        Hot-reload scheduler.toml (and the legacy JSON) as one atomic publication.
+        Hot-reload scheduler.toml as one atomic publication.
 
         The reload reads, hashes, and parses its own input bytes once, then
         builds the complete candidate (job view and every enabled job's
         registrations) outside the commit locks. Under ``_running_lock`` then
-        ``_save_lock`` it rechecks that both files still hold exactly those
+        ``_save_lock`` it rechecks that the file still holds exactly those
         bytes (no re-parse) and publishes document, hash, view, registrations,
         and generation together, clearing the RELOAD_REQUIRED latch. Safe to
         call while the scheduler is running.
@@ -2565,10 +2503,10 @@ class Scheduler:
         generation, and latch stay untouched, nothing is retried, and the result
         is {"reloaded": 0, "failed": 0, "error": <actionable notice>}: an
         unreadable or unparseable scheduler file also sets the load notice; a
-        file changed during the reload, or an unreadable legacy file, asks the
-        operator to reload again. A malformed (readable) legacy file keeps the
-        last-good legacy jobs, with scheduler.toml jobs winning, and sets the
-        legacy notice; a healthy or missing legacy file clears it.
+        file changed during the reload asks the operator to reload again. The
+        state-home legacy job file is only checked for existence, on every
+        reload outcome: its notice is set while it exists and cleared when it
+        is gone (a failed reload changes nothing else); it is never read.
         """
         logger.info("Reloading scheduler.toml…")
         path = self._scheduler_config_path
@@ -2576,37 +2514,15 @@ class Scheduler:
         if load_result.notice is not None:
             self._reload_failure = load_result.notice
             logger.warning("Scheduler reload failed (%s); last-good jobs kept.", load_result.status)
+            self._legacy_notice = self._detect_legacy_file()  # existence only; nothing else changes
             return {"reloaded": 0, "failed": 0, "error": load_result.notice}
         toml_fp = load_result.content_hash or _INPUT_MISSING
-        legacy_read = self._read_legacy_input(set(candidate))
-        legacy_fp = legacy_read.fingerprint
-        if legacy_fp is None:
-            return self._reload_not_published(
-                f"the legacy job file {self._dynamic_jobs_file} could not be read, so {path} "
-                "was not reloaded and the current jobs are kept. Check the legacy file's "
-                "permissions, then reload again (/jobs reload)."
-            )
-        legacy = legacy_read.views
-        if legacy_read.notice is not None:
-            # Legacy file malformed: keep detached copies of the last-good legacy
-            # jobs, selected by their trusted origin (never by ``source``).
-            logger.warning(
-                "Legacy jobs in %s could not be loaded; the last-good legacy jobs are kept.",
-                self._dynamic_jobs_file,
-            )
-            with self._running_lock:
-                legacy = copy.deepcopy({
-                    tag: meta for tag, meta in self._jobs_meta.items()
-                    if meta.get("_legacy_read_only") is True and tag not in candidate
-                })
-        candidate.update(legacy or {})
         registrations, reloaded, failed = self._prepare_reload_registrations(candidate)
 
         publish_fault: Optional[str] = None
         with self._running_lock, self._save_lock:
             toml_now = _input_fingerprint(path)
-            legacy_now = _input_fingerprint(self._dynamic_jobs_file)
-            if toml_now == toml_fp and legacy_now == legacy_fp:
+            if toml_now == toml_fp:
                 # Re-overlay run history so last_run/last_error survive a reload.
                 for tag, meta in candidate.items():
                     hist = self._run_history.get(tag)
@@ -2630,25 +2546,24 @@ class Scheduler:
                     self._jobs_meta = candidate
                     self._load_result = load_result
                     self._reload_failure = None
-                    # Cleared only when a healthy or missing legacy file was adopted.
-                    self._legacy_notice = legacy_read.notice
+                    # Existence only: set while the legacy file exists, cleared when gone.
+                    self._legacy_notice = self._detect_legacy_file()
                     self._reload_required = False
                     self._config_generation += 1
                 published = True
             else:
                 published = False
         if publish_fault is not None:
+            self._legacy_notice = self._detect_legacy_file()
             return self._reload_not_published(
                 f"the scheduled triggers from {path} could not be published ({publish_fault}), "
                 "so the current jobs are kept and automatic runs are paused. A reload is "
                 "required (/jobs reload) once the scheduler driver is available."
             )
         if not published:
-            changed = "it" if toml_now != toml_fp else (
-                f"the legacy job file {self._dynamic_jobs_file}"
-            )
+            self._legacy_notice = self._detect_legacy_file()
             return self._reload_not_published(
-                f"{path} was being reloaded when {changed} changed, so nothing was "
+                f"{path} was being reloaded when it changed, so nothing was "
                 "loaded and the current jobs are kept. Reload again (/jobs reload)."
             )
         logger.info("Scheduler reloaded: %d active, %d failed", reloaded, failed)
@@ -2810,11 +2725,6 @@ class Scheduler:
                 if self._config_generation != prepared.generation:
                     logger.debug("Scheduler mutation candidate is stale; re-preparing.")
                     continue
-                if (
-                    prepared.legacy_proof is not None
-                    and _input_fingerprint(self._dynamic_jobs_file) != prepared.legacy_proof
-                ):
-                    return self._legacy_changed_reason()
                 try:
                     replacement = self._replacement_registrations_locked(tag, prepared)
                 except Exception as exc:  # noqa: BLE001 - external schedule jobs; contained before any write
@@ -2921,7 +2831,6 @@ class Scheduler:
             remove=tag is not None and base is not None and new_meta is None,
             replace_registration=tag is not None and replace,
             registrations=registrations,
-            legacy_proof=plan.legacy_proof,
         )
 
     def _prepare_registration(self, tag: str, meta: dict) -> tuple:
@@ -2981,19 +2890,6 @@ class Scheduler:
         if stored.status == "missing":
             return on_disk.status == "missing"
         return on_disk.status == "valid" and on_disk.content_hash == stored.content_hash
-
-    def _legacy_changed_reason(self) -> str:
-        """Return the failure reason for a legacy file changed after a removal's preflight."""
-        legacy = self._dynamic_jobs_file
-        logger.warning(
-            "Not writing %s: the legacy job file %s changed after the removal was checked.",
-            self._scheduler_config_path, legacy,
-        )
-        return (
-            f"the legacy job file {legacy} changed while the removal was being "
-            f"prepared, so {self._scheduler_config_path} was not written. Check "
-            "that file for a job with this tag, then retry the removal."
-        )
 
     def _external_change_reason(self) -> str:
         """Return the failure reason for a file changed outside the scheduler."""
@@ -3209,7 +3105,9 @@ class Scheduler:
         return load_result, new_meta, migrated
 
     @staticmethod
-    def _build_loaded_job(tag: str, job_cfg: object, config_path: str) -> dict:
+    def _build_loaded_job(
+        tag: str, job_cfg: object, config_path: str, *, reject_obsolete: bool = True,
+    ) -> dict:
         """Build one job's runtime view from its raw TOML table, type-strictly.
 
         Raw values are kept as parsed (no ``int()``/``bool()`` coercion and no
@@ -3221,7 +3119,9 @@ class Scheduler:
             job_cfg = {}
             stype, cron, run_at, migrated = "cron", None, None, False
         else:
-            stype, cron, run_at, config_error, migrated = _classify_schedule(job_cfg)
+            stype, cron, run_at, config_error, migrated = _classify_schedule(
+                job_cfg, reject_obsolete=reject_obsolete,
+            )
         enabled = job_cfg.get("enabled", True)
         if config_error is None and not isinstance(enabled, bool):
             config_error = "enabled must be true or false"
@@ -3247,6 +3147,11 @@ class Scheduler:
         # Optional per-job step cap (raw; unused at runtime)
         if job_cfg.get("max_iterations") is not None:
             meta["max_iterations"] = job_cfg["max_iterations"]
+        # A per-job fallback_models key (presence, any value) keeps the job scheduled; it is a
+        # visible config error and fails the job's launch when it fires. No value is read.
+        if reject_obsolete and "fallback_models" in job_cfg:
+            meta["launch_config_error"] = _FALLBACK_MODELS_ERROR
+            logger.warning("Job '%s' in %s has obsolete fallback_models: its launches will fail until removed.", tag, config_path)
         if config_error is not None:
             meta["config_error"] = config_error
             logger.warning(

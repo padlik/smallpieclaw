@@ -24,8 +24,14 @@
 #   overlap_policy       = "skip"|"parallel"  (what to do if previous run is still active; default: skip)
 #   max_iterations       = N             (DEPRECATED: parsed but ignored — agents now run
 #                                         until they finish or hit a failure loop. Remove from existing jobs.)
-#   fallback_models      = ["<model>"]   (DEPRECATED: parsed but ignored — the LLM client
-#                                         is now single-model. Remove from existing jobs.)
+#
+# Obsolete fields (never converted or ignored — remove them):
+#   schedule = "daily"/"interval", time, hours, minutes   → the job is NOT scheduled and shows a
+#                                         config_error; rewrite it with schedule = "cron" and cron,
+#                                         or schedule = "once" with run_at = "HH:MM".
+#   fallback_models                       → every launch of the job fails (recorded, with an alert)
+#                                         until the key is removed; jobs never fall back to another model.
+#   Other jobs keep running; the file is never rewritten for you.
 
 [jobs.longterm_memory_update]
 enabled = true

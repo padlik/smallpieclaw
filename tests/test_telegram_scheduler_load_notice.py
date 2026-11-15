@@ -120,8 +120,8 @@ def test_jobs_mutation_displays_file_refusal(
 #
 # Relocated by task 2.4 from tests/test_scheduler_legacy_readonly.py (ledger
 # provenance in openspec/changes/simplify-model-runtime/test-preservation-ledger).
-# Deferred rewrite (task 8.4, ledger 444/445/456/457/459): keep the startup/
-# reload notice and byte preservation; detection becomes existence-only.
+# Rewritten by task 8.4 (ledger 444/445/456/457/459): the startup/reload notice
+# and byte preservation are kept; detection is existence-only (never read).
 # ---------------------------------------------------------------------------
 
 
@@ -134,19 +134,20 @@ def make_legacy_scheduler(
 
 
 class TestNonDestructiveLoad:
-    """Loading and reloading legacy jobs never writes either file."""
+    """Loading and reloading with a legacy file present never writes either file."""
 
     @pytest.mark.parametrize("toml", [legacy_fx.TOML, None], ids=["toml_present", "toml_missing"])
     def test_load_and_reload_keep_legacy_bytes_without_adoption(
         self, make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, toml: Optional[str],
     ) -> None:
-        """Legacy jobs are visible; both files keep their bytes; no TOML is created."""
+        """Legacy jobs are never listed; both files keep their bytes; no TOML is created."""
         env = make_legacy_scheduler(toml, legacy=legacy_fx.LEGACY)
 
         reloaded = env.sched.reload()
 
         assert "error" not in reloaded, reloaded
-        assert {"legacyjob", "legacypaused"} <= set(legacy_fx.tags(env.sched))
+        assert not {"legacyjob", "legacypaused"} & set(legacy_fx.tags(env.sched))
+        assert str(env.legacy_path) in (env.sched.load_notice() or "")
         assert env.legacy_path.read_bytes() == legacy_fx.legacy_bytes(legacy_fx.LEGACY)
         if toml is None:
             assert not env.toml_path.exists()
@@ -165,7 +166,7 @@ _BAD_LEGACY = {
 def test_bad_legacy_file_sends_startup_notice(
     make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, bad: str,
 ) -> None:
-    """Startup notifies the operator with the legacy path and repair steps, no content."""
+    """Startup notifies the operator with the legacy path and conversion steps, no content."""
     env = make_legacy_scheduler(legacy_fx.TOML, legacy=_BAD_LEGACY[bad], enabled=True)
 
     env.sched.start()
@@ -175,19 +176,21 @@ def test_bad_legacy_file_sends_startup_notice(
     assert naming, f"no startup notice names the legacy file: {sent!r}"
     text = naming[0].lower()
     assert "reload" in text
-    assert "repair" in text or "fix" in text or "edit" in text
+    assert "cron" in text and "once" in text and "scheduler.toml" in text
     assert legacy_fx.SECRET not in naming[0]
 
 
-def test_uninspectable_legacy_file_sends_startup_notice(
+def test_uninspectable_legacy_file_is_never_opened_and_never_blocks_startup(
     make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An existing legacy file that cannot be inspected is read, not treated as missing.
+    """A legacy file whose metadata cannot even be stat-ed is still never opened.
 
     A real valid legacy file exists, but while the scheduler is constructed
     and started the external ``os.stat`` and ``open`` on that one path raise
     ``PermissionError`` (an inaccessible parent directory) without host
-    permission changes; every other path and file descriptor delegates.
+    permission changes; every other path and file descriptor delegates. The
+    existence check only needs metadata, so there is no read attempt and no
+    fallback read; scheduler.toml jobs start normally and the bytes stay.
     """
     paths = xdg_paths("legacy-readonly-test")  # the fixture's own stable paths
     paths.state_home.mkdir(parents=True, exist_ok=True)
@@ -224,14 +227,8 @@ def test_uninspectable_legacy_file_sends_startup_notice(
         env.sched.start()
         attempts = list(open_attempts)
 
-    sent = [call.args[0] for call in env.notify.call_args_list]
-    naming = [m for m in sent if html.escape(str(legacy_path)) in m]
-    assert naming, f"no startup notice names the uninspectable legacy file: {sent!r}"
-    text = naming[0].lower()
-    assert "reload" in text
-    assert "repair" in text or "fix" in text or "edit" in text
-    assert legacy_fx.SECRET not in naming[0]
-    assert attempts, "the legacy file was assumed missing instead of being read"
+    assert attempts == [], "the legacy file was opened"
     assert env.sched.show_job("alpha")["next_run"] is not None
+    assert legacy_fx.SECRET not in "".join(str(c) for c in env.notify.call_args_list)
     assert env.legacy_path == legacy_path
     assert legacy_path.read_bytes() == legacy_fx.legacy_bytes(legacy_fx.LEGACY)

@@ -262,11 +262,11 @@ def test_graph_pin_is_not_retargeted_by_later_main_change_or_target_removal(tmp_
 @pytest.mark.parametrize("entry", ["admit", "admit_scheduled"])
 @pytest.mark.parametrize("main_state", ["unselected", "remembered-missing"])
 def test_graph_resolution_does_not_open_ordinary_admission(tmp_path: Path, entry: str, main_state: str) -> None:
-    """Graph resolution never activates Main: implicit and scheduled admission stay closed."""
+    """Graph resolution never activates Main: implicit and inheriting scheduled admission stay closed."""
     fixture = arrange(tmp_path, main_state, "fresh")
     ordinary = (
         fixture.registry.admit if entry == "admit"
-        else (lambda: fixture.registry.admit_scheduled(GRAPH_RECORD.id))
+        else fixture.registry.admit_scheduled  # inheriting (absent selector) needs Main; explicit does not (8.1)
     )
     with pytest.raises(ModelRegistryError) as before:
         ordinary()

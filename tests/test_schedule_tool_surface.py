@@ -944,11 +944,11 @@ _LIST_FIELDS = frozenset({
 })
 
 
-@pytest.mark.parametrize("tag", ["alpha", "legacyjob"])
+@pytest.mark.parametrize("tag", ["alpha"])  # task 8.4: legacy-file jobs no longer exist
 def test_public_job_field_sets_are_unchanged(
     make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, tag: str,
 ) -> None:
-    """No new public list/show fields are introduced for either origin."""
+    """No new public list/show fields are introduced (a legacy file adds none)."""
     env = make_legacy_scheduler(legacy_fx.TOML, legacy=legacy_fx.LEGACY)
 
     listed = next(job for job in env.sched.list_jobs() if job["tag"] == tag)

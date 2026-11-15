@@ -12,6 +12,7 @@ resolution, and HTTP. Instrumented subclasses always call ``super()``.
 
 from __future__ import annotations
 
+import html as _html
 import json
 import logging
 import os
@@ -415,33 +416,36 @@ def _pb_status(world: _World) -> str:
 
 # (raw saved selector, stale pb provider) shared by both gates.
 _UNCACHED_B = ModelRecord("pb/not-cached", "pb", "not-cached", "not-cached")
-_SELECTORS = [(None, False), (MODEL_B.id, False), ("ghost/not-known", False),
-              (123, False), (MODEL_B.id, True)]
-_SELECTOR_IDS = ["inherit-main", "explicit-b", "unknown-connection", "malformed-int",
-                 "explicit-b-stale"]
+_UPSTREAM_PADDED_B = ModelRecord("pb/ not-cached ", "pb", " not-cached ", " not-cached ")
 
 
 @pytest.mark.parametrize(
-    ("raw", "stale", "expected", "warnings"),
-    [(raw, stale, expected, warns) for (raw, stale), (expected, warns) in zip(
-        _SELECTORS,
-        [(MODEL_A, 0), (MODEL_B, 0), (MODEL_A, 1), (MODEL_A, 1), (MODEL_B, 0)],
-    )] + [(_UNCACHED_B.id, False, _UNCACHED_B, 0)],  # task 4.1: uncached exact target is pinned
-    ids=[*_SELECTOR_IDS, "uncached-exact"],
+    ("raw", "stale", "select", "expected"),
+    [
+        pytest.param(None, False, True, MODEL_A, id="inherit-main"),
+        pytest.param(MODEL_B.id, False, True, MODEL_B, id="explicit-b"),
+        pytest.param(MODEL_B.id, True, True, MODEL_B, id="explicit-b-stale"),
+        # task 4.1: an uncached exact target is pinned; task 8.1: Main is not needed for it.
+        pytest.param(_UNCACHED_B.id, False, True, _UNCACHED_B, id="uncached-exact"),
+        pytest.param(_UPSTREAM_PADDED_B.id, False, True, _UPSTREAM_PADDED_B, id="upstream-whitespace-verbatim"),
+        pytest.param(MODEL_B.id, False, False, MODEL_B, id="explicit-b-without-main"),
+        pytest.param(MODEL_B.id, True, False, MODEL_B, id="explicit-b-stale-without-main"),
+        pytest.param(_UNCACHED_B.id, False, False, _UNCACHED_B, id="uncached-exact-without-main"),
+    ],
 )
 def test_cron_fire_admits_once_and_completes_on_pinned_model(
     make_world, caplog: pytest.LogCaptureFixture, raw: str | int | None, stale: bool,
-    expected: ModelRecord, warnings: int,
+    select: bool, expected: ModelRecord,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="model_registry")
-    world = make_world(select=True, job_model=raw, stale_provider=stale)
+    world = make_world(select=select, job_model=raw, stale_provider=stale)
     assert _pb_status(world) == ("stale" if stale else "fresh")
 
     world.sched._run_job(TAG)
     assert world.sched.released_event.wait(_BOUND), ("run never released", world.records())
 
     run_id = _assert_admitted_at_entry(world, raw)
-    assert len(_registry_warnings(caplog)) == warnings, caplog.records
+    assert _registry_warnings(caplog) == [], caplog.records
     (pin,) = world.factory.pins
     assert pin.model == expected and world.resolved == [expected.provider_id]
     (client,) = world.chats
@@ -470,32 +474,44 @@ def test_cron_fire_admits_once_and_completes_on_pinned_model(
     assert embedding.close_count == 1
     assert not world.embed_http[0].is_closed, "borrowed embedding HTTP closed by runner"
     assert world.embed_requests == []
-    assert world.registry.view().active_model_id == MODEL_A.id
+    assert world.registry.view().active_model_id == (MODEL_A.id if select else None)
     assert world.settings_path.read_bytes() == world.document
     assert _pb_status(world) == ("stale" if stale else "fresh")
 
 
 @pytest.mark.parametrize(
-    ("raw", "stale", "evidence"),
-    [(raw, stale, evidence) for (raw, stale), evidence in zip(
-        _SELECTORS,
-        ["inherit", MODEL_B.id, "ghost/not-known", "malformed (not a string)", MODEL_B.id],
-    )],
-    ids=_SELECTOR_IDS,
+    ("raw", "stale", "select", "code", "message", "evidence"),
+    [
+        pytest.param(None, False, False, "no_active_selection", "no active selection", "inherit",
+                     id="inherit-without-main"),
+        pytest.param("ghost/not-known", False, True, "unknown_connection", "not configured",
+                     "ghost/not-known", id="unknown-connection"),
+        pytest.param("ghost/not-known", False, False, "unknown_connection", "not configured",
+                     "ghost/not-known", id="unknown-connection-without-main"),
+        pytest.param(" pb/model-b", False, True, "unknown_connection", "not configured",
+                     " pb/model-b", id="padded-connection"),
+        pytest.param(123, False, True, "malformed_selector", "must be '<connection>/<model>'",
+                     "malformed (not a string)", id="malformed-int"),
+        pytest.param(123, False, False, "malformed_selector", "must be '<connection>/<model>'",
+                     "malformed (not a string)", id="malformed-int-without-main"),
+        pytest.param("   ", False, True, "malformed_selector", "must be '<connection>/<model>'",
+                     "blank", id="whitespace"),
+    ],
 )
-def test_selector_does_not_bypass_missing_main(
+def test_invalid_selector_fails_only_its_launch_with_its_own_code_and_never_substitutes(
     make_world, caplog: pytest.LogCaptureFixture, raw: str | int | None, stale: bool,
-    evidence: str,
+    select: bool, code: str, message: str, evidence: str,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="model_registry")
-    world = make_world(select=False, job_model=raw, stale_provider=stale)
+    world = make_world(select=select, job_model=raw, stale_provider=stale)
     assert _pb_status(world) == ("stale" if stale else "fresh")
     managed_before = get_registry().count_managed()
 
     world.sched._run_job(TAG)
 
     run_id = _assert_admitted_at_entry(world, raw)
-    assert _registry_warnings(caplog) == [], "selector classified before the Main gate"
+    assert _registry_warnings(caplog) == [], "warn-and-inherit must not exist"
+    assert world.registry.scheduled_errors == [code]
     assert world.factory.pins == [] and world.factory.runners == []
     assert world.resolved == []
     assert world.chats == [] and world.embeddings == []
@@ -505,15 +521,19 @@ def test_selector_does_not_bypass_missing_main(
     (record,) = world.records()
     assert record["run_id"] == run_id and record["status"] == "failed"
     assert record["success"] is False
-    assert "no active selection" in record["result"]
+    assert message in record["result"]
     assert record["model"] == evidence
     alerts = [c.args[0] for c in world.sched.notify.call_args_list]
     assert len(alerts) == 1 and TAG in alerts[0] and "failed to spawn" in alerts[0]
+    assert f"Model: {_html.escape(evidence)}" in alerts[0]
+    if not isinstance(raw, str):
+        assert str(raw) not in alerts[0] and str(raw) not in record["result"]
     for text in (record["result"], alerts[0]):
         assert "secret-" not in text and "env:KEY_" not in text
     assert [(r, n) for r, _t, n in world.sched.released] == [(run_id, 1)]
     assert TAG not in world.sched._running_jobs and not world.sched._active_runs.get(TAG)
-    assert world.registry.view().active_model_id is None
+    assert TAG in world.sched._jobs_meta, "a failed launch must not unschedule the job"
+    assert world.registry.view().active_model_id == (MODEL_A.id if select else None)
     assert world.settings_path.read_bytes() == world.document
 
 
@@ -726,47 +746,6 @@ def test_shutdown_during_admission_is_a_recorded_launch_failure(make_world) -> N
     assert [(r, n) for r, _t, n in world.sched.released] == [(run_id, 1)]
     assert TAG not in world.sched._running_jobs and not world.sched._active_runs.get(TAG)
     assert get_registry().count_managed() == managed_before
-
-
-def test_run_now_of_agentic_legacy_json_job_uses_normal_admission(make_world) -> None:
-    """A JSON-only agentic job's ``run_now`` takes the same scheduled lifecycle.
-
-    The legacy file is read non-destructively; its raw selector reaches one
-    ``admit_scheduled``, the run finishes on that pin, its terminal record
-    carries the minted run ID, tracking is released, and the file is untouched.
-    """
-    legacy_tag = "legacy_agentic"
-    world = make_world(select=True, job_model=None)
-    legacy_bytes = (json.dumps({legacy_tag: {
-        "schedule_type": "cron", "cron": "0 5 1 1 *", "task": "legacy report",
-        "enabled": True, "notify": False, "model": MODEL_B.id,
-    }}, indent=2) + "\n").encode("utf-8")
-    world.paths.scheduler_jobs.write_bytes(legacy_bytes)
-    assert "error" not in world.sched.reload()
-    assert "legacy, read-only" in world.sched.show_job(legacy_tag)["schedule"]
-
-    assert world.sched.run_now(legacy_tag) == {"success": True}
-    assert world.sched.released_event.wait(_BOUND), ("run never released", world.records())
-
-    assert world.registry.scheduled_calls == [MODEL_B.id]
-    assert world.registry.ordinary_calls == 0
-    (call,) = world.factory.calls
-    assert call["profile"] is RuntimeProfile.SCHEDULED_AGENT
-    assert call["kwargs"]["model"] == MODEL_B.id and call["kwargs"]["label"] == legacy_tag
-    (pin,) = world.factory.pins
-    assert pin.model == MODEL_B and world.resolved == ["pb"]
-    (request,) = world.chat_requests
-    assert str(request.url) == f"{URLS['pb']}/chat/completions"
-    (record,) = [e for e in world.sched.execution_log.read_recent() if e["tag"] == legacy_tag]
-    assert _RUN_ID_RE.match(record["run_id"])
-    assert record["status"] == "done" and record["result"] == RESULT
-    assert record["model"] == MODEL_B.id
-    assert [r for r, _t, _n in world.sched.released] == [record["run_id"]]
-    assert legacy_tag not in world.sched._running_jobs
-    assert not world.sched._active_runs.get(legacy_tag)
-    assert world.sched.show_job(legacy_tag)["last_run"] is not None
-    assert world.paths.scheduler_jobs.read_bytes() == legacy_bytes
-    assert world.registry.view().active_model_id == MODEL_A.id
 
 
 # ---------------------------------------------------------------------------

@@ -273,14 +273,18 @@ def test_default_profile_is_on_demand(build: Callable[[str], _Wiring], explicit:
 
 
 def test_scheduled_raw_selector_forwarded_by_identity(build: Callable[[str], _Wiring]) -> None:
-    """A malformed scheduled selector reaches ``admit_scheduled`` unconverted."""
+    """A malformed scheduled selector reaches ``admit_scheduled`` unconverted and fails
+    typed before any credential, runtime, client or runner exists (no Main inheritance)."""
     wiring = build("active")
     raw = [MODEL_B.id]
-    runner = wiring.factory()(model=raw, runtime_profile=_SCHEDULED)
+    with pytest.raises(ModelRegistryError) as caught:
+        wiring.factory()(model=raw, runtime_profile=_SCHEDULED)
     assert _only_arg(wiring.admit_scheduled) is raw
     assert wiring.admit.call_count == 0
-    # Existing registry policy decides: a non-string selector inherits Main.
-    assert runner._llm._run_model is wiring.pins[0] and runner.model_id == MODEL_A.id
+    assert caught.value.code == "malformed_selector"
+    assert wiring.pins == [] and wiring.runners == [] and wiring.embeddings == []
+    assert wiring.resolver.call_count == wiring.create.call_count == 0
+    assert wiring.registry.view().active_model_id == MODEL_A.id
 
 
 @pytest.mark.parametrize("profile", _PROFILES, ids=[p.value for p in _PROFILES])
@@ -325,18 +329,24 @@ def test_ordinary_explicit_selector_is_admitted_once_without_active_main(
 
 
 @pytest.mark.parametrize("state", ["no-selection", "remembered-missing"])
-def test_inactive_main_rejects_scheduled_selector_before_allocation(
+def test_inactive_main_rejects_only_inheriting_scheduled_admission(
     build: Callable[[str], _Wiring], state: str,
 ) -> None:
-    """Scheduled admission still requires Main (scheduled handling is task 8.x)."""
+    """Task 8.1: only an inheriting scheduled launch needs Main; it fails before allocation,
+    while an explicit selector is pinned exactly with no Main."""
     wiring = build(state)
     before = wiring.settings_path.read_bytes()
     with pytest.raises(ModelRegistryError) as caught:
-        wiring.factory()(model=MODEL_B.id, runtime_profile=_SCHEDULED)
+        wiring.factory()(model=None, runtime_profile=_SCHEDULED)
     assert caught.value.code == "no_active_selection"
     assert wiring.admissions() == 1 and wiring.pins == []
     assert wiring.resolver.call_count == wiring.create.call_count == 0
     assert wiring.embeddings == [] and wiring.runners == []
+
+    runner = wiring.factory()(model=MODEL_B.id, runtime_profile=_SCHEDULED)
+
+    assert wiring.admissions() == 2 and [pin.model.id for pin in wiring.pins] == [MODEL_B.id]
+    assert wiring.resolver.call_count == 1 and runner.model_id == MODEL_B.id
     assert wiring.registry.view().active_model_id is None
     assert wiring.settings_path.read_bytes() == before
 

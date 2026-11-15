@@ -1,4 +1,4 @@
-"""Context-window consumption profiling for the ``context_profile`` built-in tool.
+"""Estimated-input context profiling for the ``context_profile`` built-in tool.
 
 This module exposes ``exec_context_profile``, which reads the most recently
 published :class:`~context_monitor.ContextSnapshot` and returns a JSON-serializable
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 def exec_context_profile(context_monitor: Optional["ContextMonitor"]) -> "dict[str, Any]":
-    """Return a JSON snapshot of context-window consumption from the monitor.
+    """Return a JSON snapshot of estimated input tokens from the monitor.
 
     Reads the most recently published :class:`~context_monitor.ContextSnapshot`
     from *context_monitor* and returns a result dict suitable for the LLM tool
@@ -34,7 +34,7 @@ def exec_context_profile(context_monitor: Optional["ContextMonitor"]) -> "dict[s
         "system_prompt_tokens": snapshot.system_prompt_tokens,
         "chat_history_tokens": snapshot.chat_history_tokens,
         "tool_defs_tokens": snapshot.tool_defs_tokens,
-        "tool_defs_by_server": snapshot.tool_defs_by_server,
+        "tool_defs_by_server": dict(snapshot.tool_defs_by_server),  # copy: callers must not mutate the published snapshot
         "compaction_threshold": snapshot.compaction_threshold,
         "model_id": snapshot.model_id,
         "is_live": snapshot.is_live,

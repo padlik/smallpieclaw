@@ -539,13 +539,16 @@ class TestRootStartupComposition:
             for profile, selector in (
                 (RuntimeProfile.ON_DEMAND_SUBAGENT, None),
                 (RuntimeProfile.PLAN_STEP_AGENT, None),  # implicit; explicit needs no Main (task 4.1)
-                (RuntimeProfile.SCHEDULED_AGENT, OTHER_ID),
+                (RuntimeProfile.SCHEDULED_AGENT, None),  # inheriting; explicit needs no Main (task 8.1)
             ):
                 with pytest.raises(ModelRegistryError) as info:
                     root.builtin._sub_agent_factory(model=selector, runtime_profile=profile)
                 codes.append(info.value.code)
             outcome["codes"] = codes
-            outcome["creates"] = creates
+            outcome["creates"] = list(creates)
+            # A saved explicit scheduled selector is pinned exactly with no Main.
+            root.builtin._sub_agent_factory(model=OTHER_ID, runtime_profile=RuntimeProfile.SCHEDULED_AGENT)
+            outcome["explicit_scheduled_creates"] = creates[len(outcome["creates"]):]
 
         root_harness.start(saved_default=saved_default, hold=hold)
         root = root_harness
@@ -562,6 +565,9 @@ class TestRootStartupComposition:
         assert boundary.calls == []
         assert outcome["codes"] == ["no_active_selection"] * 3
         assert outcome["creates"] == []
+        ((create_args, _create_kwargs),) = outcome["explicit_scheduled_creates"]
+        assert create_args[0] is RuntimeProfile.SCHEDULED_AGENT
+        assert create_args[1].run_model.model.id == OTHER_ID
         assert root.llm_clients == [] and root.main_controller.llm is None
         view = root.registry.view()
         assert view.active_model_id is None

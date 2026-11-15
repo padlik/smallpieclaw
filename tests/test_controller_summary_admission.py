@@ -369,8 +369,16 @@ def test_borrowed_client_without_factory_is_used_and_never_closed(world, op) -> 
     borrowed = world.borrowed(MODEL_B)
     controller = world.controller_with(llm=borrowed)
 
-    world.run(op)
-    assert world.hosts() == [HOST_B] and f"summary-{HOST_B}" in world.summary(op)
+    if op == "compress":
+        # Task 7.2: manual compression never borrows a client; it refuses. (No early
+        # return: the shared-client assertions below must execute on this path too.)
+        world.seed()
+        before = world.state()
+        msg = world.invoke(op)
+        assert msg.startswith("❌") and world.requests == [] and world.state() == before
+    else:
+        world.run(op)
+        assert world.hosts() == [HOST_B] and f"summary-{HOST_B}" in world.summary(op)
     assert controller.llm is borrowed
     assert borrowed.close_count == 0 and world.embedding.close_count == 0
     assert world.embedding.embed("probe") == [0.5]
@@ -383,6 +391,16 @@ def test_borrowed_client_without_factory_is_used_and_never_closed(world, op) -> 
 @pytest.mark.parametrize("op", OPS)
 def test_missing_every_client_falls_back_with_actionable_reason(world, caplog, op) -> None:
     world.controller_with()
+    if op == "compress":
+        # Task 7.2: admission failure is a reported failure with history unchanged.
+        world.seed()
+        before = world.state()
+        with caplog.at_level(logging.WARNING):
+            msg = world.invoke(op)
+        assert msg.startswith("❌") and "/models" in msg and "unchanged" in msg
+        assert "NoneType" not in msg and "AttributeError" not in msg
+        assert world.requests == [] and world.state() == before
+        return
     with caplog.at_level(logging.WARNING):
         msg = world.run(op)
     assert _fell_back(op, world.summary(op)) and world.requests == []
@@ -409,12 +427,24 @@ def test_expected_factory_failure_falls_back_never_to_borrowed_client(world, cap
     assert reason
     world.controller_with(llm=borrowed, run_client_factory=factory)
 
+    world.seed()
+    before = world.state()
     with caplog.at_level(logging.WARNING):
-        msg = world.run(op)
+        msg = world.invoke(op)
     assert len(factory.events) == 1
     assert world.requests == [] and borrowed.close_count == 0
-    assert _fell_back(op, world.summary(op))
-    _assert_reason_reported(op, msg, caplog, reason)
+    assert world.embedding.close_count == 0 and world.embedding.embed("probe") == [0.5]
+    if op == "compress":
+        # Task 7.2: admission failure reports the reason; history is unchanged.
+        # Controlled label only: a registry error keeps its whitelisted code, any
+        # other (untrusted) factory fault never has its text echoed.
+        expected = "no active selection" if kind == "unselected" else "model admission failed"
+        assert msg.startswith("❌") and expected in msg and "unchanged" in msg
+        assert kind == "unselected" or reason not in msg
+        assert world.state() == before
+    else:
+        assert _fell_back(op, world.summary(op))
+        _assert_reason_reported(op, msg, caplog, reason)
     world.assert_no_events_registered()
 
 
@@ -450,9 +480,18 @@ def test_owned_client_closed_exactly_once_on_success_and_chat_failure(world, cap
         msg = world.run(op)
     assert len(world.requests) == 1
     assert factory.clients[0].close_count == 1
-    assert _fell_back(op, world.summary(op)) is (chat_error is not None)
-    if chat_error is not None:
-        _assert_reason_reported(op, msg, caplog, "chat boom")
+    if op == "compress":
+        # Task 7.3: an ordinary chat failure is a reported, fixed-label failure; history
+        # is unchanged and no deterministic fallback or raw error text appears.
+        if chat_error is not None:
+            assert msg.startswith("❌") and "chat boom" not in msg and "chat boom" not in caplog.text
+            assert world.short_term.get_messages() == [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]
+        else:
+            assert msg.startswith("✅")
+    else:
+        assert _fell_back(op, world.summary(op)) is (chat_error is not None)
+        if chat_error is not None:
+            _assert_reason_reported(op, msg, caplog, "chat boom")
     assert world.embedding.close_count == 0
     world.assert_no_events_registered()
 
@@ -521,7 +560,10 @@ def test_controller_owned_event_is_registered_for_factory_and_cancel_skips_chat(
     assert seen == {"registered": True, "fresh": True, "reached": True}
     assert event is not controller._cancel_event and client._cancel_event is event
     assert world.requests == [] and client.close_count == 1
-    assert _fell_back(op, world.summary(op))
+    if op == "compress":  # Task 7.3: cancelled manual summary keeps history, no fallback
+        assert world.short_term.get_messages() == [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]
+    else:
+        assert _fell_back(op, world.summary(op))
     world.assert_no_events_registered()
 
 
@@ -545,8 +587,11 @@ def test_cancel_during_chat_reaches_owned_client_event_but_in_flight_summary_suc
 
     assert seen == {"registered": True, "client_bound": True, "delivered": True}
     assert len(world.requests) == 1 and len(factory.events) == 1
-    assert not _fell_back(op, world.summary(op))
-    assert f"summary-{HOST_A}" in world.summary(op)
+    if op == "compress":  # Task 7.3: cancel during the reply never publishes
+        assert world.short_term.get_messages() == [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]
+    else:
+        assert not _fell_back(op, world.summary(op))
+        assert f"summary-{HOST_A}" in world.summary(op)
     assert factory.clients[0].close_count == 1
     world.assert_no_events_registered()
 
@@ -577,7 +622,10 @@ def test_external_event_identity_and_state_are_preserved(world, op, preset) -> N
     assert factory.events == [external] and factory.clients[0]._cancel_event is external
     assert external.is_set() is preset and controller._cancel_registry is None
     assert (world.requests == []) is preset
-    assert _fell_back(op, world.summary(op)) is preset
+    if op == "compress":  # Task 7.3: a cancelled manual summary keeps history intact
+        assert (world.short_term.get_messages() == [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]) is preset
+    else:
+        assert _fell_back(op, world.summary(op)) is preset
     assert factory.clients[0].close_count == 1
 
 

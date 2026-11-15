@@ -335,13 +335,15 @@ class ModelRegistry:
         self._settings_error_code = None
 
     def select(self, canonical_id: str) -> CatalogView:
-        """Persist an inventory-backed selection before making it active."""
+        """Persist a deliberate selection before making it active.
+
+        Only the exact first-slash selector shape and a configured connection
+        are validated (``malformed_selector`` / ``unknown_connection``); the
+        cache is not a whitelist, so a candidate a later refresh removed still
+        selects and no provider is contacted.
+        """
         with self._lock:
-            model = self._models.get(canonical_id)
-            if model is None:
-                raise ModelRegistryError("model_not_found")
-            if model.provider_id not in self._connections:
-                raise ModelRegistryError("connection_changed")
+            parse_selector(canonical_id, self._connections)
             if self._preference is not None:
                 # Durable before published: a failed write leaves prior bytes
                 # and the prior active choice untouched.
@@ -413,39 +415,29 @@ class ModelRegistry:
         return self._pin(model, config, catalog_revision, selection_revision)
 
     def admit_scheduled(self, raw_selector: object = None) -> RunModel:
-        """Pin a scheduled run to its saved selector, inheriting Main otherwise.
+        """Pin a scheduled run to its saved selector exactly, or inherit Main.
 
-        Requires an active Main first. ``None`` inherits Main silently; a
-        blank, whitespace-only or non-string selector, or one that is malformed
-        or names an unconfigured connection, inherits Main with one bounded
-        warning. A well-formed selector on a configured connection is used
-        verbatim, cached or not, with no fallback. Credentials are resolved once
-        outside the lock and nothing is rechecked afterwards.
+        The saved value is inherited or exact, never substituted. ``None``
+        snapshots the active Main once and fails with ``no_active_selection``
+        when none exists. Any other value is routed exactly once and needs
+        neither an active Main nor a cached candidate: a blank, whitespace-only
+        or non-string value or any other malformed shape fails
+        ``malformed_selector``, and an absent or padded connection
+        ``unknown_connection``, before any credential resolution. A well-formed
+        selector on a configured connection is used verbatim (the upstream
+        id is never trimmed); a provider rejecting it is an ordinary run
+        failure. Credentials are resolved once outside the lock and nothing is
+        rechecked afterwards.
         """
-        warning: str | None = None
         with self._lock:
-            main_id = self._active_model_id
-            if main_id is None:
-                raise ModelRegistryError("no_active_selection")
-            target = main_id
-            if raw_selector is None:
-                pass
-            elif not isinstance(raw_selector, str) or not raw_selector.strip():
-                warning = f"Scheduled selector {bounded_selector_evidence(raw_selector)}; inheriting Main"
-            else:
-                try:
-                    self._route(raw_selector)
-                except ModelRegistryError:
-                    evidence = bounded_selector_evidence(raw_selector, redact=self._selector_redactor)
-                    warning = f"Scheduled selector unknown; inheriting Main: '{evidence}'"
-                else:
-                    target = raw_selector
+            target = raw_selector
+            if target is None:
+                target = self._active_model_id
+                if target is None:
+                    raise ModelRegistryError("no_active_selection")
             model, config = self._route(target)
             catalog_revision = self._document.revision
             selection_revision = self._selection_revision
-
-        if warning is not None:
-            logger.warning(warning, extra={"scheduled_selector_warning": True})
         return self._pin(model, config, catalog_revision, selection_revision)
 
     def _route(self, selector: object) -> tuple[ModelRecord, ProviderConfig]:

@@ -419,7 +419,7 @@ class TestMutationDuringReloadPreparation:
 
 
 # ---------------------------------------------------------------------------
-# The legacy JSON fingerprint is rechecked against the reload's own bytes
+# The legacy JSON is only existence-checked; changing it never fails a reload (8.4)
 # ---------------------------------------------------------------------------
 
 
@@ -453,23 +453,27 @@ _LEGACY_CHANGES = {
 }
 
 
-class TestLegacyFingerprintRace:
-    """A legacy JSON change during reload preparation fails the reload; nothing is adopted."""
+class TestLegacyChangeDuringReload:
+    """Task 8.4: the legacy JSON is never fingerprinted, so changing it never fails a reload.
+
+    The reload still publishes only the candidate it parsed from scheduler.toml; the state-home
+    file is only checked for existence when the candidate is published (notice set or cleared).
+    """
 
     @pytest.mark.parametrize("change", sorted(_LEGACY_CHANGES))
-    def test_reload_fails_and_keeps_last_good_view_and_legacy_file(
+    def test_reload_still_publishes_and_the_legacy_file_is_untouched(
         self,
         make_scheduler: MakeScheduler,
         monkeypatch: pytest.MonkeyPatch,
         change: str,
     ) -> None:
-        """Last-good map (incl. legacy view), document, hash, registrations, and file stay."""
+        """No reload-again failure; no legacy job published; exactly one candidate preparation."""
         initially_present, apply_change = _LEGACY_CHANGES[change]
         sched, toml_path, legacy_path = make_scheduler(
             _BASE_TOML, legacy=_LEGACY_JOBS if initially_present else None,
         )
-        assert ("legacyjob" in sched._jobs_meta) is initially_present
-        last_good = _snapshot(sched)
+        assert "legacyjob" not in sched._jobs_meta
+        generation_before = sched._config_generation
         toml_bytes = toml_path.read_bytes()
 
         def change_legacy() -> object:
@@ -482,15 +486,18 @@ class TestLegacyFingerprintRace:
         assert run["alive"] == []
         assert not run["expired"], "the held reload expired instead of being released"
         assert run["still_held"]
-        _assert_reload_again(run["reloaded"], toml_path)
-        assert _snapshot(sched) == last_good
+        assert "error" not in run["reloaded"], run["reloaded"]
+        assert run["reloaded"]["result"] == {"reloaded": 1, "failed": 0}
+        assert sched._config_generation == generation_before + 1
+        assert "legacyjob" not in sched._jobs_meta
         assert toml_path.read_bytes() == toml_bytes
+        assert run["driver_calls"] == 1, "reload re-prepared its candidate"
         if legacy_after is None:
             assert not legacy_path.exists()
+            assert sched.load_notice() is None
         else:
             assert legacy_path.read_bytes() == legacy_after
-        expected_calls = 2 if initially_present else 1  # one per prepared cron job
-        assert run["driver_calls"] == expected_calls, "reload re-prepared its candidate"
+            assert str(legacy_path) in (sched.load_notice() or "")
 
 
 # ---------------------------------------------------------------------------

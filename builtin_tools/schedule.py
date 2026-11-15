@@ -75,6 +75,12 @@ def _coerce_context_max_messages(value: object, action: str) -> int:
     return parsed
 
 
+def _blocks(scheduler: object, tag: str) -> bool:
+    """Whether the job's config error leaves it unscheduled (unknown schedulers: assume it does)."""
+    check = getattr(scheduler, "config_blocks_schedule", None)
+    return bool(check(tag)) if callable(check) else True
+
+
 def _file_notice(scheduler) -> str:
     """Return the scheduler's file-failure notice, or "" when there is none."""
     accessor = getattr(scheduler, "load_notice", None)
@@ -164,7 +170,8 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             task_label = "Message" if stype == "once" else "Task"
             err = f"\n   ⚠️ last error: {j['last_error'][:120]}" if j.get("last_error") else ""
             if j.get("config_error"):
-                err += f"\n   ⚠️ config_error (not scheduled): {j['config_error']}"
+                note = "not scheduled" if _blocks(scheduler, j["tag"]) else "launches fail until fixed"
+                err += f"\n   ⚠️ config_error ({note}): {j['config_error']}"
             lines.append(
                 f"{status} {j['tag']} ({j['schedule']})\n"
                 f"   {task_label}: {j['task']}\n"
@@ -211,8 +218,22 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             f"created_at: {job['created_at'] or 'unknown'}",
         ])
         if job.get("config_error"):
-            lines.append(f"config_error: {job['config_error']} (not scheduled; fix the job, then reload)")
+            note = "not scheduled; fix the job, then reload" if _blocks(scheduler, job["tag"]) else "scheduled, but every launch fails until fixed; then reload"
+            lines.append(f"config_error: {job['config_error']} ({note})")
         return with_execution({"success": True, "output": "\n".join(lines), "error": "", "exit_code": 0}, "executed")
+
+    if action in ("add", "modify"):
+        # Obsolete scheduling/fallback input is known-bad: refuse by PRESENCE before any coercion,
+        # validation of other fields or the attempt hook, changing nothing.
+        from scheduler import obsolete_mutation_error  # lazy: scheduler imports this package
+
+        obsolete = obsolete_mutation_error(args)
+        if obsolete is not None:
+            return with_execution({
+                "success": False, "output": "", "error": obsolete.replace("schedule:", f"schedule {action}:", 1),
+                "exit_code": -1, "error_type": "validation_error", "recoverable": True,
+                "suggestion": "Use cron (or schedule_type 'once' with run_at); remove obsolete fields.",
+            }, "refused")
 
     if action == "add":
         if not tag:
@@ -285,9 +306,6 @@ def exec_schedule(scheduler, args: dict, caller_depth: int = 0) -> dict:
             schedule_type=str(args.get("schedule_type", args.get("schedule", "cron"))),
             task=str(args.get("task", "")),
             notify=notify,
-            hours=int(args["hours"]) if args.get("hours") is not None else None,
-            minutes=int(args["minutes"]) if args.get("minutes") is not None else None,
-            time_str=str(args.get("time", "")) or None,
             run_at=str(args.get("run_at", "")) or None,
             cron=str(args.get("cron", "")) or None,
             model=args.get("model"),

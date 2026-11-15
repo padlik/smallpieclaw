@@ -322,8 +322,8 @@ def test_saved_state_migrates_jobs_only_history(tmp_path: Path, isolated_schedul
         sched.stop()
 
 
-def test_saved_state_projects_legacy_job(tmp_path: Path, isolated_schedule: None) -> None:
-    """A legacy JSON job is saved as the plain projection, without origin markers."""
+def test_saved_state_never_projects_a_legacy_file_job(tmp_path: Path, isolated_schedule: None) -> None:
+    """Task 8.4: a legacy JSON job is never loaded, so the saved state projects only TOML jobs."""
     legacy = {"legacyjob": {
         "schedule_type": "cron",
         "cron": "0 4 1 1 *",
@@ -344,21 +344,12 @@ def test_saved_state_projects_legacy_job(tmp_path: Path, isolated_schedule: None
     sched, paths, _ = _construct(tmp_path, _ALPHA_TOML)
     try:
         state = _read_state_strict(paths.scheduler_state)
-        assert state["jobs"]["legacyjob"] == {
-            "enabled": True,
-            "schedule_type": "cron",
-            "cron": "0 4 1 1 *",
-            "run_at": None,
-            "last_run": None,
-            "last_error": None,
-            "schedule_description": "cron: 0 4 1 1 *",
-        }
+        assert "legacyjob" not in state["jobs"] and "alpha" in state["jobs"]
         assert _SECRET not in paths.scheduler_state.read_text()
         assert "legacy, read-only" not in paths.scheduler_state.read_text()
 
         assert legacy_path.read_bytes() == legacy_bytes
-        listed = {job["tag"]: job for job in sched.list_jobs()}
-        assert listed["legacyjob"]["schedule"].endswith("(legacy, read-only)")
+        assert "legacyjob" not in {job["tag"] for job in sched.list_jobs()}
     finally:
         sched.stop()
 

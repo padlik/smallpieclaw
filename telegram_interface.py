@@ -700,7 +700,7 @@ class TelegramInterface:
             BotCommand("myid", "Show your Telegram user ID"),
             BotCommand("mcp", "List and manage MCP servers"),
             BotCommand("show_ctx", "Show current system prompt snapshot"),
-            BotCommand("context", "Show context window consumption profile"),
+            BotCommand("context", "Show estimated input tokens and compaction threshold"),
             BotCommand("show_env", "Show runtime environment info"),
             BotCommand("stop", "Cancel the currently running task"),
             BotCommand("resume", "Resume an interrupted run from a saved checkpoint"),

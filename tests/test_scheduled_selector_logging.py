@@ -34,7 +34,7 @@ import structlog
 import agent_logging
 from builtin_tools.text_utils import redact_vault_secrets
 from config_schema import ProviderConfig, ResolvedProviderConnection
-from model_registry import CatalogDocument, ModelRecord, ModelRegistry, ProviderState
+from model_registry import CatalogDocument, ModelRecord, ModelRegistry, ModelRegistryError, ProviderState
 from model_settings import ModelSettings
 
 _MAX_MSG = 256
@@ -253,18 +253,6 @@ def _rendered(sinks: _Sinks) -> tuple[list[str], list[str]]:
     return sinks.json_stream.getvalue().splitlines(), sinks.prose_stream.getvalue().splitlines()
 
 
-def _registry_msg(sinks: _Sinks) -> str:
-    """Return the one registry warning message, identical in both sinks."""
-    json_lines, prose_lines = _rendered(sinks)
-    assert len(json_lines) == 1 and len(prose_lines) == 1, (json_lines, prose_lines)
-    record = json.loads(json_lines[0])
-    assert record["logger"] == _REGISTRY_LOGGER
-    marker = f"[WARNING] {_REGISTRY_LOGGER}: "
-    assert marker in prose_lines[0], prose_lines[0]
-    assert prose_lines[0].split(marker, 1)[1] == record["msg"]
-    return record["msg"]
-
-
 @dataclass
 class _Registry:
     """A real registry seeded with an active Main ``p/main`` plus its probes."""
@@ -304,24 +292,6 @@ def _seeded_registry(
     return _Registry(registry, settings.path, resolved, rendered_at_resolve)
 
 
-def _assert_one_warning_before_resolve(seeded: _Registry) -> None:
-    """Exactly one Main resolution, entered after one warning in each sink."""
-    assert seeded.resolved == [_PROVIDER]
-    json_lines, prose_lines = seeded.rendered_at_resolve[0]
-    assert len(json_lines) == 1 and len(prose_lines) == 1
-
-
-def test_registry_unknown_short_selector_warns_before_resolve(tmp_path: Path, sinks: _Sinks) -> None:
-    """A benign unconfigured-connection selector inherits Main; warning renders first."""
-    seeded = _seeded_registry(tmp_path, sinks)
-    with _route_registry_logger(sinks):
-        run = seeded.registry.admit_scheduled("ghost/not-known")
-
-    assert run.model.id == "p/main"
-    _assert_one_warning_before_resolve(seeded)
-    assert _registry_msg(sinks) == _KIND + repr("ghost/not-known")
-
-
 class _EmissionObserver(logging.Filter):
     """Delegating pre-handler observer: snapshots each record and never drops one."""
 
@@ -342,59 +312,68 @@ _REGISTRY_REDACTOR = functools.partial(
 )
 
 
-@pytest.mark.parametrize(
-    ("head", "secret"),
-    [
-        pytest.param("provider/" + "b" * 141, _SPANNING_SECRET, id="secret-spans-cutoff"),
-        pytest.param("", _HUGE_SECRET, id="secret-longer-than-bound"),
-    ],
-)
-def test_registry_unknown_secret_selector_redacted_and_bounded(
-    tmp_path: Path, sinks: _Sinks, head: str, secret: str
+def _assert_no_warning_and_no_work(
+    seeded: _Registry, sinks: _Sinks, observer: _EmissionObserver, view_before: object,
+    settings_before: bytes,
 ) -> None:
-    """The real warning carries redacted-then-bounded quoted evidence when emitted,
-    and both sinks stay bounded and secret-free."""
-    seeded = _seeded_registry(tmp_path, sinks, redactor=_REGISTRY_REDACTOR)
-    selector = head + secret + "-public-suffix" * 200
-    original_selector = "".join([head, secret, "-public-suffix" * 200])
-    view_before = seeded.registry.view()
-    settings_before = seeded.settings_path.read_bytes()
+    """Task 8.1: the typed failure emitted no record, resolved nothing and wrote nothing."""
+    assert observer.records == []
+    assert sinks.json_stream.getvalue() == "" and sinks.prose_stream.getvalue() == ""
+    assert seeded.resolved == [] and seeded.rendered_at_resolve == []
+    assert seeded.registry.view() == view_before
+    assert seeded.settings_path.read_bytes() == settings_before
+
+
+def _admit_expecting_failure(
+    seeded: _Registry, sinks: _Sinks, selector: object, code: str,
+) -> _EmissionObserver:
+    """Admit ``selector`` through the routed registry logger; assert its typed code."""
     observer = _EmissionObserver()
     with _route_registry_logger(sinks):
         registry_logger = logging.getLogger(_REGISTRY_LOGGER)
         registry_logger.addFilter(observer)
         try:
-            run = seeded.registry.admit_scheduled(selector)
+            with pytest.raises(ModelRegistryError) as caught:
+                seeded.registry.admit_scheduled(selector)
         finally:
             registry_logger.removeFilter(observer)
+    assert caught.value.code == code
+    return observer
 
-    # The emitted record itself is safe before any handler or sink processor runs.
-    ((emitted_msg, emitted_args, emitted_text),) = observer.records
-    assert emitted_args == ()
-    assert isinstance(emitted_msg, str) and emitted_text == emitted_msg
-    assert emitted_msg.startswith(_KIND + "'" + head) and emitted_msg.endswith("'")
-    assert len(emitted_msg) <= len(_KIND) + 2 + _MAX_MSG
-    assert _PLACEHOLDER in emitted_msg
-    for fragment in (secret, secret[:16], secret[:8]):
-        assert fragment not in emitted_msg
 
-    assert run.model.id == "p/main"
-    _assert_one_warning_before_resolve(seeded)
-    msg = _registry_msg(sinks)
-    assert len(msg) <= _MAX_MSG
-    assert msg.startswith(_KIND + "'" + head)
-    assert _PLACEHOLDER in msg
-    json_text, prose_text = sinks.json_stream.getvalue(), sinks.prose_stream.getvalue()
-    for fragment in (secret, secret[:16], secret[:8]):
-        assert fragment not in json_text
-        assert fragment not in prose_text
-    assert selector == original_selector
-    assert seeded.registry.view() == view_before
-    assert seeded.settings_path.read_bytes() == settings_before
+def test_registry_unknown_short_selector_fails_typed_without_warning(tmp_path: Path, sinks: _Sinks) -> None:
+    """An unconfigured-connection selector no longer warns and inherits Main."""
+    seeded = _seeded_registry(tmp_path, sinks)
+    view_before, settings_before = seeded.registry.view(), seeded.settings_path.read_bytes()
+
+    observer = _admit_expecting_failure(seeded, sinks, "ghost/not-known", "unknown_connection")
+
+    _assert_no_warning_and_no_work(seeded, sinks, observer, view_before, settings_before)
+
+
+@pytest.mark.parametrize(
+    ("head", "secret", "code"),
+    [
+        pytest.param("provider/" + "b" * 141, _SPANNING_SECRET, "unknown_connection", id="secret-spans-cutoff"),
+        pytest.param("", _HUGE_SECRET, "malformed_selector", id="secret-longer-than-bound"),
+    ],
+)
+def test_registry_secret_selector_failure_never_leaks_it(
+    tmp_path: Path, sinks: _Sinks, head: str, secret: str, code: str
+) -> None:
+    """The typed error and both sinks carry no part of a secret-bearing selector
+    (the bounded redacted evidence lives in the scheduler's record and alert)."""
+    seeded = _seeded_registry(tmp_path, sinks, redactor=_REGISTRY_REDACTOR)
+    selector = head + secret + "-public-suffix" * 200
+    view_before, settings_before = seeded.registry.view(), seeded.settings_path.read_bytes()
+
+    observer = _admit_expecting_failure(seeded, sinks, selector, code)
+
+    _assert_no_warning_and_no_work(seeded, sinks, observer, view_before, settings_before)
 
 
 def test_registry_malformed_selector_never_stringified(tmp_path: Path, sinks: _Sinks) -> None:
-    """A non-string selector inherits Main with a fixed label, unformatted."""
+    """A non-string selector fails typed and is never stringified or logged."""
 
     class _Poison:
         """Non-string selector whose stringification must never happen."""
@@ -413,19 +392,12 @@ def test_registry_malformed_selector_never_stringified(tmp_path: Path, sinks: _S
 
     poison = _Poison()
     seeded = _seeded_registry(tmp_path, sinks)
-    with _route_registry_logger(sinks):
-        run = seeded.registry.admit_scheduled(poison)
+    view_before, settings_before = seeded.registry.view(), seeded.settings_path.read_bytes()
 
-    assert run.model.id == "p/main"
-    _assert_one_warning_before_resolve(seeded)
-    msg = _registry_msg(sinks)
-    assert msg.startswith("Scheduled selector malformed")
-    assert len(msg) <= _MAX_MSG
-    assert poison.calls == 0
-    assert poison.fake_secret == _SPANNING_SECRET
-    for fragment in (_SPANNING_SECRET, _SPANNING_SECRET[:16], _SPANNING_SECRET[:8], "_Poison"):
-        assert fragment not in sinks.json_stream.getvalue()
-        assert fragment not in sinks.prose_stream.getvalue()
+    observer = _admit_expecting_failure(seeded, sinks, poison, "malformed_selector")
+
+    _assert_no_warning_and_no_work(seeded, sinks, observer, view_before, settings_before)
+    assert poison.calls == 0 and poison.fake_secret == _SPANNING_SECRET
 
 
 # ---------------------------------------------------------------------------
@@ -436,24 +408,17 @@ _MALFORMED_LABEL = "malformed (not a string)"
 _BLANK_LABEL = "blank"
 
 
-def test_registry_blank_selector_warns_with_verbatim_label(tmp_path: Path, sinks: _Sinks) -> None:
-    """Consolidation keeps the blank WARN message exactly."""
-    seeded = _seeded_registry(tmp_path, sinks)
-    with _route_registry_logger(sinks):
-        seeded.registry.admit_scheduled(" \t ")
-
-    assert _registry_msg(sinks) == "Scheduled selector blank; inheriting Main"
-
-
-def test_registry_non_string_selector_warns_with_verbatim_label(
-    tmp_path: Path, sinks: _Sinks
+@pytest.mark.parametrize("selector", [" \t ", 123], ids=["blank", "non-string"])
+def test_registry_blank_and_non_string_selectors_fail_typed_without_warning(
+    tmp_path: Path, sinks: _Sinks, selector: object
 ) -> None:
-    """Consolidation keeps the malformed WARN message exactly."""
+    """Blank and non-string selectors no longer warn-and-inherit; the labels live in evidence."""
     seeded = _seeded_registry(tmp_path, sinks)
-    with _route_registry_logger(sinks):
-        seeded.registry.admit_scheduled(123)
+    view_before, settings_before = seeded.registry.view(), seeded.settings_path.read_bytes()
 
-    assert _registry_msg(sinks) == "Scheduled selector malformed (not a string); inheriting Main"
+    observer = _admit_expecting_failure(seeded, sinks, selector, "malformed_selector")
+
+    _assert_no_warning_and_no_work(seeded, sinks, observer, view_before, settings_before)
 
 
 def _evidence(raw: object, **kwargs: Any) -> str:

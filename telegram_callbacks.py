@@ -253,9 +253,10 @@ async def cb_model_select(iface: "TelegramInterface", update: Update, ctx: Conte
 
     The registry write completes before any acknowledgment or success edit,
     so the user is never told about a selection that was not durably saved.
-    Every rejection (missing catalog/cache, unknown, expired or foreign
-    token, removed model, changed connection) asks the user to reopen
-    `/models`; no error detail is ever echoed or logged.
+    Every rejection (missing registry, unknown, expired or foreign token,
+    malformed selector, unconfigured connection) asks the user to reopen
+    `/models`; no error detail is ever echoed or logged. Cache membership is
+    never checked: a candidate removed by a later refresh still selects.
     """
     from model_registry import ModelRegistryError
 
@@ -278,7 +279,7 @@ async def cb_model_select(iface: "TelegramInterface", update: Update, ctx: Conte
         except ModelRegistryError as exc:
             if exc.code == "persistence_failed":
                 text = _MODELS_SAVE_FAILED_TEXT
-            elif exc.code in ("model_not_found", "connection_changed"):
+            elif exc.code in ("malformed_selector", "unknown_connection", "model_not_found", "connection_changed"):
                 text = _MODELS_REOPEN_TEXT
             else:
                 logger.warning("model selection was rejected by the registry")

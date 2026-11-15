@@ -1166,8 +1166,9 @@ def test_mutation_on_dormant_keeps_unrelated_registration_identity(
 #
 # Relocated by task 2.4 from tests/test_scheduler_legacy_readonly.py (ledger
 # provenance in openspec/changes/simplify-model-runtime/test-preservation-ledger).
-# Deferred rewrite (task 8.4, ledger 451-455/458): keep the atomic TOML change
-# and legacy byte preservation; the legacy shadow preflight goes away.
+# Task 8.4 (ledger 451-455/458): the atomic TOML change and legacy byte
+# preservation are kept; the legacy shadow preflight is gone (the legacy file
+# is never read, so it can neither shadow nor refuse a TOML job change).
 # ---------------------------------------------------------------------------
 
 
@@ -1187,7 +1188,7 @@ _REMOVAL_ALLOWED = {
 
 
 class TestTomlRemovalShadowPreflight:
-    """The removal preflight reads the legacy file on disk, never the cached map."""
+    """A removal never consults the legacy file: a missing or unrelated one changes nothing."""
 
     @pytest.mark.parametrize("case", sorted(_REMOVAL_ALLOWED))
     def test_removal_proceeds_without_current_shadow(

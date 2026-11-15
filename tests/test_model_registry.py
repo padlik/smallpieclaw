@@ -199,9 +199,7 @@ def test_missing_settings_do_not_infer_selection_and_explicit_admission_needs_no
     with pytest.raises(ModelRegistryError) as error:
         registry.admit()
     assert error.value.code == "no_active_selection"  # only an implicit request needs Main
-    with pytest.raises(ModelRegistryError) as error:
-        registry.select("p/explicit")
-    assert error.value.code == "model_not_found"  # a deliberate Main selection still comes from candidates
+    assert registry.select("p/explicit").active_model_id == "p/explicit"  # the cache is not a whitelist (task 9.3)
 
 
 @pytest.mark.parametrize(
@@ -224,7 +222,7 @@ def test_ordinary_selection_and_admission_use_exact_canonical_ids_only(
 
     with pytest.raises(ModelRegistryError) as error:
         registry.select(selector)
-    assert error.value.code == "model_not_found"
+    assert error.value.code == admit_code  # selection and admission share the exact first-slash parse
     with pytest.raises(ModelRegistryError) as error:
         registry.admit(selector)
     assert error.value.code == admit_code
@@ -664,46 +662,36 @@ def test_discovery_and_resolved_credentials_never_appear_in_public_views_or_erro
 
 
 @pytest.mark.parametrize(
-    ("raw_selector", "expected_id", "expected_warnings", "stale_explicit_provider"),
+    ("raw_selector", "expected_id", "stale_explicit_provider"),
     [
-        pytest.param(None, "p/main", 0, False, id="none-uses-main"),
-        pytest.param("", "p/main", 1, False, id="blank"),
-        pytest.param(" \t ", "p/main", 1, False, id="whitespace"),
-        pytest.param(False, "p/main", 1, False, id="bool"),
-        pytest.param(0, "p/main", 1, False, id="int"),
-        pytest.param(1.25, "p/main", 1, False, id="float"),
-        pytest.param(["fake-content"], "p/main", 1, False, id="list"),
-        pytest.param({"k": "fake-content"}, "p/main", 1, False, id="dict"),
-        pytest.param(datetime(2026, 10, 1, 12, 0), "p/main", 1, False, id="datetime"),
-        pytest.param("ghost/not-known", "p/main", 1, False, id="unknown-connection"),
-        pytest.param("p/not-known", "p/not-known", 0, False, id="uncached-exact"),
-        pytest.param(" q/explicit ", "p/main", 1, False, id="padded-known"),
-        pytest.param("Q/explicit", "p/main", 1, False, id="case-variant-known"),
-        pytest.param("q/explicit", "q/explicit", 0, False, id="known-fresh"),
-        pytest.param("q/explicit", "q/explicit", 0, True, id="known-stale-provider"),
+        pytest.param(None, "p/main", False, id="none-uses-main"),
+        pytest.param("p/not-known", "p/not-known", False, id="uncached-exact"),
+        pytest.param("p/ not-known ", "p/ not-known ", False, id="upstream-whitespace-verbatim"),
+        pytest.param("p/ ", "p/ ", False, id="blank-upstream-is-routed"),
+        pytest.param("q/explicit", "q/explicit", False, id="known-fresh"),
+        pytest.param("q/explicit", "q/explicit", True, id="known-stale-provider"),
     ],
 )
-def test_scheduled_admission_pins_saved_selector_or_falls_back_to_main_with_one_resolution(
+def test_scheduled_admission_pins_saved_selector_exactly_or_inherits_main_with_one_resolution(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     raw_selector: object,
     expected_id: str,
-    expected_warnings: int,
     stale_explicit_provider: bool,
 ) -> None:
     main_model, explicit_model = model("main", "p"), model("explicit", "q")
-    uncached = ModelRecord("p/not-known", "p", "not-known", "not-known")
-    expected_model = {"p/main": main_model, "q/explicit": explicit_model, "p/not-known": uncached}[expected_id]
+    uncached = ModelRecord(expected_id, "p", expected_id[2:], expected_id[2:])
+    expected_model = {"p/main": main_model, "q/explicit": explicit_model}.get(expected_id, uncached)
     _, settings, discovery = make_registry(
         tmp_path,
         connections=(config("p"), config("q")),
         models=(main_model, explicit_model),
     )
     caplog.set_level(logging.WARNING, logger="model_registry")
-    observations: list[tuple[str, int]] = []
+    observations: list[str] = []
 
     def observing_resolver(provider: FakeProviderConfig) -> FakeResolvedConnection:
-        observations.append((provider.name, _registry_warning_count(caplog)))
+        observations.append(provider.name)
         return resolve(provider)
 
     registry = ModelRegistry(
@@ -722,7 +710,6 @@ def test_scheduled_admission_pins_saved_selector_or_falls_back_to_main_with_one_
     before_view = registry.view()
     settings_path = tmp_path / "models-config.toml"
     before_bytes = settings_path.read_bytes()
-    selector_copy = copy.deepcopy(raw_selector)
 
     pin = registry.admit_scheduled(raw_selector)
 
@@ -731,19 +718,65 @@ def test_scheduled_admission_pins_saved_selector_or_falls_back_to_main_with_one_
     assert pin.connection.provider_id == expected_model.provider_id
     assert pin.catalog_revision == before_view.revision
     assert pin.selection_revision == before_view.selection_revision
-    assert observations == [(expected_model.provider_id, expected_warnings)]
-    assert _registry_warning_count(caplog) == expected_warnings
+    assert observations == [expected_model.provider_id]
+    assert _registry_warning_count(caplog) == 0
     assert registry.view() == before_view
     assert settings_path.read_bytes() == before_bytes
-    assert type(raw_selector) is type(selector_copy)
-    assert raw_selector == selector_copy
-    if isinstance(selector_copy, (list, dict)):
-        assert [type(item) for item in raw_selector] == [type(item) for item in selector_copy]  # type: ignore[union-attr]
-        assert list(raw_selector) == list(selector_copy)  # type: ignore[call-overload]
-    if isinstance(selector_copy, dict):
-        assert [type(value) for value in raw_selector.values()] == [  # type: ignore[union-attr]
-            type(value) for value in selector_copy.values()
-        ]
+
+
+@pytest.mark.parametrize(
+    ("raw_selector", "code"),
+    [
+        pytest.param("", "malformed_selector", id="blank"),
+        pytest.param(" \t ", "malformed_selector", id="whitespace"),
+        pytest.param(False, "malformed_selector", id="bool"),
+        pytest.param(0, "malformed_selector", id="int"),
+        pytest.param(1.25, "malformed_selector", id="float"),
+        pytest.param(["fake-content"], "malformed_selector", id="list"),
+        pytest.param({"k": "fake-content"}, "malformed_selector", id="dict"),
+        pytest.param(datetime(2026, 10, 1, 12, 0), "malformed_selector", id="datetime"),
+        pytest.param("no-slash", "malformed_selector", id="no-slash"),
+        pytest.param("p/", "malformed_selector", id="empty-upstream"),
+        pytest.param("/m", "malformed_selector", id="empty-connection"),
+        pytest.param("ghost/not-known", "unknown_connection", id="unknown-connection"),
+        pytest.param(" q/explicit ", "unknown_connection", id="padded-connection"),
+        pytest.param("Q/explicit", "unknown_connection", id="case-variant-connection"),
+    ],
+)
+@pytest.mark.parametrize("main_state", ["active", "unselected"])
+def test_scheduled_admission_fails_invalid_selector_with_its_own_code_and_never_substitutes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, main_state: str, raw_selector: object, code: str
+) -> None:
+    main_model, explicit_model = model("main", "p"), model("explicit", "q")
+    _, settings, discovery = make_registry(
+        tmp_path, connections=(config("p"), config("q")), models=(main_model, explicit_model)
+    )
+    calls: list[str] = []
+
+    def counting_resolver(provider: FakeProviderConfig) -> FakeResolvedConnection:
+        calls.append(provider.name)
+        return resolve(provider)
+
+    registry = ModelRegistry({"p": config("p"), "q": config("q")}, settings, discovery, counting_resolver)
+    if main_state == "active":
+        registry.select(main_model.id)
+    caplog.set_level(logging.WARNING, logger="model_registry")
+    caplog.clear()
+    before_view = registry.view()
+    settings_path = tmp_path / "models-config.toml"
+    before_bytes = settings_path.read_bytes()
+    selector_copy = copy.deepcopy(raw_selector)
+
+    with pytest.raises(ModelRegistryError) as error:
+        registry.admit_scheduled(raw_selector)
+
+    assert error.value.code == code
+    assert "fake-content" not in str(error.value) and "not-known" not in str(error.value)
+    assert calls == [] and discovery.calls == []
+    assert _registry_warning_count(caplog) == 0
+    assert registry.view() == before_view
+    assert settings_path.read_bytes() == before_bytes
+    assert type(raw_selector) is type(selector_copy) and raw_selector == selector_copy
 
 
 def _registry_warning_count(caplog: pytest.LogCaptureFixture) -> int:
@@ -754,14 +787,9 @@ def _registry_warning_count(caplog: pytest.LogCaptureFixture) -> int:
     )
 
 
-@pytest.mark.parametrize(
-    "raw_selector",
-    [None, "q/explicit", {"k": "fake-content"}],
-    ids=["none", "known-explicit", "malformed-dict"],
-)
 @pytest.mark.parametrize("main_state", ["unselected", "remembered-missing"])
-def test_scheduled_admission_requires_active_main_before_classifying_or_resolving(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, main_state: str, raw_selector: object
+def test_scheduled_admission_inherits_only_an_active_main_and_explicit_needs_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, main_state: str
 ) -> None:
     main_model, explicit_model = model("main", "p"), model("explicit", "q")
     _, settings, discovery = make_registry(
@@ -787,22 +815,24 @@ def test_scheduled_admission_requires_active_main_before_classifying_or_resolvin
     before_view = registry.view()
     settings_path = tmp_path / "models-config.toml"
     before_bytes = settings_path.read_bytes()
-    selector_copy = copy.deepcopy(raw_selector)
 
     with pytest.raises(ModelRegistryError) as error:
-        registry.admit_scheduled(raw_selector)
+        registry.admit_scheduled(None)
 
     assert error.value.code == "no_active_selection"
-    assert calls == []
+    assert calls == [] and discovery.calls == []
+    assert _registry_warning_count(caplog) == 0
+
+    pin = registry.admit_scheduled("q/explicit")
+
+    assert pin.model.id == "q/explicit" and calls == ["q"]
     assert discovery.calls == []
     assert _registry_warning_count(caplog) == 0
     assert registry.view() == before_view
     assert settings_path.read_bytes() == before_bytes
-    assert type(raw_selector) is type(selector_copy)
-    assert raw_selector == selector_copy
 
 
-def test_scheduled_admission_without_saved_catalog_fails_closed_without_resolution(
+def test_scheduled_admission_without_saved_catalog_runs_explicit_and_fails_closed_for_inherited(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     settings_path = tmp_path / "models-config.toml"
@@ -821,12 +851,16 @@ def test_scheduled_admission_without_saved_catalog_fails_closed_without_resoluti
     before_view = registry.view()
 
     with pytest.raises(ModelRegistryError) as error:
-        registry.admit_scheduled("q/explicit")
+        registry.admit_scheduled()
 
     assert error.value.code == "no_active_selection"
+    assert calls == []
+
+    pin = registry.admit_scheduled("q/explicit")
+
+    assert pin.model.id == "q/explicit" and calls == ["q"]
     assert before_view.models == ()
     assert before_view.selection_status == "no_selection"
-    assert calls == []
     assert discovery.calls == []
     assert _registry_warning_count(caplog) == 0
     assert registry.view() == before_view
@@ -834,11 +868,11 @@ def test_scheduled_admission_without_saved_catalog_fails_closed_without_resoluti
 
 
 @pytest.mark.parametrize(
-    ("raw_selector", "failure", "expected_provider", "expected_warnings"),
+    ("raw_selector", "failure", "expected_provider"),
     [
-        pytest.param("q/explicit", "raises", "q", 0, id="known-explicit-resolver-raises"),
-        pytest.param({"k": "fake-content"}, "raises", "p", 1, id="malformed-main-resolver-raises"),
-        pytest.param("q/explicit", "wrong-endpoint", "q", 0, id="known-explicit-wrong-endpoint"),
+        pytest.param("q/explicit", "raises", "q", id="known-explicit-resolver-raises"),
+        pytest.param(None, "raises", "p", id="inherited-main-resolver-raises"),
+        pytest.param("q/explicit", "wrong-endpoint", "q", id="known-explicit-wrong-endpoint"),
     ],
 )
 def test_scheduled_admission_rejects_unusable_credential_resolution_without_fallback(
@@ -847,7 +881,6 @@ def test_scheduled_admission_rejects_unusable_credential_resolution_without_fall
     raw_selector: object,
     failure: str,
     expected_provider: str,
-    expected_warnings: int,
 ) -> None:
     main_model, explicit_model = model("main", "p"), model("explicit", "q")
     _, settings, discovery = make_registry(
@@ -856,10 +889,10 @@ def test_scheduled_admission_rejects_unusable_credential_resolution_without_fall
         models=(main_model, explicit_model),
     )
     caplog.set_level(logging.WARNING, logger="model_registry")
-    observations: list[tuple[str, int]] = []
+    observations: list[str] = []
 
     def failing_resolver(provider: FakeProviderConfig) -> FakeResolvedConnection:
-        observations.append((provider.name, _registry_warning_count(caplog)))
+        observations.append(provider.name)
         if failure == "raises":
             raise RuntimeError("PRIVATE_CREDENTIAL_SENTINEL fake-secret")
         return FakeResolvedConnection(provider.name, provider.type, "https://wrong.invalid")
@@ -875,8 +908,8 @@ def test_scheduled_admission_rejects_unusable_credential_resolution_without_fall
         registry.admit_scheduled(raw_selector)
 
     assert error.value.code == "credential_resolution_failed"
-    assert observations == [(expected_provider, expected_warnings)]
-    assert _registry_warning_count(caplog) == expected_warnings
+    assert observations == [expected_provider]
+    assert _registry_warning_count(caplog) == 0
     assert discovery.calls == []
     assert "PRIVATE_CREDENTIAL_SENTINEL" not in str(error.value)
     assert "fake-secret" not in str(error.value)
@@ -1823,8 +1856,9 @@ def test_failed_first_start_leaves_empty_state_that_a_deliberate_refresh_and_sel
     assert error.value.code == "no_active_selection"  # implicit use refuses; /models guides
     assert registry.admit("p/a").model.upstream_id == "a"  # explicit use needs neither Main nor cache
     with pytest.raises(ModelRegistryError) as error:
-        registry.select("p/a")
-    assert error.value.code == "model_not_found"
+        registry.select("p")
+    assert error.value.code == "malformed_selector"  # selection validates shape and connection, never the empty cache
+    assert registry.view().active_model_id is None and not selection.exists()
     state["up"] = True
     registry.refresh()  # the user's explicit /models
     assert registry.select("p/a").active_model_id == "p/a"

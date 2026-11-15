@@ -1089,7 +1089,7 @@ class TestModelSelectionCallback:
             "a revision bump that leaves the target model untouched must not invalidate its selection token"
         )
 
-    def test_select_callback_reports_reopen_when_target_removed_before_redemption(self, tmp_path: Path):
+    def test_select_callback_selects_target_removed_before_redemption(self, tmp_path: Path):
         cb_model_select = _get_cb_model_select()
         p = _provider_config("p")
         old = _model("old-model", "p", context_tokens=100, display_name="Old-Model")
@@ -1111,11 +1111,11 @@ class TestModelSelectionCallback:
         update, query = _make_callback_update(token)
         asyncio.run(cb_model_select(iface, update, MagicMock()))
 
-        assert registry.view().active_model_id == old.id, "the prior real selection must survive a rejected redemption"
-        assert settings_path.read_bytes() == before_bytes, "a rejected redemption must never write to disk"
+        assert registry.view().active_model_id == target.id, "the cache is not a whitelist: the captured selector still selects"
+        assert settings_path.read_bytes() != before_bytes, "the deliberate selection is persisted"
         query.edit_message_text.assert_awaited()
         text = query.edit_message_text.call_args.args[0]
-        assert "/models" in text, "the rejection must point the user back to a fresh /models"
+        assert "Switched to" in text and target.id in text
 
     @pytest.mark.parametrize("case", ["expired_at_ttl", "unknown_token", "evicted_by_cap", "cache_restarted"])
     def test_select_callback_rejects_stale_or_unknown_tokens(self, tmp_path: Path, case: str):

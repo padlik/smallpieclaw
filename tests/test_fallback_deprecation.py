@@ -6,10 +6,11 @@ drop" contracts are superseded:
 - ``agent.fallback_models`` in config.toml is rejected whenever the key is
   present (non-empty or empty) with a ``ConfigError`` naming the field; an
   absent key parses quietly.
-- A per-job ``fallback_models`` key in scheduler.toml loads and reloads
-  silently and stays raw in the document; when the job fires, one bounded
-  warning names the job and the key (never the value) and the spawn call
-  never carries the key or any model derived from it.
+- A per-job ``fallback_models`` key in scheduler.toml (task 8.3) loads and reloads
+  as a visible ``config_error`` with remove-the-key guidance (never the value),
+  stays raw in the document, and keeps the job scheduled; when the job fires it
+  is ONE recorded launch failure with the direct alert and no spawn at all (the
+  old "ignored with a warning" contract is superseded).
 
 Only external boundaries are substituted: the file system (``tmp_path``), the
 XDG environment, the ``schedule`` library's global scheduler, notify, agent,
@@ -164,48 +165,45 @@ def legacy_scheduler(
         sched.stop()
 
 
-def test_job_fallback_models_load_and_reload_are_silent(
+def test_job_fallback_models_load_and_reload_expose_a_removal_config_error(
     legacy_scheduler: tuple[Scheduler, Path, list[tuple[dict, object]]],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Load and reload log nothing, set no config_error, keep the raw value and file bytes."""
+    """Load and reload name the key and say remove it (no value, no secret), keep the raw value and bytes."""
     sched, toml_path, _spawns = legacy_scheduler
 
     result = sched.reload()
 
     assert "error" not in result, result
-    assert _fallback_records(caplog) == [], [r.getMessage() for r in caplog.records]
+    error = (sched.show_job(_TAG) or {}).get("config_error")
+    assert error and "fallback_models" in error and "remove" in error.lower()
+    assert _SECRET not in error and "provider/alt-model" not in error
     assert _SECRET not in caplog.text
-    assert (sched.show_job(_TAG) or {}).get("config_error") is None
     assert sched._load_result.document["jobs"][_TAG]["fallback_models"] == _FALLBACK_VALUE
     assert toml_path.read_text(encoding="utf-8") == _TOML
 
 
-def test_job_fallback_models_fire_warns_once_and_spawns_without_key(
+def test_job_fallback_models_fire_is_one_recorded_launch_failure_without_spawn(
     legacy_scheduler: tuple[Scheduler, Path, list[tuple[dict, object]]],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """One bounded secret-free warning; exactly one spawn with no fallback or alternate model."""
+    """One failed launch record and one direct alert; no spawn, no fallback or alternate model, no secret."""
     sched, toml_path, spawns = legacy_scheduler
     before = toml_path.read_bytes()
     caplog.clear()
 
     sched._run_job(_TAG)
 
-    warnings = [r for r in _fallback_records(caplog) if r.levelno >= logging.WARNING]
-    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
-    message = warnings[0].getMessage()
-    assert _TAG in message and "ignored" in message, message
     assert _SECRET not in caplog.text
     assert "provider/alt-model" not in caplog.text
+    (record,) = [r for r in sched.execution_log.read_recent() if r.get("tag") == _TAG]
+    assert (record["status"], record["success"]) == ("failed", False)
+    assert "fallback_models" in record["result"] and _SECRET not in json.dumps(record)
 
-    assert len(spawns) == 1, spawns
-    args, options = spawns[0]
-    assert args == {"task": "legacy task"}, "spawn args gained a fallback-derived field"
-    assert getattr(options, "fallback_models", _MISSING) is _MISSING
-    assert _SECRET not in repr(options)
+    assert spawns == [], "a launch failure must not spawn anything"
     sched.agent.assert_not_called()
-    assert [call.args[0] for call in sched.notify.call_args_list] == []
+    (alert,) = [call.args[0] for call in sched.notify.call_args_list]
+    assert _TAG in alert and "fallback_models" in alert and _SECRET not in alert
 
     assert toml_path.read_bytes() == before
     assert sched._load_result.document["jobs"][_TAG]["fallback_models"] == _FALLBACK_VALUE

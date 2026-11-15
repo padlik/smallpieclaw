@@ -17,6 +17,7 @@ import logging
 import json
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -31,7 +32,7 @@ from context_monitor import ContextMonitor
 from conversation_io import _load_or_create_conversation_id, _save_conversation
 from embedding_client import EmbeddingClient
 from exceptions import ConfigError
-from llm_client import LLMClient, LLMError
+from llm_client import LLMCancelledError, LLMClient, LLMEmptyResponseError, LLMError
 from model_registry import CatalogView, ModelRegistryError, RunModel
 from model_selection_guard import ConversationSelectionGuard, SelectionBudgetIdentity
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
@@ -42,6 +43,36 @@ from tool_index import ToolIndex
 from trace_context import child_trace_id
 
 logger = logging.getLogger(__name__)
+
+_SUMMARY_ADMISSION_REASONS = {
+    "no_factory": "no summary model can be admitted (no run-client factory is configured)",
+    "untrusted": "model admission failed",
+}
+# Fixed, content-free reasons for a failed manual summary call (never provider text).
+_MANUAL_FAILURE_REASONS = {
+    "cancelled": "the summary request was cancelled",
+    "failed": "the summary request failed; retry later",
+    "invalid": "the model returned no usable summary",
+}
+_REGISTRY_CODE = re.compile(r"[a-z][a-z_]{0,39}")
+
+
+class _SummaryAdmissionError(Exception):
+    """A required independently admitted summary client could not be obtained.
+
+    Carries only a controlled reason: the text is built from constants plus, for
+    ``kind="registry"``, an identifier-shaped ``ModelRegistryError.code`` (itself a
+    whitelisted, selector- and secret-free code). Arbitrary exception text can
+    never be stored, so neither the operator response nor the log can echo it.
+    """
+
+    def __init__(self, kind: str, code: str = "") -> None:
+        """Build the controlled reason for ``kind`` (``no_factory``/``registry``/``untrusted``)."""
+        if kind == "registry" and _REGISTRY_CODE.fullmatch(code):
+            self.reason = f"model admission failed ({code.replace('_', ' ')})"
+        else:
+            self.reason = _SUMMARY_ADMISSION_REASONS.get(kind, _SUMMARY_ADMISSION_REASONS["untrusted"])
+        super().__init__(self.reason)
 
 
 def _is_checkpoint_primitive(value: object) -> bool:
@@ -825,7 +856,9 @@ class AgentController:
             model_catalog_view=view,
         )
 
-    def _summarize(self, messages: list[dict]) -> tuple[str | None, str]:
+    def _summarize(
+        self, messages: list[dict], *, require_admission: bool = False,
+    ) -> tuple[str | None, str]:
         """Return ``(summary, "")`` or ``(None, reason)`` when no summary is available.
 
         Client selection: the injected ``run_client_factory`` (its chat client is
@@ -835,9 +868,16 @@ class AgentController:
         callback is never invoked because the summary sends messages directly.
         Only expected admission failures (ModelRegistryError/LLMError) and chat
         failures become a reason; other admission or cleanup errors propagate.
+
+        With ``require_admission`` (manual ``/compress``) the borrowed ``self.llm``
+        is never used and a missing factory or failed admission raises
+        :class:`_SummaryAdmissionError` instead of returning a reason, so the
+        caller can leave its history untouched.
         """
         factory = self._run_client_factory
         if factory is None:
+            if require_admission:
+                raise _SummaryAdmissionError("no_factory")
             if self.llm is None:
                 return None, "No chat model is available; select one with /models."
             return self._chat_summary(self.llm, messages)
@@ -849,13 +889,25 @@ class AgentController:
             try:
                 product = factory(gate)
             except (ModelRegistryError, LLMError) as exc:
+                if require_admission:
+                    # Untrusted factory text is never copied: registry errors keep
+                    # only their whitelisted code, anything else a fixed label.
+                    code = exc.code if isinstance(exc, ModelRegistryError) else ""
+                    kind = "registry" if code else "untrusted"
+                    raise _SummaryAdmissionError(kind, code) from None
                 return None, str(exc) or type(exc).__name__
             owned = product.client if isinstance(product, RunClientBinding) else product
             try:
                 if gate.is_set():
                     result: tuple[str | None, str] = (
-                        None, "Summary cancelled before the model call.",
+                        None,
+                        _MANUAL_FAILURE_REASONS["cancelled"] if require_admission
+                        else "Summary cancelled before the model call.",
                     )
+                elif require_admission:
+                    result = self._manual_chat_summary(owned, messages)
+                    if gate.is_set():  # cancelled while the reply was in flight
+                        result = (None, _MANUAL_FAILURE_REASONS["cancelled"])
                 else:
                     result = self._chat_summary(owned, messages)
             except BaseException:
@@ -880,6 +932,28 @@ class AgentController:
             return client.chat(messages), ""
         except Exception as exc:  # noqa: BLE001
             return None, str(exc) or type(exc).__name__
+
+    @staticmethod
+    def _manual_chat_summary(client: LLMClient, messages: list[dict]) -> tuple[str | None, str]:
+        """One manual summary call; returns ``(stripped_summary, "")`` or ``(None, reason)``.
+
+        Reasons are fixed labels (never provider text). Any ordinary ``Exception``
+        raised by ``client.chat`` (HTTP, SDK validation, decoding, ...) is a
+        reportable provider failure and is never formatted or chained; only
+        ``BaseException`` propagates (after the caller closes the owned client).
+        Only this client call is covered: validation and publication stay outside.
+        """
+        try:
+            raw = client.chat(messages)
+        except LLMCancelledError:
+            return None, _MANUAL_FAILURE_REASONS["cancelled"]
+        except LLMEmptyResponseError:
+            return None, _MANUAL_FAILURE_REASONS["invalid"]
+        except Exception:  # noqa: BLE001 - SDK boundary: never inspected, formatted or re-raised
+            return None, _MANUAL_FAILURE_REASONS["failed"]
+        if not isinstance(raw, str) or not raw.strip():
+            return None, _MANUAL_FAILURE_REASONS["invalid"]
+        return raw.strip(), ""
 
     def reset_task(self, save: bool = True) -> str:
         """Save (optionally) and clear the current working + short-term context."""
@@ -966,38 +1040,35 @@ class AgentController:
         history_text = "\n".join(
             f"[{m['role']}]: {_msg_text(m)[:600]}" for m in messages
         )
-        summary, reason = self._summarize([{
-            "role": "user",
-            "content": (
-                "Summarize this conversation history as concise bullet points. "
-                "Preserve key facts, decisions, tool names, outcomes, and any "
-                "unresolved items. Omit pleasantries and repetition:\n\n"
-                + history_text
-            ),
-        }])
+        try:
+            summary, reason = self._summarize(
+                [{
+                    "role": "user",
+                    "content": (
+                        "Summarize this conversation history as concise bullet points. "
+                        "Preserve key facts, decisions, tool names, outcomes, and any "
+                        "unresolved items. Omit pleasantries and repetition:\n\n"
+                        + history_text
+                    ),
+                }],
+                require_admission=True,
+            )
+        except _SummaryAdmissionError as exc:
+            # No summary client could be admitted: nothing was sent, so the
+            # history is left exactly as it was (no deterministic fallback).
+            logger.warning("compress_context: summary admission failed: %s", exc.reason)
+            return (
+                f"❌ Context not compressed: {exc.reason}. "
+                "Select a chat model with /models and retry. "
+                "Short-term history is unchanged."
+            )
         if summary is None:
-            # Deterministic fallback: the LLM summarization call failed, but a user
-            # invoking /compress (often because the context is over budget) still
-            # needs relief. Replace the buffer with a bounded head+tail slice of the
-            # history so the next run starts smaller, matching the robustness of
-            # context_manager.maybe_compact()'s _fallback_summary path.
-            from context_manager import _truncate_head_tail
-            logger.error(
-                "compress_context: LLM call failed, applying deterministic fallback: %s",
-                reason,
-            )
-            fallback = _truncate_head_tail(history_text, 3000, 1000)
-            self.short_term.clear()
-            self.short_term.add(
-                "assistant",
-                f"[Compressed context summary — deterministic fallback]\n{fallback}",
-            )
-            return self._compression_report(
-                before_tokens,
-                _estimate_tokens(fallback),
-                len(messages),
-                fallback=True,
-                reason=reason,
+            # Failed, cancelled, empty or invalid summary: nothing is published, no
+            # deterministic truncation, and automatic compaction is not touched.
+            logger.warning("compress_context: summary unavailable (%s); history unchanged", reason)
+            return (
+                f"❌ Context not compressed: {reason}. "
+                "Short-term history is unchanged; retry /compress later."
             )
 
         self.short_term.clear()
@@ -1007,7 +1078,6 @@ class AgentController:
             before_tokens,
             _estimate_tokens(summary),
             len(messages),
-            fallback=False,
         )
 
     def _compression_report(
@@ -1015,26 +1085,14 @@ class AgentController:
         before: int,
         after: int,
         n_messages: int,
-        *,
-        fallback: bool,
-        reason: str = "",
     ) -> str:
         """Build and log a human-readable compression report, then return it."""
         saved = max(0, before - after)
         pct = int(saved / before * 100) if before else 0
         logger.info(
-            "compress_context%s: %d → ~%d tokens (%d%% reduction, %d messages → 1)",
-            " (fallback)" if fallback else "",
+            "compress_context: %d → ~%d tokens (%d%% reduction, %d messages → 1)",
             before, after, pct, n_messages,
         )
-        if fallback:
-            return (
-                f"⚠️ LLM compression unavailable — applied deterministic truncation.\n"
-                f"  Messages: {n_messages} → 1\n"
-                f"  Tokens: ~{before:,} → ~{after:,} "
-                f"(−{saved:,}, {pct}% smaller)\n"
-                f"  Reason: {reason}"
-            )
         return (
             f"✅ Context compressed.\n"
             f"  Messages: {n_messages} → 1\n"

@@ -546,16 +546,19 @@ def test_raw_model_value_loads_without_config_error(
     assert _is_scheduled(env.sched, "bad")
 
 
-def test_legacy_job_fallback_models_loads_without_warning(
+def test_legacy_job_fallback_models_loads_as_a_visible_per_job_config_error(
     make_env: Callable[..., _Env], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A legacy per-job ``fallback_models`` key is retained silently at load."""
+    """A per-job ``fallback_models`` key (task 8.3) is a visible removal config_error naming no value;
+    the job stays scheduled, the healthy sibling loads, and the file is kept byte-for-byte."""
     toml_text = _with_bad_job(_CRON_BASE + 'task = "t"\nfallback_models = ["model-b"]\n')
     with caplog.at_level(logging.WARNING, logger="scheduler"):
         env = make_env(toml_text)
         env.sched.start()
-    assert _scheduler_warnings(caplog) == []
-    assert (env.sched.show_job("bad") or {}).get("config_error") is None
+    error = (env.sched.show_job("bad") or {}).get("config_error")
+    assert error and "fallback_models" in error and "remove" in error.lower() and "model-b" not in error
+    assert "model-b" not in caplog.text
+    assert "healthy" in _tags(env.sched)
     assert env.toml_path.read_text() == toml_text
 
 
@@ -633,11 +636,6 @@ def test_registration_failure_does_not_escape_start(make_env: Callable[..., _Env
 # Load never writes: legacy daily/interval derivation stays in memory
 # ---------------------------------------------------------------------------
 
-_LEGACY_SCHEDULES = [
-    pytest.param('schedule = "daily"\ntime = "03:30"\n', "30 3 * * *", id="daily"),
-    pytest.param('schedule = "interval"\nhours = 6\n', "0 */6 * * *", id="interval"),
-]
-
 _LEGACY_SCHEDULE_LINES = [
     pytest.param('schedule = "daily"\ntime = "03:30"\n', id="daily"),
     pytest.param('schedule = "interval"\nhours = 6\n', id="interval"),
@@ -675,13 +673,16 @@ def test_legacy_schedule_load_leaves_file_untouched(
     assert (env.toml_path.read_bytes(), _side_files(env.toml_path)) == (toml_text.encode(), [])
 
 
-@pytest.mark.parametrize(("schedule_lines", "cron"), _LEGACY_SCHEDULES)
-def test_legacy_schedule_load_derives_cron_in_memory(
-    make_env: Callable[..., _Env], schedule_lines: str, cron: str
+@pytest.mark.parametrize("schedule_lines", _LEGACY_SCHEDULE_LINES)
+def test_legacy_schedule_load_is_unscheduled_without_a_derived_cron(
+    make_env: Callable[..., _Env], schedule_lines: str
 ) -> None:
-    """The runtime view of a legacy schedule carries the derived cron; healthy still loads."""
+    """Task 8.3 (policy rewrite: the old derivation is retired): a legacy schedule is unscheduled with a
+    cron/once config_error and NO derived cron; the healthy sibling still loads."""
     env = make_env(_legacy_toml(schedule_lines))
-    assert (env.sched.show_job("legacy") or {}).get("cron") == cron
+    legacy = env.sched.show_job("legacy") or {}
+    assert legacy.get("cron") is None and legacy.get("next_run") is None
+    assert "cron" in legacy["config_error"] and "once" in legacy["config_error"]
     assert "healthy" in _tags(env.sched)
 
 
@@ -697,15 +698,16 @@ def test_reload_of_edited_legacy_schedule_leaves_file_untouched(
     assert (env.toml_path.read_bytes(), _side_files(env.toml_path)) == (edited.encode(), [])
 
 
-@pytest.mark.parametrize(("schedule_lines", "cron"), _LEGACY_SCHEDULES)
-def test_reload_of_edited_legacy_schedule_refreshes_runtime_view(
-    make_env: Callable[..., _Env], schedule_lines: str, cron: str
+@pytest.mark.parametrize("schedule_lines", _LEGACY_SCHEDULE_LINES)
+def test_reload_of_edited_legacy_schedule_shows_the_unscheduled_config_error(
+    make_env: Callable[..., _Env], schedule_lines: str
 ) -> None:
-    """After reloading the operator edit, the runtime view shows the derived cron."""
+    """After reloading the operator edit, the runtime view shows the unscheduled config_error, no cron."""
     env = make_env()
     env.toml_path.write_text(_legacy_toml(schedule_lines))
     env.sched.reload()
-    assert (env.sched.show_job("legacy") or {}).get("cron") == cron
+    legacy = env.sched.show_job("legacy") or {}
+    assert legacy.get("cron") is None and "cron" in legacy["config_error"]
 
 
 # Raw non-scheduling values the old runtime-only TOML writer cannot encode.
@@ -783,12 +785,13 @@ def test_malformed_legacy_job_field_keeps_legacy_file(
 
 
 @pytest.mark.parametrize("time_str", ["2:3", "02:3"])
-def test_legacy_daily_single_digit_minute_derives_cron(
+def test_legacy_daily_single_digit_minute_is_never_derived(
     make_env: Callable[..., _Env], time_str: str
 ) -> None:
-    """Legacy daily times with a one-digit minute stay accepted as by the baseline parser."""
+    """Task 8.3 (policy rewrite): even the once-accepted one-digit-minute daily times are never derived."""
     env = make_env(_TOML + f'\n[jobs.legacy]\nschedule = "daily"\ntime = "{time_str}"\ntask = "t"\n')
-    assert (env.sched.show_job("legacy") or {}).get("cron") == "3 2 * * *"
+    legacy = env.sched.show_job("legacy") or {}
+    assert legacy.get("cron") is None and "daily" in legacy["config_error"]
 
 
 # ---------------------------------------------------------------------------

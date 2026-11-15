@@ -8,7 +8,8 @@ they stand for, and resolves them back to a canonical id while enforcing
 TTL expiry and user/chat binding. It never touches the registry or disk.
 
 Owned by `TelegramInterface`, never by `ModelRegistry`: the registry's
-`select()` already revalidates inventory and persists before publishing: a
+`select()` already validates only the selector shape and configured
+connection (never cache membership) and persists before publishing: a
 selection token is purely a presentation-layer convenience for mapping an
 opaque callback back to the canonical id that produced it.
 """

@@ -33,6 +33,7 @@ production root: ``main._run`` → real ``Scheduler._run_job`` → root
 from __future__ import annotations
 
 import copy
+import html
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 import schedule
 
@@ -58,6 +60,7 @@ from sub_agent_registry import SOURCE_SCHEDULED
 from tests.root_startup_harness import (
     ACME_HOST,
     GEM_HOST,
+    INVALID_SAVED,
     UNCONFIGURED_ID,
     MAIN_ID,
     OTHER_ID,
@@ -66,6 +69,7 @@ from tests.root_startup_harness import (
     RootHarness,
     ScheduledRootProbe,
     run_scheduled_root,
+    scheduled_job_toml,
 )
 from xdg import XDGPaths
 
@@ -476,6 +480,7 @@ def _selector_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogReco
 
 def _assert_scheduled_root_run(
     root: RootHarness, probe: ScheduledRootProbe, *, raw: object, pin_id: str,
+    main_id: str | None = MAIN_ID,
 ) -> None:
     """One admission pinned ``pin_id`` and ran once through the actual root chain."""
     after = probe.after
@@ -503,7 +508,7 @@ def _assert_scheduled_root_run(
     assert os.path.exists(_context_path(key, root.builtin._data_dir))
 
     # Wire: one request to the pinned model's own endpoint with its own credential.
-    host, path, header, credential = _WIRE[pin_id]
+    host, path, header, credential = _WIRE[MAIN_ID if pin_id.startswith("acme/") else pin_id]
     (post,) = after.provider_posts
     assert after.provider_requests == after.provider_posts
     assert (post.url.host, post.url.path) == (host, path)
@@ -519,7 +524,7 @@ def _assert_scheduled_root_run(
     assert after.notices == []
 
     # Main, settings, revision and the raw scheduler document are unchanged.
-    assert after.view == probe.view_before and after.view.active_model_id == MAIN_ID
+    assert after.view == probe.view_before and after.view.active_model_id == main_id
     assert after.settings == probe.settings_before and after.toml == probe.toml_before
     meta = root.scheduler._jobs_meta[SCHEDULED_TAG]
     if raw is _ABSENT:
@@ -533,43 +538,138 @@ def _assert_scheduled_root_run(
     assert root.unexpected == [] and root.open_clients_at_exit == []
 
 
+_UPSTREAM_PADDED = "acme/ claude-pad "
 _ROOT_SELECTORS = [
-    pytest.param(None, _ABSENT, MAIN_ID, None, id="absent"),
-    pytest.param(f'"{OTHER_ID}"', OTHER_ID, OTHER_ID, None, id="known"),
-    # An unconfigured connection (task 4.1: a configured connection's uncached model is pinned
-    # exactly, not substituted; scheduled classification of these inputs is task 8.x).
-    pytest.param('"ghost/claude-zzz"', "ghost/claude-zzz", MAIN_ID, "ghost/claude-zzz", id="unknown"),
-    pytest.param(f'"{UNCONFIGURED_ID}"', UNCONFIGURED_ID, MAIN_ID, UNCONFIGURED_ID, id="obsolete"),
-    pytest.param(f'" {OTHER_ID} "', f" {OTHER_ID} ", MAIN_ID, f" {OTHER_ID} ", id="padded"),
-    pytest.param(f'"{OTHER_ID.upper()}"', OTHER_ID.upper(), MAIN_ID, OTHER_ID.upper(), id="case-variant"),
-    pytest.param("42", 42, MAIN_ID, "malformed (not a string)", id="integer"),
-    pytest.param('""', "", MAIN_ID, "blank", id="blank"),
-    pytest.param('"   "', "   ", MAIN_ID, "blank", id="whitespace"),
+    pytest.param(None, _ABSENT, MAIN_ID, id="absent"),
+    pytest.param(f'"{OTHER_ID}"', OTHER_ID, OTHER_ID, id="known"),
+    # A configured connection's uncached model is pinned exactly (task 4.1); classification
+    # never consults the cache. Only the connection is whitespace-exact; the upstream is verbatim.
+    pytest.param('"acme/claude-zzz"', "acme/claude-zzz", "acme/claude-zzz", id="configured-uncached"),
+    pytest.param(f'"{_UPSTREAM_PADDED}"', _UPSTREAM_PADDED, _UPSTREAM_PADDED, id="upstream-whitespace-verbatim"),
 ]
 
 
-@pytest.mark.parametrize(("literal", "raw", "pin_id", "evidence"), _ROOT_SELECTORS)
+_ROOT_SELECTOR_RUNS = [
+    pytest.param(*param.values, state, id=f"{param.id}-{state}")
+    for param in _ROOT_SELECTORS
+    for state in ("valid-main", "no-main")
+    if not (param.id == "absent" and state == "no-main")  # inheriting needs Main: see failure tests
+]
+
+
+@pytest.mark.parametrize(("literal", "raw", "pin_id", "main_state"), _ROOT_SELECTOR_RUNS)
 def test_root_scheduled_selector_matrix(
     scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-    literal: str | None, raw: object, pin_id: str, evidence: str | None,
+    literal: str | None, raw: object, pin_id: str, main_state: str,
 ) -> None:
-    """Absent inherits quietly, a known ID pins exactly, and malformed or unknown
-    selectors warn once with bounded evidence and inherit Main (no trim/alias)."""
+    """Absent inherits Main quietly and a saved selector is pinned exactly, with no
+    warning, no Main (so Main need not exist) and no cache membership."""
     scheduled_root.serve_provider_chat()
+    saved = MAIN_ID if main_state == "valid-main" else INVALID_SAVED
 
-    probe = run_scheduled_root(scheduled_root, monkeypatch, literal)
+    probe = run_scheduled_root(scheduled_root, monkeypatch, literal, saved_default=saved)
 
-    _assert_scheduled_root_run(scheduled_root, probe, raw=raw, pin_id=pin_id)
-    warnings = _selector_warnings(caplog)
-    if evidence is None:
-        assert warnings == []
-        return
-    (warning,) = warnings
-    assert warning.levelno == logging.WARNING
-    assert evidence in warning.getMessage()
-    if not isinstance(raw, str):
-        # Non-string content is never stringified, in the text or the arguments.
-        assert str(raw) not in warning.getMessage() and str(raw) not in repr(warning.args)
+    _assert_scheduled_root_run(
+        scheduled_root, probe, raw=raw, pin_id=pin_id,
+        main_id=MAIN_ID if main_state == "valid-main" else None,
+    )
+    assert _selector_warnings(caplog) == []
+
+
+_ROOT_INVALID_SELECTORS = [
+    pytest.param('"ghost/claude-zzz"', "ghost/claude-zzz", "unknown_connection", "ghost/claude-zzz", id="unknown"),
+    pytest.param(f'"{UNCONFIGURED_ID}"', UNCONFIGURED_ID, "unknown_connection", UNCONFIGURED_ID, id="obsolete"),
+    pytest.param(f'" {OTHER_ID} "', f" {OTHER_ID} ", "unknown_connection", f" {OTHER_ID} ", id="padded"),
+    pytest.param(f'"{OTHER_ID.upper()}"', OTHER_ID.upper(), "unknown_connection", OTHER_ID.upper(), id="case-variant"),
+    pytest.param('"gem-1"', "gem-1", "malformed_selector", "gem-1", id="no-slash"),
+    pytest.param('"gem/"', "gem/", "malformed_selector", "gem/", id="empty-upstream"),
+    pytest.param('"/gem-1"', "/gem-1", "malformed_selector", "/gem-1", id="empty-connection"),
+    pytest.param("42", 42, "malformed_selector", "malformed (not a string)", id="integer"),
+    pytest.param("true", True, "malformed_selector", "malformed (not a string)", id="bool"),
+    pytest.param("1.5", 1.5, "malformed_selector", "malformed (not a string)", id="float"),
+    pytest.param('["QZXlist"]', ["QZXlist"], "malformed_selector", "malformed (not a string)", id="list"),
+    pytest.param('{ QZXkey = "QZXvalue" }', {"QZXkey": "QZXvalue"}, "malformed_selector",
+                 "malformed (not a string)", id="table"),
+    pytest.param('""', "", "malformed_selector", "blank", id="blank"),
+    pytest.param('"   "', "   ", "malformed_selector", "blank", id="whitespace"),
+]
+
+
+@pytest.mark.parametrize("main_state", ["valid-main", "no-main"])
+@pytest.mark.parametrize(("literal", "raw", "code", "evidence"), _ROOT_INVALID_SELECTORS)
+def test_root_scheduled_invalid_selector_fails_only_that_job_without_substitution(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    literal: str, raw: object, code: str, evidence: str, main_state: str,
+) -> None:
+    """A blank, non-string, malformed or unknown-connection saved selector is a normal
+    launch failure of that job (record + direct alert, bounded evidence): no warning,
+    no Main inheritance, no credential/runtime/client/provider work, nothing rewritten."""
+    scheduled_root.serve_provider_chat()
+    saved = MAIN_ID if main_state == "valid-main" else INVALID_SAVED
+
+    probe = run_scheduled_root(scheduled_root, monkeypatch, literal, saved_default=saved)
+
+    after = probe.after
+    _assert_strict_equal(probe.admits, {"admit": [], "admit_scheduled": [raw]})
+    assert probe.codes == [code] and probe.resolved == [] and probe.pins == []
+    assert probe.creates == [] and probe.registered == [] and probe.loop_calls == []
+    assert _selector_warnings(caplog) == []
+    (entry,) = probe.at_admission
+    assert entry.running is True and len(entry.run_ids) == 1 and entry.records == []
+    (run_id,) = entry.run_ids
+    (record,) = after.records
+    assert (record["run_id"], record["status"], record["success"], record["model"]) == (
+        run_id, "failed", False, evidence,
+    )
+    (alert,) = after.notices  # notify = false: the direct launch-failure alert still goes out
+    assert f"Job {SCHEDULED_TAG} failed to spawn" in alert and f"Model: {html.escape(evidence)}" in alert
+    # Non-string content is never stringified: only the typed label is shown, and the
+    # canary payloads inside list/table values appear nowhere (record, alert, logs).
+    (model_line,) = [line for line in alert.splitlines() if line.startswith("Model: ")]
+    assert model_line == f"Model: {html.escape(evidence)}"
+    for text in (record["result"], alert, caplog.text, json.dumps(after.state)):
+        assert "QZXlist" not in text and "QZXvalue" not in text and "QZXkey" not in text
+    assert after.state["last_error"] == record["result"]
+    assert after.tracked is False and after.active_children == []
+    assert after.llm_clients == 0 and after.http_clients == 0 and after.provider_requests == []
+    assert after.view == probe.view_before and after.settings == probe.settings_before
+    assert after.view.active_model_id == (MAIN_ID if main_state == "valid-main" else None)
+    assert after.toml == probe.toml_before  # the raw saved value is never rewritten
+    assert SCHEDULED_TAG in scheduled_root.scheduler._jobs_meta, "the job must stay registered"
+    assert scheduled_root.unexpected == [] and scheduled_root.open_clients_at_exit == []
+
+
+def test_root_scheduled_failing_selector_does_not_disturb_a_healthy_sibling(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One job's invalid selector fails only that job: the sibling still completes on
+    Main with its own success record and no spurious alert; Main and the TOML stay put."""
+    scheduled_root.serve_provider_chat()
+    probes: list[ScheduledRootProbe] = []
+    toml = scheduled_job_toml('"ghost/claude-zzz"', tag="badjob") + "\n" + scheduled_job_toml(None, tag="goodjob")
+
+    def hold(started: RootHarness) -> None:
+        """Fire the failing job, then the healthy one, each once."""
+        started.registry.refresh()
+        for tag in ("badjob", "goodjob"):
+            probe = ScheduledRootProbe(started, monkeypatch, tag=tag)
+            probes.append(probe)
+            probe.fire()
+
+    scheduled_root.start(saved_default=MAIN_ID, hold=hold, scheduler_toml=toml)
+
+    bad, good = probes
+    (bad_record,) = bad.after.records
+    assert (bad_record["status"], bad_record["model"]) == ("failed", "ghost/claude-zzz")
+    assert len(bad.after.notices) == 1
+    (good_record,) = good.after.records
+    assert (good_record["status"], good_record["success"], good_record["model"]) == ("done", True, MAIN_ID)
+    assert good.after.notices == [] and good.after.tracked is False
+    assert [pin.model.id for pin in good.pins] == [MAIN_ID]
+    assert good.after.view == good.view_before and good.view_before.active_model_id == MAIN_ID
+    assert good.after.toml == bad.toml_before
+    assert _selector_warnings(caplog) == []
+    assert scheduled_root.unexpected == [] and scheduled_root.open_clients_at_exit == []
 
 
 def test_root_scheduled_stale_known_selector_is_pinned_without_warning(
@@ -586,27 +686,376 @@ def test_root_scheduled_stale_known_selector_is_pinned_without_warning(
     assert _selector_warnings(caplog) == []
 
 
-def test_root_scheduled_unknown_selector_warning_is_bounded_and_redacted(
+def test_root_scheduled_unknown_selector_failure_evidence_is_bounded_and_redacted(
     scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The emitted WARN uses the bounded representation redacted by the root's own
-    redactor; the raw value stays verbatim in the human-edited scheduler file."""
-    raw = "ghost/" + "b" * 200 + VAULT_SECRET + "-public-suffix" * 50 + "-TAILQZX"
+    """The failed record and the direct alert carry the bounded evidence redacted by the
+    root's own redactor (and the alert escapes HTML); the raw value stays verbatim in the
+    human-edited scheduler file."""
+    raw = "ghost/<b>" + "b" * 200 + VAULT_SECRET + "-public-suffix" * 50 + "-TAILQZX"
     scheduled_root.serve_provider_chat()
 
     probe = run_scheduled_root(scheduled_root, monkeypatch, f'"{raw}"')
 
-    _assert_scheduled_root_run(scheduled_root, probe, raw=raw, pin_id=MAIN_ID)
     redactor = scheduled_root.scheduler.selector_redactor
     assert redactor is not None and VAULT_SECRET not in redactor(raw), "root redactor lacks the vault value"
     evidence = bounded_selector_evidence(raw, redact=redactor)
-    assert len(evidence) <= 256 and VAULT_SECRET not in evidence
-    (warning,) = _selector_warnings(caplog)
-    message = warning.getMessage()
-    assert evidence in message
-    # The 256 bound applies to the evidence; only a short fixed text may surround it.
-    assert len(message) < len(evidence) + 128
-    for text in (message, repr(warning.msg), repr(warning.args)):
+    assert len(evidence) <= 256 and VAULT_SECRET not in evidence and "<b>" in evidence
+    assert probe.codes == ["unknown_connection"] and probe.resolved == []
+    (record,) = probe.after.records
+    (alert,) = probe.after.notices
+    assert record["model"] == evidence
+    (model_line,) = [line for line in alert.splitlines() if line.startswith("Model: ")]
+    assert model_line == f"Model: {html.escape(evidence)}"
+    assert "<b>" not in model_line and "&lt;b&gt;" in model_line
+    # The 256 bound applies to the evidence; only a short fixed text surrounds it in the alert.
+    assert len(alert) < 2 * len(html.escape(evidence)) + 512
+    for text in (record["model"], record["result"], alert, caplog.text, json.dumps(probe.after.state)):
         for fragment in (VAULT_SECRET, VAULT_SECRET[:12], "TAILQZX"):
             assert fragment not in text
+    assert _selector_warnings(caplog) == []
     assert raw in scheduled_root.paths.scheduler_config.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# H. Task 8.2: one root admission, no live recheck, no fallback, per-job failure isolation
+# ---------------------------------------------------------------------------
+
+_PROVIDER_CANARY = "QZXprovider-body-canary-8-2"
+_ACME_CHAT_PATH = "/v1/messages"
+_UNCACHED_ID = "acme/claude-zzz"
+
+
+def test_root_scheduled_pin_survives_main_switch_and_catalog_refresh_after_admission(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After the one root admission, switching Main and refreshing a changed catalog while the run
+    is in flight cannot re-resolve, re-admit or redirect it: the one request still goes to the
+    pinned model's own endpoint with its own credential, through the one pinned client."""
+    scheduled_root.serve_provider_chat()
+    probes: list[ScheduledRootProbe] = []
+    seen: dict[str, object] = {}
+
+    def hold(started: RootHarness) -> None:
+        """Fire once; inside the run (after admission) change Main and the catalog."""
+        started.registry.refresh()
+        probe = ScheduledRootProbe(started, monkeypatch)
+        probes.append(probe)
+        chat_loop = probe._loop
+
+        def loop(ctx: object, goal: str, progress_callback: object = None, images: object = None, **kw: object) -> str:
+            """Disturb Main, the catalog and the credentials, then send the pinned request."""
+            registry = started.registry
+            seen["admissions_at_run"] = (list(probe.admits["admit"]), list(probe.admits["admit_scheduled"]), list(probe.resolved))
+            registry.select(MAIN_ID.replace("claude-a", "claude-b"))  # Main moves to another model
+            report = registry.refresh()  # a deliberate /models refresh while the run is in flight
+            seen["refreshed"] = report.refreshed_provider_ids
+            monkeypatch.setenv("KEY_GEM", "rotated-after-admission")  # the run keeps its pinned credential
+            seen["main_after_switch"] = registry.view().active_model_id
+            seen["resolved_after_disturbance"] = list(probe.resolved)  # discovery resolves its own credentials
+            return chat_loop(ctx, goal, progress_callback, images, **kw)
+
+        monkeypatch.setattr(probe, "_loop", loop)
+        probe.fire()
+
+    scheduled_root.start(saved_default=MAIN_ID, hold=hold, scheduler_toml=scheduled_job_toml(f'"{OTHER_ID}"'))
+
+    (probe,) = probes
+    assert seen["admissions_at_run"] == ([], [OTHER_ID], ["gem"])
+    assert seen["refreshed"] and seen["main_after_switch"] == "acme/claude-b"
+    # Still exactly one admission and one credential resolution, and the pin was not replaced.
+    _assert_strict_equal(probe.admits, {"admit": [], "admit_scheduled": [OTHER_ID]})
+    # The run itself resolved nothing after the disturbance (the refresh's own discovery resolutions
+    # precede it); the pinned client sent the request with the credential resolved at admission.
+    assert probe.resolved == seen["resolved_after_disturbance"] and probe.resolved[0] == "gem"
+    assert len(probe.pins) == 1 and len(probe.creates) == 1
+    (post,) = probe.after.provider_posts
+    assert (post.url.host, post.url.path, post.headers["x-goog-api-key"]) == (
+        GEM_HOST, "/v1beta/models/gem-1:generateContent", SECRETS["KEY_GEM"],
+    )
+    (record,) = probe.after.records
+    assert (record["status"], record["success"], record["model"]) == ("done", True, OTHER_ID)
+    assert probe.after.llm_clients == 1 and probe.after.tracked is False
+    assert probe.after.view.active_model_id == "acme/claude-b"  # the operator's change, not the run's
+    assert _selector_warnings(caplog) == []
+
+
+def _reject_provider_requests(root: RootHarness, predicate: Callable[[httpx.Request], bool], response: httpx.Response) -> None:
+    """Answer chat requests selected by ``predicate`` with ``response``; delegate everything else."""
+    served = root._route
+
+    def route(request: httpx.Request) -> httpx.Response:
+        """Reject the selected provider chat request, recording it like the harness does."""
+        if request.method == "POST" and request.url.host in (ACME_HOST, GEM_HOST):
+            request.read()
+            if predicate(request):
+                root.requests.append(request)
+                return response
+        return served(request)
+
+    root.monkeypatch.setattr(root, "_route", route)
+
+
+def _is_acme_upstream(request: httpx.Request, upstream: str) -> bool:
+    """True for an acme chat request whose body names ``upstream`` exactly."""
+    return request.url.host == ACME_HOST and json.loads(request.content).get("model") == upstream
+
+
+# Provider-side rejections are proven through the canonical react_loop below; this launch-failure
+# (exception) path needs no loop at all because the credential fails before any client exists.
+_ISOLATION_CASES = [
+    pytest.param(OTHER_ID, "credential-unresolvable", id="credential-unresolvable"),
+]
+
+
+@pytest.mark.parametrize(("selector", "failure"), _ISOLATION_CASES)
+def test_root_scheduled_failure_is_recorded_for_that_job_only_and_never_falls_back(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    selector: str, failure: str,
+) -> None:
+    """A provider rejection of an uncached configured upstream, a provider context rejection and an
+    unresolvable credential each fail ONLY the pinned job, once, with the pinned selector in its
+    record; a healthy sibling on the same Scheduler completes on Main; Main and preferences stay."""
+    scheduled_root.serve_provider_chat()
+    if failure == "provider-rejects-uncached-upstream":
+        _reject_provider_requests(
+            scheduled_root, lambda r: _is_acme_upstream(r, "claude-zzz"),
+            httpx.Response(404, json={"error": {"message": f"model not found {_PROVIDER_CANARY}"}}),
+        )
+    elif failure == "provider-context-rejection":
+        _reject_provider_requests(
+            scheduled_root, lambda r: r.url.host == GEM_HOST,
+            httpx.Response(400, json={"error": {"message": f"context_length_exceeded {_PROVIDER_CANARY}"}}),
+        )
+    probes: list[ScheduledRootProbe] = []
+    prefs: dict[str, bytes | None] = {}
+    bad_snapshot: dict[str, object] = {}
+    toml = scheduled_job_toml(f'"{selector}"', tag="badjob") + "\n" + scheduled_job_toml(None, tag="goodjob")
+
+    def hold(started: RootHarness) -> None:
+        """Fire the failing job, then the healthy sibling, each once."""
+        started.registry.refresh()
+        pref = started.paths.model_selection_file
+        prefs["before"] = pref.read_bytes() if pref.exists() else None
+        if failure == "credential-unresolvable":
+            monkeypatch.delenv("KEY_GEM")
+        for tag in ("badjob", "goodjob"):
+            probe = ScheduledRootProbe(started, monkeypatch, tag=tag)
+            probes.append(probe)
+            probe.fire()
+            if tag == "badjob":  # the sibling's probe wraps the same spies: snapshot first
+                bad_snapshot.update(
+                    admits={k: list(v) for k, v in probe.admits.items()}, resolved=list(probe.resolved),
+                    codes=list(probe.codes), pins=list(probe.pins), creates=list(probe.creates),
+                )
+        prefs["after"] = pref.read_bytes() if pref.exists() else None
+
+    scheduled_root.start(saved_default=MAIN_ID, hold=hold, scheduler_toml=toml)
+
+    bad, good = probes
+    provider = selector.split("/", 1)[0]
+    # The failing job: one admission of the exact saved selector, never Main.
+    _assert_strict_equal(bad_snapshot["admits"], {"admit": [], "admit_scheduled": [selector]})
+    assert bad_snapshot["resolved"] == [provider]
+    entry = bad.at_admission[0]  # the sibling's later probe also observes this registry
+    (run_id,) = entry.run_ids
+    (record,) = bad.after.records
+    assert (record["run_id"], record["status"], record["success"], record["model"]) == (run_id, "failed", False, selector)
+    assert bad.after.tracked is False and bad.after.active_children == []
+    if failure == "credential-unresolvable":
+        assert bad_snapshot["codes"] == ["credential_resolution_failed"] and bad_snapshot["pins"] == [] and bad_snapshot["creates"] == []
+        assert bad.after.llm_clients == 0 and bad.after.provider_requests == []
+        assert len(bad.after.notices) == 1 and f"Model: {selector}" in bad.after.notices[0]
+    else:
+        assert bad_snapshot["codes"] == [] and [pin.model.id for pin in bad_snapshot["pins"]] == [selector] and len(bad_snapshot["creates"]) == 1
+        assert bad.after.llm_clients == 1 and bad.after.llm_closed == [True] and bad.after.http_open == []
+        assert bad.after.notices == []  # notify = false: a run failure alerts only through its record
+        (post,) = bad.after.provider_posts  # exactly one attempt, on the pinned model's provider
+        assert post.url.host == (ACME_HOST if provider == "acme" else GEM_HOST)
+        if provider == "acme":
+            assert json.loads(post.content)["model"] == "claude-zzz"  # the exact upstream, not Main's
+            assert post.headers["x-api-key"] == SECRETS["KEY_ACME"]
+        assert _PROVIDER_CANARY not in record["result"] and _PROVIDER_CANARY not in caplog.text
+    assert record["result"] and _PROVIDER_CANARY not in json.dumps(bad.after.state)
+    # The healthy sibling: completes on Main with its own record; no alert; nothing of Main changed.
+    (good_record,) = good.after.records
+    assert (good_record["status"], good_record["success"], good_record["model"]) == ("done", True, MAIN_ID)
+    assert good.after.notices == [] and good.after.tracked is False
+    assert [pin.model.id for pin in good.pins][-1] == MAIN_ID and good.resolved[-1] == "acme"
+    assert good.after.view == good.view_before and good.view_before.active_model_id == MAIN_ID
+    assert good.after.settings == bad.settings_before and good.after.toml == bad.toml_before
+    assert prefs["before"] == prefs["after"]
+    assert scheduled_root.unexpected == [] and scheduled_root.open_clients_at_exit == []
+
+
+@pytest.fixture
+def canonical_loop_root(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
+) -> RootHarness:
+    """The scheduled root with a zero retry-prompt timeout (the product's own setting value only).
+
+    ``_handle_llm_error`` waits ``ctx.retry_timeout_seconds`` for an operator retry/cancel answer that a
+    scheduled run never receives. A sub-agent controller does not inherit the root's
+    ``[llm_error_handling]`` value (it keeps its 120 s default), so the existing setting is overridden
+    here on the controller deps only; the loop, ``_request_turn`` and ``_handle_llm_error`` run unchanged.
+    """
+    import dataclasses
+
+    from agent_controller import AgentController
+
+    original = AgentController.runtime_deps
+    monkeypatch.setattr(
+        AgentController, "runtime_deps",
+        property(lambda self: dataclasses.replace(original.fget(self), retry_timeout_seconds=0)),
+    )
+    return scheduled_root
+
+
+_FINISH = "canonical-finish-8-2"
+
+
+def _finish_acme_chats(root: RootHarness) -> None:
+    """Give every successful acme chat a valid finish action (transport shape only)."""
+    served = root._route
+
+    def route(request: httpx.Request) -> httpx.Response:
+        """Answer acme chat with the real finish-action schema; delegate everything else."""
+        if request.method == "POST" and request.url.host == ACME_HOST and request.url.path == _ACME_CHAT_PATH:
+            response = served(request)
+            if response.status_code == 200:
+                return httpx.Response(200, json={
+                    "content": [{"type": "text", "text": json.dumps({"action": "finish", "result": _FINISH})}],
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                })
+            return response
+        return served(request)
+
+    root.monkeypatch.setattr(root, "_route", route)
+
+
+def _canonical_probe(started: RootHarness, monkeypatch: pytest.MonkeyPatch, tag: str) -> ScheduledRootProbe:
+    """A probe whose fire runs the REAL ``react_loop`` (the harness patches ``self._loop`` in)."""
+    from react_loop import react_loop as canonical_react_loop
+
+    probe = ScheduledRootProbe(started, monkeypatch, tag=tag)
+    monkeypatch.setattr(probe, "_loop", canonical_react_loop)
+    return probe
+
+
+_CANONICAL_REJECTIONS = [
+    pytest.param(
+        _UNCACHED_ID, lambda r: _is_acme_upstream(r, "claude-zzz"), 404, "model not found", "Provider rejected", id="uncached-upstream-404",
+    ),
+    pytest.param(
+        OTHER_ID, lambda r: r.url.host == GEM_HOST, 400, "context_length_exceeded", "Context too long", id="context-400",
+    ),
+]
+
+
+@pytest.mark.parametrize(("selector", "predicate", "status", "provider_text", "sanitized"), _CANONICAL_REJECTIONS)
+def test_root_scheduled_provider_rejection_through_canonical_react_loop_fails_only_that_job(
+    canonical_loop_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    selector: str, predicate: Callable[[httpx.Request], bool], status: int, provider_text: str, sanitized: str,
+) -> None:
+    """The REAL react_loop turns a provider rejection into a sanitized ``❌`` NORMAL return (no exception
+    reaches the supervisor); the scheduler must still classify it as THAT job's failed run: one pinned
+    attempt, no fallback to Main, run released, healthy sibling finishing through the same loop, and
+    Main/preferences/TOML/settings unchanged."""
+    root = canonical_loop_root
+    root.serve_provider_chat()
+    _finish_acme_chats(root)
+    _reject_provider_requests(
+        root, predicate, httpx.Response(status, json={"error": {"message": f"{provider_text} {_PROVIDER_CANARY}"}}),
+    )
+    probes: list[ScheduledRootProbe] = []
+    prefs: dict[str, bytes | None] = {}
+    bad_snapshot: dict[str, object] = {}
+    toml = scheduled_job_toml(f'"{selector}"', tag="badjob") + "\n" + scheduled_job_toml(None, tag="goodjob")
+
+    def hold(started: RootHarness) -> None:
+        """Fire the rejected job, then the healthy sibling, each once through the canonical loop."""
+        started.registry.refresh()
+        pref = started.paths.model_selection_file
+        prefs["before"] = pref.read_bytes() if pref.exists() else None
+        for tag in ("badjob", "goodjob"):
+            probe = _canonical_probe(started, monkeypatch, tag)
+            probes.append(probe)
+            probe.fire()
+            if tag == "badjob":  # the sibling's probe wraps the same spies: snapshot first
+                bad_snapshot.update(
+                    admits={k: list(v) for k, v in probe.admits.items()}, resolved=list(probe.resolved),
+                    codes=list(probe.codes), pins=list(probe.pins), creates=list(probe.creates),
+                )
+        prefs["after"] = pref.read_bytes() if pref.exists() else None
+
+    root.start(saved_default=MAIN_ID, hold=hold, scheduler_toml=toml)
+
+    bad, good = probes
+    provider = selector.split("/", 1)[0]
+    # The loop really ran and returned (the harness chat boundary never did): nothing but production code.
+    assert bad.loop_calls == [] and good.loop_calls == []
+    # One admission of the exact saved selector, one pin, one runtime, one pinned client; no Main fallback.
+    _assert_strict_equal(bad_snapshot["admits"], {"admit": [], "admit_scheduled": [selector]})
+    assert bad_snapshot["codes"] == [] and bad_snapshot["resolved"] == [provider]
+    assert [pin.model.id for pin in bad_snapshot["pins"]] == [selector] and len(bad_snapshot["creates"]) == 1
+    entry = bad.at_admission[0]
+    (run_id,) = entry.run_ids
+    (post,) = bad.after.provider_posts  # exactly one provider attempt; the sibling's request is separate
+    assert post.url.host == (ACME_HOST if provider == "acme" else GEM_HOST)
+    if provider == "acme":
+        assert json.loads(post.content)["model"] == "claude-zzz" and post.headers["x-api-key"] == SECRETS["KEY_ACME"]
+    # NORMAL-RETURN classification: the done result starts with the sanitized ❌, the record is failed.
+    (record,) = bad.after.records
+    assert (record["run_id"], record["status"], record["success"], record["model"]) == (run_id, "failed", False, selector)
+    assert record["result"].startswith("❌") and sanitized in record["result"]
+    assert _PROVIDER_CANARY not in record["result"] and _PROVIDER_CANARY not in caplog.text
+    assert _PROVIDER_CANARY not in json.dumps(bad.after.state)
+    assert bad.after.state["last_run"] == entry.persisted_last_run
+    assert bad.after.notices == []  # notify = false
+    assert bad.after.tracked is False and bad.after.active_children == []
+    assert bad.after.llm_clients == 1 and bad.after.llm_closed == [True] and bad.after.http_open == []
+    # The healthy sibling finishes through the same canonical loop on Main with a real finish action.
+    (good_record,) = good.after.records
+    assert (good_record["status"], good_record["success"], good_record["model"]) == ("done", True, MAIN_ID)
+    assert good_record["result"] == _FINISH and good.after.notices == [] and good.after.tracked is False
+    (good_post,) = good.after.provider_posts
+    assert json.loads(good_post.content)["model"] == "claude-a" and good_post.url.host == ACME_HOST
+    assert good.after.view == good.view_before and good.view_before.active_model_id == MAIN_ID
+    assert good.after.settings == bad.settings_before and good.after.toml == bad.toml_before
+    assert prefs["before"] == prefs["after"]
+    assert root.unexpected == [] and root.open_clients_at_exit == []
+
+
+def test_root_scheduled_provider_rejection_sends_one_sanitized_notice_without_main(
+    canonical_loop_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``notify = true`` the canonical loop's sanitized ``❌`` normal return still produces exactly one
+    failure notice for that job (no provider body text, no Main identity); one request, no second attempt."""
+    root = canonical_loop_root
+    root.serve_provider_chat()
+    _reject_provider_requests(
+        root, lambda r: _is_acme_upstream(r, "claude-zzz"),
+        httpx.Response(404, json={"error": {"message": f"model not found {_PROVIDER_CANARY}"}}),
+    )
+    toml = scheduled_job_toml(f'"{_UNCACHED_ID}"').replace("notify = false\n", "notify = true\n")
+    probes: list[ScheduledRootProbe] = []
+
+    def hold(started: RootHarness) -> None:
+        """Fire the notifying job once through the canonical loop."""
+        started.registry.refresh()
+        probe = _canonical_probe(started, monkeypatch, SCHEDULED_TAG)
+        probes.append(probe)
+        probe.fire()
+
+    root.start(saved_default=MAIN_ID, hold=hold, scheduler_toml=toml)
+
+    (probe,) = probes
+    (record,) = probe.after.records
+    assert (record["status"], record["success"], record["model"]) == ("failed", False, _UNCACHED_ID)
+    assert record["result"].startswith("❌")
+    (notice,) = probe.after.notices
+    assert "Scheduled job failed: nightly" in notice and "Provider rejected" in notice
+    assert MAIN_ID not in notice and _PROVIDER_CANARY not in notice
+    (post,) = probe.after.provider_posts
+    assert json.loads(post.content)["model"] == "claude-zzz"
+    assert probe.after.tracked is False and probe.after.llm_clients == 1

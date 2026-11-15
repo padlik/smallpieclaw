@@ -124,7 +124,7 @@ async def cmd_help(iface: "TelegramInterface", update: Update, ctx: ContextTypes
         "  <code>how much RAM is free?</code>\n\n"
         "<b>Commands:</b>\n"
         "  /status   — agent status, uptime, token usage\n"
-        "  /context  — show context window consumption profile\n"
+        "  /context  — show estimated input tokens and compaction threshold\n"
         "  /tools    — list available tools\n"
         "  /models  — list and switch LLM models\n"
         "  /mode    — set creativity mode (default / planner / explorer / resilient)\n"
@@ -1437,7 +1437,15 @@ async def _render_models_catalog(registry: "ModelRegistry") -> "CatalogRenderRes
         if not report.persisted:
             refresh_not_saved = True
     view = registry.view()
-    return render_models_catalog(view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved)
+    # The registry's selection notice is a construction-time constant. Once a successful select
+    # has replaced the unusable preference the runtime state is saved-and-active (a failed save
+    # changes neither), so only then is the notice stale; the cache notice is never gated.
+    resolved = view.active_model_id is not None and view.remembered_model_id == view.active_model_id
+    return render_models_catalog(
+        view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved,
+        cache_notice=registry.cache_notice,
+        selection_notice=None if resolved else registry.selection_notice,
+    )
 
 
 async def _render_models_catalog_text(registry: "ModelRegistry") -> str:
