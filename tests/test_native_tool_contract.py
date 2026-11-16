@@ -359,9 +359,7 @@ def test_real_loop_reuses_cached_full_definitions_on_every_native_request(
         builds.append(built)
         return built
 
-    # Phase-aware delegating observer. Each loop turn binds twice: the read-only
-    # pre-fit preview (``LLMClient.preview_request`` binds a fresh private state and
-    # stops at the send gate) and the loop's actual send (``_request_turn``).
+    # Delegating observer: each loop turn binds once for its actual send.
     binds: list[SimpleNamespace] = []
     real_bind: Callable[..., Any] = client.bind_attempt
 

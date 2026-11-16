@@ -126,26 +126,6 @@ def test_native_tool_success_counts_once_and_preserves_nested_definition_fields(
     client.close()
 
 
-def test_preview_uses_final_wire_estimate_without_sending_or_counting() -> None:
-    requests: list[httpx.Request] = []
-    client = _client(transport=httpx.MockTransport(
-        lambda request: requests.append(request) or _openai_response()
-    ))
-
-    preview = client.preview_request(
-        [{"role": "user", "content": "hello"}],
-        tools=[{"type": "function", "function": {"name": "go", "parameters": {"type": "object"}}}],
-        definition_revision=12,
-    )
-
-    assert preview.canonical_model_id == "connection/upstream/model"
-    assert preview.definition_revision == 12
-    assert preview.input_tokens > 0
-    assert preview.hard_input_budget >= preview.input_tokens
-    assert requests == []
-    client.close()
-
-
 def test_unsupported_native_adapter_is_rejected_before_send_but_unknown_vision_images_are_sent() -> None:
     """A genuine adapter limitation (no native tools on Anthropic) still fails locally
     before any I/O; unknown vision metadata never blocks an image request."""

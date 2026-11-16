@@ -674,7 +674,6 @@ class TestSdkClientWrapper:
     @pytest.mark.parametrize("is_error", [False, True])
     def test_call_tool_completed_sdk_result_is_locally_executed(self, is_error):
         from outcome_utils import effective_execution, read_execution
-        from react_loop import _outcome_guard_eligible
 
         call_result = MagicMock()
         call_result.isError = is_error
@@ -688,7 +687,6 @@ class TestSdkClientWrapper:
         assert result["success"] is (not is_error)
         assert read_execution(result) == "executed"
         assert effective_execution(result) == "executed"
-        assert _outcome_guard_eligible(result) is True
 
     @pytest.mark.parametrize("is_error", [False, True])
     def test_call_tool_conflicting_remote_fields_do_not_override_local_proof(self, is_error):
@@ -728,8 +726,7 @@ class TestSdkClientWrapper:
         assert effective_execution(result) == "unknown"
 
     def test_call_tool_transport_exception_without_result_is_unknown(self):
-        from outcome_utils import read_execution
-        from react_loop import _outcome_guard_eligible
+        from outcome_utils import effective_execution, read_execution
 
         call_tool = AsyncMock(side_effect=ConnectionResetError("pipe broke"))
         wrapper = self._connected_wrapper(call_tool)
@@ -741,11 +738,10 @@ class TestSdkClientWrapper:
         assert "pipe broke" in result["error"]
         assert wrapper.connected is False
         assert read_execution(result) == "unknown"
-        assert _outcome_guard_eligible(result) is False
+        assert effective_execution(result) == "unknown"
 
     def test_call_tool_timeout_without_result_is_unknown(self):
-        from outcome_utils import read_execution
-        from react_loop import _outcome_guard_eligible
+        from outcome_utils import effective_execution, read_execution
 
         started = threading.Event()
 
@@ -762,7 +758,7 @@ class TestSdkClientWrapper:
         assert result["success"] is False
         assert "timeout" in result["error"]
         assert read_execution(result) == "unknown"
-        assert _outcome_guard_eligible(result) is False
+        assert effective_execution(result) == "unknown"
 
     def test_call_tool_needs_auth_predispatch_is_refused_and_not_sent(self):
         from outcome_utils import effective_execution, read_execution

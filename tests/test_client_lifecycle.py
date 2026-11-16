@@ -16,7 +16,6 @@ from providers._errors import (
     LLMCancelledError,
     LLMEmptyResponseError,
     LLMError,
-    LLMPermanentError,
 )
 from tests.run_model_fixtures import make_run_model_client
 
@@ -232,24 +231,6 @@ def test_tiny_cached_limits_do_not_block_a_send_or_log_a_failure(monkeypatch):
         client.chat([{"role": "user", "content": "word " * 4000}])
         assert len(requests) == 1
         assert LogEvent.LLM_FAILED not in [event for event, _message, _fields in events]
-    finally:
-        client.close()
-
-
-def test_previews_never_emit_lifecycle_events_or_send(monkeypatch):
-    requests: list[httpx.Request] = []
-    client = _client(
-        lambda request: requests.append(request) or _response(),
-        metadata=ModelMetadata(context_tokens=64, output_tokens=32),
-    )
-    events = _capture_events(monkeypatch)
-    try:
-        preview = client.preview_request([{"role": "user", "content": "small"}])
-        assert preview.canonical_model_id.endswith("lifecycle-test-model")
-        with pytest.raises(LLMPermanentError, match="local budget"):
-            client.preview_request([{"role": "user", "content": "word " * 4000}])
-        assert requests == []
-        assert events == []
     finally:
         client.close()
 

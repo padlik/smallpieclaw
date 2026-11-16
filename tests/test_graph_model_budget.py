@@ -1,9 +1,7 @@
-"""Graph extraction budget: fixed 1024-token policy over the pinned model limits.
+"""Graph extraction's fixed wire policy through real pinned clients.
 
-These tests characterize the public budget kernel and real extraction client
-using supplied settled pins. HTTP transport is mocked; budgets, estimation,
-routing and usage accounting use production implementations. Startup,
-backfill and admission wiring are not exercised here.
+HTTP transport is mocked; routing, usage and provider rejections use
+production implementations. No local metadata-limit or input-fit gate exists.
 """
 
 from __future__ import annotations
@@ -19,12 +17,6 @@ from config_schema import AgentConfig, ResolvedProviderConnection
 from llm_client import LLMClient
 from model_discovery import ModelDiscovery
 from model_registry import ModelMetadata, ModelRecord, RunModel
-from model_request_budget import (
-    ModelRequestBudget,
-    ModelRequestBudgetError,
-    compute_request_budget,
-    repair_input_ceiling,
-)
 from providers._errors import LLMPermanentError
 from token_usage import TokenUsageRegistry
 
@@ -100,147 +92,6 @@ def _dig(payload: dict[str, Any], path: tuple[str, ...]) -> object:
         assert isinstance(value, dict)
         value = value[key]
     return value
-
-
-# (metadata, local context, combined, input limit, hard budget, assumed context)
-_GRAPH_MATRIX = [
-    pytest.param(ModelMetadata(context_tokens=8192), 4096, 8192, None, 7168, False,
-                 id="context_only_unknown_output"),
-    pytest.param(ModelMetadata(context_tokens=10_000, input_tokens=8000), 4096,
-                 10_000, 8000, 8000, False, id="input_limit_below_context"),
-    pytest.param(ModelMetadata(context_tokens=10_000, input_tokens=9000), 4096,
-                 10_000, 9000, 8976, False, id="context_minus_cap_below_input_limit"),
-    pytest.param(ModelMetadata(input_tokens=8000), 1, None, 8000, 8000, False,
-                 id="input_only_ignores_tiny_local"),
-    pytest.param(ModelMetadata(), 12_000, 12_000, None, 10_976, True,
-                 id="no_limits_uses_local_context"),
-    pytest.param(ModelMetadata(context_tokens=8192, output_tokens=64_000), 4096,
-                 8192, None, 7168, False, id="large_known_output_keeps_fixed_reserve"),
-    pytest.param(ModelMetadata(context_tokens=1025), 4096, 1025, None, 1, False,
-                 id="one_token_headroom"),
-]
-
-
-@pytest.mark.parametrize(
-    ("metadata", "local", "combined", "input_limit", "budget", "assumed"), _GRAPH_MATRIX
-)
-def test_kernel_fixed_cap_report_and_exact_fit_boundary(
-    metadata: ModelMetadata,
-    local: int,
-    combined: int | None,
-    input_limit: int | None,
-    budget: int,
-    assumed: bool,
-) -> None:
-    """The fixed cap always reserves 1024, fits I == B and rejects I == B + 1."""
-    report = compute_request_budget(
-        metadata, input_tokens=0, local_context_tokens=local, fixed_output_cap=_CAP
-    )
-    assert report == ModelRequestBudget(
-        input_tokens=0,
-        hard_input_budget=budget,
-        output_cap=_CAP,
-        completion_reserve=_CAP,
-        combined_context=combined,
-        input_limit=input_limit,
-        assumed_context=assumed,
-        assumed_completion_reserve=False,
-    )
-
-    at_limit = compute_request_budget(
-        metadata, input_tokens=budget, local_context_tokens=local, fixed_output_cap=_CAP
-    )
-    assert (at_limit.input_tokens, at_limit.hard_input_budget) == (budget, budget)
-    assert at_limit.output_cap == _CAP
-
-    with pytest.raises(ModelRequestBudgetError) as caught:
-        compute_request_budget(
-            metadata, input_tokens=budget + 1, local_context_tokens=local,
-            fixed_output_cap=_CAP,
-        )
-    assert caught.value.code == "input_exceeds_budget"
-    assert repair_input_ceiling(
-        metadata, local_context_tokens=local, fixed_output_cap=_CAP
-    ) == budget
-
-
-@pytest.mark.parametrize(
-    ("metadata", "local", "code"),
-    [
-        pytest.param(ModelMetadata(context_tokens=8192, output_tokens=1023), 4096,
-                     "output_limit_too_small", id="known_output_1023"),
-        pytest.param(ModelMetadata(context_tokens=1024), 4096, "no_input_budget",
-                     id="context_1024"),
-        pytest.param(ModelMetadata(context_tokens=1023), 4096, "no_input_budget",
-                     id="context_1023"),
-        pytest.param(ModelMetadata(), 1024, "no_input_budget", id="local_1024_no_limits"),
-    ],
-)
-def test_kernel_rejects_prerequisites_at_zero_input(
-    metadata: ModelMetadata, local: int, code: str
-) -> None:
-    """Too-small output limits and zero headroom fail typed even for empty input."""
-    with pytest.raises(ModelRequestBudgetError) as caught:
-        compute_request_budget(
-            metadata, input_tokens=0, local_context_tokens=local, fixed_output_cap=_CAP
-        )
-    assert caught.value.code == code
-    with pytest.raises(ModelRequestBudgetError) as repair:
-        repair_input_ceiling(metadata, local_context_tokens=local, fixed_output_cap=_CAP)
-    assert repair.value.code == code
-
-
-@pytest.mark.parametrize("output_tokens", [1024, None], ids=["known_1024", "unknown"])
-def test_kernel_accepts_output_threshold_and_unknown_output(output_tokens: int | None) -> None:
-    """A known 1024 output limit or an unknown one admits the fixed cap unchanged."""
-    report = compute_request_budget(
-        ModelMetadata(context_tokens=8192, output_tokens=output_tokens),
-        input_tokens=0,
-        local_context_tokens=4096,
-        fixed_output_cap=_CAP,
-    )
-    assert (report.output_cap, report.completion_reserve) == (_CAP, _CAP)
-    assert report.hard_input_budget == 7168
-    assert report.assumed_completion_reserve is False
-
-
-_INVALID_LIMITS = [
-    0, -1, True, "8192", 1.5,
-    pytest.param(float("inf"), id="inf"),
-    pytest.param(float("nan"), id="nan"),
-]
-
-
-@pytest.mark.parametrize("value", _INVALID_LIMITS)
-@pytest.mark.parametrize("field", ["context_tokens", "input_tokens", "output_tokens"])
-def test_kernel_rejects_invalid_raw_metadata_limits(field: str, value: object) -> None:
-    """Non-positive, boolean, string and non-integer catalog limits are invalid."""
-    metadata = ModelMetadata(**{field: value})
-    with pytest.raises(ModelRequestBudgetError) as caught:
-        compute_request_budget(
-            metadata, input_tokens=0, local_context_tokens=4096, fixed_output_cap=_CAP
-        )
-    assert caught.value.code == "invalid_limit"
-    with pytest.raises(ModelRequestBudgetError) as repair:
-        repair_input_ceiling(metadata, local_context_tokens=4096, fixed_output_cap=_CAP)
-    assert repair.value.code == "invalid_limit"
-
-
-@pytest.mark.parametrize(
-    ("input_tokens", "local"),
-    [(-1, 4096), (True, 4096), (1.5, 4096), (0, 0), (0, -5), (0, True)],
-    ids=["input_negative", "input_bool", "input_float", "local_zero", "local_negative", "local_bool"],
-)
-def test_kernel_rejects_invalid_input_and_local_context(input_tokens: object, local: object) -> None:
-    """Input must be a non-negative int and local context a positive int."""
-    with pytest.raises(ModelRequestBudgetError) as caught:
-        compute_request_budget(
-            ModelMetadata(context_tokens=8192),
-            input_tokens=input_tokens,
-            local_context_tokens=local,
-            fixed_output_cap=_CAP,
-        )
-    assert caught.value.code == "invalid_limit"
 
 
 _WIRE_CASES = [
@@ -398,15 +249,6 @@ def test_discovered_google_methods_infer_no_limits_and_rejection_stays_single_se
 def test_ordinary_required_cap_comes_from_config_while_graph_keeps_its_fixed_cap() -> None:
     """Ordinary Anthropic sends the configured cap without discovered output; the graph cap is separate."""
     metadata = ModelMetadata(context_tokens=200_000)
-    with pytest.raises(ModelRequestBudgetError) as caught:
-        compute_request_budget(
-            metadata, input_tokens=0, local_context_tokens=4096, output_cap_required=True
-        )
-    assert caught.value.code == "output_cap_unavailable"
-    assert compute_request_budget(
-        metadata, input_tokens=0, local_context_tokens=4096, fixed_output_cap=_CAP
-    ).output_cap == _CAP
-
     pin = _pin(metadata, adapter="anthropic", upstream="claude-graph")
     ordinary_transport = _CountingTransport(
         lambda request: httpx.Response(200, json=_reply_body("anthropic", "json"))

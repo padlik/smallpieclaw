@@ -175,7 +175,7 @@ class TestWhitespaceSummaryDisablesTheRun:
         msgs = _history()
         snapshot = copy.deepcopy(msgs)
         with pytest.raises(CompactionFailedError) as info:
-            maybe_compact(msgs, "sys", 0, MagicMock(), threshold=100, summarize=lambda _p: blank)
+            maybe_compact(msgs, "sys", MagicMock(), threshold=100, summarize=lambda _p: blank)
         assert info.value.reason == "empty_summary" and msgs == snapshot
 
 
@@ -200,7 +200,7 @@ class TestInvalidCandidateDisablesTheRun:
         bad = [{"role": "tool", "tool_call_id": "x", "content": "orphan"}, {"role": "user", "content": "u"}]
         called = []
         with pytest.raises(LLMPermanentError) as info:
-            maybe_compact(bad, "sys", 0, MagicMock(), threshold=1,
+            maybe_compact(bad, "sys", MagicMock(), threshold=1,
                           summarize=lambda p: called.append(p) or "s")
         assert not isinstance(info.value, CompactionFailedError) and called == []
 
@@ -222,14 +222,14 @@ class TestUnexpectedErrorsStayVisible:
             raise TypeError("bug")
 
         with pytest.raises(TypeError):
-            maybe_compact(_history(), "sys", 0, MagicMock(), threshold=100, summarize=broken)
+            maybe_compact(_history(), "sys", MagicMock(), threshold=100, summarize=broken)
 
     def test_provider_error_type_is_reported_as_a_label_only(self):
         def failing(_prompt):
             raise LLMError(f"secret {CANARY_BODY}")
 
         with pytest.raises(CompactionFailedError) as info:
-            maybe_compact(_history(), "sys", 0, MagicMock(), threshold=100, summarize=failing)
+            maybe_compact(_history(), "sys", MagicMock(), threshold=100, summarize=failing)
         assert info.value.reason == "summary_failed" and info.value.cause_type == "LLMError"
         assert CANARY_BODY not in str(info.value)
 
@@ -401,7 +401,7 @@ class TestCancellation:
             raise LLMCancelledError("cancelled")
 
         with pytest.raises(LLMCancelledError):
-            maybe_compact(_history(), "sys", 0, MagicMock(), threshold=100, summarize=cancelled)
+            maybe_compact(_history(), "sys", MagicMock(), threshold=100, summarize=cancelled)
 
     def test_loop_ends_through_cancellation_without_sending_the_main_request(self, caplog):
         event = threading.Event()

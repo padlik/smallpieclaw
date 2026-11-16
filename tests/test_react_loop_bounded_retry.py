@@ -532,9 +532,9 @@ def _cancelled_resume(tmp_path, *, enabled, mismatch=False, blocked=False, monke
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_pre_send_cancel_retires_saved_checkpoint_regardless_of_write_permission(tmp_path, enabled):
+def test_pre_send_cancel_preserves_saved_checkpoint_regardless_of_write_permission(tmp_path, enabled):
     try:
-        result, captured, attempt, path, owner, store, _ = _cancelled_resume(
+        result, captured, attempt, path, owner, store, checkpoint = _cancelled_resume(
             tmp_path, enabled=enabled
         )
         assert "[Cancelled]" in result or "stopped by operator" in result
@@ -542,7 +542,9 @@ def test_pre_send_cancel_retires_saved_checkpoint_regardless_of_write_permission
         assert attempt.outbound_attempts == 1
         assert attempt.manual_retries_used == 0
         assert attempt.manual_retry_authorized is True
-        assert not path.exists()
+        assert path.exists()
+        assert store.load(owner.trace_id, owner=owner) == checkpoint
+        assert store.recovery_available(owner.trace_id, owner) is True
         assert owner._released is False
     finally:
         owner.release()

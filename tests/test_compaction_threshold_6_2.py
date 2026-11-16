@@ -350,24 +350,6 @@ def test_summary_request_is_not_previewed_against_cached_limits() -> None:
     assert "earlier steps summarized" in json.dumps(state.messages)
 
 
-def test_guarded_first_request_is_not_rejected_by_cached_limits() -> None:
-    from unittest.mock import patch
-
-    import react_loop
-
-    requests: list[httpx.Request] = []
-    client = _llm("openai", _recorder(requests), _TINY)
-    try:
-        ctx, _state = _ctx_state(client, tools=False, images=False)
-        with patch("react_loop._build_system_prompt", return_value=("system " * 2000, None)):
-            staged = react_loop._stage_guarded_first_request(ctx, "GOAL", None, None)
-    finally:
-        client.close()
-    assert staged.rejected is False
-    assert staged.tool_defs and staged.system.startswith("system")
-    assert requests == []
-
-
 # --- D. snapshot contract ------------------------------------------------------------
 
 

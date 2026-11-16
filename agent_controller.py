@@ -34,7 +34,6 @@ from embedding_client import EmbeddingClient
 from exceptions import ConfigError
 from llm_client import LLMCancelledError, LLMClient, LLMEmptyResponseError, LLMError
 from model_registry import CatalogView, ModelRegistryError, RunModel
-from model_selection_guard import ConversationSelectionGuard, SelectionBudgetIdentity
 from memory_store import MemoryStore, extract_tools_used, save_task_outcome
 from prompt_loader import build_system_prompt as _build_system_prompt
 from prompt_builder import estimate_tokens as _estimate_tokens
@@ -375,10 +374,6 @@ class AgentController:
         # AgentController and BuiltinExecutor so that the context_profile tool
         # reads the same monitor the ReAct loop publishes to. See ADR-0022.
         self.context_monitor = context_monitor or ContextMonitor()
-        self._selection_guard = ConversationSelectionGuard()
-        if short_term is not None and short_term.get_messages():
-            # Injected history has unknown provenance: protect it until a request fits.
-            self._selection_guard.notify_history_restored(None)
 
     # ------------------------------------------------------------------
     # AgentConfig / ExecutorPaths accessors
@@ -702,21 +697,10 @@ class AgentController:
             # trace/agent/prompt_id.
             bind_run_context(trace=run_trace_id, agent=self.label, prompt_id=str(prompt_id) if prompt_id is not None else "")
 
-            identity_fn = getattr(run_llm, "selection_identity", None)
-            ticket = (
-                self._selection_guard.begin(identity_fn())
-                if callable(identity_fn) else None
-            )
-            guarded = ticket is not None and ticket.guarded
-
-            def install_run_scope() -> None:
-                if self.builtin_executor is not None and self._depth == 0:
-                    self.builtin_executor._coordinator = self._confirmation
-                    self.builtin_executor._current_prompt_id = prompt_id
-                    self._confirmation.grant_ledger.clear_prompt_scope(None)
-
-            if not guarded:
-                install_run_scope()
+            if self.builtin_executor is not None and self._depth == 0:
+                self.builtin_executor._coordinator = self._confirmation
+                self.builtin_executor._current_prompt_id = prompt_id
+                self._confirmation.grant_ledger.clear_prompt_scope(None)
             # ReactContext assembly is owned by the runtime (ADR-0007). This frontend
             # keeps only per-run concerns: trace minting (above), checkpoint
             # restoration, and progress/image passthrough. The LLM client is pinned.
@@ -729,12 +713,6 @@ class AgentController:
             if run_cancel_event is not None:
                 # A cancel during setup of this registered run event must survive react_loop's legacy clear().
                 ctx.owns_cancel_event = False
-            if ticket is not None:
-                ctx.on_accepted = lambda: self._selection_guard.complete(ticket)
-            if guarded:
-                ctx.guarded_first_request = True
-                ctx.activated = False
-                ctx.on_activate = install_run_scope
             ctx.checkpoint_owner = checkpoint_owner
             ctx.prompt_id = prompt_id
             ctx.milestone_notify_fn = milestone_notify_fn
@@ -751,7 +729,7 @@ class AgentController:
                 try:
                     if trace_bound:
                         run_llm.set_trace_id(prev_trace)
-                    if self.builtin_executor is not None and self._depth == 0 and ctx is not None and ctx.activated:
+                    if self.builtin_executor is not None and self._depth == 0 and ctx is not None:
                         # Idempotent fallback only: react_loop's finally is the canonical
                         # turn drain (with progress). Repeating it here is a no-op once
                         # the children are released and covers a loop that exited before
@@ -788,22 +766,6 @@ class AgentController:
                             raise
                         logger.error("run-owned LLM client close failed", exc_info=True)
 
-
-    def notify_manual_selection(self, identity: SelectionBudgetIdentity) -> None:
-        """Record a persisted manual model selection for the conversation guard."""
-        self._selection_guard.notify_manual_selection(identity)
-
-    def notify_history_restored(
-        self, selection: Optional[SelectionBudgetIdentity] = None
-    ) -> None:
-        """Record that conversation history was restored from an earlier selection."""
-        history = self.short_term.get_messages() if self.short_term is not None else []
-        self._selection_guard.notify_history_restored(selection, empty=not history)
-
-    @property
-    def selection_guard_armed(self) -> bool:
-        """Whether the next first request is previewed before any run effect."""
-        return self._selection_guard.armed
 
     def cancel(self) -> None:
         """Cancel the currently-running task(s). Safe to call from any thread.
@@ -1004,7 +966,6 @@ class AgentController:
             self.short_term.clear()
         # /reset clears both prompt and session grants (session lifetime boundary).
         self._confirmation.grant_ledger.clear_all()
-        self._selection_guard.reset()
         return msg
 
     def compress_context(self) -> str:

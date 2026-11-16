@@ -164,12 +164,6 @@ class _AttemptBoundFake:
         finally:
             self._attempt_binding = previous
 
-    def preview_request(self, messages, system=None, *, tools=None, json_mode=False,
-                        definition_revision=0):
-        from tests.execution_harness import DEFAULT_FAKE_METADATA, scripted_preview
-
-        return scripted_preview(DEFAULT_FAKE_METADATA, messages, system, tools, definition_revision)
-
     def _record_send(self):
         if self._attempt_binding is not None:
             state, manual = self._attempt_binding

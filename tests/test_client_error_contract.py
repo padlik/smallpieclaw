@@ -107,8 +107,6 @@ def test_http_context_overflow_keeps_only_safe_marker(adapter: str, status: int)
             _request(client)
         assert state.outbound_attempts == 1
         assert caught.value.status_code == status
-        assert caught.value.input_tokens is None
-        assert caught.value.repair_input_ceiling is None
         assert str(caught.value) == "Provider rejected request: context_length_exceeded"
         assert caught.value.__cause__ is None
         assert not hasattr(caught.value, "response") and not hasattr(caught.value, "request")
@@ -240,7 +238,7 @@ def test_ollama_sdk_request_errors_detach_original_request(
         client.close()
 
 
-def test_cancellation_and_preview_do_not_start_ollama_outbound_attempt() -> None:
+def test_cancellation_does_not_start_ollama_outbound_attempt() -> None:
     captured: list[httpx.Request] = []
     cancel = threading.Event()
     client = _client(
@@ -249,8 +247,6 @@ def test_cancellation_and_preview_do_not_start_ollama_outbound_attempt() -> None
         cancel_event=cancel,
     )
     state = CallAttemptState(1, 0)
-    preview = client.preview_request([{"role": "user", "content": "hello"}], tools=[])
-    assert preview.mode == "native"
     with client.bind_attempt(state):
         cancel.set()
         with pytest.raises(Exception, match="cancelled"):

@@ -675,9 +675,7 @@ def test_reset_closes_owned_client_before_persistence_and_keeps_order(world) -> 
     factory = _Factory(world)
     controller = world.controller_with(run_client_factory=factory)
     controller._confirmation.grant_ledger.add("file_write", "/tmp", GrantLifetime.SESSION)
-    controller.notify_history_restored(None)
     world.seed()
-    assert controller.selection_guard_armed
     before = world.state()
 
     msg = controller.reset_task(save=True)
@@ -693,7 +691,6 @@ def test_reset_closes_owned_client_before_persistence_and_keeps_order(world) -> 
     assert state["saved"] == ["conv-old.json"] and state["conv_id"] != "conv-old"
     assert state["stm"] == 0 and state["working"] is False
     assert controller._confirmation.grant_ledger.check("file_write", "/tmp") is False
-    assert controller.selection_guard_armed is False
 
 
 def test_reset_fallback_summary_is_first_300_chars_and_works_without_results_store(world) -> None:
@@ -716,15 +713,13 @@ def test_reset_fallback_summary_is_first_300_chars_and_works_without_results_sto
     assert msg == "✅ Task saved to results memory. Starting fresh context."
 
 
-def test_compress_truncates_input_closes_before_mutation_and_keeps_guard(world) -> None:
+def test_compress_truncates_input_and_closes_before_mutation(world) -> None:
     factory = _Factory(world)
     controller = world.controller_with(run_client_factory=factory)
     world.seed()
     world.short_term.clear()
     world.short_term.add("user", "x" * 1000)
     world.short_term.add("assistant", "ok")
-    controller.notify_history_restored(None)
-    assert controller.selection_guard_armed
     before = world.state()
 
     msg = controller.compress_context()
@@ -734,7 +729,7 @@ def test_compress_truncates_input_closes_before_mutation_and_keeps_guard(world) 
     assert world.log == ["factory", "request", "close"]
     assert world.close_snapshots[0] == before and before["stm"] == 2
     assert world.summary("compress") == f"[Compressed context summary]\nsummary-{HOST_A}"
-    assert msg.startswith("✅") and controller.selection_guard_armed is True
+    assert msg.startswith("✅")
 
 
 @pytest.mark.parametrize("op", OPS)

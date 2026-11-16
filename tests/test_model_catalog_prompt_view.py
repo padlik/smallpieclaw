@@ -27,11 +27,9 @@ from __future__ import annotations
 import copy
 import json
 import re
-from unittest.mock import patch
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable
 
 import pytest
 
@@ -634,22 +632,11 @@ class _FailingMCP:
 
 
 class _RecordingNativeLLM(NativeScriptedLLM):
-    """Records every preview and native dispatch (system + definitions)."""
+    """Record native dispatches with their system prompt and definitions."""
 
     def __init__(self, responses: list) -> None:
         super().__init__(responses)
-        self.previews: list[tuple[str | None, list | None]] = []
         self.dispatches: list[tuple[str | None, list | None]] = []
-        self.on_first_preview: Callable[[], None] | None = None
-
-    def preview_request(self, messages, system=None, *, tools=None, json_mode=False, definition_revision=0):
-        self.previews.append((system, copy.deepcopy(tools)))
-        hook, self.on_first_preview = self.on_first_preview, None
-        if hook is not None:
-            hook()
-        return super().preview_request(
-            messages, system, tools=tools, json_mode=json_mode, definition_revision=definition_revision
-        )
 
     def chat_with_tools_fallback(self, messages, tools, system=None, progress_cb=None):
         self.dispatches.append((system, copy.deepcopy(tools)))
@@ -728,13 +715,6 @@ def test_mcp_failure_fallback_keeps_the_view_in_builtin_definitions(meta_world: 
     assert meta_world.removed.id in _spawn_description(ctx._tool_defs)
 
 
-def test_strict_definition_build_propagates_mcp_failure(meta_world: _World) -> None:
-    ctx = _loop_ctx(ScriptedLLM([_FINISH]), meta_world.view, mcp_manager=_FailingMCP())
-
-    with pytest.raises(RuntimeError, match="mcp listing unavailable"):
-        _ensure_tool_defs(ctx, strict=True)
-
-
 # ---------------------------------------------------------------------------
 # Phase 2: replaced view invalidates cached definitions
 # ---------------------------------------------------------------------------
@@ -793,31 +773,8 @@ def test_next_run_with_replaced_view_reports_recomputed_definition_tokens(meta_w
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: guarded first request is one coherent bundle
+# Phase 2: request assembly uses one coherent catalog view
 # ---------------------------------------------------------------------------
-
-def test_guarded_first_request_dispatches_one_staged_captured_view(meta_world: _World) -> None:
-    import react_loop as react_loop_module
-
-    view_b = _other_pin_view(meta_world)
-    llm = _RecordingNativeLLM([ChatResponse(text=_FINISH)])
-    ctx = _loop_ctx(llm, meta_world.view, guarded_first_request=True)
-    real_stage = react_loop_module._stage_guarded_first_request
-
-    def stage_then_swap(*args, **kwargs):
-        staged = real_stage(*args, **kwargs)
-        ctx.model_catalog_view = view_b  # a swap between staging and the send
-        return staged
-
-    with patch.object(react_loop_module, "_stage_guarded_first_request", stage_then_swap):
-        assert react_loop(ctx, "goal") == "done"
-
-    assert ctx.model_catalog_view is view_b
-    assert llm.previews == [] and len(llm.dispatches) == 1
-    staged_system, staged_tools = llm.dispatches[0]
-    assert staged_system.count(_render(meta_world.view).strip()) == 1
-    assert meta_world.removed.id in _spawn_description(staged_tools)
-
 
 # ---------------------------------------------------------------------------
 # Review regression: unguarded request bundle uses the view captured at assembly

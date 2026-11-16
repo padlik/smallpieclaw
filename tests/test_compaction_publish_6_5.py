@@ -76,7 +76,7 @@ def _history():
 
 def _compact(messages, summarize, goal_idx=0):
     return maybe_compact(
-        messages, "sys", 0, MagicMock(), goal_idx=goal_idx, threshold=THRESHOLD,
+        messages, "sys", MagicMock(), goal_idx=goal_idx, threshold=THRESHOLD,
         summarize=summarize,
     )
 

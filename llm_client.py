@@ -22,14 +22,6 @@ from config_schema import AgentConfig
 from embedding_client import EmbeddingClient, EmbeddingUnavailableError
 from interfaces import ChatResponse, ProviderContext
 from model_registry import ModelMetadata, RunModel
-from model_request_budget import (
-    ModelRequestBudget,
-    ModelRequestBudgetError,
-    compute_request_budget,
-    ordinary_output_cap_required,
-    repair_input_ceiling,
-)
-from model_selection_guard import SelectionBudgetIdentity
 from providers import anthropic_provider, google_provider, ollama_provider, openai_provider
 from providers._errors import (
     LLMCancelledError,
@@ -44,7 +36,6 @@ from providers._utils import (
     is_context_overflow_message,
     provider_error_code,
 )
-from token_estimator import estimate_request_payload_tokens
 from token_usage import TokenUsageRegistry
 
 logger = logging.getLogger(__name__)
@@ -105,8 +96,6 @@ def _safe_llm_failure_category(exc: Exception) -> str:
         return "cancelled"
     if isinstance(exc, LLMEmptyResponseError):
         return "empty_response"
-    if isinstance(exc, ModelRequestBudgetError):
-        return f"budget_{exc.code}"
     if isinstance(exc, httpx.TimeoutException):
         return "timeout"
     if isinstance(exc, httpx.ConnectError):
@@ -124,21 +113,6 @@ def _safe_llm_failure_category(exc: Exception) -> str:
     return "provider_error"
 
 
-@dataclass(frozen=True)
-class RequestPreview:
-    """Sanitized final-wire estimate without payload, credentials, or endpoint."""
-
-    canonical_model_id: str
-    mode: str
-    input_tokens: int
-    hard_input_budget: int
-    output_cap: int | None
-    completion_reserve: int
-    assumed_context: bool
-    assumed_completion_reserve: bool
-    definition_revision: str | int | None
-    budget: ModelRequestBudget
-
 
 @dataclass
 class _AttemptBinding:
@@ -146,6 +120,11 @@ class _AttemptBinding:
     manual: bool
     definition_revision: str | int | None
     sent: bool = False
+    before_send: Callable[[], None] | None = None
+
+
+class CheckpointRetirementBlocked(RuntimeError):
+    """A saved checkpoint could not be retired before an outbound attempt."""
 
 
 @dataclass(frozen=True)
@@ -185,13 +164,6 @@ class _OllamaWireTransport(httpx.BaseTransport):
         self._inner.close()
 
 
-class _PreviewCaptured(Exception):
-    """Private control flow used only by the SDK-backed preview path."""
-
-    def __init__(self, preview: RequestPreview) -> None:
-        self.preview = preview
-        super().__init__("preview captured")
-
 
 class LLMClient:
     """One immutable admitted model and its matching provider connection."""
@@ -220,7 +192,6 @@ class LLMClient:
             self._validate_ollama_connection(run_model)
 
         self._run_model = run_model
-        self._ctx_max_tokens = int(agent_config.ctx_max_tokens)
         self._required_output_cap = int(agent_config.required_output_cap_tokens)
         self._max_retries = int(agent_config.max_retries)
         self._retry_delay = float(agent_config.retry_delay)
@@ -240,9 +211,6 @@ class LLMClient:
         )
         self._ollama_invocation_var: contextvars.ContextVar[_OllamaInvocation | None] = (
             contextvars.ContextVar(f"llm_client_ollama_invocation_{id(self)}", default=None)
-        )
-        self._preview_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
-            f"llm_client_preview_{id(self)}", default=False
         )
         self._usage_date = date.today()
         self._prompt_tokens = 0
@@ -317,30 +285,6 @@ class LLMClient:
     def metadata(self) -> ModelMetadata:
         """Return the immutable typed metadata of the pinned model."""
         return self._run_model.model.metadata
-
-    def selection_identity(self) -> SelectionBudgetIdentity:
-        """Return the sanitized budget identity of the pinned model for the guard."""
-        record = self._run_model.model
-        metadata = record.metadata
-        adapter = self._run_model.connection.adapter
-        try:
-            ceiling: int | None = repair_input_ceiling(
-                metadata,
-                local_context_tokens=self._ctx_max_tokens,
-                output_cap_required=ordinary_output_cap_required(adapter),
-                required_output_cap=self._required_output_cap,
-            )
-        except ModelRequestBudgetError:
-            ceiling = None
-        return SelectionBudgetIdentity(
-            model_id=record.id,
-            selection_revision=self._run_model.selection_revision,
-            adapter=adapter,
-            input_ceiling=ceiling,
-            assumed=metadata.context_tokens is None and metadata.input_tokens is None,
-            metadata=metadata,
-            local_context_tokens=self._ctx_max_tokens,
-        )
 
     @property
     def llm_cfg(self) -> dict[str, Any]:
@@ -419,11 +363,12 @@ class LLMClient:
         *,
         manual: bool = False,
         definition_revision: str | int = 0,
+        before_send: Callable[[], None] | None = None,
     ) -> Iterator[None]:
         """Bind one public invocation to its shared logical-request state."""
         if not isinstance(state, CallAttemptState):
             raise CallAttemptStateError("invalid_state", "state must be CallAttemptState")
-        binding = _AttemptBinding(state, manual, definition_revision)
+        binding = _AttemptBinding(state, manual, definition_revision, before_send=before_send)
         token = self._binding_var.set(binding)
         try:
             yield
@@ -613,11 +558,10 @@ class LLMClient:
         if binding.sent:
             raise LLMPermanentError("A public provider invocation may send only once")
         request = self._prepare_request(payload, mode)
-        if self._preview_var.get():
-            raise _PreviewCaptured(
-                self._preview_for_request(request, mode, binding.definition_revision)
-            )
         self._check_cancelled()
+        if binding.before_send is not None:
+            binding.before_send()
+            self._check_cancelled()
         binding.state.begin_outbound_attempt(mode, manual=binding.manual)
         binding.sent = True
         if self._http is None:
@@ -708,7 +652,8 @@ class LLMClient:
             self._apply_graph_policy(body, adapter, mode)
             return self._make_http_request(body, mode)
 
-        if ordinary_output_cap_required(adapter):
+        if adapter == "anthropic":
+            # Anthropic requires an explicit cap: send the configured one, never a derived limit.
             body["max_tokens"] = self._required_output_cap
         return self._make_http_request(body, mode)
 
@@ -757,56 +702,6 @@ class LLMClient:
             raise LLMPermanentError("Ollama route is provided by its SDK")
         parts = urlsplit(self._endpoint)
         return urlunsplit(parts._replace(path=f"{parts.path.rstrip('/')}{path}"))
-
-    def _estimate_wire_input(
-        self, request: httpx.Request, definition_revision: str | int | None
-    ) -> int:
-        try:
-            text = request.content.decode("utf-8")
-            return estimate_request_payload_tokens(
-                text,
-                model=self._run_model.model.upstream_id,
-                definition_revision=definition_revision,
-            )
-        except (UnicodeDecodeError, TypeError, ValueError):
-            raise LLMPermanentError("Provider request could not be estimated safely") from None
-
-    def _compute_budget(
-        self,
-        input_tokens: int,
-        *,
-        output_cap_required: bool,
-        fixed_output_cap: int | None,
-    ) -> ModelRequestBudget:
-        try:
-            return compute_request_budget(
-                self._run_model.model.metadata,
-                input_tokens=input_tokens,
-                local_context_tokens=self._ctx_max_tokens,
-                output_cap_required=output_cap_required,
-                fixed_output_cap=fixed_output_cap,
-                required_output_cap=self._required_output_cap,
-            )
-        except ModelRequestBudgetError as exc:
-            message = f"Provider request rejected by local budget ({exc.code})"
-            if exc.code in {"input_exceeds_budget", "no_input_budget"}:
-                try:
-                    ceiling = repair_input_ceiling(
-                        self._run_model.model.metadata,
-                        local_context_tokens=self._ctx_max_tokens,
-                        output_cap_required=output_cap_required,
-                        fixed_output_cap=fixed_output_cap,
-                        required_output_cap=self._required_output_cap,
-                    )
-                except ModelRequestBudgetError:
-                    ceiling = None
-                if ceiling is not None and input_tokens > ceiling:
-                    raise LLMContextOverflowError(
-                        message,
-                        input_tokens=input_tokens,
-                        repair_input_ceiling=ceiling,
-                    ) from None
-            raise LLMPermanentError(message) from None
 
     def _apply_graph_policy(self, payload: dict[str, Any], adapter: str, mode: str) -> None:
         policy = self._graph_policy
@@ -887,13 +782,9 @@ class LLMClient:
             extensions=dict(request.extensions),
         )
         self._check_cancelled()
-        if self._preview_var.get():
-            raise _PreviewCaptured(
-                self._preview_for_request(
-                    final_request, invocation.mode, binding.definition_revision
-                )
-            )
-
+        if binding.before_send is not None:
+            binding.before_send()
+            self._check_cancelled()
         binding.state.begin_outbound_attempt(invocation.mode, manual=binding.manual)
         binding.sent = True
         try:
@@ -911,72 +802,6 @@ class LLMClient:
                 "Provider connection failed", request=safe_request
             ) from None
         raise AssertionError("unreachable")
-
-    def _preview_for_request(
-        self,
-        request: httpx.Request,
-        mode: str,
-        definition_revision: str | int | None,
-    ) -> RequestPreview:
-        """Build a sanitized preview from the exact finalized HTTP request."""
-        input_tokens = self._estimate_wire_input(request, definition_revision)
-        fixed_cap = self._graph_policy.output_cap if self._graph_policy else None
-        required = (
-            ordinary_output_cap_required(self._run_model.connection.adapter) and fixed_cap is None
-        )
-        budget = self._compute_budget(
-            input_tokens,
-            output_cap_required=required,
-            fixed_output_cap=fixed_cap,
-        )
-        return RequestPreview(
-            canonical_model_id=self._run_model.model.id,
-            mode=mode,
-            input_tokens=input_tokens,
-            hard_input_budget=budget.hard_input_budget,
-            output_cap=budget.output_cap,
-            completion_reserve=budget.completion_reserve,
-            assumed_context=budget.assumed_context,
-            assumed_completion_reserve=budget.assumed_completion_reserve,
-            definition_revision=definition_revision,
-            budget=budget,
-        )
-
-    def preview_request(
-        self,
-        messages: list[dict],
-        system: str | None = None,
-        *,
-        tools: list[dict] | None = None,
-        json_mode: bool = False,
-        definition_revision: str | int = 0,
-    ) -> RequestPreview:
-        """Assemble and budget the final provider wire request without sending."""
-        if tools is not None and self._run_model.connection.adapter not in _NATIVE_TOOL_PROVIDERS:
-            raise NotImplementedError(
-                f"Native tool calling is unsupported for {self._run_model.connection.adapter}"
-            )
-        token = self._preview_var.set(True)
-        try:
-            try:
-                with self.bind_attempt(
-                    CallAttemptState(self._max_retries, self._retry_delay),
-                    definition_revision=definition_revision,
-                ):
-                    self._invoke_provider_bound(
-                        messages,
-                        system,
-                        tools=tools,
-                        json_mode=json_mode,
-                        mode="native" if tools is not None else "json",
-                    )
-            except _PreviewCaptured as captured:
-                return captured.preview
-            if self._run_model.connection.adapter == "ollama":
-                raise LLMPermanentError("Cloud Ollama preview did not reach its SDK request hook")
-            raise LLMPermanentError("Provider preview did not reach the final send gate")
-        finally:
-            self._preview_var.reset(token)
 
     def _track_usage(self, prompt: int, completion: int) -> None:
         today = date.today()

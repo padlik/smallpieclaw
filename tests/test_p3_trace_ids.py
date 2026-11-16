@@ -174,8 +174,6 @@ class TestReactLoopTraceLogging:
         llm.chat_with_fallback.return_value = '{"action": "finish", "result": "done"}'
         llm.chat_with_tools_fallback.side_effect = NotImplementedError("native tools not mocked")
         llm.llm_cfg = {"model": "test-model"}
-        from tests.execution_harness import attach_preview
-        attach_preview(llm)
         ctx = ReactContext(
             llm=llm, tool_index=MagicMock(), memory=MagicMock(), builtin_executor=None, mcp_manager=None, skill_registry=None,
             cancel_event=threading.Event(), label="main", trace_id="r-trace777",

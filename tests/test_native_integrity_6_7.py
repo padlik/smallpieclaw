@@ -4,8 +4,8 @@ Removing preview-fit gating must not remove protocol validation. Strict native-h
 validation runs before any send or compaction (enabled, disabled, below-threshold and
 no-eligible-middle paths alike) and fails with one fixed sanitized error before provider
 I/O; the wire model equals the pinned upstream ID; and the assembled tool schemas reach
-every adapter (including the real Ollama SDK) unchanged. ``preview_request`` and
-``_compute_budget`` are trapped to raise: no supported request path may consult them.
+every adapter (including the real Ollama SDK) unchanged. The retired preview and
+budget methods are absent, so no supported request path can consult them.
 
 Everything runs against the real pinned ``LLMClient`` over ``httpx.MockTransport``.
 """
@@ -29,7 +29,7 @@ from interfaces import ChatResponse
 from llm_client import LLMClient
 from model_registry import ModelMetadata
 from providers._errors import LLMPermanentError
-from react_loop import _LoopState, _prepare_request, _stage_guarded_first_request
+from react_loop import _LoopState, _prepare_request
 from tests.execution_harness import RecordingExecutor, build_context, run_react
 from tests.run_model_fixtures import make_run_model_client
 from tool_registry import Tool
@@ -175,30 +175,16 @@ class TestEveryPrepareStateFailsBeforeIO:
         assert SECRET not in str(info.value) + repr([r.__dict__ for r in caplog.records])
         assert not [r for r in caplog.records if "Automatic compaction failed" in r.getMessage()]
 
-    def test_guarded_first_request_staging_rejects_a_malformed_resume_state(self) -> None:
-        seen: list[str] = []
-        client = _recording_client(seen)
-        ctx = build_context(client, RecordingExecutor())
-        state = _LoopState(messages=_tag_secret(SHAPES["no-eligible-middle"]), goal_idx=0, max_steps=3)
-        try:
-            with pytest.raises(LLMPermanentError) as info:
-                _stage_guarded_first_request(ctx, "GOAL", None, state)
-        finally:
-            client.close()
-        assert seen == [] and SECRET not in str(info.value)
-
 
 # ---------------------------------------------------------------------------
 # C. No preview / fit / budget consult on any supported send path
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def gates_trapped(monkeypatch: pytest.MonkeyPatch) -> None:
-    def trapped(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("a preview/fit/budget gate was consulted on the send path")
-
-    monkeypatch.setattr(LLMClient, "preview_request", trapped)
-    monkeypatch.setattr(LLMClient, "_compute_budget", trapped)
+def gates_trapped() -> None:
+    """The preview/fit/budget gate no longer exists, so no send path can consult it."""
+    for name in ("preview_request", "_compute_budget", "_preview_for_request", "selection_identity"):
+        assert not hasattr(LLMClient, name), name
 
 
 METADATA = {

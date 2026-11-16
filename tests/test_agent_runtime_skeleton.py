@@ -479,7 +479,8 @@ class TestAgentRuntimeCreateSubAgent:
         caller_cfg = AgentConfig(
             agent_name="caller-agent", max_iterations=3, scheduled_max_iterations=55,
             tool_timeout=21, max_output_size=1234, top_tools=9,
-            ctx_max_tokens=23456, max_retries=7, retry_delay=0.25, max_subagents=2,
+            ctx_max_tokens=23456, compaction_threshold_tokens=12321,
+            required_output_cap_tokens=617, max_retries=7, retry_delay=0.25, max_subagents=2,
             subagent_result_timeout=45, long_run_warn_minutes=12,
             diagnose_empty_responses=True, default_model="pa/up/a",
             background_model="pb/up/b", fallback_models=["pb/up/b", "pa/up/a"],
@@ -513,7 +514,8 @@ class TestAgentRuntimeCreateSubAgent:
         assert runner._agent.plan_max_iterations == 17
         assert runner._agent.inactivity_warn_minutes == 4
         # Effective client settings come from the snapshot values.
-        assert runner._llm._ctx_max_tokens == snapshot["ctx_max_tokens"]
+        assert runner._agent.compaction_threshold_tokens == snapshot["compaction_threshold_tokens"]
+        assert runner._llm._required_output_cap == snapshot["required_output_cap_tokens"]
         assert runner._llm._max_retries == snapshot["max_retries"]
         assert runner._llm._retry_delay == snapshot["retry_delay"]
         assert runner._llm._diagnose_empty is True

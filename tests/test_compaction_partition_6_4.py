@@ -67,7 +67,7 @@ def _run(messages, goal_idx=0, **kw):
 
     snapshot = copy.deepcopy(messages)
     out, idx = maybe_compact(
-        messages, "sys", 0, MagicMock(), goal_idx=goal_idx, threshold=THRESHOLD,
+        messages, "sys", MagicMock(), goal_idx=goal_idx, threshold=THRESHOLD,
         summarize=summarize, **kw,
     )
     assert messages == snapshot, "input history must never be mutated"

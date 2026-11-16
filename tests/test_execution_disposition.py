@@ -33,7 +33,7 @@ from outcome_utils import (
     strip_execution,
     with_execution,
 )
-from react_loop import ToolTrace, _outcome_guard_eligible
+from react_loop import ToolTrace
 from sub_agent_registry import (
     SOURCE_ON_DEMAND,
     SubAgentRecord,
@@ -59,6 +59,11 @@ MARKER = "_execution_disposition"
 # ---------------------------------------------------------------------------
 # outcome_utils primitives
 # ---------------------------------------------------------------------------
+
+def _executed(outcome) -> bool:
+    """Whether a tool outcome's effective disposition is ``executed`` (the loop's usable-action test)."""
+    return effective_execution(outcome) == "executed"
+
 
 class TestMarkerPrimitives:
     def test_with_execution_copies_and_stamps(self):
@@ -88,15 +93,15 @@ class TestMarkerPrimitives:
     def test_vetoes_override_executed_marker_and_success(self, veto):
         outcome = with_execution({"success": True, **veto}, "executed")
         assert effective_execution(outcome) != "executed"
-        assert _outcome_guard_eligible(outcome) is False
+        assert _executed(outcome) is False
 
     @pytest.mark.parametrize("disposition", ["refused", "deferred", "cancelled"])
     def test_non_executed_overrides_success(self, disposition):
-        assert _outcome_guard_eligible(with_execution({"success": True}, disposition)) is False
+        assert _executed(with_execution({"success": True}, disposition)) is False
 
     def test_success_and_error_text_are_not_evidence(self):
-        assert _outcome_guard_eligible({"success": True, "output": "ok"}) is False
-        assert _outcome_guard_eligible({"success": False, "error": "boom"}) is False
+        assert _executed({"success": True, "output": "ok"}) is False
+        assert _executed({"success": False, "error": "boom"}) is False
 
     def test_consume_strips_marker(self):
         outcome, disposition = consume_execution(with_execution({"success": True}, "executed"))
@@ -247,7 +252,7 @@ class TestBuiltinProducerMatrix:
     def test_missing_args_or_collaborator_is_refused_even_with_success(self, world, tool):
         outcome = world.bare.execute(tool, {})
         assert read_execution(outcome) == "refused", (tool, outcome)
-        assert _outcome_guard_eligible(outcome) is False
+        assert _executed(outcome) is False
 
     def test_unknown_builtin_refused(self, world):
         assert read_execution(world.bare.execute("nope", {})) == "refused"
@@ -275,7 +280,7 @@ class TestBuiltinProducerMatrix:
         assert outcome["success"] is False
         assert outcome["exit_code"] == 2
         assert read_execution(outcome) == "executed"
-        assert _outcome_guard_eligible(outcome) is True
+        assert _executed(outcome) is True
 
     def test_empty_shell_command_refused_both_paths(self, world):
         with patch.object(shell_mod, "_spawn") as spawn:
@@ -284,7 +289,7 @@ class TestBuiltinProducerMatrix:
                 world.full._run("shell", {"command": ""}),
             ):
                 assert read_execution(outcome) == "refused"
-                assert _outcome_guard_eligible(outcome) is False
+                assert _executed(outcome) is False
         spawn.assert_not_called()
 
     @pytest.mark.parametrize("route", ["direct", "staged"])
@@ -305,7 +310,7 @@ class TestBuiltinProducerMatrix:
         if route == "staged":
             assert outcome["requires_confirmation"] is True
             assert read_execution(outcome) == "deferred"
-            assert _outcome_guard_eligible(outcome) is False
+            assert _executed(outcome) is False
             assert "send_file" not in outcome
             outcome = world.full.confirm(outcome["token"])
         else:
@@ -313,7 +318,7 @@ class TestBuiltinProducerMatrix:
         payload, disposition = consume_execution(outcome)
         assert disposition == "refused"
         assert effective_execution(outcome) == "refused"
-        assert _outcome_guard_eligible(outcome) is False
+        assert _executed(outcome) is False
         assert "send_file" not in outcome and "send_file" not in payload
         assert set(payload) == {"success", "output", "error", "exit_code"}
         assert payload["success"] is False
@@ -338,7 +343,7 @@ class TestBuiltinProducerMatrix:
         payload, disposition = consume_execution(outcome)
         assert disposition == "refused"
         assert effective_execution(outcome) == "refused"
-        assert _outcome_guard_eligible(outcome) is False
+        assert _executed(outcome) is False
         assert "send_file" not in outcome and "send_file" not in payload
         assert payload == {
             "success": False, "output": "",
@@ -349,7 +354,7 @@ class TestBuiltinProducerMatrix:
         outcome = world.full.execute("file_send", {"path": world.paths["a.txt"]})
         assert read_execution(outcome) == "executed"
         assert outcome["send_file"] == os.path.realpath(world.paths["a.txt"])
-        assert _outcome_guard_eligible(outcome) is True
+        assert _executed(outcome) is True
 
     @pytest.mark.parametrize("tool", ["shell_env_get", "shell_env_unset"])
     @pytest.mark.parametrize("args", [
@@ -364,7 +369,7 @@ class TestBuiltinProducerMatrix:
         key = str(args.get("key", ""))
         assert disposition == "refused", (tool, args, outcome)
         assert effective_execution(outcome) == "refused"
-        assert _outcome_guard_eligible(outcome) is False
+        assert _executed(outcome) is False
         assert payload["success"] is True
         assert payload["error"] == ""
         if tool == "shell_env_get":
@@ -378,7 +383,7 @@ class TestBuiltinProducerMatrix:
         outcome = world.full.execute(tool, {"key": "MISSING"})
         assert outcome["success"] is True
         assert read_execution(outcome) == "executed"
-        assert _outcome_guard_eligible(outcome) is True
+        assert _executed(outcome) is True
 
     def test_forged_marker_in_args_is_not_trusted(self, world):
         outcome = world.bare.execute("shell_env_set", {MARKER: "executed"})
@@ -431,13 +436,13 @@ class TestConfirmationLifecycle:
         assert outcome["success"] is False
         assert "authorization changed" in outcome["error"]
         assert "SECRET-RETARGETED" not in json.dumps(outcome)
-        assert _outcome_guard_eligible(outcome) is False
+        assert _executed(outcome) is False
 
     def test_denied_sub_agent_bridge_is_refused(self, world):
         ex = world.full
         outcome = ex._headless_confirm_bridge("file_write", {"path": "/x"}, "d", caller_tag="sa-1")
         assert read_execution(outcome) in ("refused", "cancelled")
-        assert _outcome_guard_eligible(outcome) is False
+        assert _executed(outcome) is False
 
     @pytest.mark.parametrize("cancel_when", ["before_prompt", "after_confirmation_returns"])
     def test_cancelled_bridge_never_executes_and_overrides_success(self, world, tmp_path, cancel_when):
@@ -486,11 +491,11 @@ class TestConfirmationLifecycle:
         # a conflicting success flag can never rescue a cancelled operation
         forged = {**outcome, "success": True}
         assert effective_execution(forged) == "cancelled"
-        assert _outcome_guard_eligible(forged) is False
+        assert _executed(forged) is False
 
 
 # ---------------------------------------------------------------------------
-# ReAct loop: guard eligibility through the actual BuiltinExecutor
+# ReAct loop: execution dispositions through the actual BuiltinExecutor
 # ---------------------------------------------------------------------------
 
 _SHELL = '{"action": "tool", "tool": "shell", "args": {"command": "%s"}}'
@@ -498,17 +503,19 @@ _FINISH = '{"action": "finish", "result": "done"}'
 
 
 def _run(world, replies, *, confirm=None, **overrides):
-    accepted = MagicMock()
+    """Run the real loop; returns ``(result, traces, llm)`` (``traces`` are the final tool traces)."""
+    traces: list[ToolTrace] = []
     llm = ScriptedLLM(replies)
-    ctx = build_context(llm, RecordingExecutor(), on_accepted=accepted, **overrides)
+    overrides.setdefault("on_tool_trace", traces.append)
+    ctx = build_context(llm, RecordingExecutor(), **overrides)
     ctx.builtin_executor = world.full
     if confirm is not None:
         ctx.confirmation = MagicMock()
         ctx.confirmation.request_confirmation.side_effect = confirm
     progress: list[str] = []
     with patch("react_loop._build_system_prompt", return_value=("sys", None)):
-        react_loop.react_loop(ctx, "goal", progress_callback=progress.append)
-    return accepted, llm
+        result = react_loop.react_loop(ctx, "goal", progress_callback=progress.append)
+    return result, traces, llm
 
 
 def _first_tool_state(world, action, confirm=None):
@@ -521,38 +528,32 @@ def _first_tool_state(world, action, confirm=None):
     return ctx, outcome
 
 
-class TestLoopGuardThroughRealExecutor:
-    def test_mocked_nonzero_exit_clears_guard(self, world):
+class TestLoopDispositionThroughRealExecutor:
+    def test_mocked_nonzero_exit_is_an_executed_disposition(self, world):
         failed = {"success": False, "output": "", "error": "exit 2", "exit_code": 2}
         with patch.object(world.full._shell, "_run_shell_subprocess", return_value=failed):
-            accepted, _ = _run(world, [_SHELL % "false", _FINISH])
-        accepted.assert_called_once()
+            result, traces, _ = _run(world, [_SHELL % "false", _FINISH])
+        assert result == "done"
+        assert [t.execution_disposition for t in traces] == ["executed"]
 
     def test_three_identical_empty_command_refusals_abort_before_finish(self, world):
         # The existing doom-loop policy aborts on the 3rd identical failure, so
-        # the trailing finish is never consumed and nothing clears the guard.
+        # the trailing finish is never consumed and no step is executed.
         with patch.object(world.full._shell, "_run_shell_subprocess") as subprocess_run:
-            accepted, llm = _run(world, [_SHELL % ""] * 3 + [_FINISH])
+            result, traces, llm = _run(world, [_SHELL % ""] * 3 + [_FINISH])
         subprocess_run.assert_not_called()
-        accepted.assert_not_called()
+        assert result != "done"
+        assert [t.execution_disposition for t in traces] == ["refused"] * 3
         assert len(llm.calls) == 3
 
-    def test_fewer_than_three_empty_command_refusals_then_valid_finish_clears_once(self, world):
-        order: list[int] = []
-        holder: dict = {}
-        accepted = MagicMock(side_effect=lambda *a, **k: order.append(len(holder["llm"].calls)))
+    def test_fewer_than_three_empty_command_refusals_then_valid_finish_completes(self, world):
         with patch.object(world.full._shell, "_run_shell_subprocess") as subprocess_run:
-            llm = ScriptedLLM([_SHELL % ""] * 2 + [_FINISH])
-            holder["llm"] = llm
-            ctx = build_context(llm, RecordingExecutor(), on_accepted=accepted)
-            ctx.builtin_executor = world.full
-            with patch("react_loop._build_system_prompt", return_value=("sys", None)):
-                react_loop.react_loop(ctx, "goal", progress_callback=lambda _m: None)
+            result, traces, llm = _run(world, [_SHELL % ""] * 2 + [_FINISH])
         subprocess_run.assert_not_called()
-        accepted.assert_called_once()
-        assert order == [3]  # acceptance happened only after the finish turn
+        assert result == "done" and len(llm.calls) == 3  # completion only after the finish turn
+        assert [t.execution_disposition for t in traces] == ["refused", "refused"]
 
-    def test_tool_step_alone_does_not_clear_when_refused(self, world):
+    def test_tool_step_alone_stays_refused_for_an_empty_command(self, world):
         seen = []
         ctx = build_context(ScriptedLLM([_SHELL % ""]), RecordingExecutor())
         ctx.builtin_executor = world.full
@@ -602,16 +603,16 @@ class TestLoopGuardThroughRealExecutor:
 
     def test_marker_never_reaches_wire_history_or_trace(self, world):
         traces: list[ToolTrace] = []
-        accepted, llm = _run(world, [_SHELL % "echo hi", _FINISH], on_tool_trace=traces.append)
-        accepted.assert_called_once()
+        result, _, llm = _run(world, [_SHELL % "echo hi", _FINISH], on_tool_trace=traces.append)
+        assert result == "done"
         for call in llm.calls:
             assert MARKER not in json.dumps(call.messages, default=str)
         assert [t.execution_disposition for t in traces] == ["executed"]
         assert MARKER not in repr(traces)
 
-    def test_valid_finish_still_accepted_without_tools(self, world):
-        accepted, _ = _run(world, [_FINISH])
-        accepted.assert_called_once()
+    def test_valid_finish_still_completes_without_tools(self, world):
+        result, traces, _ = _run(world, [_FINISH])
+        assert result == "done" and traces == []
 
 
 # ---------------------------------------------------------------------------
@@ -928,20 +929,18 @@ class TestPlanDisposition:
         msg, ok, flags = run_plan({"s1": lambda t, task: '{"success": true, "output": "x"}'})
         assert flags == ["unknown"]
 
-    def test_plan_action_drives_guard_by_derived_disposition(self, world):
+    def test_plan_action_then_finish_keeps_the_marker_off_the_wire(self, world):
         plan_action = json.dumps({"action": "plan", "plan": {
             "description": "d", "steps": [{"id": "s1", "tool": "shell", "args": {}}]}})
-        for behaviour, expected_calls in ((_ok, 1), (lambda t, task: '{"success": true}', 1)):
-            accepted = MagicMock()
+        for behaviour in (_ok, lambda t, task: '{"success": true}'):
             llm = ScriptedLLM([plan_action, _FINISH])
-            ctx = build_context(llm, RecordingExecutor(), on_accepted=accepted)
+            ctx = build_context(llm, RecordingExecutor())
             ctx.builtin_executor = SimpleNamespace(
                 _sub_agent_factory=_factory({"s1": behaviour}), is_builtin=lambda n: True,
             )
             with patch("react_loop._build_system_prompt", return_value=("sys", None)):
-                react_loop.react_loop(ctx, "goal", progress_callback=lambda _m: None)
-            # the valid finish clears the guard either way; plan alone is covered above
-            assert accepted.call_count == expected_calls
+                result = react_loop.react_loop(ctx, "goal", progress_callback=lambda _m: None)
+            assert result == "done"  # plan disposition alone is covered above
             for call in llm.calls:
                 assert MARKER not in json.dumps(call.messages, default=str)
 
@@ -1044,22 +1043,18 @@ def _mcp_manager(raw):
 
 
 def _run_mcp_auth(raw):
-    """Run the real loop (dispatch, final trace, accepted callback) over an MCP auth failure."""
+    """Run the real loop (dispatch, final trace) over an MCP auth failure."""
     traces: list[ToolTrace] = []
-    order: list[int] = []
-    holder: dict = {}
-    accepted = MagicMock(side_effect=lambda *a, **k: order.append(len(holder["llm"].calls)))
     llm = ScriptedLLM([_MCP_ACTION, _FINISH])
-    holder["llm"] = llm
     mgr = _mcp_manager(raw)
     ctx = build_context(
-        llm, RecordingExecutor(), on_accepted=accepted, on_tool_trace=traces.append,
+        llm, RecordingExecutor(), on_tool_trace=traces.append,
         builtin_executor=None, mcp_manager=mgr,
     )
     with patch("react_loop._build_system_prompt", return_value=("sys", None)):
         react_loop.react_loop(ctx, "goal", progress_callback=lambda _m: None)
     mgr.call_tool.assert_called_once()  # the MCP path really ran
-    return SimpleNamespace(traces=traces, order=order, accepted=accepted, mgr=mgr, llm=llm)
+    return SimpleNamespace(traces=traces, mgr=mgr, llm=llm)
 
 
 class TestMcpAuthTranslationKeepsEffectiveDisposition:
@@ -1072,7 +1067,7 @@ class TestMcpAuthTranslationKeepsEffectiveDisposition:
         translated = react_loop._handle_mcp_auth_failure(ctx, "t", _auth_raw(veto))
         assert "/mcp auth srv" in translated["error"]
         assert effective_execution(translated) == expected
-        assert _outcome_guard_eligible(translated) is False
+        assert _executed(translated) is False
 
     @pytest.mark.parametrize(("veto", "expected"), _AUTH_VETOES)
     def test_actual_dispatch_keeps_vetoed_disposition(self, veto, expected):
@@ -1086,35 +1081,27 @@ class TestMcpAuthTranslationKeepsEffectiveDisposition:
         assert effective_execution(outcome) == expected
 
     @pytest.mark.parametrize(("veto", "expected"), _AUTH_VETOES)
-    def test_final_trace_and_accepted_callback_keep_veto(self, veto, expected):
+    def test_final_trace_keeps_veto(self, veto, expected):
         run = _run_mcp_auth(_auth_raw(veto))
         run.mgr.mark_needs_auth.assert_called_once_with("srv")
         assert [t.execution_disposition for t in run.traces] == [expected]
         assert MARKER not in repr(run.traces)
         for call in run.llm.calls:
             assert MARKER not in json.dumps(call.messages, default=str)
-        # acceptance came only from the later valid finish, never from the vetoed tool step
-        run.accepted.assert_called_once()
-        assert run.order == [2]
 
-    def test_genuine_executed_sdk_error_remains_guard_eligible(self):
+    def test_genuine_executed_sdk_error_remains_executed(self):
         run = _run_mcp_auth(_auth_raw())
         run.mgr.mark_needs_auth.assert_called_once_with("srv")
         assert [t.execution_disposition for t in run.traces] == ["executed"]
         assert run.traces[0].success is False
-        run.accepted.assert_called_once()
-        assert run.order == [1]  # fired right after the tool step, before the finish turn
 
-    def test_unstamped_auth_failure_is_not_guard_eligible(self):
+    def test_unstamped_auth_failure_stays_unknown(self):
         run = _run_mcp_auth(_auth_raw(prior=None))
         assert [t.execution_disposition for t in run.traces] == ["unknown"]
-        run.accepted.assert_called_once()
-        assert run.order == [2]
 
     def test_predispatch_refusal_stays_refused_through_translation(self):
         run = _run_mcp_auth(_auth_raw(prior="refused"))
         assert [t.execution_disposition for t in run.traces] == ["refused"]
-        assert run.order == [2]
 
 
 class TestPersistenceExceptionsAreNotUsableOutcomes:
@@ -1146,11 +1133,9 @@ class TestPersistenceExceptionsAreNotUsableOutcomes:
     @pytest.mark.parametrize("method", sorted(_CASES))
     def test_exception_escapes_dispatch_without_accepting_or_tracing(self, world, method):
         exc, root = self._boom()
-        accepted = MagicMock()
         traces: list[ToolTrace] = []
         ctx = build_context(
-            ScriptedLLM([_FINISH]), RecordingExecutor(),
-            on_accepted=accepted, on_tool_trace=traces.append,
+            ScriptedLLM([_FINISH]), RecordingExecutor(), on_tool_trace=traces.append,
         )
         ctx.builtin_executor = world.full
         state = react_loop._LoopState(messages=[], goal_idx=0, max_steps=10)
@@ -1166,18 +1151,13 @@ class TestPersistenceExceptionsAreNotUsableOutcomes:
         assert info.value.__cause__ is root
         assert traces == []
         sink.assert_not_called()
-        assert state.guard_eligible is False and state.action_accepted is False
-        react_loop._fire_accepted(ctx, state)
-        accepted.assert_not_called()
-        assert ctx.on_accepted is accepted  # guard completion still pending
+        assert state.action_accepted is False
 
-    def test_returned_executed_failure_contrasts_as_eligible(self, world):
+    def test_returned_executed_failure_contrasts_as_an_accepted_action(self, world):
         failed = {"success": False, "output": "", "error": "exit 2", "exit_code": 2}
-        accepted = MagicMock()
         traces: list[ToolTrace] = []
         ctx = build_context(
-            ScriptedLLM([_FINISH]), RecordingExecutor(),
-            on_accepted=accepted, on_tool_trace=traces.append,
+            ScriptedLLM([_FINISH]), RecordingExecutor(), on_tool_trace=traces.append,
         )
         ctx.builtin_executor = world.full
         state = react_loop._LoopState(messages=[], goal_idx=0, max_steps=10)
@@ -1188,9 +1168,7 @@ class TestPersistenceExceptionsAreNotUsableOutcomes:
             )
         run.assert_called_once()
         assert [t.execution_disposition for t in traces] == ["executed"]
-        assert state.guard_eligible is True
-        react_loop._fire_accepted(ctx, state)
-        accepted.assert_called_once()
+        assert state.action_accepted is True
 
 
 # ---------------------------------------------------------------------------
@@ -1444,14 +1422,14 @@ class TestActualDispatchConfirmationTrace:
             assert traces == []  # no provisional trace while the request is pending
             return True
 
-        accepted, _ = _run(
+        result, _, _ = _run(
             world, [action, _FINISH], confirm=approve, on_tool_trace=traces.append,
         )
         assert len(asked) == 1
         assert target.read_text() == "x"
         assert [t.execution_disposition for t in traces] == ["executed"]
         assert traces[0].success is True
-        accepted.assert_called_once()
+        assert result == "done"
 
     def test_vision_confirmation_emits_one_final_executed_trace(self, tmp_path):
         image_path = "/unrecognised/pic.png"
@@ -1460,9 +1438,7 @@ class TestActualDispatchConfirmationTrace:
         llm = ScriptedLLM([action, _FINISH])
         llm.chat = MagicMock(return_value="A cat.")
         traces: list[ToolTrace] = []
-        accepted = MagicMock()
-        ctx = build_context(llm, RecordingExecutor(), on_accepted=accepted,
-                            on_tool_trace=traces.append)
+        ctx = build_context(llm, RecordingExecutor(), on_tool_trace=traces.append)
         stub = ctx.builtin_executor
 
         class _Executor(_VisionFakeExecutor):
@@ -1490,11 +1466,11 @@ class TestActualDispatchConfirmationTrace:
 
         with patch("react_loop._encode_images", return_value=["<b64>"]), \
                 patch("react_loop._build_system_prompt", return_value=("sys", None)):
-            react_loop.react_loop(ctx, "goal", progress_callback=lambda _m: None)
+            result = react_loop.react_loop(ctx, "goal", progress_callback=lambda _m: None)
 
         assert confirmation.last_call is not None
         assert confirmation.last_call[1] == "vision_query"
         llm.chat.assert_called_once()
         assert [t.execution_disposition for t in traces] == ["executed"]
         assert traces[0].success is True
-        accepted.assert_called_once()
+        assert result == "done"

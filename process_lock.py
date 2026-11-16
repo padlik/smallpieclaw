@@ -1,8 +1,7 @@
 """Exclusive agent PID-file lock shared by the daemon and offline tools.
 
-The daemon (``main.py``) and mutating maintenance tools such as
-``migrate_models.py --apply`` hold the same lock, so they can never run at the
-same time for one agent.
+The daemon (``main.py``) and any offline maintenance tool that mutates agent
+state hold the same lock, so they can never run at the same time for one agent.
 """
 
 from __future__ import annotations

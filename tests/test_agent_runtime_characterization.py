@@ -504,7 +504,6 @@ class TestSubAgentModelConfiguration:
             assert runner._agent.creativity_mode == "planner"
             assert runner._agent.plan_max_iterations == 17
             assert runner._agent.inactivity_warn_minutes == 4
-            assert runner._llm._ctx_max_tokens == snapshot["ctx_max_tokens"]
             assert runner._llm._max_retries == snapshot["max_retries"]
             assert runner._llm._retry_delay == snapshot["retry_delay"]
             assert runner._llm._diagnose_empty is True
@@ -580,7 +579,7 @@ class TestForwardedCancelEvent:
         )
         # Forwarded signal survives -> loop honors it and short-circuits.
         assert cancel.is_set()
-        assert result == "[Cancelled]"
+        assert result == "⚠️ Task stopped by operator."
 
     def test_react_loop_clears_owned_cancel(self):
         cancel = threading.Event()

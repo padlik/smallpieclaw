@@ -10,7 +10,6 @@ mutable state. This decouples the iteration logic from the controller class.
 from __future__ import annotations
 
 import base64
-import copy
 import hashlib
 import json
 import logging
@@ -44,9 +43,8 @@ from context_monitor import (
 from interfaces import ToolCall
 from call_attempt_state import CallAttemptState
 from checkpoint_store import CheckpointRetireStatus
-from llm_client import LLMClient, LLMCancelledError, LLMContextOverflowError, LLMEmptyResponseError, LLMError, LLMPermanentError, _encode_images
+from llm_client import CheckpointRetirementBlocked, LLMClient, LLMCancelledError, LLMContextOverflowError, LLMEmptyResponseError, LLMError, LLMPermanentError, _encode_images
 from prompt_builder import estimate_messages_tokens, estimate_tokens
-from model_selection_guard import GUARD_PREPARATION_FAILED_MESSAGE, GUARD_REJECTION_MESSAGE
 from memory_store import _summarize_result, extract_tools_used, save_task_outcome
 from outcome_utils import (
     consume_execution,
@@ -258,6 +256,7 @@ class ReactContext:
     trace_id: str = ""
     checkpoint_owner: object = None
     disk_recovery_available: bool = True
+    main_send_started: bool = False
 
     # Immutable identity for result ownership during one interactive run. It is
     # deliberately independent of trace_id because resumed runs reuse traces.
@@ -344,13 +343,6 @@ class ReactContext:
     # Shared, lock-free context-window profiler; injected from AgentController/main.py.
     context_monitor: ContextMonitor | None = None
 
-    # Conversation selection guard (set by AgentController for a guarded run).
-    # A guarded run stages its exact first request and defers every run effect
-    # until it fits; ``activated`` tells cleanup whether the run took effect.
-    guarded_first_request: bool = False
-    on_activate: Optional[Callable[[], None]] = None
-    on_accepted: Optional[Callable[[], None]] = None
-    activated: bool = True
 
     # Presentation-only sanitized catalog view (never the authoritative run
     # pin). A replacement applies at the next prompt/definition build.
@@ -680,9 +672,6 @@ class _LoopState:
     json_fail_streak: int = 0
     attempt_state: CallAttemptState | None = None
     action_accepted: bool = False
-    # Set only by dispatch of an actually executed, usable action; the guard's
-    # one-shot completion fires from this and never from action_accepted.
-    guard_eligible: bool = False
     operator_cancelled: bool = False
     # Set when an automatic compaction attempt fails; skips further automatic attempts
     # for this run only. Run state: a new run constructs a new _LoopState, and a resumed
@@ -972,31 +961,24 @@ def _publish_context_snapshot(
     ctx.context_monitor.publish(snapshot)
 
 
-_GRAPH_NOT_PREPARED = object()
 _VIEW_FROM_CONTEXT = object()
 
 
 def _assemble_system_prompt(
     ctx: ReactContext,
     user_goal: str,
-    graph_text: object = _GRAPH_NOT_PREPARED,
     *,
     model_catalog_view: object = _VIEW_FROM_CONTEXT,
 ) -> str:
     """Assemble the full system prompt string for a run.
 
     Scheduled-job history is never injected: it is job-owned, not operator
-    context (isolate-job-execution, design decision 2). A guarded run passes
-    ``graph_text`` (possibly empty) from its single read-only preparation; the
-    explicit sentinel, not truthiness, selects the ordinary retrieval path.
-    A guarded run likewise passes the ``model_catalog_view`` captured with its
-    staged definitions; otherwise ``ctx.model_catalog_view`` is presented.
+    context (isolate-job-execution, design decision 2). The request presents
+    ``model_catalog_view`` when given, otherwise ``ctx.model_catalog_view``.
     """
     view = ctx.model_catalog_view if model_catalog_view is _VIEW_FROM_CONTEXT else model_catalog_view
     _graph_context_section = ""
-    if graph_text is not _GRAPH_NOT_PREPARED:
-        _graph_context_section = graph_text if isinstance(graph_text, str) else ""
-    elif ctx.graph_memory is not None:
+    if ctx.graph_memory is not None:
         try:
             _graph_context_section = (
                 ctx.graph_memory.format_for_prompt(
@@ -1073,15 +1055,12 @@ def _init_messages(
 def _ensure_tool_defs(
     ctx: ReactContext,
     *,
-    strict: bool = False,
     model_catalog_view: object = _VIEW_FROM_CONTEXT,
 ) -> None:
     """Lazily build _tool_defs if not populated for the requested catalog view.
 
-    ``strict`` (guarded staging) propagates a build failure instead of silently
-    dropping MCP schemas. ``model_catalog_view`` is the view captured for the
-    request (an explicit ``None`` included); by default ``ctx.model_catalog_view``
-    is read. Cached definitions are rebuilt when that view differs from the
+    ``model_catalog_view`` is the view captured for the request (an explicit
+    ``None`` included); by default ``ctx.model_catalog_view`` is read. Cached definitions are rebuilt when that view differs from the
     view they were built with; a rebuild also drops the dependent per-run token
     grouping cache (the definition revision is a digest of ``_tool_defs`` and
     follows it).
@@ -1097,8 +1076,6 @@ def _ensure_tool_defs(
             mcp_manager=ctx.mcp_manager, **view_kwargs,
         )
     except Exception as _btd_exc:  # noqa: BLE001
-        if strict:
-            raise
         # The exception text may carry provider/MCP credentials; log only its type.
         logger.warning(
             "build_tool_definitions failed (%s) — MCP tools skipped", type(_btd_exc).__name__,
@@ -1275,7 +1252,7 @@ def _prepare_request(
     ) + tool_defs_tokens
     try:
         compacted, goal_idx = maybe_compact(
-            state.messages, system, ctx.compaction_threshold_tokens, ctx.llm,
+            state.messages, system, ctx.llm,
             goal_idx=state.goal_idx, input_tokens=total,
             threshold=ctx.compaction_threshold_tokens, summarize=summarize,
         )
@@ -1314,10 +1291,24 @@ def _request_turn(
     native = bool(ctx._tool_defs and supports_native_fallback and attempt.mode == "native")
     manual_call = False
     empty_count = 0
+
+    def retire_before_send() -> None:
+        """Retire an admitted snapshot only after preparation, at the send gate."""
+        if ctx.cancel_event.is_set():
+            raise LLMCancelledError("cancelled")
+        retirement = ctx.checkpoint_store.retire_pending(ctx.trace_id, ctx.checkpoint_owner)
+        if retirement.status is CheckpointRetireStatus.BLOCKED:
+            ctx.disk_recovery_available = False
+            raise CheckpointRetirementBlocked(retirement.message)
+        ctx.disk_recovery_available = False
+        ctx.main_send_started = True
+
     while True:
         if ctx.cancel_event.is_set():
             return _Turn([], "", False, "[Cancelled]")
-        if ctx.checkpoint_store is not None and ctx.checkpoint_owner is not None:
+        # Scripted clients keep the legacy pre-call gate; real clients retire
+        # at their transport send gate after wire/schema preparation succeeds.
+        if ctx.checkpoint_store is not None and ctx.checkpoint_owner is not None and not isinstance(ctx.llm, LLMClient):
             retirement = ctx.checkpoint_store.retire_pending(
                 ctx.trace_id, ctx.checkpoint_owner
             )
@@ -1325,12 +1316,19 @@ def _request_turn(
                 ctx.disk_recovery_available = False
                 return _Turn([], "", False, retirement.message)
             ctx.disk_recovery_available = False
+            ctx.main_send_started = True
         manual_call = attempt.manual_retry_authorized
         bind = getattr(ctx.llm, "bind_attempt", None)
         has_transport_binding = callable(bind)
         definition_revision = _definition_revision(ctx)
+        before_send = (
+            {"before_send": retire_before_send}
+            if isinstance(ctx.llm, LLMClient)
+            and ctx.checkpoint_store is not None
+            and ctx.checkpoint_owner is not None else {}
+        )
         binding = (
-            bind(attempt, manual=manual_call, definition_revision=definition_revision)
+            bind(attempt, manual=manual_call, definition_revision=definition_revision, **before_send)
             if has_transport_binding else nullcontext()
         )
 
@@ -1379,6 +1377,8 @@ def _request_turn(
         except LLMCancelledError:
             logger.info("Agent LLM call cancelled at step %d", state.step)
             return _Turn([], "", False, "[Cancelled]")
+        except CheckpointRetirementBlocked as exc:
+            return _Turn([], "", False, str(exc))
         except NotImplementedError:
             # A native implementation that reports unsupported after sending is
             # not eligible for protocol conversion.
@@ -1434,33 +1434,6 @@ def _result_sink(
     return lambda content: state.messages.append({"role": "user", "content": content})
 
 
-def _outcome_guard_eligible(outcome: dict) -> bool:
-    """Return whether a tool outcome carries local proof the action executed.
-
-    Only an explicit ``executed`` marker stamped by the producing boundary
-    qualifies; success flags and error strings are never evidence. Refusals,
-    staged confirmations and operator cancellations veto a conflicting marker.
-    """
-    return effective_execution(outcome) == "executed"
-
-
-def _fire_accepted(ctx: ReactContext, state: _LoopState) -> None:
-    """Run the guard's one-shot completion after a usable, uncancelled dispatch."""
-    callback = ctx.on_accepted
-    if (
-        callback is None
-        or not state.guard_eligible
-        or state.operator_cancelled
-        or ctx.cancel_event.is_set()
-    ):
-        return
-    ctx.on_accepted = None
-    try:
-        callback()
-    except Exception:  # noqa: BLE001
-        logger.warning("selection guard completion failed", exc_info=True)
-
-
 def _dispatch_action(
     ctx: ReactContext,
     action_obj: dict,
@@ -1493,7 +1466,6 @@ def _dispatch_action(
                 return None
         result = _finish_run(ctx, action_obj, user_goal)
         state.action_accepted = True
-        state.guard_eligible = True
         return result
 
     if action == "tool":
@@ -1528,7 +1500,6 @@ def _dispatch_action(
         progress(f"__TOOL_END__:{_end_status}:{tool_name}\n{fmt_tool_result_progress(tool_name, args, outcome)}")
         sink(tool_result)
         state.action_accepted = True
-        state.guard_eligible = disposition == "executed"
 
         if tool_name in ("get_agent_result", "wait_for_any_agent"):
             status = outcome.get("status")
@@ -1596,7 +1567,6 @@ def _dispatch_action(
             state.max_steps = max(state.step, min(int(new_max_steps), _ABSOLUTE_PLAN_CEILING))
         sink(result_msg)
         state.action_accepted = True
-        state.guard_eligible = plan_disposition[-1] == "executed"
         if ctx.cancel_event.is_set():
             state.operator_cancelled = True
         return None
@@ -1708,14 +1678,12 @@ def _run_single_step(
         return _StepResult(early_return=err_msg)
 
     state.action_accepted = False
-    state.guard_eligible = False
     final = _dispatch_action(
         ctx, action_obj, sink, state, user_goal, run_start, progress,
     )
     if final is not None:
         if state.action_accepted:
             state.attempt_state = None
-        _fire_accepted(ctx, state)
         try:
             _publish_context_snapshot(
                 ctx, state, system,
@@ -1729,7 +1697,6 @@ def _run_single_step(
     # its result. Corrective refusals such as finish-veto keep the request alive.
     if state.action_accepted:
         state.attempt_state = None
-    _fire_accepted(ctx, state)
 
     if state.operator_cancelled:
         return _StepResult(should_continue=False)
@@ -1785,71 +1752,6 @@ def _register_turn(ctx: ReactContext) -> None:
         supervisor.register_active_turn(ctx.turn_id)
 
 
-@dataclass
-class _StagedFirstRequest:
-    """Frozen first-request bundle of a guarded run; built with no run effects."""
-
-    rejected: bool = False
-    system: str = ""
-    messages: list = field(default_factory=list)
-    goal_idx: int = 0
-    tool_defs: Optional[list] = None
-    graph_commit: Optional[Callable[[], None]] = None
-    graph_injected: bool = False
-
-
-def _stage_guarded_first_request(
-    ctx: ReactContext,
-    user_goal: str,
-    images: Optional[list[str]],
-    initial_state: Optional[_LoopState],
-
-) -> _StagedFirstRequest:
-    """Stage the exact first request without side effects.
-
-    Nothing is previewed or size-checked against cached model limits, so staging
-    never rejects; malformed native history and tool-definition build failures
-    still raise to the caller.
-    """
-    if initial_state is not None:
-        messages = copy.deepcopy(initial_state.messages)
-        goal_idx = initial_state.goal_idx
-    else:
-        messages, goal_idx = _init_messages(ctx, user_goal, images)
-        messages = copy.deepcopy(messages)
-
-    validate_native_history(messages)
-    ctx._tool_defs = None
-    _ensure_tool_defs(ctx, strict=True)
-    tool_defs = copy.deepcopy(ctx._tool_defs)
-    ctx._tool_defs = tool_defs
-    # One presentation view for the whole bundle: the prompt uses the view the
-    # staged definitions were built with, even if ctx's view is later replaced.
-    staged_view = ctx._tool_defs_view
-
-    graph_text = ""
-    graph_commit: Optional[Callable[[], None]] = None
-    if ctx.graph_memory is not None:
-        try:
-            prepared = ctx.graph_memory.prepare_for_prompt(
-                user_goal, max_entries=ctx.graph_memory_max_entries
-            )
-            text = prepared.text
-            graph_text = text if isinstance(text, str) else ""
-            graph_commit = prepared.commit_metrics
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Graph memory preparation failed: %s", type(exc).__name__)
-            graph_text, graph_commit = "", None
-    system = _assemble_system_prompt(
-        ctx, user_goal, graph_text, model_catalog_view=staged_view
-    )
-
-    return _StagedFirstRequest(
-        system=system, messages=messages, goal_idx=goal_idx, tool_defs=tool_defs,
-        graph_commit=graph_commit, graph_injected=bool(graph_text),
-    )
-
-
 def _react_loop_owned(
     ctx: ReactContext,
     user_goal: str,
@@ -1872,6 +1774,7 @@ def _react_loop_owned(
         logger.debug("Agent progress: %s", msg)
 
     state = None
+    cancelled_before_request = False
     try:
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
@@ -1880,48 +1783,26 @@ def _react_loop_owned(
             ctx.llm.chat_with_tools_fallback
         )
 
-        graph_commit: Optional[Callable[[], None]] = None
-        if ctx.guarded_first_request:
-            if ctx.cancel_event.is_set():
-                return "⚠️ Task stopped by operator."
-            try:
-                staged = _stage_guarded_first_request(
-                    ctx, user_goal, images, initial_state
-                )
-            except LLMCancelledError:
-                return "⚠️ Task stopped by operator."
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Guarded request preparation failed: %s", type(exc).__name__)
-                return GUARD_PREPARATION_FAILED_MESSAGE
-            if staged.rejected:
-                return GUARD_REJECTION_MESSAGE
-            if ctx.cancel_event.is_set():
-                return "⚠️ Task stopped by operator."
-            graph_commit = staged.graph_commit
-            if ctx.on_activate is not None:
-                ctx.on_activate()
-            ctx.activated = True
-            system = staged.system
-            messages, goal_idx = staged.messages, staged.goal_idx
-            ctx._tool_defs = staged.tool_defs
-            request_view = ctx._tool_defs_view  # view the staged bundle was built with
-            _register_turn(ctx)
-        else:
-            _register_turn(ctx)
-            ctx._tool_defs = None
-            system = messages = goal_idx = None  # assigned below
-            # One presentation view per request bundle: a replacement made by a
-            # collaborator during assembly applies at the next run.
-            request_view = ctx.model_catalog_view
+        _register_turn(ctx)
+        if ctx.cancel_event.is_set():
+            cancelled_before_request = True
+            return "⚠️ Task stopped by operator."
+        ctx._tool_defs = None
+        system = messages = goal_idx = None  # assigned below
+        # One presentation view per request bundle: a replacement made by a
+        # collaborator during assembly applies at the next run.
+        request_view = ctx.model_catalog_view
 
         if ctx.working:
             ctx.working.start_task(user_goal)
 
-        if not ctx.guarded_first_request:
-            system = _assemble_system_prompt(
-                ctx, user_goal, model_catalog_view=request_view
-            )
-            messages, goal_idx = _init_messages(ctx, user_goal, images)
+        system = _assemble_system_prompt(
+            ctx, user_goal, model_catalog_view=request_view
+        )
+        if ctx.cancel_event.is_set():
+            cancelled_before_request = True
+            return "⚠️ Task stopped by operator."
+        messages, goal_idx = _init_messages(ctx, user_goal, images)
         ctx.memory.record_event(f"User request: {user_goal[:100]}")
 
         if ctx.graph_memory_writer is not None:
@@ -1930,18 +1811,7 @@ def _react_loop_owned(
             except Exception as _gw_exc:  # noqa: BLE001
                 logger.debug("Graph memory enqueue failed: %s", _gw_exc)
 
-        if graph_commit is not None:
-            try:
-                graph_commit()
-            except Exception as _gc_exc:  # noqa: BLE001
-                logger.debug("Graph metrics commit failed: %s", type(_gc_exc).__name__)
-            if ctx.guarded_first_request and staged.graph_injected:
-                logger.info("Graph memory context injected")
-
-        # A guarded run dispatches its staged bundle as-is: a catalog view
-        # replaced during staging must not retarget the staged definitions.
-        if not ctx.guarded_first_request or ctx._tool_defs is None:
-            _ensure_tool_defs(ctx, model_catalog_view=request_view)
+        _ensure_tool_defs(ctx, model_catalog_view=request_view)
 
         if initial_state is not None:
             state = initial_state
@@ -1985,10 +1855,11 @@ def _react_loop_owned(
         return "⚠️ Task stopped by operator."
     finally:
         if (
-            ctx.activated
-            and ctx.cancel_event.is_set()
+            ctx.cancel_event.is_set()
+            and not cancelled_before_request
             and ctx.checkpoint_store is not None
             and (ctx.checkpoint_enabled or ctx.checkpoint_owner is not None)
+            and (ctx.checkpoint_owner is None or ctx.main_send_started)
         ):
             try:
                 if ctx.checkpoint_owner is None:
@@ -2004,7 +1875,7 @@ def _react_loop_owned(
         # callbacks remain processable. AgentController.run repeats the drain
         # as an idempotent fallback (see there); it must stay a no-op after this.
         supervisor = getattr(ctx.builtin_executor, "_supervisor", None)
-        if ctx.depth == 0 and supervisor is not None and ctx.activated:
+        if ctx.depth == 0 and supervisor is not None:
             try:
                 draining = supervisor.draining_children(ctx.turn_id)
                 if draining:

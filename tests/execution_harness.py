@@ -31,46 +31,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import patch
 
-import json
 
-from llm_client import LLMClient, RequestPreview
+from llm_client import LLMClient
 from call_attempt_state import CallAttemptState
 from model_registry import ModelMetadata
-from model_request_budget import compute_request_budget
-from prompt_builder import estimate_messages_tokens
 from react_loop import ReactContext, react_loop
 
 DEFAULT_FAKE_METADATA = ModelMetadata(context_tokens=1_000_000, output_tokens=4_096)
-
-
-def scripted_preview(
-    metadata: ModelMetadata,
-    messages: list,
-    system: Optional[str],
-    tools: Optional[list],
-    definition_revision,
-) -> RequestPreview:
-    """Typed preview for a fake client: real estimator, real budget compute."""
-    tokens = estimate_messages_tokens(messages, system or "")
-    if tools:
-        tokens += estimate_messages_tokens(
-            [{"role": "user", "content": json.dumps(tools, sort_keys=True)}], ""
-        )
-    budget = compute_request_budget(
-        metadata, input_tokens=tokens, local_context_tokens=100_000
-    )
-    return RequestPreview(
-        canonical_model_id="test/model",
-        mode="native" if tools else "json",
-        input_tokens=tokens,
-        hard_input_budget=budget.hard_input_budget,
-        output_cap=budget.output_cap,
-        completion_reserve=budget.completion_reserve,
-        assumed_context=budget.assumed_context,
-        assumed_completion_reserve=budget.assumed_completion_reserve,
-        definition_revision=definition_revision,
-        budget=budget,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -86,17 +53,6 @@ def make_outcome(success: bool = True, output: str = "", error: str = "",
 # ---------------------------------------------------------------------------
 # Scripted LLM
 # ---------------------------------------------------------------------------
-
-def attach_preview(llm, metadata: ModelMetadata | None = None):
-    """Give a MagicMock client a typed ``preview_request`` and ``metadata``."""
-    meta = metadata or DEFAULT_FAKE_METADATA
-    llm.metadata = meta
-    llm.preview_request.side_effect = (
-        lambda messages, system=None, *, tools=None, json_mode=False, definition_revision=0:
-        scripted_preview(meta, messages, system, tools, definition_revision)
-    )
-    return llm
-
 
 @dataclass
 class LLMCall:
@@ -162,10 +118,6 @@ class ScriptedLLM:
         response = self._next()
         self._count_attempt("json")
         return response
-
-    def preview_request(self, messages, system=None, *, tools=None, json_mode=False,
-                        definition_revision=0) -> RequestPreview:
-        return scripted_preview(self.metadata, messages, system, tools, definition_revision)
 
     # Compaction path (only used if a scenario forces compaction).
     def chat(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
@@ -237,10 +189,6 @@ class NativeScriptedLLM(LLMClient):
     @property
     def metadata(self) -> ModelMetadata:
         return self._fake_metadata
-
-    def preview_request(self, messages, system=None, *, tools=None, json_mode=False,
-                        definition_revision=0) -> RequestPreview:
-        return scripted_preview(self._fake_metadata, messages, system, tools, definition_revision)
 
     def set_trace_id(self, trace_id: str | None = None) -> None:
         # Base LLMClient.set_trace_id writes through a context-local property

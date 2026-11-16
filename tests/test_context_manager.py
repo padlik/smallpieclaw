@@ -83,7 +83,7 @@ class TestMaybeCompact:
                              lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10)
         llm = MagicMock()
         llm.chat.return_value = "• summarized steps"
-        out, _ = maybe_compact(msgs, "system", 100_000, llm)
+        out, _ = maybe_compact(msgs, "system", llm, threshold=100_000)
         # First message (goal) preserved.
         assert out[0]["content"] == "GOAL: do the big task"
         # Summary message injected.
@@ -141,7 +141,7 @@ class TestGoalDriftRegression:
         llm = MagicMock()
         llm.chat.return_value = "• summarized prior steps"
 
-        out, _ = maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx)
+        out, _ = maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=100_000)
 
         goal_msgs = [
             m for m in out
@@ -162,7 +162,7 @@ class TestGoalDriftRegression:
         llm = MagicMock()
         llm.chat.return_value = "• summary"
 
-        out, _ = maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx)
+        out, _ = maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=100_000)
 
         # The first preserved message in the output must be the current goal,
         # not the stale "old goal 0" from short-term history.
@@ -187,7 +187,7 @@ class TestGoalDriftRegression:
         llm.chat.return_value = "• summary"
 
         # No goal_idx → default 0 → messages[0] is the stale "old goal 0"
-        out, _ = maybe_compact(msgs, "system", 100_000, llm)
+        out, _ = maybe_compact(msgs, "system", llm, threshold=100_000)
 
         assert "old goal 0" in out[0]["content"], (
             "With goal_idx=0 (default), the stale short-term message is preserved as first"
@@ -215,7 +215,7 @@ class TestGoalDriftRegression:
         llm = MagicMock()
         llm.chat.return_value = "• summary"
 
-        out, _ = maybe_compact(msgs, "system", 100_000, llm, goal_idx=0)
+        out, _ = maybe_compact(msgs, "system", llm, goal_idx=0, threshold=100_000)
 
         assert out[0]["content"] == "GOAL: do something", (
             "With goal_idx=0 and no prior history, the goal message must remain first"
@@ -274,7 +274,7 @@ class TestRepeatedCompactionRegression:
         msgs, goal_idx = self._make_initial_messages()
 
         # --- First compaction (mirrors react_loop step N) ---
-        compacted, goal_idx = maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx)
+        compacted, goal_idx = maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=100_000)
         assert len(compacted) < len(msgs), (
             "First compaction should have fired to produce a shorter list"
         )
@@ -289,7 +289,7 @@ class TestRepeatedCompactionRegression:
             msgs.append(_msg("user", f"post-compact result {i}\n" + "r" * 4000))
 
         # --- Second compaction (mirrors react_loop step M > N) ---
-        compacted2, goal_idx = maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx)
+        compacted2, goal_idx = maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=100_000)
         assert len(compacted2) < len(msgs), (
             "Second compaction should also fire after more steps were added"
         )
@@ -328,7 +328,7 @@ class TestRepeatedCompactionRegression:
         ]
         goal_idx = len(msgs) - 1  # last index
 
-        compacted, goal_idx = maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx)
+        compacted, goal_idx = maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=100_000)
         assert len(compacted) < len(msgs)
         # Clamped into the tail — NOT the naive 0 the old heuristic would have used.
         assert goal_idx != 0
@@ -344,7 +344,7 @@ class TestRepeatedCompactionRegression:
             msgs.append(_msg("assistant", f"action {i} " + "p" * 2000))
             msgs.append(_msg("user", f"result {i}\n" + "r" * 4000))
 
-        compacted2, goal_idx = maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx)
+        compacted2, goal_idx = maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=100_000)
         assert "CURRENT GOAL" in compacted2[goal_idx]["content"], (
             f"Goal must stay anchored via the returned index (no drift); got "
             f"{compacted2[goal_idx]['content'][:80]!r}"
@@ -376,7 +376,7 @@ class TestRepeatedCompactionRegression:
         ]
         goal_idx = 1
 
-        compacted, goal_idx = maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx)
+        compacted, goal_idx = maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=100_000)
         # Length is unchanged: the old `<` guard would have skipped the reset here.
         assert len(compacted) == len(msgs) == 4
         # The returned index still locates the goal precisely.
@@ -389,7 +389,7 @@ class TestRepeatedCompactionRegression:
             msgs.append(_msg("assistant", f"action {i} " + "p" * 2000))
             msgs.append(_msg("user", f"result {i}\n" + "r" * 4000))
 
-        compacted2, goal_idx = maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx)
+        compacted2, goal_idx = maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=100_000)
         assert "CURRENT GOAL" in compacted2[goal_idx]["content"], (
             f"Goal must stay anchored after the n==4 boundary compaction; got "
             f"{compacted2[goal_idx]['content'][:80]!r}"
@@ -415,7 +415,7 @@ class TestBackwardCompatibility:
         llm = MagicMock()
         llm.llm_cfg = {"context_window": 8192, "max_tokens": 1024}
 
-        out, _ = maybe_compact(msgs, "system", 8192, llm)
+        out, _ = maybe_compact(msgs, "system", llm, threshold=8192)
 
         assert out is msgs
         llm.chat.assert_not_called()
@@ -492,8 +492,8 @@ class TestGoalPreserved:
     HUGE = "GOAL " + "g" * 60_000
 
     @pytest.mark.parametrize("n_history", [0, 1, 6])
-    @pytest.mark.parametrize("forced", [False, True])
-    def test_huge_goal_unchanged_on_every_path(self, monkeypatch, n_history, forced):
+    @pytest.mark.parametrize("threshold", [500, 4000])
+    def test_huge_goal_unchanged_on_every_path(self, monkeypatch, n_history, threshold):
         monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
         goal = {"role": "user", "content": self.HUGE, "extra": {"k": [1, 2]}}
         msgs = [goal]
@@ -503,8 +503,7 @@ class TestGoalPreserved:
         before = copy.deepcopy(msgs)
         llm = MagicMock()
         llm.chat.return_value = "- s"
-        kwargs = dict(force=True, repair_target=500, input_tokens=_char_estimate(msgs, "")) if forced else {}
-        out, idx = maybe_compact(msgs, "system", 4000, llm, **kwargs)
+        out, idx = maybe_compact(msgs, "system", llm, threshold=threshold)
         assert out[idx] == goal
         assert out[idx]["content"] == self.HUGE
         assert msgs == before
@@ -517,7 +516,7 @@ class TestGoalPreserved:
         ]}
         msgs = [goal] + [_msg("assistant" if i % 2 == 0 else "user", "w" * 3000) for i in range(6)]
         before = copy.deepcopy(msgs)
-        out, idx = maybe_compact(msgs, "system", 4000, MagicMock(**{"chat.return_value": "- s"}))
+        out, idx = maybe_compact(msgs, "system", MagicMock(**{"chat.return_value": "- s"}), threshold=4000)
         assert out[idx] == before[0]
         assert msgs == before
 
@@ -526,7 +525,7 @@ class TestAtomicGroupCompaction:
     def _compact(self, msgs, goal_idx=0, summary="- sum"):
         llm = MagicMock()
         llm.chat.return_value = summary
-        return maybe_compact(msgs, "system", 4000, llm, goal_idx=goal_idx), llm
+        return maybe_compact(msgs, "system", llm, goal_idx=goal_idx, threshold=4000), llm
     def test_five_message_orphan_reproduction(self, monkeypatch):
         monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
         msgs = [
@@ -541,6 +540,27 @@ class TestAtomicGroupCompaction:
         assert out[idx]["content"] == "GOAL"
         ids = [m.get("tool_call_id") for m in out if m["role"] == "tool"]
         assert ids in ([], ["a", "b"])
+
+    def test_historical_huge_args_keep_whole_native_span_after_one_summary(self, monkeypatch):
+        """A huge recent call/result span is not clipped to make the estimate fit."""
+        monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
+        huge = json.dumps({"blob": "Q" * 120_000})
+        msgs = [
+            _msg("user", "GOAL"),
+            _msg("assistant", "old " + "o" * 2000),
+            _msg("user", "older " + "u" * 2000),
+            _assistant_calls(_call("big", "write_file", huge), content="writing"),
+            _tool("big", "done"),
+        ]
+        prompts: list[str] = []
+        out, idx = maybe_compact(
+            msgs, "system", MagicMock(), threshold=4000,
+            summarize=lambda prompt: prompts.append(prompt) or "- early",
+        )
+        assert len(prompts) == 1
+        _assert_wire_valid(out)
+        assert out[idx] is msgs[0]
+        assert out[-2:] == msgs[-2:]
 
     def test_multicall_last_two_boundary_retains_whole_group(self, monkeypatch):
         monkeypatch.setattr(context_manager, "estimate_messages_tokens", _char_estimate)
@@ -562,8 +582,8 @@ class TestAtomicGroupCompaction:
             _msg("user", "y " * 4000),
         ]
         seen: list[str] = []
-        maybe_compact(msgs, "system", 1000, MagicMock(),
-                      summarize=lambda p: seen.append(p) or "- s")
+        maybe_compact(msgs, "system", MagicMock(),
+                      summarize=lambda p: seen.append(p) or "- s", threshold=1000)
         assert "read_file" in seen[0] and "/a" in seen[0] and "id=zz" in seen[0]
 
 
@@ -637,19 +657,19 @@ def _place(group: list[dict], where: str) -> tuple[list[dict], int]:
 class TestMalformedNativeHistory:
     @pytest.mark.parametrize("where", ["short", "middle", "suffix"])
     @pytest.mark.parametrize("case", sorted(_malformed_cases()))
-    @pytest.mark.parametrize("forced", [False, True])
-    def test_rejected_before_summary_or_early_return(self, monkeypatch, case, where, forced):
+    @pytest.mark.parametrize("threshold", [5, 100_000])
+    def test_rejected_before_summary_or_early_return(self, monkeypatch, case, where, threshold):
         group = _malformed_cases()[case]
         msgs, goal_idx = _place(group, where)
-        # Under-threshold unless forced: the estimator says everything fits.
+        # The estimator says everything fits the larger threshold; malformed
+        # history must still fail before either path makes summary/provider I/O.
         monkeypatch.setattr(context_manager, "estimate_messages_tokens", lambda *a, **k: 10)
         before = copy.deepcopy(msgs)
         llm = MagicMock()
         summarize = MagicMock(return_value="- s")
-        kwargs = dict(force=True, repair_target=5, input_tokens=9_000) if forced else {}
         with pytest.raises(LLMPermanentError) as info:
-            maybe_compact(msgs, "system", 100_000, llm, goal_idx=goal_idx,
-                          summarize=summarize, **kwargs)
+            maybe_compact(msgs, "system", llm, goal_idx=goal_idx,
+                          summarize=summarize, threshold=threshold)
         assert _SECRET not in str(info.value)
         summarize.assert_not_called()
         llm.chat.assert_not_called()
@@ -664,14 +684,14 @@ class TestMalformedNativeHistory:
             {"role": "assistant", "content": "", "tool_calls": []},
         ]
         msgs, goal_idx = _place(group, where)
-        out, idx = maybe_compact(msgs, "system", 100_000, MagicMock(), goal_idx=goal_idx)
+        out, idx = maybe_compact(msgs, "system", MagicMock(), goal_idx=goal_idx, threshold=100_000)
         assert out is msgs and idx == goal_idx
 
 
 class TestValidReusedAndShapedCalls:
     @pytest.mark.parametrize("where", ["short", "middle", "suffix"])
-    @pytest.mark.parametrize("forced", [False, True])
-    def test_production_groups_reusing_supplied_id_are_valid(self, monkeypatch, where, forced):
+    @pytest.mark.parametrize("threshold", [5, 100_000])
+    def test_production_groups_reusing_supplied_id_are_valid(self, monkeypatch, where, threshold):
         from interfaces import ToolCall
         from native_turns import _append_native_tool_result
 
@@ -683,13 +703,12 @@ class TestValidReusedAndShapedCalls:
         before = copy.deepcopy(msgs)
         summarize = MagicMock(return_value="- s")
         context_manager.validate_native_history(msgs)
-        kwargs = dict(force=True, repair_target=5, input_tokens=9_000) if forced else {}
         try:
-            maybe_compact(msgs, "system", 100_000, MagicMock(), goal_idx=goal_idx,
-                          summarize=summarize, **kwargs)
+            maybe_compact(msgs, "system", MagicMock(), goal_idx=goal_idx,
+                          summarize=summarize, threshold=threshold)
         except LLMPermanentError:
             pytest.fail("valid reused IDs rejected")
-        if not forced:
+        if threshold == 100_000:
             assert msgs == before
 
     def test_args_whitespace_dict_args_prose_and_missing_type_pass_unchanged(self):
@@ -723,6 +742,6 @@ def test_cancellation_propagates_through_compaction():
 
     with pytest.raises(LLMCancelledError):
         maybe_compact(
-            messages, "s", 500, client, force=True, repair_target=200,
+            messages, "s", client, threshold=200,
             input_tokens=10_000, summarize=summarize,
         )

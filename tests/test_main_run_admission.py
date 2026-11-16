@@ -352,7 +352,6 @@ class _World:
             ),
             "settings": self.settings_path.read_bytes(),
             "ckpt": {p.name: p.read_bytes() for p in sorted(Path(self.store._checkpoint_dir).glob("*"))},
-            "armed": self.controller.selection_guard_armed,
             "registered": list(self.executor._supervisor.registered),
         }
 
@@ -605,8 +604,7 @@ def test_context_build_failure_closes_owned_client_and_releases(make_world, monk
         raise boom_error
 
     monkeypatch.setattr(agent_controller.AgentRuntime, "build_react_context", staticmethod(boom))
-    # Default restored-history world is guarded: nothing is activated before the loop,
-    # so the whole protected snapshot (incl. executor registrations) must be unchanged.
+    # Context construction fails before the loop starts: the protected state is unchanged.
     before = w.snapshot()
     _result, exc = _run(w)
     assert exc is boom_error
@@ -876,7 +874,6 @@ def test_setup_cancel_not_cleared_for_(make_world, monkeypatch, source) -> None:
         kwargs = {}
     w.prime_grants()
     path = w.save_checkpoint(TRACE, MODEL_A.id)
-    assert w.controller.selection_guard_armed
     before = w.snapshot()
     assert before["ckpt"][path.name] == path.read_bytes()
 
@@ -894,21 +891,15 @@ def test_setup_cancel_not_cleared_for_(make_world, monkeypatch, source) -> None:
     monkeypatch.setattr(
         agent_controller.AgentRuntime, "build_react_context", staticmethod(cancel_after_registration)
     )
-    prepare_calls: list[tuple] = []
-
-    def guarded_prepare_spy(*args, **kwargs):
-        prepare_calls.append(args)
-        raise AssertionError("guarded first-request preparation must not start after a cancel")
-
-    monkeypatch.setattr(react_loop_module, "_stage_guarded_first_request", guarded_prepare_spy)
-
     result, exc = _run(w, resume_from=TRACE, trace_id=None, **kwargs)
     assert len(hook_events) == 1, "setup cancel hook was never reached"
     assert exc is None and result == STOPPED
-    assert prepare_calls == []
     assert w.requests == []
-    assert [v for v in w.executor.coordinator_log if v is not None] == []
-    assert w.snapshot() == before
+    after = w.snapshot()
+    assert {key: value for key, value in after.items() if key != "registered"} == {
+        key: value for key, value in before.items() if key != "registered"
+    }
+    assert w.executor._supervisor.registered == w.executor._supervisor.unregistered
     assert path.read_bytes() == before["ckpt"][path.name]
     assert chosen.close_count == 0 and injected.close_count == 0
     w.assert_owner_free(TRACE)

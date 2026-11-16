@@ -58,6 +58,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import structlog
@@ -181,7 +182,7 @@ def _dispatch_probe_tool(
     seen = SimpleNamespace(
         on_tool_trace=ctx.on_tool_trace, builtin=ctx.builtin_executor, depth=ctx.depth,
         payload=getattr(ctx, "_context_payload", None), variant=getattr(ctx, "_prompt_variant", None),
-        traces=[], sink=[], progress=[],
+        traces=[], dispositions=[], sink=[], progress=[],
     )
     supplied = ctx.on_tool_trace
     if supplied is not None:
@@ -199,15 +200,22 @@ def _dispatch_probe_tool(
         if progress_callback is not None:
             progress_callback(message)
 
+    emit_trace = react_loop._emit_tool_trace
+
+    def observe_emit(*args: Any, **kwargs: Any) -> None:
+        """Observe the local disposition without replacing the real trace sink."""
+        seen.dispositions.append(kwargs["execution_disposition"])
+        emit_trace(*args, **kwargs)
+
     state = react_loop._LoopState(messages=[], goal_idx=0, max_steps=1)
     try:
-        seen.returned = react_loop._dispatch_action(
-            ctx, {"action": "tool", "tool": PROBE_TOOL, "args": {}},
-            seen.sink.append, state, goal, time.time(), progress,
-        )
+        with patch.object(react_loop, "_emit_tool_trace", side_effect=observe_emit):
+            seen.returned = react_loop._dispatch_action(
+                ctx, {"action": "tool", "tool": PROBE_TOOL, "args": {}},
+                seen.sink.append, state, goal, time.time(), progress,
+            )
     finally:
         ctx.on_tool_trace = supplied
-    seen.guard_eligible = state.guard_eligible
     return seen
 
 
@@ -236,7 +244,7 @@ class _ProfileLoop:
 
 def _assert_probe_dispatched(seen: SimpleNamespace) -> None:
     """The real built-in ran once through the production action path."""
-    assert seen.returned is None and seen.guard_eligible is True
+    assert seen.returned is None and seen.dispositions == ["executed"]
     assert len(seen.sink) == 1 and seen.sink[0].startswith(f"Tool '{PROBE_TOOL}' succeeded")
     assert any(m.startswith(f"__TOOL_END__:ok:{PROBE_TOOL}") for m in seen.progress), seen.progress
     assert seen.depth == 1

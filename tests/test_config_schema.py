@@ -1413,3 +1413,107 @@ class TestObsoleteContextLimitKeyIsRejected:
     def test_config_without_the_obsolete_key_never_sets_the_internal_attribute(self, minimal_config):
         # Task 6.2 removes the attribute; until then no config path may populate it.
         assert parse_config(minimal_config).agent.ctx_max_tokens == AgentConfig().ctx_max_tokens
+
+
+# ---------------------------------------------------------------------------
+# Task 10.2: obsolete model configuration is rejected, never converted
+# ---------------------------------------------------------------------------
+
+_OBSOLETE_MODEL_FIELDS = (
+    "name", "provider", "model", "api_key", "base_url", "request_timeout",
+    "max_tokens", "temperature", "top_p", "vision", "reasoning", "aliases",
+    "context_window", "max_retries", "retry_delay",
+)
+_OBSOLETE_AGENT_KEYS = (
+    "default_model", "background_model", "fallback_model", "fallback_models", "ctx_max_tokens",
+)
+_OBSOLETE_PROVIDER_FIELDS = (
+    "max_tokens", "temperature", "top_p", "model", "max_retries", "retry_delay", "retries",
+)
+_OBSOLETE_SENTINEL = "SECRET-SENTINEL-VALUE"
+
+
+def _obsolete_message(raw: dict) -> str:
+    """Return the ConfigError text for *raw*, failing the test if it parses."""
+    with pytest.raises(ConfigError) as caught:
+        parse_config(raw)
+    return str(caught.value)
+
+
+class TestObsoleteModelConfigurationRejectedWithoutConversion:
+    """``[[models]]``, ``[agent]`` selector keys and provider tuning fields fail actionably."""
+
+    @pytest.mark.parametrize("field", _OBSOLETE_MODEL_FIELDS)
+    def test_models_table_with_any_listed_field_names_replacement(self, minimal_config, field):
+        minimal_config["models"] = [{field: "x"}]
+        message = _obsolete_message(minimal_config)
+        assert "[[models]]" in message
+        assert "[providers.<connection-id>]" in message and "/models" in message
+
+    @pytest.mark.parametrize("key", _OBSOLETE_AGENT_KEYS)
+    @pytest.mark.parametrize("value", ["x", [], 0, False, None], ids=["str", "list", "zero", "false", "none"])
+    def test_agent_key_is_rejected_by_presence_with_replacement(self, minimal_config, key, value):
+        minimal_config["agent"][key] = value
+        message = _obsolete_message(minimal_config)
+        assert f"agent.{key}" in message
+        expected = "agent.compaction_threshold_tokens" if key == "ctx_max_tokens" else "/models"
+        assert expected in message
+
+    @pytest.mark.parametrize("field", _OBSOLETE_PROVIDER_FIELDS)
+    def test_provider_field_names_path_and_supported_fields(self, minimal_config, field):
+        minimal_config["providers"]["openai-main"][field] = 1
+        message = _obsolete_message(minimal_config)
+        assert f"providers.openai-main.{field}" in message
+        for allowed in ("type", "api_key", "base_url", "request_timeout"):
+            assert allowed in message
+        if field in {"max_retries", "retry_delay", "retries"}:
+            assert "[agent]" in message
+
+    def test_obsolete_models_agent_and_provider_fields_rejected_actionably(self, minimal_config):
+        """Each obsolete family fails alone; no message names a migration tool."""
+        for mutate in (
+            lambda raw: raw.__setitem__("models", [{"name": "m", "temperature": 0.1}]),
+            lambda raw: raw["agent"].__setitem__("fallback_models", ["m"]),
+            lambda raw: raw["agent"].__setitem__("ctx_max_tokens", 1000),
+            lambda raw: raw["providers"]["openai-main"].__setitem__("temperature", 0.1),
+        ):
+            raw = copy.deepcopy(minimal_config)
+            mutate(raw)
+            assert "migrat" not in _obsolete_message(raw).lower()
+
+    def test_rejection_converts_nothing_and_leaves_input_untouched(self, minimal_config):
+        minimal_config["models"] = [{"name": "m", "model": "gpt-x", "temperature": 0.1}]
+        minimal_config["agent"]["default_model"] = "gpt-x"
+        before = copy.deepcopy(minimal_config)
+        with pytest.raises(ConfigError):
+            parse_config(minimal_config)
+        assert minimal_config == before
+        assert "default_model" not in minimal_config["providers"]["openai-main"]
+
+    def test_global_agent_retry_settings_remain_valid(self, minimal_config):
+        minimal_config["agent"].update(max_retries=3, retry_delay=1.5)
+        agent = parse_config(minimal_config).agent
+        assert agent.max_retries == 3 and agent.retry_delay == 1.5
+
+    def test_connection_fields_only_config_still_parses(self, minimal_config):
+        minimal_config["providers"]["openai-main"].update(request_timeout=30)
+        assert parse_config(minimal_config).providers["openai-main"].request_timeout == 30
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda raw: raw.__setitem__("models", [{"name": _OBSOLETE_SENTINEL, "api_key": _OBSOLETE_SENTINEL}]),
+        lambda raw: raw["agent"].__setitem__("default_model", _OBSOLETE_SENTINEL),
+        lambda raw: raw["agent"].__setitem__("fallback_models", [_OBSOLETE_SENTINEL]),
+        lambda raw: raw["agent"].__setitem__("ctx_max_tokens", _OBSOLETE_SENTINEL),
+        lambda raw: raw["providers"]["openai-main"].__setitem__("temperature", _OBSOLETE_SENTINEL),
+        lambda raw: raw["providers"]["openai-main"].__setitem__("model", _OBSOLETE_SENTINEL),
+        lambda raw: raw["providers"]["openai-main"].__setitem__("retries", _OBSOLETE_SENTINEL),
+    ],
+    ids=["models", "default_model", "fallback_models", "ctx_max_tokens", "provider-temperature", "provider-model", "provider-retries"],
+)
+def test_obsolete_field_error_never_echoes_value(minimal_config, mutate):
+    """Obsolete-field diagnostics name keys/paths but never the configured value or secret."""
+    mutate(minimal_config)
+    assert _OBSOLETE_SENTINEL not in _obsolete_message(minimal_config)

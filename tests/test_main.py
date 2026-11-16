@@ -9,6 +9,7 @@ caller cutover belong to task 12.25, scheduler closure to 7.3.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import concurrent.futures
 import dataclasses
 import html
@@ -17,6 +18,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
@@ -2567,3 +2569,226 @@ class TestRootInitialCacheChoice:
         root = root_harness
         assert root.registry.view().active_model_id == min(DISCOVERED)
         assert not root.paths.model_selection_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 10.3: the retired combined models-config.toml is only existence-checked
+# ---------------------------------------------------------------------------
+
+_RETIRED_CANARY = "sk-RETIRED0123456789canary"
+_RETIRED_CONTENTS: dict[str, bytes] = {
+    "valid-catalog": b"schema_version = 1\nrevision = 3\n# " + _RETIRED_CANARY.encode() + b"\n",
+    "malformed": b"schema_version = [\n# " + _RETIRED_CANARY.encode() + b"\n",
+    "secret-like": b'api_key = "' + _RETIRED_CANARY.encode() + b'"\n[[models]]\nname = "x"\n',
+    "empty": b"",
+    "invalid-utf8": b"\xff\xfe\x00" + _RETIRED_CANARY.encode(),
+}
+_CONTACT_TARGETS: tuple[tuple[Any, str], ...] = (
+    (builtins, "open"), (io, "open"),
+    (os, "open"), (os, "rename"), (os, "replace"), (os, "remove"), (os, "unlink"),
+    (os, "rmdir"), (os, "truncate"), (os, "chmod"), (os, "utime"), (os, "link"), (os, "symlink"),
+    (shutil, "copy"), (shutil, "copy2"), (shutil, "copyfile"), (shutil, "move"), (shutil, "rmtree"),
+    (Path, "open"), (Path, "read_bytes"), (Path, "read_text"), (Path, "write_bytes"),
+    (Path, "write_text"), (Path, "rename"), (Path, "replace"), (Path, "unlink"),
+    (Path, "touch"), (Path, "chmod"), (Path, "rmdir"),
+)
+
+
+class _ContactTraps(list):
+    """Recorded contacts (a list of labels); ``armed`` gates recording after startup."""
+
+    armed: bool = True
+
+
+def _install_contact_traps(monkeypatch: pytest.MonkeyPatch, *targets: Path) -> _ContactTraps:
+    """Record (and refuse) any open/read/write/rename/delete of *targets* during startup.
+
+    Contacts are recorded as well as raised because production may swallow
+    exceptions. ``stat``/``lstat``/``exists`` are intentionally not trapped:
+    they are the permitted existence probe. Call ``disarm()`` before the test
+    inspects or restores the files itself.
+    """
+    names = {os.fspath(t) for t in targets} | {os.path.realpath(t) for t in targets}
+    contacts = _ContactTraps()
+
+    def matches(value: object) -> bool:
+        if isinstance(value, (str, os.PathLike)):
+            return os.fspath(value) in names
+        return False
+
+    for owner, attr in _CONTACT_TARGETS:
+        real = getattr(owner, attr)
+
+        def make(real: Callable[..., Any], label: str) -> Callable[..., Any]:
+            def trapped(*args: Any, **kwargs: Any) -> Any:
+                if contacts.armed and (any(matches(a) for a in args[:2]) or any(matches(v) for v in kwargs.values())):
+                    contacts.append(label)
+                    raise AssertionError(f"retired file contact: {label}")
+                return real(*args, **kwargs)
+            return trapped
+
+        monkeypatch.setattr(owner, attr, make(real, f"{getattr(owner, '__name__', owner)}.{attr}"))
+    return contacts
+
+
+def _lstat_fingerprint(path: Path) -> tuple[int, ...]:
+    """Return the metadata that any read-modify, rename or chmod would change."""
+    st = os.lstat(path)
+    return (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_uid)
+
+
+class TestRetiredCombinedCatalogFile:
+    """Real ``main._run`` startup: only an existence probe and one /models notice."""
+
+    @staticmethod
+    def _spy_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        messages: list[str] = []
+        real = main_mod.logger.warning
+
+        def spy(msg: object, *args: object, **kwargs: Any) -> None:
+            messages.append(str(msg) % args if args else str(msg))
+            real(msg, *args, **kwargs)
+
+        monkeypatch.setattr(main_mod.logger, "warning", spy)
+        return messages
+
+    @staticmethod
+    def _forbid_settings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        import model_settings
+
+        constructed: list[str] = []
+
+        def tripwire(self: object, path: object, *a: object, **k: object) -> None:
+            constructed.append(os.fspath(path))  # type: ignore[arg-type]
+            raise AssertionError("ModelSettings must not be constructed at runtime")
+
+        monkeypatch.setattr(model_settings.ModelSettings, "__init__", tripwire)
+        return constructed
+
+    @staticmethod
+    def _prepare(root: RootHarness) -> Path:
+        retired = root.paths.models_config_file
+        retired.parent.mkdir(parents=True, exist_ok=True)
+        return retired
+
+    def _assert_one_notice(self, messages: list[str], retired: Path) -> None:
+        mine = [m for m in messages if str(retired) in m]
+        assert len(mine) == 1, messages
+        assert "/models" in mine[0] and "models-config.toml" in mine[0]
+        assert all(_RETIRED_CANARY not in m for m in messages)
+
+    @pytest.mark.parametrize("kind", sorted(_RETIRED_CONTENTS))
+    def test_existing_file_gets_one_path_naming_notice_and_is_never_touched(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch, kind: str,
+    ) -> None:
+        retired = self._prepare(root_harness)
+        retired.write_bytes(_RETIRED_CONTENTS[kind])
+        before, fingerprint = retired.read_bytes(), _lstat_fingerprint(retired)
+        siblings = sorted(p.name for p in retired.parent.iterdir())
+        contacts = _install_contact_traps(monkeypatch, retired)
+        constructed = self._forbid_settings(monkeypatch)
+        messages = self._spy_warnings(monkeypatch)
+
+        root_harness.start(saved_default=None, write_cache=False)
+
+        assert contacts == [] and constructed == []
+        self._assert_one_notice(messages, retired)
+        contacts.armed = False
+        assert retired.read_bytes() == before and _lstat_fingerprint(retired) == fingerprint
+        assert [n for n in sorted(p.name for p in retired.parent.iterdir()) if "models-config" in n] == [
+            "models-config.toml"
+        ]
+        assert set(siblings) <= {p.name for p in retired.parent.iterdir()}
+        # The notice never derives or saves a selection.
+        assert not root_harness.paths.model_selection_file.exists()
+        assert root_harness.registry.view().active_model_id == min(DISCOVERED)
+
+    def test_absent_file_emits_no_notice_and_is_not_created(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        retired = root_harness.paths.models_config_file
+        contacts = _install_contact_traps(monkeypatch, retired)
+        messages = self._spy_warnings(monkeypatch)
+
+        root_harness.start(saved_default=None, write_cache=False)
+
+        assert contacts == []
+        assert not any("models-config" in m for m in messages)
+        assert not retired.exists()
+
+    def test_unreadable_mode_file_is_noticed_without_any_open(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        retired = self._prepare(root_harness)
+        retired.write_bytes(_RETIRED_CONTENTS["secret-like"])
+        retired.chmod(0)
+        fingerprint = _lstat_fingerprint(retired)
+        contacts = _install_contact_traps(monkeypatch, retired)
+        try:
+            messages = self._spy_warnings(monkeypatch)
+            root_harness.start(saved_default=None, write_cache=False)
+            assert contacts == []
+            contacts.armed = False
+            self._assert_one_notice(messages, retired)
+            assert _lstat_fingerprint(retired) == fingerprint
+        finally:
+            contacts.armed = False
+            retired.chmod(0o600)
+
+    def test_directory_at_the_retired_path_is_noticed_and_left_alone(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        retired = self._prepare(root_harness)
+        retired.mkdir()
+        contacts = _install_contact_traps(monkeypatch, retired)
+        messages = self._spy_warnings(monkeypatch)
+        root_harness.start(saved_default=None, write_cache=False)
+        contacts.armed = False
+        assert contacts == [] and retired.is_dir() and list(retired.iterdir()) == []
+        self._assert_one_notice(messages, retired)
+
+    def test_symlink_is_noticed_and_its_target_never_read(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        retired = self._prepare(root_harness)
+        target = tmp_path / "elsewhere.toml"
+        target.write_bytes(_RETIRED_CONTENTS["secret-like"])
+        retired.symlink_to(target)
+        before, fingerprint = target.read_bytes(), _lstat_fingerprint(target)
+        contacts = _install_contact_traps(monkeypatch, retired, target)
+        messages = self._spy_warnings(monkeypatch)
+        root_harness.start(saved_default=None, write_cache=False)
+        assert contacts == []
+        contacts.armed = False
+        self._assert_one_notice(messages, retired)
+        assert os.path.islink(retired) and os.readlink(retired) == str(target)
+        assert target.read_bytes() == before and _lstat_fingerprint(target) == fingerprint
+
+    def test_notice_is_not_repeated_by_later_catalog_work(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        retired = self._prepare(root_harness)
+        retired.write_bytes(_RETIRED_CONTENTS["valid-catalog"])
+        messages = self._spy_warnings(monkeypatch)
+
+        def hold(root: RootHarness) -> None:
+            root.registry.refresh()
+            root.registry.select(OTHER_ID)
+
+        root_harness.start(saved_default=None, write_cache=False, hold=hold)
+        self._assert_one_notice(messages, retired)
+        assert root_harness.registry.view().active_model_id == OTHER_ID
+
+    def test_only_the_startup_existence_probe_references_the_retired_path_in_production(self) -> None:
+        """Production names ``models_config_file`` only in ``xdg`` (path) and ``main`` (probe)."""
+        repo = Path(main_mod.__file__).resolve().parent
+        hits: dict[str, int] = {}
+        for source in sorted(repo.glob("*.py")) + sorted(repo.glob("*/*.py")):
+            if "tests" in source.parts or ".venv" in source.parts:
+                continue
+            count = source.read_text(encoding="utf-8").count("models_config_file")
+            if count:
+                hits[source.relative_to(repo).as_posix()] = count
+        assert set(hits) == {"xdg.py", "main.py"}, hits
+        probe = Path(main_mod.__file__).read_text(encoding="utf-8")
+        assert probe.count("models_config_file") == 1

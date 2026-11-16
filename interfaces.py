@@ -23,7 +23,6 @@ from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 import httpx
 from model_registry import ModelRecord
-from model_selection_guard import SelectionBudgetIdentity
 
 
 # ---------------------------------------------------------------------------
@@ -250,17 +249,8 @@ class MCPManagerProtocol(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Conversation selection guard / graph preparation
+# Graph preparation
 # ---------------------------------------------------------------------------
-
-@runtime_checkable
-class SelectionIdentityProvider(Protocol):
-    """A pinned model client that can describe its sanitized budget identity."""
-
-    def selection_identity(self) -> SelectionBudgetIdentity:
-        """Return the secret-free budget identity of the pinned model."""
-        ...
-
 
 @runtime_checkable
 class PreparedGraphContext(Protocol):

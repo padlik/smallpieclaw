@@ -1117,9 +1117,15 @@ def _validate_provider_structure(raw: dict) -> None:
                         f"providers.{connection_id}.api_key_file is unsupported; "
                         f"configure the credential source at providers.{connection_id}.api_key"
                     )
+                guidance = (
+                    "retries are configured under [agent] max_retries/retry_delay"
+                    if key in {"max_retries", "retry_delay", "retries"}
+                    else "model selection and generation settings are not connection fields"
+                )
                 raise ConfigError(
-                    f"providers.{connection_id}.{key} is unsupported; "
-                    "configure provider connections without model tuning or retry overrides"
+                    f"providers.{connection_id}.{key} is unsupported; a provider connection "
+                    "accepts only type, api_key, base_url and request_timeout "
+                    f"({guidance})"
                 )
         adapter = entry.get("type")
         if not isinstance(adapter, str) or adapter not in _PROVIDER_TYPES:
@@ -1296,14 +1302,6 @@ def _reject_removed_fields(raw: dict) -> None:
             "[graph_memory] 'db_path' has been removed. "
             "The graph memory database path is now derived from XDG_DATA_HOME."
         )
-
-    providers = raw.get("providers") or {}
-    if isinstance(providers, dict):
-        for provider_id, entry in providers.items():
-            if isinstance(entry, dict):
-                for key in ("max_retries", "retry_delay", "retries"):
-                    if key in entry:
-                        raise ConfigError(f"providers.{provider_id}.{key} is no longer supported; retries are configured under [agent]")
 
     agent = raw.get("agent") or {}
     if isinstance(agent, dict):

@@ -288,7 +288,7 @@ class TestTurnOwnedDrain:
 
         assert visible_before_cleanup is True
         assert progress_messages[-1] == "__DRAINING__:sa-draining"
-        assert results == ["[Cancelled]"]
+        assert results == ["⚠️ Task stopped by operator."]
 
 
 class TestExtractJsonCandidates:

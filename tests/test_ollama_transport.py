@@ -12,7 +12,6 @@ from config_schema import AgentConfig, ResolvedProviderConnection
 from interfaces import ChatResponse
 from llm_client import LLMClient
 from model_registry import ModelMetadata, ModelRecord, RunModel
-from token_estimator import estimate_request_payload_tokens
 
 
 def _client(handler) -> LLMClient:
@@ -71,18 +70,6 @@ def test_installed_sdk_serializes_exact_pinned_cloud_request_and_counts_once() -
     client.close()
 
 
-def test_ollama_preview_is_captured_at_sdk_hook_without_transport_or_count() -> None:
-    captured: list[httpx.Request] = []
-    client = _client(lambda request: captured.append(request) or _ollama_response())
-
-    preview = client.preview_request([{"role": "user", "content": "hello"}])
-
-    assert preview.canonical_model_id == "cloud/model"
-    assert preview.input_tokens > 0
-    assert captured == []
-    client.close()
-
-
 def test_native_tool_wire_preserves_full_schema_and_snapshots_caller_tools() -> None:
     captured: list[httpx.Request] = []
     tools = [{
@@ -121,18 +108,12 @@ def test_native_tool_wire_preserves_full_schema_and_snapshots_caller_tools() -> 
         return _ollama_response()
 
     client = _client(handler)
-    preview = client.preview_request(messages, tools=tools, definition_revision=17)
-    assert preview.mode == "native"
-    assert captured == []
     state = CallAttemptState(2, 0)
     with client.bind_attempt(state, definition_revision=17):
         response = client.chat_with_tools(messages, tools)
 
     assert isinstance(response, ChatResponse)
     assert json.loads(captured[0].content)["tools"] == expected_tools
-    assert preview.input_tokens == estimate_request_payload_tokens(
-        captured[0].content.decode("utf-8"), model="model", definition_revision=17
-    )
     assert state.mode == "native"
     assert state.outbound_attempts == 1
     client.close()
@@ -161,13 +142,9 @@ def test_large_native_schema_is_sent_unchanged_and_counted_once() -> None:
     client.close()
 
 
-def test_empty_native_tools_remain_native_for_preview_and_send() -> None:
+def test_empty_native_tools_remain_native_for_send() -> None:
     captured: list[httpx.Request] = []
     client = _client(lambda request: captured.append(request) or _ollama_response())
-
-    preview = client.preview_request([{"role": "user", "content": "hello"}], tools=[])
-    assert preview.mode == "native"
-    assert captured == []
 
     state = CallAttemptState(1, 0)
     with client.bind_attempt(state):

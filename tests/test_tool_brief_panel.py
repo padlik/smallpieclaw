@@ -509,7 +509,7 @@ class TestProgressPanelDrainMarkers:
             state.cleanup_event.set()
             run_thread.join(timeout=5.0)
 
-        assert results == ["[Cancelled]"]
+        assert results == ["⚠️ Task stopped by operator."]
 
     def test_draining_marker_shows_persistent_operator_status_without_ids(self) -> None:
         panel = _make_panel()
