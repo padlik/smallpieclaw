@@ -1,5 +1,119 @@
 # Test preservation ledger — simplify-model-runtime (task 2.1)
 
+## Task 10.1 candidate census (pending parent review)
+
+The immutable class definitions 0–572 and all `executed_*` records through
+9.4 remain unchanged. Independently collected clean HEAD has 6,370 nodes.
+Its ledger `groups` omitted 44 actual IDs (43 added in 9.2–9.4 and one
+9.3 callback renamed *before* task 10.1) and included one stale callback ID.
+The current census replays that inherited repair against actual HEAD IDs
+before classifying 10.1 changes. The live collection has **6,187 nodes**:
+
+`6,370 − 354 removed (158 renamed + 196 retired) + 171 added
+(158 renamed + 13 new) = 6,187`.
+
+Twelve new ordinary-run nodes form class 573; the thirteenth new node is the
+whole-native-span/huge-arguments assertion under existing class 200. The
+current membership counts are keep 5,613, rewrite 436, retire 138.
+`executed_10_1` records each old/new node mapping, each retirement and the
+mixed-policy exceptions; it does not alter historical class assertions.
+In particular, the old local input-fit clause in class 540 retired, while
+the configured mandatory Anthropic cap and graph fixed wire are still tested
+with real provider transports. Classes 150–151 retain their pre-send
+checkpoint/no-I/O cancellation guarantee in the new ordinary-run owners.
+
+Evidence and the idempotent census author/read-only checker live outside the
+repository under `.../opencode/simplify-task-10.1/`. The checker compares
+*both* independently collected HEAD/current node multisets, exact
+retired/renamed/new partitions, frozen classes and historical execution
+records, and bounded AST assertion contacts for four checkpoint/history
+owners, including post-send recovery-checkpoint retirement. Thirteen
+JSON/source-copy negative controls are detected. The original
+three copied-tree mutants and two targeted checkpoint-retirement probes each
+have a green baseline and named assertion failures; copied sources were
+restored. The task checkbox remains reserved for parent review.
+
+The parent's first full gate was **RED** (12 failures, 6,173 passed, two
+baseline skips); its original log and `FINAL-GATE.md` are preserved outside
+this repository. The 12 failed node IDs remain collected under their existing
+classes. A bounded test-only alignment corrects the root probe to observe the
+real executed disposition while delegating to the real trace emitter, checks
+MCP local completion as executed versus no-result failures as unknown,
+expects the operator-stopped result for three pre-cancel owners, and checks
+non-default current threshold and output cap forwarding rather than the
+removed private client capacity. No production source changed in that
+alignment. Its exact 12-node and adjacent focused tests are green; the full
+gate is **not** reclassified as passing. Checker controls now include root
+disposition, MCP unknown, drain privacy and config forwarding. This bounded
+audit does not assert exhaustive historical equivalence. Parent decides
+whether to rerun the full gate after Oracle review.
+
+## Task 10.3 candidate census (pending parent review)
+
+Compared against the immutable 10.3 preflight (6,148 collected = the 10.2
+result). Classes 0–575 and every `executed_*` record are unchanged; class 576
+and `executed_10_3` are added. Live collection is **6,159**:
+`6,148 − 0 removed + 11 added = 6,159`; no renames or retirements. Counts:
+keep 5,682, rewrite 434, retire 43.
+
+The 11 new nodes (`tests/test_main.py::TestRetiredCombinedCatalogFile`) drive
+the real `main._run` and prove the contract of the retired combined
+`models-config.toml`: a present file (valid, malformed, secret-like, empty,
+invalid UTF-8, mode 000, directory or symlink) produces exactly one warning
+naming its path and advising `/models`, with traps on open/read/write/rename/
+delete and on `ModelSettings` construction empty and bytes plus `lstat`
+metadata unchanged; an absent file produces nothing and is not created; the
+notice is not repeated by later refresh/select; and production names
+`models_config_file` only in `xdg.py` and one `main.py` probe. Ten were RED
+first (no notice existed); the absent-file case was already correct, so no RED
+is claimed for it. Production change: `main._retired_catalog_notice`
+(`os.path.lexists` only) plus one startup warning; one README sentence.
+
+Reconciliation: every retained generic regression from 10.1–10.2 has a
+currently collected owner (listed in `executed_10_3.retained_generic_owners`)
+that was executed and passed in the focused run; no model converter file or
+import remains and no scheduler path opens the legacy `scheduler_jobs.json`
+(existence probe and messages only). `ModelSettings` stays because tests and
+`prepare_backfill_prerequisites` inject it; no production caller points it at
+the retired file. The assertion audit is bounded and not an exhaustive
+historical equivalence claim. The checkbox stays with the parent.
+
+## Task 10.2 candidate census (pending parent review)
+
+Compared against the immutable 10.2 preflight (6,187 collected = the 10.1
+result), **not** clean HEAD. Historical class definitions 0–573 and every
+`executed_*` record are unchanged; `executed_10_2` and classes 574–575 are
+added. Live collection is **6,148 nodes**:
+
+`6,187 − 97 removed (all of tests/test_migrate_models.py: 95 retired + 2
+rewritten) + 58 added (51 new rejection owners in class 574 + 7 parametrised
+rewrite destinations in class 575) = 6,148`. There are no one-to-one renames.
+Current membership counts: keep 5,671, rewrite 434, retire 43.
+
+`migrate_models.py` and `tests/test_migrate_models.py` are deleted. The 89
+conversion/preview/`--apply`/`--recover` nodes (class 114) retire as
+conversion-only. Their write-safety invariants (backup-before-replace,
+rollback that never overwrites operator edits, manifest recovery, lock refusal
+during apply) existed only because the tool rewrote `config.toml` and
+`models-config.toml`; no remaining code path writes either file, and 10.3 owns
+the existence-only `models-config.toml` contract. The generic shared-lock
+refusal remains owned by `tests/test_process_lock.py`; the six symlink nodes
+(class 116) retire as migration-only hardening, as already recorded. The two
+non-echo nodes (class 115) are rewritten into
+`tests/test_config_schema.py::test_obsolete_field_error_never_echoes_value[...]`
+(7 cases). The planned
+`test_obsolete_models_agent_and_provider_fields_rejected_actionably` is realised
+as the class `TestObsoleteModelConfigurationRejectedWithoutConversion`
+(15 `[[models]]` fields, 25 `[agent]` key/value shapes, 7 provider fields, plus
+four whole-behaviour nodes, one of which carries the planned method name).
+
+Production change: `config_schema` provider-field errors now state the
+supported fields and point retry keys at `[agent]` (RED first: 7 failing
+cases; the other 51 new nodes were green immediately because the rejection
+already existed). The unreachable duplicate provider-retry block was removed.
+Global `[agent]` retries and the XDG `migrate.py`/`tests/test_migrate.py` are
+unchanged. No full suite is claimed and the 10.2 checkbox stays with the parent.
+
 This ledger was created after apply approval, during the implementation phase. It inventories the predecessor tests **before any deletion**. For each collected test node it records one of three dispositions: keep, rewrite or retire. It also lists the new tests planned so far. The ledger adds no decision beyond the frozen proposal, design (Decision 6), the nine specs, `tasks.md` and ADR-0040–0044. No test, code or configuration file was changed to produce it.
 
 ## Baseline and evidence
@@ -1171,9 +1285,9 @@ Fixture rule F1 is broader than `minimal_config`: `make_builtin_executor`, `run_
 | `tests/test_telegram_scheduler_load_notice.py::test_state_home_json_existence_notice_never_reads_file` | 8.4 | existence-only | planned, not implemented |
 | `tests/test_telegram_models.py::test_models_select_text_path_without_cache_or_main` | 9.2 | textual select | planned, not implemented |
 | `tests/test_refresh_tool_defs_snapshot.py::test_idle_refresh_preserves_identity_and_sets_not_live` | 9.4 | idle refresh | planned, not implemented |
-| `tests/test_config_schema.py::test_obsolete_models_agent_and_provider_fields_rejected_actionably` | 10.2 | rejection without conversion | planned, not implemented |
-| `tests/test_config_schema.py::test_obsolete_field_error_never_echoes_value` | 10.2 | obsolete-field diagnostics never echo values/secrets (from migrate_models non-echo) | planned, not implemented |
-| `tests/test_model_registry.py::test_retired_models_config_file_existence_notice_only` | 10.3 | never read/parse/write | planned, not implemented |
+| `tests/test_config_schema.py::test_obsolete_models_agent_and_provider_fields_rejected_actionably` | 10.2 | rejection without conversion | implemented in 10.2 as `TestObsoleteModelConfigurationRejectedWithoutConversion::` method of the same name |
+| `tests/test_config_schema.py::test_obsolete_field_error_never_echoes_value` | 10.2 | obsolete-field diagnostics never echo values/secrets (from migrate_models non-echo) | implemented in 10.2 (7 parametrised nodes, class 575) |
+| `tests/test_model_registry.py::test_retired_models_config_file_existence_notice_only` | 10.3 | never read/parse/write | implemented in 10.3 as `tests/test_main.py::TestRetiredCombinedCatalogFile` |
 
 ## Task 3.7 execution record (unreviewed; parent owns final gate)
 
