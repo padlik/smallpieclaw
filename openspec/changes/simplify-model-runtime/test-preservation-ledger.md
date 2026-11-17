@@ -48,6 +48,51 @@ disposition, MCP unknown, drain privacy and config forwarding. This bounded
 audit does not assert exhaustive historical equivalence. Parent decides
 whether to rerun the full gate after Oracle review.
 
+## Task 11.3 warning-fix addendum (candidate)
+
+Follow-up to the formal verification warnings; the 11.1 census below is
+untouched. Compared against the 6,189-node baseline: `6,189 − 0 + 1 = 6,190`;
+keep 5,713, rewrite 434, retire 43. Classes 0–577 and every `executed_*`
+record (including `executed_11_1`) are frozen; class 578 and
+`executed_11_3_warning_fixes` are added.
+
+The one new node, `tests/test_profile_admission_matrix.py::test_child_run_publishes_only_to_its_own_monitor_and_leaves_main_snapshot_unchanged`,
+proves the `context-monitoring` "sub-agent runs do not overwrite the main
+snapshot" scenario with a real Main `AgentController` monitor holding a
+sentinel snapshot and a real sub-agent run on a mock transport. It was GREEN on
+its first run (the product already isolates the monitors), so no RED is
+claimed; a copied-tree alias mutant makes it fail at the child-monitor identity
+assertion. `ARCHITECTURE.md` and `MEMORY.md` were corrected to the actual
+four-field graph extraction contract and the actual threshold-based compaction.
+The 19 non-canonical REMOVED requirements remain unverified.
+
+## Task 11.1 candidate census (pending parent review)
+
+Documentation task, still a candidate (an independent review returned FAIL on
+two README contradictions, corrected in a bounded follow-up). Compared against
+the clean committed baseline (6,159 collected). Classes 0–576 and every
+`executed_*` record are unchanged; class 577 and `executed_11_1` are added.
+Live collection is **6,189**: `6,159 − 0 removed + 30 added = 6,189`; no
+renames or retirements. Counts: keep 5,712, rewrite 434, retire 43.
+
+The 30 new nodes (`tests/test_docs_examples_11_1.py`) validate the shipped
+README, `config.toml.example` and `scheduler.toml.example`: retired wording is
+absent (12 params, including the injected-catalog and blanket-refusal
+phrases); README topic markers remain; README TOML examples use only
+production fields; `/compress` stays hidden; the config example parses through
+`parse_config` and the scheduler example through the production reader. Four
+semantic tests separate `config.toml` startup errors from per-job contained
+`scheduler.toml` errors (executing `parse_config` and
+`scheduler._classify_schedule`), require legacy `time`/`hours`/`minutes` to be
+deleted when converting to cron, restrict the no-Main refusal to requests
+that inherit Main, and narrow the rollback untouched-file claim; they cite
+canonical production tests that must still exist. The first 22 nodes were
+17-RED/5-GREEN against the pre-edit documents, and the marker tests had passed
+despite wrong prose, so they are not a semantic proof; after the follow-up 8
+nodes were RED against the first-candidate README. These are documentation
+regressions, not behavioural proof. No runtime behaviour changed; the checkbox
+stays with the parent.
+
 ## Task 10.3 candidate census (pending parent review)
 
 Compared against the immutable 10.3 preflight (6,148 collected = the 10.2

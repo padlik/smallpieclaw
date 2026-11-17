@@ -2,13 +2,13 @@
   "change": "simplify-model-runtime",
   "task": "2.1",
   "base": "2c00e608beecc315d60f18ae01eff8932f77854d",
-  "collected": 6159,
+  "collected": 6190,
   "baseline_skips": [
     "tests/test_consent_scope_wording.py::test_vision_query_scope_line",
     "tests/test_path_policy.py::TestIsContained::test_normcase_case_insensitive"
   ],
   "counts": {
-    "keep": 5682,
+    "keep": 5713,
     "rewrite": 434,
     "retire": 43
   },
@@ -5558,6 +5558,24 @@
       "destination": "same",
       "assertion": "Real main._run startup: a present retired models-config.toml (valid/malformed/secret-like/empty/invalid-UTF-8 bytes, mode 000, directory, symlink) yields exactly one warning naming its path and advising /models, with open/read/write/rename/delete/ModelSettings contact traps empty, bytes and lstat metadata unchanged, no selection derived, no repeat after refresh/select; absent file emits nothing and is not created; production names models_config_file only in xdg.py and one main.py probe.",
       "refs": "task 10.3; provider-model-catalog: The retired combined model settings file receives only an existence notice; ADR-0040/0044"
+    },
+    {
+      "id": 577,
+      "file": "tests/test_docs_examples_11_1.py",
+      "basis": "added-11.1",
+      "disposition": "keep",
+      "destination": "same",
+      "assertion": "README/config.toml.example/scheduler.toml.example validation: retired wording (85% budget, typed /models select, background_model override, local token-limit rejection) absent; README keeps topic markers (buttons only, Refresh first, unsaved bootstrap, corrupt-preference recovery, manual upgrade/rollback, context-length rejection, inert legacy files); README TOML examples use only production connection/job/extraction/embedding fields and valid schedules; /compress stays hidden and /stop listed; config example parses with parse_config; scheduler example loads through the production reader with no job config errors; four semantic tests distinguish startup config errors from per-job contained errors (parse_config vs scheduler._classify_schedule), legacy time/hours/minutes leftovers, explicit-vs-inheriting requests without Main, and the rollback untouched-file claim, citing canonical production tests that must still exist.",
+      "refs": "task 11.1; provider-model-catalog; ADR-0040/0044/0045"
+    },
+    {
+      "id": 578,
+      "file": "tests/test_profile_admission_matrix.py",
+      "basis": "added-11.3-warning-fix",
+      "disposition": "keep",
+      "destination": "same",
+      "assertion": "context-monitoring \"Sub-agent runs do not overwrite the main snapshot\": a real Main AgentController monitor holding a sentinel ContextSnapshot (also injected into the shared executor) stays the same object with every field unchanged while a real ON_DEMAND sub-agent runs through factory/AgentRuntime.create/react_loop on a mock transport and publishes only to its own distinct monitor; balanced closes.",
+      "refs": "task 11.3 formal-verification warning 3; context-monitoring spec"
     }
   ],
   "groups": {
@@ -10047,6 +10065,9 @@
       ],
       "367": [
         "test_plan_step_without_main_fails_step_before_allocation"
+      ],
+      "578": [
+        "test_child_run_publishes_only_to_its_own_monitor_and_leaves_main_snapshot_unchanged"
       ]
     },
     "tests/test_prompt_builder_results_recall.py": {
@@ -13170,6 +13191,40 @@
         "TestOrdinaryRunOwners::test_ordinary_finish_updates_goal_memory_graph_and_balances_supervisor",
         "TestOrdinaryRunOwners::test_ordinary_run_accounts_for_one_real_graph_retrieval",
         "TestOrdinaryRunOwners::test_ordinary_run_retrieves_graph_context_via_format_for_prompt"
+      ]
+    },
+    "tests/test_docs_examples_11_1.py": {
+      "577": [
+        "test_config_example_documents_selection_and_inert_legacy_files",
+        "test_explicit_selectors_need_no_main_but_inheriting_requests_do",
+        "test_migration_steps_remove_legacy_time_fields_because_leftovers_invalidate_the_job",
+        "test_no_retired_wording_in_shipped_documents[/models select]",
+        "test_no_retired_wording_in_shipped_documents[85 %]",
+        "test_no_retired_wording_in_shipped_documents[85%]",
+        "test_no_retired_wording_in_shipped_documents[Not yet changed (tasks 6.x)]",
+        "test_no_retired_wording_in_shipped_documents[Without an injected catalog]",
+        "test_no_retired_wording_in_shipped_documents[can reject requests locally]",
+        "test_no_retired_wording_in_shipped_documents[later context-policy change]",
+        "test_no_retired_wording_in_shipped_documents[never changes those old files]",
+        "test_no_retired_wording_in_shipped_documents[not changed by this step]",
+        "test_no_retired_wording_in_shipped_documents[override background_model]",
+        "test_no_retired_wording_in_shipped_documents[provider model catalog is injected]",
+        "test_no_retired_wording_in_shipped_documents[tasks and sub-agents are refused]",
+        "test_readme_command_table_keeps_compress_hidden_and_stop_listed",
+        "test_readme_documents_each_current_topic[Refresh first]",
+        "test_readme_documents_each_current_topic[Rollback]",
+        "test_readme_documents_each_current_topic[Selection is by buttons only]",
+        "test_readme_documents_each_current_topic[Upgrading manually from the old model configuration]",
+        "test_readme_documents_each_current_topic[active but unsaved]",
+        "test_readme_documents_each_current_topic[context-length rejection]",
+        "test_readme_documents_each_current_topic[never read, parsed, converted]",
+        "test_readme_documents_each_current_topic[no typed selection command]",
+        "test_readme_models_row_describes_button_selection",
+        "test_readme_toml_examples_use_only_current_fields",
+        "test_rollback_untouched_claim_names_only_the_retired_files",
+        "test_scheduler_example_documents_strict_selectors_and_inert_json",
+        "test_scheduler_example_parses_and_every_job_is_current",
+        "test_startup_errors_are_chat_config_and_job_errors_are_contained"
       ]
     }
   },
@@ -72162,5 +72217,94 @@
     "production_change": "main._retired_catalog_notice (os.path.lexists only) + one logger.warning at startup before catalog refresh. README one sentence. ModelSettings retained: it is the injected store of many tests and of backfill_graph_memory.prepare_backfill_prerequisites (no production caller reads the retired path; live backfill tripwire test unchanged).",
     "red_evidence": "10 of 11 new nodes RED first (no notice; log RED-retired-notice.txt); the absent-file node was already GREEN (pre-existing correct, no fabricated RED).",
     "limits": "No full suite and no 10.3 checkbox; parent owns review and full gate. Dead scheduler _legacy_read_only branches (always False) left untouched as out of scope."
+  },
+  "executed_11_1": {
+    "baseline_collected": 6159,
+    "current_collected": 6189,
+    "arithmetic": "6159 - 0 removed + 30 added (all new, class 577) = 6189",
+    "counts_before": {
+      "keep": 5682,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "counts_after": {
+      "keep": 5712,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "retired": [],
+    "renamed": {},
+    "new_node_ids": [
+      "tests/test_docs_examples_11_1.py::test_config_example_documents_selection_and_inert_legacy_files",
+      "tests/test_docs_examples_11_1.py::test_explicit_selectors_need_no_main_but_inheriting_requests_do",
+      "tests/test_docs_examples_11_1.py::test_migration_steps_remove_legacy_time_fields_because_leftovers_invalidate_the_job",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[/models select]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[85 %]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[85%]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[Not yet changed (tasks 6.x)]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[Without an injected catalog]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[can reject requests locally]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[later context-policy change]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[never changes those old files]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[not changed by this step]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[override background_model]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[provider model catalog is injected]",
+      "tests/test_docs_examples_11_1.py::test_no_retired_wording_in_shipped_documents[tasks and sub-agents are refused]",
+      "tests/test_docs_examples_11_1.py::test_readme_command_table_keeps_compress_hidden_and_stop_listed",
+      "tests/test_docs_examples_11_1.py::test_readme_documents_each_current_topic[Refresh first]",
+      "tests/test_docs_examples_11_1.py::test_readme_documents_each_current_topic[Rollback]",
+      "tests/test_docs_examples_11_1.py::test_readme_documents_each_current_topic[Selection is by buttons only]",
+      "tests/test_docs_examples_11_1.py::test_readme_documents_each_current_topic[Upgrading manually from the old model configuration]",
+      "tests/test_docs_examples_11_1.py::test_readme_documents_each_current_topic[active but unsaved]",
+      "tests/test_docs_examples_11_1.py::test_readme_documents_each_current_topic[context-length rejection]",
+      "tests/test_docs_examples_11_1.py::test_readme_documents_each_current_topic[never read, parsed, converted]",
+      "tests/test_docs_examples_11_1.py::test_readme_documents_each_current_topic[no typed selection command]",
+      "tests/test_docs_examples_11_1.py::test_readme_models_row_describes_button_selection",
+      "tests/test_docs_examples_11_1.py::test_readme_toml_examples_use_only_current_fields",
+      "tests/test_docs_examples_11_1.py::test_rollback_untouched_claim_names_only_the_retired_files",
+      "tests/test_docs_examples_11_1.py::test_scheduler_example_documents_strict_selectors_and_inert_json",
+      "tests/test_docs_examples_11_1.py::test_scheduler_example_parses_and_every_job_is_current",
+      "tests/test_docs_examples_11_1.py::test_startup_errors_are_chat_config_and_job_errors_are_contained"
+    ],
+    "new_nodes": 30,
+    "preserved_generic_owners": [
+      "tests/test_config_example.py",
+      "tests/test_models_list_only_9_2.py::test_readme_directs_selection_to_buttons"
+    ],
+    "red_evidence": "Initial: 17 of 22 nodes RED against the pre-edit docs (RED-docs.txt); the 5 structural nodes were already GREEN. Oracle FAIL follow-up: 8 of the 30 final nodes RED against the first-candidate README (RED-followup-docs.txt: 4 retired-wording params plus the startup-vs-job-containment, legacy time/hours/minutes, explicit-vs-implicit-without-Main and rollback-claim tests); the marker tests had passed despite wrong prose, so they do not prove semantic accuracy.",
+    "oracle_followup": "README startup errors now limited to config.toml; scheduler job fields are contained per job; explicit selectors work without Main (even with a corrupt preference), only inheriting requests are refused; migration step removes legacy time/hours/minutes; rollback untouched-claim narrowed to retired files; internal injected-catalog wording removed. Semantic tests execute scheduler._classify_schedule / parse_config and require canonical production tests to exist; they are documentation regressions, not behavioural proof.",
+    "docs_changed": [
+      "README.md",
+      "config.toml.example",
+      "scheduler.toml.example"
+    ],
+    "limits": "Documentation only; no runtime change. No full suite and no 11.1 checkbox; parent owns review and gate. The topic-marker tests pin a few phrases, not prose."
+  },
+  "executed_11_3_warning_fixes": {
+    "baseline_collected": 6189,
+    "current_collected": 6190,
+    "arithmetic": "6189 - 0 removed + 1 added (class 578) = 6190",
+    "counts_before": {
+      "keep": 5712,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "counts_after": {
+      "keep": 5713,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "retired": [],
+    "renamed": {},
+    "new_node_ids": [
+      "tests/test_profile_admission_matrix.py::test_child_run_publishes_only_to_its_own_monitor_and_leaves_main_snapshot_unchanged"
+    ],
+    "new_nodes": 1,
+    "evidence": "First run GREEN (product already isolates child monitors; coverage gap, no fabricated RED). Copied-tree alias mutant (SubAgentRunner passes the shared executor monitor to its inner AgentController) fails the new test at the child-monitor identity assertion, baseline copy green (CONTROL-*.txt).",
+    "docs_changed": [
+      "ARCHITECTURE.md",
+      "MEMORY.md"
+    ],
+    "limits": "Documentation + one test; no runtime change. 19 non-canonical REMOVED requirements remain unverified. No full suite; no checkbox change; executed_11_1 untouched."
   }
 }
