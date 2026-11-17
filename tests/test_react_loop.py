@@ -75,6 +75,95 @@ class TestTurnOwnedFinishGate:
         assert "get_agent_result" in feedback
         assert "cancel_agent" in feedback
 
+    def test_finish_veto_preserves_request_attempt_state_and_checkpoint(self):
+        from call_attempt_state import CallAttemptState
+        from tests.execution_harness import RecordingExecutor, build_context
+        from react_loop import _LoopState, _StepResult, _Turn, _run_single_step
+
+        ctx = build_context(MagicMock(), RecordingExecutor(), trace_id="r-finish-veto")
+        supervisor = MagicMock()
+        supervisor.unaccounted_children.return_value = [("sa-child", "done")]
+        ctx.builtin_executor._supervisor = supervisor
+        ctx.checkpoint_store = MagicMock()
+        attempt = CallAttemptState(max_retries=1)
+        attempt.begin_outbound_attempt("json")
+        state = _LoopState(
+            messages=[{"role": "user", "content": "goal"}], goal_idx=0,
+            max_steps=8, attempt_state=attempt,
+        )
+
+        with patch("react_loop._prepare_request"), patch(
+            "react_loop._request_turn",
+            return_value=_Turn([], '{"action":"finish","result":"premature"}', False, None),
+        ):
+            result = _run_single_step(
+                ctx, state, "system", "goal", 0.0, lambda _message: None,
+                supports_native_fallback=False,
+            )
+
+        assert result == _StepResult(should_continue=True)
+        assert state.attempt_state is attempt
+        assert attempt.outbound_attempts == 1
+        assert attempt.automatic_retries_used == 0
+        ctx.checkpoint_store.delete.assert_not_called()
+
+
+class TestDirectCheckpointOwnershipCleanup:
+    def test_direct_loop_releases_owner_when_context_setup_raises(self, tmp_path):
+        from checkpoint_store import CheckpointStore
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import react_loop
+
+        store = CheckpointStore(str(tmp_path))
+        ctx = build_context(ScriptedLLM(['{"action":"finish"}']), RecordingExecutor(), trace_id="r-direct-setup")
+        ctx.checkpoint_store = store
+
+        with patch("react_loop.agent_logging.bind_run_context", side_effect=RuntimeError("bind failed")):
+            with pytest.raises(RuntimeError, match="bind failed"):
+                react_loop(ctx, "goal")
+
+        assert ctx.checkpoint_owner is None
+        owner = store.acquire_owner("r-direct-setup")
+        assert owner is not None
+        owner.release()
+
+    def test_direct_loop_releases_owner_when_teardown_raises(self, tmp_path):
+        from checkpoint_store import CheckpointStore
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import react_loop
+
+        store = CheckpointStore(str(tmp_path))
+        ctx = build_context(ScriptedLLM(['{"action":"finish","result":"ok"}']), RecordingExecutor(), trace_id="r-direct-cleanup")
+        ctx.checkpoint_store = store
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)), \
+             patch("react_loop.agent_logging.reset_run_context", side_effect=RuntimeError("reset failed")):
+            with pytest.raises(RuntimeError, match="reset failed"):
+                react_loop(ctx, "goal")
+
+        assert ctx.checkpoint_owner is None
+        owner = store.acquire_owner("r-direct-cleanup")
+        assert owner is not None
+        owner.release()
+
+    def test_direct_loop_does_not_release_caller_owned_lease(self, tmp_path):
+        from checkpoint_store import CheckpointStore
+        from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context
+        from react_loop import react_loop
+
+        store = CheckpointStore(str(tmp_path))
+        owner = store.acquire_owner("r-external-owner")
+        assert owner is not None
+        ctx = build_context(ScriptedLLM(['{"action":"finish","result":"ok"}']), RecordingExecutor(), trace_id="r-external-owner")
+        ctx.checkpoint_store = store
+        ctx.checkpoint_owner = owner
+
+        with patch("react_loop._build_system_prompt", return_value=("system", None)):
+            assert react_loop(ctx, "goal") == "ok"
+
+        assert owner.released is False
+        owner.release()
+
     def test_wait_timeout_keeps_child_finish_obligation(self):
         from tests.execution_harness import RecordingExecutor, ScriptedLLM, build_context, make_outcome
         from react_loop import react_loop
@@ -199,7 +288,7 @@ class TestTurnOwnedDrain:
 
         assert visible_before_cleanup is True
         assert progress_messages[-1] == "__DRAINING__:sa-draining"
-        assert results == ["[Cancelled]"]
+        assert results == ["⚠️ Task stopped by operator."]
 
 
 class TestExtractJsonCandidates:
@@ -849,16 +938,27 @@ class TestAgentControllerTurnOwnership:
         assert seen[0][1] != seen[1][1]
 
     def test_resume_reuses_checkpoint_trace_but_not_turn_owner(self):
+        from call_attempt_state import CallAttemptState
+
         ctrl = self._make_controller()
+        ctrl.llm.llm_cfg = {"id": "fixture-canonical", "model": "fixture-upstream"}
         ctrl.checkpoint_store = MagicMock()
         ctrl.checkpoint_store.load.return_value = {
-            "messages": [],
+            "format_version": 2,
+            "messages": [{"role": "user", "content": "resumed goal"}],
             "goal_idx": 0,
             "max_steps": 8,
             "step": 0,
             "json_fail_streak": 0,
             "trace_id": "r-checkpoint",
             "user_goal": "resumed goal",
+            "model_id": "fixture-canonical",
+            "attempt_state": CallAttemptState().to_dict(),
+            "created_at": "2026-01-01T00:00:00Z",
+            "error_info": {
+                "type": "timeout", "message": "timeout",
+                "retryable": True, "detail": "TimeoutException",
+            },
         }
         seen = []
 
@@ -966,6 +1066,11 @@ class TestCompactionGoalAnchoring:
         # Force compaction whenever more than three messages are present.
         monkeypatch.setattr(
             context_manager, "estimate_messages_tokens",
+            lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10,
+        )
+        import react_loop as react_loop_module
+        monkeypatch.setattr(
+            react_loop_module, "estimate_messages_tokens",
             lambda m, s, model=None: 1_000_000 if len(m) > 3 else 10,
         )
 
@@ -1134,9 +1239,8 @@ class TestNativeFallbackLinearization:
         assert once == plain
         assert _linearize_native_turns(once) == once
 
-    def test_native_failure_falls_back_to_linearized_json_mode(self):
-        """End-to-end: step-1 native tool call, step-2 native failure → the
-        json_mode fallback receives clean, linearized history (H1 regression)."""
+    def test_native_failure_is_terminal_without_json_protocol_switch(self):
+        """A post-send native error must not be hidden by a JSON retry."""
         from interfaces import ChatResponse, ToolCall
         from llm_client import LLMError
         from tests.execution_harness import (
@@ -1145,6 +1249,7 @@ class TestNativeFallbackLinearization:
             make_outcome,
             run_react,
         )
+        from confirmation import ConfirmationManager
 
         llm = NativeScriptedLLM([
             ChatResponse(tool_calls=[
@@ -1153,29 +1258,14 @@ class TestNativeFallbackLinearization:
             LLMError("native tool calling unavailable"),
         ])
         ex = RecordingExecutor({"shell": make_outcome(output="hi")})
+        confirmation = ConfirmationManager()
+        confirmation.request_retry = lambda *args, **kwargs: "timeout"
 
-        result, _calls, _progress = run_react(llm, ex, "do it")
+        result, _calls, _progress = run_react(llm, ex, "do it", confirmation=confirmation)
 
-        assert result == "done"
+        assert result.startswith("❌")
         assert ex.tool_order == ["shell"]
-
-        # The json_mode fallback ran and received a fully linearized payload.
-        assert llm.json_mode_calls, "expected a json_mode fallback call"
-        fallback_msgs = llm.json_mode_calls[0]
-        for m in fallback_msgs:
-            assert m.get("content") is not None, "assistant content=None leaked into json_mode"
-            assert "tool_calls" not in m, "tool_calls leaked into json_mode payload"
-            assert m.get("role") != "tool", "role=tool leaked into json_mode payload"
-            assert "tool_call_id" not in m, "tool_call_id leaked into json_mode payload"
-        # The step-1 tool call and its result survive as readable plain text.
-        assert any(
-            m["role"] == "assistant" and str(m.get("content", "")).startswith("Called tool: shell(")
-            for m in fallback_msgs
-        )
-        assert any(
-            m["role"] == "user" and "hi" in str(m.get("content", ""))
-            for m in fallback_msgs
-        )
+        assert llm.json_mode_calls == []
 
 
 class TestSingleRecordLifecycle:

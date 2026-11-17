@@ -37,13 +37,16 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import jinja2
 import yaml
 
 from exceptions import ConfigError
 from token_estimator import estimate_tokens
+
+if TYPE_CHECKING:
+    from model_registry import CatalogView
 
 logger = logging.getLogger(__name__)
 
@@ -384,6 +387,7 @@ def build_system_prompt(
     mode: str = "default",
     prompts_dir: Optional[str] = None,
     parent_context_section: str = "",
+    model_catalog_view: CatalogView | None = None,
 ) -> tuple[str, int]:
     """Build the full system prompt for the ReAct agent.
 
@@ -393,6 +397,9 @@ def build_system_prompt(
     exists, sections are loaded from ``prompts/system/*.md`` and rendered via
     Jinja2. Otherwise the legacy ``SYSTEM_PROMPT_TEMPLATE`` from
     ``prompt_builder.py`` is used and a deprecation warning is logged.
+
+    ``model_catalog_view`` (optional) is forwarded to ``format_models`` and
+    ``format_tools`` on every path, including the legacy fallback.
 
     Returns:
         ``(prompt_text, estimated_tokens)``.
@@ -426,6 +433,7 @@ def build_system_prompt(
             parent_context_section=parent_context_section,
             strategies_section=strategies_section,
             mode=mode,
+            model_catalog_view=model_catalog_view,
         )
 
     # Choose variant directory: sub-agent prompts live under prompts/sub-agent
@@ -448,7 +456,7 @@ def build_system_prompt(
     from prompt_builder import format_log_section, format_models, format_skills, format_tools
 
     relevant_tools = tool_index.search(user_goal, top_k=top_tools)
-    tools_text = format_tools(relevant_tools)
+    tools_text = format_tools(relevant_tools, model_catalog_view)
     memory_text = memory.as_prompt_text()
     if results and results_top_k > 0:
         past_results_text = results.as_prompt_text(user_goal, top_k=results_top_k)
@@ -457,7 +465,7 @@ def build_system_prompt(
     else:
         past_results_text = "No past results."
     skills_section = format_skills(skill_registry)
-    models_section = format_models(llm)
+    models_section = format_models(llm, model_catalog_view)
     file_storage = (
         f"- User workspace (prefer this for files you create or edit for the user):\n"
         f"    {workspace_dir}  ← trusted zone (no confirmation for normal files)\n"
@@ -613,6 +621,7 @@ def _legacy_build_system_prompt(
     parent_context_section: str = "",
     strategies_section: str = "",
     mode: str = "default",
+    model_catalog_view: CatalogView | None = None,
 ) -> tuple[str, int]:
     """Build the system prompt using the legacy static template."""
     from prompt_builder import (
@@ -624,7 +633,7 @@ def _legacy_build_system_prompt(
     )
 
     relevant_tools = tool_index.search(user_goal, top_k=top_tools)
-    tools_text = format_tools(relevant_tools)
+    tools_text = format_tools(relevant_tools, model_catalog_view)
     memory_text = memory.as_prompt_text()
     if results and results_top_k > 0:
         past_results_text = results.as_prompt_text(user_goal, top_k=results_top_k)
@@ -633,7 +642,7 @@ def _legacy_build_system_prompt(
     else:
         past_results_text = "No past results."
     skills_section = format_skills(skill_registry)
-    models_section = format_models(llm)
+    models_section = format_models(llm, model_catalog_view)
     file_storage = (
         f"- User workspace (prefer this for files you create or edit for the user):\n"
         f"    {workspace_dir}  ← trusted zone (no confirmation for normal files)\n"

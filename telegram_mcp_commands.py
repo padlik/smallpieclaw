@@ -12,11 +12,7 @@ from dataclasses import replace as dataclass_replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from builtin_tools.schemas import build_tool_definitions, builtin_tool_names
-from context_monitor import (
-    compute_danger_level,
-    compute_headroom_real,
-    group_tool_defs_by_server,
-)
+from context_monitor import group_tool_defs_by_server
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
@@ -126,9 +122,9 @@ async def _mcp_auth_revoke(
 def _refresh_tool_defs_snapshot(iface: "TelegramInterface") -> None:
     """Refresh the context monitor snapshot after the tool set changes.
 
-    Recomputes the tool-definitions-by-server breakdown, token total, danger
-    level, and real headroom from the most recent snapshot. The updated
-    snapshot is published as non-live so ``/context`` reflects the latest
+    Recomputes the tool-definitions-by-server breakdown and its token total
+    from the most recent snapshot, preserving every other field (counts,
+    threshold, turn and model identity). The updated snapshot is published as non-live so ``/context`` reflects the latest
     available tool configuration immediately after a tool-changing command.
     """
     if iface.agent is None or iface.agent.context_monitor is None:
@@ -156,20 +152,10 @@ def _refresh_tool_defs_snapshot(iface: "TelegramInterface") -> None:
     # a per-run filtered subset like ctx._tool_defs in the ReAct loop. The
     # is_live=False marker flags this snapshot as approximate.
     fresh_tokens = sum(fresh.values())
-    total = last.system_prompt_tokens + last.chat_history_tokens + fresh_tokens
-    danger = compute_danger_level(total, last.compaction_threshold)
-    headroom = compute_headroom_real(
-        last.compaction_threshold,
-        last.system_prompt_tokens,
-        last.chat_history_tokens,
-        fresh_tokens,
-    )
     updated = dataclass_replace(
         last,
         tool_defs_by_server=fresh,
         tool_defs_tokens=fresh_tokens,
-        danger_level=danger,
-        headroom_real=headroom,
         is_live=False,
     )
     iface.agent.context_monitor.publish(updated)

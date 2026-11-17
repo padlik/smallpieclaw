@@ -363,7 +363,7 @@ class TestOperatorCancelRegression:
 
     def test_cancel_event_pre_set_terminates_pre_step(self):
         """A forwarded stop (cancel_event already set, not owned) yields the
-        pre-step [Cancelled] early return."""
+        pre-step operator-stopped result."""
 
         from tests.execution_harness import build_context
         from unittest.mock import patch
@@ -378,5 +378,7 @@ class TestOperatorCancelRegression:
             # Not owning the event prevents react_loop from clearing it.
             ctx.owns_cancel_event = False
             result = react_loop(ctx, "task")
-        assert result == "[Cancelled]"
+        assert result == "⚠️ Task stopped by operator."
         assert ex.calls == []
+        assert llm.calls == []
+        assert ctx.cancel_event.is_set()

@@ -4,11 +4,12 @@ order: 3
 required: true
 mode: all
 variables:
+  - models_section
   - tools
   - file_storage
 ---
 
-AVAILABLE TOOLS:
+{{models_section}}AVAILABLE TOOLS:
 {{tools}}
 
 FILE STORAGE:

@@ -14,23 +14,27 @@ with the HTTP layer mocked at ``client._http`` — no network.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
+import httpx
 import pytest
 
-from llm_client import LLMClient, LLMError
+from llm_client import LLMPermanentError
+from model_registry import ModelMetadata
+from tests.run_model_fixtures import make_run_model_client
 
 
-def _make_client(provider: str) -> LLMClient:
-    """Build a real LLMClient for *provider* with fake credentials (no network)."""
-    model = {
-        "name": "m", "provider": provider, "model": "m",
-        "api_key": "k", "base_url": "https://example.invalid/v1",
-    }
-    return LLMClient({
-        "models": [model],
-        "agent": {"default_model": "m"},
-    })
+def _make_client(provider: str, transport: httpx.BaseTransport):
+    """Build a pinned test client with explicit capabilities and fake transport."""
+    return make_run_model_client(
+        provider,
+        transport,
+        metadata=ModelMetadata(
+            context_tokens=8192,
+            output_tokens=1024,
+            vision=False,
+            tool_calling=True,
+        ),
+        upstream_id="test-native-model",
+    )
 
 
 def _tool_call_body(arguments) -> dict:
@@ -51,15 +55,21 @@ def _tool_call_body(arguments) -> dict:
 
 
 def _invoke(provider: str, body: dict):
-    """Call the provider's native tool parser with *body* mocked at the HTTP seam."""
-    client = _make_client(provider)
-    resp_obj = MagicMock()
-    resp_obj.json.return_value = body
-    resp_obj.raise_for_status.return_value = None
-    client._http = MagicMock()
-    client._http.post.return_value = resp_obj
+    """Call the parser with a real mock-transport HTTP exchange."""
+    captured: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json=body)
+
+    client = _make_client(provider, httpx.MockTransport(respond))
     messages = [{"role": "user", "content": "hi"}]
-    return client.chat_with_tools(messages, tools=[], system=None)
+    try:
+        result = client.chat_with_tools(messages, tools=[], system=None)
+        assert len(captured) == 1
+        return result
+    finally:
+        client.close()
 
 
 # (label, wire value for the arguments field)
@@ -120,14 +130,21 @@ def test_anthropic_chat_with_tools_raises_not_implemented():
     # Anthropic has no native tool-calling backend, so chat_with_tools() must
     # raise NotImplementedError — the signal the ReAct loop uses to fall back to
     # the json_mode path.
-    client = _make_client("anthropic")
-    with pytest.raises(NotImplementedError):
-        client.chat_with_tools([{"role": "user", "content": "hi"}], tools=[], system=None)
+    captured: list[httpx.Request] = []
+    client = _make_client(
+        "anthropic",
+        httpx.MockTransport(lambda request: captured.append(request) or httpx.Response(200)),
+    )
+    try:
+        with pytest.raises(NotImplementedError):
+            client.chat_with_tools([{"role": "user", "content": "hi"}], tools=[], system=None)
+        assert captured == []
+    finally:
+        client.close()
 
 
 def test_unknown_provider_chat_raises_llm_error():
-    # An unrecognised provider string has no _PROVIDER_MODULES entry; chat() must
-    # surface a clear LLMError rather than a bare KeyError/AttributeError.
-    client = _make_client("unknown_xyz")
-    with pytest.raises(LLMError):
-        client.chat([{"role": "user", "content": "hi"}])
+    # The pinned client rejects an adapter outside the approved registry at
+    # construction, before a chat call or transport can occur.
+    with pytest.raises(LLMPermanentError, match="Pinned provider configuration"):
+        _make_client("unknown_xyz", httpx.MockTransport(lambda request: httpx.Response(200)))

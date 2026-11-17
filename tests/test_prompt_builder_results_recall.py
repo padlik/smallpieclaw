@@ -79,3 +79,10 @@ class TestResultsRecallControl:
         prompt, _ = _build(results, graph_context_section=graph, results_top_k=0)
         assert "alice uses postgres" in prompt
         assert results.calls == []
+
+
+def test_spawn_agent_description_omits_generation_knobs():
+    prompt, _ = _build(None)
+    spawn_line = next(line for line in prompt.splitlines() if line.strip().startswith("spawn_agent "))
+    assert "response_format" in spawn_line
+    assert [knob for knob in ("max_tokens", "temperature", "top_p") if knob in spawn_line] == []

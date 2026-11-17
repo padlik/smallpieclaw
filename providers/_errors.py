@@ -26,6 +26,26 @@ class LLMPermanentError(LLMError):
     """
 
 
+class LLMContextOverflowError(LLMPermanentError):
+    """The provider reported that the request exceeds its context capacity.
+
+    ``status_code`` is the plain integer HTTP status of the provider response,
+    else ``None``. No request, model, endpoint or credential text is retained.
+    """
+
+    def __init__(
+        self,
+        message: str = "Request exceeds the model context capacity",
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        """Create the error, keeping only a plain in-range HTTP status."""
+        super().__init__(message)
+        self.status_code = (
+            status_code if type(status_code) is int and 100 <= status_code <= 599 else None
+        )
+
+
 # Error codes (from OpenAI / OpenRouter / Anthropic) that are permanent — retrying
 # them wastes quota, burns time, and can trigger duplicate billing on some providers.
 _PERMANENT_ERROR_CODES = frozenset({

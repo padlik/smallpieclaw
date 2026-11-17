@@ -6,14 +6,22 @@ result substitution, and the :class:`PlanExecutor` sub-agent orchestration.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import threading
 import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
-from agent_runtime import RuntimeProfile
+import agent_controller
+import execution_plan
+from agent_runtime import RuntimeOptions, RuntimeProfile
 from execution_plan import (
     ExecutionPlan,
     PlanExecutor,
@@ -26,7 +34,21 @@ from execution_plan import (
     topological_sort,
     validate_plan,
 )
+from llm_client import LLMClient
+from model_registry import ModelRegistryError, RunModel
 from react_loop import ReactContext
+from sub_agent_registry import SOURCE_PLAN_STEP, get_registry
+from tests.root_startup_harness import (
+    ACME_HOST,
+    GEM_HOST,
+    INVALID_SAVED,
+    UNCONFIGURED_ID,
+    remembered_for,
+    MAIN_ID,
+    OTHER_ID,
+    SECRETS,
+    RootHarness,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -973,3 +995,309 @@ class TestParentCancelBridgeHelper:
             assert cancelled_flag[0] is False
         assert not cancel_event.is_set()
         assert cancelled_flag[0] is False
+
+
+class TestPlanStepPublicShape:
+    """Task 12.13: PlanStep keeps its public five-field shape (no model field)."""
+
+    def test_exact_public_fields(self):
+        import dataclasses
+
+        assert [f.name for f in dataclasses.fields(PlanStep)] == [
+            "id", "tool", "args", "depends_on", "description",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Task 7.2: production-root ordinary admission through the actual plan route
+#
+# Drives the real ``main._run`` via ``tests/root_startup_harness.py``. A real
+# ``PlanExecutor`` without an injected factory late-binds the actual root
+# builtin's main-owned factory from a real ``ReactContext``; it always passes
+# ``model=None``, so a ``model`` key in step args stays opaque tool payload.
+# Replaced boundaries: the harness's external effects,
+# ``agent_controller.react_loop`` and the plan's worker pool, run inline.
+# Admission, credential resolution, runtime construction and run
+# registration are observed by delegating spies installed after startup.
+# ---------------------------------------------------------------------------
+
+ROOT_PLAN_TRACE = "r-7a2b0c1d"
+ROOT_OPAQUE_ARGS = {"model": OTHER_ID, "note": "opaque"}
+ROOT_STEP_OUTPUT = "root-plan-step-done"
+
+
+@pytest.fixture
+def production_root(tmp_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[RootHarness]:
+    """Keep production ownership assertions ahead of fallback fixture hygiene."""
+    root = RootHarness(tmp_xdg, monkeypatch)
+    try:
+        yield root
+    finally:
+        root.release_leftovers()
+
+
+class _InlineExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Worker-pool boundary that runs submitted work inline: no thread starts."""
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> concurrent.futures.Future:
+        """Run *fn* now and return its completed future."""
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 — delivered through the future
+            future.set_exception(exc)
+        return future
+
+
+class _RootReactBoundary:
+    """Replaces only ``agent_controller.react_loop``; each run sends one real pinned request."""
+
+    def __init__(self, answer: str) -> None:
+        """Record runs and return *answer* from each."""
+        self.answer = answer
+        self.calls: list[SimpleNamespace] = []
+
+    def __call__(
+        self, ctx: ReactContext, goal: str, progress_callback: Any = None,
+        images: Any = None, **kwargs: Any,
+    ) -> str:
+        """Capture the run's pinned client, then send one request through it."""
+        call = SimpleNamespace(goal=goal, llm=ctx.llm, pin=getattr(ctx.llm, "_run_model", None))
+        self.calls.append(call)
+        call.reply = ctx.llm.chat([{"role": "user", "content": "ping"}])
+        return self.answer
+
+
+class _RootAttemptSpies:
+    """Delegating observers on the started root; counters exclude startup work."""
+
+    def __init__(self, root: RootHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Snapshot root state, then wrap the root's real collaborators."""
+        self._root = root
+        self.view_before = root.registry.view()
+        self.settings_before = root.paths.models_cache_file.read_bytes()
+        self._requests = len(root.requests)
+        self._llm_clients = len(root.llm_clients)
+        self._http_clients = len(root.http_clients)
+        self.admits: dict[str, list[object]] = {"admit": [], "admit_scheduled": []}
+        self.codes: list[str] = []
+        self.pins: list[RunModel] = []
+        self.resolved: list[str] = []
+        self.creates: list[tuple[object, object]] = []
+        self.registered: list[tuple[str, str]] = []
+        registry = root.registry
+        for name in self.admits:
+            monkeypatch.setattr(registry, name, self._admission_spy(name, getattr(registry, name)))
+        resolve = registry._credential_resolver
+
+        def resolve_spy(config: Any) -> Any:
+            """Record the provider whose credentials are resolved, then delegate."""
+            self.resolved.append(config.name)
+            return resolve(config)
+
+        monkeypatch.setattr(registry, "_credential_resolver", resolve_spy)
+        create = root.runtime.create
+
+        def create_spy(profile: object, options: object, **kwargs: Any) -> object:
+            """Record the runtime construction request, then delegate."""
+            self.creates.append((profile, options))
+            return create(profile, options, **kwargs)
+
+        monkeypatch.setattr(root.runtime, "create", create_spy)
+        runs = get_registry()
+        register = runs.register
+
+        def register_spy(record: Any) -> None:
+            """Record the child run registration, then delegate."""
+            self.registered.append((record.agent_id, record.source))
+            register(record)
+
+        monkeypatch.setattr(runs, "register", register_spy)
+
+    def _admission_spy(self, name: str, original: Callable[[object], RunModel]) -> Callable[..., RunModel]:
+        """Return a spy recording selector, pin or typed refusal code around *original*."""
+
+        def spy(selector: object = None) -> RunModel:
+            """Record, then delegate to the real registry admission."""
+            self.admits[name].append(selector)
+            try:
+                pin = original(selector)
+            except ModelRegistryError as exc:
+                self.codes.append(exc.code)
+                raise
+            self.pins.append(pin)
+            return pin
+
+        return spy
+
+    def provider_requests(self) -> list[httpx.Request]:
+        """Requests to either catalog provider since the snapshot."""
+        return [r for r in self._root.requests[self._requests:] if r.url.host in (ACME_HOST, GEM_HOST)]
+
+    def new_llm_clients(self) -> list[LLMClient]:
+        """Inference clients constructed since the snapshot."""
+        return self._root.llm_clients[self._llm_clients:]
+
+    def new_http_clients(self) -> list[httpx.Client]:
+        """HTTP clients constructed since the snapshot."""
+        return self._root.http_clients[self._http_clients:]
+
+
+def _serve_anthropic_chat(root: RootHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Extend the harness HTTP boundary with a canned Anthropic chat reply."""
+    original = root._route
+
+    def route(request: httpx.Request) -> httpx.Response:
+        """Serve the pinned Anthropic chat endpoint; delegate everything else."""
+        if (
+            request.method == "POST" and request.url.host == ACME_HOST
+            and request.url.path == "/v1/messages"
+        ):
+            request.read()
+            root.requests.append(request)
+            return httpx.Response(200, json={
+                "content": [{"type": "text", "text": "pong"}],
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            })
+        return original(request)
+
+    monkeypatch.setattr(root, "_route", route)
+
+
+class TestProductionRootPlanAdmission:
+    """Task 7.2: actual root plan route; plan steps snapshot Main and never bypass its gate."""
+
+    @staticmethod
+    def _execute_root_plan(
+        root: RootHarness, monkeypatch: pytest.MonkeyPatch, outcome: dict[str, Any],
+    ) -> None:
+        """Run a one-step plan through a real PlanExecutor on the root builtin."""
+        runtime, registry, factory = root.factory_binding()
+        outcome["binding"] = (
+            runtime is root.runtime, registry is root.registry,
+            root.builtin._sub_agent_factory is factory,
+        )
+        spies = _RootAttemptSpies(root, monkeypatch)
+        outcome["spies"] = spies
+        monkeypatch.setattr(execution_plan, "ThreadPoolExecutor", _InlineExecutor)
+        executor = PlanExecutor(max_concurrent=1)
+        ctx = ReactContext(
+            llm=None, tool_index=None, memory=None, builtin_executor=root.builtin,
+            mcp_manager=None, skill_registry=None, trace_id=ROOT_PLAN_TRACE,
+        )
+        outcome["late_bound"] = (
+            executor._sub_agent_factory is None, executor._get_factory(ctx) is factory,
+        )
+        args = dict(ROOT_OPAQUE_ARGS)
+        plan = ExecutionPlan(description="root plan", steps=[PlanStep(id="a", tool="shell", args=args)])
+        outcome["args"], outcome["plan"] = args, plan
+        outcome["result"] = executor.execute(plan, ctx)
+        outcome["llm_closed"] = [client._closed for client in spies.new_llm_clients()]
+        outcome["http_open"] = [c for c in spies.new_http_clients() if not c.is_closed]
+        outcome["view_after"] = root.registry.view()
+        outcome["settings_after"] = root.paths.models_cache_file.read_bytes()
+
+    @pytest.mark.parametrize(
+        "saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no-saved-selection", "saved-model-missing"],
+    )
+    def test_plan_step_fails_normally_without_active_main(
+        self, production_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
+        saved_default: str | None,
+    ) -> None:
+        """model=None hits the Main gate; the step fails before resolver/runtime/client/HTTP."""
+        boundary = _RootReactBoundary(json.dumps({"success": True, "output": ROOT_STEP_OUTPUT}))
+        monkeypatch.setattr(agent_controller, "react_loop", boundary)
+        outcome: dict[str, Any] = {}
+
+        production_root.start(
+            saved_default=saved_default,
+            hold=lambda root: self._execute_root_plan(root, monkeypatch, outcome),
+        )
+        root = production_root
+        spies: _RootAttemptSpies = outcome["spies"]
+
+        assert outcome["binding"] == (True, True, True)
+        assert outcome["late_bound"] == (True, True)
+        before = spies.view_before
+        assert before.active_model_id is None and before.remembered_model_id == remembered_for(saved_default)
+        assert OTHER_ID in {m.id for m in before.models}
+        # Normal failed step and error list; no diagnostic retry.
+        error = "Failed to create sub-agent: model registry no active selection"
+        result = outcome["result"]
+        assert result["success"] is False
+        step = result["results"]["a"]
+        assert step["success"] is False and step["error"] == error
+        assert "diagnosis" not in step
+        assert result["errors"] == [f"Step 'a' failed: {error}"]
+        assert all(secret not in json.dumps(result, default=str) for secret in SECRETS.values())
+        # One ordinary admission with model=None, refused at the Main gate.
+        assert spies.admits == {"admit": [None], "admit_scheduled": []}
+        assert spies.codes == ["no_active_selection"] and spies.pins == []
+        # Nothing after the gate.
+        assert spies.resolved == [] and spies.creates == [] and spies.registered == []
+        assert spies.new_llm_clients() == [] and spies.new_http_clients() == []
+        assert spies.provider_requests() == [] and boundary.calls == []
+        # The opaque model-valued arg is neither consumed nor rewritten.
+        plan = outcome["plan"]
+        assert plan.steps[0].args is outcome["args"] and outcome["args"] == ROOT_OPAQUE_ARGS
+        assert outcome["view_after"] == before
+        assert outcome["settings_after"] == spies.settings_before
+        assert root.unexpected == [] and root.open_clients_at_exit == []
+
+    def test_plan_step_snapshots_active_main_despite_opaque_model_arg(
+        self, production_root: RootHarness, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Positive control: the step pins Main A once and reaches only the acme endpoint."""
+        _serve_anthropic_chat(production_root, monkeypatch)
+        boundary = _RootReactBoundary(json.dumps({
+            "success": True, "output": ROOT_STEP_OUTPUT, "error": "", "exit_code": 0,
+        }))
+        monkeypatch.setattr(agent_controller, "react_loop", boundary)
+        outcome: dict[str, Any] = {}
+
+        def hold(root: RootHarness) -> None:
+            """Deliberate /models-style refresh first: startup no longer rediscovers a cached catalog,
+            and Anthropic budgeting needs the provider-reported max_tokens. Spies start after it."""
+            root.registry.refresh()
+            self._execute_root_plan(root, monkeypatch, outcome)
+
+        production_root.start(saved_default=MAIN_ID, hold=hold)
+        root = production_root
+        spies: _RootAttemptSpies = outcome["spies"]
+
+        assert outcome["binding"] == (True, True, True)
+        assert outcome["late_bound"] == (True, True)
+        assert spies.view_before.active_model_id == MAIN_ID
+        result = outcome["result"]
+        assert result["success"] is True, result
+        step = result["results"]["a"]
+        assert step["success"] is True and step["output"] == ROOT_STEP_OUTPUT
+        # One ordinary admission snapshotting Main A; the opaque OTHER_ID arg is not a selector.
+        assert spies.admits == {"admit": [None], "admit_scheduled": []} and spies.codes == []
+        (pin,) = spies.pins
+        assert pin.model.id == MAIN_ID and pin.connection.provider_id == "acme"
+        assert pin.connection.base_url == f"https://{ACME_HOST}"
+        assert spies.resolved == ["acme"]
+        ((profile, options),) = spies.creates
+        assert profile is RuntimeProfile.PLAN_STEP_AGENT
+        assert isinstance(options, RuntimeOptions)
+        assert options.run_model is pin and options.label == "plan-a"
+        assert options.trace_id == ROOT_PLAN_TRACE
+        (call,) = boundary.calls
+        assert call.pin is pin and call.reply == "pong"
+        assert f"Arguments: {json.dumps(ROOT_OPAQUE_ARGS, ensure_ascii=False)}" in call.goal
+        assert spies.new_llm_clients() == [call.llm]
+        # The only model request went to the pinned acme endpoint with its own credential.
+        (post,) = [r for r in spies.provider_requests() if r.method == "POST"]
+        assert str(post.url) == f"https://{ACME_HOST}/v1/messages"
+        assert post.headers["x-api-key"] == SECRETS["KEY_ACME"]
+        assert json.loads(post.content)["model"] == "claude-a"
+        assert [r for r in spies.provider_requests() if r.url.host == GEM_HOST] == []
+        # Registered once as a plan step, deregistered, run-owned clients closed.
+        ((agent_id, source),) = spies.registered
+        assert source == SOURCE_PLAN_STEP and get_registry().get(agent_id) is None
+        assert outcome["llm_closed"] == [True] and outcome["http_open"] == []
+        assert outcome["args"] == ROOT_OPAQUE_ARGS
+        assert outcome["view_after"] == spies.view_before
+        assert outcome["settings_after"] == spies.settings_before
+        assert root.unexpected == [] and root.open_clients_at_exit == []

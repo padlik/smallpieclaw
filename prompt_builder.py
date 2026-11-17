@@ -11,24 +11,217 @@ pure (no side effects) and accept their data as parameters.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 # Token estimation lives in token_estimator.py. Re-exported here so existing
 # `from prompt_builder import estimate_tokens` callers keep working.
 from token_estimator import estimate_messages_tokens, estimate_tokens
 
+if TYPE_CHECKING:
+    from model_registry import CatalogView, ModelRecord
+
 # Re-exported for backward compatibility; listed so linters treat them as used.
 __all__ = ["estimate_tokens", "estimate_messages_tokens"]
+
+# Built-in tools whose descriptions carry the compact model-catalog summary.
+MODEL_AWARE_TOOL_NAMES = frozenset({"spawn_agent", "schedule"})
+
+_LIMIT_FIELDS = (
+    ("context_tokens", "context"),
+    ("input_tokens", "input"),
+    ("output_tokens", "output"),
+)
+_CAPABILITY_FIELDS = (
+    ("vision", "vision"),
+    ("tool_calling", "tool calling"),
+    ("reasoning", "reasoning"),
+)
+_CATALOG_DISCLAIMER = (
+    "Listing does not guarantee that a model is callable or that the account has access; "
+    "it is not a routing promise."
+)
+
+
+# ---------------------------------------------------------------------------
+# Model catalog presentation (whitelisted fields only)
+# ---------------------------------------------------------------------------
+
+def _one_line(text: str) -> str:
+    """Collapse whitespace so provider-supplied text cannot break line structure."""
+    return " ".join(str(text).split())
+
+
+def _format_model_entry(model: ModelRecord) -> str:
+    """Render one model as a single line: id, display name, limits, capabilities."""
+    metadata = model.metadata
+    parts: list[str] = []
+    for field_name, label in _LIMIT_FIELDS:
+        value = getattr(metadata, field_name)
+        if value is None:
+            parts.append(f"{label} unknown")
+        else:
+            parts.append(f"{label} {value:,}")
+    for field_name, label in _CAPABILITY_FIELDS:
+        value = getattr(metadata, field_name)
+        if value is None:
+            parts.append(f"{label} unknown")
+        else:
+            state = "supported" if value else "unsupported"
+            parts.append(f"{label} {state}")
+    display = _one_line(model.display_name)
+    name = f"{model.id} ({display})" if display and display != model.upstream_id else model.id
+    return f"{name}: {'; '.join(parts)}"
+
+
+def _format_pin(view: CatalogView) -> str:
+    """Describe the pinned execution model and whether it is still discovered."""
+    pin = view.pinned_model
+    if pin is None:
+        return "none"
+    inventory_ids = {model.id for model in view.models}
+    where = (
+        "still in current inventory, whose current metadata may differ"
+        if pin.id in inventory_ids
+        else "no longer in current inventory"
+    )
+    return f"{_format_model_entry(pin)} ({where}; metadata recorded at admission time, not current discovery)"
+
+
+def _stale_providers(view: CatalogView) -> set[str]:
+    """Return the ids of providers whose last discovery attempt failed."""
+    return {state.provider_id for state in view.providers if state.status == "stale"}
+
+
+def _format_current_entry(model: ModelRecord, stale: set[str]) -> str:
+    """Render a current inventory record, marking it when its provider is stale."""
+    marker = f" (provider {model.provider_id} stale)" if model.provider_id in stale else ""
+    return f"{_format_model_entry(model)}{marker}"
+
+
+def _current_projection(
+    view: CatalogView, max_models: int
+) -> tuple[ModelRecord | None, list[ModelRecord], int]:
+    """Split current inventory into active record, capped other records, omitted count.
+
+    The pinned model never substitutes for a current record: if its id is still
+    listed, the current record stays in the capped inventory like any other.
+    """
+    active = None
+    if view.selection_status == "active" and view.active_model_id:
+        active = next((m for m in view.models if m.id == view.active_model_id), None)
+    listable = sorted(
+        (m for m in view.models if active is None or m.id != active.id), key=lambda m: m.id
+    )
+    shown = listable[: max(max_models, 0)]
+    return active, shown, len(listable) - len(shown)
+
+
+def _format_active_id(view: CatalogView) -> str:
+    """Describe the active selection for future runs by id and status only."""
+    if view.selection_status == "active" and view.active_model_id:
+        return f"{view.active_model_id} (status active)"
+    if view.selection_status == "saved_selection_unavailable":
+        remembered = view.remembered_model_id or "unknown"
+        return f"none (remembered selection {remembered} is unavailable)"
+    return "none (no model selected)"
+
+
+def _format_providers(view: CatalogView) -> str:
+    """Return provider freshness without any connection or error details."""
+    if not view.providers:
+        return "none configured"
+    return "; ".join(f"{state.provider_id} {state.status}" for state in view.providers)
+
+
+def format_model_catalog_summary(view: CatalogView | None, *, max_models: int = 20) -> str:
+    """Return the compact one-line catalog summary used in tool descriptions.
+
+    Carries the historical pin (admission-time metadata), the current active
+    record and a capped projection of other current records, each with its own
+    current limits, capabilities and stale-provider marker.
+    """
+    if view is None:
+        return ""
+    stale = _stale_providers(view)
+    active, shown, omitted = _current_projection(view, max_models)
+    parts = [f"[Model catalog — pinned execution model for this run: {_format_pin(view)}."]
+    if active is not None:
+        parts.append(
+            "Active selection for future runs (status active, current metadata): "
+            f"{_format_current_entry(active, stale)}."
+        )
+    else:
+        parts.append(f"Active selection for future runs: {_format_active_id(view)}.")
+    if shown:
+        entries = " | ".join(_format_current_entry(model, stale) for model in shown)
+        parts.append(f"Other current models (current metadata): {entries}.")
+    if omitted:
+        parts.append(f"{omitted} more current models omitted.")
+    parts.append(f"Provider freshness: {_format_providers(view)}. {_CATALOG_DISCLAIMER}]")
+    return " ".join(parts)
+
+
+def format_model_catalog_section(view: CatalogView | None, *, max_models: int = 20) -> str:
+    """Return the MODEL CATALOG prompt section for a sanitized catalog view.
+
+    The pinned entry (admission-time metadata) and the current active record
+    are rendered outside the inventory cap; the other current records,
+    including a still-listed pinned id, are listed in deterministic id order up
+    to ``max_models`` entries and the count of unlisted ones is reported.
+    Returns ``""`` when *view* is ``None``.
+    """
+    if view is None:
+        return ""
+    stale = _stale_providers(view)
+    provider_lines = [
+        f"{state.provider_id} ({state.adapter}) {state.status}, "
+        f"last successful discovery {state.last_success_at or 'never'}"
+        for state in view.providers
+    ]
+    lines = [
+        "MODEL CATALOG (discovered provider models; canonical ids are provider-id/upstream-id):",
+        f"- {_CATALOG_DISCLAIMER}",
+        f"- Provider freshness: {'; '.join(provider_lines) or 'none configured'}",
+        f"- Pinned execution model for this run: {_format_pin(view)}",
+    ]
+    active, shown, omitted = _current_projection(view, max_models)
+    if active is not None:
+        lines.append(
+            f"- Active selection for future runs (status active): {_format_current_entry(active, stale)}"
+        )
+    else:
+        lines.append(f"- Active selection for future runs: {_format_active_id(view)}")
+
+    lines.append(
+        f"- Current inventory ({len(view.models)} models, current discovery metadata; "
+        "the active entry is listed above):"
+    )
+    for model in shown:
+        lines.append(f"  {_format_current_entry(model, stale)}")
+    if omitted > 0:
+        lines.append(f"  ... {omitted} more inventory models omitted")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Section formatters
 # ---------------------------------------------------------------------------
 
-def format_tools(tools) -> str:
-    """Format a list of tool objects for inclusion in the system prompt."""
+def format_tools(tools, model_catalog_view: CatalogView | None = None) -> str:
+    """Format a list of tool objects for inclusion in the system prompt.
+
+    With *model_catalog_view*, built-in ``spawn_agent``/``schedule`` lines get
+    the compact catalog summary appended; tool objects are never mutated.
+    """
     if not tools:
         return "No additional tools registered."
-    lines = [f"  {t.name}: {t.description}" for t in tools]
+    summary = format_model_catalog_summary(model_catalog_view)
+    lines = []
+    for t in tools:
+        line = f"  {t.name}: {t.description}"
+        if summary and t.name in MODEL_AWARE_TOOL_NAMES and not getattr(t, "is_mcp", False):
+            line += f" {summary}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -49,8 +242,15 @@ def format_skills(skill_registry) -> str:
     return "\n".join(lines)
 
 
-def format_models(llm) -> str:
-    """Return the AVAILABLE MODELS prompt section listing all configured models."""
+def format_models(llm, model_catalog_view: CatalogView | None = None) -> str:
+    """Return the models prompt section.
+
+    With *model_catalog_view* the shared MODEL CATALOG section is returned;
+    otherwise the legacy AVAILABLE MODELS listing of configured models.
+    """
+    if model_catalog_view is not None:
+        section = format_model_catalog_section(model_catalog_view)
+        return f"{section}\n\n" if section else ""
     try:
         models = llm._models
     except AttributeError:
@@ -112,7 +312,7 @@ RELEVANT PAST RESULTS:
   file_read         — read a file from the filesystem
   file_write        — write content to a file on the filesystem
   schedule          — manage scheduled jobs and reminders (actions: list, add, remove, pause, resume, run_now)
-  spawn_agent       — spawn an isolated sub-agent in the background; accepts response_format ("text"|"json"|"file"), max_tokens, temperature, top_p; returns agent_id immediately
+  spawn_agent       — spawn an isolated sub-agent in the background; accepts response_format ("text"|"json"|"file"); returns agent_id immediately
   get_agent_result  — wait for a sub-agent to finish and retrieve its typed result; args: agent_id (required), timeout (optional seconds), cancel_on_timeout (bool, default true — auto-cancels agent on timeout)
   wait_for_any_agent — wait for the first of a set of sub-agents to finish and return its result. Call repeatedly with remaining ids to collect results in completion order, then decide whether you have enough before calling finish.
   cancel_agent      — cancel a spawned sub-agent you no longer need, or pass "managed"/"all" to stop all of them. Not confirmation-gated.
@@ -233,6 +433,7 @@ def build_system_prompt(
     user_goal: str = "(context snapshot)",
     graph_context_section: str = "",
     results_top_k: int = 2,
+    model_catalog_view: CatalogView | None = None,
 ) -> tuple[str, int]:
     """Build the full system prompt for the ReAct agent.
 
@@ -242,9 +443,12 @@ def build_system_prompt(
     Pass ``0`` to suppress ResultsMemory recall entirely — callers do this when
     graph memory has already supplied richer semantic recall for this turn,
     avoiding redundant/overlapping recall context in the prompt.
+
+    ``model_catalog_view`` (optional) replaces the legacy models listing with
+    the shared MODEL CATALOG section and decorates model-aware tool lines.
     """
     relevant_tools = tool_index.search(user_goal, top_k=top_tools)
-    tools_text = format_tools(relevant_tools)
+    tools_text = format_tools(relevant_tools, model_catalog_view)
     memory_text = memory.as_prompt_text()
     if results and results_top_k > 0:
         past_results_text = results.as_prompt_text(user_goal, top_k=results_top_k)
@@ -253,7 +457,7 @@ def build_system_prompt(
     else:
         past_results_text = "No past results."
     skills_section = format_skills(skill_registry)
-    models_section = format_models(llm)
+    models_section = format_models(llm, model_catalog_view)
     file_storage = (
         f"- User workspace (prefer this for files you create or edit for the user):\n"
         f"    {workspace_dir}  ← trusted zone (no confirmation for normal files)\n"

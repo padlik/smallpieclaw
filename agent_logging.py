@@ -176,8 +176,8 @@ def _shared_processors(secret_values: frozenset[str]) -> list:
     """Build the processor chain shared by native and foreign records.
 
     Order: contextvars identity → level → logger name → ISO timestamp →
-    rename ``event``→``msg`` → redact secrets. Renderers run afterwards, per
-    handler.
+    rename ``event``→``msg`` → redact secrets → bound marked scheduled-selector
+    warnings. Renderers run afterwards, per handler.
     """
     return [
         structlog.contextvars.merge_contextvars,
@@ -186,7 +186,32 @@ def _shared_processors(secret_values: frozenset[str]) -> list:
         structlog.processors.TimeStamper(fmt="iso", key="ts"),
         structlog.processors.EventRenamer("msg"),
         _make_redactor(secret_values),
+        _bound_scheduled_selector_warning,
     ]
+
+
+_SCHEDULED_SELECTOR_MARKER = "scheduled_selector_warning"
+_SCHEDULED_SELECTOR_MAX_MSG = 256
+_TRUNCATION_INDICATOR = "..."
+
+
+def _bound_scheduled_selector_warning(
+    _logger: WrappedLogger, _name: str, event_dict: EventDict
+) -> EventDict:
+    """Cap the already-redacted ``msg`` of marked stdlib records at 256 chars.
+
+    Only records whose ``LogRecord`` carries ``scheduled_selector_warning is
+    True`` (set via ``extra=``) are bounded; every other record is untouched.
+    Must run after the redactor so truncation never exposes a secret fragment.
+    """
+    record = event_dict.get("_record")
+    if getattr(record, _SCHEDULED_SELECTOR_MARKER, False) is not True:
+        return event_dict
+    message = event_dict.get("msg")
+    if isinstance(message, str) and len(message) > _SCHEDULED_SELECTOR_MAX_MSG:
+        keep = _SCHEDULED_SELECTOR_MAX_MSG - len(_TRUNCATION_INDICATOR)
+        event_dict["msg"] = message[:keep] + _TRUNCATION_INDICATOR
+    return event_dict
 
 
 # ---------------------------------------------------------------------------

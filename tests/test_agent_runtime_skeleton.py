@@ -7,11 +7,18 @@ Covers OpenSpec change ``introduce-agent-runtime`` tasks 2.1-2.4:
 - ``AgentRuntime`` construction boundary skeleton API (2.3).
 - Profile-to-source mapping proving profiles stay separate from
   ``SubAgentRecord.source`` visibility/capacity categories (2.4).
+
+Models are admitted by a real ``ModelRegistry`` outside the runtime; the runtime
+and runner only consume the immutable ``RunModel`` pin.
 """
 
 from __future__ import annotations
 
+import copy
 import threading
+from collections.abc import Callable, Iterator
+from dataclasses import asdict
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,7 +30,25 @@ from agent_runtime import (
     RuntimeProfile,
     profile_to_source,
 )
+from config_schema import (
+    AgentConfig,
+    EmbeddingsConfig,
+    ExecutorPaths,
+    ProviderConfig,
+    ResolvedProviderConnection,
+)
+from embedding_client import EmbeddingClient
 from memory_store import ShortTermMemory, WorkingMemory
+from model_registry import (
+    CatalogDocument,
+    ModelMetadata,
+    ModelRecord,
+    ModelRegistry,
+    ModelRegistryError,
+    ProviderState,
+    RunModel,
+)
+from model_settings import ModelSettings
 from sub_agent_registry import (
     CAPACITY_COUNTED_SOURCES,
     SOURCE_DIAGNOSTIC,
@@ -35,7 +60,7 @@ from sub_agent_registry import (
 
 
 # ---------------------------------------------------------------------------
-# Builders for AgentRuntime.create sub-agent construction tests
+# Real registry admission + AgentRuntime.create builders
 # ---------------------------------------------------------------------------
 
 _SUB_AGENT_PROFILES = [
@@ -45,30 +70,73 @@ _SUB_AGENT_PROFILES = [
     RuntimeProfile.DIAGNOSTIC_AGENT,
 ]
 
-
-def _cfg() -> dict:
-    models = [
-        {"name": "a", "provider": "openai", "model": "model-a",
-         "api_key": "k", "base_url": "http://x", "max_tokens": 1024,
-         "temperature": 0.2},
-        {"name": "b", "provider": "openai", "model": "model-b",
-         "api_key": "k", "base_url": "http://x"},
-        {"name": "c", "provider": "openai", "model": "model-c",
-         "api_key": "k", "base_url": "http://x"},
-    ]
-    agent = {"default_model": "model-a"}
-    return {"models": models, "agent": agent}
+_URLS = {"pa": "https://a.example.test/v1", "pb": "https://b.example.test/v1"}
+AGENT_CFG = AgentConfig(top_tools=4, ctx_max_tokens=12345)
 
 
-def _runtime(config: dict, *, notify_fn=None, scheduled_max_iterations: int = 100,
-             usage_registry=None) -> AgentRuntime:
-    from config_schema import AgentConfig, ExecutorPaths
+def _record(provider: str, upstream: str, context: int) -> ModelRecord:
+    return ModelRecord(
+        f"{provider}/{upstream}", provider, upstream, f"{upstream} display",
+        ModelMetadata(
+            context, None, 2048, False, True, None,
+        ),
+    )
 
-    return AgentRuntime(
-        config=config,
-        all_models=config["models"],
-        background_model_cfg=config["models"][0],
-        agent_cfg=AgentConfig(top_tools=4, ctx_max_tokens=12345),
+
+MODEL_A = _record("pa", "up/a", 5000)
+MODEL_B = _record("pb", "up/b", 7000)
+
+
+class _NoDiscovery:
+    def fetch(self, connection: object) -> object:
+        raise AssertionError("discovery must not run during admission")
+
+
+def _resolve(config: ProviderConfig) -> ResolvedProviderConnection:
+    return ResolvedProviderConnection(
+        provider_id=config.name, adapter=config.type, base_url=config.base_url,
+        request_timeout=config.request_timeout, api_key=f"secret-{config.name}",
+    )
+
+
+@pytest.fixture
+def registry(tmp_path: Path) -> ModelRegistry:
+    """Real registry with models A (active) and B (inactive)."""
+    providers = {
+        name: ProviderConfig(name, "openai", f"env:KEY_{name}", url, 9)
+        for name, url in _URLS.items()
+    }
+    settings = ModelSettings(tmp_path / "models-config.toml")
+    settings.write(CatalogDocument(
+        1, 2, None,
+        tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+        (MODEL_A, MODEL_B),
+    ))
+    reg = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+    reg.select(MODEL_A.id)
+    return reg
+
+
+@pytest.fixture
+def pin_a(registry: ModelRegistry) -> RunModel:
+    return registry.admit()
+
+
+@pytest.fixture
+def pin_b(registry: ModelRegistry) -> RunModel:
+    return registry.admit(MODEL_B.id)
+
+
+def _unavailable_embedding(event: threading.Event) -> EmbeddingClient:
+    """Real independent EmbeddingClient with no configuration (unavailable)."""
+    return EmbeddingClient(EmbeddingsConfig(), cancel_event=event)
+
+
+def _runtime(*, notify_fn=None, scheduled_max_iterations: int = 100,
+             usage_registry=None, **overrides) -> AgentRuntime:
+    kwargs: dict = dict(
+        agent_cfg=AGENT_CFG,
+        embedding_factory=_unavailable_embedding,
         paths=ExecutorPaths(tmp_dir="/tmp/agent", downloads_dir="downloads",
                             workspace_dir="~/Documents", log_file="agent.log",
                             log_backup_count=30),
@@ -82,6 +150,37 @@ def _runtime(config: dict, *, notify_fn=None, scheduled_max_iterations: int = 10
         notify_fn=notify_fn,
         scheduled_max_iterations=scheduled_max_iterations,
     )
+    kwargs.update(overrides)
+    return AgentRuntime(**kwargs)
+
+
+@pytest.fixture
+def build() -> Iterator[Callable[..., SubAgentRunner]]:
+    """Create runners through ``AgentRuntime.create`` and close them on teardown."""
+    runners: list[SubAgentRunner] = []
+
+    def _build(runtime: AgentRuntime, profile: RuntimeProfile, *,
+               notify_fn=None, on_tool_trace=None, **option_kwargs) -> SubAgentRunner:
+        runner = runtime.create(
+            profile, RuntimeOptions(**option_kwargs),
+            notify_fn=notify_fn, on_tool_trace=on_tool_trace,
+        )
+        runners.append(runner)
+        return runner
+
+    yield _build
+    for runner in runners:
+        runner.close()
+
+
+def _counting_embedding_factory() -> tuple[list[threading.Event], Callable]:
+    events: list[threading.Event] = []
+
+    def factory(event: threading.Event) -> EmbeddingClient:
+        events.append(event)
+        return _unavailable_embedding(event)
+
+    return events, factory
 
 
 # ===========================================================================
@@ -114,11 +213,8 @@ class TestRuntimeOptions:
 
     def test_defaults_are_inherit_none(self):
         opts = RuntimeOptions()
-        assert opts.model is None
+        assert opts.run_model is None
         assert opts.max_iterations is None
-        assert opts.max_tokens is None
-        assert opts.temperature is None
-        assert opts.top_p is None
         assert opts.context_key is None
         assert opts.context_payload is None
         assert opts.prompt_variant is None
@@ -127,13 +223,11 @@ class TestRuntimeOptions:
         assert opts.label is None
 
     def test_all_documented_fields_exist(self):
-        # Freeze the documented option surface (design.md decision 3).
+        # Freeze the option surface: the admitted pin replaces selector and
+        # generation-tuning knobs.
         expected = {
-            "model",
+            "run_model",
             "max_iterations",
-            "max_tokens",
-            "temperature",
-            "top_p",
             "context_key",
             "context_payload",
             "prompt_variant",
@@ -143,14 +237,11 @@ class TestRuntimeOptions:
         }
         assert set(RuntimeOptions.__dataclass_fields__) == expected
 
-    def test_fields_are_assignable(self):
+    def test_fields_are_assignable(self, pin_a):
         cancel = threading.Event()
         opts = RuntimeOptions(
-            model="model-a",
+            run_model=pin_a,
             max_iterations=12,
-            max_tokens=256,
-            temperature=0.9,
-            top_p=0.95,
             context_key="ctx-key",
             context_payload={"parent": "state"},
             prompt_variant="sub-agent",
@@ -158,17 +249,31 @@ class TestRuntimeOptions:
             cancel_event=cancel,
             label="on-demand",
         )
-        assert opts.model == "model-a"
+        assert opts.run_model is pin_a
         assert opts.max_iterations == 12
-        assert opts.max_tokens == 256
-        assert opts.temperature == pytest.approx(0.9)
-        assert opts.top_p == pytest.approx(0.95)
         assert opts.context_key == "ctx-key"
         assert opts.context_payload == {"parent": "state"}
         assert opts.prompt_variant == "sub-agent"
         assert opts.trace_id == "r-abc12345"
         assert opts.cancel_event is cancel
         assert opts.label == "on-demand"
+
+    @pytest.mark.parametrize(
+        "obsolete",
+        [{"model": "pa/up/a"}, {"max_tokens": 256}, {"temperature": 0.9}, {"top_p": 0.95}],
+        ids=["model", "max_tokens", "temperature", "top_p"],
+    )
+    def test_removed_selector_and_generation_options_rejected_before_allocation(
+        self, obsolete, pin_a
+    ):
+        events, factory = _counting_embedding_factory()
+        runtime = _runtime(embedding_factory=factory)
+        with pytest.raises((TypeError, ValueError)):
+            runtime.create(
+                RuntimeProfile.ON_DEMAND_SUBAGENT,
+                RuntimeOptions(run_model=pin_a, **obsolete),
+            )
+        assert events == []
 
 
 # ===========================================================================
@@ -227,21 +332,17 @@ class TestAgentRuntimeSkeleton:
         assert isinstance(runtime, AgentRuntime)
 
     def test_holds_construction_dependencies(self):
-        from config_schema import AgentConfig
-
         tool_index = object()
         base_memory = object()
         runtime = AgentRuntime(
-            config={"models": []},
-            all_models=[{"model": "model-a"}],
-            background_model_cfg={"model": "model-a"},
             agent_cfg=AgentConfig(top_tools=4, ctx_max_tokens=12345),
+            embedding_factory=_unavailable_embedding,
             tool_index=tool_index,
             base_memory=base_memory,
         )
         assert runtime._tool_index is tool_index
         assert runtime._base_memory is base_memory
-        assert runtime._all_models == [{"model": "model-a"}]
+        assert runtime._embedding_factory is _unavailable_embedding
         assert runtime._agent_cfg.top_tools == 4
         assert runtime._agent_cfg.ctx_max_tokens == 12345
 
@@ -250,11 +351,25 @@ class TestAgentRuntimeSkeleton:
         for profile in RuntimeProfile:
             assert runtime.source_for_profile(profile) == profile_to_source(profile)
 
-    def test_create_subagent_without_config_raises(self):
-        # A runtime with no config cannot build a sub-agent product.
+    def test_create_subagent_without_admitted_pin_raises(self):
+        # No fallback model exists: unbound options cannot build a sub-agent.
         runtime = AgentRuntime()
-        with pytest.raises(ValueError, match="config"):
+        with pytest.raises(ValueError, match="run_model"):
             runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
+
+    def test_create_without_typed_agent_config_raises(self, pin_a):
+        runtime = AgentRuntime(embedding_factory=_unavailable_embedding)
+        with pytest.raises(ValueError, match="AgentConfig"):
+            runtime.create(
+                RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions(run_model=pin_a),
+            )
+
+    def test_create_without_embedding_factory_raises(self, pin_a):
+        runtime = AgentRuntime(agent_cfg=AGENT_CFG)
+        with pytest.raises(ValueError, match="embedding_factory"):
+            runtime.create(
+                RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions(run_model=pin_a),
+            )
 
 
 # ===========================================================================
@@ -266,182 +381,239 @@ class TestAgentRuntimeCreateSubAgent:
     profiles, preserving construction behavior and the product surface."""
 
     @pytest.mark.parametrize("profile", _SUB_AGENT_PROFILES)
-    def test_builds_runner_with_product_surface(self, profile):
-        runtime = _runtime(_cfg())
-        runner = runtime.create(profile, RuntimeOptions())
+    def test_builds_runner_with_product_surface(self, profile, build, pin_a):
+        runner = build(_runtime(), profile, run_model=pin_a)
         assert isinstance(runner, SubAgentRunner)
         # Runner-shaped product surface (3.4).
         assert callable(runner.run)
         assert runner.agent_id.startswith("sa-")
-        assert runner._model_id == "model-a"
+        assert runner._model_id == MODEL_A.id
+        assert runner.model_id == MODEL_A.id
         assert isinstance(runner._cancel_event, threading.Event)
         from llm_client import LLMClient
         assert isinstance(runner._llm, LLMClient)
+        assert runner._llm._run_model is pin_a
         assert isinstance(runner._agent, AgentController)
         assert isinstance(runner._short_term, ShortTermMemory)
         assert callable(runner.close)
         assert callable(runner.notify_fn)
 
     @pytest.mark.parametrize("profile", _SUB_AGENT_PROFILES)
-    def test_subagent_depth_is_one(self, profile):
-        runtime = _runtime(_cfg())
-        runner = runtime.create(profile, RuntimeOptions())
+    def test_subagent_depth_is_one(self, profile, build, pin_a):
+        runner = build(_runtime(), profile, run_model=pin_a)
         assert runner._agent._depth == 1
 
-    def test_all_subagent_profiles_build_equivalent_products(self):
+    def test_all_subagent_profiles_build_equivalent_products(self, build, pin_a):
         # Construction is uniform across sub-agent profiles (source differs later).
-        runtime = _runtime(_cfg())
-        runners = [runtime.create(p, RuntimeOptions()) for p in _SUB_AGENT_PROFILES]
+        runtime = _runtime()
+        runners = [build(runtime, p, run_model=pin_a) for p in _SUB_AGENT_PROFILES]
         depths = {r._agent._depth for r in runners}
         models = {r._model_id for r in runners}
         iters = {r._agent.max_iterations for r in runners}
         working = {type(r._working) for r in runners}
         assert depths == {1}
-        assert models == {"model-a"}
+        assert models == {MODEL_A.id}
         assert iters == {100}
         assert working == {WorkingMemory}
 
-    def test_model_override_resolves_and_activates(self):
-        runtime = _runtime(_cfg())
-        runner = runtime.create(
-            RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions(model="model-b"),
+    def test_explicit_pin_b_is_used_while_registry_active_model_is_a(
+        self, registry, pin_b, build
+    ):
+        runner = build(
+            _runtime(), RuntimeProfile.ON_DEMAND_SUBAGENT, run_model=pin_b,
         )
-        assert runner._model_id == "model-b"
-        assert runner._llm.llm_cfg.get("model") == "model-b"
+        assert runner._model_id == MODEL_B.id
+        assert runner._llm._run_model is pin_b
+        assert registry.view().active_model_id == MODEL_A.id
 
-    def test_unknown_model_raises(self):
-        runtime = _runtime(_cfg())
-        with pytest.raises(ValueError, match="not found"):
-            runtime.create(
-                RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions(model="nope"),
-            )
+    def test_registry_selection_never_retargets_existing_runner(
+        self, registry, pin_a, build
+    ):
+        runner = build(_runtime(), RuntimeProfile.ON_DEMAND_SUBAGENT, run_model=pin_a)
+        registry.select(MODEL_B.id)
+        assert runner._model_id == MODEL_A.id
+        assert runner._llm._run_model is pin_a
 
-    def test_default_model_is_background_model(self):
-        # No model override -> background_model_cfg (models[0]).
-        runtime = _runtime(_cfg())
-        runner = runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
-        assert runner._model_id == "model-a"
+    def test_unknown_selector_fails_registry_admission_before_runtime_allocation(
+        self, registry, monkeypatch
+    ):
+        import agent_controller
 
-    def test_per_call_overrides_applied_without_mutating_shared_config(self):
-        config = _cfg()
-        runtime = _runtime(config)
-        runner = runtime.create(
-            RuntimeProfile.ON_DEMAND_SUBAGENT,
-            RuntimeOptions(max_tokens=256, temperature=0.9, top_p=0.95),
+        chat_allocations: list[tuple] = []
+
+        def forbidden_llm(*args, **kwargs):
+            chat_allocations.append(args)
+            raise AssertionError("chat client allocated after failed admission")
+
+        monkeypatch.setattr(agent_controller, "LLMClient", forbidden_llm)
+        events, factory = _counting_embedding_factory()
+        runtime = _runtime(embedding_factory=factory)
+
+        # Admission happens outside the runtime; a failed admission yields no pin,
+        # so nothing can reach create() and nothing is allocated.
+        with pytest.raises(ModelRegistryError) as excinfo:
+            registry.admit("not-a-model")  # no connection part: malformed, never an uncached send
+        assert excinfo.value.code == "malformed_selector"
+        assert events == []
+        assert chat_allocations == []
+        assert registry.view().active_model_id == MODEL_A.id
+
+        # The runtime itself still refuses an unbound call without allocating.
+        with pytest.raises(ValueError, match="run_model"):
+            runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
+        assert events == []
+        assert chat_allocations == []
+
+    @pytest.mark.parametrize("profile", _SUB_AGENT_PROFILES)
+    def test_unbound_options_have_no_background_fallback_and_allocate_nothing(
+        self, profile
+    ):
+        events, factory = _counting_embedding_factory()
+        runtime = _runtime(embedding_factory=factory)
+        with pytest.raises(ValueError, match="run_model"):
+            runtime.create(profile, RuntimeOptions())
+        assert events == []
+
+    def test_max_iterations_replaces_only_that_typed_config_field(self, build, pin_a):
+        # Caller-owned, fully non-default config (incl. a mutable list field).
+        caller_cfg = AgentConfig(
+            agent_name="caller-agent", max_iterations=3, scheduled_max_iterations=55,
+            tool_timeout=21, max_output_size=1234, top_tools=9,
+            ctx_max_tokens=23456, compaction_threshold_tokens=12321,
+            required_output_cap_tokens=617, max_retries=7, retry_delay=0.25, max_subagents=2,
+            subagent_result_timeout=45, long_run_warn_minutes=12,
+            diagnose_empty_responses=True, default_model="pa/up/a",
+            background_model="pb/up/b", fallback_models=["pb/up/b", "pa/up/a"],
+            shell_backend="pty", shell_pty_cols=100, shell_pty_rows=30,
+            shell_streaming=True, shell_nsjail_confirm_mode="adaptive",
+            shell_nsjail_memory_mb=512, shell_nsjail_pids_max=32,
+            shell_nsjail_cpu_percent=25, shell_nsjail_dump_config_on_error=True,
+            allow_net=True, dns_nameserver="1.1.1.1", session_logs_retention_days=3,
+            creativity_mode="planner", step_notify_interval=5,
+            inactivity_warn_minutes=4, plan_max_iterations=17,
         )
-        active = runner._llm.llm_cfg
-        assert active["max_tokens"] == 256
-        assert active["temperature"] == pytest.approx(0.9)
-        assert active["top_p"] == pytest.approx(0.95)
-        # Shared config entry unchanged.
-        assert config["models"][0]["max_tokens"] == 1024
-        assert config["models"][0]["temperature"] == pytest.approx(0.2)
+        # Independent snapshot taken BEFORE runtime/runner construction.
+        snapshot = copy.deepcopy(asdict(caller_cfg))
+        expected = {**copy.deepcopy(snapshot), "max_iterations": 7}
+        assert snapshot["max_iterations"] == 3 and snapshot["top_tools"] == 9
 
-    def test_usage_registry_propagated(self):
-        registry = MagicMock()
-        runtime = _runtime(_cfg(), usage_registry=registry)
-        runner = runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
-        assert runner._llm._usage_registry is registry
+        runner = build(
+            _runtime(agent_cfg=caller_cfg), RuntimeProfile.ON_DEMAND_SUBAGENT,
+            run_model=pin_a, max_iterations=7,
+        )
 
-    def test_caller_tag_is_agent_id(self):
-        runtime = _runtime(_cfg())
-        runner = runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
+        # Caller-owned config unchanged in every field (incl. nested list).
+        assert asdict(caller_cfg) == snapshot
+        assert caller_cfg.fallback_models == ["pb/up/b", "pa/up/a"]
+        # Effective controller config == snapshot except max_iterations only.
+        assert asdict(runner._agent._agent_cfg) == expected
+        assert runner._agent.max_iterations == 7
+        assert runner._agent.top_tools == 9
+        assert runner._agent.ctx_max_tokens == 23456
+        assert runner._agent.creativity_mode == "planner"
+        assert runner._agent.plan_max_iterations == 17
+        assert runner._agent.inactivity_warn_minutes == 4
+        # Effective client settings come from the snapshot values.
+        assert runner._agent.compaction_threshold_tokens == snapshot["compaction_threshold_tokens"]
+        assert runner._llm._required_output_cap == snapshot["required_output_cap_tokens"]
+        assert runner._llm._max_retries == snapshot["max_retries"]
+        assert runner._llm._retry_delay == snapshot["retry_delay"]
+        assert runner._llm._diagnose_empty is True
+
+    def test_usage_registry_propagated(self, build, pin_a):
+        usage = MagicMock()
+        runner = build(
+            _runtime(usage_registry=usage), RuntimeProfile.ON_DEMAND_SUBAGENT,
+            run_model=pin_a,
+        )
+        assert runner._llm._usage_registry is usage
+
+    def test_caller_tag_is_agent_id(self, build, pin_a):
+        runner = build(_runtime(), RuntimeProfile.ON_DEMAND_SUBAGENT, run_model=pin_a)
         assert runner._llm._base_caller_tag == runner.agent_id
 
-    def test_scheduled_max_iterations_default(self):
-        runtime = _runtime(_cfg(), scheduled_max_iterations=42)
-        runner = runtime.create(RuntimeProfile.SCHEDULED_AGENT, RuntimeOptions())
+    def test_scheduled_max_iterations_default(self, build, pin_a):
+        runner = build(
+            _runtime(scheduled_max_iterations=42), RuntimeProfile.SCHEDULED_AGENT,
+            run_model=pin_a,
+        )
         assert runner._agent.max_iterations == 42
 
-    def test_explicit_max_iterations_overrides_default(self):
-        runtime = _runtime(_cfg(), scheduled_max_iterations=42)
-        runner = runtime.create(
-            RuntimeProfile.PLAN_STEP_AGENT, RuntimeOptions(max_iterations=7),
+    def test_explicit_max_iterations_overrides_default(self, build, pin_a):
+        runner = build(
+            _runtime(scheduled_max_iterations=42), RuntimeProfile.PLAN_STEP_AGENT,
+            run_model=pin_a, max_iterations=7,
         )
         assert runner._agent.max_iterations == 7
 
-    def test_label_defaults_to_on_demand(self):
-        runtime = _runtime(_cfg())
-        runner = runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
+    def test_label_defaults_to_on_demand(self, build, pin_a):
+        runner = build(_runtime(), RuntimeProfile.ON_DEMAND_SUBAGENT, run_model=pin_a)
         assert runner.label == "on-demand"
 
-    def test_label_passthrough(self):
-        runtime = _runtime(_cfg())
-        runner = runtime.create(
-            RuntimeProfile.PLAN_STEP_AGENT, RuntimeOptions(label="plan-s1"),
+    def test_label_passthrough(self, build, pin_a):
+        runner = build(
+            _runtime(), RuntimeProfile.PLAN_STEP_AGENT,
+            run_model=pin_a, label="plan-s1",
         )
         assert runner.label == "plan-s1"
 
-    def test_prompt_variant_and_context_payload_propagated(self):
-        runtime = _runtime(_cfg())
+    def test_prompt_variant_and_context_payload_propagated(self, build, pin_a):
         payload = {"parent_working_summary": "state"}
-        runner = runtime.create(
-            RuntimeProfile.PLAN_STEP_AGENT,
-            RuntimeOptions(prompt_variant="sub-agent", context_payload=payload),
+        runner = build(
+            _runtime(), RuntimeProfile.PLAN_STEP_AGENT,
+            run_model=pin_a, prompt_variant="sub-agent", context_payload=payload,
         )
         assert runner.prompt_variant == "sub-agent"
         assert runner._agent._prompt_variant == "sub-agent"
         assert runner.context_payload == payload
         assert runner._agent._context_payload == payload
 
-    def test_trace_and_cancel_event_propagated(self):
-        runtime = _runtime(_cfg())
+    def test_trace_and_cancel_event_propagated(self, build, pin_a):
         cancel = threading.Event()
-        runner = runtime.create(
-            RuntimeProfile.PLAN_STEP_AGENT,
-            RuntimeOptions(trace_id="r-abc12345", cancel_event=cancel),
+        runner = build(
+            _runtime(), RuntimeProfile.PLAN_STEP_AGENT,
+            run_model=pin_a, trace_id="r-abc12345", cancel_event=cancel,
         )
         assert runner._cancel_event is cancel
         assert runner._agent._cancel_event is cancel
         assert runner._agent._trace_id == "r-abc12345"
 
-    def test_notify_fn_override_threaded_through(self):
-        runtime = _runtime(_cfg(), notify_fn=lambda _m: None)
+    def test_notify_fn_override_threaded_through(self, build, pin_a):
         sentinel = MagicMock()
-        runner = runtime.create(
-            RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions(), notify_fn=sentinel,
+        runner = build(
+            _runtime(notify_fn=lambda _m: None), RuntimeProfile.ON_DEMAND_SUBAGENT,
+            run_model=pin_a, notify_fn=sentinel,
         )
         assert runner.notify_fn is sentinel
 
-    def test_notify_fn_defaults_to_runtime_notify(self):
+    def test_notify_fn_defaults_to_runtime_notify(self, build, pin_a):
         default_notify = MagicMock()
-        runtime = _runtime(_cfg(), notify_fn=default_notify)
-        runner = runtime.create(RuntimeProfile.ON_DEMAND_SUBAGENT, RuntimeOptions())
+        runner = build(
+            _runtime(notify_fn=default_notify), RuntimeProfile.ON_DEMAND_SUBAGENT,
+            run_model=pin_a,
+        )
         assert runner.notify_fn is default_notify
 
-    def test_on_tool_trace_threaded_through(self):
-        runtime = _runtime(_cfg())
+    def test_on_tool_trace_threaded_through(self, build, pin_a):
         trace_cb = MagicMock()
-        runner = runtime.create(
-            RuntimeProfile.PLAN_STEP_AGENT, RuntimeOptions(), on_tool_trace=trace_cb,
+        runner = build(
+            _runtime(), RuntimeProfile.PLAN_STEP_AGENT,
+            run_model=pin_a, on_tool_trace=trace_cb,
         )
         assert runner._agent._on_tool_trace is trace_cb
 
-    def test_on_step_not_set_by_construction(self):
+    def test_on_step_not_set_by_construction(self, build, pin_a):
         # Registry helpers install _on_step after construction (Phase 1 invariant).
-        runtime = _runtime(_cfg())
-        runner = runtime.create(RuntimeProfile.PLAN_STEP_AGENT, RuntimeOptions())
+        runner = build(_runtime(), RuntimeProfile.PLAN_STEP_AGENT, run_model=pin_a)
         assert runner._agent._on_step is None
 
-    def test_context_key_preloads_short_term(self, tmp_path):
-        from config_schema import AgentConfig, ExecutorPaths
-
+    def test_context_key_preloads_short_term(self, tmp_path, build, pin_a):
         # context_key routes through _load_context; a missing key yields fresh memory.
-        runtime = AgentRuntime(
-            config=_cfg(),
-            all_models=_cfg()["models"],
-            background_model_cfg=_cfg()["models"][0],
-            agent_cfg=AgentConfig(),
-            paths=ExecutorPaths(),
-            tool_index=MagicMock(),
-            base_memory=MagicMock(),
-            builtin_executor=MagicMock(),
-            skill_registry=MagicMock(),
-            results=MagicMock(),
-            data_dir=str(tmp_path),
-        )
-        runner = runtime.create(
-            RuntimeProfile.SCHEDULED_AGENT, RuntimeOptions(context_key="never-saved"),
+        runner = build(
+            _runtime(data_dir=str(tmp_path), agent_cfg=AgentConfig(),
+                     paths=ExecutorPaths()),
+            RuntimeProfile.SCHEDULED_AGENT,
+            run_model=pin_a, context_key="never-saved",
         )
         assert runner.context_key == "never-saved"
         assert isinstance(runner._short_term, ShortTermMemory)

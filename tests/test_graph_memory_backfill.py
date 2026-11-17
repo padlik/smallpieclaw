@@ -13,114 +13,358 @@ Covers:
 
 from __future__ import annotations
 
+import builtins
+import copy
+import dataclasses
 import json
 import os
-from unittest.mock import MagicMock
+import subprocess
+import sys
+import textwrap
+import traceback
+from pathlib import Path
+from typing import Any, Callable, Iterator
+from unittest.mock import MagicMock, call
 
+import httpx
 import pytest
 
+import backfill_graph_memory
+import graph_memory
+import model_discovery
+import token_usage
 from backfill_graph_memory import (
     _entry_checksum,
     _load_backfill_state,
     _save_backfill_state,
     backfill_longterm_to_graph,
 )
+from config_schema import (
+    AgentConfig,
+    AppConfig,
+    EmbeddingsConfig,
+    GraphMemoryConfig,
+    ProviderConfig,
+    ResolvedProviderConnection,
+    parse_config,
+)
+from embedding_client import EmbeddingClient
+from graph_memory import GraphPrerequisiteError, GraphPrerequisites
+from llm_client import LLMClient
 from memory_store import LongTermMemory
+from model_registry import CatalogDocument, ModelMetadata, ModelRecord, ModelRegistry, ProviderState, RunModel
+from model_settings import ModelSettings
+from providers._errors import LLMContextOverflowError, LLMError, LLMPermanentError
+from xdg import xdg_paths
 
 
 # ---------------------------------------------------------------------------
 # build_extraction_llm_call — shared extraction LLM builder
 # ---------------------------------------------------------------------------
 
+_GRAPH_UPSTREAM = "vendor/graph-model"
+_GRAPH_URL = "https://graph.example.test/v1/chat/completions"
+_GRAPH_KEY = "fake-graph-key"
+_EXTRACTION_REPLY = '{"entities":[],"relationships":[]}'
+_GRAPH_WIRE_KEYS = {"model", "messages", "max_completion_tokens", "temperature"}
+
+
+def _graph_pin() -> RunModel:
+    """Return a settled graph pin with a slash-bearing upstream ID."""
+    model = ModelRecord(
+        "graph/vendor/graph-model",
+        "graph",
+        _GRAPH_UPSTREAM,
+        "Graph Model",
+        ModelMetadata(context_tokens=4096, output_tokens=2048),
+    )
+    connection = ResolvedProviderConnection(
+        "graph", "openai", "https://graph.example.test/v1", 15, _GRAPH_KEY
+    )
+    return RunModel(model, connection, 1, 1)
+
+
+def _graph_agent_config() -> AgentConfig:
+    """Return a valid agent config whose local context differs from the graph cap."""
+    return AgentConfig(ctx_max_tokens=3000, max_retries=0)
+
+
+def _extraction_reply(request: httpx.Request) -> httpx.Response:
+    """Return a successful OpenAI-compatible extraction response."""
+    del request
+    return httpx.Response(
+        200, json={"choices": [{"message": {"content": _EXTRACTION_REPLY}}]}
+    )
+
+
+class _TrackingTransport(httpx.MockTransport):
+    """Real MockTransport that records sent requests and close calls."""
+
+    def __init__(self, handler: Callable[[httpx.Request], httpx.Response]) -> None:
+        self.requests: list[httpx.Request] = []
+        self.close_count = 0
+
+        def record(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return handler(request)
+
+        super().__init__(record)
+
+    def close(self) -> None:
+        """Count the close, then close the underlying transport."""
+        self.close_count += 1
+        super().close()
+
+
+def _assert_graph_wire(request: httpx.Request, *, prompt: str = "extract") -> None:
+    """Assert one sent request targets the pin, prompt, and fixed policy."""
+    assert str(request.url) == _GRAPH_URL
+    assert request.headers["authorization"] == f"Bearer {_GRAPH_KEY}"
+    assert "x-api-key" not in request.headers
+    assert "x-goog-api-key" not in request.headers
+    payload = json.loads(request.content)
+    assert set(payload) == _GRAPH_WIRE_KEYS
+    assert payload["model"] == _GRAPH_UPSTREAM
+    assert payload["messages"] == [{"role": "user", "content": prompt}]
+    assert payload["max_completion_tokens"] == 1024
+    assert payload["temperature"] == 0.1
+
+
 class TestBuildExtractionLLMCall:
-    """Regression tests for graph_memory.build_extraction_llm_call.
+    """Regression tests for the settled graph_memory.build_extraction_llm_call.
 
-    Guards against the bug where the closure called
-    ``llm.chat(messages, temperature=0.1, max_tokens=1024)`` (chat() takes no
-    such kwargs) and then ``resp.get("content")`` (chat() returns a str).
-
-    Both backfill_graph_memory._build_llm_call and main.py delegate to this
-    shared helper, so coverage here covers all extraction paths.
+    After the 12.25 cutover the helper accepts a resolved ``RunModel`` and typed
+    ``AgentConfig``, builds a distinct ``LLMClient.for_graph_extraction`` per
+    call, calls ``chat(messages)`` only, returns the string, and closes the
+    client in ``finally`` on both success and failure.  Both
+    ``backfill_graph_memory._build_llm_call`` and ``main.py`` delegate to this
+    helper.
     """
 
-    def _app_cfg(self, minimal_config):
-        from config_schema import parse_config
-        minimal_config["graph_memory"] = {"enabled": True}
-        return parse_config(minimal_config)
-
-    def test_chat_called_without_unsupported_kwargs(self, minimal_config, monkeypatch):
+    def test_chat_called_without_unsupported_kwargs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """chat() gets messages only; result passes through; closure always closes."""
         from graph_memory import build_extraction_llm_call
 
-        app_cfg = self._app_cfg(minimal_config)
-        all_models = minimal_config["models"]
+        pin = _graph_pin()
+        agent_config = _graph_agent_config()
+        transports: list[_TrackingTransport] = []
+        clients: list[LLMClient] = []
+        close_calls: list[LLMClient] = []
+        chat_calls: list[tuple[LLMClient, tuple[object, ...], dict[str, object]]] = []
 
-        instance = MagicMock()
-        instance.chat.return_value = '{"entities":[],"facts":[]}'
-        llm_cls = MagicMock(return_value=instance)
-        monkeypatch.setattr("llm_client.LLMClient", llm_cls)
-        monkeypatch.setattr("token_usage.get_registry", lambda: MagicMock())
+        real_for_graph = LLMClient.for_graph_extraction
+        real_chat = LLMClient.chat
 
-        fn = build_extraction_llm_call(minimal_config, app_cfg, all_models)
+        def spy_for_graph_extraction(*args: object, **kwargs: object) -> LLMClient:
+            """Observe exact factory inputs and delegate with an external transport."""
+            assert len(args) == 1
+            assert args[0] is pin
+            assert kwargs["agent_config"] is agent_config
+            transport = _TrackingTransport(_extraction_reply)
+            transports.append(transport)
+            kwargs["http_transport"] = transport
+            client = real_for_graph(*args, **kwargs)
+            clients.append(client)
+            real_close = client.close
+
+            def close() -> None:
+                """Record the production close before delegating to the real client."""
+                close_calls.append(client)
+                real_close()
+
+            monkeypatch.setattr(client, "close", close)
+            return client
+
+        def spy_chat(
+            client: LLMClient,
+            *args: object,
+            **kwargs: object,
+        ) -> str:
+            """Record the exact call shape without adding default arguments."""
+            chat_calls.append((client, args, dict(kwargs)))
+            return real_chat(client, *args, **kwargs)
+
+        monkeypatch.setattr(LLMClient, "for_graph_extraction", spy_for_graph_extraction)
+        monkeypatch.setattr(LLMClient, "chat", spy_chat)
+
+        fn = build_extraction_llm_call(pin, agent_config)
         result = fn("some prompt")
 
-        # chat() returns a str — it must be passed straight through
-        assert result == '{"entities":[],"facts":[]}'
-        # chat() must be called with the messages list only — no temperature/max_tokens kwargs
-        assert instance.chat.call_count == 1
-        args, kwargs = instance.chat.call_args
-        assert "temperature" not in kwargs
-        assert "max_tokens" not in kwargs
-        assert args[0] == [{"role": "user", "content": "some prompt"}]
-        instance.close.assert_called_once()
+        assert result == _EXTRACTION_REPLY
+        assert len(transports) == 1
+        assert transports[0].close_count == 1
+        assert len(clients) == 1
+        assert close_calls == clients
+        assert clients[0]._closed
+        assert len(chat_calls) == 1
+        client, args, kwargs = chat_calls[0]
+        assert client is clients[0]
+        assert args == ([{"role": "user", "content": "some prompt"}],)
+        assert kwargs == {}
+        assert pin == _graph_pin()
+        assert agent_config == _graph_agent_config()
 
-    def test_temperature_and_max_tokens_injected_into_config(self, minimal_config, monkeypatch):
+    def test_temperature_and_max_tokens_injected_into_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Real fixed 0.1/1024 policy appears on the wire; pin/config stay immutable."""
         from graph_memory import build_extraction_llm_call
 
-        app_cfg = self._app_cfg(minimal_config)
-        all_models = minimal_config["models"]
-        original_model = dict(all_models[0])  # snapshot to detect mutation
+        pin = _graph_pin()
+        agent_config = _graph_agent_config()
+        transports: list[_TrackingTransport] = []
+        clients: list[LLMClient] = []
+        close_calls: list[LLMClient] = []
 
-        instance = MagicMock()
-        instance.chat.return_value = "{}"
-        llm_cls = MagicMock(return_value=instance)
-        monkeypatch.setattr("llm_client.LLMClient", llm_cls)
-        monkeypatch.setattr("token_usage.get_registry", lambda: MagicMock())
+        real_for_graph = LLMClient.for_graph_extraction
 
-        fn = build_extraction_llm_call(minimal_config, app_cfg, all_models)
-        fn("prompt")
+        def spy_for_graph_extraction(*args: object, **kwargs: object) -> LLMClient:
+            """Record each real client created from the exact extraction inputs."""
+            assert len(args) == 1
+            assert args[0] is pin
+            assert kwargs["agent_config"] is agent_config
+            transport = _TrackingTransport(_extraction_reply)
+            transports.append(transport)
+            kwargs["http_transport"] = transport
+            client = real_for_graph(*args, **kwargs)
+            clients.append(client)
+            real_close = client.close
 
-        # The config handed to LLMClient must carry the low-temperature extraction settings
-        passed_cfg = llm_cls.call_args[0][0]
-        extraction_model = passed_cfg["models"][0]
-        assert extraction_model["temperature"] == 0.1
-        assert extraction_model["max_tokens"] == 1024
-        # The shared all_models entry must NOT have been mutated
-        assert all_models[0] == original_model
-        assert "temperature" not in all_models[0]
+            def close() -> None:
+                """Record the production close and close the real HTTP client."""
+                close_calls.append(client)
+                real_close()
 
-    def test_backfill_delegate_calls_shared_helper(self, minimal_config, monkeypatch):
-        """backfill_graph_memory._build_llm_call must delegate to build_extraction_llm_call."""
+            monkeypatch.setattr(client, "close", close)
+            return client
+
+        monkeypatch.setattr(LLMClient, "for_graph_extraction", spy_for_graph_extraction)
+
+        fn = build_extraction_llm_call(pin, agent_config)
+        fn("first")
+        assert len(clients) == 1
+        assert close_calls == clients
+        assert clients[0]._closed
+        fn("second")
+
+        assert len(clients) == 2
+        assert clients[0] is not clients[1]
+        assert close_calls == clients
+        assert all(client._closed for client in clients)
+        assert len(transports) == 2
+        assert transports[0] is not transports[1]
+        assert transports[0].close_count == 1
+        assert transports[1].close_count == 1
+        _assert_graph_wire(transports[0].requests[0], prompt="first")
+        _assert_graph_wire(transports[1].requests[0], prompt="second")
+        assert pin == _graph_pin()
+        assert agent_config == _graph_agent_config()
+
+    def test_failed_chat_closes_owned_client_and_transports_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A chat failure raises its typed error and the helper still closes the client."""
+        from graph_memory import build_extraction_llm_call
+
+        pin = _graph_pin()
+        agent_config = _graph_agent_config()
+        transports: list[_TrackingTransport] = []
+        clients: list[LLMClient] = []
+        close_calls: list[LLMClient] = []
+        real_for_graph = LLMClient.for_graph_extraction
+
+        def spy_for_graph_extraction(*args: object, **kwargs: object) -> LLMClient:
+            """Delegate the real factory; only the external HTTP response fails."""
+            assert len(args) == 1
+            assert args[0] is pin
+            assert kwargs["agent_config"] is agent_config
+            transport = _TrackingTransport(lambda request: httpx.Response(401, text="denied"))
+            transports.append(transport)
+            kwargs["http_transport"] = transport
+            client = real_for_graph(*args, **kwargs)
+            clients.append(client)
+            real_close = client.close
+
+            def close() -> None:
+                """Observe cleanup on the real typed-error path."""
+                close_calls.append(client)
+                real_close()
+
+            monkeypatch.setattr(client, "close", close)
+            return client
+
+        monkeypatch.setattr(LLMClient, "for_graph_extraction", spy_for_graph_extraction)
+
+        fn = build_extraction_llm_call(pin, agent_config)
+        with pytest.raises(LLMPermanentError):
+            fn("failing prompt")
+
+        assert len(clients) == 1
+        assert close_calls == clients
+        assert clients[0]._closed
+        assert len(transports) == 1
+        assert transports[0].close_count == 1
+        assert len(transports[0].requests) == 1
+        _assert_graph_wire(transports[0].requests[0], prompt="failing prompt")
+        assert pin == _graph_pin()
+        assert agent_config == _graph_agent_config()
+
+    def test_backfill_delegate_calls_shared_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """backfill_graph_memory._build_llm_call delegates with caller_tag='backfill'."""
         from backfill_graph_memory import _build_llm_call
-        from graph_memory import build_extraction_llm_call
 
-        app_cfg = self._app_cfg(minimal_config)
-        all_models = minimal_config["models"]
+        pin = _graph_pin()
+        agent_config = _graph_agent_config()
+        captured: dict[str, Any] = {}
+        real_helper = graph_memory.build_extraction_llm_call
+        real_for_graph = LLMClient.for_graph_extraction
+        transports: list[_TrackingTransport] = []
+        clients: list[LLMClient] = []
+        close_calls: list[LLMClient] = []
 
-        captured = {}
-        original = build_extraction_llm_call
-        def spy_helper(raw_cfg, a_cfg, models, caller_tag="graph-extract"):
-            captured["called"] = True
-            captured["caller_tag"] = caller_tag
-            return original(raw_cfg, a_cfg, models, caller_tag=caller_tag)
+        def spy_helper(*args: object, **kwargs: object) -> Callable[[str], str]:
+            """Observe actual backfill delegation without substituting its closure."""
+            captured["args"] = args
+            captured["kwargs"] = dict(kwargs)
+            return real_helper(*args, **kwargs)
+
+        def spy_for_graph_extraction(*args: object, **kwargs: object) -> LLMClient:
+            """Preserve the real factory with only its transport boundary replaced."""
+            assert len(args) == 1
+            assert args[0] is pin
+            assert kwargs["agent_config"] is agent_config
+            assert kwargs.get("caller_tag") == "backfill"
+            transport = _TrackingTransport(_extraction_reply)
+            transports.append(transport)
+            kwargs["http_transport"] = transport
+            client = real_for_graph(*args, **kwargs)
+            clients.append(client)
+            real_close = client.close
+
+            def close() -> None:
+                """Record the helper-owned real client close."""
+                close_calls.append(client)
+                real_close()
+
+            monkeypatch.setattr(client, "close", close)
+            return client
 
         monkeypatch.setattr("graph_memory.build_extraction_llm_call", spy_helper)
-        monkeypatch.setattr("llm_client.LLMClient", MagicMock(return_value=MagicMock(
-            chat=MagicMock(return_value="{}"))))
-        monkeypatch.setattr("token_usage.get_registry", lambda: MagicMock())
+        monkeypatch.setattr(LLMClient, "for_graph_extraction", spy_for_graph_extraction)
 
-        _build_llm_call(minimal_config, app_cfg, all_models)
-        assert captured.get("called"), "backfill _build_llm_call did not call build_extraction_llm_call"
-        assert captured.get("caller_tag") == "backfill"
+        fn = _build_llm_call(pin, agent_config)
+        assert len(captured["args"]) == 2
+        assert captured["args"][0] is pin
+        assert captured["args"][1] is agent_config
+        assert captured["kwargs"] == {"caller_tag": "backfill"}
+        assert fn("x") == _EXTRACTION_REPLY
+        assert len(clients) == 1
+        assert close_calls == clients
+        assert clients[0]._closed
+        assert len(transports) == 1
+        assert transports[0].close_count == 1
+        assert len(transports[0].requests) == 1
+        _assert_graph_wire(transports[0].requests[0], prompt="x")
+        assert pin == _graph_pin()
+        assert agent_config == _graph_agent_config()
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +912,316 @@ class TestBackfillFailures:
 
 
 # ---------------------------------------------------------------------------
+# Real extraction wire: per-entry failure isolation
+# ---------------------------------------------------------------------------
+
+_IMPORTED_REPLY = {
+    "choices": [{"message": {"content": json.dumps({
+        "entities": [{"name": "Bob", "entity_type": "person"}],
+        "facts": [],
+    })}}],
+    "usage": {"prompt_tokens": 11, "completion_tokens": 5},
+}
+
+
+def _imported_reply(request: httpx.Request) -> httpx.Response:
+    """Return a successful extraction with one entity and real usage numbers."""
+    del request
+    return httpx.Response(200, json=_IMPORTED_REPLY)
+
+
+def _context_overflow_reply(request: httpx.Request) -> httpx.Response:
+    """Return a provider-side context-length rejection."""
+    del request
+    return httpx.Response(
+        400, json={"error": {"message": "maximum context length exceeded: context_length_exceeded"}}
+    )
+
+
+def _rejected_reply(request: httpx.Request) -> httpx.Response:
+    """Return a synthetic, permanent provider rejection (not a context overflow)."""
+    del request
+    return httpx.Response(
+        400,
+        json={"error": {"type": "invalid_request_error", "message": "synthetic rejection"}},
+    )
+
+
+def _unknown_output_graph_pin() -> RunModel:
+    """Return the graph pin with its output ceiling left unknown (no invented value)."""
+    pin = _graph_pin()
+    metadata = dataclasses.replace(pin.model.metadata, output_tokens=None)
+    return dataclasses.replace(pin, model=dataclasses.replace(pin.model, metadata=metadata))
+
+
+@dataclasses.dataclass
+class _WireObservations:
+    """Real clients, transports, chat calls and typed errors seen by delegating spies."""
+
+    transports: list[_TrackingTransport] = dataclasses.field(default_factory=list)
+    clients: list[LLMClient] = dataclasses.field(default_factory=list)
+    close_calls: list[LLMClient] = dataclasses.field(default_factory=list)
+    chat_calls: list[tuple[LLMClient, tuple[object, ...], dict[str, object]]] = dataclasses.field(
+        default_factory=list
+    )
+    chat_errors: list[tuple[LLMClient, LLMError]] = dataclasses.field(default_factory=list)
+    usage_registry: token_usage.TokenUsageRegistry = dataclasses.field(
+        default_factory=token_usage.TokenUsageRegistry
+    )
+
+    def prompt(self, index: int) -> str:
+        """Return the prompt text handed to the indexed real chat call."""
+        _, args, _ = self.chat_calls[index]
+        return args[0][0]["content"]
+
+
+def _observe_backfill_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+    pin: RunModel,
+    agent_config: AgentConfig,
+    handlers: list[Callable[[httpx.Request], httpx.Response]],
+) -> _WireObservations:
+    """Delegate the real factory and chat; inject only the next mock HTTP transport."""
+    seen = _WireObservations()
+    # Isolate the real shared usage registry; monkeypatch restores the global.
+    monkeypatch.setattr(token_usage, "_registry", seen.usage_registry)
+    real_for_graph = LLMClient.for_graph_extraction
+    real_chat = LLMClient.chat
+
+    def spy_for_graph_extraction(*args: object, **kwargs: object) -> LLMClient:
+        """Check the exact pinned inputs, then build the real client on a mock transport."""
+        assert len(args) == 1
+        assert args[0] is pin
+        assert kwargs["agent_config"] is agent_config
+        assert kwargs.get("caller_tag") == "backfill"
+        assert "http_transport" not in kwargs
+        transport = _TrackingTransport(handlers[len(seen.transports)])
+        seen.transports.append(transport)
+        kwargs["http_transport"] = transport
+        client = real_for_graph(*args, **kwargs)
+        seen.clients.append(client)
+        real_close = client.close
+
+        def close() -> None:
+            """Record the helper-owned close before delegating to the real client."""
+            seen.close_calls.append(client)
+            real_close()
+
+        monkeypatch.setattr(client, "close", close)
+        return client
+
+    def spy_chat(client: LLMClient, *args: object, **kwargs: object) -> str:
+        """Record the exact call and any typed error, without altering either."""
+        seen.chat_calls.append((client, args, dict(kwargs)))
+        try:
+            return real_chat(client, *args, **kwargs)
+        except LLMError as exc:
+            seen.chat_errors.append((client, exc))
+            raise
+
+    monkeypatch.setattr(LLMClient, "for_graph_extraction", spy_for_graph_extraction)
+    monkeypatch.setattr(LLMClient, "chat", spy_chat)
+    return seen
+
+
+def _request_counts(seen: _WireObservations) -> list[int]:
+    """Return the number of requests each owned transport actually received."""
+    return [len(transport.requests) for transport in seen.transports]
+
+
+def _effects_snapshot(
+    seen: _WireObservations, store: MagicMock, state_path: str
+) -> dict[str, object]:
+    """Capture wire, usage, store and state effects at one point in the loop."""
+    return {
+        "clients": len(seen.clients),
+        "requests": _request_counts(seen),
+        "closed": [client._closed for client in seen.clients],
+        "usage": [client.get_today_usage()["total_tokens"] for client in seen.clients],
+        "store_calls": list(store.method_calls),
+        "state_exists": os.path.exists(state_path),
+        "global_usage": seen.usage_registry.get_today(),
+    }
+
+
+class TestBackfillExtractionWireIsolation:
+    """Backfill over the real shared helper, real client and budget kernel.
+
+    Only the provider HTTP transport and the graph DB store are substituted.
+    Each case proves that one failed extraction stays contained to its entry
+    while the next entry imports on the same immutable pin and fixed policy.
+    """
+
+    def test_oversized_source_failure_is_contained_per_entry(
+        self, monkeypatch: pytest.MonkeyPatch, mock_store: MagicMock, tmp_path: Path
+    ) -> None:
+        """A huge source is sent unchecked; the provider's rejection fails only that entry."""
+        pin = _graph_pin()
+        agent_config = _graph_agent_config()
+        state_path = str(tmp_path / "state.json")
+        huge_body = " ".join(f"ledger{index} migrated" for index in range(6000))
+        fit_content = "Bob reviews the graph migration plan."
+        entries = [
+            ("entry-huge", {"content": f"\n  {huge_body}  \n", "source": "manual",
+                            "timestamp": "2024-01-01"}),
+            ("entry-fit", {"content": fit_content, "source": "manual",
+                           "timestamp": "2024-01-02"}),
+        ]
+        entries_before = copy.deepcopy(entries)
+        seen = _observe_backfill_extraction(
+            monkeypatch, pin, agent_config, [_context_overflow_reply, _imported_reply]
+        )
+        snapshots: list[dict[str, object]] = []
+
+        def notify(current: int, total: int, result: object, entry_result: Any) -> None:
+            """Snapshot all effects as each entry finishes."""
+            del current, total, result
+            snapshots.append(
+                {"entry": entry_result.entry_id, "status": entry_result.status,
+                 **_effects_snapshot(seen, mock_store, state_path)}
+            )
+
+        result = backfill_longterm_to_graph(
+            long_term_entries=entries,
+            store=mock_store,
+            llm_call_fn=backfill_graph_memory._build_llm_call(pin, agent_config),
+            state_path=state_path,
+            notify_fn=notify,
+        )
+
+        # The failed entry reached the provider once and produced no usage, store or state effect.
+        assert snapshots[0] == {
+            "entry": "entry-huge", "status": "failed", "clients": 1, "requests": [1],
+            "closed": [True], "usage": [0], "store_calls": [], "state_exists": False,
+            "global_usage": {},
+        }
+        # The whole original prompt reached the real chat, untruncated.
+        assert len(seen.chat_calls) == 2
+        for _, args, kwargs in seen.chat_calls:
+            assert len(args) == 1
+            assert kwargs == {}
+        assert seen.prompt(0).startswith(graph_memory.EXTRACTION_PROMPT)
+        assert "Long-term memory entry entry-huge" in seen.prompt(0)
+        assert seen.prompt(0).endswith(huge_body)
+        # Provider-reported overflow (no local fit check), fixed cap unlowered.
+        assert len(seen.chat_errors) == 1
+        failed_client, error = seen.chat_errors[0]
+        assert failed_client is seen.clients[0]
+        assert isinstance(error, LLMContextOverflowError)
+        assert error.status_code == 400
+        _assert_graph_wire(seen.transports[0].requests[0], prompt=seen.prompt(0))
+        assert [(er.entry_id, er.status) for er in result.entries] == [
+            ("entry-huge", "failed"), ("entry-fit", "imported"),
+        ]
+        assert result.entries[0].error == str(error)
+        assert (result.total, result.imported, result.failed) == (2, 1, 1)
+        # The next entry imports on the same pin with the fixed policy, once.
+        assert _request_counts(seen) == [1, 1]
+        _assert_graph_wire(seen.transports[1].requests[0], prompt=seen.prompt(1))
+        assert seen.prompt(1).endswith(fit_content)
+        assert [client.get_today_usage()["total_tokens"] for client in seen.clients] == [0, 16]
+        assert seen.usage_registry.get_today() == {
+            pin.model.id: {"prompt": 11, "completion": 5, "total": 16}
+        }
+        assert mock_store.add_episode.call_args_list == [
+            call(fit_content, user_id="backfill", source="longterm_memory_backfill")
+        ]
+        assert set(_load_backfill_state(state_path)["imported"]) == {"entry-fit"}
+        # One distinct real client per attempted extraction, all closed by the helper.
+        assert len(seen.clients) == 2
+        assert seen.clients[0] is not seen.clients[1]
+        assert seen.close_calls == seen.clients
+        assert all(client._closed for client in seen.clients)
+        assert [transport.close_count for transport in seen.transports] == [1, 1]
+        assert entries == entries_before
+        assert pin == _graph_pin()
+        assert agent_config == _graph_agent_config()
+
+    def test_unknown_output_provider_rejection_is_contained_per_entry(
+        self, monkeypatch: pytest.MonkeyPatch, mock_store: MagicMock, tmp_path: Path
+    ) -> None:
+        """An unknown-output pin sends once; a provider 400 fails only that entry."""
+        pin = _unknown_output_graph_pin()
+        agent_config = _graph_agent_config()
+        state_path = str(tmp_path / "state.json")
+        rejected_content = "Carol plans the catalog cutover."
+        fit_content = "Bob reviews the graph migration plan."
+        entries = [
+            ("entry-rejected", {"content": rejected_content, "source": "manual",
+                                "timestamp": "2024-01-01"}),
+            ("entry-fit", {"content": fit_content, "source": "manual",
+                           "timestamp": "2024-01-02"}),
+        ]
+        entries_before = copy.deepcopy(entries)
+        seen = _observe_backfill_extraction(
+            monkeypatch, pin, agent_config, [_rejected_reply, _imported_reply]
+        )
+        snapshots: list[dict[str, object]] = []
+
+        def notify(current: int, total: int, result: object, entry_result: Any) -> None:
+            """Snapshot all effects as each entry finishes."""
+            del current, total, result
+            snapshots.append(
+                {"entry": entry_result.entry_id, "status": entry_result.status,
+                 **_effects_snapshot(seen, mock_store, state_path)}
+            )
+
+        result = backfill_longterm_to_graph(
+            long_term_entries=entries,
+            store=mock_store,
+            llm_call_fn=backfill_graph_memory._build_llm_call(pin, agent_config),
+            state_path=state_path,
+            notify_fn=notify,
+        )
+
+        # Exactly one send for the rejected entry; no store, usage or state effect.
+        assert snapshots[0] == {
+            "entry": "entry-rejected", "status": "failed", "clients": 1, "requests": [1],
+            "closed": [True], "usage": [0], "store_calls": [], "state_exists": False,
+            "global_usage": {},
+        }
+        assert pin.model.metadata.output_tokens is None
+        assert all(client.metadata.output_tokens is None for client in seen.clients)
+        _assert_graph_wire(seen.transports[0].requests[0], prompt=seen.prompt(0))
+        assert seen.prompt(0).startswith(graph_memory.EXTRACTION_PROMPT)
+        assert seen.prompt(0).endswith(rejected_content)
+        # The real typed provider error is recorded on that entry only.
+        assert len(seen.chat_errors) == 1
+        failed_client, error = seen.chat_errors[0]
+        assert failed_client is seen.clients[0]
+        assert isinstance(error, LLMPermanentError)
+        assert not isinstance(error, LLMContextOverflowError)
+        assert "invalid_request_error" in str(error)
+        assert [(er.entry_id, er.status) for er in result.entries] == [
+            ("entry-rejected", "failed"), ("entry-fit", "imported"),
+        ]
+        assert result.entries[0].error == str(error)
+        assert (result.total, result.imported, result.failed) == (2, 1, 1)
+        # No retry or alternate attempt; the next entry imports on the same pin.
+        assert len(seen.chat_calls) == 2
+        assert all(kwargs == {} for _, _, kwargs in seen.chat_calls)
+        assert _request_counts(seen) == [1, 1]
+        _assert_graph_wire(seen.transports[1].requests[0], prompt=seen.prompt(1))
+        assert seen.prompt(1).endswith(fit_content)
+        assert [client.get_today_usage()["total_tokens"] for client in seen.clients] == [0, 16]
+        assert seen.usage_registry.get_today() == {
+            pin.model.id: {"prompt": 11, "completion": 5, "total": 16}
+        }
+        assert mock_store.add_episode.call_args_list == [
+            call(fit_content, user_id="backfill", source="longterm_memory_backfill")
+        ]
+        assert set(_load_backfill_state(state_path)["imported"]) == {"entry-fit"}
+        assert len(seen.clients) == 2
+        assert seen.clients[0] is not seen.clients[1]
+        assert seen.close_calls == seen.clients
+        assert all(client._closed for client in seen.clients)
+        assert [transport.close_count for transport in seen.transports] == [1, 1]
+        assert entries == entries_before
+        assert pin == _unknown_output_graph_pin()
+        assert agent_config == _graph_agent_config()
+
+
+# ---------------------------------------------------------------------------
 # notify_fn / progress callback
 # ---------------------------------------------------------------------------
 
@@ -790,6 +1344,985 @@ class TestBackfillProgress:
         assert result.imported == 1
 
 
+@dataclasses.dataclass
+class _CLIWorld:
+    """Files and entry metadata produced by ``TestBackfillMainLiveAndDryRun._write_world``."""
+
+    config_path: Path
+    entries: list[tuple[str, dict]]
+    state_path: Path
+    before_tree: dict[str, bytes | None]
+
+
+class _FakeGraphStore:
+    """Thread/file-free fake for the actual CLI ``GraphMemoryStore`` binding.
+
+    Records the keyword arguments passed at construction and every store mutation
+    so the live CLI path can be exercised without spinning up LadybugDB.
+    """
+
+    def __init__(
+        self,
+        *,
+        db_path: str,
+        embedder_fn: Callable[[str], list[float]],
+        embedding_dim: int,
+        buffer_pool_mb: int = 256,
+    ) -> None:
+        self.db_path = db_path
+        self.embedder_fn = embedder_fn
+        self.embedding_dim = embedding_dim
+        self.buffer_pool_mb = buffer_pool_mb
+        self.closed = False
+        self.close_count = 0
+        self.upserts: list[tuple[str, str, str | None]] = []
+        self.relations: list[tuple[str, str, str, str, str | None]] = []
+        self.episodes: list[tuple[str, str, str]] = []
+
+    def upsert_entity(self, name: str, entity_type: str, ts: str | None = None) -> str:
+        """Return a deterministic fake entity id."""
+        self.upserts.append((name, entity_type, ts))
+        return f"ent:{name.lower()}:{entity_type}"
+
+    def add_relation(
+        self,
+        src_id: str,
+        tgt_id: str,
+        relation_type: str,
+        fact: str,
+        ts: str | None = None,
+    ) -> None:
+        """Record a relation write."""
+        self.relations.append((src_id, tgt_id, relation_type, fact, ts))
+
+    def add_episode(self, content: str, *, user_id: str, source: str) -> str:
+        """Record an episode write and return a fake episode id."""
+        self.episodes.append((content, user_id, source))
+        return f"ep:fake:{len(self.episodes)}"
+
+    def close(self) -> None:
+        """Mark the store closed."""
+        self.closed = True
+        self.close_count += 1
+
+
+class _RecordingRouter:
+    """Routes fake provider traffic through the real ``httpx.HTTPTransport``.
+
+    Replaces only ``httpx.HTTPTransport.handle_request`` so ``EmbeddingClient``
+    and ``LLMClient`` still construct real ``httpx.Client`` instances. All
+    unmatched requests are recorded and rejected with 404.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.unknown: list[httpx.Request] = []
+        self.embed_status = 200
+        self.embed_vector: list[float] = [0.1, 0.2, 0.3]
+        self.chat_status = 200
+        self.chat_content = '{"entities":[],"facts":[]}'
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        """Record the request and serve provider-specific fake responses."""
+        self.requests.append(request)
+        url = request.url
+        if url.host == "e.backfill.test" and url.path == "/v1/embeddings":
+            if self.embed_status != 200:
+                return httpx.Response(self.embed_status, text="embedding unavailable")
+            inputs = json.loads(request.content)["input"]
+            count = len(inputs) if isinstance(inputs, list) else 1
+            return httpx.Response(200, json={
+                "data": [{"index": index, "embedding": list(self.embed_vector)} for index in range(count)]
+            })
+        if url.host == "g.backfill.test" and url.path == "/v1/chat/completions":
+            if self.chat_status != 200:
+                return httpx.Response(self.chat_status, text="denied")
+            return httpx.Response(200, json={"choices": [{"message": {"content": self.chat_content}}]})
+        self.unknown.append(request)
+        return httpx.Response(404, text=f"unexpected {url}")
+
+
+class _ClientRecorder:
+    """Record ``EmbeddingClient``/``LLMClient`` instances and their close counts."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.embed_clients: list[EmbeddingClient] = []
+        self.llm_clients: list[LLMClient] = []
+        self.llm_models: list[RunModel] = []
+
+        real_embed_init = EmbeddingClient.__init__
+        recorder = self
+
+        def spy_embed_init(self: EmbeddingClient, *args: object, **kwargs: object) -> None:
+            real_embed_init(self, *args, **kwargs)
+            self._recorded_close_count = 0
+            real_close = self.close
+
+            def counting_close() -> None:
+                self._recorded_close_count += 1
+                return real_close()
+
+            self.close = counting_close
+            recorder.embed_clients.append(self)
+
+        real_llm_init = LLMClient.__init__
+
+        def spy_llm_init(self: LLMClient, run_model: RunModel, *args: object, **kwargs: object) -> None:
+            real_llm_init(self, run_model, *args, **kwargs)
+            self._recorded_close_count = 0
+            recorder.llm_clients.append(self)
+            recorder.llm_models.append(run_model)
+            real_close = self.close
+
+            def counting_close() -> None:
+                self._recorded_close_count += 1
+                return real_close()
+
+            self.close = counting_close
+
+        monkeypatch.setattr(EmbeddingClient, "__init__", spy_embed_init)
+        monkeypatch.setattr(LLMClient, "__init__", spy_llm_init)
+
+    def close_counts(self) -> dict[str, int]:
+        """Return total close calls per client family."""
+        return {
+            "embed": sum(getattr(c, "_recorded_close_count", 0) for c in self.embed_clients),
+            "extract": sum(getattr(c, "_recorded_close_count", 0) for c in self.llm_clients),
+        }
+
+    def close_leftovers(self) -> None:
+        """Defensively close any clients that the production code forgot."""
+        for client in self.embed_clients + self.llm_clients:
+            if client._recorded_close_count == 0:
+                client.close()
+
+
+# ---------------------------------------------------------------------------
+# backfill_graph_memory.main() — live CLI + dry-run caller tests (Lane1)
+# ---------------------------------------------------------------------------
+
+class TestBackfillMainLiveAndDryRun:
+    """Real CLI path exercises the planned live/dry pipeline.
+
+    These tests target the source migration where ``main()``:
+    - on ``--dry-run``, reads the raw TOML plus longterm/state file metadata and
+      previews counts before provider/secret/env credential resolution, model
+      pinning, catalog load or refresh, ladybug import, embedding/extraction
+      client allocation, or DB creation;
+    - on the live path, calls ``prepare_backfill_prerequisites`` first, then
+      opens the independent embedding client, graph store, shared extraction
+      helper, and runs the backfill engine;
+    - closes all live clients on both success and error paths.
+
+    Until that source migration lands these tests are expected RED.
+    """
+
+    _CLI_AGENT = "cli-agent"
+
+    @staticmethod
+    def _patch_cli_store(monkeypatch: pytest.MonkeyPatch, replacement: Callable[..., object]) -> None:
+        """Patch the store's owning module and an existing eager CLI alias only."""
+        monkeypatch.setattr(graph_memory, "GraphMemoryStore", replacement)
+        if "GraphMemoryStore" in vars(backfill_graph_memory):
+            monkeypatch.setattr(backfill_graph_memory, "GraphMemoryStore", replacement)
+
+    @staticmethod
+    def _tree_bytes(root: Path) -> dict[str, bytes | None]:
+        """Return every file's bytes below *root* (directories as None)."""
+        tree: dict[str, bytes | None] = {}
+        for entry in sorted(root.rglob("*")):
+            key = entry.relative_to(root).as_posix()
+            if entry.is_file():
+                with entry.open("rb") as stream:
+                    tree[key] = stream.read()
+            else:
+                tree[key] = None
+        return tree
+
+    def _write_world(
+        self,
+        tmp_xdg: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        missing_telegram_secret: bool = False,
+        invalid_selector: bool = False,
+        longterm_entries: list[tuple[str, dict]] | None = None,
+        imported: dict[str, dict] | None = None,
+    ) -> _CLIWorld:
+        """Write config, optional vault, saved catalog and longterm/state files."""
+        from xdg import xdg_paths
+
+        paths = xdg_paths(self._CLI_AGENT)
+        for directory in (paths.config_home, paths.data_home, paths.state_home):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        adapter = "invalid-adapter" if invalid_selector else "openai"
+        bot_token = (
+            'bot_token = "sec:missing_telegram_token"\n'
+            if missing_telegram_secret
+            else 'bot_token = "plain-token"\n'
+        )
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            "[telegram]\n"
+            f"{bot_token}"
+            "allowed_user_ids = [1]\n"
+            "\n"
+            "[agent]\n"
+            "compaction_threshold_tokens = 3000\n"
+            "\n"
+            "[embeddings]\n"
+            'provider = "openai"\n'
+            'model = "text-embed"\n'
+            'api_key = "env:BF_EMBED_KEY"\n'
+            'base_url = "https://e.backfill.test/v1"\n'
+            "\n"
+            "[graph_memory]\n"
+            "enabled = true\n"
+            f'extraction_provider = "{adapter}"\n'
+            'extraction_base_url = "https://g.backfill.test/v1"\n'
+            'extraction_api_key = "env:BF_GRAPH_KEY"\n'
+            'extraction_model = "org/graph-model"\n'
+        )
+
+        # Live path needs the agent vault to resolve the Telegram sec ref; dry-run
+        # intentionally omits it to prove missing credentials do not block preview.
+        if not missing_telegram_secret:
+            paths.secrets_file.write_text('bot_token = "sec-resolved-token"\n')
+
+        # Graph backfill reads no saved catalog: none is written for the live world.
+        assert not paths.models_config_file.exists()
+
+        longterm_path = paths.data_home / "longterm_memory.json"
+        ltm = LongTermMemory(path=str(longterm_path))
+        entries = longterm_entries or [
+            ("entry-a", {"content": "Alice uses Python.", "source": "manual"}),
+            ("entry-b", {"content": "Bob uses Go.", "source": "scheduled"}),
+        ]
+        for _, entry in entries:
+            ltm.add(entry["content"], source=entry.get("source", "manual"))
+
+        # Persisted IDs are generated by LongTermMemory; tests must use real IDs.
+        persisted = list(ltm.entries())
+
+        state_path = paths.data_home / "graph_memory_backfill_state.json"
+        _save_backfill_state(str(state_path), {"version": 1, "imported": imported or {}})
+
+        monkeypatch.setenv("BF_GRAPH_KEY", _BF_GRAPH_KEY)
+        monkeypatch.setenv("BF_EMBED_KEY", _BF_EMBED_KEY)
+        monkeypatch.delenv("BF_CONN_KEY", raising=False)
+
+        before_tree = self._tree_bytes(tmp_path)
+        return _CLIWorld(config_path, persisted, state_path, before_tree)
+
+    @staticmethod
+    def _forbid_side_effects(monkeypatch: pytest.MonkeyPatch, *, dry_run: bool = False) -> list[str]:
+        """Refuse discovery/settings writes, plus every expensive dry-run boundary."""
+        import config_schema
+        import embedding_client
+
+        captured: list[str] = []
+
+        def tripwire(label: str) -> Callable[..., object]:
+            def tripped(*args: object, **kwargs: object) -> object:
+                captured.append(label)
+                raise AssertionError(f"{label} must not run")
+            return tripped
+
+        targets = [
+            (ModelSettings, "write"),
+            (model_discovery.ModelDiscovery, "fetch"),
+            (ModelRegistry, "refresh"),
+        ]
+        if dry_run:
+            targets.extend([
+                (config_schema, "parse_config"),
+                (config_schema, "resolve_provider_connection"),
+                (config_schema, "_expand_value"),
+                (embedding_client, "_resolve_credential"),
+                (backfill_graph_memory, "prepare_backfill_prerequisites"),
+                (EmbeddingClient, "__init__"),
+                (LLMClient, "__init__"),
+                (LLMClient, "for_graph_extraction"),
+                (httpx.Client, "__init__"),
+                (graph_memory, "GraphMemoryStore"),
+                (graph_memory, "build_extraction_llm_call"),
+                (graph_memory, "resolve_graph_prerequisites"),
+                (ModelSettings, "load"),
+                (ModelRegistry, "resolve_graph_model"),
+            ])
+            if "GraphMemoryStore" in vars(backfill_graph_memory):
+                targets.append((backfill_graph_memory, "GraphMemoryStore"))
+            real_import = builtins.__import__
+
+            def blocking_import(name: str, *args: object, **kwargs: object) -> Any:
+                if name == "ladybug" or name.startswith("ladybug."):
+                    return tripwire("ladybug import")()
+                return real_import(name, *args, **kwargs)
+
+            monkeypatch.setattr(builtins, "__import__", blocking_import)
+        for owner, name in targets:
+            monkeypatch.setattr(owner, name, tripwire(f"{owner.__name__}.{name}"))
+        return captured
+
+    def test_dry_run_counts_despite_missing_telegram_secret_and_invalid_selector(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--dry-run previews counts before credential/catalog/DB work."""
+        world = self._write_world(
+            tmp_xdg, tmp_path, monkeypatch, missing_telegram_secret=True, invalid_selector=True
+        )
+
+        captured = self._forbid_side_effects(monkeypatch, dry_run=True)
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "backfill_graph_memory.py",
+                "--config", str(world.config_path),
+                "--agent-name", self._CLI_AGENT,
+                "--dry-run",
+            ],
+        )
+        try:
+            backfill_graph_memory.main()
+        except SystemExit as exc:
+            assert exc.code == 0
+
+        assert captured == []
+        assert self._tree_bytes(tmp_path) == world.before_tree
+
+        out = capsys.readouterr().out
+        assert "Total entries:      2" in out
+        assert "Imported:           2" in out
+        assert "DRY-RUN" in out
+
+    def test_dry_run_preview_limit_force_checksum_and_no_writes(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--dry-run honors limit, force and cached-checksum skip; leaves files unchanged."""
+        world = self._write_world(tmp_xdg, tmp_path, monkeypatch, missing_telegram_secret=True)
+
+        first_eid, first_entry = world.entries[0]
+        first_checksum = _entry_checksum(first_entry)
+        _save_backfill_state(
+            str(world.state_path),
+            {"version": 1, "imported": {first_eid: {"checksum": first_checksum}}},
+        )
+
+        before_tree = self._tree_bytes(tmp_path)
+
+        captured = self._forbid_side_effects(monkeypatch, dry_run=True)
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "backfill_graph_memory.py",
+                "--config", str(world.config_path),
+                "--agent-name", self._CLI_AGENT,
+                "--dry-run",
+                "--limit", "1",
+            ],
+        )
+        try:
+            backfill_graph_memory.main()
+        except SystemExit as exc:
+            assert exc.code == 0
+        assert captured == []
+
+        out = capsys.readouterr().out
+        assert "Total entries:      2" in out
+        assert "Imported:           1" in out
+        assert "Skipped (cached):   1" in out
+        after_tree = self._tree_bytes(tmp_path)
+        assert after_tree == before_tree
+
+        # With --force the cached entry is counted as would-import again.
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "backfill_graph_memory.py",
+                "--config", str(world.config_path),
+                "--agent-name", self._CLI_AGENT,
+                "--dry-run",
+                "--limit", "1",
+                "--force",
+            ],
+        )
+        try:
+            backfill_graph_memory.main()
+        except SystemExit as exc:
+            assert exc.code == 0
+        assert captured == []
+        out = capsys.readouterr().out
+        assert "Imported:           1" in out
+        assert "Skipped (cached):   0" in out
+        assert self._tree_bytes(tmp_path) == before_tree
+
+    def test_cold_start_dry_run_never_imports_ladybug(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fresh CLI process previews raw files without even attempting Ladybug import."""
+        world = self._write_world(
+            tmp_xdg, tmp_path, monkeypatch, missing_telegram_secret=True, invalid_selector=True,
+        )
+        script = Path(backfill_graph_memory.__file__).resolve()
+        marker = "COLD_DRY_RUN_LADYBUG_IMPORT_ATTEMPT"
+        bootstrap = textwrap.dedent('''\
+            import builtins
+            import runpy
+            import sys
+
+            original_import = builtins.__import__
+
+            def guarded_import(name: str, *args: object, **kwargs: object) -> object:
+                """Refuse Ladybug before any application module is imported."""
+                if name == "ladybug" or name.startswith("ladybug."):
+                    print("COLD_DRY_RUN_LADYBUG_IMPORT_ATTEMPT", file=sys.stderr, flush=True)
+                    raise ImportError("Ladybug is forbidden during cold dry-run")
+                return original_import(name, *args, **kwargs)
+
+            def forbid_network(event: str, args: tuple[object, ...]) -> None:
+                """Prevent accidental external traffic in the isolated CLI process."""
+                if event in ("socket.connect", "socket.getaddrinfo"):
+                    raise AssertionError("cold dry-run attempted network access")
+
+            assert "graph_memory" not in sys.modules
+            assert "backfill_graph_memory" not in sys.modules
+            builtins.__import__ = guarded_import
+            sys.addaudithook(forbid_network)
+            sys.argv = sys.argv[1:]
+            runpy.run_path(sys.argv[0], run_name="__main__")
+            ''')
+        completed = subprocess.run(
+            [
+                sys.executable, "-B", "-c", bootstrap, str(script),
+                "--config", str(world.config_path), "--agent-name", self._CLI_AGENT, "--dry-run",
+            ],
+            cwd=script.parent,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert marker not in completed.stdout + completed.stderr
+        assert "Total entries:      2" in completed.stdout
+        assert "Imported:           2" in completed.stdout
+        assert "DRY-RUN" in completed.stdout
+        assert self._tree_bytes(tmp_path) == world.before_tree
+
+    def test_live_path_validates_then_runs_extraction_and_closes_clients(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Live CLI validates purely, calls shared helper with fixed wire, and closes all clients."""
+        world = self._write_world(tmp_xdg, tmp_path, monkeypatch)
+
+        real_prepare = graph_memory.resolve_graph_startup
+        real_helper = graph_memory.build_extraction_llm_call
+        router = _RecordingRouter()
+        router.chat_content = json.dumps({
+            "entities": [
+                {"name": "Alice", "entity_type": "person"},
+                {"name": "Python", "entity_type": "tool"},
+            ],
+            "facts": [
+                {"source": "Alice", "target": "Python", "relation_type": "USES", "fact": "Alice uses Python."}
+            ],
+        })
+        store_instances: list[_FakeGraphStore] = []
+        calls: dict[str, Any] = {"prepare": [], "build_extraction": []}
+        recorder = _ClientRecorder(monkeypatch)
+
+        def spy_prepare(app_cfg: AppConfig, *, vault_file: str | None = None) -> GraphPrerequisites:
+            """Observe real prerequisites prepared inside the CLI invocation."""
+            prepared = real_prepare(app_cfg, vault_file=vault_file)
+            calls["prepare"].append((app_cfg, vault_file, prepared))
+            assert recorder.embed_clients == []  # pure validation: no probe client
+            assert router.requests == []
+            assert store_instances == []
+            return prepared
+
+        def spy_helper(*args: object, **kwargs: object) -> Callable[[str], str]:
+            """Observe, but never replace, the real shared extraction helper."""
+            calls["build_extraction"].append((args, kwargs))
+            return real_helper(*args, **kwargs)
+
+        def spy_store(
+            *,
+            db_path: str,
+            embedder_fn: Callable[[str], list[float]],
+            embedding_dim: int,
+            buffer_pool_mb: int = 256,
+        ) -> _FakeGraphStore:
+            """Record store construction and return the file-free fake."""
+            store = _FakeGraphStore(
+                db_path=db_path,
+                embedder_fn=embedder_fn,
+                embedding_dim=embedding_dim,
+                buffer_pool_mb=buffer_pool_mb,
+            )
+            store_instances.append(store)
+            return store
+
+        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda _transport, request: router.handle_request(request))
+        monkeypatch.setattr(graph_memory, "resolve_graph_startup", spy_prepare)
+        self._patch_cli_store(monkeypatch, spy_store)
+        monkeypatch.setattr(graph_memory, "build_extraction_llm_call", spy_helper)
+        forbidden = self._forbid_side_effects(monkeypatch)
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["backfill_graph_memory.py", "--config", str(world.config_path), "--agent-name", self._CLI_AGENT],
+        )
+        try:
+            try:
+                backfill_graph_memory.main()
+            except SystemExit as exc:
+                assert exc.code == 0
+            assert len(recorder.embed_clients) == 1
+            assert len(recorder.llm_clients) == 2
+            assert len({id(client) for client in recorder.llm_clients}) == 2
+            for client in recorder.embed_clients + recorder.llm_clients:
+                assert client._recorded_close_count == 1
+            assert len(store_instances) == 1
+            assert store_instances[0].close_count == 1
+        finally:
+            recorder.close_leftovers()
+            for store in store_instances:
+                if not store.closed:
+                    store.close()
+
+        assert len(calls["prepare"]) == 1
+        assert calls["prepare"][0][1] is not None  # vault_file passed
+        assert len(calls["build_extraction"]) == 1
+        app_cfg, vault_file, prereqs = calls["prepare"][0]
+        assert not xdg_paths(self._CLI_AGENT).models_config_file.exists()
+        assert vault_file == str(xdg_paths(self._CLI_AGENT).secrets_file)
+        helper_args, helper_kwargs = calls["build_extraction"][0]
+        assert len(helper_args) == 2
+        assert helper_args[0] is prereqs.pin
+        assert helper_args[1] is app_cfg.agent
+        assert helper_kwargs["caller_tag"] == "backfill"
+        assert len(store_instances) == 1
+        assert store_instances[0].closed
+        assert store_instances[0].db_path == str(xdg_paths(self._CLI_AGENT).graph_memory_db)
+        assert store_instances[0].embedding_dim == len(router.embed_vector)
+        assert store_instances[0].buffer_pool_mb == app_cfg.graph_memory.buffer_pool_mb
+        state_key = world.state_path.relative_to(tmp_path).as_posix()
+        assert {k: v for k, v in self._tree_bytes(tmp_path).items() if k != state_key} == {
+            k: v for k, v in world.before_tree.items() if k != state_key
+        }
+        assert forbidden == []
+        assert router.unknown == []
+
+        counts = recorder.close_counts()
+        # One live embedding client; validation builds no probe.
+        assert counts["embed"] == 1
+        # One distinct extraction client per entry, each closed once.
+        assert counts["extract"] == 2
+
+        # Authorization and model routing must stay separate.
+        embed_reqs = [r for r in router.requests if r.url.host == "e.backfill.test"]
+        graph_reqs = [r for r in router.requests if r.url.host == "g.backfill.test"]
+        assert embed_reqs
+        assert len(graph_reqs) == 2
+        for req in embed_reqs:
+            assert req.headers.get("authorization") == f"Bearer {_BF_EMBED_KEY}"
+            payload = json.loads(req.content)
+            assert payload["model"] == "text-embed"
+        for req in graph_reqs:
+            assert req.headers.get("authorization") == f"Bearer {_BF_GRAPH_KEY}"
+            payload = json.loads(req.content)
+            assert payload["model"] == "org/graph-model"
+            assert payload["temperature"] == 0.1
+            assert payload["max_completion_tokens"] == 1024
+
+        # Extraction clients were constructed with the preparation pin.
+        for run_model in recorder.llm_models:
+            assert run_model is prereqs.pin
+
+        out = capsys.readouterr().out
+        assert "Total entries:      2" in out
+        assert "Imported:           2" in out
+        assert len(store_instances[0].upserts) == 4
+        assert len(store_instances[0].relations) == 2
+        assert len(store_instances[0].episodes) == 2
+
+        # Live state records real entry ids and checksums.
+        state = _load_backfill_state(str(world.state_path))
+        assert set(state["imported"]) == {eid for eid, _entry in world.entries}
+        for eid, entry in world.entries:
+            assert eid in state["imported"]
+            assert state["imported"][eid]["checksum"] == _entry_checksum(entry)
+
+    def test_live_path_helper_construction_failure_closes_store(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A helper-construction exception releases the already constructed CLI store."""
+        world = self._write_world(tmp_xdg, tmp_path, monkeypatch)
+        router = _RecordingRouter()
+        recorder = _ClientRecorder(monkeypatch)
+        stores: list[_FakeGraphStore] = []
+        engine_calls: list[dict[str, object]] = []
+        helper_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def store_factory(**kwargs: Any) -> _FakeGraphStore:
+            """Replace only the DB boundary with the existing recording store."""
+            store = _FakeGraphStore(**kwargs)
+            stores.append(store)
+            return store
+
+        def fail_helper(*args: object, **kwargs: object) -> Callable[[str], str]:
+            """Inject the fault after store acquisition, before engine execution."""
+            helper_calls.append((args, dict(kwargs)))
+            assert len(stores) == 1
+            assert stores[0].close_count == 0
+            assert len(recorder.embed_clients) == 1
+            assert recorder.embed_clients[0]._recorded_close_count == 0
+            raise RuntimeError("injected extraction helper construction failure")
+
+        def forbid_engine(**kwargs: object) -> None:
+            """Record and reject an engine call after the injected setup failure."""
+            engine_calls.append(dict(kwargs))
+            raise AssertionError("backfill engine must not run after helper construction failure")
+
+        monkeypatch.setattr(
+            httpx.HTTPTransport, "handle_request", lambda _transport, request: router.handle_request(request),
+        )
+        self._patch_cli_store(monkeypatch, store_factory)
+        monkeypatch.setattr(backfill_graph_memory, "_build_llm_call", fail_helper)
+        monkeypatch.setattr(backfill_graph_memory, "backfill_longterm_to_graph", forbid_engine)
+        forbidden = self._forbid_side_effects(monkeypatch)
+        monkeypatch.setattr(
+            sys, "argv",
+            [str(Path(backfill_graph_memory.__file__)), "--config", str(world.config_path),
+             "--agent-name", self._CLI_AGENT],
+        )
+        try:
+            with pytest.raises(RuntimeError, match="injected extraction helper construction failure"):
+                backfill_graph_memory.main()
+            assert len(helper_calls) == 1
+            assert engine_calls == []
+            assert len(stores) == 1
+            assert len(recorder.embed_clients) == 1
+            for client in recorder.embed_clients:
+                assert client._recorded_close_count == 1
+            assert recorder.llm_clients == []
+            assert stores[0].close_count == 1
+            assert stores[0].upserts == []
+            assert stores[0].relations == []
+            assert stores[0].episodes == []
+            assert router.requests
+            assert all(request.url.host == "e.backfill.test" for request in router.requests)
+            assert router.unknown == []
+            assert forbidden == []
+            assert self._tree_bytes(tmp_path) == world.before_tree
+        finally:
+            recorder.close_leftovers()
+            for store in stores:
+                if not store.closed:
+                    store.close()
+
+    def test_live_path_prepare_failure_exits_before_db_http_and_state_writes(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unresolvable extraction credential fails validation before DB, HTTP or state writes."""
+        world = self._write_world(tmp_xdg, tmp_path, monkeypatch)
+        monkeypatch.delenv("BF_GRAPH_KEY")
+        before_tree = self._tree_bytes(tmp_path)
+
+        router = _RecordingRouter()
+        recorder = _ClientRecorder(monkeypatch)
+        real_prepare = graph_memory.resolve_graph_startup
+        failures: list[GraphPrerequisiteError] = []
+
+        def spy_prepare(*args: object, **kwargs: object) -> GraphPrerequisites:
+            """Record the real failure from the unresolvable credential."""
+            try:
+                return real_prepare(*args, **kwargs)
+            except GraphPrerequisiteError as exc:
+                failures.append(exc)
+                raise
+
+        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda _transport, request: router.handle_request(request))
+        monkeypatch.setattr(graph_memory, "resolve_graph_startup", spy_prepare)
+        forbidden = self._forbid_side_effects(monkeypatch)
+        self._patch_cli_store(
+            monkeypatch,
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("store must not init after prepare failure")),
+        )
+        monkeypatch.setattr(
+            graph_memory,
+            "build_extraction_llm_call",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("helper must not run after prepare failure")),
+        )
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["backfill_graph_memory.py", "--config", str(world.config_path), "--agent-name", self._CLI_AGENT],
+        )
+        try:
+            with pytest.raises(SystemExit) as caught:
+                backfill_graph_memory.main()
+            assert caught.value.code != 0
+            assert len(failures) == 1
+            assert failures[0].code == "extraction_credential_unavailable"
+            assert recorder.embed_clients == []
+            assert recorder.llm_clients == []
+            assert router.requests == []
+            assert forbidden == []
+            assert self._tree_bytes(tmp_path) == before_tree
+        finally:
+            recorder.close_leftovers()
+
+    @pytest.mark.parametrize("failure", ["toml-syntax", "invalid-schema"])
+    def test_live_path_ignores_corrupt_catalog_and_never_reads_it(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture, failure: str,
+    ) -> None:
+        """Task 5.3: live backfill uses no saved catalog; corrupt catalog bytes are never read.
+
+        A corrupt ``models-config.toml`` used to fail preparation with
+        ``catalog_corrupt``.  Graph validation is now independent of it: the
+        run succeeds, never constructs ``ModelSettings``/``ModelRegistry`` and
+        leaves the file byte-identical."""
+        world = self._write_world(tmp_xdg, tmp_path, monkeypatch)
+        paths = xdg_paths(self._CLI_AGENT)
+        corrupt = {
+            "toml-syntax": f"schema_version = 1\nrevision = [\n# {_BF_LEAK}\n".encode(),
+            "invalid-schema": f'schema_version = 1\nrevision = 1\napi_key = "{_BF_LEAK}"\n'.encode(),
+        }
+        paths.models_config_file.write_bytes(corrupt[failure])
+        catalog_before = paths.models_config_file.read_bytes()
+        before_tree = self._tree_bytes(tmp_path)
+
+        router = _RecordingRouter()
+        recorder = _ClientRecorder(monkeypatch)
+        constructed: list[str] = []
+
+        def tripwire(label: str) -> Callable[..., object]:
+            def tripped(*_a: object, **_k: object) -> object:
+                constructed.append(label)
+                raise AssertionError(f"{label} must not run for live backfill")
+            return tripped
+
+        monkeypatch.setattr(ModelSettings, "__init__", tripwire("ModelSettings"))
+        monkeypatch.setattr(ModelRegistry, "__init__", tripwire("ModelRegistry"))
+        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda _transport, request: router.handle_request(request))
+        stores: list[_FakeGraphStore] = []
+
+        def store_factory(**kwargs: Any) -> _FakeGraphStore:
+            store = _FakeGraphStore(**kwargs)
+            stores.append(store)
+            return store
+
+        self._patch_cli_store(monkeypatch, store_factory)
+        forbidden = self._forbid_side_effects(monkeypatch)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["backfill_graph_memory.py", "--config", str(world.config_path), "--agent-name", self._CLI_AGENT],
+        )
+        try:
+            try:
+                backfill_graph_memory.main()
+            except SystemExit as exc:
+                assert exc.code == 0
+            assert constructed == [] and forbidden == []
+            assert len(stores) == 1 and stores[0].closed
+            assert paths.models_config_file.read_bytes() == catalog_before
+            state_key = world.state_path.relative_to(tmp_path).as_posix()
+            assert {k: v for k, v in self._tree_bytes(tmp_path).items() if k != state_key} == {
+                k: v for k, v in before_tree.items() if k != state_key
+            }
+            logged = "\n".join(r.getMessage() for r in caplog.records)
+            for secret in _BF_SECRETS:
+                assert secret not in logged
+        finally:
+            recorder.close_leftovers()
+
+    def test_live_path_embedding_unavailable_exits_before_graph_store(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Embedding 503 closes the embed client and never opens the store."""
+        world = self._write_world(tmp_xdg, tmp_path, monkeypatch)
+
+        real_prepare = graph_memory.resolve_graph_startup
+        router = _RecordingRouter()
+        router.embed_status = 503
+        store_instances: list[_FakeGraphStore] = []
+        recorder = _ClientRecorder(monkeypatch)
+
+        def spy_prepare(app_cfg: AppConfig, *, vault_file: str | None = None) -> GraphPrerequisites:
+            prepared = real_prepare(app_cfg, vault_file=vault_file)
+            assert recorder.embed_clients == []  # pure validation: no probe client
+            assert router.requests == []
+            assert store_instances == []
+            return prepared
+
+        def spy_store(
+            *,
+            db_path: str,
+            embedder_fn: Callable[[str], list[float]],
+            embedding_dim: int,
+            buffer_pool_mb: int = 256,
+        ) -> _FakeGraphStore:
+            store = _FakeGraphStore(
+                db_path=db_path,
+                embedder_fn=embedder_fn,
+                embedding_dim=embedding_dim,
+                buffer_pool_mb=buffer_pool_mb,
+            )
+            store_instances.append(store)
+            return store
+
+        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda _transport, request: router.handle_request(request))
+        monkeypatch.setattr(graph_memory, "resolve_graph_startup", spy_prepare)
+        self._patch_cli_store(monkeypatch, spy_store)
+        monkeypatch.setattr(
+            graph_memory,
+            "build_extraction_llm_call",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("helper must not run after embedding failure")),
+        )
+        forbidden = self._forbid_side_effects(monkeypatch)
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["backfill_graph_memory.py", "--config", str(world.config_path), "--agent-name", self._CLI_AGENT],
+        )
+        try:
+            with pytest.raises(SystemExit) as caught:
+                backfill_graph_memory.main()
+            assert caught.value.code != 0
+            assert len(recorder.embed_clients) == 1
+            for client in recorder.embed_clients:
+                assert client._recorded_close_count == 1
+            assert recorder.llm_clients == []
+            assert store_instances == []
+            assert router.requests
+            assert all(request.url.host == "e.backfill.test" for request in router.requests)
+            for request in router.requests:
+                assert request.headers["authorization"] == f"Bearer {_BF_EMBED_KEY}"
+                assert json.loads(request.content)["model"] == "text-embed"
+            assert router.unknown == []
+            assert forbidden == []
+            assert self._tree_bytes(tmp_path) == world.before_tree
+        finally:
+            recorder.close_leftovers()
+            for store in store_instances:
+                if not store.closed:
+                    store.close()
+
+    def test_live_path_extraction_failure_closes_all_clients(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Two extraction 401 failures still close extraction and embed clients."""
+        world = self._write_world(tmp_xdg, tmp_path, monkeypatch)
+
+        real_prepare = graph_memory.resolve_graph_startup
+        real_helper = graph_memory.build_extraction_llm_call
+        router = _RecordingRouter()
+        router.chat_status = 401
+        store_instances: list[_FakeGraphStore] = []
+        recorder = _ClientRecorder(monkeypatch)
+
+        preparations: list[tuple[AppConfig, GraphPrerequisites]] = []
+        helper_calls: list[tuple[tuple, dict]] = []
+
+        def spy_prepare(app_cfg: AppConfig, *, vault_file: str | None = None) -> GraphPrerequisites:
+            prepared = real_prepare(app_cfg, vault_file=vault_file)
+            preparations.append((app_cfg, prepared))
+            assert recorder.embed_clients == []  # pure validation: no probe client
+            assert router.requests == []
+            assert store_instances == []
+            return prepared
+
+        def spy_helper(*args: object, **kwargs: object) -> Callable[[str], str]:
+            helper_calls.append((args, kwargs))
+            return real_helper(*args, **kwargs)
+
+        def spy_store(
+            *,
+            db_path: str,
+            embedder_fn: Callable[[str], list[float]],
+            embedding_dim: int,
+            buffer_pool_mb: int = 256,
+        ) -> _FakeGraphStore:
+            store = _FakeGraphStore(
+                db_path=db_path,
+                embedder_fn=embedder_fn,
+                embedding_dim=embedding_dim,
+                buffer_pool_mb=buffer_pool_mb,
+            )
+            store_instances.append(store)
+            return store
+
+        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda _transport, request: router.handle_request(request))
+        monkeypatch.setattr(graph_memory, "resolve_graph_startup", spy_prepare)
+        self._patch_cli_store(monkeypatch, spy_store)
+        monkeypatch.setattr(graph_memory, "build_extraction_llm_call", spy_helper)
+        forbidden = self._forbid_side_effects(monkeypatch)
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["backfill_graph_memory.py", "--config", str(world.config_path), "--agent-name", self._CLI_AGENT],
+        )
+        try:
+            with pytest.raises(SystemExit) as caught:
+                backfill_graph_memory.main()
+            assert caught.value.code != 0
+            assert len(recorder.embed_clients) == 1
+            assert len(recorder.llm_clients) == 2
+            assert len({id(client) for client in recorder.llm_clients}) == 2
+            for client in recorder.embed_clients + recorder.llm_clients:
+                assert client._recorded_close_count == 1
+            assert len(store_instances) == 1
+            assert store_instances[0].close_count == 1
+        finally:
+            recorder.close_leftovers()
+            for store in store_instances:
+                if not store.closed:
+                    store.close()
+
+        assert len(store_instances) == 1
+        assert store_instances[0].closed
+        assert store_instances[0].upserts == []
+        assert store_instances[0].relations == []
+        assert store_instances[0].episodes == []
+
+        counts = recorder.close_counts()
+        assert counts["embed"] == 1
+        assert counts["extract"] == 2  # two distinct extraction clients, each closed once
+
+        assert len(preparations) == len(helper_calls) == 1
+        app_cfg, prepared = preparations[0]
+        helper_args, helper_kwargs = helper_calls[0]
+        assert len(helper_args) == 2
+        assert helper_args[0] is prepared.pin
+        assert helper_args[1] is app_cfg.agent
+        assert helper_kwargs["caller_tag"] == "backfill"
+        assert all(pin is prepared.pin for pin in recorder.llm_models)
+        assert forbidden == []
+        assert router.unknown == []
+        graph_requests = [request for request in router.requests if request.url.host == "g.backfill.test"]
+        assert len(graph_requests) == 2
+        for request in router.requests:
+            payload = json.loads(request.content)
+            if request.url.host == "g.backfill.test":
+                assert request.headers["authorization"] == f"Bearer {_BF_GRAPH_KEY}"
+                assert payload["model"] == "org/graph-model"
+            else:
+                assert request.headers["authorization"] == f"Bearer {_BF_EMBED_KEY}"
+                assert payload["model"] == "text-embed"
+        assert self._tree_bytes(tmp_path) == world.before_tree
+
+        out = capsys.readouterr().out
+        assert "Failed:             2" in out
+
+
 # ---------------------------------------------------------------------------
 # backfill_graph_memory.main() — vault_file wiring regression
 # ---------------------------------------------------------------------------
@@ -817,8 +2350,8 @@ class TestMainResolvesVaultFile:
         config_path = tmp_path / "config.toml"
         config_path.write_text(
             '[telegram]\nbot_token = "sec:bot_token"\nallowed_user_ids = []\n'
-            '[agent]\ndefault_model = "test"\n'
-            '[[models]]\nname = "m"\nprovider = "openai"\nmodel = "gpt-4o-mini"\n'
+            '[providers.openai-main]\ntype = "openai"\napi_key = "test-provider-key"\n'
+            'base_url = "https://api.openai.com/v1"\n'
             "[graph_memory]\nenabled = false\n"
         )
 
@@ -834,3 +2367,365 @@ class TestMainResolvesVaultFile:
                 backfill_graph_memory.main()
         assert any("not enabled" in r.message for r in caplog.records)
         assert not any("vault file" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# prepare_backfill_prerequisites — saved-catalog preparation (task 12.17)
+#
+# Real ModelSettings (setup writes only), read-only load, ModelRegistry,
+# resolve_provider_connection, resolve_graph_prerequisites, budget kernel and
+# EmbeddingClient. Only the environment, vault file, filesystem read errors and
+# the HTTP transport are external fakes; tripwires refuse forbidden side
+# effects. The API is imported inside helpers so legacy tests still collect.
+# ---------------------------------------------------------------------------
+
+_BF_GRAPH_ID = "g/org/graph-model"
+_BF_GRAPH_KEY = "fake-backfill-graph-key"
+_BF_MAIN_KEY = "fake-backfill-main-key"
+_BF_EMBED_KEY = "fake-backfill-embed-key"
+_BF_VAULT_GRAPH_KEY = "fake-backfill-vault-graph-key"
+_BF_VAULT_EMBED_KEY = "fake-backfill-vault-embed-key"
+_BF_LEAK = "sk-backfillleak12345"
+_BF_SECRETS = (_BF_GRAPH_KEY, _BF_MAIN_KEY, _BF_EMBED_KEY, _BF_VAULT_GRAPH_KEY, _BF_VAULT_EMBED_KEY, _BF_LEAK)
+_BF_LOCAL_CONTEXT = 3000
+_BF_EMBEDDINGS = EmbeddingsConfig(
+    provider="openai", model="text-embed", api_key="env:BF_EMBED_KEY", base_url="https://e.backfill.test/v1"
+)
+_BF_REAL_HTTPX_CLIENT = httpx.Client
+
+
+def _bf_meta(context: int | None = None, output: int | None = None) -> ModelMetadata:
+    """Return provider-reported metadata for the populated token limits."""
+    return ModelMetadata(context_tokens=context, output_tokens=output)
+
+
+def _bf_document(remembered: str | None, freshness: str, metadata: ModelMetadata) -> CatalogDocument:
+    """Return a saved catalog with an independent graph record and a Main record."""
+    return CatalogDocument(
+        1,
+        3,
+        remembered,
+        (
+            ProviderState("g", "openai", "2026-01-01T00:00:00Z", freshness),
+            ProviderState("p", "openai", "2026-01-01T00:00:00Z", "fresh"),
+        ),
+        (
+            ModelRecord(_BF_GRAPH_ID, "g", "org/graph-model", "Graph Model", metadata),
+            ModelRecord("p/main", "p", "main", "Main", _bf_meta(8192, 1024)),
+        ),
+    )
+
+
+class _BfTransport(httpx.MockTransport):
+    """Real MockTransport that refuses connections and records requests and closes."""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.close_count = 0
+
+        def refuse(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            raise httpx.ConnectError("connection refused", request=request)
+
+        super().__init__(refuse)
+
+    def close(self) -> None:
+        """Count the close, then close the underlying transport."""
+        self.close_count += 1
+        super().close()
+
+
+@dataclasses.dataclass
+class _BackfillWorld:
+    """Saved catalog location, typed config and observed side-effect boundaries."""
+
+    root: Path
+    settings_path: Path
+    app_cfg: AppConfig
+    vault_file: str
+    transports: list[_BfTransport]
+    tripwires: list[str]
+
+    def snapshot(self) -> dict[str, bytes | None]:
+        """Return every entry and file's bytes below the world root (no Path.read_bytes)."""
+        tree: dict[str, bytes | None] = {}
+        for entry in sorted(self.root.rglob("*")):
+            key = entry.relative_to(self.root).as_posix()
+            if entry.is_file():
+                with entry.open("rb") as stream:
+                    tree[key] = stream.read()
+            else:
+                tree[key] = None
+        return tree
+
+    def assert_clean(self, before: dict[str, bytes | None]) -> None:
+        """Assert unchanged files/entries, no tripwire, and closed request-free transports."""
+        assert self.snapshot() == before
+        assert self.tripwires == []
+        assert len(self.transports) <= 1
+        for transport in self.transports:
+            assert transport.requests == []
+            assert transport.close_count == 1
+
+
+@pytest.fixture
+def backfill_world(tmp_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., _BackfillWorld]]:
+    """Build a saved-catalog world, then install transport and forbidden-effect tripwires."""
+    created: list[_BfTransport] = []
+
+    def build(
+        *,
+        catalog: str = "valid",
+        raw: bytes = b"",
+        remembered: str | None = None,
+        freshness: str = "fresh",
+        metadata: ModelMetadata | None = None,
+        graph_key: str = "env:BF_GRAPH_KEY",
+        embeddings: EmbeddingsConfig = _BF_EMBEDDINGS,
+        selector: str = _BF_GRAPH_ID,
+        enabled: bool = True,
+    ) -> _BackfillWorld:
+        root = tmp_xdg / "world"
+        (root / "state").mkdir(parents=True)
+        settings_path = root / "config" / "models-config.toml"
+        if catalog != "no-parent":
+            settings_path.parent.mkdir()
+        if catalog == "valid":
+            ModelSettings(settings_path).write(_bf_document(remembered, freshness, metadata or _bf_meta(4096, 2048)))
+        elif catalog == "raw":
+            settings_path.write_bytes(raw)
+        vault = root / "vaults" / "custom-vault.toml"
+        vault.parent.mkdir()
+        vault.write_text(f'graph_key = "{_BF_VAULT_GRAPH_KEY}"\nembed_key = "{_BF_VAULT_EMBED_KEY}"\n')
+        monkeypatch.setenv("HOME", str(tmp_xdg / "home"))
+        monkeypatch.setenv("BF_GRAPH_KEY", _BF_GRAPH_KEY)
+        monkeypatch.setenv("BF_MAIN_KEY", _BF_MAIN_KEY)
+        monkeypatch.setenv("BF_EMBED_KEY", _BF_EMBED_KEY)
+        monkeypatch.delenv("BF_CONN_KEY", raising=False)
+
+        def connection(name: str, key: str) -> ProviderConfig:
+            return ProviderConfig(name, "openai", api_key=key, base_url=f"https://{name}.backfill.test/v1", request_timeout=20)
+
+        base = parse_config({
+            "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [12345]},
+            "agent": {"compaction_threshold_tokens": _BF_LOCAL_CONTEXT},
+            "paths": {},
+        })
+        app_cfg = dataclasses.replace(
+            base,
+            # Retained internal attribute (no longer configurable; removed in 6.2).
+            agent=dataclasses.replace(base.agent, ctx_max_tokens=_BF_LOCAL_CONTEXT),
+            providers={
+                "g": connection("g", graph_key),
+                "p": connection("p", "env:BF_MAIN_KEY"),
+                "e": connection("e", "env:BF_CONN_KEY"),
+            },
+            embeddings=embeddings,
+            graph_memory=GraphMemoryConfig(enabled=enabled, extraction_model=selector),
+        )
+        tripwires: list[str] = []
+
+        def client_factory(*_args: object, **_kwargs: object) -> httpx.Client:
+            transport = _BfTransport()
+            created.append(transport)
+            return _BF_REAL_HTTPX_CLIENT(transport=transport)
+
+        def tripwire(name: str) -> Callable[..., None]:
+            def tripped(*_args: object, **_kwargs: object) -> None:
+                tripwires.append(name)
+                raise AssertionError(f"{name} must not run during backfill preparation")
+            return tripped
+
+        monkeypatch.setattr(httpx, "Client", client_factory)
+        for owner, name in (
+            (model_discovery.ModelDiscovery, "fetch"),
+            (ModelRegistry, "refresh"),
+            (ModelRegistry, "select"),
+            (ModelRegistry, "restore_selection"),
+            (ModelSettings, "write"),
+            (LLMClient, "__init__"),
+            (LLMClient, "for_graph_extraction"),
+            (graph_memory.GraphMemoryWriter, "__init__"),
+            (graph_memory, "create_graph_memory"),
+            (graph_memory, "build_extraction_llm_call"),
+            (backfill_graph_memory, "_save_backfill_state"),
+        ):
+            monkeypatch.setattr(owner, name, tripwire(name))
+        monkeypatch.setattr(graph_memory, "GraphMemoryStore", tripwire("GraphMemoryStore"))
+        if "GraphMemoryStore" in vars(backfill_graph_memory):
+            monkeypatch.setattr(backfill_graph_memory, "GraphMemoryStore", tripwire("GraphMemoryStore"))
+        return _BackfillWorld(root, settings_path, app_cfg, str(vault), created, tripwires)
+
+    yield build
+    for transport in created:
+        if transport.close_count == 0:
+            transport.close()
+
+
+def _prepare_ok(world: _BackfillWorld, *, vault_file: str | None = None) -> GraphPrerequisites:
+    """Prepare from the saved catalog, asserting the success-path side-effect contract."""
+    from backfill_graph_memory import prepare_backfill_prerequisites
+
+    before = world.snapshot()
+    embeddings = world.app_cfg.embeddings
+    result = prepare_backfill_prerequisites(world.app_cfg, world.settings_path, vault_file=vault_file)
+    world.assert_clean(before)
+    assert len(world.transports) == 1
+    assert world.app_cfg.embeddings is embeddings
+    assert isinstance(result, GraphPrerequisites)
+    return result
+
+
+def _prepare_fails(world: _BackfillWorld, code: str, *, vault_file: str | None = None) -> GraphPrerequisiteError:
+    """Prepare expecting a safe ``GraphPrerequisiteError`` with ``code`` and no side effect."""
+    from backfill_graph_memory import prepare_backfill_prerequisites
+
+    before = world.snapshot()
+    with pytest.raises(GraphPrerequisiteError) as caught:
+        prepare_backfill_prerequisites(world.app_cfg, world.settings_path, vault_file=vault_file)
+    error = caught.value
+    assert error.code == code
+    rendered = "".join(traceback.format_exception(error))
+    for secret in _BF_SECRETS:
+        assert secret not in rendered
+    world.assert_clean(before)
+    return error
+
+
+class TestPrepareBackfillPrerequisites:
+    """Independently callable saved-catalog preparation; the CLI gate stays with 12.25."""
+
+    @pytest.mark.parametrize(
+        ("remembered", "freshness"),
+        [(None, "fresh"), ("p/gone", "stale"), ("p/main", "stale")],
+        ids=["main-unselected", "main-missing-stale", "main-remembered-stale"],
+    )
+    def test_saved_catalog_pins_graph_model_independent_of_main(
+        self, backfill_world: Callable[..., _BackfillWorld], remembered: str | None, freshness: str
+    ) -> None:
+        """Fresh or stale saved records pin the exact graph model and embedding identity."""
+        world = backfill_world(remembered=remembered, freshness=freshness)
+
+        result = _prepare_ok(world)
+
+        graph = _bf_document(remembered, freshness, _bf_meta(4096, 2048)).models[0]
+        assert result.pin.model == graph
+        assert (result.pin.connection.provider_id, result.pin.connection.api_key) == ("g", _BF_GRAPH_KEY)
+        assert result.pin.connection.base_url == "https://g.backfill.test/v1"
+        assert result.pin.catalog_revision == 3
+        assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
+
+    def test_disabled_graph_memory_is_still_prepared(self, backfill_world: Callable[..., _BackfillWorld]) -> None:
+        """The enabled gate belongs to the caller; invoking preparation always validates."""
+        result = _prepare_ok(backfill_world(enabled=False))
+        assert result.pin.model.id == _BF_GRAPH_ID
+
+    @pytest.mark.parametrize(
+        "metadata", [_bf_meta(), _bf_meta(4096, 1023), _bf_meta(1024)],
+        ids=["unknown", "output-below-fixed-cap", "no-headroom"],
+    )
+    def test_model_limits_are_not_a_startup_gate(
+        self, backfill_world: Callable[..., _BackfillWorld], metadata: ModelMetadata
+    ) -> None:
+        """Unknown or tiny discovered limits never fail preparation: graph has no fit gate."""
+        result = _prepare_ok(backfill_world(metadata=metadata))
+        assert result.pin.model.metadata == metadata
+        assert not hasattr(result, "budget")
+
+    def test_supplied_vault_file_resolves_graph_and_embedding_secrets(
+        self, backfill_world: Callable[..., _BackfillWorld]
+    ) -> None:
+        """sec: references resolve through the supplied vault, not a default home vault."""
+        world = backfill_world(
+            graph_key="sec:graph_key",
+            embeddings=EmbeddingsConfig(
+                provider="openai", model="text-embed", api_key="sec:embed_key",
+                base_url="https://e.backfill.test/v1",
+            ),
+        )
+        result = _prepare_ok(world, vault_file=world.vault_file)
+        assert result.pin.connection.api_key == _BF_VAULT_GRAPH_KEY
+        assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
+
+    @pytest.mark.parametrize("parent_exists", [True, False], ids=["file-missing", "parent-missing"])
+    def test_missing_catalog_fails_with_refresh_guidance(
+        self, backfill_world: Callable[..., _BackfillWorld], parent_exists: bool
+    ) -> None:
+        """A missing saved catalog fails before registry/embedding work and creates nothing."""
+        world = backfill_world(catalog="none" if parent_exists else "no-parent")
+        error = _prepare_fails(world, "catalog_missing")
+        assert "/models refresh" in str(error)
+        assert world.transports == []
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            f"schema_version = 1\nrevision = [\n# {_BF_LEAK}\n".encode(),
+            f'schema_version = 1\nrevision = 1\napi_key = "{_BF_LEAK}"\n'.encode(),
+        ],
+        ids=["toml-syntax", "invalid-schema"],
+    )
+    def test_corrupt_catalog_fails_without_backup_or_contents(
+        self, backfill_world: Callable[..., _BackfillWorld], raw: bytes
+    ) -> None:
+        """Corrupt bytes stay in place with no .corrupt sibling and never reach the error."""
+        world = backfill_world(catalog="raw", raw=raw)
+        error = _prepare_fails(world, "catalog_corrupt")
+        assert "/models refresh" in str(error)
+        assert world.transports == []
+
+    def test_unreadable_catalog_reports_permission_and_refresh_guidance(
+        self, backfill_world: Callable[..., _BackfillWorld], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OS read error on the saved catalog is a safe catalog_read_failed failure."""
+        world = backfill_world()
+        target = world.settings_path.resolve()
+        real_read_bytes = Path.read_bytes
+
+        def denied(self: Path) -> bytes:
+            if self.resolve() == target:
+                raise PermissionError(13, f"Permission denied {_BF_LEAK}")
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", denied)
+        error = _prepare_fails(world, "catalog_read_failed")
+        assert "permission" in str(error).lower()
+        assert "/models refresh" in str(error)
+        assert world.transports == []
+
+    def test_unknown_selector_keeps_model_not_found(self, backfill_world: Callable[..., _BackfillWorld]) -> None:
+        """An unknown graph selector keeps the registry code and names the setting to fix."""
+        error = _prepare_fails(backfill_world(selector=f"g/{_BF_LEAK}"), "model_not_found")
+        assert "graph_memory.extraction_model" in str(error)
+
+    @pytest.mark.parametrize("graph_key", ["env:BF_GRAPH_KEY", "sec:graph_key"], ids=["env-unset", "sec-no-vault"])
+    def test_graph_credential_failure_is_sanitized(
+        self, backfill_world: Callable[..., _BackfillWorld], monkeypatch: pytest.MonkeyPatch, graph_key: str
+    ) -> None:
+        """Unresolvable graph credentials fail safely; no default vault is consulted."""
+        world = backfill_world(graph_key=graph_key)
+        monkeypatch.delenv("BF_GRAPH_KEY")
+        error = _prepare_fails(world, "credential_resolution_failed")
+        assert "credential" in str(error).lower()
+
+    @pytest.mark.parametrize(
+        "embeddings",
+        [
+            pytest.param(
+                EmbeddingsConfig(provider="openai", api_key="env:BF_EMBED_KEY", base_url="https://e.backfill.test/v1"),
+                id="model-missing",
+            ),
+            pytest.param(
+                EmbeddingsConfig(provider="openai", model="text-embed", base_url="https://e.backfill.test/v1"),
+                id="no-graph-credential-inheritance",
+            ),
+        ],
+    )
+    def test_unavailable_embeddings_fail_actionably(
+        self, backfill_world: Callable[..., _BackfillWorld], embeddings: EmbeddingsConfig
+    ) -> None:
+        """Bad explicit embeddings fail after the pin, with the temporary client closed."""
+        world = backfill_world(embeddings=embeddings)
+        error = _prepare_fails(world, "embedding_unavailable")
+        assert "embeddings" in str(error).lower()
+        assert len(world.transports) == 1

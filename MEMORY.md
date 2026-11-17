@@ -16,7 +16,7 @@ The agent uses **five distinct memory layers** at different scopes and lifetimes
 | ShortTermMemory | Per-conversation | In-memory ring buffer; persisted for sub-agents | `data/job_contexts/<key>.json` |
 | WorkingMemory | Per-task (in-flight) | In-memory only | — |
 | ResultsMemory | Cross-session, per-agent | JSON file | `data/results_memory.json` |
-| GraphMemoryStore | Cross-session, semantic | LadybugDB graph + HNSW vector index | `data/graph_memory` (default) |
+| GraphMemoryStore | Cross-session, semantic | LadybugDB graph + HNSW vector index | `<XDG_DATA_HOME>/<agent_name>/graph_memory` |
 
 ---
 
@@ -143,7 +143,7 @@ An opt-in, session-persistent knowledge graph backed by **LadybugDB**
 (embedded Kuzu-compatible graph DB) with an HNSW vector index. Enabled via
 `[graph_memory] enabled = true` in `config.toml`. Off by default.
 
-**Storage:** single file at `graph_memory.db_path` (default: `data/graph_memory`).
+**Storage:** `<XDG_DATA_HOME>/<agent_name>/graph_memory` (not configurable; a `db_path` setting is rejected at startup).
 
 ### Schema
 
@@ -225,47 +225,57 @@ system prompt before each turn.
 
 ## Context Compaction Algorithm
 
-**File:** `context_manager.py` → `maybe_compact()`
+**File:** `context_manager.py` → `maybe_compact()`; driven by `react_loop.py`
 
-The ReAct loop calls `maybe_compact()` before each LLM call. If the estimated
-token count of the current message list exceeds **85 % of `ctx_max_tokens`**, the
-algorithm fires:
+The ReAct loop calls `maybe_compact()` before each LLM request. The estimated
+input (system prompt, the full message history including images, and the
+complete current tool definitions) is compared with the single numeric setting
+**`agent.compaction_threshold_tokens`** (default 60000). The threshold is
+model-independent: discovered context or input limits never trigger, shrink or
+reject a request, and there is no local capacity check, reserve or
+overflow-repair step.
 
-### Short-history path (≤ 3 messages)
+At or below the threshold nothing changes. Above it, **one attempt** is made per
+request:
 
-If there are 3 or fewer messages but they already exceed budget (e.g. a single
-huge tool result), no summary is possible. Instead:
+1. **Partition on whole spans.** The goal message (and the whole native
+   tool-call/result span holding it) and the last two messages (extended back to
+   a span boundary so a native call and its results are never split) are kept
+   **unchanged** — never capped or truncated. Everything between them is the
+   *middle*.
+2. **Empty middle = no change.** If there is nothing between the kept parts, the
+   original history is sent as is (no truncation of a huge goal or recent
+   result).
+3. **Summarize the middle only.** The middle is rendered for the summary prompt
+   (assistant text head-capped, tool results head + tail, call arguments capped)
+   and summarized by the run's **own pinned client** with its own retry state
+   (`react_loop._summarize_on_pin`), separate from the main request.
+4. **Success-only publish.** Only a stripped, non-empty summary is published:
+   goal span + one `[Compacted context — earlier steps summary]` message + the
+   last two spans. The candidate is re-validated as native history.
+5. **A later step may compact again**, including the earlier summary message,
+   if the input is still above the threshold; there is no same-step
+   recursion or deterministic tightening loop.
 
-1. Cap every message's string content to `_RECENT_HEAD + _RECENT_TAIL` chars
-   (3000 + 3000 = 6000 chars default) using a head+tail truncation.
-2. Halve the cap repeatedly down to `_SHRINK_FLOOR` (400 chars) until within budget.
-3. Log a warning and return the capped list.
+**Failure.** A provider failure, a blank or non-string summary, or an invalid
+candidate raises `CompactionFailedError` (fixed labels only, never provider or
+history text). The caller sends the **original, unmodified history**, logs one
+warning and disables *automatic* attempts for **that run only**
+(`_LoopState.auto_compaction_disabled`); a new run starts enabled again.
+Cancellation propagates without a warning. A request that is still too large is
+simply sent: a genuine provider context-length rejection follows the normal
+error path and is never repaired by forced compaction, truncation or resend.
 
-### Normal compaction path (> 3 messages)
+**Output cap.** The only output-token cap is `agent.required_output_cap_tokens`
+(default 1024), sent only to adapters whose API requires one (currently
+Anthropic); it is not derived from context or discovered metadata, which stay
+advisory display data.
 
-1. **Split:** `first = messages[:1]` (user goal, always kept verbatim),
-   `middle = messages[1:-2]` (history to compress), `last = messages[-2:]`
-   (two most recent, kept verbatim).
-
-2. **Render middle for LLM:** each message is formatted with
-   `_format_middle_message()` — assistant messages are head-capped at 800 chars
-   (intent is at the start), tool-result messages keep 1200 chars head + 1200
-   chars tail so both the command header and trailing errors survive.
-
-3. **LLM summary call:** the middle text is sent to `llm.chat()` asking for a
-   bullet-point summary preserving tool names, key outputs, errors, and
-   decisions. If the LLM call fails or returns empty, a **deterministic fallback
-   summary** is produced via `_fallback_summary()` — a head+tail truncation of
-   the rendered middle text capped at `_SUMMARY_CAP` (6000 chars).
-
-4. **Assemble:** `first` + compaction-summary message + `last`, with the summary
-   capped at 6000 chars and the recent/goal messages capped at 6000 chars each.
-
-5. **Budget-tightening loop:** if the post-compaction token count still exceeds
-   the 85 % threshold (e.g. a huge goal or enormous recent tool result), the
-   algorithm halves `summary_cap`, `recent_cap`, and `first_cap` in lockstep
-   until within budget or all reach `_SHRINK_FLOOR` (400 chars). This guarantees
-   the model context is never over-budget after compaction.
+**Separate paths.** Manual `/compress` (hidden, see below) and `reset_task()`
+are not the automatic path: `/compress` admits its own summary client from
+the injected run-client factory and leaves history unchanged on any failure,
+while `reset_task()` keeps its own separate fallback when the summary is
+unavailable.
 
 ### Token Estimation
 
@@ -333,14 +343,19 @@ to shrink the context window without losing the current task.
 
 `/compress` is a **hidden command** — it is not shown in Telegram's command
 menu or in `/help`. Normal users do not need it: automatic context compaction
-fires at 85% of `ctx_max_tokens` without any manual trigger. For task lifecycle
+fires above `agent.compaction_threshold_tokens` without any manual trigger. For task lifecycle
 management, use `/reset` (save and clear) or `/reset discard` (clear without saving).
 `/compress` remains available as an advanced escape hatch by typing it directly.
 
-If the LLM summarization call fails, `/compress` falls back to a **deterministic
-head+tail truncation** of the assembled history (rather than leaving the buffer
-untouched), so an over-budget context is still reduced. The replacement message
-is marked as a deterministic fallback.
+`/compress` obtains its own summary client for each invocation from the injected
+run-client factory, closes it once admitted work ends, and never borrows the Main
+client or a finished run's pin. If no factory or admission is available, or the
+summary call fails, is cancelled, or returns an empty or non-string result, it
+reports a short fixed failure (never provider text) and leaves the short-term
+history **unchanged** — there is no deterministic truncation fallback. Only a
+validated non-empty summary replaces the buffer, with one
+`[Compressed context summary]` entry. It never disables a later run's automatic
+compaction.
 
 ---
 
@@ -350,7 +365,7 @@ is marked as a deterministic fallback.
 |---|---|---|---|
 | `data/memory.json` | `MemoryStore` | First run; `memory_write` tool | Never (operator-managed) |
 | `data/results_memory.json` | `ResultsMemory` | Task completion / `/reset` | Never (accumulates) |
-| `data/graph_memory` | `GraphMemoryStore` | `[graph_memory] enabled = true` | Never (accumulates) |
+| `<XDG_DATA_HOME>/<agent_name>/graph_memory` | `GraphMemoryStore` | `[graph_memory] enabled = true` | Never (accumulates) |
 | `data/job_contexts/<key>.json` | `ShortTermMemory` | Sub-agent on exit | Next sub-agent run or manual delete |
 | In-memory only | `ShortTermMemory` (main) | Start of process | `/reset` |
 | In-memory only | `WorkingMemory` | Each task start | Task finish or `/reset` |
@@ -366,10 +381,16 @@ results_memory_file    = "data/results_memory.json"
 
 [graph_memory]
 enabled                = false          # opt-in
-db_path                = "data/graph_memory"
 buffer_pool_mb         = 256
-extraction_model       = ""             # defaults to agent.default_model
+# When enabled, all four extraction_* fields are required; nothing is inherited from
+# [providers.*], the Main selection, the model catalog or [embeddings].
+extraction_provider    = "openai"                      # adapter: openai|openrouter|anthropic|google|ollama
+extraction_base_url    = "https://api.openai.com/v1"   # receives only the extraction credential
+extraction_api_key     = "sec:graph_extraction_key"    # literal, env:VAR or sec:KEY
+extraction_model       = "gpt-example-mini"            # upstream model string, sent verbatim
 extract_every_n_turns  = 3              # batch N turns before extracting
 min_message_length     = 100            # skip short messages
 max_context_entries    = 10             # max items injected into system prompt
 ```
+
+`db_path` is no longer a setting (it is rejected at startup); the database is always `<XDG_DATA_HOME>/<agent_name>/graph_memory`. Missing or invalid extraction fields disable graph memory with a warning (field names only). Graph vectors use the separate four-field `[embeddings]` section.

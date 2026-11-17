@@ -1,183 +1,168 @@
-"""Tests for LLMClient.embed_batch and provider batch embedding helpers."""
+"""Tests for independent embedding delegation from the pinned chat client."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import copy
+from contextlib import ExitStack
+from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
+from config_schema import AgentConfig, AppConfig, ResolvedProviderConnection, parse_config
+from embedding_client import EmbeddingClient, EmbeddingUnavailableError
 from llm_client import LLMClient
-from providers._errors import LLMError
-from providers import openai_provider, google_provider
+from model_registry import ModelRecord, RunModel
+from tool_index import ToolIndex
+from tool_registry import Tool, ToolRegistry
 
 
-def _make_client(provider: str = "openai") -> LLMClient:
-    """Return an LLMClient with a single model and embeddings config."""
-    cfg = {
-        "models": [
-            {
-                "name": "test",
-                "provider": provider,
-                "model": "test-model",
-                "api_key": "secret",
-                "base_url": "https://api.example.com",
-                "max_tokens": 1024,
-                "temperature": 0.2,
-                "request_timeout": 30,
-                "max_retries": 1,
-                "retry_delay": 0,
-            }
-        ],
-        "agent": {"default_model": "test-model"},
-        "embeddings": {
-            "provider": provider,
-            "model": "embed-model",
-            "api_key": "secret",
-            "base_url": "https://api.example.com",
+def _make_client(embedding_client: MagicMock | None = None) -> LLMClient:
+    """Construct a pinned chat client with independently injected embeddings."""
+    model = ModelRecord("test/model", "test", "model", "Test model")
+    connection = ResolvedProviderConnection(
+        provider_id="test",
+        adapter="openai",
+        base_url="https://api.example.invalid/v1",
+        request_timeout=30,
+        api_key="chat-key",
+    )
+    run_model = RunModel(model, connection, catalog_revision=1, selection_revision=1)
+    return LLMClient(run_model, agent_config=AgentConfig(), embedding_client=embedding_client)
+
+
+def test_embed_delegates_without_changing_input_or_result() -> None:
+    embedding = MagicMock()
+    embedding.embed.return_value = [0.1, 0.2]
+    client = _make_client(embedding)
+
+    assert client.embed("embedding input") == [0.1, 0.2]
+    embedding.embed.assert_called_once_with("embedding input")
+
+
+def test_embed_batch_delegates_without_changing_input_or_result() -> None:
+    embedding = MagicMock()
+    embedding.embed_batch.return_value = [[0.1], [0.2]]
+    client = _make_client(embedding)
+    texts = ["first", "second"]
+
+    assert client.embed_batch(texts) == [[0.1], [0.2]]
+    embedding.embed_batch.assert_called_once_with(texts)
+
+
+@pytest.mark.parametrize("method,args", [("embed", ("text",)), ("embed_batch", (["text"],))])
+def test_missing_embedding_injection_fails_actionably(method: str, args: tuple) -> None:
+    client = _make_client()
+
+    with pytest.raises(EmbeddingUnavailableError, match="not configured"):
+        getattr(client, method)(*args)
+
+
+def test_closing_chat_client_does_not_close_borrowed_embedding_client() -> None:
+    embedding = MagicMock()
+    client = _make_client(embedding)
+
+    client.close()
+
+    embedding.close.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Parsed missing/invalid [embeddings] degrade the real client and tool index
+# ---------------------------------------------------------------------------
+
+_CHAT_KEY = "fake-valid-chat-key"
+_EMBEDDING_CASES = {
+    "missing": (None, "embeddings.provider, embeddings.base_url, embeddings.api_key, embeddings.model must be configured explicitly"),
+    "invalid-provider": (
+        {
+            "provider": "not-a-provider", "model": "text-embed",
+            "base_url": "https://embed.example.invalid/v1", "api_key": "fake-embedding-key",
         },
+        "embeddings.provider must name a supported adapter type",
+    ),
+}
+
+
+def _parsed_config(minimal_config: dict, case: str) -> AppConfig:
+    """Parse a provider-based config with a valid chat connection and the given embeddings."""
+    raw = copy.deepcopy(minimal_config)
+    raw.pop("models", None)
+    raw["agent"].pop("default_model", None)
+    raw["providers"] = {
+        "chat": {"type": "openai", "api_key": _CHAT_KEY, "base_url": "https://chat.example.invalid/v1"}
     }
-    return LLMClient(cfg)
+    section, _ = _EMBEDDING_CASES[case]
+    if section is not None:
+        raw["embeddings"] = section
+    return parse_config(raw)
 
 
-class TestLLMClientEmbedBatch:
-    """Exercise LLMClient.embed_batch caching and provider routing."""
+def _counting_transport(requests: list[httpx.Request]) -> httpx.MockTransport:
+    """Return a real MockTransport that records and fails any request."""
 
-    def test_empty_list_returns_empty(self):
-        client = _make_client()
-        assert client.embed_batch([]) == []
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError(f"unexpected network I/O: {request.url}")
 
-    def test_openai_batch_returns_vectors_and_caches(self):
-        client = _make_client("openai")
-        fake_resp = MagicMock()
-        fake_resp.json.return_value = {
-            "data": [
-                {"embedding": [0.1, 0.2]},
-                {"embedding": [0.3, 0.4]},
-            ]
-        }
-        fake_resp.raise_for_status.return_value = None
-
-        with patch.object(client._http, "post", return_value=fake_resp) as mock_post:
-            vectors = client.embed_batch(["hello", "world"])
-
-        assert len(vectors) == 2
-        assert vectors[0] == [0.1, 0.2]
-        assert vectors[1] == [0.3, 0.4]
-        mock_post.assert_called_once()
-        _, kwargs = mock_post.call_args
-        assert kwargs["json"]["input"] == ["hello", "world"]
-        # Second call should be served from cache
-        with patch.object(client._http, "post", return_value=fake_resp) as mock_post2:
-            vectors2 = client.embed_batch(["hello", "world"])
-        mock_post2.assert_not_called()
-        assert vectors2 == vectors
-
-    def test_google_batch_returns_vectors(self):
-        client = _make_client("google")
-        fake_resp = MagicMock()
-        fake_resp.json.return_value = {
-            "embeddings": [
-                {"values": [0.5, 0.6]},
-                {"values": [0.7, 0.8]},
-            ]
-        }
-        fake_resp.raise_for_status.return_value = None
-
-        with patch.object(client._http, "post", return_value=fake_resp) as mock_post:
-            vectors = client.embed_batch(["foo", "bar"])
-
-        assert len(vectors) == 2
-        assert vectors[0] == [0.5, 0.6]
-        assert vectors[1] == [0.7, 0.8]
-        mock_post.assert_called_once()
-        _, kwargs = mock_post.call_args
-        assert kwargs["json"]["requests"] == [
-            {"model": "embed-model", "content": {"parts": [{"text": "foo"}]}},
-            {"model": "embed-model", "content": {"parts": [{"text": "bar"}]}},
-        ]
-
-    def test_unsupported_provider_falls_back_to_serial(self):
-        client = _make_client("ollama")
-        # ollama is not a native embeddings provider; LLMClient falls back to
-        # openai_provider.embed for individual embed() calls, so we patch that.
-        side_effects = [[0.1, 0.2], [0.3, 0.4]]
-        with patch.object(
-            client, "embed", side_effect=side_effects
-        ) as mock_embed:
-            vectors = client.embed_batch(["a", "b"])
-        assert mock_embed.call_count == 2
-        assert vectors == side_effects
-
-    def test_partial_cache_hit_makes_network_only_for_missing(self):
-        client = _make_client("openai")
-        client._embed_cache["cached"] = [1.0, 2.0]
-        fake_resp = MagicMock()
-        fake_resp.json.return_value = {"data": [{"embedding": [3.0, 4.0]}]}
-        fake_resp.raise_for_status.return_value = None
-
-        with patch.object(client._http, "post", return_value=fake_resp) as mock_post:
-            vectors = client.embed_batch(["cached", "new"])
-
-        assert vectors == [[1.0, 2.0], [3.0, 4.0]]
-        mock_post.assert_called_once()
-        _, kwargs = mock_post.call_args
-        assert kwargs["json"]["input"] == ["new"]
-
-    def test_mismatch_count_raises_llm_error(self):
-        client = _make_client("openai")
-        fake_resp = MagicMock()
-        fake_resp.json.return_value = {"data": [{"embedding": [0.1, 0.2]}]}
-        fake_resp.raise_for_status.return_value = None
-
-        with patch.object(client._http, "post", return_value=fake_resp):
-            with pytest.raises(LLMError, match="1 vectors for 3 inputs"):
-                client.embed_batch(["a", "b", "c"])
+    return httpx.MockTransport(handler)
 
 
-class TestOpenAIProviderEmbedBatch:
-    """Direct tests for providers.openai_provider.embed_batch."""
-
-    def test_returns_vectors_in_order(self):
-        ctx = MagicMock()
-        ctx.emb_cfg = {"api_key": "k", "model": "m", "base_url": "https://api.example.com"}
-        ctx.max_retries = 1
-        ctx.retry_delay = 0
-        fake_resp = MagicMock()
-        fake_resp.json.return_value = {
-            "data": [
-                {"embedding": [0.1]},
-                {"embedding": [0.2]},
-                {"embedding": [0.3]},
-            ]
-        }
-        fake_resp.raise_for_status.return_value = None
-        ctx.http.post.return_value = fake_resp
-
-        vectors = openai_provider.embed_batch(ctx, ["a", "b", "c"])
-        assert vectors == [[0.1], [0.2], [0.3]]
+def _inventory_registry() -> MagicMock:
+    """Return a ToolRegistry inventory standing in for upstream tool definitions."""
+    registry = MagicMock(spec=ToolRegistry)
+    registry.all.return_value = [
+        Tool(name=name, language="python", description=f"{name} description")
+        for name in ("alpha", "beta", "gamma")
+    ]
+    return registry
 
 
-class TestGoogleProviderEmbedBatch:
-    """Direct tests for providers.google_provider.embed_batch."""
+@pytest.mark.parametrize("case", sorted(_EMBEDDING_CASES))
+def test_parsed_unavailable_embeddings_degrade_client_and_tool_index(
+    minimal_config: dict, tmp_path, case: str
+) -> None:
+    """Missing or invalid explicit embeddings never borrow the valid chat connection."""
+    app_cfg = _parsed_config(minimal_config, case)
+    assert app_cfg.embeddings.unavailable_reason == _EMBEDDING_CASES[case][1]
+    assert app_cfg.providers["chat"].api_key == _CHAT_KEY
 
-    def test_returns_vectors_in_order(self):
-        ctx = MagicMock()
-        ctx.emb_cfg = {"api_key": "k", "model": "models/text-embedding-004"}
-        ctx.max_retries = 1
-        ctx.retry_delay = 0
-        fake_resp = MagicMock()
-        fake_resp.json.return_value = {
-            "embeddings": [
-                {"values": [0.1]},
-                {"values": [0.2]},
-            ]
-        }
-        fake_resp.raise_for_status.return_value = None
-        ctx.http.post.return_value = fake_resp
+    embedding_requests: list[httpx.Request] = []
+    chat_requests: list[httpx.Request] = []
+    with ExitStack() as stack:
+        http = stack.enter_context(httpx.Client(transport=_counting_transport(embedding_requests)))
+        embedding = EmbeddingClient(app_cfg.embeddings, http_client=http)
+        stack.callback(embedding.close)
+        assert embedding.available is False
+        assert embedding.unavailable_reason == "embedding configuration unavailable"
+        assert _CHAT_KEY not in embedding.unavailable_reason
+        assert embedding.model_name == ""
 
-        vectors = google_provider.embed_batch(ctx, ["x", "y"])
-        assert vectors == [[0.1], [0.2]]
+        model = ModelRecord("chat/model", "chat", "model", "Chat model")
+        connection = ResolvedProviderConnection(
+            "chat", "openai", "https://chat.example.invalid/v1", 30, _CHAT_KEY
+        )
+        client = LLMClient(
+            RunModel(model, connection, 1, 1),
+            agent_config=AgentConfig(max_retries=0, retry_delay=0),
+            embedding_client=embedding,
+            http_transport=_counting_transport(chat_requests),
+        )
+        stack.callback(client.close)
+        with pytest.raises(EmbeddingUnavailableError, match="configure an explicit supported provider"):
+            client.embed("text")
+        with pytest.raises(EmbeddingUnavailableError, match="configure an explicit supported provider") as caught:
+            client.embed_batch(["first", "second"])
+        assert _CHAT_KEY not in str(caught.value)
 
+        index_path = tmp_path / "tool_index.json"
+        index = ToolIndex(_inventory_registry(), embedding, str(index_path))
+        index.build()
+        assert not index_path.exists()
+        first = [tool.name for tool in index.search("query", top_k=2)]
+        second = [tool.name for tool in index.search("other query", top_k=2)]
+        assert first == second == ["alpha", "beta"]
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    assert embedding_requests == []
+    assert chat_requests == []
+    assert http.is_closed

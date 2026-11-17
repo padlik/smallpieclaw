@@ -14,6 +14,8 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from outcome_utils import with_execution
+
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
 
@@ -46,21 +48,21 @@ class ShellEnvTools:
         key = str(args.get("key", ""))
         value = str(args.get("value", ""))
         if not _ENV_KEY_RE.match(key):
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": f"Invalid env var key {key!r}: must match [A-Za-z_][A-Za-z0-9_]*",
-            }
+            }, "refused")
         if any(c in value for c in ("\x00", "\n", "\r")):
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": "Null byte, newline, or carriage return in env var value is not allowed",
-            }
+            }, "refused")
         logger.info("Built-in shell_env_set: %s", key)
         with self._owner._shell_env_lock:
             self._owner._shell_env[key] = value
-        return {"success": True, "output": f"Set {key}={value}", "error": ""}
+        return with_execution({"success": True, "output": f"Set {key}={value}", "error": ""}, "executed")
 
     def shell_env_unset(self, args: dict) -> dict:
         """Remove a session-scoped shell environment variable.
@@ -75,7 +77,8 @@ class ShellEnvTools:
         logger.info("Built-in shell_env_unset: %s", key)
         with self._owner._shell_env_lock:
             self._owner._shell_env.pop(key, None)
-        return {"success": True, "output": f"Unset {key}", "error": ""}
+        disposition = "executed" if _ENV_KEY_RE.match(key) else "refused"
+        return with_execution({"success": True, "output": f"Unset {key}", "error": ""}, disposition)
 
     def shell_env_list(self, args: dict) -> dict:
         """Return a snapshot of all session-scoped shell environment variables.
@@ -90,7 +93,7 @@ class ShellEnvTools:
         with self._owner._shell_env_lock:
             snapshot = dict(self._owner._shell_env)
         logger.info("Built-in shell_env_list: %d entries", len(snapshot))
-        return {"success": True, "output": json.dumps(snapshot, ensure_ascii=False), "env": snapshot, "error": ""}
+        return with_execution({"success": True, "output": json.dumps(snapshot, ensure_ascii=False), "env": snapshot, "error": ""}, "executed")
 
     def shell_env_get(self, args: dict) -> dict:
         """Get the value of a session-scoped shell environment variable.
@@ -106,4 +109,5 @@ class ShellEnvTools:
         logger.info("Built-in shell_env_get: %s", key)
         with self._owner._shell_env_lock:
             value = self._owner._shell_env.get(key, "")
-        return {"success": True, "output": value, "value": value, "error": ""}
+        disposition = "executed" if _ENV_KEY_RE.match(key) else "refused"
+        return with_execution({"success": True, "output": value, "value": value, "error": ""}, disposition)

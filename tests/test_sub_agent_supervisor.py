@@ -432,26 +432,53 @@ class TestTurnOwnershipObligations:
     def test_timeout_cancellation_accounts_while_cleanup_is_pending(
         self, make_builtin_executor, tmp_path
     ):
-        runner = FakeRunner(agent_id="sa-timeout-draining", block=True)
-        exc = make_builtin_executor(
-            sub_agent_factory=_seq_factory([runner]),
-            data_dir=str(tmp_path),
-        )
-        result = exc._exec_spawn_agent(
-            {"task": "long child work"},
-            trace_id="r-owner",
-        )
+        class GatedRunner(FakeRunner):
+            """Observes cancellation, then stays inside run() until released.
 
-        outcome = exc._exec_get_agent_result(
-            {"agent_id": result["agent_id"], "timeout": 0},
-            caller_tag="main r-owner",
-        )
+            This makes the advertised 'cleanup pending' state a real precondition
+            instead of a race against the worker returning and finishing cleanup.
+            """
 
-        assert outcome["status"] == "timeout"
-        assert exc._supervisor.unaccounted_children("r-owner") == []
-        assert exc._supervisor.draining_children("r-owner") == [
-            (runner.agent_id, "running")
-        ]
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.entered = threading.Event()
+                self.cancel_seen = threading.Event()
+                self.release = threading.Event()
+
+            def run(self, task):
+                self.entered.set()
+                self._cancel_event.wait(timeout=5.0)
+                self.saw_cancel = self._cancel_event.is_set()
+                self.cancel_seen.set()
+                self.release.wait(timeout=5.0)  # after cancellation, before run() returns
+                return "[Cancelled]"
+
+        runner = GatedRunner(agent_id="sa-timeout-draining", block=True)
+        try:
+            exc = make_builtin_executor(
+                sub_agent_factory=_seq_factory([runner]),
+                data_dir=str(tmp_path),
+            )
+            result = exc._exec_spawn_agent(
+                {"task": "long child work"},
+                trace_id="r-owner",
+            )
+            assert runner.entered.wait(timeout=5.0)
+
+            outcome = exc._exec_get_agent_result(
+                {"agent_id": result["agent_id"], "timeout": 0},
+                caller_tag="main r-owner",
+            )
+
+            assert outcome["status"] == "timeout"
+            assert runner.cancel_seen.wait(timeout=5.0)
+            # The worker is held inside run(): cleanup is genuinely pending here.
+            assert exc._supervisor.unaccounted_children("r-owner") == []
+            assert exc._supervisor.draining_children("r-owner") == [
+                (runner.agent_id, "running")
+            ]
+        finally:
+            runner.release.set()
         assert runner._done_event.wait(timeout=5.0)
 
     def test_operator_cancellation_accounts_child_before_cleanup(
@@ -1114,3 +1141,223 @@ class TestGrantScopeExpiry:
             assert ledger.check("file_write", str(tmp_path / "f.txt"), scope_owner="sa-cb") is False
         finally:
             supervisor.shutdown(graceful_timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# late cancellation vs. normal runner return
+# ---------------------------------------------------------------------------
+
+class TestLateCancellationTerminalDecision:
+    """A cancel observed at the post-run decision wins over a normal return.
+
+    Cancellation after the terminal outcome is published does not rewrite it.
+    """
+
+    @pytest.mark.parametrize("origin", ["ordinary", "scheduled"])
+    def test_cancel_before_normal_return_finalizes_cancelled(
+        self, make_builtin_executor, tmp_path, origin
+    ):
+        from sub_agent_supervisor import CANCELLED_SENTINEL
+
+        runner = FakeRunner(agent_id=f"sa-late-cancel-{origin}")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        local_reg = SubAgentRegistry()
+        seen: dict = {}
+        finish_calls = []
+        result_calls = []
+        completion_calls = []
+
+        def cancel_then_finish(task):
+            # Real cancel path (record.cancel), then a normal return that
+            # deliberately ignores the shared cancel_event.
+            record = local_reg.get(runner.agent_id)
+            assert record is not None
+            seen["record"] = record
+            record.cancel()
+            seen["flag_before_return"] = (
+                record.is_cancelled and runner._cancel_event.is_set()
+            )
+            return "normal finish"
+
+        runner.run = cancel_then_finish
+        scheduled = origin == "scheduled"
+        options = SupervisionOptions(
+            source="scheduled" if scheduled else "on-demand",
+            job_tag="nightly" if scheduled else None,
+            notify=scheduled,
+            finish_cb=finish_calls.append,
+            result_log_cb=lambda **kwargs: result_calls.append(kwargs),
+            completion_cb=completion_calls.append,
+        )
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit",
+                          side_effect=lambda fn, *a, **kw: fn()):
+            spawned = exc._exec_spawn_agent(
+                {"task": "late cancel work"},
+                trace_id="" if scheduled else "r-owner",
+                options=options,
+            )
+
+        assert spawned["success"] is True
+        record = seen["record"]
+        assert seen["flag_before_return"] is True
+        assert record.status == "cancelled"
+        assert record.result == CANCELLED_SENTINEL
+        assert record._result_event.is_set()
+        assert local_reg.get(runner.agent_id) is None
+        assert local_reg.get_completed(runner.agent_id) is record
+        assert runner.closed is True
+        assert runner.notify_calls == []
+        assert len(result_calls) == 1
+        assert result_calls[0]["result"] == CANCELLED_SENTINEL
+        assert result_calls[0]["success"] is False
+        assert len(finish_calls) == 1
+        if scheduled:
+            assert result_calls[0]["tag"] == "nightly"
+            assert finish_calls == ["nightly"]
+            assert [c.status for c in completion_calls] == ["cancelled"]
+            assert completion_calls[0].result == CANCELLED_SENTINEL
+            assert completion_calls[0].agent_id == runner.agent_id
+        else:
+            assert completion_calls == []
+
+    def test_cancel_after_publication_does_not_rewrite_done(
+        self, make_builtin_executor, tmp_path
+    ):
+        runner = FakeRunner(agent_id="sa-post-publication", result="normal finish")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]),
+            data_dir=str(tmp_path),
+        )
+        local_reg = SubAgentRegistry()
+        seen: dict = {}
+        finish_calls = []
+        result_calls = []
+        completion_calls = []
+
+        def cancel_after_publication(**kwargs):
+            # _finalize_terminal invokes result_log_cb synchronously on the
+            # pool thread only after record.signal_result(); the event check
+            # below proves the outcome is already published when we cancel.
+            record = local_reg.get(runner.agent_id)
+            assert record is not None
+            seen["record"] = record
+            seen["published"] = record._result_event.is_set()
+            seen["status_at_cancel"] = record.status
+            record.cancel()
+            seen["cancelled_flag"] = record.is_cancelled
+            result_calls.append(kwargs)
+
+        def finish_cb(tag):
+            seen["status_at_finish"] = seen["record"].status
+            finish_calls.append(tag)
+
+        with patch("sub_agent_registry.get_registry", return_value=local_reg), \
+             patch.object(exc._supervisor._pool, "submit",
+                          side_effect=lambda fn, *a, **kw: fn()):
+            spawned = exc._exec_spawn_agent(
+                {"task": "post publication work"},
+                options=SupervisionOptions(
+                    source="scheduled",
+                    job_tag="nightly",
+                    notify=True,
+                    finish_cb=finish_cb,
+                    result_log_cb=cancel_after_publication,
+                    completion_cb=completion_calls.append,
+                ),
+            )
+
+        assert spawned["success"] is True
+        record = seen["record"]
+        assert seen["published"] is True
+        assert seen["status_at_cancel"] == "done"
+        assert seen["cancelled_flag"] is True
+        assert seen["status_at_finish"] == "done"
+        assert record.status == "done"
+        assert record.result == "normal finish"
+        assert local_reg.get_completed(runner.agent_id) is record
+        assert runner.closed is True
+        assert len(result_calls) == 1
+        assert result_calls[0]["result"] == "normal finish"
+        assert result_calls[0]["success"] is True
+        assert finish_calls == ["nightly"]
+        assert [c.status for c in completion_calls] == ["done"]
+
+
+# ---------------------------------------------------------------------------
+# Task 7.2 regression: non-Main admission errors keep the generic rejection
+# ---------------------------------------------------------------------------
+
+GENERIC_MODEL_SUGGESTION = "Choose a model that exists in the configured model list."
+
+
+class TestSubmitRejectionCompatibility:
+    """Classification regression only (factory fault injection, not root proof):
+    a generic ``ValueError`` and a registry ``model_not_found`` refusal keep the
+    exact generic configured-model rejection when Main-gate guidance is added."""
+
+    @pytest.mark.parametrize(
+        "kind,expected_error",
+        [
+            ("value_error", "spawn_agent: Model 'nope' not found"),
+            ("model_not_found", "spawn_agent: model registry model not found"),
+        ],
+        ids=["generic-value-error", "registry-model-not-found"],
+    )
+    def test_non_main_gate_value_errors_keep_generic_rejection(
+        self, make_builtin_executor, tmp_path, kind: str, expected_error: str,
+    ) -> None:
+        """Both errors keep the generic suggestion, response fields and no finish_cb."""
+        from model_registry import ModelRegistryError
+        from outcome_utils import read_execution
+
+        calls: list[dict] = []
+
+        def factory(**kwargs: object) -> None:
+            """Record the call, then raise the injected admission error."""
+            calls.append(kwargs)
+            if kind == "value_error":
+                raise ValueError("Model 'nope' not found")
+            raise ModelRegistryError("model_not_found")
+
+        exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
+        finish_calls: list[str] = []
+
+        res = exc._exec_spawn_agent(
+            {"task": "x", "context_payload": {"n": "x"}},
+            caller_depth=0,
+            options=SupervisionOptions(job_tag="j", finish_cb=finish_calls.append),
+        )
+
+        assert len(calls) == 1
+        assert res["success"] is False and "agent_id" not in res
+        assert res["error"] == expected_error
+        assert res["exit_code"] == -1
+        assert res["error_type"] == "wrong_model_for_task"
+        assert res["recoverable"] is False
+        assert res["suggestion"] == GENERIC_MODEL_SUGGESTION
+        assert read_execution(res) == "refused"
+        # finish_cb must NOT fire on synchronous admission failure.
+        assert finish_calls == []
+
+    @pytest.mark.parametrize("code", ["malformed_selector", "unknown_connection"])
+    def test_selector_shape_errors_give_actionable_connection_guidance(
+        self, make_builtin_executor, tmp_path, code: str,
+    ) -> None:
+        """Task 4.1: a bad selector shape/connection says how to write one, with no selector echo."""
+        from model_registry import ModelRegistryError
+
+        def factory(**_kwargs: object) -> None:
+            raise ModelRegistryError(code)
+
+        exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
+
+        res = exc._exec_spawn_agent({"task": "x", "model": " secret-conn/m"}, caller_depth=0)
+
+        assert res["success"] is False and res["error_type"] == "wrong_model_for_task"
+        assert "<connection>/<model>" in res["suggestion"] and "configured" in res["suggestion"]
+        assert "secret-conn" not in res["error"] and res["recoverable"] is False

@@ -7,7 +7,10 @@ if it is not installed.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -20,9 +23,15 @@ try:
 except ImportError:
     _LADYBUG_AVAILABLE = False
 
+from confirmation import ConfirmationManager
 from graph_memory import (
+    ADMISSION_CONFIRMED,
+    ADMISSION_OBSERVED,
+    CONFIDENCE_CONFIRMED,
+    CONFIDENCE_OBSERVED,
     GraphMemoryStore,
     GraphMemoryWriter,
+    _coerce_admission,
     parse_extraction,
     create_graph_memory,
 )
@@ -774,6 +783,114 @@ class TestGraphMemoryWriter:
 
 
 # ---------------------------------------------------------------------------
+# Bounded writer stop (task 12.26) — actual worker thread, Event barriers only.
+# The future GraphMemoryStopError is asserted by runtime type name so this
+# module still collects before the class exists.
+# ---------------------------------------------------------------------------
+
+_STOP_TIMEOUT_MESSAGE = (
+    "Graph memory worker did not terminate before the shutdown deadline; "
+    "dependent resources retained."
+)
+
+
+def _end_worker(writer: GraphMemoryWriter) -> None:
+    """Test hygiene: deliver a sentinel to a still-running worker, join boundedly,
+    and fail if it survives. Never evidence of production stop behavior."""
+    if writer._thread.is_alive():
+        writer._queue.put(GraphMemoryWriter._SENTINEL)
+        writer._thread.join(timeout=10)
+    assert not writer._thread.is_alive(), "graph worker survived the bounded cleanup join"
+
+
+class TestGraphMemoryWriterBoundedStop:
+    def test_blocked_worker_stop_fails_explicitly_until_released(self, store):
+        """A finite stop on a blocked worker raises the safe error, every time,
+        and a bounded stop after release terminates the worker."""
+        entered, release = threading.Event(), threading.Event()
+        processed: list[str] = []
+
+        def _llm(prompt: str) -> str:
+            entered.set()
+            if not release.wait(timeout=30):
+                raise AssertionError("test barrier was never released")
+            processed.append(prompt)
+            return '{"entities":[],"facts":[]}'
+
+        writer = GraphMemoryWriter(
+            store=store, llm_call_fn=_llm, extract_every_n_turns=1, min_message_length=10,
+        )
+        try:
+            writer.enqueue("a long enough message to block the worker", user_id="u1")
+            assert entered.wait(timeout=10), "worker never reached the extraction barrier"
+            for join_timeout in (0.0, 0.05):
+                with pytest.raises(RuntimeError, match=re.escape(_STOP_TIMEOUT_MESSAGE)) as caught:
+                    writer.stop(join_timeout=join_timeout)
+                assert type(caught.value).__name__ == "GraphMemoryStopError"
+                assert str(caught.value) == _STOP_TIMEOUT_MESSAGE
+                assert writer._thread.is_alive()
+            assert processed == []
+
+            release.set()
+            writer.stop(join_timeout=10.0)
+            assert not writer._thread.is_alive()
+            assert len(processed) == 1
+        finally:
+            release.set()
+            _end_worker(writer)
+
+    def test_cleanup_ends_blocked_worker_when_test_fails_before_stop(self, store):
+        """Hygiene regression: a test failing before any stop still releases the
+        barrier, delivers a sentinel and confirms termination in its finally."""
+        entered, release = threading.Event(), threading.Event()
+
+        def _llm(prompt: str) -> str:
+            entered.set()
+            if not release.wait(timeout=30):
+                raise AssertionError("test barrier was never released")
+            return '{"entities":[],"facts":[]}'
+
+        writer = GraphMemoryWriter(
+            store=store, llm_call_fn=_llm, extract_every_n_turns=1, min_message_length=10,
+        )
+        with pytest.raises(AssertionError, match="simulated early failure"):
+            try:
+                writer.enqueue("a long enough message to block the worker", user_id="u1")
+                assert entered.wait(timeout=10), "worker never reached the extraction barrier"
+                raise AssertionError("simulated early failure before stop")
+            finally:
+                release.set()
+                _end_worker(writer)
+        assert not writer._thread.is_alive()
+
+    def test_finite_stop_drains_buffered_pending_batch_before_returning(self, store):
+        """Buffered (not yet batched) work is flushed and processed before stop returns."""
+        processed: list[str] = []
+        text = "a buffered message long enough to keep"
+
+        def _llm(prompt: str) -> str:
+            processed.append(prompt)
+            return '{"entities":[],"facts":[]}'
+
+        writer = GraphMemoryWriter(
+            store=store, llm_call_fn=_llm, extract_every_n_turns=10, min_message_length=10,
+        )
+        try:
+            writer.enqueue(text, user_id="u1")
+            assert writer.get_stats()["pending_depth"] == 1
+            assert processed == []
+            writer.stop(join_timeout=10.0)
+            assert not writer._thread.is_alive()
+            assert len(processed) == 1 and processed[0].endswith(text)
+            stats = writer.get_stats()
+            assert stats["pending_depth"] == 0
+            assert stats["queue_depth"] == 0
+            assert stats["parse_failures"] == 1
+        finally:
+            _end_worker(writer)
+
+
+# ---------------------------------------------------------------------------
 # create_graph_memory factory tests
 # ---------------------------------------------------------------------------
 
@@ -1146,3 +1263,288 @@ class TestGraphMemoryWriterStats:
             for record in caplog.records
             if record.levelname == "WARNING"
         )
+
+
+# ===========================================================================
+# Graph fact admission and confidence controls (observed/confirmed facts).
+# Relocated in task 2.3 from tests/test_p2_graph_memory_admission.py with
+# unchanged assertions; it uses this module's equivalent mock_ladybug,
+# embedder and store fixtures. This is domain fact admission, not model admission.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Migration / detection
+# ---------------------------------------------------------------------------
+
+class TestAdmissionMigration:
+    def test_migration_runs_alter_statements(self, store, mock_ladybug):
+        executed = [c.args[0] for c in mock_ladybug["conn"].execute.call_args_list]
+        alters = [q for q in executed if isinstance(q, str) and q.startswith("ALTER TABLE")]
+        # Episode.admission_status, Episode.confidence,
+        # RELATES_TO.admission_status, RELATES_TO.confidence
+        assert any("Episode ADD admission_status" in q for q in alters)
+        assert any("Episode ADD confidence" in q for q in alters)
+        assert any("RELATES_TO ADD admission_status" in q for q in alters)
+        assert any("RELATES_TO ADD confidence" in q for q in alters)
+
+    def test_already_has_property_message_is_idempotent(
+        self, mock_ladybug, embedder, tmp_path, caplog,
+    ):
+        """LadybugDB reports existing columns as 'already has property'."""
+        conn = mock_ladybug["conn"]
+
+        def _execute(query, params=None):
+            if isinstance(query, str) and query.startswith("ALTER TABLE"):
+                raise RuntimeError("Episode table already has property admission_status")
+            res = MagicMock()
+            res.has_next.return_value = False
+            return res
+
+        conn.execute.side_effect = _execute
+        caplog.set_level(logging.WARNING)
+
+        GraphMemoryStore(
+            db_path=str(tmp_path / "existing"),
+            embedder_fn=embedder,
+            embedding_dim=4,
+            buffer_pool_mb=64,
+        )
+
+        assert "admission metadata migration" not in caplog.text
+
+    def test_meta_available_when_probe_succeeds(self, store):
+        assert store._has_admission_meta is True
+
+    def test_meta_unavailable_degrades_gracefully(self, mock_ladybug, embedder, tmp_path):
+        # Make the detection probe (RETURN admission_status) raise to simulate a
+        # DB engine that cannot add the columns. Migration must not crash and the
+        # store must fall back to legacy behaviour.
+        conn = mock_ladybug["conn"]
+
+        def _execute(query, params=None):
+            if "RETURN e.admission_status" in query or "RETURN r.admission_status" in query:
+                raise RuntimeError("no such property: admission_status")
+            res = MagicMock()
+            res.has_next.return_value = False
+            return res
+
+        conn.execute.side_effect = _execute
+        s = GraphMemoryStore(
+            db_path=str(tmp_path / "legacy"),
+            embedder_fn=embedder,
+            embedding_dim=4,
+            buffer_pool_mb=64,
+        )
+        assert s._has_admission_meta is False
+
+
+# ---------------------------------------------------------------------------
+# Write paths carry admission metadata
+# ---------------------------------------------------------------------------
+
+class TestAdmissionWrites:
+    def test_add_episode_observed_by_default(self, store, mock_ladybug):
+        mock_ladybug["conn"].execute.reset_mock()
+        store.add_episode("a note", user_id="u")
+        params = [c.args[1] for c in mock_ladybug["conn"].execute.call_args_list
+                  if len(c.args) > 1 and isinstance(c.args[1], dict) and "adm" in c.args[1]]
+        assert params and params[-1]["adm"] == ADMISSION_OBSERVED
+        assert params[-1]["conf"] == CONFIDENCE_OBSERVED
+
+    def test_add_episode_confirmed(self, store, mock_ladybug):
+        mock_ladybug["conn"].execute.reset_mock()
+        store.add_episode(
+            "approved note", user_id="u",
+            admission_status=ADMISSION_CONFIRMED, confidence=CONFIDENCE_CONFIRMED,
+        )
+        params = [c.args[1] for c in mock_ladybug["conn"].execute.call_args_list
+                  if len(c.args) > 1 and isinstance(c.args[1], dict) and "adm" in c.args[1]]
+        assert params and params[-1]["adm"] == ADMISSION_CONFIRMED
+        assert params[-1]["conf"] == CONFIDENCE_CONFIRMED
+
+    def test_add_relation_observed_by_default(self, store, mock_ladybug):
+        mock_ladybug["conn"].execute.reset_mock()
+        store.add_relation("ent:a", "ent:b", "USES", "a uses b", "2024-01-01T00:00:00Z")
+        params = [c.args[1] for c in mock_ladybug["conn"].execute.call_args_list
+                  if len(c.args) > 1 and isinstance(c.args[1], dict) and "adm" in c.args[1]]
+        assert params and params[-1]["adm"] == ADMISSION_OBSERVED
+        assert params[-1]["conf"] == CONFIDENCE_OBSERVED
+
+    def test_add_relation_legacy_no_meta(self, store, mock_ladybug):
+        store._has_admission_meta = False
+        mock_ladybug["conn"].execute.reset_mock()
+        store.add_relation("ent:a", "ent:b", "USES", "a uses b", "2024-01-01T00:00:00Z")
+        # Legacy query must not reference admission_status.
+        queries = [c.args[0] for c in mock_ladybug["conn"].execute.call_args_list]
+        assert all("admission_status" not in q for q in queries)
+
+    def test_observed_write_protects_confirmed_fact(self, store, mock_ladybug):
+        """A non-confirmed merge must NOT overwrite a confirmed edge's fact.
+
+        The ON MATCH clause guards r.fact/r.valid_at with a CASE that keeps the
+        existing value when the stored edge is confirmed and the incoming write
+        is not, so observed extraction cannot poison operator-approved facts.
+        """
+        mock_ladybug["conn"].execute.reset_mock()
+        store.add_relation(
+            "ent:a", "ent:b", "USES", "observed overwrite", "2024-01-02T00:00:00Z",
+            admission_status=ADMISSION_OBSERVED, confidence=CONFIDENCE_OBSERVED,
+        )
+        merge_q = next(
+            c.args[0] for c in mock_ladybug["conn"].execute.call_args_list
+            if "MERGE" in c.args[0] and "RELATES_TO" in c.args[0]
+        )
+        assert "ON MATCH SET" in merge_q
+        assert "CASE" in merge_q
+        assert "r.admission_status='confirmed'" in merge_q
+        assert "$adm<>'confirmed'" in merge_q
+
+    def test_confirmed_write_upgrades_existing_edge(self, store, mock_ladybug):
+        """A confirmed merge still runs the upgrade-only status/confidence SET."""
+        mock_ladybug["conn"].execute.reset_mock()
+        store.add_relation(
+            "ent:a", "ent:b", "USES", "approved", "2024-01-02T00:00:00Z",
+            admission_status=ADMISSION_CONFIRMED, confidence=CONFIDENCE_CONFIRMED,
+        )
+        upgrade = [
+            c for c in mock_ladybug["conn"].execute.call_args_list
+            if len(c.args) > 1 and isinstance(c.args[1], dict)
+            and c.args[1].get("adm") == ADMISSION_CONFIRMED
+            and "MERGE" not in c.args[0]
+        ]
+        assert upgrade, "confirmed write should emit an upgrade SET statement"
+
+
+# ---------------------------------------------------------------------------
+# Read / format labelling
+# ---------------------------------------------------------------------------
+
+class TestAdmissionFormatting:
+    def _wire_facts(self, conn, fact_rows, ep_rows=None):
+        seed_result = MagicMock()
+        seed_result.has_next.side_effect = [True, False]
+        seed_result.get_next.return_value = (
+            {"id": "ent:alice:person", "name": "Alice", "entity_type": "person"}, 0.1,
+        )
+        graph_result = MagicMock()
+        graph_result.has_next.side_effect = [True] * len(fact_rows) + [False]
+        graph_result.get_next.side_effect = fact_rows
+        ep_result = MagicMock()
+        ep_rows = ep_rows or []
+        ep_result.has_next.side_effect = [True] * len(ep_rows) + [False]
+        ep_result.get_next.side_effect = ep_rows
+        conn.execute.side_effect = [seed_result, graph_result, ep_result]
+
+    def test_confirmed_ranked_before_observed_and_labelled(self, store, mock_ladybug):
+        conn = mock_ladybug["conn"]
+        self._wire_facts(conn, [
+            ("Alice", "USES", "Alice uses Python", "Python", ADMISSION_OBSERVED, 0.6),
+            ("Alice", "LIKES", "Alice likes tea", "Tea", ADMISSION_CONFIRMED, 0.95),
+        ])
+        output = store.format_for_prompt("Alice")
+        assert "untrusted recalled memory" in output
+        assert "[confirmed" in output
+        assert "[observed" in output
+        # Confirmed fact must be listed before the observed one.
+        assert output.index("Alice likes tea") < output.index("Alice uses Python")
+
+    def test_legacy_rows_treated_as_observed(self, store, mock_ladybug):
+        conn = mock_ladybug["conn"]
+        # 4-tuple = legacy row without admission/confidence columns.
+        self._wire_facts(conn, [("Alice", "USES", "Alice uses Python", "Python")])
+        output = store.format_for_prompt("Alice")
+        assert "[observed" in output
+        # No fact line should be labelled confirmed (header legend aside).
+        fact_lines = [ln for ln in output.splitlines() if "Alice uses Python" in ln]
+        assert fact_lines and all("[confirmed" not in ln for ln in fact_lines)
+
+
+# ---------------------------------------------------------------------------
+# memory_graph_store confirmation gating
+# ---------------------------------------------------------------------------
+
+class TestMemoryGraphStoreConfirmation:
+    @pytest.fixture
+    def executor_with_graph(self, make_builtin_executor):
+        b = make_builtin_executor(default_timeout=30)
+        b._graph_memory = MagicMock()
+        b._graph_memory.add_episode.return_value = "ep:1"
+        b._graph_memory_writer = MagicMock()
+        return b
+
+    def test_depth0_requires_confirmation(self, executor_with_graph):
+        b = executor_with_graph
+        out = b.execute("memory_graph_store", {"content": "remember this"}, caller_depth=0)
+        assert out.get("requires_confirmation") is True
+        b._graph_memory.add_episode.assert_not_called()
+
+    def test_subagent_uses_headless_bridge_and_stores_confirmed(self, executor_with_graph):
+        b = executor_with_graph
+        coordinator = ConfirmationManager()
+        b._coordinator = coordinator
+        tokens_seen: list[str] = []
+
+        def prompt_fn(token, tool_name, desc, tag):
+            tokens_seen.append(token)
+
+        b._subagent_confirm_prompt_fn = prompt_fn
+
+        def _approve():
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if tokens_seen:
+                    break
+                time.sleep(0.005)
+            if tokens_seen:
+                coordinator.signal_headless_confirmation(tokens_seen[0], True)
+
+        t = threading.Thread(target=_approve, daemon=True)
+        t.start()
+        out = b.execute("memory_graph_store", {"content": "sub-agent fact"}, caller_depth=1)
+        t.join(timeout=4.0)
+
+        assert out["success"] is True
+        _, kwargs = b._graph_memory.add_episode.call_args
+        assert kwargs.get("admission_status") == ADMISSION_CONFIRMED
+
+    def test_subagent_denied_writes_nothing(self, executor_with_graph):
+        b = executor_with_graph
+        coordinator = ConfirmationManager()
+        b._coordinator = coordinator
+        tokens_seen: list[str] = []
+
+        def prompt_fn(token, tool_name, desc, tag):
+            tokens_seen.append(token)
+
+        b._subagent_confirm_prompt_fn = prompt_fn
+
+        def _deny():
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if tokens_seen:
+                    break
+                time.sleep(0.005)
+            if tokens_seen:
+                coordinator.signal_headless_confirmation(tokens_seen[0], False)
+
+        t = threading.Thread(target=_deny, daemon=True)
+        t.start()
+        out = b.execute("memory_graph_store", {"content": "sub-agent fact"}, caller_depth=1)
+        t.join(timeout=4.0)
+
+        assert out["success"] is False
+        b._graph_memory.add_episode.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+class TestCoerceAdmission:
+    def test_known_values_pass_through(self):
+        assert _coerce_admission("confirmed") == ADMISSION_CONFIRMED
+        assert _coerce_admission("OBSERVED") == ADMISSION_OBSERVED
+
+    def test_unknown_falls_back_to_observed(self):
+        assert _coerce_admission(None) == ADMISSION_OBSERVED
+        assert _coerce_admission("garbage") == ADMISSION_OBSERVED

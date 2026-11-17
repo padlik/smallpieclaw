@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 from agent_logging import bind_run_context, clear_run_context
+from model_registry import ModelRegistryError
 from sub_agent_registry import SOURCE_ON_DEMAND
 from trace_context import child_trace_id
 
@@ -351,6 +352,11 @@ class SubAgentSupervisor:
         try:
             runner = request.factory(**factory_kwargs)
         except ValueError as exc:
+            # An inactive Main refuses implicit requests until the operator selects one.
+            no_main = isinstance(exc, ModelRegistryError) and exc.code == "no_active_selection"
+            bad_selector = isinstance(exc, ModelRegistryError) and exc.code in {
+                "malformed_selector", "unknown_connection",
+            }
             return {
                 "success": False,
                 "output": "",
@@ -358,7 +364,15 @@ class SubAgentSupervisor:
                 "exit_code": -1,
                 "error_type": "wrong_model_for_task",
                 "recoverable": False,
-                "suggestion": "Choose a model that exists in the configured model list.",
+                "suggestion": (
+                    "Use /models to select a main model, then retry this request."
+                    if no_main
+                    else (
+                        "Use '<connection>/<model>' where <connection> is a configured provider connection."
+                        if bad_selector
+                        else "Choose a model that exists in the configured model list."
+                    )
+                ),
             }
 
         # Create + wire (cancel_event/LLM client/on-step) + register the record
@@ -514,7 +528,7 @@ class SubAgentSupervisor:
             # risks prompt poisoning. If a result should be remembered, the
             # operator/main agent must explicitly (and with confirmation) call
             # memory_graph_store.
-            if result == CANCELLED_SENTINEL:
+            if result == CANCELLED_SENTINEL or record.is_cancelled:
                 elapsed = int(time.time() - record.started_at)
                 self._finalize_terminal(
                     record=record,

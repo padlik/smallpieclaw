@@ -13,6 +13,12 @@ import html
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING, Callable
+
+from model_registry import bounded_selector_evidence
+
+if TYPE_CHECKING:
+    from model_registry import CatalogView, ModelRecord, ProviderState
 
 # ---------------------------------------------------------------------------
 # HTML tag sanitisation
@@ -152,8 +158,12 @@ def split_message(text: str, limit: int = 4000) -> list[str]:
 # Jobs list formatting
 # ---------------------------------------------------------------------------
 
-def format_jobs_list(jobs: list) -> str:
-    """Render a list of job dicts (from scheduler.list_jobs()) as HTML."""
+def format_jobs_list(jobs: list, redactor: Callable[[str], str] | None = None) -> str:
+    """Render a list of job dicts (from scheduler.list_jobs()) as HTML.
+
+    *redactor*, when given, masks secrets in saved model selectors before
+    they are bounded and HTML-escaped.
+    """
     if not jobs:
         return "No scheduled jobs configured."
     lines = [f"📅 <b>Scheduled Jobs</b> ({len(jobs)} total)\n"]
@@ -183,12 +193,19 @@ def format_jobs_list(jobs: list) -> str:
             except Exception:
                 nr = next_run
             lines.append(f"   Next run: {html.escape(nr)}")
-        if job.get("model"):
-            lines.append(f"   Model: <code>{html.escape(job['model'])}</code>")
+        lines.append(
+            "   Model: <code>"
+            f"{html.escape(bounded_selector_evidence(job.get('model'), redact=redactor))}</code>"
+        )
         if job.get("preserve_context"):
             lines.append("   🧠 Context: preserved between runs")
         if job.get("last_error"):
             lines.append(f"   ⚠️ Last error: {html.escape(str(job['last_error'])[:120])}")
+        if job.get("config_error"):
+            error = str(job["config_error"])
+            if redactor is not None:
+                error = redactor(error)
+            lines.append(f"   ⚠️ config_error: {html.escape(error[:400])}")
         lines.append(f"   {task_label}: {task_display}\n")
     lines.append(
         "<i>Tip: /jobs reload · /jobs remove &lt;tag&gt; · /jobs pause &lt;tag&gt; · /jobs resume &lt;tag&gt;\n"
@@ -444,3 +461,336 @@ def details_callback_data(run_id: str) -> str:
             f"Details callback data for {run_id!r} exceeds {CALLBACK_DATA_LIMIT} bytes"
         )
     return data
+
+
+# ---------------------------------------------------------------------------
+# Provider model catalog (read-only) — task 8.1
+# ---------------------------------------------------------------------------
+
+#: Callback data for the /models refresh button. Fixed and opaque: it never
+#: carries a model identity, so it needs no expiry/revalidation (task 8.2).
+MODELS_REFRESH_CALLBACK = "models_refresh"
+
+#: Entries actually rendered before the list is capped with an overflow note.
+_MODELS_DISPLAY_CAP = 20
+
+#: Per-field text bound applied before HTML-escaping, so one long provider or
+#: model value can never push the whole message over Telegram's limit.
+_CATALOG_FIELD_BOUND = 200
+
+_SELECTION_STATUS_LABELS = {
+    "active": "active",
+    "no_selection": "no selection",
+    "saved_selection_unavailable": "saved selection unavailable",
+}
+
+
+def _bound_catalog_text(value: str, limit: int = _CATALOG_FIELD_BOUND) -> str:
+    """Bound raw text before escaping so truncation never splits an entity."""
+    if len(value) > limit:
+        return value[: limit - 1] + "…"
+    return value
+
+
+def _capability_label(value: bool | None) -> str:
+    """Tri-state label: never conflate "unsupported" with "not yet known"."""
+    if value is True:
+        return "known-yes"
+    if value is False:
+        return "known-no"
+    return "unknown"
+
+
+def _catalog_field_line(field_name: str, value_text: str) -> str:
+    """One verbose "<field>: <value>" line of provider-reported display metadata."""
+    return f"  {html.escape(field_name)}: {html.escape(value_text)}"
+
+
+def _format_catalog_model(record: "ModelRecord", active_model_id: str | None) -> list[str]:
+    """One multi-line, fully-labeled block — used while it still fits the budget."""
+    active_mark = "✅" if record.id == active_model_id else "⬜"
+    metadata = record.metadata
+    return [
+        f"{active_mark} <code>{html.escape(_bound_catalog_text(record.id))}</code> — "
+        f"{html.escape(_bound_catalog_text(record.display_name))}",
+        _catalog_field_line(
+            "context_tokens",
+            "unknown" if metadata.context_tokens is None else str(metadata.context_tokens),
+        ),
+        _catalog_field_line(
+            "input_tokens",
+            "unknown" if metadata.input_tokens is None else str(metadata.input_tokens),
+        ),
+        _catalog_field_line(
+            "output_tokens",
+            "unknown" if metadata.output_tokens is None else str(metadata.output_tokens),
+        ),
+        _catalog_field_line("vision", _capability_label(metadata.vision)),
+        _catalog_field_line("tool_calling", _capability_label(metadata.tool_calling)),
+        _catalog_field_line("reasoning", _capability_label(metadata.reasoning)),
+    ]
+
+
+#: Legend for the dense one-line-per-model layout used once the fully
+#: labeled layout cannot fit every ~20 capped entries in one message.
+_COMPACT_LEGEND = (
+    "<i>y=known-yes n=known-no ?=unknown · provider-reported, advisory only</i>"
+)
+
+
+def _compact_numeric(value: int | None) -> str:
+    return "?" if value is None else str(value)
+
+
+def _compact_capability(value: bool | None) -> str:
+    if value is True:
+        return "y"
+    if value is False:
+        return "n"
+    return "?"
+
+
+def _format_catalog_model_compact(record: "ModelRecord", active_model_id: str | None) -> str:
+    """One dense line carrying every field's literal name, value, and source.
+
+    Values are abbreviated (y/n/?) but every field *name* stays literal, so
+    completeness checks never mistake a compacted row for a half-rendered one.
+    """
+    active_mark = "✅" if record.id == active_model_id else "⬜"
+    metadata = record.metadata
+    fields = " ".join([
+        f"context_tokens:{_compact_numeric(metadata.context_tokens)}",
+        f"input_tokens:{_compact_numeric(metadata.input_tokens)}",
+        f"output_tokens:{_compact_numeric(metadata.output_tokens)}",
+        f"vision:{_compact_capability(metadata.vision)}",
+        f"tool_calling:{_compact_capability(metadata.tool_calling)}",
+        f"reasoning:{_compact_capability(metadata.reasoning)}",
+    ])
+    return (
+        f"{active_mark} <code>{html.escape(_bound_catalog_text(record.id))}</code> "
+        f"{html.escape(_bound_catalog_text(record.display_name))} {fields}"
+    )
+
+
+_SHOWN_PLACEHOLDER = "{SHOWN}"
+
+
+def _catalog_header_lines(
+    view: "CatalogView", *, refresh_failed: bool, refresh_not_saved: bool,
+    cache_notice: str | None = None, selection_notice: str | None = None,
+) -> list[str]:
+    """Title, refresh-outcome warning, and selection lines.
+
+    `refresh_failed` and `refresh_not_saved` are mutually distinct and never
+    collapsed into one generic flag: an unexpected exception escaping the
+    registry boundary is not the same honest state as a refresh that ran but
+    could not be persisted, and neither implies every provider failed — each
+    provider's own fresh/stale line (built separately, and budgeted on its
+    own) already carries that detail. These lines are always small and
+    provider/model-count independent, so they never compete for the budget
+    consumed by the — potentially large — provider and model sections.
+    """
+    lines = ["🤖 <b>Model Catalog</b> (provider-discovered)\n"]
+    if refresh_failed:
+        lines.append("⚠️ <i>Refresh failed unexpectedly — showing the last known catalog.</i>\n")
+    elif refresh_not_saved:
+        lines.append("⚠️ <i>Refresh was not saved to the model cache — showing this session's results only.</i>\n")
+    # Standing file-state notices (fixed, content-free registry sentences) follow the
+    # transient refresh outcome: the saved-selection notice, then the cache notice.
+    for notice in (selection_notice, cache_notice):
+        if notice:
+            lines.append(f"⚠️ <i>{html.escape(notice)}</i>\n")
+
+    selection_label = _SELECTION_STATUS_LABELS.get(view.selection_status, view.selection_status)
+    if view.selection_status == "active":
+        # An active selector equal to the saved one is "saved"; otherwise it is the
+        # in-memory automatic choice, which is never written to the preference.
+        saved = view.remembered_model_id == view.active_model_id
+        selection_label += " (saved)" if saved else " (automatic, unsaved)"
+    lines.append(f"Selection: {html.escape(selection_label)}")
+    shown_id = view.active_model_id or view.remembered_model_id
+    if shown_id:
+        kind = "Active" if view.active_model_id else "Saved"
+        lines.append(f"{kind}: <code>{html.escape(_bound_catalog_text(shown_id))}</code>")
+    return lines
+
+
+def _provider_line(state: "ProviderState") -> str:
+    """One provider's bounded, escaped freshness line."""
+    status_word = "fresh" if state.status == "fresh" else "stale"
+    detail = ""
+    if state.status != "fresh" and state.sanitized_last_error_code:
+        detail = f" ({html.escape(state.sanitized_last_error_code)})"
+    return f"  {html.escape(_bound_catalog_text(state.provider_id))}: {status_word}{detail}"
+
+
+def _providers_header_worst_case(total: int) -> str:
+    """Upper-bound header length used only to reserve budget before fitting."""
+    if not total:
+        return "<b>Providers</b> (none configured)"
+    return f"<b>Providers</b> ({total} shown of {total} total)"
+
+
+def _providers_header_line(total: int, shown: int) -> str:
+    """The real provider-section header, computed only after fitting.
+
+    Stays plain when every provider fit (no reason to clutter an unremarkable
+    catalog with a count); states "N shown of M total" only when providers
+    were actually omitted, so the omission is never silent.
+    """
+    if not total:
+        return "<b>Providers</b> (none configured)"
+    if shown < total:
+        return f"<b>Providers</b> ({shown} shown of {total} total)"
+    return "<b>Providers</b>"
+
+
+_MODELS_ADVISORY = "(advisory, provider-reported)"
+_EMPTY_CACHE_GUIDANCE = "No models are cached yet. Tap 🔄 Refresh, then choose one with its button."
+
+
+def _models_header_template(total: int) -> str:
+    """Model-section header: always advisory-labelled; empty cache adds static guidance."""
+    if not total:
+        return f"<b>Models</b> {_MODELS_ADVISORY} (none discovered)\n{_EMPTY_CACHE_GUIDANCE}"
+    return f"<b>Models</b> {_MODELS_ADVISORY} ({_SHOWN_PLACEHOLDER} shown of {total} total)"
+
+
+def _fit_lines(lines: list[str], budget: int) -> list[str]:
+    """Greedily keep whole lines within `budget`; a line is never split."""
+    kept: list[str] = []
+    size = 0
+    for line in lines:
+        added = len(line) + 1
+        if size + added > max(budget, 0):
+            break
+        kept.append(line)
+        size += added
+    return kept
+
+
+@dataclass(frozen=True)
+class CatalogRenderResult:
+    """Rendered catalog text plus the exact model ids that made the final cut.
+
+    `shown_model_ids` is the single source of truth for "what is actually on
+    screen" — callers (e.g. the Telegram command layer, to mint per-model
+    selection controls) must never re-derive or guess it from the text or
+    re-run the fitting algorithm themselves.
+    """
+
+    text: str
+    shown_model_ids: tuple[str, ...]
+
+
+def format_models_catalog(
+    view: "CatalogView", *, refresh_failed: bool = False, refresh_not_saved: bool = False,
+    cache_notice: str | None = None, selection_notice: str | None = None,
+) -> str:
+    """Render a sanitized `CatalogView` as read-only HTML (task 8.1).
+
+    Thin wrapper over `render_models_catalog` kept for existing callers that
+    only need text, not the shown-model-id list.
+    """
+    return render_models_catalog(
+        view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved,
+        cache_notice=cache_notice, selection_notice=selection_notice,
+    ).text
+
+
+def render_models_catalog(
+    view: "CatalogView", *, refresh_failed: bool = False, refresh_not_saved: bool = False,
+    cache_notice: str | None = None, selection_notice: str | None = None,
+) -> CatalogRenderResult:
+    """Render a sanitized `CatalogView` as read-only HTML, and report which
+    model ids were actually displayed (task 8.2 shared seam).
+
+    Only whitelisted `CatalogView`/`ProviderState`/`ModelRecord` fields are
+    used — never raw connections, credentials, or provider exception text.
+    No canonical model id is embedded in any callback data here; this is a
+    pure render — minting opaque selection tokens from `shown_model_ids` is
+    the caller's responsibility, not this function's.
+
+    Both the provider section and the model section are budgeted as part of
+    one overall 4096-char message: providers are fit first (whole, escaped
+    lines only — never split), any omission is stated explicitly, and model
+    entries then get whatever room remains. Entries are budgeted as whole,
+    fully-labeled blocks — never cut mid field — and every "shown" count is
+    computed only *after* fitting, so it is always the true number of
+    complete entries that made it into the message, never a pre-truncation
+    cap. The fully labeled model layout is used whenever it fits; otherwise
+    every capped entry switches together to a dense one-line-per-model
+    layout (with a legend) that keeps every field name, value, and source
+    but drops verbose wording, so ordinary catalogs can still show the full
+    ~20-entry cap within one message even when many providers are present.
+    """
+    header_lines = _catalog_header_lines(
+        view, refresh_failed=refresh_failed, refresh_not_saved=refresh_not_saved,
+        cache_notice=cache_notice, selection_notice=selection_notice,
+    )
+
+    provider_total = len(view.providers)
+    provider_lines_all = [_provider_line(state) for state in view.providers]
+    providers_header_worst = _providers_header_worst_case(provider_total)
+
+    model_total = len(view.models)
+    candidates = view.models[:_MODELS_DISPLAY_CAP]
+    models_header = _models_header_template(model_total)
+    model_trailer_worst = (
+        f"\n\n…+{model_total} more models available ({model_total} total)" if model_total else ""
+    )
+
+    provider_trailer_worst = (
+        f"\n…+{provider_total} more providers not shown ({provider_total} total)" if provider_total else ""
+    )
+    scaffold = "\n".join(header_lines + ["", providers_header_worst, "", models_header])
+    provider_budget = (
+        TELEGRAM_RENDERED_LIMIT - len(scaffold) - len(provider_trailer_worst) - len(model_trailer_worst)
+    )
+    kept_providers = _fit_lines(provider_lines_all, provider_budget)
+    providers_shown = len(kept_providers)
+
+    prefix_text = "\n".join(header_lines) + "\n\n" + _providers_header_line(provider_total, providers_shown)
+    if kept_providers:
+        prefix_text += "\n" + "\n".join(kept_providers)
+    if provider_total > providers_shown:
+        prefix_text += f"\n…+{provider_total - providers_shown} more providers not shown ({provider_total} total)"
+    prefix_text += "\n"
+
+    model_budget = TELEGRAM_RENDERED_LIMIT - len(prefix_text) - len(models_header) - len(model_trailer_worst)
+
+    verbose_blocks = [_format_catalog_model(record, view.active_model_id) for record in candidates]
+    verbose_body = "\n".join(line for block in verbose_blocks for line in block)
+    if (len(verbose_body) if verbose_body else 0) <= model_budget:
+        shown_models = len(candidates)
+        body_text = verbose_body
+    else:
+        compact_blocks = [[_format_catalog_model_compact(record, view.active_model_id)] for record in candidates]
+        kept_blocks = _fit_blocks(compact_blocks, model_budget - (len(_COMPACT_LEGEND) + 1 if candidates else 0))
+        shown_models = len(kept_blocks)
+        body_lines = ([_COMPACT_LEGEND] if kept_blocks else []) + [
+            line for block in kept_blocks for line in block
+        ]
+        body_text = "\n".join(body_lines)
+
+    text = prefix_text + models_header.replace(_SHOWN_PLACEHOLDER, str(shown_models))
+    if body_text:
+        text += "\n" + body_text
+    if model_total > shown_models:
+        text += f"\n\n…+{model_total - shown_models} more models available ({model_total} total)"
+    shown_model_ids = tuple(record.id for record in candidates[:shown_models])
+    return CatalogRenderResult(text, shown_model_ids)
+
+
+def _fit_blocks(blocks: list[list[str]], budget: int) -> list[list[str]]:
+    """Greedily keep whole multi-line blocks within `budget`; never splits one."""
+    kept: list[list[str]] = []
+    size = 0
+    for block in blocks:
+        block_text = "\n".join(block)
+        added = len(block_text) + 1
+        if size + added > max(budget, 0):
+            break
+        kept.append(block)
+        size += added
+    return kept

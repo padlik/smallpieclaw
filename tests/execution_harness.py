@@ -26,12 +26,18 @@ Typical use::
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import patch
 
+
 from llm_client import LLMClient
+from call_attempt_state import CallAttemptState
+from model_registry import ModelMetadata
 from react_loop import ReactContext, react_loop
+
+DEFAULT_FAKE_METADATA = ModelMetadata(context_tokens=1_000_000, output_tokens=4_096)
 
 
 # ---------------------------------------------------------------------------
@@ -64,15 +70,34 @@ class ScriptedLLM:
     deterministic. Every call is recorded in ``.calls``.
     """
 
-    def __init__(self, responses: list[str], model: str = "test-model"):
+    def __init__(self, responses: list[str], model: str = "test-model",
+                 metadata: ModelMetadata | None = None):
         if not responses:
             raise ValueError("ScriptedLLM needs at least one response")
+        self.metadata = metadata or DEFAULT_FAKE_METADATA
         self._responses = list(responses)
         self._idx = 0
         self.calls: list[LLMCall] = []
         self._model = model
         self._active_idx = 0
         self._trace_id = ""
+        self._attempt_binding: tuple[CallAttemptState, bool] | None = None
+
+    @contextmanager
+    def bind_attempt(self, state: CallAttemptState, *, manual: bool = False, definition_revision=0):
+        """Bind a scripted request to its logical attempt state."""
+        del definition_revision
+        previous = self._attempt_binding
+        self._attempt_binding = (state, manual)
+        try:
+            yield
+        finally:
+            self._attempt_binding = previous
+
+    def _count_attempt(self, mode: str) -> None:
+        if self._attempt_binding is not None:
+            state, manual = self._attempt_binding
+            state.begin_outbound_attempt(mode, manual=manual)
 
     @property
     def llm_cfg(self) -> dict:
@@ -90,7 +115,9 @@ class ScriptedLLM:
         images_present = any(m.get("images") for m in messages)
         self.calls.append(LLMCall(messages=list(messages), system=system,
                                   images_present=images_present))
-        return self._next()
+        response = self._next()
+        self._count_attempt("json")
+        return response
 
     # Compaction path (only used if a scenario forces compaction).
     def chat(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
@@ -138,13 +165,16 @@ class NativeScriptedLLM(LLMClient):
     ``ScriptedLLM``.
     """
 
-    def __init__(self, responses: list, model: str = "test-model"):
+    def __init__(self, responses: list, model: str = "test-model",
+                 metadata: ModelMetadata | None = None):
         if not responses:
             raise ValueError("NativeScriptedLLM needs at least one response")
+        self._fake_metadata = metadata or DEFAULT_FAKE_METADATA
         self._responses = list(responses)
         self._idx = 0
         self._model = model
         self._active_idx = 0
+        self._attempt_binding: tuple[CallAttemptState, bool] | None = None
         # Snapshot of the messages list handed to each native call.
         self.tool_calls_seen: list[list[dict]] = []
         # Snapshot of messages handed to the json_mode fallback
@@ -156,11 +186,31 @@ class NativeScriptedLLM(LLMClient):
     def llm_cfg(self) -> dict:
         return {"model": self._model}
 
+    @property
+    def metadata(self) -> ModelMetadata:
+        return self._fake_metadata
+
     def set_trace_id(self, trace_id: str | None = None) -> None:
         # Base LLMClient.set_trace_id writes through a context-local property
         # backed by state built in the real __init__ (which we bypass); store to
         # a plain attribute instead so the base property is never touched.
         self._trace_id_value = (trace_id or "").strip()
+
+    @contextmanager
+    def bind_attempt(self, state: CallAttemptState, *, manual: bool = False, definition_revision=0):
+        """Bind a scripted native/JSON call to the real retry counters."""
+        del definition_revision
+        previous = self._attempt_binding
+        self._attempt_binding = (state, manual)
+        try:
+            yield
+        finally:
+            self._attempt_binding = previous
+
+    def _count_attempt(self, mode: str) -> None:
+        if self._attempt_binding is not None:
+            state, manual = self._attempt_binding
+            state.begin_outbound_attempt(mode, manual=manual)
 
     def chat_with_tools_fallback(self, messages, tools, system=None, progress_cb=None):
         # Shallow-copy each message so later in-place mutation of the shared
@@ -171,7 +221,10 @@ class NativeScriptedLLM(LLMClient):
         # A scripted exception simulates the native path failing on this turn,
         # exercising react_loop's fallback to json_mode.
         if isinstance(resp, BaseException):
+            if not isinstance(resp, NotImplementedError):
+                self._count_attempt("native")
             raise resp
+        self._count_attempt("native")
         return resp
 
     def chat_with_fallback(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
@@ -180,6 +233,7 @@ class NativeScriptedLLM(LLMClient):
         # react_loop linearizes native turns) so the payload's shape can be
         # asserted, then return a finish so the loop terminates deterministically.
         self.json_mode_calls.append([dict(m) for m in messages])
+        self._count_attempt("json")
         return '{"action": "finish", "result": "done"}'
 
     def chat(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
@@ -271,6 +325,7 @@ def build_context(llm, executor: RecordingExecutor, *, label: str = "main",
         skill_registry=None,
         max_iterations=max_iterations,
         cancel_event=threading.Event(),
+        retry_wait=lambda event, seconds: event.is_set(),
         label=label,
         trace_id=trace_id,
     )

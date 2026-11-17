@@ -30,6 +30,12 @@ class XDGPaths:
 
     # Derived leaf paths
     config_file: Path
+    # Durable deliberate model selection (protected config home).
+    model_selection_file: Path
+    # Disposable discovered-model cache (cache home; holds no secrets).
+    models_cache_file: Path
+    # Retired combined model settings file; resolved only for its existence check.
+    models_config_file: Path
     scheduler_config: Path
     memory_file: Path
     graph_memory_db: Path
@@ -81,6 +87,9 @@ def xdg_paths(agent_name: str) -> XDGPaths:
         cache_home=cache_home,
         runtime_dir=runtime_dir,
         config_file=config_home / "config.toml",
+        model_selection_file=config_home / "model-selection.toml",
+        models_cache_file=cache_home / "models-cache.json",
+        models_config_file=config_home / "models-config.toml",
         scheduler_config=config_home / "scheduler.toml",
         memory_file=data_home / "memory.json",
         graph_memory_db=data_home / "graph_memory",

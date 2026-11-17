@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from builtin_tools.schedule import exec_schedule
 from scheduler import Scheduler
+from tests import scheduler_legacy_fixtures as legacy_fx
 from xdg import xdg_paths
 
 
@@ -65,6 +67,7 @@ class TestExecScheduleShow:
 
     def test_show_returns_full_metadata(self) -> None:
         scheduler = MagicMock()
+        scheduler.selector_redactor = None
         scheduler.show_job.return_value = {
             "tag": "report",
             "task": "do work",
@@ -908,3 +911,47 @@ class TestSchedulerContextMaxMessagesInvariant:
         assert result["success"] is True
         assert s._jobs_meta["report"]["context_max_messages"] == 20
         assert s.show_job("report")["context_max_messages"] == 20
+
+
+# ---------------------------------------------------------------------------
+# Public job field sets
+#
+# Relocated by task 2.4 from tests/test_scheduler_legacy_readonly.py (ledger
+# provenance in openspec/changes/simplify-model-runtime/test-preservation-ledger).
+# Keep (ledger 447).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_legacy_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[legacy_fx.MakeLegacyScheduler]:
+    """Real legacy-beside-TOML schedulers (shared factory, see the support module)."""
+    yield from legacy_fx.legacy_scheduler_factory(tmp_path, monkeypatch)
+
+
+_SHOW_FIELDS = frozenset({
+    "tag", "task", "schedule", "schedule_type", "cron", "run_at", "next_run",
+    "last_run", "last_error", "notify", "model", "preserve_context",
+    "context_max_messages", "overlap_policy", "source", "enabled", "is_running",
+    "created_at",
+})
+
+_LIST_FIELDS = frozenset({
+    "tag", "schedule", "schedule_type", "cron", "next_run", "enabled", "last_run",
+    "last_error", "task", "notify", "source", "model", "preserve_context",
+    "is_running", "config_error",
+})
+
+
+@pytest.mark.parametrize("tag", ["alpha"])  # task 8.4: legacy-file jobs no longer exist
+def test_public_job_field_sets_are_unchanged(
+    make_legacy_scheduler: legacy_fx.MakeLegacyScheduler, tag: str,
+) -> None:
+    """No new public list/show fields are introduced (a legacy file adds none)."""
+    env = make_legacy_scheduler(legacy_fx.TOML, legacy=legacy_fx.LEGACY)
+
+    listed = next(job for job in env.sched.list_jobs() if job["tag"] == tag)
+
+    assert set(env.sched.show_job(tag)) == _SHOW_FIELDS
+    assert set(listed) == _LIST_FIELDS

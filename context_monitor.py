@@ -4,8 +4,8 @@ context_monitor.py
 Lightweight, lock-free context-window profiler for the agent runtime.
 
 Provides an immutable :class:`ContextSnapshot` dataclass that captures the
-current token budget (system prompt, chat history, tool definitions grouped by
-server, headroom, danger level, etc.) and a :class:`ContextMonitor` that
+estimated input (system prompt, chat history, tool definitions grouped by
+server) and the configured compaction threshold, and a :class:`ContextMonitor` that
 publishes and serves these snapshots via atomic reference swaps.
 
 The module is intentionally decoupled from the rest of the agent code so it can
@@ -26,22 +26,20 @@ from token_estimator import estimate_tokens
 class ContextSnapshot:
     """Immutable snapshot of context-window consumption at a single turn.
 
-    Attributes are ordered to match the dashboard layout: token counts first,
-    then budget/threshold values, then derived status, and finally run state.
+    Informational only: estimated input token counts, the configured compaction
+    threshold, run state and the pinned model identity. There is no capacity,
+    reserve, headroom or danger information.
     """
 
     system_prompt_tokens: int
     chat_history_tokens: int
     tool_defs_tokens: int
     tool_defs_by_server: dict[str, int]
-    completion_reserve: int
-    effective_window: int
     compaction_threshold: int
-    headroom_nominal: int
-    headroom_real: int
-    danger_level: str
     is_live: bool
     turn: int
+    # Canonical ID of the model pinned to the run that produced the counts.
+    model_id: str = ""
 
 
 class ContextMonitor:
@@ -71,53 +69,6 @@ class ContextMonitor:
             The most recently published :class:`ContextSnapshot`, or ``None``.
         """
         return self._snapshot
-
-
-def compute_danger_level(total_tokens: int, compaction_threshold: int) -> str:
-    """Classify *total_tokens* relative to *compaction_threshold*.
-
-    Buckets:
-      - ``"safe"`` when total is below 70% of the threshold.
-      - ``"approaching"`` when total is 70% or above but below 90%.
-      - ``"danger"`` when total is 90% or above, or when the threshold is not
-        positive.
-
-    Args:
-        total_tokens: Estimated consumed tokens.
-        compaction_threshold: Token budget that triggers compaction.
-
-    Returns:
-        One of ``"safe"``, ``"approaching"``, or ``"danger"``.
-    """
-    if compaction_threshold <= 0:
-        return "danger"
-    ratio = total_tokens / compaction_threshold
-    if ratio < 0.7:
-        return "safe"
-    if ratio < 0.9:
-        return "approaching"
-    return "danger"
-
-
-def compute_headroom_real(
-    threshold: int,
-    system_tokens: int,
-    history_tokens: int,
-    tool_defs_tokens: int,
-) -> int:
-    """Compute remaining headroom after fixed-size context pieces.
-
-    Args:
-        threshold: Effective compaction threshold.
-        system_tokens: Tokens consumed by the system prompt.
-        history_tokens: Tokens consumed by chat history.
-        tool_defs_tokens: Tokens consumed by tool definitions.
-
-    Returns:
-        ``threshold - system_tokens - history_tokens - tool_defs_tokens``.
-        May be negative.
-    """
-    return threshold - system_tokens - history_tokens - tool_defs_tokens
 
 
 def group_tool_defs_by_server(

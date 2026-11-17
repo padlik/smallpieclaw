@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from outcome_utils import with_execution
+
 if TYPE_CHECKING:
     from builtin_executor import BuiltinExecutor
 
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def _scheduled_memory_unavailable(tool_name: str) -> dict:
     """Refuse an operator-memory tool for a scheduled run without touching any store."""
-    return {
+    return with_execution({
         "success": False,
         "output": "",
         "error": (
@@ -36,7 +38,7 @@ def _scheduled_memory_unavailable(tool_name: str) -> dict:
             "Keep job state in the job's own context (preserve_context) or its "
             "returned result; do not retry this memory tool."
         ),
-    }
+    }, "refused")
 
 
 class MemoryTools:
@@ -50,14 +52,14 @@ class MemoryTools:
         if scheduled:
             return _scheduled_memory_unavailable("memory_write")
         if self._owner._memory is None:
-            return {
+            return with_execution({
                 "success": False, "output": "",
                 "error": "memory_write: MemoryStore is not available in this context.",
                 "exit_code": -1,
                 "error_type": "impossible_with_current_tools",
                 "recoverable": False,
                 "suggestion": "Memory storage is disabled in this runtime; do not rely on memory_write.",
-            }
+            }, "refused")
 
         action = args.get("action", "").strip().lower()
         key = args.get("key", "").strip()
@@ -65,7 +67,7 @@ class MemoryTools:
         import json as _json
 
         def _ok(out: str) -> dict:
-            return {
+            return with_execution({
                 "success": True,
                 "output": out,
                 "error": "",
@@ -73,10 +75,10 @@ class MemoryTools:
                 "error_type": "",
                 "recoverable": False,
                 "suggestion": "",
-            }
+            }, "executed")
 
         def _err(msg: str, error_type: str = "", suggestion: str = "") -> dict:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": msg,
@@ -84,7 +86,7 @@ class MemoryTools:
                 "error_type": error_type or "fundamentally_wrong_approach",
                 "recoverable": False,
                 "suggestion": suggestion,
-            }
+            }, "refused")
 
         if action == "get":
             if not key:
@@ -143,7 +145,7 @@ class MemoryTools:
         if scheduled:
             return _scheduled_memory_unavailable("memory_graph_search")
         if self._owner._graph_memory is None:
-            return {
+            return with_execution({
                 "success": False, "output": "",
                 "error": "memory_graph_search: graph memory is not enabled or not available. "
                          "Set [graph_memory] enabled = true in config.toml and install ladybug.",
@@ -151,10 +153,10 @@ class MemoryTools:
                 "error_type": "impossible_with_current_tools",
                 "recoverable": False,
                 "suggestion": "Graph memory is disabled or ladybug is not installed; do not retry.",
-            }
+            }, "refused")
         query = str(args.get("query", "")).strip()
         if not query:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": "memory_graph_search: 'query' is required.",
@@ -162,11 +164,11 @@ class MemoryTools:
                 "error_type": "fundamentally_wrong_approach",
                 "recoverable": False,
                 "suggestion": "Provide a non-empty query string.",
-            }
+            }, "refused")
         try:
             context = self._owner._graph_memory.format_for_prompt(query)
             if not context:
-                return {
+                return with_execution({
                     "success": True,
                     "output": "No relevant entities or facts found in graph memory.",
                     "error": "",
@@ -174,9 +176,9 @@ class MemoryTools:
                     "error_type": "",
                     "recoverable": False,
                     "suggestion": "",
-                }
+                }, "executed")
             logger.info("memory_graph_search: query=%s", query[:60])
-            return {
+            return with_execution({
                 "success": True,
                 "output": context,
                 "error": "",
@@ -184,9 +186,9 @@ class MemoryTools:
                 "error_type": "",
                 "recoverable": False,
                 "suggestion": "",
-            }
+            }, "executed")
         except Exception as exc:  # noqa: BLE001
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": f"memory_graph_search failed: {exc}",
@@ -194,7 +196,7 @@ class MemoryTools:
                 "error_type": "network_error",
                 "recoverable": True,
                 "suggestion": "Retry the graph memory search; the database may be temporarily unavailable.",
-            }
+            }, "executed")
 
     # ---- memory_graph_store ----
 
@@ -203,7 +205,7 @@ class MemoryTools:
         if scheduled:
             return _scheduled_memory_unavailable("memory_graph_store")
         if self._owner._graph_memory is None:
-            return {
+            return with_execution({
                 "success": False, "output": "",
                 "error": "memory_graph_store: graph memory is not enabled or not available. "
                          "Set [graph_memory] enabled = true in config.toml and install ladybug.",
@@ -211,10 +213,10 @@ class MemoryTools:
                 "error_type": "impossible_with_current_tools",
                 "recoverable": False,
                 "suggestion": "Graph memory is disabled or ladybug is not installed; do not retry.",
-            }
+            }, "refused")
         content = str(args.get("content", "")).strip()
         if not content:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": "memory_graph_store: 'content' is required.",
@@ -222,7 +224,7 @@ class MemoryTools:
                 "error_type": "fundamentally_wrong_approach",
                 "recoverable": False,
                 "suggestion": "Provide the fact or relationship you want to store.",
-            }
+            }, "refused")
         # Writing to graph memory changes future recalled prompt context, so it is
         # a confirmation-requiring operation. Operator approval admits the memory
         # as "confirmed"; the model/sub-agent cannot self-approve it.
@@ -241,17 +243,17 @@ class MemoryTools:
         from graph_memory import ADMISSION_CONFIRMED, CONFIDENCE_CONFIRMED
 
         if self._owner._graph_memory is None:
-            return {
+            return with_execution({
                 "success": False, "output": "",
                 "error": "memory_graph_store: graph memory is not enabled or not available.",
                 "exit_code": -1,
                 "error_type": "impossible_with_current_tools",
                 "recoverable": False,
                 "suggestion": "Graph memory is disabled or ladybug is not installed; do not retry.",
-            }
+            }, "refused")
         content = str(args.get("content", "")).strip()
         if not content:
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": "memory_graph_store: 'content' is required.",
@@ -259,7 +261,7 @@ class MemoryTools:
                 "error_type": "fundamentally_wrong_approach",
                 "recoverable": False,
                 "suggestion": "Provide the fact or relationship you want to store.",
-            }
+            }, "refused")
         user_id = str(args.get("user_id", "agent")).strip() or "agent"
         try:
             # Store the operator-approved note as a confirmed episode.
@@ -276,7 +278,7 @@ class MemoryTools:
                 self._owner._graph_memory_writer.enqueue(content, user_id=user_id, source="manual")
                 self._owner._graph_memory_writer.flush()
             logger.info("memory_graph_store: stored confirmed episode %s", ep_id)
-            return {
+            return with_execution({
                 "success": True,
                 "output": f"Stored in graph memory as confirmed (episode {ep_id}). "
                           "Extraction scheduled in background.",
@@ -285,9 +287,9 @@ class MemoryTools:
                 "error_type": "",
                 "recoverable": False,
                 "suggestion": "",
-            }
+            }, "executed")
         except Exception as exc:  # noqa: BLE001
-            return {
+            return with_execution({
                 "success": False,
                 "output": "",
                 "error": f"memory_graph_store failed: {exc}",
@@ -295,4 +297,4 @@ class MemoryTools:
                 "error_type": "network_error",
                 "recoverable": True,
                 "suggestion": "Retry the graph memory store; the database may be temporarily unavailable.",
-            }
+            }, "executed")

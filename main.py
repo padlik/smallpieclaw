@@ -6,7 +6,8 @@ Entry point for the Telegram Home Server Agent.
 Boot sequence:
   1. Parse --agent-name, resolve XDG paths, create XDG dirs, run migration check
   2. Load config
-  3. Initialise all components
+  3. Refresh the provider model catalog, restore a valid remembered Main,
+     and initialise all components
   4. Build the semantic tool index
   5. Start the scheduler
   6. Start the Telegram bot (blocking)
@@ -15,83 +16,28 @@ Boot sequence:
 from __future__ import annotations
 
 import argparse
-import fcntl
+import contextlib
+import functools
 import logging
 import os
 import shutil
 import signal
 import sys
 import tempfile
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
 import agent_logging
 
+# PID file locking — prevents multiple concurrent instances. The shared lock
+# lives in process_lock so offline maintenance tools exclude a
+# live daemon; _PidFileLock is the compatibility name.
+from process_lock import PidFileLock as _PidFileLock
+
 # Bootstrap logging to stdout until config (and the resolved XDG log path) load.
 agent_logging.setup_bootstrap()
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# PID file locking — prevents multiple concurrent instances
-# ---------------------------------------------------------------------------
-class _PidFileLock:
-    """
-    Advisory exclusive lock on a PID file using fcntl.flock().
-
-    The OS releases the lock automatically when the process exits (even on
-    crash), so stale PID files left by a previous crash are handled without
-    any PID-alive check — if flock() succeeds, the previous holder is gone.
-
-    Usage::
-
-        with _PidFileLock("/run/agent.pid"):
-            ...  # only one process can hold this at a time
-    """
-
-    def __init__(self, path: str) -> None:
-        self._path = path
-        self._fd: int | None = None
-
-    def __enter__(self) -> "_PidFileLock":
-        os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
-        try:
-            fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o644)
-        except OSError as exc:
-            logger.error("Cannot open PID file %s: %s", self._path, exc)
-            sys.exit(1)
-
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            try:
-                existing_pid = open(self._path).read().strip()
-            except OSError:
-                existing_pid = "unknown"
-            logger.error(
-                "Another instance is already running (PID %s). Aborting.", existing_pid
-            )
-            os.close(fd)
-            sys.exit(1)
-
-        # Lock acquired — write our PID
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode())
-        self._fd = fd
-        return self
-
-    def __exit__(self, *_) -> None:
-        if self._fd is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-                os.close(self._fd)
-            except OSError:
-                pass
-            self._fd = None
-        try:
-            os.unlink(self._path)
-        except OSError:
-            pass
 
 # ---------------------------------------------------------------------------
 # Third-party & local imports
@@ -101,19 +47,34 @@ try:
 except ImportError:
     import tomllib as tomli  # Python 3.11+
 
-from agent_controller import AgentController  # noqa: E402
+import httpx  # noqa: E402
+from agent_controller import AgentController, RunClientBinding, SubAgentRunner  # noqa: E402
 from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile  # noqa: E402
 from builtin_executor import BuiltinExecutor  # noqa: E402
-from config_schema import resolve_model_id, parse_vault_content, ExecutorPaths  # noqa: E402
+from builtin_tools.text_utils import redact_vault_secrets  # noqa: E402
+from config_schema import (  # noqa: E402
+    AgentConfig,
+    AppConfig,
+    ExecutorPaths,
+    parse_vault_content,
+    resolve_provider_connection,
+)
 from context_monitor import ContextMonitor  # noqa: E402
+from embedding_client import EmbeddingClient  # noqa: E402
 from exceptions import ConfigError  # noqa: E402
 from graph_memory import (  # noqa: E402
+    GraphMemoryStopError,
     GraphMemoryStore,
     GraphMemoryWriter,
+    GraphPrerequisiteError,
     create_graph_memory,
+    resolve_graph_startup,
 )
 from llm_client import LLMClient  # noqa: E402
 from mcp_client import MCPManager  # noqa: E402
+from model_discovery import ModelDiscovery  # noqa: E402
+from model_registry import CatalogView, ModelRegistry  # noqa: E402
+from model_settings import ModelCache, ModelPreference  # noqa: E402
 from memory_store import MemoryStore, ShortTermMemory, WorkingMemory, ResultsMemory  # noqa: E402
 from path_policy import PathPolicy  # noqa: E402
 from prompt_registry import PromptRegistry  # noqa: E402
@@ -386,9 +347,111 @@ def _build_executor_paths(
     )
 
 
-def _build_embedder(llm: LLMClient) -> Callable[[str], list[float]]:
-    """Return a callable that embeds text using the shared LLM client."""
-    return llm.embed
+def _build_embedder(embedding: EmbeddingClient) -> Callable[[str], list[float]]:
+    """Return a callable that embeds text using the root embedding client."""
+    return embedding.embed
+
+
+def _make_embedding_factory(
+    app_cfg: AppConfig, vault_file: str,
+) -> Callable[[threading.Event], EmbeddingClient]:
+    """Return a factory building one runner-owned embedding client per event.
+
+    Each call constructs a distinct ``EmbeddingClient`` from the explicit
+    ``[embeddings]`` settings, bound to *event*; the caller owns and closes it.
+    """
+
+    def embedding_factory(event: threading.Event) -> EmbeddingClient:
+        """Build an embedding client bound to *event* from explicit settings."""
+        return EmbeddingClient(
+            app_cfg.embeddings, vault_file=vault_file, cancel_event=event,
+        )
+
+    return embedding_factory
+
+
+def _make_run_client_factory(
+    model_registry: ModelRegistry,
+    agent_cfg: AgentConfig,
+    embedding: EmbeddingClient,
+) -> Callable[[threading.Event], RunClientBinding]:
+    """Return the main controller's per-run client factory.
+
+    Each call admits the active Main exactly once, builds a run-owned
+    ``LLMClient`` pinned to that admission (normal usage accounting, the shared
+    root embedding client, the run's cancel event), and returns it with a view
+    callback closing over the same immutable pin. Admission errors propagate
+    before any client is allocated.
+    """
+
+    def run_client_factory(event: threading.Event) -> RunClientBinding:
+        """Admit Main once and bind its run-owned client to the pinned view."""
+        pin = model_registry.admit()
+        client = LLMClient(
+            pin,
+            agent_config=agent_cfg,
+            embedding_client=embedding,
+            cancel_event=event,
+            usage_registry=get_token_registry(),
+            caller_tag="main",
+        )
+
+        def catalog_view() -> CatalogView:
+            """Present the current catalog with this run's admitted pin."""
+            return model_registry.view(pinned=pin)
+
+        return RunClientBinding(client, catalog_view)
+
+    return run_client_factory
+
+
+def _make_sub_agent_factory(
+    runtime: AgentRuntime, model_registry: ModelRegistry,
+) -> Callable[..., SubAgentRunner]:
+    """Return the sub-agent factory that admits one pin per call on its profile branch.
+
+    Building the factory does no work. Each call admits exactly one ``RunModel``
+    — ``admit_scheduled`` for ``SCHEDULED_AGENT`` (raw selector forwarded
+    unchanged), ``admit`` for the ordinary profiles — and hands that pin to
+    ``AgentRuntime.create`` via ``RuntimeOptions.run_model``. Admission errors
+    propagate before any runner or client is allocated.
+    """
+
+    def sub_agent_factory(
+        model: object = None,
+        context_key: str | None = None,
+        label: str = "on-demand",
+        notify_fn: Callable[[str], None] | None = None,
+        max_iterations: int | None = None,
+        *,
+        on_tool_trace: Callable[..., None] | None = None,
+        cancel_event: threading.Event | None = None,
+        trace_id: str | None = None,
+        context_payload: dict | None = None,
+        prompt_variant: str | None = None,
+        runtime_profile: RuntimeProfile | None = None,
+    ) -> SubAgentRunner:
+        """Admit a pin for *runtime_profile* (default on-demand) and build its runner."""
+        profile = runtime_profile or RuntimeProfile.ON_DEMAND_SUBAGENT
+        if profile is RuntimeProfile.SCHEDULED_AGENT:
+            run_model = model_registry.admit_scheduled(model)
+        else:
+            run_model = model_registry.admit(model)
+        options = RuntimeOptions(
+            run_model=run_model,
+            max_iterations=max_iterations,
+            context_key=context_key,
+            context_payload=context_payload,
+            prompt_variant=prompt_variant,
+            trace_id=trace_id,
+            cancel_event=cancel_event,
+            label=label,
+        )
+        return runtime.create(
+            profile, options, notify_fn=notify_fn, on_tool_trace=on_tool_trace,
+        )
+
+    return sub_agent_factory
 
 
 def _build_memory_stack(
@@ -416,26 +479,37 @@ def _build_memory_stack(
 
 
 def _build_graph_memory(
-    app_cfg,
-    cfg: dict,
+    app_cfg: AppConfig,
     paths: XDGPaths,
     agent: AgentController,
     builtin: BuiltinExecutor,
-    all_models: list[dict],
+    vault_file: str,
     embedder_fn: Callable[[str], list[float]],
 ) -> tuple[GraphMemoryStore | None, GraphMemoryWriter | None]:
     """Initialise graph memory (opt-in) and wire it into agent + executor.
 
-    Returns ``(None, None)`` when disabled, when ladybug is unavailable, or when
-    initialisation fails, matching the original graceful-degradation behaviour.
+    Returns ``(None, None)`` when disabled, when prerequisites fail, or when
+    store/writer construction fails. Telegram, indexing, and ordinary services
+    remain available on prerequisite failures.
     """
     if not app_cfg.graph_memory.enabled:
         return None, None
+
+    try:
+        prepared = resolve_graph_startup(app_cfg, vault_file=vault_file)
+    except GraphPrerequisiteError as exc:
+        logger.warning(
+            "Graph memory initialisation failed (continuing without it): %s",
+            exc,
+        )
+        return None, None
+
     try:
         from graph_memory import build_extraction_llm_call as _build_extraction_llm_call
 
-        llm_call_fn = _build_extraction_llm_call(cfg, app_cfg, all_models)
-
+        llm_call_fn = _build_extraction_llm_call(
+            prepared.pin, app_cfg.agent, caller_tag="graph-extract"
+        )
         graph_memory_store, graph_memory_writer = create_graph_memory(
             cfg=app_cfg,
             db_path=str(paths.graph_memory_db),
@@ -454,13 +528,14 @@ def _build_graph_memory(
             logger.info(
                 "Graph memory enabled (db=%s, extraction_model=%s)",
                 paths.graph_memory_db,
-                app_cfg.graph_memory.extraction_model or app_cfg.agent.default_model,
+                prepared.pin.model.id,
             )
         return graph_memory_store, graph_memory_writer
     except Exception as _gm_init_exc:
+        # Class name only: provider/SDK messages may embed endpoints or credentials.
         logger.warning(
             "Graph memory initialisation failed (continuing without it): %s",
-            _gm_init_exc,
+            type(_gm_init_exc).__name__,
         )
         return None, None
 
@@ -481,22 +556,24 @@ def main():
     _check_migration(paths, agent_name)
     _create_xdg_dirs(paths)
 
-    if not paths.config_file.exists():
-        sys.exit(f"No config found. Create: {paths.config_file}")
-
-    cfg, app_cfg = load_config(paths.config_file, vault_file=str(paths.secrets_file), agent_name=agent_name)
-    _warn_relative_paths(cfg)
-
-    workspace_dir = os.path.abspath(os.path.expanduser(
-        cfg.get("paths", {}).get("workspace_dir", f"~/Documents/{agent_name}_workspace")
-    ))
-    downloads_dir = os.path.join(workspace_dir, "downloads")
-    tmp_dir = f"/tmp/{agent_name}"
-
-    # SIGTERM → clean exit so the finally: block always runs (e.g. systemctl stop)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-
+    # The shared lock is held from the first config read through startup, so a
+    # concurrent migration can never restore originals around a live config load.
     with _PidFileLock(str(paths.pid_file)):
+        if not paths.config_file.exists():
+            sys.exit(f"No config found. Create: {paths.config_file}")
+
+        cfg, app_cfg = load_config(paths.config_file, vault_file=str(paths.secrets_file), agent_name=agent_name)
+        _warn_relative_paths(cfg)
+
+        workspace_dir = os.path.abspath(os.path.expanduser(
+            cfg.get("paths", {}).get("workspace_dir", f"~/Documents/{agent_name}_workspace")
+        ))
+        downloads_dir = os.path.join(workspace_dir, "downloads")
+        tmp_dir = f"/tmp/{agent_name}"
+
+        # SIGTERM → clean exit so the finally: block always runs (e.g. systemctl stop)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
         _run(
             cfg=cfg, app_cfg=app_cfg, paths=paths,
             downloads_dir=downloads_dir, tmp_dir=tmp_dir,
@@ -514,12 +591,20 @@ def _run(
     # Re-initialise logging with the resolved XDG log paths and structlog dual sink.
     # Vault secret values are passed so they are redacted from every log record.
     # The graph-memory component log is routed explicitly (see ADR-0023).
+    _known_secrets = _read_vault_secrets(str(paths.secrets_file))
     log_store_path = agent_logging.setup_logging(
         str(paths.log_file),
         db_path=str(paths.log_store),
         graph_memory_log=str(paths.graph_memory_log),
         backup_count=int(cfg.get("paths", {}).get("log_backup_count", 30)),
-        secret_values=_read_vault_secrets(str(paths.secrets_file)),
+        secret_values=_known_secrets,
+    )
+    # Saved scheduled selectors are redacted with the same startup secrets,
+    # under the same >= 6-character needle policy as log ingestion.
+    selector_redactor = functools.partial(
+        redact_vault_secrets,
+        secrets=tuple(s for s in _known_secrets if len(s) >= 6),
+        placeholder="***REDACTED***",
     )
 
     os.makedirs(downloads_dir, exist_ok=True)
@@ -592,13 +677,163 @@ def _run(
 
     logger.info("Initialising components...")
 
+    # Root-owned model services are closed on every exit of _run — normal,
+    # exceptional, and setup failures after allocation: the one explicit root
+    # embedding client and the discovery HTTP clients. One bounded exception:
+    # when graph worker termination is unconfirmed (GraphMemoryStopError), the
+    # root embedding client the worker may still use is left open; discovery
+    # clients still close. There is no standing chat client; ordinary runs
+    # build their own pinned client per admission.
+    retain_graph_dependencies = False
+
+    def close_root_embedding() -> None:
+        """Close the root embedding unless a live graph worker may still use it."""
+        if not retain_graph_dependencies:
+            root_embedding.close()
+
+    with contextlib.ExitStack() as root_resources:
+        root_embedding = EmbeddingClient(
+            app_cfg.embeddings, vault_file=vault_file,
+        )
+        root_resources.callback(close_root_embedding)
+        if not root_embedding.available:
+            logger.warning(
+                "Embeddings unavailable (%s); tool search and results recall run degraded.",
+                app_cfg.embeddings.unavailable_reason or root_embedding.unavailable_reason,
+            )
+        discovery_http = root_resources.enter_context(
+            httpx.Client(follow_redirects=False, trust_env=False)
+        )
+        # One model catalog/selection owner (distinct from the MCP ToolRegistry).
+        model_registry = ModelRegistry(
+            app_cfg.providers,
+            ModelCache(paths.models_cache_file),
+            ModelDiscovery(discovery_http),
+            functools.partial(resolve_provider_connection, vault_file=vault_file),
+            selector_redactor=selector_redactor,
+            preference=ModelPreference(paths.model_selection_file),
+        )
+        if model_registry.cache_notice is not None:
+            logger.warning("%s Cache file: %s", model_registry.cache_notice, paths.models_cache_file)
+        if model_registry.selection_notice is not None:
+            logger.warning(
+                "%s Selection file: %s", model_registry.selection_notice, paths.model_selection_file,
+            )
+        retired_notice = _retired_catalog_notice(paths.models_config_file)
+        if retired_notice is not None:
+            logger.warning("%s", retired_notice)
+        _refresh_model_catalog(model_registry, paths.models_cache_file)
+        try:
+            _run_with_model_services(
+                cfg=cfg, app_cfg=app_cfg, paths=paths,
+                downloads_dir=downloads_dir,
+                nsjail_state_dir=nsjail_state_dir,
+                nsjail_session_tmpdir=nsjail_session_tmpdir,
+                conversation_id=conversation_id,
+                conversations_dir=conversations_dir,
+                data_dir=data_dir,
+                skills_dir_abs=skills_dir_abs,
+                vault_file=vault_file,
+                path_policy=path_policy,
+                executor_paths=executor_paths,
+                scheduled_max_iter=scheduled_max_iter,
+                selector_redactor=selector_redactor,
+                model_registry=model_registry,
+                root_embedding=root_embedding,
+            )
+        except GraphMemoryStopError:
+            # Set before the ExitStack unwinds so close_root_embedding skips it.
+            retain_graph_dependencies = True
+            raise
+
+
+def _retired_catalog_notice(retired_file: Path) -> str | None:
+    """Return the one startup notice for the retired combined model settings file.
+
+    The retired ``models-config.toml`` is only ever probed for existence
+    (``lexists``: a symlink or directory at the path counts, and a symlink is
+    never followed). It is never opened, read, parsed, written, renamed or
+    deleted, whatever its content or permissions; ``None`` means it is absent.
+    """
+    if not os.path.lexists(retired_file):
+        return None
+    return (
+        f"The retired combined model settings file exists at {retired_file}; it is never read "
+        "or changed and no model is derived from it. Choose a model deliberately with /models."
+    )
+
+
+def _refresh_model_catalog(model_registry: ModelRegistry, cache_file: Path) -> None:
+    """Select the startup Main: the saved selection, else the first cached candidate.
+
+    Discovery runs at most once, and only when nothing is known: no preference
+    file (a corrupt, unreadable or unconfigured one counts as present) and zero
+    cached candidates of configured connections. It is the same reusable
+    refresh as ``/models`` (one logical pass, no retry); failed providers keep
+    their last-good entries as stale. A saved selection that is invalid,
+    unreadable or unconfigured leaves Main unset with no automatic choice
+    (the registry already reported why). When no Main results, startup
+    continues (commands stay available) but model work is refused until an
+    explicit ``/models`` selection.
+    """
+    if model_registry.needs_first_start_discovery:
+        report = model_registry.refresh()
+        for provider_id, code in report.error_codes:
+            if provider_id in report.stale_provider_ids:
+                logger.warning(
+                    "Model catalog refresh failed for provider %s (%s); keeping last-good entries as stale.",
+                    provider_id, code,
+                )
+        if not report.persisted:
+            logger.warning(
+                "Model cache could not be saved to %s; continuing with this session's discovery. "
+                "Selection and preference are unchanged; use /models to retry.",
+                cache_file,
+            )
+    view = model_registry.restore_selection()
+    if view.active_model_id is None:
+        logger.warning(
+            "No main model is active (%s); select one with /models before model work can run.",
+            view.selection_status,
+        )
+
+
+def _run_with_model_services(
+    *,
+    cfg: dict,
+    app_cfg: AppConfig,
+    paths: XDGPaths,
+    downloads_dir: str,
+    nsjail_state_dir: str,
+    nsjail_session_tmpdir: str,
+    conversation_id: str,
+    conversations_dir: str,
+    data_dir: str,
+    skills_dir_abs: str,
+    vault_file: str,
+    path_policy: PathPolicy,
+    executor_paths: ExecutorPaths,
+    scheduled_max_iter: int,
+    selector_redactor: Callable[[str], str],
+    model_registry: ModelRegistry,
+    root_embedding: EmbeddingClient,
+) -> None:
+    """Compose and serve the agent on root-owned model services.
+
+    Model-resource ownership: ``_run``'s root ``ExitStack`` owns and closes
+    *model_registry*'s discovery clients and *root_embedding*, including on
+    early setup failure, except that *root_embedding* stays open when shutdown
+    raises ``GraphMemoryStopError`` (graph worker termination unconfirmed; the
+    graph store and logging are then also left open here). That guarantee covers root model resources only;
+    the other (legacy) setup resources constructed here keep their existing
+    cleanup behavior and are not newly guaranteed by the root stack.
+    """
     # Single shared ContextMonitor instance — injected into both BuiltinExecutor
     # (for the context_profile tool) and AgentController (for the ReAct loop
     # publish path and /context command). Both must reference the same instance.
     # See ADR-0022.
     context_monitor = ContextMonitor()
 
-    llm      = LLMClient(cfg, usage_registry=get_token_registry(), caller_tag="main")
     memory   = MemoryStore(str(paths.memory_file))
     # Purge any model/LLM facts the agent may have written in past sessions.
     # These are always stale — authoritative model info lives in config.toml and is
@@ -616,7 +851,10 @@ def _run(
         path_policy=path_policy,
     )
     builtin.conversation_id = conversation_id
-    index    = ToolIndex(registry=registry, llm=llm, index_path=str(paths.tool_index_file), builtin_executor=builtin)
+    index    = ToolIndex(
+        registry=registry, llm=root_embedding,
+        index_path=str(paths.tool_index_file), builtin_executor=builtin,
+    )
 
     # Initialise MCP servers (optional — skip if none configured)
     mcp_manager: MCPManager | None = None
@@ -641,7 +879,7 @@ def _run(
             logger.warning("MCP connect_all failed (agent will start without MCP): %s", exc)
 
     short_term, working, results_mem, strategy_mem, prompt_registry = _build_memory_stack(
-        app_cfg, paths, llm, conversations_dir, conversation_id, data_dir,
+        app_cfg, paths, root_embedding, conversations_dir, conversation_id, data_dir,
     )
     # Wire working memory and results memory into builtin executor so that
     # implicit spawn_agent context summaries include recent tool results.
@@ -657,10 +895,14 @@ def _run(
     logger.info("Loaded %d skill(s) from %s", skills.count(), skills_dir_abs)
     builtin.skill_registry = skills  # type: ignore[attr-defined]
 
+    # No standing chat client: each run admits Main once through the factory,
+    # which returns a run-owned client bound to that pin's catalog view.
     agent = AgentController(
         agent_cfg=app_cfg.agent,
         paths=executor_paths,
-        llm=llm,
+        llm=None,
+        run_client_factory=_make_run_client_factory(model_registry, app_cfg.agent, root_embedding),
+        model_catalog_view_provider=model_registry.view,
         tool_index=index,
         memory=memory,
         short_term=short_term,
@@ -725,31 +967,15 @@ def _run(
         if tg is not None:
             tg.send_html_to_users(html_msg)
 
-    # Resolve background_model for sub-agents
-    background_model_id = app_cfg.agent.background_model or app_cfg.agent.default_model
-    all_models = cfg.get("models", [])
-    _bg_resolved = resolve_model_id(background_model_id, all_models)
-    background_model_cfg = next(
-        (m for m in all_models if m.get("model") == _bg_resolved),
-        all_models[0] if all_models else {},
-    )
-    if background_model_id and background_model_cfg.get("model") != _bg_resolved:
-        logger.warning(
-            "background_model '%s' not found in [[models]]. Falling back to '%s'.",
-            background_model_id,
-            background_model_cfg.get("model", "none"),
-        )
-
     # Construction boundary for all sub-agent products (ADR-0007). The runtime
     # holds the shared, run-independent collaborators; per-call construction
-    # knobs are passed through RuntimeOptions. Construction is uniform across the
-    # sub-agent profiles — the visibility source (on-demand/scheduled/plan-step/
-    # diagnostic) is assigned later by register_run, not by the runtime.
+    # knobs (including the admitted pin) are passed through RuntimeOptions.
+    # Construction is uniform across the sub-agent profiles — the visibility
+    # source (on-demand/scheduled/plan-step/diagnostic) is assigned later by
+    # register_run, not by the runtime. Each runner owns its embedding client.
     agent_runtime = AgentRuntime(
-        config=cfg,
-        all_models=all_models,
-        background_model_cfg=background_model_cfg,
         agent_cfg=app_cfg.agent,
+        embedding_factory=_make_embedding_factory(app_cfg, vault_file),
         paths=executor_paths,
         tool_index=index,
         base_memory=memory,
@@ -763,47 +989,9 @@ def _run(
         scheduled_max_iterations=scheduled_max_iter,
     )
 
-    def sub_agent_factory(model=None, context_key=None, label="on-demand", notify_fn=None,
-                          max_iterations=None,
-                          max_tokens=None, temperature=None, top_p=None,
-                          on_tool_trace=None, cancel_event=None, trace_id=None,
-                          context_payload=None, prompt_variant=None,
-                          runtime_profile=RuntimeProfile.ON_DEMAND_SUBAGENT):
-        """Create an isolated SubAgentRunner with the requested model override.
-
-        Thin frontend over ``AgentRuntime.create``; the signature is preserved for
-        existing callers (``BuiltinExecutor.spawn_agent``, the scheduler, and
-        ``PlanExecutor``).
-
-        ``runtime_profile`` selects the construction profile (default
-        ``ON_DEMAND_SUBAGENT``); scheduler, plan-step, and diagnostic call sites
-        pass their matching profile through this internal parameter. Construction
-        is behavior-equivalent across the sub-agent profiles today — the profile
-        is threaded so the visibility source assigned later stays consistent with
-        the construction origin.
-        """
-        options = RuntimeOptions(
-            model=model,
-            max_iterations=max_iterations,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            context_key=context_key,
-            context_payload=context_payload,
-            prompt_variant=prompt_variant,
-            trace_id=trace_id,
-            cancel_event=cancel_event,
-            label=label,
-        )
-        return agent_runtime.create(
-            runtime_profile,
-            options,
-            notify_fn=notify_fn,
-            on_tool_trace=on_tool_trace,
-        )
-
-    # Wire sub_agent_factory into builtin executor
-    builtin._sub_agent_factory = sub_agent_factory
+    # Wire the sole sub-agent factory into the builtin executor: one admission
+    # per call on its profile branch (spawn_agent, scheduler, PlanExecutor).
+    builtin._sub_agent_factory = _make_sub_agent_factory(agent_runtime, model_registry)
     builtin._notify_html_fn = notify_html
 
     scheduler = Scheduler(
@@ -811,15 +999,18 @@ def _run(
         paths=paths,
         scheduler_config_path=str(paths.scheduler_config),
         builtin_executor=builtin,
+        selector_redactor=selector_redactor,
     )
     builtin.scheduler = scheduler  # wire scheduler into built-in tool
     # Scheduled job history is not operator context (isolate-job-execution,
     # design decision 2): it stays in job-owned history, not the operator prompt.
 
     # Initialise graph memory (opt-in) and wire it into agent + executor.
-    _embedder_fn = _build_embedder(llm)
+    # Graph extraction uses only its own explicit [graph_memory] route (ADR-0042);
+    # it consults neither the model catalog nor Main.
+    _embedder_fn = _build_embedder(root_embedding)
     graph_memory_store, graph_memory_writer = _build_graph_memory(
-        app_cfg, cfg, paths, agent, builtin, all_models, _embedder_fn,
+        app_cfg, paths, agent, builtin, vault_file, _embedder_fn,
     )
 
     logger.info("Starting Telegram bot...")
@@ -829,12 +1020,12 @@ def _run(
         agent_compress_fn=agent.compress_context,
         scheduler=scheduler,
         tool_registry=registry,
-        llm_client=llm,
         tool_index=index,
         skill_registry=skills,
         usage_registry=get_token_registry(),
         downloads_dir=downloads_dir,
         mcp_manager=mcp_manager,
+        model_registry=model_registry,
     )
     tg.agent = agent  # type: ignore[attr-defined]  # wire agent for confirm/resume and /models
     tg._graph_memory_store = graph_memory_store  # type: ignore[attr-defined]
@@ -889,16 +1080,22 @@ def _run(
         except Exception:  # noqa: BLE001
             pass
         if graph_memory_writer is not None:
+            # Worker termination gates every dependent close below. When it is
+            # not confirmed, report the fixed safe message and propagate before
+            # closing the store, stopping logging or reporting success.
             try:
                 graph_memory_writer.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except GraphMemoryStopError as exc:
+                logger.error(str(exc))
+                raise
+            except Exception as exc:
+                logger.error(GraphMemoryStopError.FAILED_MESSAGE)
+                raise GraphMemoryStopError(GraphMemoryStopError.FAILED_MESSAGE) from exc
         if graph_memory_store is not None:
             try:
                 graph_memory_store.close()
             except Exception:  # noqa: BLE001
                 pass
-        llm.close()
         if mcp_manager:
             mcp_manager.close_all()
             logger.info("MCP servers closed.")

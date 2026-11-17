@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
+
+import pytest
 
 from config_schema import AppConfig, LLMErrorHandlingConfig, parse_config
 
@@ -21,20 +24,33 @@ def _make_config(extra: dict[str, Any]) -> dict[str, Any]:
             "tool_timeout": 10,
             "max_output_size": 4000,
             "top_tools": 3,
-            "ctx_max_tokens": 90000,
+            "compaction_threshold_tokens": 60000,
         },
-        "models": [
-            {
-                "name": "test-model",
-                "provider": "openai",
-                "model": "gpt-4o-mini",
-                "api_key": "sk-test-key",
+        "providers": {
+            "openai-main": {
+                "type": "openai",
+                "api_key": "test-provider-key",
                 "base_url": "https://api.openai.com/v1",
             }
-        ],
+        },
         "paths": {},
         **extra,
     }
+
+
+@pytest.fixture
+def minimal_config(minimal_config: dict[str, Any]) -> dict[str, Any]:
+    """Return the shared config migrated from legacy ``[[models]]`` to a provider connection."""
+    config = copy.deepcopy(minimal_config)
+    config.pop("models", None)
+    config["providers"] = {
+        "openai-main": {
+            "type": "openai",
+            "api_key": "test-provider-key",
+            "base_url": "https://api.openai.com/v1",
+        }
+    }
+    return config
 
 
 def test_llm_error_handling_section_present() -> None:

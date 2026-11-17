@@ -46,19 +46,20 @@ class TestMakeOnRetry:
 
 
 class TestRunWithRetry:
-    """Exercise the shared retry runner that wires ``make_on_retry`` + ``_with_retry``."""
+    """Ensure provider compatibility plumbing cannot orchestrate retries."""
 
-    def _ctx(self, max_retries=2, retry_delay=0.0, cancel_event=None):
+    def _ctx(self, cancel_event=None):
         from interfaces import ProviderContext
+        from model_registry import ModelRecord
         return ProviderContext(
-            get_cfg=lambda: {"model": "test-model"},
-            http=MagicMock(),
-            max_retries=max_retries,
-            retry_delay=retry_delay,
+            model=ModelRecord("p/test-model", "p", "test-model", "Test"),
+            adapter="openai",
+            mode="json",
+            send_json=MagicMock(),
+            track_usage=MagicMock(),
             cancel_event=cancel_event,
             caller_tag="test",
             diagnose_empty=False,
-            track_usage=MagicMock(),
         )
 
     def test_returns_first_success(self):
@@ -70,24 +71,21 @@ class TestRunWithRetry:
         assert result == "ok"
         do_request.assert_called_once()
 
-    def test_retries_and_calls_progress_cb(self):
+    def test_transient_failure_is_not_retried_or_notified(self):
         progress_cb = MagicMock()
-        ctx = self._ctx(max_retries=2, retry_delay=0.0)
         import httpx
-        do_request = MagicMock(
-            side_effect=[httpx.TimeoutException("boom"), "ok"]
-        )
+        ctx = self._ctx()
+        do_request = MagicMock(side_effect=httpx.TimeoutException("boom"))
 
-        result = run_with_retry(ctx, do_request, progress_cb=progress_cb)
+        with pytest.raises(httpx.TimeoutException, match="boom"):
+            run_with_retry(ctx, do_request, progress_cb=progress_cb)
 
-        assert result == "ok"
-        assert do_request.call_count == 2
-        progress_cb.assert_called_once()
-        assert "retry 1/2" in progress_cb.call_args[0][0]
+        do_request.assert_called_once()
+        progress_cb.assert_not_called()
 
     def test_propagates_after_exhaustion(self):
         import httpx
-        ctx = self._ctx(max_retries=1, retry_delay=0.0)
+        ctx = self._ctx()
         do_request = MagicMock(side_effect=httpx.TimeoutException("final"))
 
         with pytest.raises(httpx.TimeoutException, match="final"):
@@ -107,6 +105,53 @@ class TestRunWithRetry:
             run_with_retry(ctx, do_request)
 
         do_request.assert_not_called()
+
+
+class TestCloudOllamaClientConstructionGuards:
+    """Real LLMClient construction refuses unusable cloud Ollama pins before I/O."""
+
+    _FAKE_KEY = "fake-ollama-guard-key"
+
+    def _construct(self, base_url: str, api_key: str) -> tuple[pytest.ExceptionInfo, list]:
+        """Construct a pinned cloud Ollama client expecting rejection; return requests."""
+        import httpx
+
+        from config_schema import AgentConfig, ResolvedProviderConnection
+        from llm_client import LLMClient
+        from model_registry import ModelRecord, RunModel
+        from providers._errors import LLMPermanentError
+
+        requests: list = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={})
+
+        model = ModelRecord("cloud/model", "cloud", "model", "Cloud model")
+        connection = ResolvedProviderConnection("cloud", "ollama", base_url, 20, api_key)
+        with pytest.raises(LLMPermanentError) as caught:
+            LLMClient(
+                RunModel(model, connection, 1, 1),
+                agent_config=AgentConfig(max_retries=0, retry_delay=0),
+                http_transport=httpx.MockTransport(handler),
+            )
+        return caught, requests
+
+    @pytest.mark.parametrize("api_key", ["", "   "])
+    def test_empty_cloud_api_key_is_rejected_before_io(self, api_key):
+        caught, requests = self._construct("https://ollama.com", api_key)
+
+        assert str(caught.value) == "Cloud Ollama requires an API credential"
+        assert requests == []
+
+    @pytest.mark.parametrize("base_url", ["https://ollama.com/api", "https://ollama.com/api/"])
+    def test_authenticated_non_root_official_base_is_rejected_before_sdk_request(self, base_url):
+        caught, requests = self._construct(base_url, self._FAKE_KEY)
+
+        assert str(caught.value) == "Cloud Ollama requires the official https://ollama.com origin"
+        assert self._FAKE_KEY not in str(caught.value)
+        assert self._FAKE_KEY not in repr(caught.value)
+        assert requests == []
 
 
 if __name__ == "__main__":

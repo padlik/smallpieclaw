@@ -658,6 +658,177 @@ class TestSdkClientWrapper:
         assert result["success"] is False
         assert "closing" in result["error"].lower()
 
+    # -- R6 execution-disposition evidence: the real SDK wrapper stamps it ----
+
+    def _connected_wrapper(self, call_tool: AsyncMock):
+        session = _make_mock_session()
+        session.call_tool = call_tool
+        stdio_cm, session_cm = _make_stdio_patches(session)
+        with patch("mcp_client.stdio_client", return_value=stdio_cm):
+            with patch("mcp_client.ClientSession", return_value=session_cm):
+                wrapper = self._make_wrapper()
+                wrapper.connect()
+        assert wrapper.connected is True
+        return wrapper
+
+    @pytest.mark.parametrize("is_error", [False, True])
+    def test_call_tool_completed_sdk_result_is_locally_executed(self, is_error):
+        from outcome_utils import effective_execution, read_execution
+
+        call_result = MagicMock()
+        call_result.isError = is_error
+        call_result.content = [_text_item("remote text")]
+        call_tool = AsyncMock(return_value=call_result)
+        wrapper = self._connected_wrapper(call_tool)
+
+        result = wrapper.call_tool("tool1", {"k": "v"})
+
+        call_tool.assert_awaited_once_with("tool1", {"k": "v"})
+        assert result["success"] is (not is_error)
+        assert read_execution(result) == "executed"
+        assert effective_execution(result) == "executed"
+
+    @pytest.mark.parametrize("is_error", [False, True])
+    def test_call_tool_conflicting_remote_fields_do_not_override_local_proof(self, is_error):
+        from outcome_utils import effective_execution, read_execution
+
+        remote = {
+            "_execution_disposition": "refused",
+            "_guard_refusal": True,
+            "_operator_cancelled": True,
+            "requires_confirmation": True,
+            "error_type": "prohibited_path",
+        }
+        call_result = MagicMock()
+        call_result.isError = is_error
+        call_result.content = [_text_item(json.dumps(remote))]
+        call_result.structuredContent = remote
+        wrapper = self._connected_wrapper(AsyncMock(return_value=call_result))
+
+        result = wrapper.call_tool("tool1", {})
+
+        assert read_execution(result) == "executed"
+        assert effective_execution(result) == "executed"
+        for key in remote:
+            assert key == "_execution_disposition" or key not in result
+
+    def test_call_tool_remote_executed_claim_is_not_proof_without_sdk_result(self):
+        from outcome_utils import effective_execution, read_execution
+
+        call_tool = AsyncMock(side_effect=RuntimeError('{"_execution_disposition": "executed"}'))
+        wrapper = self._connected_wrapper(call_tool)
+
+        result = wrapper.call_tool("tool1", {})
+
+        call_tool.assert_awaited_once()
+        assert result["success"] is False
+        assert read_execution(result) == "unknown"
+        assert effective_execution(result) == "unknown"
+
+    def test_call_tool_transport_exception_without_result_is_unknown(self):
+        from outcome_utils import effective_execution, read_execution
+
+        call_tool = AsyncMock(side_effect=ConnectionResetError("pipe broke"))
+        wrapper = self._connected_wrapper(call_tool)
+
+        result = wrapper.call_tool("tool1", {})
+
+        call_tool.assert_awaited_once()
+        assert result["success"] is False
+        assert "pipe broke" in result["error"]
+        assert wrapper.connected is False
+        assert read_execution(result) == "unknown"
+        assert effective_execution(result) == "unknown"
+
+    def test_call_tool_timeout_without_result_is_unknown(self):
+        from outcome_utils import effective_execution, read_execution
+
+        started = threading.Event()
+
+        async def _never_finishes(name, args):  # noqa: ARG001
+            started.set()
+            await asyncio.sleep(30)
+
+        wrapper = self._connected_wrapper(AsyncMock(side_effect=_never_finishes))
+        wrapper._timeout = 0.3
+
+        result = wrapper.call_tool("slow", {})
+
+        assert started.is_set()
+        assert result["success"] is False
+        assert "timeout" in result["error"]
+        assert read_execution(result) == "unknown"
+        assert effective_execution(result) == "unknown"
+
+    def test_call_tool_needs_auth_predispatch_is_refused_and_not_sent(self):
+        from outcome_utils import effective_execution, read_execution
+
+        call_tool = AsyncMock()
+        wrapper = self._connected_wrapper(call_tool)
+        wrapper.needs_auth = True
+
+        result = wrapper.call_tool("tool1", {})
+
+        call_tool.assert_not_awaited()
+        assert "needs authorization" in result["error"]
+        assert read_execution(result) == "refused"
+        assert effective_execution(result) == "refused"
+
+    def test_call_tool_disconnected_predispatch_is_refused_and_not_sent(self):
+        from outcome_utils import read_execution
+
+        call_tool = AsyncMock()
+        wrapper = self._connected_wrapper(call_tool)
+        wrapper.connected = False
+
+        result = wrapper.call_tool("tool1", {})
+
+        call_tool.assert_not_awaited()
+        assert "not connected" in result["error"]
+        assert read_execution(result) == "refused"
+
+    def test_call_tool_closed_loop_is_refused(self):
+        from outcome_utils import read_execution
+
+        loop = asyncio.new_event_loop()
+        cfg = {"name": "srv", "transport": "stdio", "command": ["x"], "timeout": 5}
+        wrapper = _SdkClientWrapper(cfg, loop)
+        wrapper.connected = True
+        wrapper._queue = MagicMock()
+        loop.close()
+
+        result = wrapper.call_tool("any_tool", {})
+
+        assert "closing" in result["error"].lower()
+        assert read_execution(result) == "refused"
+
+    def test_pending_request_on_session_end_is_refused(self):
+        from mcp_client import _ToolRequest
+        from outcome_utils import read_execution
+
+        wrapper = self._make_wrapper()
+        wrapper._queue = asyncio.Queue()
+        req = _ToolRequest(name="tool1", args={})
+        wrapper._queue.put_nowait(req)
+
+        wrapper._drain_queue("MCP server 'test' session ended")
+
+        outcome = req.future.result(timeout=1)
+        assert outcome["success"] is False
+        assert read_execution(outcome) == "refused"
+
+    def test_cancelled_in_flight_call_is_refused_closing(self):
+        from outcome_utils import read_execution
+
+        call_tool = AsyncMock(side_effect=asyncio.CancelledError())
+        wrapper = self._connected_wrapper(call_tool)
+
+        result = wrapper.call_tool("tool1", {})
+
+        call_tool.assert_awaited_once()
+        assert "closing" in result["error"]
+        assert read_execution(result) == "refused"
+
     def test_connect_http_transport(self):
         session = _make_mock_session(tools=[_sdk_tool("http_tool")])
         read, write = AsyncMock(), AsyncMock()

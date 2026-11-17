@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from config_schema import SecurityConfig, parse_config
 from exceptions import ConfigError
+
+
+@pytest.fixture
+def minimal_config(minimal_config: dict) -> dict:
+    """Return the shared config migrated from legacy ``[[models]]`` to a provider connection."""
+    config = copy.deepcopy(minimal_config)
+    config.pop("models", None)
+    config["providers"] = {
+        "openai-main": {
+            "type": "openai",
+            "api_key": "test-provider-key",
+            "base_url": "https://api.openai.com/v1",
+        }
+    }
+    return config
 
 
 class TestSecurityConfigParsing:

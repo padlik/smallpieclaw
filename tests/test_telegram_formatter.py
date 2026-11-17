@@ -402,3 +402,68 @@ class TestDetailsCallbackData:
     def test_overlong_run_id_is_rejected(self):
         with pytest.raises(ValueError):
             details_callback_data("run-" + "f" * 80)
+
+
+def _job_with_model(**model: object) -> dict:
+    """One enabled cron job whose ``model`` entry is *model* (empty = absent)."""
+    return {"tag": "nightly", "enabled": True, "schedule": "daily", "task": "t",
+            "schedule_type": "cron", **model}
+
+
+class TestFormatJobsListSelectorEvidence:
+    """Saved selectors render through the bounded pre-pin representation (12.22)."""
+
+    @pytest.mark.parametrize(
+        "model",
+        [123, 0, ["QZXlist"], {"QZXkey": "QZXvalue"}],
+        ids=["int", "zero", "list", "dict"],
+    )
+    def test_non_string_model_renders_label_without_contents(self, model):
+        result = format_jobs_list([_job_with_model(model=model)])
+
+        assert "malformed (not a string)" in result
+        assert "QZX" not in result
+        assert "Model: <code>123</code>" not in result
+
+    def test_string_model_renders_escaped_string(self):
+        result = format_jobs_list([_job_with_model(model="p/<model>")])
+
+        assert "Model: <code>p/&lt;model&gt;</code>" in result
+
+    def test_absent_model_renders_inherit(self):
+        result = format_jobs_list([_job_with_model()])
+
+        assert "inherit" in result
+
+
+_TG_SECRET = "QZXSENTINEL7f3aJOBS-token"
+
+
+def _tg_redactor(text: str) -> str:
+    """Fake vault redaction with a placeholder that needs HTML escaping."""
+    return text.replace(_TG_SECRET, "<REDACTED>")
+
+
+class TestFormatJobsListRedactor:
+    """``/jobs`` passes the scheduler's redactor into the evidence helper (12.22 F1)."""
+
+    def test_redactor_masks_secret_string_model(self):
+        result = format_jobs_list(
+            [_job_with_model(model=f"p/{_TG_SECRET}")], redactor=_tg_redactor,
+        )
+
+        assert "Model: <code>p/&lt;REDACTED&gt;</code>" in result
+        assert _TG_SECRET[:8] not in result
+
+    def test_without_redactor_string_model_is_unredacted(self):
+        result = format_jobs_list([_job_with_model(model=f"p/{_TG_SECRET}")])
+
+        assert f"Model: <code>p/{_TG_SECRET}</code>" in result
+
+    def test_redactor_keeps_label_and_inherit_rendering(self):
+        result = format_jobs_list(
+            [_job_with_model(model=123), _job_with_model()], redactor=_tg_redactor,
+        )
+
+        assert "malformed (not a string)" in result
+        assert "inherit" in result

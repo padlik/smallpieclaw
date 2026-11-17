@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from typing import Callable, Optional
 from unittest.mock import patch
 
 import httpx
 
 from checkpoint_store import CheckpointStore
+from call_attempt_state import CallAttemptState
 from confirmation import ConfirmationManager
 from llm_client import LLMCancelledError, LLMEmptyResponseError, LLMPermanentError
+from model_registry import ModelMetadata
 from react_loop import (
     LLMErrorInfo,
     ReactContext,
@@ -26,6 +29,7 @@ from tests.execution_harness import (
     _NullMemory,
     _NullToolIndex,
 )
+from tests.run_model_fixtures import make_run_model_client
 
 
 # ---------------------------------------------------------------------------
@@ -144,10 +148,33 @@ def _checkpoint_path(ctx: ReactContext, trace_id: str) -> str:
     )
 
 
-class ScriptedFinishLLM:
+class _AttemptBoundFake:
+    """Test-only binder counts each scripted provider call exactly once."""
+
+    def __init__(self):
+        self._attempt_binding: tuple[CallAttemptState, bool] | None = None
+
+    @contextmanager
+    def bind_attempt(self, state, *, manual=False, definition_revision=0):
+        del definition_revision
+        previous = self._attempt_binding
+        self._attempt_binding = (state, manual)
+        try:
+            yield
+        finally:
+            self._attempt_binding = previous
+
+    def _record_send(self):
+        if self._attempt_binding is not None:
+            state, manual = self._attempt_binding
+            state.begin_outbound_attempt("json", manual=manual)
+
+
+class ScriptedFinishLLM(_AttemptBoundFake):
     """Fake LLM that never raises and returns a finish response."""
 
     def __init__(self, response: str = '{"action": "finish", "result": "done"}'):
+        super().__init__()
         self._response = response
         self._call_count = 0
         self.calls: list[list[dict]] = []
@@ -166,6 +193,7 @@ class ScriptedFinishLLM:
         progress_cb: Optional[Callable[[str], None]] = None,
         json_mode: bool = False,
     ) -> str:
+        self._record_send()
         self.calls.append(list(messages))
         self._call_count += 1
         return self._response
@@ -180,10 +208,11 @@ class ScriptedFinishLLM:
         return "compaction summary"
 
 
-class ErrorThenSuccessLLM:
+class ErrorThenSuccessLLM(_AttemptBoundFake):
     """Fake LLM that raises on the first call and succeeds afterwards."""
 
     def __init__(self, error: Exception, success_response: str):
+        super().__init__()
         self._error = error
         self._success = success_response
         self._call_count = 0
@@ -204,6 +233,7 @@ class ErrorThenSuccessLLM:
         json_mode: bool = False,
     ) -> str:
         _ = system, progress_cb, json_mode
+        self._record_send()
         self.calls.append(list(messages))
         self._call_count += 1
         if self._call_count == 1:
@@ -243,6 +273,8 @@ def _build_context(
         checkpoint_store=CheckpointStore(data_dir),
         checkpoint_enabled=checkpoint_enabled,
         confirmation=confirmation or ConfirmationManager(),
+        max_retries=0,
+        retry_wait=lambda event, seconds: event.is_set(),
     )
 
 
@@ -567,3 +599,81 @@ class TestToolResultsCount:
             and "tool '" in m.get("content", "").lower()
         )
         assert count == 2
+
+
+# ---------------------------------------------------------------------------
+# Preparation-failure checkpoint on a real httpx.MockTransport client
+# (relocated from tests/test_request_preparation.py::TestPreparationFailureState
+# in simplify-model-runtime task 2.2). Task 6.2 retired the oversized-system
+# trigger (no local size rejection); the failure is now a malformed native
+# tool-call group rejected by ``_prepare_request`` before any provider I/O, with
+# the checkpoint-validity and zero-outbound assertions unchanged.
+# ---------------------------------------------------------------------------
+
+
+def run_failing_preparation(tmp_path):
+    """Run one real-client turn whose preparation fails, then time out the retry."""
+    from checkpoint_store import CheckpointStore
+    from confirmation import ConfirmationManager
+
+    store = CheckpointStore(str(tmp_path))
+    owner = store.acquire_owner("r-harness1")
+    assert owner is not None
+    confirmation = ConfirmationManager()
+    confirmation.request_retry = lambda *args, **kwargs: "timeout"
+    requests = []
+
+    finish = {"choices": [{"message": {"content": '{"action":"finish","result":"done"}'}}]}
+    summary = {"choices": [{"message": {"content": "- earlier steps summarized"}}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        body = request.content.decode()
+        return httpx.Response(200, json=summary if "Summarize these" in body else finish)
+
+    client = make_run_model_client(
+        "openai", httpx.MockTransport(handler),
+        metadata=ModelMetadata(context_tokens=2_000, output_tokens=200), upstream_id="prep-model",
+    )
+    try:
+        from unittest.mock import patch
+
+        from react_loop import _LoopState, react_loop
+        from tests.execution_harness import build_context
+
+        malformed = _LoopState(
+            messages=[
+                {"role": "user", "content": "goal"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "a", "type": "function",
+                     "function": {"name": "probe", "arguments": "{}"}},
+                ]},
+            ],
+            goal_idx=0, max_steps=3,
+        )
+        ctx = build_context(
+            client, RecordingExecutor(),
+            checkpoint_store=store, checkpoint_owner=owner, checkpoint_enabled=True,
+            confirmation=confirmation,
+        )
+        with patch("react_loop._build_system_prompt", return_value=("sys-prompt", None)):
+            result = react_loop(ctx, "goal", progress_callback=lambda _m: None, initial_state=malformed)
+        return result, store, owner, requests
+    finally:
+        client.close()
+
+
+def test_timeout_saves_valid_zero_outbound_state(tmp_path):
+    from call_attempt_state import CallAttemptState
+
+    result, store, owner, requests = run_failing_preparation(tmp_path)
+    try:
+        assert result.startswith("❌")
+        assert requests == []
+        saved = store.load("r-harness1", owner=owner)
+        assert isinstance(saved["attempt_state"], dict)
+        restored = CallAttemptState.from_dict(saved["attempt_state"])
+        assert restored.outbound_attempts == 0
+        assert restored.manual_retry_authorized is False
+    finally:
+        owner.release()

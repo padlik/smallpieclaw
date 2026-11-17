@@ -18,22 +18,71 @@ import logging
 import mimetypes
 import re
 import subprocess
-import time
 from typing import Callable, TYPE_CHECKING, TypeVar
-
-import httpx
 
 if TYPE_CHECKING:
     from interfaces import ProviderContext
 
 from providers._errors import (
     LLMCancelledError,
-    LLMEmptyResponseError,
     LLMError,
     LLMPermanentError,
 )
 
 logger = logging.getLogger(__name__)
+
+_PERMANENT_PROVIDER_ERROR_CODES = frozenset({
+    "invalid_api_key",
+    "authentication_error",
+    "permission_denied",
+    "permission_error",
+    "not_found",
+    "not_found_error",
+    "model_not_found",
+    "invalid_argument",
+    "invalid_request",
+    "invalid_request_error",
+    "content_filter",
+    "content_policy_violation",
+})
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length",
+    "context window",
+    "maximum context",
+    "prompt is too long",
+    "context length exceeded",
+    "token limit",
+    "exceeds the maximum number of tokens",
+    "input token count",
+    "maximum number of tokens allowed",
+)
+
+
+def provider_error_code(error: object) -> str | None:
+    """Return a provider error code only when it is in the safe allowlist."""
+    if not isinstance(error, dict):
+        return None
+    for key in ("code", "type", "status"):
+        value = error.get(key)
+        if isinstance(value, str):
+            normalized = value.lower()
+            if normalized in _PERMANENT_PROVIDER_ERROR_CODES:
+                return normalized
+    return None
+
+
+def raise_provider_api_error(error: object) -> None:
+    """Raise a safe typed API error without relaying provider-supplied text."""
+    code = provider_error_code(error)
+    if code is not None:
+        raise LLMPermanentError(f"Provider rejected the request ({code})") from None
+    raise LLMError("Provider returned an API error") from None
+
+
+def is_context_overflow_message(message: str) -> bool:
+    """Recognize known context-overflow wording without returning provider text."""
+    normalized = message.lower()
+    return any(marker in normalized for marker in _CONTEXT_OVERFLOW_MARKERS)
 
 
 def make_on_retry(
@@ -61,32 +110,11 @@ def run_with_retry(
     *,
     progress_cb: Callable[[str], None] | None = None,
 ) -> T:
-    """Wrap a provider-specific request callable with the shared retry policy.
+    """Compatibility name for one provider invocation; retries belong to ReAct."""
+    if ctx.cancel_event and ctx.cancel_event.is_set():
+        raise LLMCancelledError("LLM request cancelled")
+    return do_request()
 
-    This helper removes the duplicated boilerplate in every provider ``chat()``:
-    building the retry-notification callback and invoking :func:`_with_retry`
-    with the standard parameters. Each provider supplies its own ``do_request``
-    closure; this function only handles the surrounding retry wiring.
-
-    The initial model name is read from ``ctx.get_cfg()`` once at call time so
-    log tags remain stable across retries even if ``set_model`` switches the
-    active config mid-flight.
-    """
-    _on_retry = make_on_retry(progress_cb)
-    _initial_model = ctx.get_cfg()["model"]
-    return _with_retry(
-        do_request,
-        ctx.max_retries,
-        ctx.retry_delay,
-        on_retry=_on_retry,
-        cancel_event=ctx.cancel_event,
-        model_name=_initial_model,
-        caller_tag=ctx.caller_tag,
-    )
-
-
-# HTTP status codes that are safe to retry
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _THINK_CONTENT_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
@@ -114,97 +142,10 @@ def _extract_thinking_content(text: str) -> str:
 
 def _with_retry(fn, max_retries: int, base_delay: float, on_retry=None, cancel_event=None,
                 model_name: str | None = None, caller_tag: str | None = None):
-    """
-    Call fn(), retrying on transient httpx errors, retryable HTTP status codes,
-    and LLMError (e.g. OpenRouter 200-OK with error body for server overload).
-    LLMPermanentError propagates immediately without consuming retries.
-    Uses exponential backoff: base_delay, base_delay*2, base_delay*4, …
-    Non-retryable exceptions (e.g. 400 Bad Request) propagate immediately.
-    on_retry(attempt, max_retries, exc_str) is called before each retry delay.
-    model_name and caller_tag are included in log messages when provided.
-    """
-    _parts = []
-    if caller_tag and caller_tag.strip():
-        _parts.append(caller_tag.strip())
-    if model_name and model_name.strip():
-        _parts.append(model_name.strip())
-    _model_tag = f"[{'/'.join(_parts)}] " if _parts else ""
-    last_exc: Exception = RuntimeError("No attempts made")
-    for attempt in range(1, max_retries + 1):
-        # Check cancellation before each attempt (including before the first)
-        if cancel_event and cancel_event.is_set():
-            raise LLMCancelledError("LLM request cancelled")
-        try:
-            return fn()
-        except LLMCancelledError:
-            raise  # propagate immediately — never retry a cancel
-        except LLMError as exc:
-            if isinstance(exc, LLMPermanentError):
-                raise  # permanent errors are never retried
-            last_exc = exc
-            logger.warning("%sAPI error body (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"api error: {exc}")
-        except httpx.TimeoutException as exc:
-            last_exc = exc
-            logger.warning("%sRequest timed out (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"timeout: {exc}")
-        except LLMEmptyResponseError as exc:
-            last_exc = exc
-            logger.warning("%sEmpty LLM response (attempt %d/%d)", _model_tag, attempt, max_retries)
-            if on_retry:
-                on_retry(attempt, max_retries, "empty response")
-        except httpx.RemoteProtocolError as exc:
-            if cancel_event and cancel_event.is_set():
-                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
-            last_exc = exc
-            logger.warning("%sRemote protocol error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"protocol error: {exc}")
-        except httpx.ConnectError as exc:
-            if cancel_event and cancel_event.is_set():
-                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
-            last_exc = exc
-            logger.warning("%sConnection error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"connection error: {exc}")
-        except (httpx.TransportError, httpx.PoolTimeout) as exc:
-            if cancel_event and cancel_event.is_set():
-                raise LLMCancelledError("LLM request cancelled (connection interrupted)")
-            last_exc = exc
-            logger.warning("%sTransport error (attempt %d/%d): %s", _model_tag, attempt, max_retries, exc)
-            if on_retry:
-                on_retry(attempt, max_retries, f"transport error: {exc}")
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in _RETRYABLE_STATUS:
-                last_exc = exc
-                logger.warning(
-                    "%sHTTP %d (attempt %d/%d): %s",
-                    _model_tag, exc.response.status_code, attempt, max_retries, exc,
-                )
-                if on_retry:
-                    on_retry(attempt, max_retries, f"HTTP {exc.response.status_code}")
-            else:
-                # Log full response body to aid debugging (e.g. "invalid parameter" messages)
-                logger.error(
-                    "%sHTTP %d error — response body: %s",
-                    _model_tag, exc.response.status_code,
-                    exc.response.text[:2000],
-                )
-                raise  # 4xx errors are not retryable
-        if attempt < max_retries:
-            delay = base_delay * (2 ** (attempt - 1))
-            # Don't sleep if already cancelled
-            if cancel_event:
-                # Use event.wait() so cancellation wakes us up immediately
-                cancelled = cancel_event.wait(timeout=delay)
-                if cancelled:
-                    raise LLMCancelledError("LLM request cancelled during retry delay")
-            else:
-                logger.info("%sRetrying in %.1fs…", _model_tag, delay)
-                time.sleep(delay)
-    raise last_exc
+    """Legacy compatibility seam that always performs exactly one call."""
+    if cancel_event and cancel_event.is_set():
+        raise LLMCancelledError("LLM request cancelled")
+    return fn()
 
 
 # Matches OpenAI reasoning / o-series model names:

@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, Callable, Optional
 from confirmation import ConfirmationManager
 from context_monitor import ContextMonitor
 from config_schema import AgentConfig, ExecutorPaths
+from embedding_client import EmbeddingClient
+from model_registry import CatalogView, RunModel
 from react_loop import ReactContext
 from sub_agent_registry import (
     SOURCE_DIAGNOSTIC,
@@ -68,6 +70,7 @@ class ControllerDeps:
     max_iterations: int = 8
     top_tools: int = 3
     ctx_max_tokens: int = 90_000
+    compaction_threshold_tokens: int = 60_000
     tmp_dir: str = "/tmp/agent"
     downloads_dir: str = "downloads"
     workspace_dir: str = "~/Documents"
@@ -94,8 +97,12 @@ class ControllerDeps:
     checkpoint_store: Optional[object] = None
     checkpoint_enabled: bool = True
     retry_timeout_seconds: int = 120
+    max_retries: int = 4
+    retry_delay: float = 2.0
     context_monitor: ContextMonitor | None = None
     step_notify_interval: int = 0
+    # Presentation-only catalog view; never the authoritative run pin.
+    model_catalog_view: CatalogView | None = None
 
 
 class RuntimeProfile(Enum):
@@ -168,11 +175,8 @@ class RuntimeOptions:
     profile / configured default".
     """
 
-    model: Optional[str] = None
+    run_model: Optional[RunModel] = None
     max_iterations: Optional[int] = None
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
     context_key: Optional[str] = None
     context_payload: Optional[dict] = None
     prompt_variant: Optional[str] = None
@@ -201,10 +205,8 @@ class AgentRuntime:
     def __init__(
         self,
         *,
-        config: Optional[dict] = None,
-        all_models: Optional[list[dict]] = None,
-        background_model_cfg: Optional[dict] = None,
         agent_cfg: AgentConfig | None = None,
+        embedding_factory: Callable[[threading.Event], EmbeddingClient] | None = None,
         paths: ExecutorPaths | None = None,
         tool_index: object = None,
         base_memory: object = None,
@@ -217,12 +219,10 @@ class AgentRuntime:
         data_dir: str = "data",
         scheduled_max_iterations: int = 100,
     ) -> None:
-        # Shared model configuration.
-        self._config = config
-        self._all_models = all_models if all_models is not None else []
-        self._background_model_cfg = background_model_cfg or {}
-        # Typed agent config + runtime path bundle.
-        self._agent_cfg = agent_cfg or AgentConfig()
+        # Typed agent config, embedding dependency + runtime path bundle;
+        # validated by create() before any allocation.
+        self._agent_cfg = agent_cfg
+        self._embedding_factory = embedding_factory
         self._paths = paths or ExecutorPaths()
         # Shared tool + memory collaborators.
         self._tool_index = tool_index
@@ -260,8 +260,8 @@ class AgentRuntime:
         This is the runtime-owned per-run context builder. It is deliberately
         separate from create-time construction: ``AgentController.run`` (and the
         sub-agent path via ``SubAgentRunner.run`` -> ``AgentController.run``) mints
-        the per-run trace id, saves/restores the model ``_active_idx``, and sets
-        the LLM trace id, then delegates the dataclass assembly here.
+        the per-run trace id and sets the LLM trace id, then delegates the
+        dataclass assembly here. The LLM client remains pinned for the run.
 
         The controller exposes its runtime dependencies through
         ``controller.runtime_deps`` (a :class:`ControllerDeps` dataclass).  The
@@ -327,6 +327,14 @@ class AgentRuntime:
         """
         if profile not in _PROFILE_SOURCE:
             raise ValueError(f"Unknown runtime profile: {profile!r}")
+        if not isinstance(options.run_model, RunModel):
+            raise ValueError(
+                "RuntimeOptions.run_model must be an admitted RunModel snapshot."
+            )
+        if not isinstance(self._agent_cfg, AgentConfig):
+            raise ValueError("AgentRuntime requires typed AgentConfig.")
+        if not callable(self._embedding_factory):
+            raise ValueError("AgentRuntime requires a callable embedding_factory.")
 
         if profile is RuntimeProfile.SCHEDULED_AGENT:
             # Job-owned context only (isolate-job-execution, design decision 2):
@@ -362,7 +370,8 @@ class AgentRuntime:
     ) -> "SubAgentRunner":
         """Build a ``SubAgentRunner`` mirroring the legacy ``sub_agent_factory``.
 
-        Preserves model resolution, per-call LLM override shallow-copy,
+        The caller supplies an already admitted ``options.run_model`` (validated
+        by :meth:`create`); no model resolution happens here. Preserves the
         scheduled ``max_iterations`` default, context preloading, depth=1, and
         the runner-shaped product surface. ``base_memory``, ``results``, and
         ``builtin_executor`` are the profile-selected collaborators.
@@ -371,37 +380,6 @@ class AgentRuntime:
         # builtin_executor both sit above this construction boundary).
         from agent_controller import SubAgentRunner
         from builtin_tools.context_io import _load_context
-        from config_schema import resolve_model_id
-
-        if self._config is None:
-            raise ValueError(
-                "AgentRuntime requires 'config' to build sub-agent products."
-            )
-
-        # Resolve model config — accept full model ID, model name, or alias.
-        if options.model:
-            resolved = resolve_model_id(options.model, self._all_models)
-            model_cfg = next(
-                (m for m in self._all_models if m.get("model") == resolved), None
-            )
-            if model_cfg is None:
-                raise ValueError(
-                    f"Model '{options.model}' not found in [[models]]. "
-                    f"Available: {[m.get('model') for m in self._all_models]}"
-                )
-        else:
-            model_cfg = self._background_model_cfg
-
-        # Per-call LLM parameter overrides — always shallow-copy to protect the
-        # shared config from mutation.
-        llm_overrides: dict = {}
-        if options.max_tokens is not None:
-            llm_overrides["max_tokens"] = options.max_tokens
-        if options.temperature is not None:
-            llm_overrides["temperature"] = options.temperature
-        if options.top_p is not None:
-            llm_overrides["top_p"] = options.top_p
-        model_cfg = {**model_cfg, **llm_overrides}
 
         # max_iterations: explicit override > scheduled default.
         effective_max_iter = (
@@ -417,12 +395,12 @@ class AgentRuntime:
             )
 
         runner = SubAgentRunner(
-            model_cfg=model_cfg,
-            config=self._config,
+            run_model=options.run_model,
             agent_cfg=replace(
                 self._agent_cfg,
                 max_iterations=effective_max_iter,
             ),
+            embedding_factory=self._embedding_factory,
             paths=self._paths,
             tool_index=self._tool_index,
             base_memory=base_memory,

@@ -1,21 +1,40 @@
 """
 Tests for scheduled job failure classification and error-log enrichment.
 
-Part of the "llm-timeout-hardening" OpenSpec change.
+Part of the "llm-timeout-hardening" OpenSpec change. The final section (task
+7.3, provider-model-catalog) drives scheduled admission failures through the
+actual production root with ``tests/root_startup_harness.py``.
 """
 
 from __future__ import annotations
 
+import html
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+from typing import Iterator
 
+import httpx
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent_runtime import RuntimeProfile
 from scheduler import JobExecutionLog, _classify_job_failure
+from tests.root_startup_harness import (
+    GEM_HOST,
+    INVALID_SAVED,
+    UNCONFIGURED_ID,
+    remembered_for,
+    MAIN_ID,
+    OTHER_ID,
+    SCHEDULED_TAG,
+    RootHarness,
+    ScheduledRootProbe,
+    run_scheduled_root,
+)
 
 
 @pytest.mark.parametrize(
@@ -641,3 +660,404 @@ def test_long_running_warning_stays_direct_with_sink_installed(
     s.notify.assert_called_once()
     assert "Sub-agent running for" in s.notify.call_args.args[0]
     sink.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 12.22: pre-pin launch records carry only bounded selector evidence
+# ---------------------------------------------------------------------------
+
+_FAKE_SELECTOR_SECRET = "QZXSENTINEL7f3aRECORD" + "z9" * 60
+_FAKE_PLACEHOLDER = "***REDACTED***"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        pytest.param(123, id="int"),
+        pytest.param({"QZXkey": "QZXvalue"}, id="dict"),
+        pytest.param(__import__("datetime").datetime(2026, 1, 2, 3, 4), id="datetime"),
+    ],
+)
+def test_pre_pin_launch_record_stores_label_for_non_string_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: object
+) -> None:
+    """The fail-closed record's model is the classification label, never the raw object."""
+    s = _fallback_scheduler(tmp_path, monkeypatch)
+    s._jobs_meta["nightly"]["model"] = model
+
+    s._run_job("nightly")
+
+    entry = s.execution_log.read_recent()[0]
+    assert entry["status"] == "failed"
+    assert entry["model"] == "malformed (not a string)"
+    assert s._jobs_meta["nightly"]["model"] == model
+
+
+def test_pre_pin_launch_record_bounds_and_redacts_string_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An injected fake redactor runs before the 256-char bound on the stored model."""
+    from unittest.mock import MagicMock
+
+    from scheduler import Scheduler
+    from xdg import xdg_paths
+
+    config_path = tmp_path / "scheduler.toml"
+    config_path.write_text("")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    s = Scheduler(
+        config={"scheduler": {"enabled": False}, "agent": {}},
+        notify_fn=MagicMock(),
+        agent_fn=MagicMock(),
+        scheduler_config_path=str(config_path),
+        paths=xdg_paths("test-agent"),
+        selector_redactor=lambda text: text.replace(_FAKE_SELECTOR_SECRET, _FAKE_PLACEHOLDER),
+    )
+    head = "provider/" + "b" * 200
+    raw = head + _FAKE_SELECTOR_SECRET + "-public-suffix" * 50
+    s._jobs_meta["nightly"] = {
+        "task": "summarize", "enabled": True, "notify": False,
+        "_next_run": _NEXT_RUN, "model": raw,
+    }
+
+    s._run_job("nightly")
+
+    stored = s.execution_log.read_recent()[0]["model"]
+    assert len(stored) <= 256
+    assert stored.startswith(head + _FAKE_PLACEHOLDER)
+    for fragment in (_FAKE_SELECTOR_SECRET, _FAKE_SELECTOR_SECRET[:16], _FAKE_SELECTOR_SECRET[:8]):
+        assert fragment not in stored
+    assert s._jobs_meta["nightly"]["model"] == raw
+
+
+_SHORT_SECRET = "QZXSENTINEL7f3aSHORT-token"
+
+
+def _fake_redactor(text: str) -> str:
+    """Fake vault redaction: replace the short fabricated sentinel only."""
+    return text.replace(_SHORT_SECRET, _FAKE_PLACEHOLDER)
+
+
+def _redacting_scheduler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, redactor=None):
+    """``_fallback_scheduler`` equivalent constructed with an injected redactor."""
+    from unittest.mock import MagicMock
+
+    from scheduler import Scheduler
+    from xdg import xdg_paths
+
+    config_path = tmp_path / "scheduler.toml"
+    config_path.write_text("")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    s = Scheduler(
+        config={"scheduler": {"enabled": False}, "agent": {}},
+        notify_fn=MagicMock(),
+        agent_fn=MagicMock(),
+        scheduler_config_path=str(config_path),
+        paths=xdg_paths("test-agent"),
+        selector_redactor=redactor,
+    )
+    s._jobs_meta["nightly"] = {
+        "task": "summarize", "enabled": True, "notify": False, "_next_run": _NEXT_RUN,
+    }
+    return s
+
+
+def _failing_spawn_executor():
+    from unittest.mock import MagicMock
+
+    executor = MagicMock()
+    executor.spawn_agent = MagicMock(return_value={
+        "success": False, "error": "spawn_agent: ConnectError: connection refused",
+    })
+    return executor
+
+
+def test_pre_pin_launch_record_empty_model_is_blank(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evidence comes from the saved value: ``""`` records ``blank``, not ``inherit``."""
+    s = _fallback_scheduler(tmp_path, monkeypatch)
+    s._jobs_meta["nightly"]["model"] = ""
+
+    s._run_job("nightly")
+
+    assert s.execution_log.read_recent()[0]["model"] == "blank"
+
+
+def test_bad_fields_launch_record_stores_label_for_non_string_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The invalid-field launch failure records the label, never the raw int."""
+    s = _fallback_scheduler(tmp_path, monkeypatch)
+    s._jobs_meta["nightly"].update({"notify": "nope", "model": 123})
+
+    s._run_job("nightly")
+
+    entry = s.execution_log.read_recent()[0]
+    assert entry["status"] == "failed"
+    assert "invalid job configuration" in entry["result"]
+    assert entry["model"] == "malformed (not a string)"
+
+
+def test_spawn_failure_record_stores_label_for_dict_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed spawn with a dict model writes its record with the label only."""
+    s = _fallback_scheduler(tmp_path, monkeypatch)
+    s.builtin_executor = _failing_spawn_executor()
+    s._jobs_meta["nightly"]["model"] = {"QZXkey": "QZXvalue"}
+
+    s._run_job("nightly")
+
+    entry = s.execution_log.read_recent()[0]
+    assert entry["status"] == "failed"
+    assert entry["model"] == "malformed (not a string)"
+
+
+def test_spawn_failure_record_redacts_short_secret_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sub-256 secret-bearing selector is redacted by the injected redactor."""
+    s = _redacting_scheduler(tmp_path, monkeypatch, _fake_redactor)
+    s.builtin_executor = _failing_spawn_executor()
+    s._jobs_meta["nightly"]["model"] = f"provider/{_SHORT_SECRET}"
+
+    s._run_job("nightly")
+
+    stored = s.execution_log.read_recent()[0]["model"]
+    assert stored == f"provider/{_FAKE_PLACEHOLDER}"
+    assert _SHORT_SECRET[:8] not in stored
+
+
+def test_scheduler_exposes_injected_selector_redactor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = _redacting_scheduler(tmp_path, monkeypatch, _fake_redactor)
+
+    assert s.selector_redactor is _fake_redactor
+
+
+def test_scheduler_default_selector_redactor_is_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = _fallback_scheduler(tmp_path, monkeypatch)
+
+    assert s.selector_redactor is None
+
+
+# ---------------------------------------------------------------------------
+# Task 7.3: actual-root scheduled admission failures
+# ---------------------------------------------------------------------------
+# main._run → real Scheduler._run_job(manual=True) → root spawn/supervisor →
+# main-produced factory → ModelRegistry.admit_scheduled. Every job has
+# notify=false, so any alert below is the launch-failure alert.
+
+
+@pytest.fixture
+def scheduled_root(
+    tmp_xdg: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> Iterator[RootHarness]:
+    """Real-scheduler root; production assertions precede fixture hygiene."""
+    caplog.set_level(logging.WARNING, logger="model_registry")
+    root = RootHarness(tmp_xdg, monkeypatch, real_scheduler=True)
+    try:
+        yield root
+    finally:
+        root.release_leftovers()
+
+
+def _selector_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The registry's emitted scheduled-selector WARN records."""
+    return [r for r in caplog.records if getattr(r, "scheduled_selector_warning", False)]
+
+
+def _assert_failed_launch(
+    root: RootHarness, probe: ScheduledRootProbe, *, evidence: str, error_text: str,
+) -> None:
+    """The admission failure is a recorded launch failure of the already admitted run."""
+    after = probe.after
+    (entry,) = probe.at_admission
+    assert entry.running is True and len(entry.run_ids) == 1
+    assert entry.persisted_last_run and entry.records == []
+    (run_id,) = entry.run_ids
+    (record,) = after.records
+    assert (record["run_id"], record["status"], record["success"], record["model"]) == (
+        run_id, "failed", False, evidence,
+    )
+    assert error_text in record["result"]
+    assert after.state["last_run"] == entry.persisted_last_run
+    assert after.state["last_error"] == record["result"]
+    (alert,) = after.notices
+    assert f"Job {SCHEDULED_TAG} failed to spawn" in alert
+    # The alert carries the same bounded, redacted selector evidence, HTML-escaped.
+    assert f"Model: {html.escape(evidence)}" in alert
+    assert after.tracked is False and after.active_children == []
+    assert probe.pins == [] and probe.creates == [] and probe.registered == [] and probe.loop_calls == []
+    assert after.llm_clients == 0 and after.http_clients == 0 and after.provider_requests == []
+    assert after.view == probe.view_before and after.settings == probe.settings_before
+    assert after.toml == probe.toml_before
+    assert root.unexpected == [] and root.open_clients_at_exit == []
+
+
+_INACTIVE_MAIN_SELECTORS = [
+    pytest.param(None, None, "inherit", "no_active_selection", id="absent"),
+    pytest.param("42", 42, "malformed (not a string)", "malformed_selector", id="integer"),
+]
+
+
+@pytest.mark.parametrize(("literal", "forwarded", "evidence", "code"), _INACTIVE_MAIN_SELECTORS)
+@pytest.mark.parametrize(
+    "saved_default", [INVALID_SAVED, UNCONFIGURED_ID], ids=["no-saved-selection", "saved-model-missing"],
+)
+def test_root_scheduled_job_without_valid_main_fails_before_model_work(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    saved_default: str | None, literal: str | None, forwarded: object, evidence: str, code: str,
+) -> None:
+    """Without a valid Main only an inheriting job (absent selector) or an invalid
+    saved value fails, each with its own code, before warnings, credentials,
+    runtime, clients or provider I/O. A valid explicit selector needs no Main
+    (see ``test_scheduled_model_admission``)."""
+    scheduled_root.serve_provider_chat()
+
+    probe = run_scheduled_root(scheduled_root, monkeypatch, literal, saved_default=saved_default)
+
+    before = probe.view_before
+    assert before.active_model_id is None and before.remembered_model_id == remembered_for(saved_default)
+    assert OTHER_ID in {model.id for model in before.models}
+    assert probe.admits == {"admit": [], "admit_scheduled": [forwarded]}
+    assert probe.codes == [code] and probe.resolved == []
+    assert _selector_warnings(caplog) == []
+    error_text = (
+        "model registry no active selection" if code == "no_active_selection"
+        else "model selector must be '<connection>/<model>'"
+    )
+    _assert_failed_launch(scheduled_root, probe, evidence=evidence, error_text=error_text)
+
+
+@pytest.mark.parametrize(
+    ("selector", "missing_key", "provider", "code", "resolved"),
+    [
+        pytest.param(OTHER_ID, "KEY_GEM", "gem", "credential_resolution_failed", ["gem"], id="known-selector"),
+        pytest.param(
+            "ghost/claude-zzz", "KEY_ACME", "acme", "unknown_connection", [], id="unknown-connection-no-main-fallback",
+        ),
+    ],
+)
+def test_root_scheduled_credential_failure_stays_on_effective_model(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    selector: str, missing_key: str, provider: str, code: str, resolved: list[str],
+) -> None:
+    """A valid selector's credential failure fails the job on that model (one
+    resolution, nothing substituted). An unknown connection fails its own job
+    with no credential work at all: Main's provider is never consulted."""
+    scheduled_root.serve_provider_chat()
+
+    probe = run_scheduled_root(
+        scheduled_root, monkeypatch, f'"{selector}"',
+        before_fire=lambda _root: monkeypatch.delenv(missing_key),
+    )
+
+    assert probe.view_before.active_model_id == MAIN_ID
+    assert probe.admits == {"admit": [], "admit_scheduled": [selector]}
+    assert probe.codes == [code] and probe.resolved == resolved
+    assert _selector_warnings(caplog) == []
+    _assert_failed_launch(
+        scheduled_root, probe, evidence=selector,
+        error_text=(
+            "model registry credential resolution failed" if code == "credential_resolution_failed"
+            else "connection that is not configured"
+        ),
+    )
+
+
+def test_root_scheduled_provider_failure_is_one_attempt_without_fallback(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A provider outage on the pinned model is that run's normal failure: one
+    request to it, no request to Main's provider, no second admission or replay."""
+    scheduled_root.serve_provider_chat(failing_chat_hosts=(GEM_HOST,))
+
+    probe = run_scheduled_root(scheduled_root, monkeypatch, f'"{OTHER_ID}"')
+
+    after = probe.after
+    assert probe.view_before.active_model_id == MAIN_ID
+    assert probe.admits == {"admit": [], "admit_scheduled": [OTHER_ID]}
+    assert probe.codes == [] and [pin.model.id for pin in probe.pins] == [OTHER_ID]
+    assert probe.resolved == ["gem"]
+    ((profile, options),) = probe.creates
+    assert profile is RuntimeProfile.SCHEDULED_AGENT and options.run_model is probe.pins[0]
+    assert len(probe.loop_calls) == 1
+    assert [(r.method, r.url.host, r.url.path) for r in after.provider_requests] == [
+        ("POST", GEM_HOST, "/v1beta/models/gem-1:generateContent"),
+    ]
+    (entry,) = probe.at_admission
+    (run_id,) = entry.run_ids
+    (record,) = after.records
+    assert (record["run_id"], record["status"], record["success"], record["model"]) == (
+        run_id, "failed", False, OTHER_ID,
+    )
+    assert after.notices == []
+    assert after.tracked is False and after.active_children == []
+    assert _selector_warnings(caplog) == []
+    assert after.view == probe.view_before and after.settings == probe.settings_before
+    assert after.toml == probe.toml_before
+    assert after.llm_clients == 1 and after.llm_closed == [True] and after.http_open == []
+    assert scheduled_root.unexpected == [] and scheduled_root.open_clients_at_exit == []
+
+
+_GEM_CHAT_PATH = "/v1beta/models/gem-1:generateContent"
+
+
+@pytest.mark.parametrize(
+    ("messages", "provider_context_error", "sent", "error_text"),
+    [
+        pytest.param(
+            [{"role": "user", "content": "ping"}], True, 1,
+            "context_length_exceeded", id="context-rejected-by-provider",
+        ),
+    ],
+)
+def test_root_scheduled_pinned_capability_or_context_failure_has_no_fallback(
+    scheduled_root: RootHarness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    messages: list[dict], provider_context_error: bool, sent: int, error_text: str,
+) -> None:
+    """After the pin, exceeded context fails that run normally: no Main
+    substitution, no second admission, no cross-model request."""
+    scheduled_root.serve_provider_chat()
+    if provider_context_error:
+        served = scheduled_root._route
+
+        def route(request: httpx.Request) -> httpx.Response:
+            """Reject the pinned model's chat as context-length exceeded."""
+            if request.method == "POST" and request.url.path == _GEM_CHAT_PATH:
+                request.read()
+                scheduled_root.requests.append(request)
+                return httpx.Response(
+                    400, json={"error": {"message": "context_length_exceeded: input too long"}},
+                )
+            return served(request)
+
+        monkeypatch.setattr(scheduled_root, "_route", route)
+
+    probe = run_scheduled_root(scheduled_root, monkeypatch, f'"{OTHER_ID}"', messages=messages)
+
+    after = probe.after
+    assert probe.view_before.active_model_id == MAIN_ID
+    assert probe.admits == {"admit": [], "admit_scheduled": [OTHER_ID]}
+    assert probe.codes == [] and [pin.model.id for pin in probe.pins] == [OTHER_ID]
+    assert probe.resolved == ["gem"] and len(probe.creates) == 1 and len(probe.loop_calls) == 1
+    assert [(r.url.host, r.url.path) for r in after.provider_posts] == [(GEM_HOST, _GEM_CHAT_PATH)] * sent
+    (entry,) = probe.at_admission
+    (run_id,) = entry.run_ids
+    (record,) = after.records
+    assert (record["run_id"], record["status"], record["success"], record["model"]) == (
+        run_id, "failed", False, OTHER_ID,
+    )
+    assert error_text in record["result"]
+    assert after.notices == []
+    assert after.tracked is False and after.active_children == []
+    assert _selector_warnings(caplog) == []
+    assert after.view == probe.view_before and after.settings == probe.settings_before
+    assert after.toml == probe.toml_before
+    assert after.llm_clients == 1 and after.llm_closed == [True] and after.http_open == []
+    assert scheduled_root.unexpected == [] and scheduled_root.open_clients_at_exit == []

@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+import os
+
+import pytest
+
+from path_policy import PathPolicy, PathVerdict
 from xdg import migration_sentinel_exists, write_migration_sentinel, xdg_paths
 
 
@@ -22,6 +28,9 @@ class TestXdgPathsDefaults:
         assert paths.runtime_dir == home_state / "test-agent"
 
         assert paths.config_file == paths.config_home / "config.toml"
+        assert paths.models_config_file == paths.config_home / "models-config.toml"
+        assert paths.model_selection_file == paths.config_home / "model-selection.toml"
+        assert paths.models_cache_file == paths.cache_home / "models-cache.json"
         assert paths.scheduler_config == paths.config_home / "scheduler.toml"
         assert paths.memory_file == paths.data_home / "memory.json"
         assert paths.graph_memory_db == paths.data_home / "graph_memory"
@@ -48,6 +57,9 @@ class TestXdgPathsDefaults:
         paths = xdg_paths("agent")
 
         assert paths.config_home == tmp_path / "c1" / "agent"
+        assert paths.models_config_file == tmp_path / "c1" / "agent" / "models-config.toml"
+        assert paths.model_selection_file == tmp_path / "c1" / "agent" / "model-selection.toml"
+        assert paths.models_cache_file == tmp_path / "c4" / "agent" / "models-cache.json"
         assert paths.data_home == tmp_path / "c2" / "agent"
         assert paths.state_home == tmp_path / "c3" / "agent"
         assert paths.cache_home == tmp_path / "c4" / "agent"
@@ -78,6 +90,66 @@ class TestXdgPathsDefaults:
         for d in (paths.config_home, paths.data_home, paths.state_home,
                   paths.cache_home, paths.runtime_dir):
             assert not d.exists()
+        for leaf in (paths.model_selection_file, paths.models_cache_file,
+                     paths.models_config_file):
+            assert not leaf.exists()
+        assert sorted(p.name for p in tmp_xdg.iterdir()) == ["runtime"]
+
+
+def test_model_selection_and_cache_leaves_resolve_in_config_and_cache_homes(
+    tmp_path, monkeypatch,
+):
+    """Selection preference in protected config home; cache in cache home only."""
+    for var in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "custom-cfg"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "custom-cache"))
+    before = sorted(tmp_path.rglob("*"))
+
+    paths = xdg_paths("piclaw")
+
+    assert sorted(tmp_path.rglob("*")) == before  # pure: nothing created
+    assert paths.model_selection_file == tmp_path / "custom-cfg" / "piclaw" / "model-selection.toml"
+    assert paths.models_cache_file == tmp_path / "custom-cache" / "piclaw" / "models-cache.json"
+    # Retired combined settings path stays resolvable for its existence check only.
+    assert paths.models_config_file == tmp_path / "custom-cfg" / "piclaw" / "models-config.toml"
+    assert paths.models_config_file != paths.model_selection_file
+    assert paths.data_home == tmp_path / "home" / ".local" / "share" / "piclaw"
+
+    # Moving only the cache root leaves the durable preference in config home.
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    moved = xdg_paths("piclaw")
+    assert moved.model_selection_file == paths.model_selection_file
+    assert moved.models_cache_file == tmp_path / "home" / ".cache" / "piclaw" / "models-cache.json"
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        paths.model_selection_file = tmp_path / "elsewhere.toml"  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        paths.models_cache_file = tmp_path / "elsewhere.json"  # type: ignore[misc]
+
+    # Real access-control boundary built from the resolved homes (ADR-0019/0028).
+    for d in (paths.config_home, paths.data_home, paths.state_home,
+              tmp_path / "ws", tmp_path / "dl"):
+        d.mkdir(parents=True, exist_ok=True)
+    policy = PathPolicy.create(
+        agent_name="piclaw",
+        workspace_dir=str(tmp_path / "ws"),
+        downloads_dir=str(tmp_path / "dl"),
+        tmp_dir=str(tmp_path / "tmp"),
+        skills_dir=str(tmp_path / "skills"),
+        results_dir=str(tmp_path / "results"),
+        data_home=str(paths.data_home),
+        state_home=str(paths.state_home),
+        config_home=str(paths.config_home),
+    )
+    selection = os.path.realpath(paths.model_selection_file)
+    for operation in ("read", "write"):
+        verdict, _reason = policy.classify(selection, operation)
+        assert verdict is PathVerdict.PROHIBITED
+    # No new rule for the cache leaf: it is not opened up by the policy.
+    cache_verdict, _ = policy.classify(os.path.realpath(paths.models_cache_file), "write")
+    assert cache_verdict is not PathVerdict.ALLOWED
 
 
 class TestMigrationSentinel:

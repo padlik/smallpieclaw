@@ -15,6 +15,7 @@ import os
 import re
 from typing import TYPE_CHECKING
 
+from outcome_utils import read_execution, with_execution
 from path_policy import PathVerdict
 
 if TYPE_CHECKING:
@@ -78,14 +79,14 @@ class FileTools:
 
     def _policy_none_error(self) -> dict:
         """Fail-closed error when path_policy is not configured."""
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": "Path policy not configured — refusing file operation",
             "error_type": "prohibited_path",
             "recoverable": False,
             "suggestion": "Restart the agent with a valid configuration so the path policy is initialised.",
-        }
+        }, "refused")
 
     def _prohibited_error(self, reason: str, real_path: str = "") -> dict:
         """Fail-closed error for a path classified as PROHIBITED.
@@ -113,14 +114,14 @@ class FileTools:
                 "Limit file operations to allowed directories (e.g. the workspace). "
                 "Ask the operator to add the directory to allowed_dirs if legitimate access is needed."
             )
-        return {
+        return with_execution({
             "success": False,
             "output": "",
             "error": f"Permission denied: prohibited path ({reason})",
             "error_type": "prohibited_path",
             "recoverable": False,
             "suggestion": suggestion,
-        }
+        }, "refused")
 
     def _resolve_skill_paths(self, content: str, path: str) -> str:
         """Resolve relative paths in SKILL.md content using the skill registry."""
@@ -206,7 +207,7 @@ class FileTools:
                         scheduled: bool = False) -> dict:
         path = str(args.get("path", "")).strip()
         if not path:
-            return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "No path provided.", "exit_code": -1}, "refused")
 
         real_path = os.path.realpath(os.path.expanduser(path))
         args["_resolved_path"] = real_path
@@ -233,6 +234,10 @@ class FileTools:
         return self._run_file_read(args, caller_tag=caller_tag)
 
     def _run_file_read(self, args: dict, caller_tag: str = "") -> dict:
+        """Execute file_read; the attempted operation (even a failed one) counts as executed."""
+        return with_execution(self._file_read_impl(args, caller_tag=caller_tag), "executed")
+
+    def _file_read_impl(self, args: dict, caller_tag: str = "") -> dict:
         path = args.get("_resolved_path") or str(args.get("path", "")).strip()
         max_bytes = int(args.get("max_bytes", 50_000))
         offset = int(args.get("offset", 0))
@@ -302,15 +307,15 @@ class FileTools:
         path_a = os.path.expanduser(str(args.get("path_a", "")).strip())
         path_b = os.path.expanduser(str(args.get("path_b", "")).strip())
         if not path_a or not path_b:
-            return {
+            return with_execution({
                 "success": False, "output": "",
                 "error": "file_diff: both 'path_a' and 'path_b' are required.",
                 "exit_code": -1,
-            }
+            }, "refused")
         try:
             context_lines = int(args.get("context_lines", 3))
         except (TypeError, ValueError):
-            return {"success": False, "output": "", "error": "file_diff: 'context_lines' must be an integer.", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "file_diff: 'context_lines' must be an integer.", "exit_code": -1}, "refused")
         if context_lines < 0:
             context_lines = 0
         logger.info("Built-in file_diff: %s <-> %s (context=%d)", path_a, path_b, context_lines)
@@ -383,6 +388,24 @@ class FileTools:
         self, args: dict, caller_tag: str = "", *, approved_zone_paths: tuple[str, ...] = (),
         scope_owner: str | None = None, scheduled: bool = False,
     ) -> dict:
+        """Execute file_diff, marking only attempted reads as executed.
+
+        The recheck inside the implementation may refuse (policy, prohibited,
+        scheduled denial, changed authorisation); those outcomes carry their own
+        marker and must not be upgraded.
+        """
+        outcome = self._file_diff_impl(
+            args, caller_tag=caller_tag, approved_zone_paths=approved_zone_paths,
+            scope_owner=scope_owner, scheduled=scheduled,
+        )
+        if read_execution(outcome) == "unknown" and not outcome.get("requires_confirmation"):
+            return with_execution(outcome, "executed")
+        return outcome
+
+    def _file_diff_impl(
+        self, args: dict, caller_tag: str = "", *, approved_zone_paths: tuple[str, ...] = (),
+        scope_owner: str | None = None, scheduled: bool = False,
+    ) -> dict:
         """Execute file_diff after zone gate has passed.
 
         Paths are re-resolved here (a symlink may have been retargeted since the
@@ -425,7 +448,10 @@ class FileTools:
                 and ledger.check("file_diff", os.path.dirname(path), scope_owner=scope_owner)
             )
             if not (has_grant or os.path.dirname(path) in approved_dirs):
-                return {"success": False, "output": "", "error": "file_diff authorization changed; refusing to read either file.", "exit_code": 1}
+                return with_execution(
+                    {"success": False, "output": "", "error": "file_diff authorization changed; refusing to read either file.", "exit_code": 1},
+                    "refused",
+                )
         path_a, path_b = paths
         try:
             max_bytes = int(args.get("max_bytes", 200_000))
@@ -464,7 +490,7 @@ class FileTools:
         if mode not in ("w", "a"):
             mode = "w"
         if not path:
-            return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "No path provided.", "exit_code": -1}, "refused")
 
         action = "append to" if mode == "a" else "overwrite"
         desc = f"{action.capitalize()} file: <code>{path}</code> ({len(content)} chars)"
@@ -492,6 +518,10 @@ class FileTools:
         return self._run_file_write(args, caller_tag=caller_tag)
 
     def _run_file_write(self, args: dict, caller_tag: str = "") -> dict:
+        """Execute file_write; the attempted operation (even a failed one) counts as executed."""
+        return with_execution(self._file_write_impl(args, caller_tag=caller_tag), "executed")
+
+    def _file_write_impl(self, args: dict, caller_tag: str = "") -> dict:
         path = args.get("_resolved_path") or str(args.get("path", "")).strip()
         content = str(args.get("content", ""))
         mode = str(args.get("mode", "w"))
@@ -542,14 +572,14 @@ class FileTools:
         try:
             occurrence = int(args.get("occurrence", 1))
         except (ValueError, TypeError):
-            return {"success": False, "output": "", "error": "file_patch: 'occurrence' must be an integer.", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "file_patch: 'occurrence' must be an integer.", "exit_code": -1}, "refused")
         if occurrence < 0:
-            return {"success": False, "output": "", "error": "file_patch: 'occurrence' must be >= 0 (0 = replace all).", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "file_patch: 'occurrence' must be >= 0 (0 = replace all).", "exit_code": -1}, "refused")
 
         if not path:
-            return {"success": False, "output": "", "error": "file_patch: 'path' is required.", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "file_patch: 'path' is required.", "exit_code": -1}, "refused")
         if not old_str:
-            return {"success": False, "output": "", "error": "file_patch: 'old_str' is required.", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "file_patch: 'old_str' is required.", "exit_code": -1}, "refused")
 
         # FIX 2: realpath + zone classification BEFORE any file read (content oracle fix)
         real_path = os.path.realpath(os.path.expanduser(path))
@@ -595,10 +625,17 @@ class FileTools:
 
         # ALLOWED or grant-covered: check existence, then patch
         if not os.path.exists(path):
-            return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
+            return with_execution(
+                {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1},
+                "executed",
+            )
         return self._run_file_patch(args, caller_tag=caller_tag)
 
     def _run_file_patch(self, args: dict, caller_tag: str = "") -> dict:
+        """Execute file_patch; the attempted operation (even a failed one) counts as executed."""
+        return with_execution(self._file_patch_impl(args, caller_tag=caller_tag), "executed")
+
+    def _file_patch_impl(self, args: dict, caller_tag: str = "") -> dict:
         path = args.get("_resolved_path") or str(args.get("path", "")).strip()
         old_str = str(args.get("old_str", ""))
         new_str = str(args.get("new_str", ""))
@@ -656,7 +693,7 @@ class FileTools:
                         scheduled: bool = False) -> dict:
         path = os.path.expanduser(str(args.get("path", "")).strip())
         if not path:
-            return {"success": False, "output": "", "error": "No path provided.", "exit_code": -1}
+            return with_execution({"success": False, "output": "", "error": "No path provided.", "exit_code": -1}, "refused")
 
         real_path = os.path.realpath(path)
         args["_resolved_path"] = real_path
@@ -685,19 +722,32 @@ class FileTools:
         return self._run_file_send(args, caller_tag=caller_tag)
 
     def _run_file_send(self, args: dict, caller_tag: str = "") -> dict:
+        """Execute file_send; the attempted operation (even a failed one) counts as executed."""
+        outcome = self._file_send_impl(args, caller_tag=caller_tag)
+        if read_execution(outcome) == "unknown":
+            return with_execution(outcome, "executed")
+        return outcome
+
+    def _file_send_impl(self, args: dict, caller_tag: str = "") -> dict:
         """Execute file_send after zone gate has passed."""
         path = args.get("_resolved_path") or os.path.expanduser(str(args.get("path", "")).strip())
         caption = str(args.get("caption", "")).strip()
         if not os.path.exists(path):
-            return {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1}
+            return with_execution(
+                {"success": False, "output": "", "error": f"File not found: {path}", "exit_code": 1},
+                "refused",
+            )
         if not os.path.isfile(path):
-            return {"success": False, "output": "", "error": f"Not a file: {path}", "exit_code": 1}
+            return with_execution(
+                {"success": False, "output": "", "error": f"Not a file: {path}", "exit_code": 1},
+                "refused",
+            )
         size = os.path.getsize(path)
         if size > self._MAX_FILE_SIZE:
-            return {
+            return with_execution({
                 "success": False, "output": "",
                 "error": f"File too large ({size // 1024 // 1024} MB). Max 50 MB.", "exit_code": 1,
-            }
+            }, "refused")
         logger.info("Built-in file_send: %s (%d bytes)", path, size)
         return {
             "success": True,

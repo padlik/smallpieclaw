@@ -7,20 +7,31 @@ Provides token estimation and context compaction: when the running token count
 approaches the configured limit, the middle portion of the conversation history
 is summarised by the LLM to keep the context window within bounds.
 
-Compaction is content-aware: tool-result messages (shell/file output) are
-trimmed head+tail so both the command/header and the trailing error region
-survive, while model prose is bounded with a simple head cap. On LLM failure a
-deterministic fallback summary is produced instead of returning the oversized
-original messages, and the most recent (verbatim) messages are capped so a
-single huge tool result cannot overflow the real model context.
+Compaction is content-aware: only the middle history rendered in the summary
+prompt is bounded; tool-result messages (shell/file output) retain both ends.
+The configured-threshold path makes one attempt per request: the goal and the
+last two messages (whole native call/result
+spans) are never capped, only a nonempty middle is summarized, and an empty
+middle changes and truncates nothing. A failed or empty summary and an invalid
+candidate raise ``CompactionFailedError``: the caller keeps the original history
+and disables further automatic attempts for that run. Cancellation propagates.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import httpx
+
 from prompt_builder import estimate_messages_tokens
+from providers._errors import (
+    LLMEmptyResponseError,
+    LLMError,
+    LLMPermanentError,
+)
 
 if TYPE_CHECKING:
     from llm_client import LLMClient  # noqa
@@ -32,18 +43,21 @@ logger = logging.getLogger(__name__)
 _ASSISTANT_CAP = 800        # model action/prose: intent is at the start
 _RESULT_HEAD = 1200         # tool result: keep header (command/path/success)
 _RESULT_TAIL = 1200         # tool result: keep tail (errors/final output)
+_CALL_ARGS_CAP = 400        # tool call arguments rendered per call
 
-# Cap (characters) for the most recent, verbatim-preserved messages so a single
-# huge tool result cannot blow the context even after compaction.
-_RECENT_HEAD = 3000
-_RECENT_TAIL = 3000
 
-# Hard cap (characters) on the compaction summary itself.
-_SUMMARY_CAP = 6000
+class CompactionFailedError(Exception):
+    """An automatic compaction attempt failed; the caller keeps the original history.
 
-# Floor (characters) below which deterministic budget-tightening stops shrinking
-# content — going further would discard information without meaningfully helping.
-_SHRINK_FLOOR = 400
+    Carries only fixed labels (never provider, prompt, summary or history text):
+    ``reason`` is ``summary_failed``, ``empty_summary`` or ``invalid_candidate`` and
+    ``cause_type`` the failing exception's class name (``"-"`` when none).
+    """
+
+    def __init__(self, reason: str, cause_type: str = "-") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.cause_type = cause_type
 
 
 def _active_model(llm: "LLMClient") -> str | None:
@@ -58,57 +72,157 @@ def _active_model(llm: "LLMClient") -> str | None:
         return None
 
 
-def resolve_compaction_threshold(llm_cfg: dict, ctx_max_tokens: int) -> tuple[int, int]:
-    """Compute the effective context window and compaction threshold.
+_MALFORMED_HISTORY = (
+    "Conversation history contains malformed tool-call groups and cannot be "
+    "sent or compacted. Start a new task."
+)
 
-    Args:
-        llm_cfg: Active model configuration dict. May contain ``context_window``
-            and ``max_tokens`` keys.
-        ctx_max_tokens: Agent-level context-window limit, used as a fallback when
-            the model does not specify its own ``context_window``.
 
-    Returns:
-        A ``(effective_window, compaction_threshold)`` tuple. The threshold
-        reserves the model's completion-token budget, applies an 85% margin,
-        and clamps to a 256-token floor:
+def _valid_call(call: object) -> str | None:
+    """Return the call ID when *call* is a supported native call entry."""
+    if not isinstance(call, dict):
+        return None
+    call_id = call.get("id")
+    func = call.get("function")
+    if not isinstance(call_id, str) or not call_id or not isinstance(func, dict):
+        return None
+    name = func.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    if call.get("type") not in (None, "function"):
+        return None
+    if "arguments" not in func:
+        return None
+    arguments = func["arguments"]
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError, RecursionError):
+            return None
+        if not isinstance(parsed, (dict, list)):
+            return None
+    elif not isinstance(arguments, (dict, list)):
+        return None
+    return call_id
 
-        ``threshold = max(int((effective_window - max_tokens) * 0.85), 256)``.
+
+def validate_native_history(messages: list[dict]) -> None:
+    """Reject malformed native tool-call groups with a fixed, sanitized error.
+
+    Every assistant ``tool_calls`` message needs well-formed calls with unique
+    non-empty IDs within the group, immediately followed by exactly one string-content tool
+    result per ID. Orphan or mismatched results raise. Nothing is repaired.
     """
-    cfg = llm_cfg if isinstance(llm_cfg, dict) else {}
-    effective = ctx_max_tokens
-    if cfg.get("context_window"):
-        effective = cfg["context_window"]
-    raw_max_tokens = cfg.get("max_tokens")
-    max_tokens = 1024 if raw_max_tokens is None else raw_max_tokens
-    threshold = max(int((effective - max_tokens) * 0.85), 256)
-    return effective, threshold
+    i, n = 0, len(messages)
+    while i < n:
+        m = messages[i]
+        if not isinstance(m, dict):
+            raise LLMPermanentError(_MALFORMED_HISTORY)
+        role = m.get("role")
+        calls = m.get("tool_calls") if role == "assistant" else None
+        if role == "tool":
+            raise LLMPermanentError(_MALFORMED_HISTORY)
+        i += 1
+        if not calls:
+            continue
+        if not isinstance(calls, list):
+            raise LLMPermanentError(_MALFORMED_HISTORY)
+        expected: set[str] = set()
+        for call in calls:
+            call_id = _valid_call(call)
+            if call_id is None or call_id in expected:
+                raise LLMPermanentError(_MALFORMED_HISTORY)
+            expected.add(call_id)
+        got: set[str] = set()
+        while i < n and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+            result = messages[i]
+            result_id = result.get("tool_call_id")
+            if (
+                not isinstance(result_id, str)
+                or not result_id
+                or not isinstance(result.get("content"), str)
+                or result_id not in expected
+                or result_id in got
+            ):
+                raise LLMPermanentError(_MALFORMED_HISTORY)
+            got.add(result_id)
+            i += 1
+        if got != expected:
+            raise LLMPermanentError(_MALFORMED_HISTORY)
 
 
-def _build_compacted(
-    first: list[dict],
+def _message_spans(messages: list[dict]) -> list[tuple[int, int]]:
+    """Return half-open index spans; a tool-calling assistant and its results are one."""
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(messages)
+    while i < n:
+        m = messages[i]
+        end = i + 1
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = {
+                c.get("id") for c in m["tool_calls"] if isinstance(c, dict) and c.get("id")
+            }
+            while (
+                end < n
+                and messages[end].get("role") == "tool"
+                and messages[end].get("tool_call_id") in ids
+            ):
+                end += 1
+        spans.append((i, end))
+        i = end
+    return spans
+
+
+def _partition_compaction(
+    messages: list[dict], goal_idx: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Split original indices into (first, middle, last) on whole-span boundaries.
+
+    ``last`` covers the final two messages expanded back to a span boundary;
+    ``first`` is the whole span holding the goal unless that span is in
+    ``last``; ``middle`` is everything else in original order.
+    """
+    n = len(messages)
+    goal = min(max(0, goal_idx), n - 1)
+    spans = _message_spans(messages)
+    suffix_start = next(s for s, e in spans if s <= max(0, n - 2) < e)
+    last = list(range(suffix_start, n))
+    first: list[int] = []
+    if goal < suffix_start:
+        first = list(range(*next((s, e) for s, e in spans if s <= goal < e)))
+    kept = set(first) | set(last)
+    middle = [i for i in range(n) if i not in kept]
+    return first, middle, last
+
+
+def _assemble(
+    messages: list[dict],
+    first: list[int],
+    middle: list[int],
+    last: list[int],
+    goal: int,
     summary: str,
-    last: list[dict],
-    summary_cap: int,
-    recent_cap: int,
-    first_cap: int,
-) -> list[dict]:
-    """Assemble the compacted message list under the given character caps."""
-    bounded_summary = _truncate_head_tail(summary, summary_cap // 2, summary_cap // 2)
-    head = [_cap_string_message(m, first_cap) for m in first]
-    tail = [_cap_string_message(m, recent_cap) for m in last]
-    return head + [
-        {"role": "user", "content": f"[Compacted context — earlier steps summary]\n{bounded_summary}"}
-    ] + tail
+) -> tuple[list[dict], int]:
+    """Publish a whole summary while keeping goal and recent spans unchanged."""
+    out: list[dict] = []
+    goal_pos = 0
 
+    def emit(i: int) -> None:
+        nonlocal goal_pos
+        if i == goal:
+            goal_pos = len(out)
+        out.append(messages[i])
 
-def _cap_string_message(m: dict, cap: int) -> dict:
-    """Return a copy of *m* with string content head+tail trimmed to ~*cap* chars."""
-    content = m.get("content")
-    if isinstance(content, str) and len(content) > cap:
-        capped = dict(m)
-        capped["content"] = _truncate_head_tail(content, cap // 2, cap // 2)
-        return capped
-    return m
+    for i in first:
+        emit(i)
+    if middle:
+        out.append({
+            "role": "user",
+            "content": f"[Compacted context — earlier steps summary]\n{summary}",
+        })
+    for i in last:
+        emit(i)
+    return out, goal_pos
 
 
 def _truncate_head(text: str, cap: int) -> str:
@@ -129,9 +243,26 @@ def _truncate_head_tail(text: str, head: int, tail: int) -> str:
 def _format_middle_message(m: dict) -> str:
     """Render one middle message for the compaction prompt, content-aware."""
     role = m.get("role", "?")
-    content = str(m.get("content") or "")
+    content = m.get("content")
+    content = content if isinstance(content, str) else ("" if content is None else str(content))
     if role == "assistant":
         body = _truncate_head(content, _ASSISTANT_CAP)
+        calls = []
+        for call in m.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            func = call.get("function") or {}
+            args = func.get("arguments", "")
+            args = args if isinstance(args, str) else json.dumps(args, default=str)
+            calls.append(
+                f"{func.get('name', 'tool')}({_truncate_head(args, _CALL_ARGS_CAP)}) "
+                f"id={call.get('id', '?')}"
+            )
+        if calls:
+            body = (body + "\n" if body else "") + "tool calls: " + "; ".join(calls)
+    elif role == "tool":
+        body = _truncate_head_tail(content, _RESULT_HEAD, _RESULT_TAIL)
+        return f"[tool result id={m.get('tool_call_id', '?')}]: {body}"
     else:
         # User/tool-result messages: preserve both ends so a "failed/succeeded"
         # header and the trailing error/output region both survive.
@@ -139,197 +270,84 @@ def _format_middle_message(m: dict) -> str:
     return f"[{role}]: {body}"
 
 
-def _cap_recent_message(m: dict) -> dict:
-    """Return a copy of *m* with oversized string content head+tail trimmed."""
-    content = m.get("content")
-    if isinstance(content, str) and len(content) > _RECENT_HEAD + _RECENT_TAIL:
-        capped = dict(m)
-        capped["content"] = _truncate_head_tail(content, _RECENT_HEAD, _RECENT_TAIL)
-        return capped
-    return m
-
-
-def _cap_short_overbudget_context(
-    messages: list[dict],
-    system: str,
-    threshold: int,
-    llm: "LLMClient",
-) -> list[dict]:
-    """Cap a short but already-overbudget history without adding a summary."""
-    cap = _RECENT_HEAD + _RECENT_TAIL
-    capped = [_cap_string_message(m, cap) for m in messages]
-    new_total = estimate_messages_tokens(capped, system, model=_active_model(llm))
-    while new_total > threshold and cap > _SHRINK_FLOOR:
-        cap = max(_SHRINK_FLOOR, cap // 2)
-        capped = [_cap_string_message(m, cap) for m in messages]
-        new_total = estimate_messages_tokens(capped, system, model=_active_model(llm))
-    logger.warning(
-        "Short context exceeded budget; capped message contents to ≤%d chars → ~%d tokens",
-        cap, new_total,
+def _summary_prompt(messages: list[dict], middle: list[int]) -> str:
+    """Render the compaction prompt for the eligible middle."""
+    middle_text = "\n".join(_format_middle_message(messages[i]) for i in middle)
+    return (
+        "Summarize these intermediate agent steps concisely in bullet points "
+        "(preserve tool names, key outputs, errors, and decisions):\n\n" + middle_text
     )
-    return capped
 
 
-def _fallback_summary(middle: list[dict]) -> str:
-    """Deterministic, bounded summary used when the compaction LLM is unavailable."""
-    rendered = "\n".join(_format_middle_message(m) for m in middle)
-    return _truncate_head_tail(rendered, _SUMMARY_CAP // 2, _SUMMARY_CAP // 2)
+def _summarize_automatic(
+    messages: list[dict],
+    middle: list[int],
+    llm: "LLMClient",
+    summarize: Callable[[str], str] | None,
+) -> str:
+    """Return the stripped, non-empty summary or raise :class:`CompactionFailedError`.
+
+    Only provider failures (``LLMError``, ``LLMEmptyResponseError``, ``httpx.HTTPError``)
+    and blank text are compaction failures. Cancellation (``LLMCancelledError``) and
+    unexpected programmer errors propagate unchanged.
+    """
+    prompt = _summary_prompt(messages, middle)
+    try:
+        if summarize is not None:
+            text = summarize(prompt)
+        else:
+            text = llm.chat([{"role": "user", "content": prompt}])
+    except (LLMError, LLMEmptyResponseError, httpx.HTTPError) as exc:
+        raise CompactionFailedError("summary_failed", type(exc).__name__) from exc
+    if not isinstance(text, str) or not text.strip():
+        raise CompactionFailedError("empty_summary")
+    return text.strip()
 
 
 def maybe_compact(
     messages: list[dict],
     system: str,
-    ctx_max_tokens: int,
     llm: "LLMClient",
     *,
+    threshold: int,
     goal_idx: int = 0,
     tool_defs_tokens: int = 0,
+    input_tokens: int | None = None,
+    summarize: Callable[[str], str] | None = None,
 ) -> tuple[list[dict], int]:
-    """Return a (possibly compacted) copy of *messages* and the goal's new index.
+    """Summarize only nonempty middle history once when input exceeds threshold.
 
-    If the estimated token count of *messages* plus *system* plus
-    ``tool_defs_tokens`` exceeds 85 % of the effective context window (after
-    reserving completion tokens), the middle portion of the conversation is
-    summarised and replaced with a single compaction summary message.
-
-    The compaction threshold is computed by :func:`resolve_compaction_threshold`
-    from the active model's ``llm_cfg``; it reserves completion tokens first,
-    then applies the 85% margin, finally clamping to a 256-token floor:
-    ``threshold = max(int((effective - max_tokens) * 0.85), 256)``. This
-    prevents the context from growing into the token budget the model needs
-    for its response. ``ctx_max_tokens`` is the agent-level context-window
-    limit, and the effective limit is the per-model ``context_window`` when set.
-
-    The 256-token floor is a last-resort guard for the unvalidated raw-dict path
-    where ``max_tokens >= ctx_max_tokens``; validated configs always produce a
-    positive raw threshold because ``context_window > max_tokens`` is enforced at
-    parse time.
-
-    The current active goal and the two most recent messages are preserved, but
-    very large recent tool-result content is capped head+tail so it cannot
-    overflow the real model context. If the compaction LLM call fails, a
-    deterministic fallback summary is returned rather than the un-compacted
-    oversized messages.
-
-    The goal message is preserved verbatim on every path, but its position in
-    the returned list is *not* fixed: on full compaction it becomes the ``first``
-    anchor at index 0 when it precedes the recent tail, or it is kept inside the
-    preserved ``last`` tail (at index 2 or 3 of the length-4 compacted list) when
-    it already lies within the two most recent messages. The returned index
-    locates the goal precisely so callers never have to guess after compaction.
-
-    Args:
-        messages: Conversation history to (potentially) compact.
-        system: System prompt string (used for token estimation only).
-        ctx_max_tokens: Effective context-window limit in tokens (per-model
-            ``context_window`` or ``agent.ctx_max_tokens``).
-        llm: LLM client used for the compaction summary call.
-        goal_idx: Index of the current active goal message within *messages*.
-            When ``react_loop`` prepends short-term history before the current
-            user goal, ``messages[0]`` is stale prior conversation, not the
-            goal.  Passing the correct index ensures the goal is pinned into
-            the ``first`` slot rather than being swept into the summarised
-            middle.  Defaults to ``0`` for backward-compatibility when no
-            history precedes the goal.
-        tool_defs_tokens: Extra token count to include in the total, e.g. the
-            space consumed by tool definitions that are sent with every model
-            call. This makes compaction aware of otherwise-invisible tool-def
-            overhead. Defaults to 0.
-
-    Returns:
-        A ``(compacted_messages, new_goal_idx)`` tuple where ``new_goal_idx`` is
-        the index of the goal message within ``compacted_messages``. All call
-        sites must unpack this tuple.
+    The goal and last two messages (whole native call/result spans) remain
+    unchanged. An empty middle returns the original messages without truncation.
+    A failed or invalid summary raises ``CompactionFailedError`` without publishing
+    a candidate; cancellation propagates. The caller owns run-scoped warning,
+    disabling further automatic attempts and retention of original history.
     """
-    total = estimate_messages_tokens(messages, system, model=_active_model(llm)) + tool_defs_tokens
-    _, threshold = resolve_compaction_threshold(llm.llm_cfg, ctx_max_tokens)
-    if total <= threshold:
-        # Under threshold: messages returned unchanged, so is the goal position.
+    validate_native_history(messages)
+    if not messages:
         return messages, goal_idx
-    if len(messages) <= 3:
-        # Capping-only path preserves order and length, so the goal keeps its
-        # index (clamped defensively into the valid range).
-        capped = _cap_short_overbudget_context(messages, system, threshold, llm)
-        return capped, min(max(0, goal_idx), len(capped) - 1)
-
-    logger.warning(
-        "Context size ~%d tokens exceeds threshold %d — compacting…",
-        total, threshold,
-    )
-
-    # Clamp goal_idx so there is always at least one message in middle and two
-    # in last. When the goal is very close to the end (e.g. compaction fires on
-    # the first step before any ReAct messages accumulate), the goal will land
-    # in `last` rather than `first`, but it is still preserved verbatim.
-    _goal = min(goal_idx, max(0, len(messages) - 3))
-    first = [messages[_goal]]
-    # Short-term history that precedes the goal (messages[:_goal]) is fed into
-    # the middle so it is summarised rather than silently dropped.
-    middle = messages[:_goal] + messages[_goal + 1:-2]
-    # The two most recent messages are preserved; _build_compacted caps oversized
-    # content head+tail so a single huge tool result cannot overflow the context.
-    last = messages[-2:]
-
-    middle_text = "\n".join(_format_middle_message(m) for m in middle)
-
-    summary: str
-    try:
-        summary = llm.chat([{
-            "role": "user",
-            "content": (
-                "Summarize these intermediate agent steps concisely in bullet points "
-                "(preserve tool names, key outputs, errors, and decisions):\n\n" + middle_text
-            ),
-        }])
-        if not (summary or "").strip():
-            raise ValueError("empty compaction summary")
-    except Exception as exc:
-        logger.error("Compaction LLM call failed: %s — using deterministic fallback", exc)
-        summary = _fallback_summary(middle)
-
-    # Keep the summary itself bounded.
-    compacted = _build_compacted(
-        first, summary, last,
-        summary_cap=_SUMMARY_CAP, recent_cap=_RECENT_HEAD + _RECENT_TAIL,
-        first_cap=_RECENT_HEAD + _RECENT_TAIL,
-    )
-
-    new_total = estimate_messages_tokens(compacted, system, model=_active_model(llm))
-
-    # Deterministic budget-tightening: if the compacted context still exceeds the
-    # threshold (e.g. an enormous first message or recent tool result), shrink the
-    # summary, the preserved goal, and the recent messages progressively until it
-    # fits or a sensible floor is reached. This guarantees compaction never hands
-    # the model an over-budget context.
-    if new_total > threshold:
-        summary_cap = _SUMMARY_CAP
-        recent_cap = _RECENT_HEAD + _RECENT_TAIL
-        first_cap = _RECENT_HEAD + _RECENT_TAIL
-        while new_total > threshold and (
-            summary_cap > _SHRINK_FLOOR or recent_cap > _SHRINK_FLOOR or first_cap > _SHRINK_FLOOR
-        ):
-            summary_cap = max(_SHRINK_FLOOR, summary_cap // 2)
-            recent_cap = max(_SHRINK_FLOOR, recent_cap // 2)
-            first_cap = max(_SHRINK_FLOOR, first_cap // 2)
-            compacted = _build_compacted(
-                first, summary, last,
-                summary_cap=summary_cap, recent_cap=recent_cap, first_cap=first_cap,
-            )
-            new_total = estimate_messages_tokens(compacted, system, model=_active_model(llm))
-        logger.warning(
-            "Compacted context still large; applied deterministic tightening "
-            "(summary≤%d, recent≤%d, goal≤%d chars) → ~%d tokens",
-            summary_cap, recent_cap, first_cap, new_total,
-        )
-
-    logger.info("Compacted context: %d → ~%d tokens", total, new_total)
-
-    # Locate the goal in the compacted list. `_build_compacted` returns
-    # [first_msg, summary_msg, last[0], last[1]] (length 4). When the goal
-    # preceded the recent tail it became the `first` anchor (index 0); otherwise
-    # it was clamped into `last` and keeps its offset from the end of the list.
-    if goal_idx <= len(messages) - 3:
-        new_goal_idx = 0
+    message_total = estimate_messages_tokens(messages, system, model=_active_model(llm))
+    if input_tokens is not None:
+        total = input_tokens
+        overhead = max(0, input_tokens - message_total)
     else:
-        new_goal_idx = len(compacted) - (len(messages) - goal_idx)
+        total = message_total + tool_defs_tokens
+        overhead = tool_defs_tokens
+    if total <= threshold:
+        return messages, goal_idx
+    goal = min(max(0, goal_idx), len(messages) - 1)
+    first, middle, last = _partition_compaction(messages, goal)
+    if not middle:
+        return messages, goal_idx
+    logger.warning("Context size ~%d tokens exceeds threshold %d — compacting…", total, threshold)
+    summary = _summarize_automatic(messages, middle, llm, summarize)
+    compacted, new_goal_idx = _assemble(messages, first, middle, last, goal, summary)
+    try:
+        validate_native_history(compacted)
+    except LLMPermanentError as exc:
+        raise CompactionFailedError("invalid_candidate", type(exc).__name__) from exc
+    logger.info(
+        "Compacted context: %d → ~%d tokens", total,
+        estimate_messages_tokens(compacted, system, model=_active_model(llm)) + overhead,
+    )
     return compacted, new_goal_idx
