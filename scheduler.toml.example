@@ -18,12 +18,23 @@
 #   run_at               = "HH:MM"       (for schedule = "once")
 #   task                 = "goal string sent to agent"
 #   notify               = true/false    (send result to Telegram users)
-#   model                = "<model>"     (optional: override background_model for this job)
+#   model                = "<connection-id>/<upstream-id>"  (optional: explicit route for this job)
 #   preserve_context     = true/false    (keep ShortTermMemory between runs; default: false)
 #   context_max_messages = N             (sliding window size when preserve_context=true; default: 50)
 #   overlap_policy       = "skip"|"parallel"  (what to do if previous run is still active; default: skip)
 #   max_iterations       = N             (DEPRECATED: parsed but ignored — agents now run
 #                                         until they finish or hit a failure loop. Remove from existing jobs.)
+#
+# Job model selection: a job without `model` inherits the active Main selection when it
+# launches (and fails with an actionable error if there is none). A `model` key is used
+# exactly as saved (split at the first "/", the connection must be a configured
+# [providers.<id>] and the rest is sent verbatim); it needs no cached catalog entry. A
+# blank, malformed or unknown-connection selector fails only that job's run, with an
+# alert, and never falls back to Main or another model.
+#
+# Legacy job file: a scheduler_jobs.json in the agent's state directory is inert. Only its
+# existence is checked (one notice); it is never read, run, converted or deleted, so
+# recreate any job you still need here by hand.
 #
 # Obsolete fields (never converted or ignored — remove them):
 #   schedule = "daily"/"interval", time, hours, minutes   → the job is NOT scheduled and shows a
@@ -47,6 +58,6 @@ cron = "0 */4 * * *"
 task = "Perform a self-health diagnosis: (1) Use the log_query built-in tool to retrieve recent WARNING+ and failed events (warnings, errors, and TOOL_FAILED/LLM_FAILED entries) from the structured log instead of reading raw prose lines. (2) Analyze them for repeated failures and anomalies. (3) Identify root causes and provide actionable suggestions. (4) Report findings as a structured summary."
 notify = true
 # Use a smarter model for deep log analysis; preserve context to track trends over time
-# model = "claude-3-5-sonnet-20241022"
+# model = "anthropic-main/claude-example-model"   # fake id; use <connection-id>/<upstream-id>
 # preserve_context = true
 # context_max_messages = 50

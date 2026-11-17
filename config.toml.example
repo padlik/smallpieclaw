@@ -48,10 +48,24 @@ pairing_timeout = 300
 # constructed, not while this file is parsed.
 # Connections are read once at startup; edits take effect after a restart.
 # Discovery contacts only configured provider endpoints, not public model
-# metadata services. Provider-reported vision and tool-calling flags are
-# display-only; false or unknown flags do not locally block image/native-tool
-# requests. Token limits still affect the current request budget and can
-# reject an oversized request locally (the later context-policy change is separate).
+# metadata services. Provider-reported vision, tool-calling and token-limit
+# data are display-only: they never block or reject a request locally, and a
+# genuine provider context-length rejection is reported as a normal failure.
+#
+# Choosing a model: selection is by buttons only. Open /models, press Refresh
+# first if the cache is empty, then press a candidate's button; there is no
+# typed selection command. The choice is saved on its own in
+# $XDG_CONFIG_HOME/<agent_name>/model-selection.toml (one line:
+# model = "<connection-id>/<upstream-id>") and the discovered candidates live
+# in a disposable cache; neither file holds credentials. With no saved choice
+# the first cached model is active in memory only (automatic, unsaved).
+# A corrupt preference file is left untouched until a button replaces it;
+# if providers return no candidates, repair or delete it by hand and restart.
+#
+# Retired files are inert: models-config.toml (in the same config directory) and
+# the state-directory scheduler_jobs.json are only checked for existence, one
+# notice each; they are never read, parsed, converted, written or deleted.
+# Move old [[models]] data by hand (see README "Upgrading manually").
 # ---------------------------------------------------------------------------
 # api_key is optional for adapters that support unauthenticated connections;
 # it may be a literal, env:NAME, or sec:NAME reference.

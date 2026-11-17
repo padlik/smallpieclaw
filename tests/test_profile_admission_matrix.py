@@ -23,6 +23,7 @@ import pytest
 
 import agent_controller
 from agent_runtime import AgentRuntime, RuntimeOptions, RuntimeProfile
+from context_monitor import ContextMonitor, ContextSnapshot
 from config_schema import (
     AgentConfig,
     EmbeddingsConfig,
@@ -548,3 +549,61 @@ def test_plan_step_inherits_main_a_with_opaque_model_args(
     messages = json.loads(request.content)["messages"]
     assert any(arguments in str(m.get("content")) for m in messages), messages
     assert plan.steps[0].args == OPAQUE_ARGS
+
+
+# ---------------------------------------------------------------------------
+# D. Context monitoring: a child run never publishes to the Main monitor
+# ---------------------------------------------------------------------------
+
+def test_child_run_publishes_only_to_its_own_monitor_and_leaves_main_snapshot_unchanged(
+    make_world: Callable[..., _World], tmp_path: Path,
+) -> None:
+    """Spec ``context-monitoring``: sub-agent turns never replace the Main snapshot.
+
+    A real Main ``AgentController`` owns the monitor that ``main.py`` also injects
+    into the shared executor. A real sub-agent runs through the factory, runtime
+    and ``react_loop`` on a mock transport; its turns must land on the runner's
+    own monitor while the Main sentinel snapshot stays the same object with
+    every field unchanged.
+    """
+    world = make_world(select=False)
+    sentinel = ContextSnapshot(
+        system_prompt_tokens=11111, chat_history_tokens=22222, tool_defs_tokens=33333,
+        tool_defs_by_server={"sentinel-server": 33333}, compaction_threshold=44444,
+        is_live=True, turn=77, model_id="sentinel/main-model",
+    )
+    main_monitor = ContextMonitor()
+    main_monitor.publish(sentinel)
+    world.executor._context_monitor = main_monitor
+    main = agent_controller.AgentController(
+        AGENT,
+        ExecutorPaths(tmp_dir=str(tmp_path / "main-tmp"), downloads_dir=str(tmp_path / "main-dl"),
+                      workspace_dir=str(tmp_path / "main-ws")),
+        llm=None, tool_index=_NullToolIndex(), memory=MemoryStore(str(tmp_path / "main-memory.json")),
+        builtin_executor=world.executor, context_monitor=main_monitor,
+    )
+
+    runner = world.factory(
+        model=MODEL_B.id, runtime_profile=RuntimeProfile.ON_DEMAND_SUBAGENT, label="monitor-isolation",
+    )
+    try:
+        assert runner.run("monitor task") == RESULT
+        child_monitor = runner._agent.context_monitor
+        child = child_monitor.read()
+    finally:
+        runner.close()
+
+    # The child really ran and published to its own monitor.
+    assert len(world.chat_requests) == 1
+    assert child_monitor is not main.context_monitor and child_monitor is not main_monitor
+    assert child is not None and child is not sentinel
+    assert child.model_id == MODEL_B.id and child.compaction_threshold == AGENT.compaction_threshold_tokens
+    assert child.turn != sentinel.turn and child.system_prompt_tokens != sentinel.system_prompt_tokens
+    assert child.is_live is False and child.tool_defs_by_server != sentinel.tool_defs_by_server
+    # The Main monitor still serves the very same sentinel, field by field.
+    assert main.context_monitor is main_monitor and main_monitor.read() is sentinel
+    after = main_monitor.read()
+    assert (after.system_prompt_tokens, after.chat_history_tokens, after.tool_defs_tokens) == (11111, 22222, 33333)
+    assert after.tool_defs_by_server == {"sentinel-server": 33333} and after.compaction_threshold == 44444
+    assert (after.is_live, after.turn, after.model_id) == (True, 77, "sentinel/main-model")
+    _assert_one_closed_run_on(world, MODEL_B, main=None)

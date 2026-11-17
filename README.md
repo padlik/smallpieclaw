@@ -18,7 +18,7 @@ A lightweight autonomous Telegram bot that controls and queries your server usin
 - **Multi-provider LLM** — OpenAI, OpenRouter, Google Gemini, Anthropic Claude, Ollama Cloud
 - **Multimodal vision** — send a photo with a caption; image + text sent to the pinned model (provider support determines whether it succeeds)
 - **File uploads** — any Telegram file saved to `downloads/`
-- **Context compaction** — auto-summarises at 85% of token budget; no manual intervention
+- **Context compaction** — auto-summarises older history when the estimated request input exceeds `agent.compaction_threshold_tokens` (default 60000); no manual intervention
 - **Agent Skills** — reusable task guides per [agentskills.io](https://agentskills.io/specification)
 - **Orchestrated multi-agent** — DAG-based parallel sub-agents with two-tier error recovery and strategy memory
 - **Token usage tracking** — daily prompt/completion counters per model visible in `/status`
@@ -97,7 +97,17 @@ Connection fields are exactly `type`, `api_key` (optional), `base_url` (optional
 
 Provider connections are read once at startup and stay fixed for the life of the process: editing a `[providers.<id>]` section (adding, removing or changing `type`, `api_key` reference, `base_url` or `request_timeout`) takes effect only after a restart. Until then, `/models` refresh and new runs keep using the connections the process started with. The value behind an `env:`/`sec:` reference is still read when a provider client is constructed.
 
-There is no default-model setting: the remembered selection is made (and changed) with `/models` and survives restarts. It is stored on its own in `$XDG_CONFIG_HOME/<agent>/model-selection.toml` as a single line `model = "<connection-id>/<upstream-id>"` — never a key, key reference or endpoint. A `/models` choice is written there (temporary file, then atomic replace) before it becomes active; if the write fails you get an error and the previous choice and file stay as they were. A preference file that cannot be read or parsed is left byte-for-byte untouched (nothing is remembered) until you pick a model with `/models`, which replaces it immediately. The older `models-config.toml` is retired: it is never opened, read, parsed, changed or deleted, and nothing is derived from it. If the file exists, startup only checks for it and logs one warning naming its path and advising a deliberate `/models` selection. Discovered models are kept apart from that choice, in a disposable cache at `$XDG_CACHE_HOME/<agent>/models-cache.json` (candidate ids, per-provider fresh/stale state and provider-reported display data only — no selection, key, key reference or endpoint). The cache is written atomically but best-effort: if it cannot be saved, `/models` and the startup log say so, the models just discovered stay usable for the session, and your saved choice is unchanged. A cache that cannot be read or parsed is treated as empty (a startup warning is logged), is not rewritten at startup, and is replaced by the next successful refresh; it can always be deleted safely. The retired `models-config.toml` is neither read nor written for the cache. Discovery contacts only your configured provider endpoints (no public model-metadata service). Provider-reported vision and tool-calling flags are display-only: false or unknown flags do not locally block image or native-tool requests. **Token limits still affect the current request budget and compaction policy and can reject requests locally**; that policy is not changed by this step. The agent never switches models on its own — a pinned model the provider rejects fails that request with the provider's sanitized error instead of substituting another model.
+There is no default-model setting: the remembered selection is made (and changed) with `/models` and survives restarts. It is stored on its own in `$XDG_CONFIG_HOME/<agent>/model-selection.toml` as a single line `model = "<connection-id>/<upstream-id>"` — never a key, key reference or endpoint. A `/models` choice is written there (temporary file, then atomic replace) before it becomes active; if the write fails you get an error and the previous choice and file stay as they were. A preference file that cannot be read or parsed is left byte-for-byte untouched (nothing is remembered) until you pick a model with `/models`, which replaces it immediately. The older `models-config.toml` is retired: it is never opened, read, parsed, changed or deleted, and nothing is derived from it. If the file exists, startup only checks for it and logs one warning naming its path and advising a deliberate `/models` selection. Discovered models are kept apart from that choice, in a disposable cache at `$XDG_CACHE_HOME/<agent>/models-cache.json` (candidate ids, per-provider fresh/stale state and provider-reported display data only — no selection, key, key reference or endpoint). The cache is written atomically but best-effort: if it cannot be saved, `/models` and the startup log say so, the models just discovered stay usable for the session, and your saved choice is unchanged. A cache that cannot be read or parsed is treated as empty (a startup warning is logged), is not rewritten at startup, and is replaced by the next successful refresh; it can always be deleted safely. The retired `models-config.toml` is neither read nor written for the cache. Discovery contacts only your configured provider endpoints (no public model-metadata service). Provider-reported vision and tool-calling flags are display-only: false or unknown flags do not locally block image or native-tool requests. Provider-reported token limits are display-only and never reject or shrink a request locally: an oversized request is sent as is and a genuine provider context-length rejection is reported as a normal failure (see "Context compaction"). The agent never switches models on its own — a pinned model the provider rejects fails that request with the provider's sanitized error instead of substituting another model.
+
+### Choosing a model (`/models`)
+
+Selection is by buttons only. `/models` lists up to 20 cached candidates with a 🔄 Refresh button and one select button per candidate; there is no typed selection command, and arguments after `/models` never select.
+
+- **Unsaved bootstrap.** With no `model-selection.toml`, the first cached candidate (ascending code-point order of `<connection-id>/<upstream-id>`) is chosen in memory only: it is active but unsaved (shown as "automatic, unsaved"), is derived again at every restart, and is never written. Press a candidate's button to make a deliberate, saved choice.
+- **Saved choice.** A well-formed saved selector naming a configured connection stays active and displayed whether or not it is cached; the agent never falls back to another model, and a provider rejection of that model is reported as a normal failure.
+- **Empty cache: Refresh first.** Select buttons are drawn from the cache, so with no cached candidates press Refresh first and choose a model once candidates appear. Refresh changes only the cache; it never writes or repairs your selection.
+- **Corrupt or unreadable preference.** Nothing is active, nothing is chosen automatically and the file stays byte-for-byte untouched. If candidates are cached, press one button: it replaces the file atomically before the choice becomes active, with no restart. With an empty cache, Refresh first, then press a button. If every provider still returns nothing, chat cannot repair it: fix or delete `model-selection.toml` (one line, `model = "<connection-id>/<upstream-id>"`) yourself and restart.
+- **Explicit routes.** A spawned sub-agent's `model` argument and a job's `model` key take the same exact `<connection-id>/<upstream-id>` form (split at the first `/`; the connection must be a configured `[providers.<id>]` exactly and the rest is sent verbatim, using only that connection's credential). No cache entry or active Main is needed — this holds even when the preference file is corrupt — and nothing is ever substituted. Only requests that omit the selector inherit the active Main selection and are refused while there is none.
 
 ### Embeddings
 
@@ -115,14 +125,36 @@ If any field is missing, blank, not a string, or invalid, the bot still starts a
 
 ### Obsolete model configuration is rejected
 
-There is no model-configuration migration tool. Configuration that still uses the old model settings fails at startup with an error naming the key and its replacement; nothing is converted or ignored:
+There is no model-configuration migration tool, and nothing is converted or ignored. Two different things happen depending on the file.
+
+#### `config.toml`: startup errors
+
+Chat configuration that still uses the old model settings stops startup with an error naming the key and its replacement:
 
 - a top-level `[[models]]` table (any field) — configure `[providers.<connection-id>]` and choose a model with `/models`;
 - `[agent]` `default_model`, `background_model`, `fallback_model`, `fallback_models` — choose models with `/models`;
 - `[agent]` `ctx_max_tokens` — use `agent.compaction_threshold_tokens`;
 - any `[providers.<id>]` field other than `type`, `api_key`, `base_url` and `request_timeout` (for example `model`, `max_tokens`, `temperature`, `top_p`, `max_retries`, `retry_delay`, `retries`) — retries are configured once under `[agent]` (`max_retries`, `retry_delay`).
 
-Error messages never print the rejected values.
+#### `scheduler.toml`: contained per job
+
+Obsolete job fields do not stop the daemon. Only the offending job is affected, shown with a `config_error` in `/jobs` and the `schedule` tool, and every other job keeps running:
+
+- `schedule = "daily"`/`"interval"` and any `time`, `hours` or `minutes` field — that job is unscheduled until you rewrite it as `cron` or `once`;
+- a job's `fallback_models` — the job stays listed but each launch fails with an alert until you remove the key.
+
+Error messages never print the rejected values. Old files that may still sit on disk are inert: the retired combined `models-config.toml` and the state-directory `scheduler_jobs.json` are only checked for existence (one notice each) and are never read, parsed, converted, written, renamed or deleted. The XDG storage-layout `migrate.py` is a different tool and is unaffected.
+
+### Upgrading manually from the old model configuration
+
+Nothing is migrated for you. Do this with the agent stopped:
+
+1. **Back up** (copy, do not move) `config.toml`, `scheduler.toml`, `models-config.toml`, the state-directory `scheduler_jobs.json` (if present) and `model-selection.toml` (if present).
+2. **Transcribe `config.toml` by hand.** For each distinct account in the old `[[models]]` entries add one `[providers.<id>]` with only `type`, `api_key` (keep your `env:`/`sec:` reference), `base_url` and `request_timeout`; delete the `[[models]]` tables and the obsolete `[agent]` keys above. Move retry settings to `[agent] max_retries`/`retry_delay`. Set `agent.compaction_threshold_tokens` yourself (an estimated-input token count, not a model limit) and, if you use Anthropic, `agent.required_output_cap_tokens`. Give `[embeddings]` its four fields and, for graph memory, the four `extraction_*` fields — neither inherits from the old model entries.
+3. **Transcribe jobs.** In `scheduler.toml` remove `fallback_models`, rewrite `daily`/`interval` schedules as `cron` or `once` and delete the old `time`, `hours` and `minutes` fields (leaving any of them behind keeps the job invalid even next to `cron`), and change any job `model` to `<connection-id>/<upstream-id>` (or delete it to inherit the Main selection). Recreate any job you still need from `scheduler_jobs.json` as a `cron`/`once` job.
+4. **Restart**, then use `/models` (Refresh first if the cache is empty) and press a button to choose a model. Until you do, only the unsaved automatic choice may be active.
+
+**Rollback:** stop the agent, restore the old release together with the backed-up `config.toml`, `scheduler.toml`, `models-config.toml` and `scheduler_jobs.json`, and restart. The new release does not read, change or delete the retired `models-config.toml` and `scheduler_jobs.json` (it still rewrites `scheduler.toml` when you change jobs through `/jobs` or the `schedule` tool, so restore your backed-up copy); its separate `model-selection.toml` and `models-cache.json` are not an old combined catalog, so do not copy them over `models-config.toml`.
 
 ---
 
@@ -182,7 +214,7 @@ systemctl --user enable --now telegram-agent
 | `/context` | Estimated input tokens by category (system prompt, chat history, tool definitions), the compaction threshold, and the per-MCP-server tool-def breakdown |
 | `/tools` | List all built-in and MCP tools |
 | `/skills` | List available agent skills |
-| `/models` | List LLM models and switch active one (👁 = provider reports vision) |
+| `/models` | List discovered models, Refresh them, and select one with its button — no typed selection (👁 = provider reports vision) |
 | `/jobs` | Scheduled jobs; sub-commands: `reload`, `pause <tag>`, `resume <tag>`, `remove <tag>`; read-only views: `history <tag>`, `result <execution-id>` |
 | `/agents` | Active sub-agents, scheduled jobs, and plan-step agents (with source category); `/agents cancel <id>` to stop one |
 | `/prompts` | Recent prompts with status and elapsed time; `/prompts search <query> [Nd/Nh] [--status=<S>] [--trace=<T>] [--since=<ISO>] [--until=<ISO>] [--page=<N>]` to search history; `/prompts show <id>` for full record |
@@ -201,7 +233,7 @@ systemctl --user enable --now telegram-agent
 
 Hidden diagnostic commands (not in menu, available to authorised users): `/show_ctx`, `/show_env`, `/memory`, `/compress`.
 
-When a provider model catalog is injected, `/models` instead lists a sanitized
+`/models` lists a sanitized
 view of up to 20 discovered models with refresh and selection buttons:
 each provider's fresh/stale status, the current selection state
 (active and saved, active as an unsaved automatic choice, no selection, or a saved
@@ -222,8 +254,7 @@ Expired buttons, a bot restart, or token-cache eviction require reopening `/mode
 A pressed button is not rechecked against the cache or the provider: it still
 selects a model that a later refresh removed from the list, as long as its
 provider connection remains configured. The choice is saved before success is
-shown; a failed save leaves the previous selection unchanged. Without an injected catalog, `/models` keeps its
-existing list-and-switch behavior.
+shown; a failed save leaves the previous selection unchanged.
 
 Prompt-building components and model-selecting tool descriptions also accept an
 optional sanitized catalog view. It distinguishes the running model's
@@ -243,8 +274,7 @@ needs neither an active selection nor a cached candidate. An Anthropic
 connection sends the configured `agent.required_output_cap_tokens` (positive
 integer, default 1024) as `max_tokens`, so an uncached Anthropic model is sent
 without any discovered limit; other adapters send no output cap. Graph
-extraction keeps its own fixed cap. Not yet changed (tasks 6.x): the runtime's
-internal context guard (no longer configurable) still applies and the cap is checked against it.
+extraction keeps its own fixed cap.
 With no selection
 file, the first model of the cache as loaded at startup, in ascending ordinal
 order of its full `<connection-id>/<upstream-id>` (code-point order, so
@@ -256,9 +286,11 @@ restart. Cached candidates of connections that are no longer configured are
 ignored. If the selection file is invalid, unreadable or
 names a connection that is not configured, a startup warning says so, no
 model is active, none is chosen automatically and the file is left
-byte-for-byte untouched; the bot and its commands still start and tasks and
-sub-agents are refused until you pick a model with `/models` (which replaces
-the file) or fix the file.
+byte-for-byte untouched; the bot and its commands still start. Ordinary tasks and any
+sub-agent or job that inherits the Main selection are refused until you pick a model with
+`/models` (which replaces the file) or fix the file; an explicit
+`<connection-id>/<upstream-id>` selector still runs without an active Main, even with an
+invalid preference file.
 
 Startup discovers models only when nothing is known: there is no selection
 file (an invalid or unreadable one counts as present) and no cached candidate
@@ -266,7 +298,7 @@ of a configured connection (an unreadable cache counts as empty). Then every
 configured provider is fetched once (all pages, the same path as `/models`),
 with no retry or background loop; a provider that fails keeps its last-good
 entries as stale, and if nothing could be discovered the bot still starts, no
-model is active and tasks are refused with a message to use `/models`. In every
+model is active and ordinary tasks and inheriting requests are refused with a message to use `/models` (explicit selectors are unaffected). In every
 other case startup makes no model-discovery request, so cached entries are used
 as they are until you press Refresh in `/models`. A refresh publishes a
 provider's inventory only when all of its pages are valid; a malformed or
@@ -596,6 +628,8 @@ Both commands show usage if the `<tag>` or `<execution-id>` argument is missing.
 
 Context compaction fires automatically when the estimated input (system prompt, full chat history including images, and the complete current tool definitions) exceeds `agent.compaction_threshold_tokens` (default 60000) — older messages are summarised by the LLM without operator intervention, once per over-threshold request. The current goal and the last two messages (extended to whole tool-call/result groups) are kept unchanged and only the messages between them are summarised; when there is nothing between them, nothing is changed or truncated. The summary is requested through the run's own model connection with its own retry state, separate from the main request. The threshold is model-independent: discovered context or input limits never trigger, shrink or reject a request. Use `/reset` to start fresh, or `/reset discard` to skip saving.
 
+A genuine provider context-length rejection is never repaired automatically: it is classified `context` and follows the normal LLM error path (error card and checkpoint when enabled, `/resume`) with no forced compaction, truncation, automatic resend or model switch. Use `/reset` or the hidden `/compress`, or select a larger-context model with `/models`, then retry. The only output-token cap is `agent.required_output_cap_tokens` (positive integer, default 1024), sent only to adapters whose API requires one (currently Anthropic) and never sized from context or discovered limits.
+
 ### Graph memory (optional)
 
 Install the extra dependency:
@@ -825,7 +859,7 @@ config_schema.py         # Typed config dataclasses (AppConfig, AgentConfig, Mod
 exceptions.py            # Exception hierarchy (AgentError → LLMError, ToolError, MCPError, …)
 prompt_builder.py        # System prompt assembly; re-exports estimate_tokens
 token_estimator.py       # Two-layer token counting (tiktoken + heuristic fallback)
-context_manager.py       # Auto-compaction at 85% of the request input budget (256-token threshold floor)
+context_manager.py       # Auto-compaction when estimated input exceeds agent.compaction_threshold_tokens
 context_monitor.py       # Context-window consumption monitor (push snapshot per turn)
 skills/                  # Agent Skills — skills/<name>/SKILL.md
 data/                    # Runtime state: tool_index, memory, scheduler state, graph DB

@@ -122,10 +122,17 @@ Graph memory is an **opt-in** feature that stores entities, relationships, and e
 # config.toml
 [graph_memory]
 enabled = true
-db_path = "data/graph_memory"
 buffer_pool_mb = 256
-extraction_model = "gpt-4o-mini"   # falls back to agent.default_model
+# Graph extraction has its own route: all four fields are required when enabled.
+# Nothing is inherited from [providers.*], the model catalog, the Main selection
+# or [embeddings], and the extraction credential is sent only to extraction_base_url.
+extraction_provider = "openai"                      # adapter: openai|openrouter|anthropic|google|ollama
+extraction_base_url = "https://api.openai.com/v1"
+extraction_api_key  = "sec:graph_extraction_key"    # literal, env:VAR or sec:KEY (whole string)
+extraction_model    = "gpt-example-mini"            # upstream model string, sent verbatim
 ```
+
+The database path is not configurable: `db_path` under `[graph_memory]` is rejected at startup, and the store lives at `<XDG_DATA_HOME>/<agent_name>/graph_memory`. If any extraction field is missing or invalid (field names are logged, never values), graph memory is disabled with a warning while chat keeps working. Graph vectors use the separate four-field `[embeddings]` section (`provider`, `base_url`, `api_key`, `model`) with its own credential.
 
 Install the optional dependency: `pip install ladybug`
 
