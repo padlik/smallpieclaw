@@ -2,6 +2,8 @@
 
 This is a follow-up to the **pending**, implemented `provider-model-catalog` change at `a57ab26`, not a rewrite of its frozen planning. `openspec/specs/` on `main` is canonical; `openspec/changes/provider-model-catalog/specs/` is pending predecessor delta, **not** canonical. The frozen `proposal.md` and `explore-brief.md` govern scope. The current implementation couples admission to catalog membership and Main selection, enforces request-fit budgets, stores selection with inventory in `models-config.toml`, and resolves graph extraction through the catalog. We keep its useful provider adapters, ownership and retry machinery, but remove those execution-authority couplings. The operator needs an understandable `/models` view; scheduled work and graph extraction must survive unrelated Main/catalog state.
 
+> **Historical status note (2026-11-17).** "Pending" and "not canonical" describe the predecessor at planning time. On `main` the predecessor `provider-model-catalog` has since been archived as `openspec/changes/archive/2026-11-17-provider-model-catalog` and its specifications synchronized into `openspec/specs/`; that integration lives on `main`, not in this feature branch, which carries the planning text as written. Decisions, dependency ordering and headings are unchanged.
+
 ### Existing architectural decisions (complete `adr/` inventory)
 
 All 39 files `adr/0001`–`adr/0039` were inventoried from their actual Status and Supersedes sections. The compact inventory below distinguishes whole-document replacement from scoped replacement. An edge marked **partial** replaces **only** the stated clauses: the older accepted document remains live elsewhere. An edge to an archived change is external to this ADR inventory.

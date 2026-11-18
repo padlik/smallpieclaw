@@ -357,11 +357,14 @@ def test_selecting_a_cached_model_recovers_and_clears_the_selection_notice(tmp_p
 
 def test_recovery_does_not_hide_a_still_present_cache_notice(tmp_path: Path) -> None:
     env = build(tmp_path, cache_models=pa_models("m1"), corrupt_pref=True, corrupt_cache=True)
+    stale_notice = env.registry.selection_notice
+    assert stale_notice is not None
     env.registry.select("pa/m1")
 
     text, _ = run_models(env)
 
-    assert html.escape(env.registry.cache_notice) in text and html.escape(env.registry.selection_notice) not in text
+    assert env.registry.selection_notice is None  # repaired by the durable select
+    assert html.escape(env.registry.cache_notice) in text and html.escape(stale_notice) not in text
 
 
 def test_a_failed_save_keeps_the_notice_no_selection_and_the_old_preference_bytes(tmp_path: Path) -> None:

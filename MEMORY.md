@@ -238,11 +238,16 @@ overflow-repair step.
 At or below the threshold nothing changes. Above it, **one attempt** is made per
 request:
 
-1. **Partition on whole spans.** The goal message (and the whole native
-   tool-call/result span holding it) and the last two messages (extended back to
-   a span boundary so a native call and its results are never split) are kept
-   **unchanged** — never capped or truncated. Everything between them is the
-   *middle*.
+1. **Partition on whole spans.** A native tool-call span is an assistant
+   message with its matching results. The goal message (with the whole span
+   holding it) is kept **unchanged**, as is a retained *suffix* that covers
+   the last two messages and, if the second-to-last message sits inside a
+   span, starts at that span's beginning so a native call and its results are
+   never split (the suffix can therefore be longer than two messages). Nothing
+   kept is capped or truncated. The *middle* is all remaining messages in
+   original order, including any that precede the goal. When the goal already
+   lies inside the suffix there is no separate goal span, and earlier history
+   is still summarized.
 2. **Empty middle = no change.** If there is nothing between the kept parts, the
    original history is sent as is (no truncation of a huge goal or recent
    result).
@@ -251,8 +256,9 @@ request:
    and summarized by the run's **own pinned client** with its own retry state
    (`react_loop._summarize_on_pin`), separate from the main request.
 4. **Success-only publish.** Only a stripped, non-empty summary is published:
-   goal span + one `[Compacted context — earlier steps summary]` message + the
-   last two spans. The candidate is re-validated as native history.
+   the goal span (only when it is separate from the suffix, so the goal is never
+   duplicated) + one `[Compacted context — earlier steps summary]` message +
+   the retained suffix. The candidate is re-validated as native history.
 5. **A later step may compact again**, including the earlier summary message,
    if the input is still above the threshold; there is no same-step
    recursion or deterministic tightening loop.
@@ -266,10 +272,15 @@ Cancellation propagates without a warning. A request that is still too large is
 simply sent: a genuine provider context-length rejection follows the normal
 error path and is never repaired by forced compaction, truncation or resend.
 
-**Output cap.** The only output-token cap is `agent.required_output_cap_tokens`
-(default 1024), sent only to adapters whose API requires one (currently
-Anthropic); it is not derived from context or discovered metadata, which stay
-advisory display data.
+**Output cap.** For ordinary requests the only output-token cap is
+`agent.required_output_cap_tokens` (default 1024), sent only to adapters whose
+API requires one (currently Anthropic); it is not derived from context or
+discovered metadata, which stay advisory display data. Graph-memory extraction
+is separate: its private client applies a fixed wire policy
+(output cap 1024 and `temperature` 0.1) that the setting neither changes nor
+feeds. That policy is subject to the existing adapter/model compatibility
+rules, for example the temperature is omitted for OpenAI/OpenRouter reasoning
+models, which then receive only `max_completion_tokens` 1024.
 
 **Separate paths.** Manual `/compress` (hidden, see below) and `reset_task()`
 are not the automatic path: `/compress` admits its own summary client from

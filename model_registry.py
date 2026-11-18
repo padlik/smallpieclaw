@@ -281,11 +281,6 @@ class ModelRegistry:
             return False
         return self._remembered_model_id is None and self._initial_automatic_choice is None
 
-    @property
-    def saved_selection_unusable(self) -> bool:
-        """Whether a saved selection exists but is invalid, unreadable or unconfigured."""
-        return self._selection_notice is not None
-
     def view(self, pinned: RunModel | None = None) -> CatalogView:
         """Return immutable catalog data without connections or credentials."""
         with self._lock:
@@ -349,11 +344,20 @@ class ModelRegistry:
                 # and the prior active choice untouched.
                 try:
                     self._preference.write(canonical_id)
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
+                    # ``ModelPreference.write`` validates before any I/O (any coded
+                    # ModelSettingsError other than ``write_failed`` is a bad selector);
+                    # everything else, including a code-less ValueError, is persistence.
+                    code = getattr(exc, "code", None)
+                    if isinstance(code, str) and code != "write_failed":
+                        raise ModelRegistryError("malformed_selector") from None
                     raise ModelRegistryError("persistence_failed") from None
                 self._remembered_model_id = canonical_id
                 self._active_model_id = canonical_id
                 self._selection_revision += 1
+                # A durable deliberate selection repairs a corrupt/unconfigured saved one.
+                self._selection_notice = None
+                self._preference_status = "valid"
                 return self.view()
             candidate = replace(
                 self._document,

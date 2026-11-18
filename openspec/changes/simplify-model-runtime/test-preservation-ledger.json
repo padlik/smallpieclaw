@@ -8,7 +8,7 @@
     "tests/test_path_policy.py::TestIsContained::test_normcase_case_insensitive"
   ],
   "counts": {
-    "keep": 5713,
+    "keep": 5837,
     "rewrite": 434,
     "retire": 43
   },
@@ -5576,6 +5576,42 @@
       "destination": "same",
       "assertion": "context-monitoring \"Sub-agent runs do not overwrite the main snapshot\": a real Main AgentController monitor holding a sentinel ContextSnapshot (also injected into the shared executor) stays the same object with every field unchanged while a real ON_DEMAND sub-agent runs through factory/AgentRuntime.create/react_loop on a mock transport and publishes only to its own distinct monitor; balanced closes.",
       "refs": "task 11.3 formal-verification warning 3; context-monitoring spec"
+    },
+    {
+      "id": 579,
+      "file": "tests/test_model_discovery.py",
+      "basis": "added-panel-round1-fix",
+      "disposition": "keep",
+      "destination": "same",
+      "assertion": "model-catalog discovery panel round-1 fixes. (H1) a provider display name with surrounding whitespace is trimmed (blank falls back to the exact upstream id) so one such row no longer invalidates the whole OpenRouter inventory: a real ModelRegistry.refresh over real ModelDiscovery+MockTransport commits a fresh inventory, retains every row with raw upstream identity exact, persists the cache and allows select() on a previously empty inventory; identity whitespace/control/url ids and a padded display reflecting the resolved credential still fail closed. (Medium) discovery issues at most _MAX_PAGES requests per provider refresh across anthropic/google/openrouter paging: endless fresh continuations stop at exactly the cap with pagination_limit, finishing on the last allowed page succeeds, a cap failure leaves the registry last-good stale with no partial commit, and the cap is per connection.",
+      "refs": "panel round-1 H1 (critical) + unbounded pagination (medium); no spec change"
+    },
+    {
+      "id": 580,
+      "file": "tests/test_model_registry.py",
+      "basis": "added-low-issues-1-8-wave",
+      "disposition": "keep",
+      "destination": "same",
+      "assertion": "low-issue wave (single wave, issues 1-8) new owners: (6) a selector accepted by parse_selector but rejected by ModelPreference validation fails malformed_selector (no persistence/state change, no echo) while a real write failure stays persistence_failed; (7) a successful deliberate select clears the corrupt/unconfigured selection notice, publishes the canonical valid state and survives restart, a failed repair write keeps notice/view/bytes, refresh alone never clears it, explicit admission without Main never touches the preference; (5) Google displayName is the trimmed presentation text (blank -> exact upstream id, legacy display_name honoured, unsafe/non-string/credential-reflecting text still fails closed, identity exact).",
+      "refs": "low issues 5/6/7; tests in tests/test_model_registry.py and tests/test_model_discovery.py"
+    },
+    {
+      "id": 581,
+      "file": "tests/test_job_execution_log.py",
+      "basis": "added-reliability-security-wave",
+      "disposition": "keep",
+      "destination": "same",
+      "assertion": "Issue 10: raised/returned/factory admission failures publish only safe fixed labels or known trusted guidance to logs (including record args/exception fields), history, state, record and direct alert; one terminal failed record, notification even notify=false, no stranded run. Issue 9: fsync file before replace and directory after; precommit faults leave old disk/runtime, postcommit sync fault keeps new bytes and latches reload required; success publishes after durability. Issue 12: cooperative 120-second per-connection discovery deadline across pagination, streamed chunks and normalization; restrict per-phase HTTP timeout, close response on expiry, no partial inventory; fresh provider budget each fetch.",
+      "refs": "approved issues 10, 9, 12 (simple cooperative deadline option A)"
+    },
+    {
+      "id": 582,
+      "file": "tests/test_model_discovery.py",
+      "basis": "added-input-maintenance-wave",
+      "disposition": "keep",
+      "destination": "same",
+      "assertion": "Issue 11: null/bool/number/list/object presentation values fall back to the exact upstream id and keep the whole inventory fresh; Google present-null does not fall to the legacy field; a resolved credential inside a discarded nested value, object key or Google discarded value fails the whole refresh (bounded iterative walk, deadline-checked, fixed code); unsafe strings, malformed identity and Ollama null name still fail; unknown Python objects rejected without str/repr. Issue 13: public parse_config provider behaviour (first error text, parsed values, no input mutation) characterized across 31 inputs before the duplicate structural checks in _parse_providers were removed.",
+      "refs": "approved issues 11 and 13; tests in tests/test_model_discovery.py and tests/test_config_schema.py"
     }
   ],
   "groups": {
@@ -6626,6 +6662,39 @@
         "test_obsolete_field_error_never_echoes_value[provider-model]",
         "test_obsolete_field_error_never_echoes_value[provider-retries]",
         "test_obsolete_field_error_never_echoes_value[provider-temperature]"
+      ],
+      "582": [
+        "test_parse_config_provider_behaviour_is_unchanged[absent]",
+        "test_parse_config_provider_behaviour_is_unchanged[api_key_file]",
+        "test_parse_config_provider_behaviour_is_unchanged[badid]",
+        "test_parse_config_provider_behaviour_is_unchanged[deferred-ref]",
+        "test_parse_config_provider_behaviour_is_unchanged[empty]",
+        "test_parse_config_provider_behaviour_is_unchanged[entry-not-table]",
+        "test_parse_config_provider_behaviour_is_unchanged[env-url]",
+        "test_parse_config_provider_behaviour_is_unchanged[key-nonstr]",
+        "test_parse_config_provider_behaviour_is_unchanged[legacy-models]",
+        "test_parse_config_provider_behaviour_is_unchanged[mixed-first]",
+        "test_parse_config_provider_behaviour_is_unchanged[mixed-struct-before-sec]",
+        "test_parse_config_provider_behaviour_is_unchanged[nondict]",
+        "test_parse_config_provider_behaviour_is_unchanged[none]",
+        "test_parse_config_provider_behaviour_is_unchanged[ollama-badurl]",
+        "test_parse_config_provider_behaviour_is_unchanged[ollama-nokey]",
+        "test_parse_config_provider_behaviour_is_unchanged[ollama-ok]",
+        "test_parse_config_provider_behaviour_is_unchanged[retry-field]",
+        "test_parse_config_provider_behaviour_is_unchanged[timeout-bool]",
+        "test_parse_config_provider_behaviour_is_unchanged[timeout-inf]",
+        "test_parse_config_provider_behaviour_is_unchanged[timeout-nan]",
+        "test_parse_config_provider_behaviour_is_unchanged[timeout-neg]",
+        "test_parse_config_provider_behaviour_is_unchanged[timeout-ok]",
+        "test_parse_config_provider_behaviour_is_unchanged[timeout-str]",
+        "test_parse_config_provider_behaviour_is_unchanged[timeout-zero]",
+        "test_parse_config_provider_behaviour_is_unchanged[type-missing]",
+        "test_parse_config_provider_behaviour_is_unchanged[type-nonstr]",
+        "test_parse_config_provider_behaviour_is_unchanged[type-unsupported]",
+        "test_parse_config_provider_behaviour_is_unchanged[unknown-field]",
+        "test_parse_config_provider_behaviour_is_unchanged[url-bad]",
+        "test_parse_config_provider_behaviour_is_unchanged[url-nonstr]",
+        "test_parse_config_provider_behaviour_is_unchanged[url-ref-missing]"
       ]
     },
     "tests/test_confirmation_retry.py": {
@@ -8370,6 +8439,19 @@
         "test_unretained_run_ids_are_empty_when_no_notice_is_ever_requested",
         "test_unsuccessful_record_carries_terminal_metadata[[Cancelled]-False-cancelled]",
         "test_unsuccessful_record_carries_terminal_metadata[\\u274c connection refused-False-failed]"
+      ],
+      "581": [
+        "test_factory_value_error_through_real_supervisor_is_sanitized_on_the_same_terminal_path",
+        "test_forged_refusal_stamp_cannot_forward_arbitrary_error_text",
+        "test_known_admission_codes_keep_their_fixed_guidance[malformed_selector]",
+        "test_known_admission_codes_keep_their_fixed_guidance[model_not_found]",
+        "test_known_admission_codes_keep_their_fixed_guidance[no_active_selection]",
+        "test_known_admission_codes_keep_their_fixed_guidance[unknown_connection]",
+        "test_non_allowlisted_error_dict_is_replaced_by_the_fixed_label",
+        "test_raising_spawn_never_publishes_exception_text_anywhere[canary-secret-7f3a]",
+        "test_raising_spawn_never_publishes_exception_text_anywhere[canary\\\\u002dsecret-7f3a]",
+        "test_raising_spawn_never_publishes_exception_text_anywhere[{\"error\": \"canary-secret-7f3a\"}]",
+        "test_typed_cancelled_factory_uses_existing_cancelled_record_and_releases_run"
       ]
     },
     "tests/test_log_detail.py": {
@@ -9231,6 +9313,80 @@
         "test_successful_inventory_is_accepted_by_managed_codec[ollama-payload4]",
         "test_successful_inventory_is_accepted_by_managed_codec[openai-payload0]",
         "test_successful_inventory_is_accepted_by_managed_codec[openrouter-payload3]"
+      ],
+      "579": [
+        "test_blank_display_name_falls_back_to_exact_upstream_id",
+        "test_endless_fresh_continuations_stop_at_page_cap[anthropic]",
+        "test_endless_fresh_continuations_stop_at_page_cap[google]",
+        "test_endless_fresh_continuations_stop_at_page_cap[openrouter]",
+        "test_finishing_exactly_on_last_allowed_page_succeeds[anthropic]",
+        "test_finishing_exactly_on_last_allowed_page_succeeds[google]",
+        "test_finishing_exactly_on_last_allowed_page_succeeds[openrouter]",
+        "test_identity_whitespace_and_unsafe_ids_still_reject_inventory[ padded]",
+        "test_identity_whitespace_and_unsafe_ids_still_reject_inventory[https://x.example/m]",
+        "test_identity_whitespace_and_unsafe_ids_still_reject_inventory[pad\\nded]",
+        "test_identity_whitespace_and_unsafe_ids_still_reject_inventory[padded ]",
+        "test_padded_display_reflecting_credential_still_fails_closed",
+        "test_page_cap_failure_keeps_last_good_stale_without_partial_commit",
+        "test_page_cap_is_per_connection_not_shared",
+        "test_presentation_whitespace_does_not_invalidate_openrouter_inventory[ Padded Name]",
+        "test_presentation_whitespace_does_not_invalidate_openrouter_inventory[Padded Name ]",
+        "test_presentation_whitespace_does_not_invalidate_openrouter_inventory[\\tPadded Name\\n]"
+      ],
+      "580": [
+        "test_google_blank_display_name_falls_back_to_exact_upstream_id",
+        "test_google_display_name_is_trimmed_presentation_while_identity_stays_exact",
+        "test_google_display_name_reflecting_the_credential_still_fails_closed",
+        "test_google_older_display_name_key_is_still_honoured_without_display_name",
+        "test_google_unsafe_or_non_string_display_name_still_fails_the_inventory[7]",
+        "test_google_unsafe_or_non_string_display_name_still_fails_the_inventory[https://x.example/m]",
+        "test_google_unsafe_or_non_string_display_name_still_fails_the_inventory[line\\nbreak]"
+      ],
+      "581": [
+        "test_deadline_failure_leaves_registry_last_good_stale_and_cache_unmodified",
+        "test_each_provider_fetch_gets_a_new_budget",
+        "test_fresh_continuation_expires_before_next_request_with_no_partial_inventory",
+        "test_remaining_budget_restricts_each_transport_timeout_phase",
+        "test_single_final_page_finished_at_budget_boundary_is_rejected",
+        "test_slow_stream_is_closed_when_budget_expires_between_chunks"
+      ],
+      "582": [
+        "test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[google-ignored-legacy-field]",
+        "test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[google-resource-name-display-null]",
+        "test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[string-display-other-field-key]",
+        "test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[string-display-other-field-value]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-list-leaf]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-nested-list]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-nested-object]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-object-key]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-object-value]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-list-leaf]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-nested-list]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-nested-object]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-object-key]",
+        "test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-object-value]",
+        "test_google_missing_preferred_field_still_uses_the_legacy_field",
+        "test_google_present_null_preferred_field_uses_upstream_id_not_the_legacy_field",
+        "test_malformed_identity_still_fails_even_with_unusable_presentation[ ]",
+        "test_malformed_identity_still_fails_even_with_unusable_presentation[5]",
+        "test_malformed_identity_still_fails_even_with_unusable_presentation[None]",
+        "test_malformed_identity_still_fails_even_with_unusable_presentation[]",
+        "test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails[7]",
+        "test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails[None]",
+        "test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails[]",
+        "test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails[name2]",
+        "test_presentation_walk_checks_the_cooperative_deadline",
+        "test_presentation_walk_exhaustion_fails_closed[too-deep]",
+        "test_presentation_walk_exhaustion_fails_closed[too-many-nodes]",
+        "test_unknown_python_object_presentation_is_rejected_without_stringifying_it",
+        "test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[bool]",
+        "test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[float]",
+        "test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[int]",
+        "test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[list]",
+        "test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[null]",
+        "test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[object]",
+        "test_wide_container_walk_stops_at_the_node_limit_without_expanding_children[dict]",
+        "test_wide_container_walk_stops_at_the_node_limit_without_expanding_children[list]"
       ]
     },
     "tests/test_model_records.py": {
@@ -9433,6 +9589,17 @@
         "test_scheduled_admission_inherits_only_an_active_main_and_explicit_needs_none[unselected]",
         "test_scheduled_admission_pins_saved_selector_exactly_or_inherits_main_with_one_resolution[blank-upstream-is-routed]",
         "test_scheduled_admission_pins_saved_selector_exactly_or_inherits_main_with_one_resolution[upstream-whitespace-verbatim]"
+      ],
+      "580": [
+        "test_explicit_admission_without_main_still_works_with_corrupt_preference_and_never_touches_it",
+        "test_failed_repair_write_keeps_notice_state_and_preference_bytes",
+        "test_real_preference_write_failure_is_still_persistence_failed",
+        "test_refresh_alone_never_clears_the_corrupt_preference_notice_or_saves_a_choice",
+        "test_selector_rejected_by_preference_validation_is_malformed_not_persistence_failure[p/bad\\nid]",
+        "test_selector_rejected_by_preference_validation_is_malformed_not_persistence_failure[p/https://host.invalid/m]",
+        "test_selector_rejected_by_preference_validation_is_malformed_not_persistence_failure[p/sec:value]",
+        "test_successful_deliberate_select_repairs_selection_and_clears_stale_notice[corrupt]",
+        "test_successful_deliberate_select_repairs_selection_and_clears_stale_notice[unconfigured-connection]"
       ]
     },
     "tests/test_model_secrets.py": {
@@ -11302,6 +11469,15 @@
         "test_reload_under_persistent_publication_fault_keeps_latch",
         "test_unlatched_unknown_tag_keeps_executed_failure[remove]",
         "test_unlatched_unknown_tag_keeps_executed_failure[resume]"
+      ],
+      "581": [
+        "test_directory_close_error_does_not_override_the_replace_outcome[sync-failed]",
+        "test_directory_close_error_does_not_override_the_replace_outcome[sync-succeeded]",
+        "test_directory_fsync_failure_after_replace_latches_reload_and_keeps_new_file",
+        "test_precommit_sync_failure_keeps_previous_file_and_runtime[directory_open]",
+        "test_precommit_sync_failure_keeps_previous_file_and_runtime[file_fsync]",
+        "test_precommit_sync_failure_keeps_previous_file_and_runtime[replace]",
+        "test_successful_scheduler_save_syncs_file_before_replace_and_directory_after"
       ]
     },
     "tests/test_scheduler_reload_atomicity.py": {
@@ -72306,5 +72482,276 @@
       "MEMORY.md"
     ],
     "limits": "Documentation + one test; no runtime change. 19 non-canonical REMOVED requirements remain unverified. No full suite; no checkbox change; executed_11_1 untouched."
+  },
+  "executed_panel_round1_fixes": {
+    "baseline_collected": 6190,
+    "current_collected": 6207,
+    "arithmetic": "6190 - 0 removed + 17 added (class 579) = 6207",
+    "counts_before": {
+      "keep": 5713,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "counts_after": {
+      "keep": 5730,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "retired": [],
+    "renamed": {},
+    "new_nodes": 17,
+    "new_node_ids": [
+      "tests/test_model_discovery.py::test_blank_display_name_falls_back_to_exact_upstream_id",
+      "tests/test_model_discovery.py::test_endless_fresh_continuations_stop_at_page_cap[anthropic]",
+      "tests/test_model_discovery.py::test_endless_fresh_continuations_stop_at_page_cap[google]",
+      "tests/test_model_discovery.py::test_endless_fresh_continuations_stop_at_page_cap[openrouter]",
+      "tests/test_model_discovery.py::test_finishing_exactly_on_last_allowed_page_succeeds[anthropic]",
+      "tests/test_model_discovery.py::test_finishing_exactly_on_last_allowed_page_succeeds[google]",
+      "tests/test_model_discovery.py::test_finishing_exactly_on_last_allowed_page_succeeds[openrouter]",
+      "tests/test_model_discovery.py::test_identity_whitespace_and_unsafe_ids_still_reject_inventory[ padded]",
+      "tests/test_model_discovery.py::test_identity_whitespace_and_unsafe_ids_still_reject_inventory[https://x.example/m]",
+      "tests/test_model_discovery.py::test_identity_whitespace_and_unsafe_ids_still_reject_inventory[pad\\nded]",
+      "tests/test_model_discovery.py::test_identity_whitespace_and_unsafe_ids_still_reject_inventory[padded ]",
+      "tests/test_model_discovery.py::test_padded_display_reflecting_credential_still_fails_closed",
+      "tests/test_model_discovery.py::test_page_cap_failure_keeps_last_good_stale_without_partial_commit",
+      "tests/test_model_discovery.py::test_page_cap_is_per_connection_not_shared",
+      "tests/test_model_discovery.py::test_presentation_whitespace_does_not_invalidate_openrouter_inventory[ Padded Name]",
+      "tests/test_model_discovery.py::test_presentation_whitespace_does_not_invalidate_openrouter_inventory[Padded Name ]",
+      "tests/test_model_discovery.py::test_presentation_whitespace_does_not_invalidate_openrouter_inventory[\\tPadded Name\\n]"
+    ],
+    "baseline_classes_unchanged": "classes 0-578 and every earlier executed_* record are byte-frozen",
+    "production_change": "model_discovery.py only: display text .strip() (blank -> upstream id) and _MAX_PAGES=100 page budget",
+    "evidence": "Causal RED on an external copy with baseline model_discovery.py (190e950) and current tests, monkeypatch raising=False: 8 failed (H1 discovery_failed; request count 4 != cap 3 / 3 != 2), 9 guards passed; GREEN on fixed source. The earlier AttributeError-on-_MAX_PAGES RED (12 failed) was setup-only and is disclosed, not relied on.",
+    "limits": "No full suite; no checkbox change (45/46); fixed cap of 100, no time deadline."
+  },
+  "executed_low_issues_1_8_wave": {
+    "baseline_collected": 6207,
+    "current_collected": 6223,
+    "arithmetic": "6207 - 0 removed + 16 added (class 580) = 6223",
+    "counts_before": {
+      "keep": 5730,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "counts_after": {
+      "keep": 5746,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "retired": [],
+    "renamed": {},
+    "new_nodes": 16,
+    "new_node_ids": [
+      "tests/test_model_discovery.py::test_google_blank_display_name_falls_back_to_exact_upstream_id",
+      "tests/test_model_discovery.py::test_google_display_name_is_trimmed_presentation_while_identity_stays_exact",
+      "tests/test_model_discovery.py::test_google_display_name_reflecting_the_credential_still_fails_closed",
+      "tests/test_model_discovery.py::test_google_older_display_name_key_is_still_honoured_without_display_name",
+      "tests/test_model_discovery.py::test_google_unsafe_or_non_string_display_name_still_fails_the_inventory[7]",
+      "tests/test_model_discovery.py::test_google_unsafe_or_non_string_display_name_still_fails_the_inventory[https://x.example/m]",
+      "tests/test_model_discovery.py::test_google_unsafe_or_non_string_display_name_still_fails_the_inventory[line\\nbreak]",
+      "tests/test_model_registry.py::test_explicit_admission_without_main_still_works_with_corrupt_preference_and_never_touches_it",
+      "tests/test_model_registry.py::test_failed_repair_write_keeps_notice_state_and_preference_bytes",
+      "tests/test_model_registry.py::test_real_preference_write_failure_is_still_persistence_failed",
+      "tests/test_model_registry.py::test_refresh_alone_never_clears_the_corrupt_preference_notice_or_saves_a_choice",
+      "tests/test_model_registry.py::test_selector_rejected_by_preference_validation_is_malformed_not_persistence_failure[p/bad\\nid]",
+      "tests/test_model_registry.py::test_selector_rejected_by_preference_validation_is_malformed_not_persistence_failure[p/https://host.invalid/m]",
+      "tests/test_model_registry.py::test_selector_rejected_by_preference_validation_is_malformed_not_persistence_failure[p/sec:value]",
+      "tests/test_model_registry.py::test_successful_deliberate_select_repairs_selection_and_clears_stale_notice[corrupt]",
+      "tests/test_model_registry.py::test_successful_deliberate_select_repairs_selection_and_clears_stale_notice[unconfigured-connection]"
+    ],
+    "baseline_classes_unchanged": "classes 0-579 (incl. the 17 class-579 nodes) and every earlier executed_* record are frozen",
+    "rewritten_in_place": {
+      "tests/test_model_registry.py::test_saved_configured_selector_is_active_even_when_not_cached": "probe `not saved_selection_unusable` -> canonical `selection_notice is None` (same assertion meaning)",
+      "tests/test_model_registry.py::test_invalid_saved_selection_is_unset_with_notice_and_never_replaced": "probe `saved_selection_unusable` -> `selection_notice is not None`; length/canary/path/recovery-hint/no-write clauses unchanged",
+      "tests/test_model_registry.py::test_unreadable_saved_selection_is_unset_not_treated_as_missing": "probe -> `selection_notice is not None`; unset/no-auto-choice/dir-preserved clauses unchanged",
+      "tests/test_model_registry.py::test_saved_selector_naming_a_removed_connection_is_unset_with_notice": "probe -> `selection_notice is not None` (notice-content clause retained)",
+      "tests/test_model_registry.py::test_without_preference_first_ordinal_canonical_id_is_active_in_memory_only": "probe -> `selection_notice is None`",
+      "tests/test_model_registry.py::test_no_preference_and_empty_cache_leaves_selection_unset_without_files": "probe -> `selection_notice is None`",
+      "tests/test_models_catalog_9_1.py::test_recovery_does_not_hide_a_still_present_cache_notice": "stale notice now captured BEFORE the repairing select (selection_notice is None after) and asserted absent from /models text; cache-notice-still-shown clause unchanged"
+    },
+    "production_change": "main.py comment only; model_registry.py (saved_selection_unusable removed, select() error category + repair clears notice/status); model_discovery.py (Google displayName priority)",
+    "docs_changed": [
+      "MEMORY.md",
+      "design.md",
+      "adr.md",
+      "planning-route.md",
+      "specs/provider-model-catalog/spec.md (one added scenario)"
+    ],
+    "limits": "No full suite; no checkbox change; doc/comment issues 1-3 and 8 have no RED (declarative)."
+  },
+  "executed_reliability_security_wave": {
+    "baseline_collected": 6223,
+    "current_collected": 6247,
+    "arithmetic": "6223 - 0 removed + 24 added (class 581; 21 initial + 3 review-fix) = 6247",
+    "counts_before": {
+      "keep": 5746,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "counts_after": {
+      "keep": 5770,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "retired": [],
+    "renamed": {},
+    "new_nodes": 24,
+    "new_node_ids": [
+      "tests/test_job_execution_log.py::test_factory_value_error_through_real_supervisor_is_sanitized_on_the_same_terminal_path",
+      "tests/test_job_execution_log.py::test_forged_refusal_stamp_cannot_forward_arbitrary_error_text",
+      "tests/test_job_execution_log.py::test_known_admission_codes_keep_their_fixed_guidance[malformed_selector]",
+      "tests/test_job_execution_log.py::test_known_admission_codes_keep_their_fixed_guidance[model_not_found]",
+      "tests/test_job_execution_log.py::test_known_admission_codes_keep_their_fixed_guidance[no_active_selection]",
+      "tests/test_job_execution_log.py::test_known_admission_codes_keep_their_fixed_guidance[unknown_connection]",
+      "tests/test_job_execution_log.py::test_non_allowlisted_error_dict_is_replaced_by_the_fixed_label",
+      "tests/test_job_execution_log.py::test_raising_spawn_never_publishes_exception_text_anywhere[canary-secret-7f3a]",
+      "tests/test_job_execution_log.py::test_raising_spawn_never_publishes_exception_text_anywhere[canary\\\\u002dsecret-7f3a]",
+      "tests/test_job_execution_log.py::test_raising_spawn_never_publishes_exception_text_anywhere[{\"error\": \"canary-secret-7f3a\"}]",
+      "tests/test_job_execution_log.py::test_typed_cancelled_factory_uses_existing_cancelled_record_and_releases_run",
+      "tests/test_model_discovery.py::test_deadline_failure_leaves_registry_last_good_stale_and_cache_unmodified",
+      "tests/test_model_discovery.py::test_each_provider_fetch_gets_a_new_budget",
+      "tests/test_model_discovery.py::test_fresh_continuation_expires_before_next_request_with_no_partial_inventory",
+      "tests/test_model_discovery.py::test_remaining_budget_restricts_each_transport_timeout_phase",
+      "tests/test_model_discovery.py::test_single_final_page_finished_at_budget_boundary_is_rejected",
+      "tests/test_model_discovery.py::test_slow_stream_is_closed_when_budget_expires_between_chunks",
+      "tests/test_scheduler_publication_failure.py::test_directory_close_error_does_not_override_the_replace_outcome[sync-failed]",
+      "tests/test_scheduler_publication_failure.py::test_directory_close_error_does_not_override_the_replace_outcome[sync-succeeded]",
+      "tests/test_scheduler_publication_failure.py::test_directory_fsync_failure_after_replace_latches_reload_and_keeps_new_file",
+      "tests/test_scheduler_publication_failure.py::test_precommit_sync_failure_keeps_previous_file_and_runtime[directory_open]",
+      "tests/test_scheduler_publication_failure.py::test_precommit_sync_failure_keeps_previous_file_and_runtime[file_fsync]",
+      "tests/test_scheduler_publication_failure.py::test_precommit_sync_failure_keeps_previous_file_and_runtime[replace]",
+      "tests/test_scheduler_publication_failure.py::test_successful_scheduler_save_syncs_file_before_replace_and_directory_after"
+    ],
+    "baseline_classes_unchanged": "classes 0-580 (incl. 17 class-579 and 16 class-580 nodes) and every earlier executed_* record frozen",
+    "rewritten_in_place": {
+      "tests/test_job_execution_log.py::test_raising_spawn_records_failed_run_with_admitted_id": "raw RuntimeError text assertion inverted; run id/status retained, fixed message instead",
+      "tests/test_job_execution_log.py::test_failed_spawn_persists_failed_record_with_admitted_run_id": "capacity mock stamped refused (real boundary shape); result safe fixed capacity guidance, run id/status preserved",
+      "tests/test_sub_agent_supervisor.py::TestSubmitRejectionShape::test_factory_value_error_returns_rejection_without_finish_cb": "generic raw ValueError no longer echoed; refusal/error type/finish-cb unchanged",
+      "tests/test_sub_agent_supervisor.py::TestSubmitRejectionCompatibility::test_non_main_gate_value_errors_keep_generic_rejection[generic-value-error]": "expected fixed generic admission label instead of raw model string; generic guidance/disposition/no finish-cb retained",
+      "tests/test_sub_agent_supervisor.py::TestSchedulerSynchronousRejection::test_cap_rejection_sets_last_error_notifies_and_clears_running": "capacity mock stamped refused (real boundary shape); status/notice/run release unchanged",
+      "tests/test_scheduler_failure_classification.py::test_launch_failure_record_carries_classification_and_next_run[True]": "trusted stamped ModelRegistryError unknown_connection replaces raw ConnectError mock; connection classification/next-run retained",
+      "tests/test_job_execution_log.py::test_parallel_launch_failure_keeps_other_run_active": "capacity mock stamped refused; unrelated active run preserved"
+    },
+    "limits": "No hard synchronous transport interruption; no new config/dependency; no full suite or task 11.3 checkbox update.",
+    "review_fix": {
+      "initial_oracle": "FAIL (1: directory close overrides known post-replace result; 2: LLMCancelledError converted to failed launch)",
+      "baseline_of_review_fix": "6244 collected; original wave RED remains separately disclosed",
+      "red_log": "logs/review-fix-RED.log: 3 failing real-entrypoint nodes (2 close/sync variants + typed cancellation); no setup-only failure",
+      "green_log": "logs/review-fix-GREEN-final.log: 3 passed; logs/review-fix-focused.log: 601 passed, 2 existing warnings",
+      "new_node_ids": [
+        "tests/test_job_execution_log.py::test_typed_cancelled_factory_uses_existing_cancelled_record_and_releases_run",
+        "tests/test_scheduler_publication_failure.py::test_directory_close_error_does_not_override_the_replace_outcome[sync-failed]",
+        "tests/test_scheduler_publication_failure.py::test_directory_close_error_does_not_override_the_replace_outcome[sync-succeeded]"
+      ],
+      "production": "scheduler.py only: contain OSError from directory close without overriding established outcome, and typed synchronous LLMCancelledError uses existing cancelled recorder/optional notice and releases admitted run once (no raw text)",
+      "no_other_source_change": "model_discovery.py, sub_agent_supervisor.py, README.md unchanged in review fix"
+    }
+  },
+  "executed_input_maintenance_wave": {
+    "baseline_collected": 6247,
+    "current_collected": 6314,
+    "arithmetic": "6247 - 0 removed + 67 added (class 582; 61 initial + 6 review-fix) = 6314",
+    "counts_before": {
+      "keep": 5770,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "counts_after": {
+      "keep": 5837,
+      "rewrite": 434,
+      "retire": 43
+    },
+    "retired": [],
+    "renamed": {},
+    "new_nodes": 67,
+    "new_node_ids": [
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[absent]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[api_key_file]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[badid]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[deferred-ref]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[empty]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[entry-not-table]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[env-url]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[key-nonstr]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[legacy-models]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[mixed-first]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[mixed-struct-before-sec]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[nondict]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[none]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[ollama-badurl]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[ollama-nokey]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[ollama-ok]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[retry-field]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[timeout-bool]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[timeout-inf]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[timeout-nan]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[timeout-neg]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[timeout-ok]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[timeout-str]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[timeout-zero]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[type-missing]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[type-nonstr]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[type-unsupported]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[unknown-field]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[url-bad]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[url-nonstr]",
+      "tests/test_config_schema.py::test_parse_config_provider_behaviour_is_unchanged[url-ref-missing]",
+      "tests/test_model_discovery.py::test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[google-ignored-legacy-field]",
+      "tests/test_model_discovery.py::test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[google-resource-name-display-null]",
+      "tests/test_model_discovery.py::test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[string-display-other-field-key]",
+      "tests/test_model_discovery.py::test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[string-display-other-field-value]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-list-leaf]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-nested-list]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-nested-object]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-object-key]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[google-object-value]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-list-leaf]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-nested-list]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-nested-object]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-object-key]",
+      "tests/test_model_discovery.py::test_credential_inside_discarded_presentation_value_fails_the_whole_refresh[openrouter-object-value]",
+      "tests/test_model_discovery.py::test_google_missing_preferred_field_still_uses_the_legacy_field",
+      "tests/test_model_discovery.py::test_google_present_null_preferred_field_uses_upstream_id_not_the_legacy_field",
+      "tests/test_model_discovery.py::test_malformed_identity_still_fails_even_with_unusable_presentation[ ]",
+      "tests/test_model_discovery.py::test_malformed_identity_still_fails_even_with_unusable_presentation[5]",
+      "tests/test_model_discovery.py::test_malformed_identity_still_fails_even_with_unusable_presentation[None]",
+      "tests/test_model_discovery.py::test_malformed_identity_still_fails_even_with_unusable_presentation[]",
+      "tests/test_model_discovery.py::test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails[7]",
+      "tests/test_model_discovery.py::test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails[None]",
+      "tests/test_model_discovery.py::test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails[]",
+      "tests/test_model_discovery.py::test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails[name2]",
+      "tests/test_model_discovery.py::test_presentation_walk_checks_the_cooperative_deadline",
+      "tests/test_model_discovery.py::test_presentation_walk_exhaustion_fails_closed[too-deep]",
+      "tests/test_model_discovery.py::test_presentation_walk_exhaustion_fails_closed[too-many-nodes]",
+      "tests/test_model_discovery.py::test_unknown_python_object_presentation_is_rejected_without_stringifying_it",
+      "tests/test_model_discovery.py::test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[bool]",
+      "tests/test_model_discovery.py::test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[float]",
+      "tests/test_model_discovery.py::test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[int]",
+      "tests/test_model_discovery.py::test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[list]",
+      "tests/test_model_discovery.py::test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[null]",
+      "tests/test_model_discovery.py::test_unusable_presentation_json_value_falls_back_to_exact_upstream_id[object]",
+      "tests/test_model_discovery.py::test_wide_container_walk_stops_at_the_node_limit_without_expanding_children[dict]",
+      "tests/test_model_discovery.py::test_wide_container_walk_stops_at_the_node_limit_without_expanding_children[list]"
+    ],
+    "baseline_classes_unchanged": "classes 0-581 (incl. class-579 17, class-580 16, class-581 24) and every earlier executed_* record frozen",
+    "rewritten_in_place": {
+      "tests/test_model_discovery.py::test_google_unsafe_or_non_string_display_name_still_fails_the_inventory[7]": "node id unchanged; a JSON number presentation value now falls back to the exact upstream id (approved non-string tolerance); the https and control-character siblings still assert invalid_response"
+    },
+    "production_change": "model_discovery.py (non-string presentation fallback, bounded credential walk); config_schema.py (_parse_providers duplicate structural checks removed, early _validate_provider_structure authoritative)",
+    "limits": "No full suite; issue 14/15 not started; no checkbox change.",
+    "review_fix": {
+      "initial_oracle": "FAIL issue 11 only (1: raw guard ran only on a selected non-string display value; 2: eager container expansion before limit/clock)",
+      "fix": "model_discovery.py only: the guard runs on every raw candidate row before descriptors/normalization; lazy iterator-stack walk, O(depth) pending, each admitted node counted and clock-checked; credential hit uses the registry existing invalid_inventory classification",
+      "new_node_ids": [
+        "tests/test_model_discovery.py::test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[google-ignored-legacy-field]",
+        "tests/test_model_discovery.py::test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[google-resource-name-display-null]",
+        "tests/test_model_discovery.py::test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[string-display-other-field-key]",
+        "tests/test_model_discovery.py::test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh[string-display-other-field-value]",
+        "tests/test_model_discovery.py::test_wide_container_walk_stops_at_the_node_limit_without_expanding_children[dict]",
+        "tests/test_model_discovery.py::test_wide_container_walk_stops_at_the_node_limit_without_expanding_children[list]"
+      ],
+      "red_log": "logs4/review-RED.log (4 credential nodes failed on behaviour; 2 wide-container nodes failed on allocation after the first version of the test measured ticks and did not discriminate)",
+      "config_schema": "config_schema.py and tests/test_config_schema.py byte-equal to the first candidate (issue 13 PASS)"
+    }
   }
 }

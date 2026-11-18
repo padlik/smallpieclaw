@@ -542,3 +542,566 @@ def test_no_supplement_network_call_occurs(adapter: str) -> None:
     assert [model.upstream_id for model in inventory.models] == ["m"]
     assert not hasattr(inventory, "supplemental")
     assert "models.dev" not in repr(inventory)
+
+
+def _registry_for(adapter, handler, tmp_path):
+    """Build a real registry over the real discovery and a MockTransport provider."""
+    from config_schema import ProviderConfig, ResolvedProviderConnection
+    from model_registry import ModelRegistry
+
+    def resolve(config: ProviderConfig) -> ResolvedProviderConnection:
+        return ResolvedProviderConnection(
+            config.name, config.type, config.base_url, config.request_timeout, "test-secret"
+        )
+
+    settings = ModelSettings(tmp_path / "models-config.toml")
+    return ModelRegistry(
+        {"account": ProviderConfig("account", adapter, "env:KEY")},
+        settings, _discovery(handler), resolve,
+    ), settings
+
+
+@pytest.mark.parametrize("padded", ["Padded Name ", " Padded Name", "\tPadded Name\n"])
+def test_presentation_whitespace_does_not_invalidate_openrouter_inventory(padded, tmp_path) -> None:
+    """A padded display name is trimmed; the whole inventory is still committed fresh."""
+    payload = {"data": [
+        {"id": "vendor/good", "name": "Good"},
+        {"id": "vendor/padded", "name": padded},
+        {"id": "vendor/last", "name": "Last"},
+    ]}
+    registry, settings = _registry_for(
+        "openrouter", lambda _: httpx.Response(200, json=payload), tmp_path
+    )
+    assert registry.view().models == ()
+
+    report = registry.refresh()
+
+    assert report.error_codes == ()
+    assert report.refreshed_provider_ids == ("account",)
+    view = registry.view()
+    assert view.providers[0].status == "fresh"
+    by_id = {model.id: model for model in view.models}
+    assert set(by_id) == {"account/vendor/good", "account/vendor/padded", "account/vendor/last"}
+    assert by_id["account/vendor/padded"].upstream_id == "vendor/padded"
+    assert by_id["account/vendor/padded"].display_name == "Padded Name"
+    assert {model.id for model in settings.load().document.models} == set(by_id)
+    # An initially empty inventory is now usable for selection.
+    assert registry.select("account/vendor/padded").models
+
+
+def test_blank_display_name_falls_back_to_exact_upstream_id() -> None:
+    payload = {"data": [{"id": "vendor/blank", "name": "  \t "}]}
+    inventory = _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
+        Connection(adapter="openrouter")
+    )
+    assert inventory.models[0].display_name == "vendor/blank"
+    assert inventory.models[0].upstream_id == "vendor/blank"
+
+
+@pytest.mark.parametrize("model_id", [" padded", "padded ", "pad\nded", "https://x.example/m"])
+def test_identity_whitespace_and_unsafe_ids_still_reject_inventory(model_id) -> None:
+    payload = {"data": [{"id": "ok", "name": "Ok"}, {"id": model_id, "name": "Bad"}]}
+    with pytest.raises(ModelDiscoveryError) as error:
+        _discovery(lambda _: httpx.Response(200, json=payload)).fetch(Connection(adapter="openrouter"))
+    assert error.value.code == "invalid_response"
+
+
+def test_padded_display_reflecting_credential_still_fails_closed(tmp_path) -> None:
+    payload = {"data": [{"id": "vendor/m", "name": " prefix test-secret "}]}
+    registry, settings = _registry_for(
+        "openrouter", lambda _: httpx.Response(200, json=payload), tmp_path
+    )
+    report = registry.refresh()
+    assert report.refreshed_provider_ids == ()
+    assert registry.view().models == ()
+    assert not settings.path.exists() or "test-secret" not in settings.path.read_text(encoding="utf-8")
+
+
+_FRESH_PAGE = {
+    "anthropic": lambda n: {"data": [{"id": f"m{n}"}], "has_more": True, "last_id": f"c{n}"},
+    "google": lambda n: {"models": [{"name": f"models/m{n}", "baseModelId": f"m{n}"}],
+                         "nextPageToken": f"t{n}"},
+    "openrouter": lambda n: {"data": [{"id": f"m{n}"}], "links": {"next": f"/api/v1/models?offset={n}"}},
+}
+_LAST_PAGE = {
+    "anthropic": lambda n: {"data": [{"id": f"m{n}"}], "has_more": False},
+    "google": lambda n: {"models": [{"name": f"models/m{n}", "baseModelId": f"m{n}"}]},
+    "openrouter": lambda n: {"data": [{"id": f"m{n}"}]},
+}
+
+
+@pytest.mark.parametrize("adapter", ["anthropic", "google", "openrouter"])
+def test_endless_fresh_continuations_stop_at_page_cap(adapter, monkeypatch) -> None:
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_MAX_PAGES", 3, raising=False)
+    count = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal count
+        count += 1
+        if count > 3:  # overshoot is recorded (not swallowed) and ends an unbounded loop
+            return httpx.Response(503, text="overshoot")
+        return httpx.Response(200, json=_FRESH_PAGE[adapter](count))
+
+    with pytest.raises(ModelDiscoveryError) as error:
+        _discovery(handler).fetch(Connection(adapter=adapter))
+    assert count == 3
+    assert error.value.code == "pagination_limit"
+
+
+@pytest.mark.parametrize("adapter", ["anthropic", "google", "openrouter"])
+def test_finishing_exactly_on_last_allowed_page_succeeds(adapter, monkeypatch) -> None:
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_MAX_PAGES", 3, raising=False)
+    count = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal count
+        count += 1
+        page = _LAST_PAGE if count == 3 else _FRESH_PAGE
+        return httpx.Response(200, json=page[adapter](count))
+
+    inventory = _discovery(handler).fetch(Connection(adapter=adapter))
+    assert count == 3
+    assert [model.upstream_id for model in inventory.models] == ["m1", "m2", "m3"]
+
+
+def test_page_cap_failure_keeps_last_good_stale_without_partial_commit(monkeypatch, tmp_path) -> None:
+    import model_discovery
+    from config_schema import ProviderConfig, ResolvedProviderConnection
+    from model_registry import ModelMetadata, ModelRecord, ModelRegistry
+
+    monkeypatch.setattr(model_discovery, "_MAX_PAGES", 2, raising=False)
+    cached = ModelRecord("account/cached", "account", "cached", "Cached",
+                         ModelMetadata(100, None, None, None, None, None))
+    settings = ModelSettings(tmp_path / "models-config.toml")
+    settings.write(CatalogDocument(
+        1, 2, None, (ProviderState("account", "anthropic", "2026-09-01T00:00:00Z", "fresh"),),
+        (cached,),
+    ))
+    count = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal count
+        count += 1
+        if count > 2:  # overshoot is recorded (not swallowed) and ends an unbounded loop
+            return httpx.Response(503, text="overshoot")
+        return httpx.Response(200, json=_FRESH_PAGE["anthropic"](count))
+
+    def resolve(config: ProviderConfig) -> ResolvedProviderConnection:
+        return ResolvedProviderConnection(
+            config.name, config.type, config.base_url, config.request_timeout, "test-secret"
+        )
+
+    registry = ModelRegistry(
+        {"account": ProviderConfig("account", "anthropic", "env:KEY")},
+        settings, _discovery(handler), resolve,
+    )
+    report = registry.refresh()
+
+    assert count == 2
+    view = registry.view()
+    assert view.models == (cached,)
+    assert view.providers[0].status == "stale"
+    assert report.refreshed_provider_ids == ()
+    assert [code for _p, code in report.error_codes] == [view.providers[0].sanitized_last_error_code]
+    assert settings.load().document.models == (cached,)
+    assert "m1" not in settings.path.read_text(encoding="utf-8")
+
+
+def test_page_cap_is_per_connection_not_shared(monkeypatch) -> None:
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_MAX_PAGES", 2, raising=False)
+    discovery = _discovery(lambda _: httpx.Response(
+        200, json={"data": [{"id": "m"}], "has_more": False}))
+    for _ in range(3):
+        assert discovery.fetch(Connection(adapter="anthropic")).models
+
+
+# --- low-issue wave: Google displayName is the friendly presentation field (5) ---
+
+
+def _google_row(**extra):
+    return {"name": "models/gemini-latest", "baseModelId": "gemini-1.5", **extra}
+
+
+def test_google_display_name_is_trimmed_presentation_while_identity_stays_exact() -> None:
+    payload = {"models": [_google_row(displayName="  Gemini 1.5 Pro \n")]}
+    inventory = _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
+        Connection(adapter="google", api_key="google-key")
+    )
+    record = inventory.models[0]
+    assert (record.id, record.upstream_id, record.display_name) == (
+        "account/gemini-1.5", "gemini-1.5", "Gemini 1.5 Pro",
+    )
+    assert inventory.descriptors[0].resource_name == "models/gemini-latest"
+
+
+def test_google_blank_display_name_falls_back_to_exact_upstream_id() -> None:
+    payload = {"models": [_google_row(displayName="   ")]}
+    record = _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
+        Connection(adapter="google", api_key="google-key")
+    ).models[0]
+    assert record.display_name == "gemini-1.5" and record.upstream_id == "gemini-1.5"
+
+
+def test_google_older_display_name_key_is_still_honoured_without_display_name() -> None:
+    payload = {"models": [_google_row(display_name="Older Fixture")]}
+    record = _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
+        Connection(adapter="google", api_key="google-key")
+    ).models[0]
+    assert record.display_name == "Older Fixture"
+
+
+@pytest.mark.parametrize("value", ["https://x.example/m", 7, "line\nbreak"])
+def test_google_unsafe_or_non_string_display_name_still_fails_the_inventory(value) -> None:
+    payload = {"models": [_google_row(displayName=value)]}
+    discovery = _discovery(lambda _: httpx.Response(200, json=payload))
+    if value == 7:
+        # A JSON number is unusable presentation, not unsafe: exact identity fallback.
+        record = discovery.fetch(Connection(adapter="google", api_key="google-key")).models[0]
+        assert (record.upstream_id, record.display_name) == ("gemini-1.5", "gemini-1.5")
+        return
+    with pytest.raises(ModelDiscoveryError) as error:
+        discovery.fetch(Connection(adapter="google", api_key="google-key"))
+    assert error.value.code == "invalid_response"
+
+
+def test_google_display_name_reflecting_the_credential_still_fails_closed(tmp_path) -> None:
+    payload = {"models": [_google_row(displayName=" see test-secret ")]}
+    registry, _ = _registry_for("google", lambda _: httpx.Response(200, json=payload), tmp_path)
+    report = registry.refresh()
+    assert report.refreshed_provider_ids == () and registry.view().models == ()
+
+
+# --- reliability wave: cooperative per-connection elapsed discovery budget ---
+
+
+def test_fresh_continuation_expires_before_next_request_with_no_partial_inventory(monkeypatch) -> None:
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_DISCOVERY_BUDGET_S", 120, raising=False)
+    tick = [0.0]
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        tick[0] = 120.0
+        return httpx.Response(200, json={"data": [{"id": "m1"}], "has_more": True, "last_id": "m1"})
+
+    discovery = _discovery(handler)
+    monkeypatch.setattr(discovery, "_monotonic", lambda: tick[0], raising=False)
+    with pytest.raises(ModelDiscoveryError) as error:
+        discovery.fetch(Connection(adapter="anthropic"))
+    assert error.value.code == "discovery_timeout"
+    assert len(requests) == 1
+
+
+def test_single_final_page_finished_at_budget_boundary_is_rejected(monkeypatch) -> None:
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_DISCOVERY_BUDGET_S", 120, raising=False)
+    tick = [0.0]
+
+    def handler(_request):
+        tick[0] = 120.0
+        return httpx.Response(200, json={"data": [{"id": "m1"}]})
+
+    discovery = _discovery(handler)
+    monkeypatch.setattr(discovery, "_monotonic", lambda: tick[0], raising=False)
+    with pytest.raises(ModelDiscoveryError) as error:
+        discovery.fetch(Connection())
+    assert error.value.code == "discovery_timeout"
+
+
+def test_slow_stream_is_closed_when_budget_expires_between_chunks(monkeypatch) -> None:
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_DISCOVERY_BUDGET_S", 120, raising=False)
+    tick = [0.0]
+    chunks = []
+    closed = []
+
+    class Stream(httpx.SyncByteStream):
+        def __iter__(self):
+            chunks.append(1)
+            yield b'{"data":'
+            tick[0] = 120.0
+            chunks.append(2)
+            yield b'[{"id":"m"}]}'
+            chunks.append(3)
+
+        def close(self):
+            closed.append(True)
+
+    discovery = _discovery(lambda _: httpx.Response(200, stream=Stream()))
+    monkeypatch.setattr(discovery, "_monotonic", lambda: tick[0], raising=False)
+    with pytest.raises(ModelDiscoveryError) as error:
+        discovery.fetch(Connection())
+    assert error.value.code == "discovery_timeout"
+    assert closed == [True] and chunks == [1, 2]
+
+
+def test_remaining_budget_restricts_each_transport_timeout_phase(monkeypatch) -> None:
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_DISCOVERY_BUDGET_S", 120, raising=False)
+    tick = [0.0]
+    captured = []
+
+    def clock():
+        current = tick[0]
+        tick[0] = 117.0
+        return current
+
+    def handler(request):
+        captured.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"data": [{"id": "m"}]})
+
+    discovery = _discovery(handler)
+    monkeypatch.setattr(discovery, "_monotonic", clock, raising=False)
+    inventory = discovery.fetch(Connection(request_timeout=15.0))
+    assert inventory.models[0].id == "account/m"
+    assert all(0 < value <= 3.0 for value in captured[0].values())
+
+
+def test_each_provider_fetch_gets_a_new_budget(monkeypatch) -> None:
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_DISCOVERY_BUDGET_S", 120, raising=False)
+    tick = [0.0]
+    calls = []
+
+    def handler(_request):
+        calls.append(tick[0])
+        tick[0] += 90.0
+        return httpx.Response(200, json={"data": [{"id": "m"}]})
+
+    discovery = _discovery(handler)
+    monkeypatch.setattr(discovery, "_monotonic", lambda: tick[0], raising=False)
+    assert discovery.fetch(Connection()).models
+    assert discovery.fetch(Connection()).models
+    assert calls == [0.0, 90.0]
+
+
+def test_deadline_failure_leaves_registry_last_good_stale_and_cache_unmodified(monkeypatch, tmp_path) -> None:
+    import model_discovery
+    from config_schema import ProviderConfig, ResolvedProviderConnection
+    from model_registry import ModelMetadata, ModelRecord, ModelRegistry
+
+    monkeypatch.setattr(model_discovery, "_DISCOVERY_BUDGET_S", 120, raising=False)
+    cached = ModelRecord("account/cached", "account", "cached", "Cached",
+                         ModelMetadata(100, None, None, None, None, None))
+    settings = ModelSettings(tmp_path / "models.toml")
+    settings.write(CatalogDocument(1, 2, None,
+        (ProviderState("account", "openai", "2026-09-01T00:00:00Z", "fresh"),), (cached,)))
+    tick = [0.0]
+
+    def handler(_request):
+        tick[0] = 120.0
+        return httpx.Response(200, json={"data": [{"id": "new"}]})
+
+    discovery = _discovery(handler)
+    monkeypatch.setattr(discovery, "_monotonic", lambda: tick[0], raising=False)
+
+    def resolve(config: ProviderConfig) -> ResolvedProviderConnection:
+        return ResolvedProviderConnection(config.name, config.type, config.base_url, config.request_timeout, "test-secret")
+
+    registry = ModelRegistry({"account": ProviderConfig("account", "openai", "env:KEY")}, settings, discovery, resolve)
+    report = registry.refresh()
+    assert report.refreshed_provider_ids == () and registry.view().models == (cached,)
+    assert registry.view().providers[0].status == "stale"
+    assert settings.load().document.models == (cached,)
+    assert b"new" not in settings.path.read_bytes()
+
+
+# --- input-handling wave: unusable (non-string) presentation never invalidates identity ---
+
+_UNUSABLE = [None, True, 12, 1.5, ["a", 1], {"k": "v"}]
+_UNUSABLE_IDS = ["null", "bool", "int", "float", "list", "object"]
+
+
+@pytest.mark.parametrize("unusable", _UNUSABLE, ids=_UNUSABLE_IDS)
+def test_unusable_presentation_json_value_falls_back_to_exact_upstream_id(unusable, tmp_path) -> None:
+    payload = {"data": [{"id": "vendor/good", "name": "Good"}, {"id": "vendor/odd", "name": unusable}]}
+    registry, settings = _registry_for("openrouter", lambda _: httpx.Response(200, json=payload), tmp_path)
+    assert registry.view().models == ()
+
+    report = registry.refresh()
+
+    assert report.error_codes == () and report.refreshed_provider_ids == ("account",)
+    view = registry.view()
+    assert view.providers[0].status == "fresh"
+    by_id = {m.id: m for m in view.models}
+    assert sorted(by_id) == ["account/vendor/good", "account/vendor/odd"]
+    assert by_id["account/vendor/odd"].display_name == "vendor/odd"
+    assert by_id["account/vendor/odd"].upstream_id == "vendor/odd"
+    assert by_id["account/vendor/good"].display_name == "Good"
+    assert {m.id for m in settings.load().document.models} == set(by_id)
+    assert registry.select("account/vendor/good").active_model_id == "account/vendor/good"
+
+
+def test_google_present_null_preferred_field_uses_upstream_id_not_the_legacy_field() -> None:
+    payload = {"models": [_google_row(displayName=None, display_name="Legacy")]}
+    record = _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
+        Connection(adapter="google", api_key="google-key")
+    ).models[0]
+    assert record.display_name == "gemini-1.5"
+
+
+def test_google_missing_preferred_field_still_uses_the_legacy_field() -> None:
+    payload = {"models": [_google_row(display_name="Legacy")]}
+    record = _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
+        Connection(adapter="google", api_key="google-key")
+    ).models[0]
+    assert record.display_name == "Legacy"
+
+
+_SECRET_CASES = {
+    "list-leaf": ["ok", "x test-secret x"],
+    "nested-list": [[["deep test-secret"]]],
+    "object-value": {"k": "test-secret"},
+    "object-key": {"test-secret": 1},
+    "nested-object": {"a": {"b": ["test-secret"]}},
+}
+
+
+@pytest.mark.parametrize("value", list(_SECRET_CASES.values()), ids=list(_SECRET_CASES))
+@pytest.mark.parametrize("adapter", ["openrouter", "google"])
+def test_credential_inside_discarded_presentation_value_fails_the_whole_refresh(
+    adapter, value, tmp_path, caplog
+) -> None:
+    if adapter == "google":
+        payload = {"models": [_google_row(displayName=value)]}
+    else:
+        payload = {"data": [{"id": "vendor/a", "name": value}]}
+    registry, settings = _registry_for(adapter, lambda _: httpx.Response(200, json=payload), tmp_path)
+
+    report = registry.refresh()
+
+    assert report.refreshed_provider_ids == () and registry.view().models == ()
+    assert not settings.path.exists() or settings.load().document.models == ()
+    assert "test-secret" not in caplog.text and "test-secret" not in repr(report)
+    with pytest.raises(ModelDiscoveryError) as error:
+        _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
+            Connection(adapter=adapter, api_key="test-secret")
+        )
+    assert error.value.code == "invalid_inventory" and "test-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("name", [None, 7, ["x"], ""])
+def test_ollama_identity_name_that_is_not_a_nonempty_string_still_fails(name) -> None:
+    payload = {"models": [{"name": name}]}
+    with pytest.raises(ModelDiscoveryError) as error:
+        _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
+            Connection(adapter="ollama", api_key="k")
+        )
+    assert error.value.code == "invalid_response"
+
+
+@pytest.mark.parametrize("identity", [None, 5, "", " "])
+def test_malformed_identity_still_fails_even_with_unusable_presentation(identity) -> None:
+    payload = {"data": [{"id": identity, "name": None}]}
+    with pytest.raises(ModelDiscoveryError):
+        _discovery(lambda _: httpx.Response(200, json=payload)).fetch(Connection(adapter="openrouter"))
+
+
+def test_unknown_python_object_presentation_is_rejected_without_stringifying_it() -> None:
+    import model_discovery
+
+    class Boom:
+        def __str__(self) -> str:
+            raise AssertionError("str called")
+
+        __repr__ = __str__
+        __format__ = lambda self, spec: (_ for _ in ()).throw(AssertionError("format called"))  # noqa: E731
+
+    with pytest.raises(ModelDiscoveryError) as error:
+        model_discovery._normalize_model("account", "openrouter", {"id": "m", "name": Boom()})
+    assert error.value.code == "invalid_response"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(lambda: [[]] * 0 or __import__("functools").reduce(lambda acc, _: [acc], range(60), []), id="too-deep"),
+        pytest.param(lambda: list(range(20_000)), id="too-many-nodes"),
+    ],
+)
+def test_presentation_walk_exhaustion_fails_closed(value) -> None:
+    payload = {"data": [{"id": "m", "name": value()}]}
+    with pytest.raises(ModelDiscoveryError) as error:
+        _discovery(lambda _: httpx.Response(200, json=payload)).fetch(Connection(adapter="openrouter"))
+    assert error.value.code == "invalid_response"
+
+
+def test_presentation_walk_checks_the_cooperative_deadline(monkeypatch) -> None:
+    def run(width: int, expire_after: int | None):
+        payload = {"data": [{"id": "m", "name": ["x"] * width}]}
+        calls = [0]
+
+        def clock() -> float:
+            calls[0] += 1
+            return 1e9 if expire_after is not None and calls[0] > expire_after else 0.0
+
+        discovery = _discovery(lambda _: httpx.Response(200, json=payload))
+        monkeypatch.setattr(discovery, "_monotonic", clock)
+        discovery.fetch(Connection(adapter="openrouter"))
+        return calls[0]
+
+    base = run(1, None)
+    with pytest.raises(ModelDiscoveryError) as error:
+        run(500, base + 5)
+    assert error.value.code == "discovery_timeout"
+
+
+# --- input-handling review fix: whole raw candidate guard and lazy bounded walk ---
+
+_CRED_PAYLOADS = {
+    "google-resource-name-display-null": ("google", {"models": [{"baseModelId": "safe-model", "name": "models/test-secret", "displayName": None}]}),
+    "google-ignored-legacy-field": ("google", {"models": [{"baseModelId": "safe-model", "name": "models/safe", "displayName": "Safe", "display_name": "x test-secret"}]}),
+    "string-display-other-field-value": ("openrouter", {"data": [{"id": "vendor/a", "name": "Fine", "extra": {"k": ["test-secret"]}}]}),
+    "string-display-other-field-key": ("openrouter", {"data": [{"id": "vendor/a", "name": "Fine", "architecture": {"test-secret": 1}}]}),
+}
+
+
+@pytest.mark.parametrize("case", list(_CRED_PAYLOADS))
+def test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh(case, tmp_path, caplog) -> None:
+    adapter, payload = _CRED_PAYLOADS[case]
+    registry, settings = _registry_for(adapter, lambda _: httpx.Response(200, json=payload), tmp_path)
+
+    report = registry.refresh()
+
+    assert report.refreshed_provider_ids == () and registry.view().models == ()
+    assert not settings.path.exists() or settings.load().document.models == ()
+    assert "test-secret" not in caplog.text and "test-secret" not in repr(report)
+    discovery = _discovery(lambda _: httpx.Response(200, json=payload))
+    with pytest.raises(ModelDiscoveryError) as error:
+        discovery.fetch(Connection(adapter=adapter, api_key="test-secret"))
+    assert error.value.code == "invalid_inventory" and "test-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("shape", ["list", "dict"])
+def test_wide_container_walk_stops_at_the_node_limit_without_expanding_children(shape, monkeypatch) -> None:
+    """Pending work stays O(depth): the walk allocates nothing proportional to the width."""
+    import tracemalloc
+
+    import model_discovery
+
+    monkeypatch.setattr(model_discovery, "_MAX_PRESENTATION_NODES", 3)
+    wide = list(range(200_000)) if shape == "list" else {f"k{i}": i for i in range(100_000)}
+    ticks = [0]
+    tracemalloc.start()
+    try:
+        with pytest.raises(ModelDiscoveryError) as error:
+            model_discovery._reject_credential_in_json(
+                wide, "test-secret", lambda: ticks.__setitem__(0, ticks[0] + 1)
+            )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert error.value.code == "invalid_response"
+    assert ticks[0] <= 4 and peak < 50_000  # eager expansion of the children would take MBs

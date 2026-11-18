@@ -43,6 +43,8 @@ import schedule
 from croniter import croniter, CroniterBadCronError
 
 from model_registry import bounded_selector_evidence
+from outcome_utils import read_execution
+from providers._errors import LLMCancelledError
 from sub_agent_registry import SOURCE_SCHEDULED
 from sub_agent_supervisor import CANCELLED_SENTINEL, RunCompletion, SupervisionOptions
 from telegram_formatter import (
@@ -77,6 +79,40 @@ def _local_int_setting(section_cfg: dict, section: str, key: str, default: int) 
         section, key, type(value).__name__, default,
     )
     return default
+
+
+_LAUNCH_FAILED_LABEL = (
+    "The sub-agent could not be launched; details are withheld. Check the agent's "
+    "log, then retry with run_now."
+)
+
+
+def _launch_failure_text(result: dict) -> str:
+    """Return a publishable launch-failure message from a failed spawn result.
+
+    Only a result stamped ``refused`` by ``spawn_agent`` itself (its own fixed
+    refusals, including the supervisor's sanitized admission rejection) may
+    publish its ``error`` text; every other failure, including any free-form
+    text from an unstamped result, becomes the fixed label.
+    """
+    from model_registry import ModelRegistryError
+
+    error = result.get("error")
+    if read_execution(result) != "refused" or not isinstance(error, str):
+        return _LAUNCH_FAILED_LABEL
+    # Never publish or classify arbitrary returned text, even if a foreign
+    # result contains a forged refusal stamp. Only exact known safe templates
+    # (including the supervisor's sanitized admission label) may pass.
+    known = {
+        f"spawn_agent: {ModelRegistryError(code)}"
+        for code in ("no_active_selection", "malformed_selector", "unknown_connection", "model_not_found", "credential_resolution_failed")
+    }
+    known.add("spawn_agent: model admission failed; details are withheld (check the model selector and /models)")
+    if error in known:
+        return error
+    if re.fullmatch(r"spawn_agent: max_subagents cap reached \(\d+/\d+\)\.(?: Wait for a managed sub-agent to finish or cancel one with /agents cancel managed\.)?", error):
+        return "spawn_agent: max_subagents cap reached. Wait for a managed sub-agent to finish."
+    return _LAUNCH_FAILED_LABEL
 
 
 def _classify_job_failure(result: str) -> str:
@@ -2193,16 +2229,36 @@ class Scheduler:
 
         try:
             result = self.builtin_executor.spawn_agent(spawn_args, options=options)
-        except Exception as exc:  # noqa: BLE001 - any launch error must release the admitted run
-            logger.error("Job %s spawn raised: %s", tag, exc, exc_info=True)
-            result = {
-                "success": False,
-                "error": f"spawn_agent raised {type(exc).__name__}: {exc}",
-            }
+        except LLMCancelledError:
+            # Admission was already tracked, but no child accepted ownership.
+            # Use the existing cancelled-result recorder and optional notice,
+            # then release exactly this run; never format the exception.
+            try:
+                model = bounded_selector_evidence(
+                    meta.get("model"), redact=self._selector_redactor,
+                )
+                options.result_log_cb(
+                    tag=tag, task=task, result=CANCELLED_SENTINEL,
+                    success=False, elapsed_s=0, model=model,
+                )
+                if options.notify and options.completion_cb is not None:
+                    options.completion_cb(RunCompletion(
+                        tag=tag, status="cancelled", result=CANCELLED_SENTINEL,
+                        elapsed_s=0, model=model, agent_id="",
+                    ))
+            finally:
+                self._release_run(tag, run_id)
+            return
+        except Exception:  # noqa: BLE001 - any launch error must release the admitted run
+            # Raw exception text/class/traceback can hold provider or credential text:
+            # nothing derived from the exception reaches any log, record or alert.
+            logger.error("Job %s spawn raised an unexpected error; details withheld", tag)
+            result = {"success": False, "error": _LAUNCH_FAILED_LABEL}
         if not result.get("success"):
-            logger.error("Job %s spawn failed: %s", tag, result.get("error"))
+            message = _launch_failure_text(result)
+            logger.error("Job %s spawn failed: %s", tag, message)
             self._fail_launch(
-                tag, meta, str(result.get("error", "spawn failed")), "failed to spawn",
+                tag, meta, message, "failed to spawn",
                 task=task,
                 model=bounded_selector_evidence(meta.get("model"), redact=self._selector_redactor),
                 run_id=run_id,
@@ -2707,12 +2763,13 @@ class Scheduler:
         or constructs a trigger runs after the write.
 
         Returns None on success, else an operator-safe failure reason; on
-        failure the file, the stored document/hash, the job view, and the
-        registrations are unchanged. Exceptions: while the RELOAD_REQUIRED
-        latch is set (rechecked under the locks) nothing is attempted, and an
-        ordinary exception while publishing after the write is contained: the
-        latch is set, automatic triggers are quiesced, nothing is rolled back
-        or retried, and a ``_ReloadRequiredReason`` is returned.
+        a failure before replacement the file, stored document/hash, job view,
+        and registrations are unchanged. After replacement, a failed parent
+        directory sync leaves the new bytes visible with durability uncertain;
+        an ordinary exception during later publication likewise leaves the
+        new bytes. Both latch RELOAD_REQUIRED, quiesce automatic triggers,
+        never roll back or retry, and return a ``_ReloadRequiredReason``.
+        While latched nothing is attempted until a successful reload.
         """
         for _ in range(self._MAX_MUTATION_ATTEMPTS):
             try:
@@ -2741,12 +2798,19 @@ class Scheduler:
                 if prepared.data is not None:
                     if not self._disk_unchanged_locked():
                         return self._external_change_reason()
-                    if not self._write_scheduler_file_locked(prepared.data):
+                    write_outcome = self._write_scheduler_file_locked(prepared.data)
+                    if write_outcome == "precommit_failure":
                         return (
                             f"{self._scheduler_config_path} could not be written, so the "
                             "previous file and schedule are kept. Check the file's "
                             "permissions, free space, and the logs, then retry the change."
                         )
+                    if write_outcome == "durability_uncertain":
+                        # The new bytes are visible; their durability is unknown.
+                        # Do not publish or roll back, and refuse all future changes
+                        # until a successful reload reconciles the actual file.
+                        self._quiesce_registrations_locked()
+                        return self._reload_required_reason()
                 try:
                     self._publish_mutation_locked(tag, prepared, replacement)
                 except Exception as exc:  # noqa: BLE001 - external job list after the write; contained under the latch
@@ -2950,35 +3014,58 @@ class Scheduler:
                 schedule.default_scheduler.jobs[:] = replacement
         self._config_generation += 1
 
-    def _write_scheduler_file_locked(self, data: bytes) -> bool:
-        """Write *data* atomically with a backup; always called under both commit locks.
+    def _write_scheduler_file_locked(self, data: bytes) -> Literal[
+        "committed", "precommit_failure", "durability_uncertain"
+    ]:
+        """Write and sync *data* under both commit locks; distinguish the replace boundary.
 
-        Returns False when the write failed; the file then keeps its previous
-        bytes and the caller publishes nothing. The successful ``os.replace``
-        is the last fallible step: nothing that can fail runs after it. Takes
-        no lock.
+        File fsync and opening the parent happen before replacement. A failed
+        parent fsync after replacement leaves the new bytes visible but their
+        crash durability unknown, so the caller must latch RELOAD_REQUIRED.
         """
         path = self._scheduler_config_path
         tmp = path + ".tmp"
+        directory_fd: Optional[int] = None
+        replaced = False
         try:
-            with open(tmp, "wb") as f:
-                f.write(data)
-            # Backup existing file before overwriting
+            directory_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+            with open(tmp, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Backup existing file before overwriting (unchanged policy).
             if os.path.exists(path):
                 ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 shutil.copy2(path, path + f".bak.{ts}")
                 self._prune_backups()
             logger.debug("Saving scheduler document to %s", path)
             os.replace(tmp, path)
+            replaced = True
+            os.fsync(directory_fd)
         except OSError as exc:
-            logger.warning("Could not save %s (%s); the previous file is kept.",
-                           path, type(exc).__name__)
-            try:
-                os.remove(tmp)
-            except OSError as cleanup_exc:
-                logger.debug("Could not remove %s: %s", tmp, cleanup_exc)
-            return False
-        return True
+            logger.warning(
+                "Could not %s %s (%s); %s.",
+                "sync replaced" if replaced else "save", path, type(exc).__name__,
+                "reload is required; durability is uncertain" if replaced else "the previous file is kept",
+            )
+            if not replaced:
+                try:
+                    os.remove(tmp)
+                except OSError as cleanup_exc:
+                    logger.debug("Could not remove %s: %s", tmp, type(cleanup_exc).__name__)
+            return "durability_uncertain" if replaced else "precommit_failure"
+        finally:
+            if directory_fd is not None:
+                try:
+                    os.close(directory_fd)
+                except OSError:
+                    # The descriptor may already be closed. Never retry or let
+                    # cleanup override the known pre/post-replacement outcome.
+                    logger.warning(
+                        "Could not close scheduler directory descriptor; "
+                        "the established write outcome is unchanged."
+                    )
+        return "committed"
 
     @staticmethod
     def _new_job_table(meta: dict) -> dict:

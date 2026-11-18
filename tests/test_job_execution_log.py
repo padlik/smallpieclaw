@@ -24,6 +24,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from outcome_utils import with_execution
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scheduler import JobExecutionLog, Scheduler
@@ -417,9 +419,9 @@ def test_failed_spawn_persists_failed_record_with_admitted_run_id(
     s = _sched(tmp_path, monkeypatch)
     s._jobs_meta["report"] = {"task": "write report", "enabled": True, "notify": False}
     executor = MagicMock()
-    executor.spawn_agent = MagicMock(return_value={
+    executor.spawn_agent = MagicMock(return_value=with_execution({
         "success": False, "error": "spawn_agent: max_subagents cap reached (6/6).",
-    })
+    }, "refused"))
     s.builtin_executor = executor
 
     s._run_job("report")
@@ -430,7 +432,7 @@ def test_failed_spawn_persists_failed_record_with_admitted_run_id(
     assert re.match(_RUN_ID_RE, entry["run_id"])
     assert entry["status"] == "failed"
     assert entry["success"] is False
-    assert entry["result"] == "spawn_agent: max_subagents cap reached (6/6)."
+    assert entry["result"] == "spawn_agent: max_subagents cap reached. Wait for a managed sub-agent to finish."
 
 
 def test_fail_closed_fallback_persists_failed_record_with_admitted_run_id(
@@ -776,9 +778,9 @@ def test_parallel_launch_failure_keeps_other_run_active(tmp_path, monkeypatch):
     s, captured = _spawn_sched(tmp_path, monkeypatch, overlap_policy="parallel")
     s._run_job("report")
     s.builtin_executor.spawn_agent.side_effect = None
-    s.builtin_executor.spawn_agent.return_value = {
+    s.builtin_executor.spawn_agent.return_value = with_execution({
         "success": False, "error": "spawn_agent: max_subagents cap reached (6/6).",
-    }
+    }, "refused")
 
     s._run_job("report")
 
@@ -865,7 +867,7 @@ def test_raising_spawn_records_failed_run_with_admitted_id(tmp_path, monkeypatch
     entry = s.execution_log.read_recent()[0]
     assert re.match(_RUN_ID_RE, entry["run_id"])
     assert entry["status"] == "failed"
-    assert "cannot schedule new futures after shutdown" in entry["result"]
+    assert "cannot schedule new futures after shutdown" not in entry["result"]  # raw text is never recorded
 
 
 def test_raising_spawn_sends_direct_launch_failure_alert(tmp_path, monkeypatch):
@@ -1352,3 +1354,136 @@ def test_restart_loses_queued_notice_but_retains_outcome(tmp_path, monkeypatch):
     assert [(e["run_id"], e["result"], e["status"]) for e in entries] == [
         (run_id, full, "done")
     ]
+
+
+# --- reliability wave: launch failures never publish raw exception text (issue 10) ---
+
+_CANARY = "canary-secret-7f3a"
+_CANARY_JSON = "canary\\u002dsecret-7f3a"  # JSON-escaped spelling of the same canary
+
+
+def _launch_failure_sinks(s, caplog):
+    """Every place a launch failure can be published, as one searchable text."""
+    parts = [caplog.text]
+    for record in caplog.records:
+        parts += [repr(record.args), repr(record.exc_info), repr(record.exc_text), repr(sorted(record.__dict__.items(), key=str))]
+    parts.append(json.dumps(s._jobs_meta, default=str))
+    parts.append(json.dumps(s._run_history, default=str))
+    parts.append(json.dumps(s.execution_log.read_recent(), default=str))
+    parts += [repr(c) for c in s.notify.call_args_list]
+    if os.path.exists(s._state_file):
+        parts.append(open(s._state_file, encoding="utf-8").read())
+    return "\n".join(parts)
+
+
+@pytest.mark.parametrize("message", [_CANARY, _CANARY_JSON, f'{{"error": "{_CANARY}"}}'])
+def test_raising_spawn_never_publishes_exception_text_anywhere(tmp_path, monkeypatch, caplog, message):
+    s, _captured = _spawn_sched(tmp_path, monkeypatch, overlap_policy="skip")
+    s.builtin_executor.spawn_agent.side_effect = RuntimeError(message)
+    caplog.set_level("DEBUG")
+
+    s._run_job("report")
+
+    sinks = _launch_failure_sinks(s, caplog)
+    assert "canary" not in sinks and "RuntimeError" not in sinks and "Traceback" not in sinks
+    assert all(r.exc_info is None for r in caplog.records)
+    (entry,) = s.execution_log.read_recent()
+    assert entry["status"] == "failed" and entry["result"]  # fixed actionable label
+    s.notify.assert_called_once()  # one alert even with notify=False
+    assert "failed to spawn" in s.notify.call_args.args[0]
+    assert s._running_jobs == set()
+
+
+def test_factory_value_error_through_real_supervisor_is_sanitized_on_the_same_terminal_path(
+    tmp_path, monkeypatch, caplog, make_builtin_executor
+):
+    s, _captured = _spawn_sched(tmp_path, monkeypatch, overlap_policy="skip")
+
+    def factory(**_kwargs):
+        raise ValueError(f"Model '{_CANARY}' not found")
+
+    s.builtin_executor = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
+    caplog.set_level("DEBUG")
+
+    s._run_job("report")
+
+    assert "canary" not in _launch_failure_sinks(s, caplog)
+    (entry,) = s.execution_log.read_recent()
+    assert entry["status"] == "failed"
+    s.notify.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "code", ["no_active_selection", "malformed_selector", "unknown_connection", "model_not_found"]
+)
+def test_known_admission_codes_keep_their_fixed_guidance(tmp_path, monkeypatch, make_builtin_executor, code):
+    from model_registry import ModelRegistryError
+
+    s, _captured = _spawn_sched(tmp_path, monkeypatch, overlap_policy="skip")
+
+    def factory(**_kwargs):
+        raise ModelRegistryError(code)
+
+    s.builtin_executor = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
+
+    s._run_job("report")
+
+    (entry,) = s.execution_log.read_recent()
+    assert entry["status"] == "failed" and str(ModelRegistryError(code)) in entry["result"]
+    s.notify.assert_called_once()
+
+
+def test_non_allowlisted_error_dict_is_replaced_by_the_fixed_label(tmp_path, monkeypatch, caplog):
+    s, _captured = _spawn_sched(tmp_path, monkeypatch, overlap_policy="skip")
+    s.builtin_executor.spawn_agent.side_effect = None
+    s.builtin_executor.spawn_agent.return_value = {
+        "success": False, "error": f"spawn_agent: {_CANARY}", "admission_code": "not-a-code",
+    }
+    caplog.set_level("DEBUG")
+
+    s._run_job("report")
+
+    assert "canary" not in _launch_failure_sinks(s, caplog)
+
+
+def test_forged_refusal_stamp_cannot_forward_arbitrary_error_text(tmp_path, monkeypatch, caplog):
+    s, _captured = _spawn_sched(tmp_path, monkeypatch, overlap_policy="skip")
+    s.builtin_executor.spawn_agent.side_effect = None
+    s.builtin_executor.spawn_agent.return_value = with_execution({
+        "success": False, "error": f"spawn_agent: {_CANARY}",
+    }, "refused")
+    caplog.set_level("DEBUG")
+
+    s._run_job("report")
+
+    assert "canary" not in _launch_failure_sinks(s, caplog)
+    assert s.execution_log.read_recent()[0]["error_type"] == "unknown"
+
+
+def test_typed_cancelled_factory_uses_existing_cancelled_record_and_releases_run(
+    tmp_path, monkeypatch, caplog, make_builtin_executor
+):
+    """The scheduled launch's synchronous cancellation is not a failed launch."""
+    from providers._errors import LLMCancelledError
+
+    s, _captured = _spawn_sched(tmp_path, monkeypatch, overlap_policy="skip")
+    calls = []
+
+    def factory(**kwargs):
+        calls.append(kwargs)
+        raise LLMCancelledError(_CANARY)
+
+    s.builtin_executor = make_builtin_executor(
+        sub_agent_factory=factory, data_dir=str(tmp_path)
+    )
+    caplog.set_level("DEBUG")
+
+    s._run_job("report")
+
+    assert len(calls) == 1
+    (entry,) = s.execution_log.read_recent()
+    assert entry["status"] == "cancelled" and entry["result"] == "[Cancelled]"
+    assert entry["success"] is False and not entry.get("error_type")
+    assert s._running_jobs == set() and s._active_runs == {}
+    s.notify.assert_not_called()  # notify=False; no failed-launch direct alert
+    assert "canary" not in _launch_failure_sinks(s, caplog)

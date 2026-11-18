@@ -585,3 +585,151 @@ def test_latched_loop_tick_does_not_admit_due_cron_job(
     assert live.get("last_run") is None and live.get("last_error") is None
     assert "alpha" not in sched._run_history
     assert "alpha" not in sched._running_jobs
+
+
+# --- reliability wave: file and parent-directory fsync around atomic replacement ---
+
+
+def test_directory_fsync_failure_after_replace_latches_reload_and_keeps_new_file(
+    make_scheduler: MakeScheduler, monkeypatch: pytest.MonkeyPatch, isolated_schedule: _IsolatedScheduler,
+) -> None:
+    """A failed parent sync is post-commit uncertainty, not a claim of old bytes."""
+    import stat
+
+    sched, path = make_scheduler()
+    old = path.read_bytes()
+    real_fsync = os.fsync
+    calls = []
+
+    def fault(fd: int) -> None:
+        directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        calls.append("directory" if directory else "file")
+        if directory:
+            raise OSError("private directory sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(scheduler_module.os, "fsync", fault)
+    outcome = sched.resume_job("paused")
+
+    assert outcome is False
+    assert calls == ["file", "directory"]
+    assert path.read_bytes() != old and b"enabled = true" in path.read_bytes()
+    assert sched._reload_required is True
+    assert "reload" in sched.load_notice().lower()
+    assert not isolated_schedule.jobs
+    before = path.read_bytes()
+    assert sched.resume_job("paused") is False and path.read_bytes() == before
+    monkeypatch.setattr(scheduler_module.os, "fsync", real_fsync)
+    result = sched.reload()
+    assert result["failed"] == 0 and sched._reload_required is False
+    assert sched.show_job("paused")["enabled"] is True
+
+
+@pytest.mark.parametrize("stage", ["file_fsync", "replace", "directory_open"])
+def test_precommit_sync_failure_keeps_previous_file_and_runtime(
+    make_scheduler: MakeScheduler, monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    import stat
+
+    sched, path = make_scheduler()
+    old = path.read_bytes()
+    before = sched.show_job("paused")
+    real_fsync, real_replace, real_open = os.fsync, os.replace, os.open
+    reached = []
+
+    def fsync(fd: int) -> None:
+        if stage == "file_fsync" and not stat.S_ISDIR(os.fstat(fd).st_mode):
+            reached.append(stage)
+            raise OSError("private sync failure")
+        real_fsync(fd)
+
+    def replace(src, dst):
+        if stage == "replace" and str(dst) == str(path):
+            reached.append(stage)
+            raise OSError("private replace failure")
+        return real_replace(src, dst)
+
+    def open_dir(name, *args, **kwargs):
+        if stage == "directory_open" and str(name) == str(path.parent):
+            reached.append(stage)
+            raise OSError("private directory open failure")
+        return real_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler_module.os, "fsync", fsync)
+    monkeypatch.setattr(scheduler_module.os, "replace", replace)
+    monkeypatch.setattr(scheduler_module.os, "open", open_dir)
+    assert sched.resume_job("paused") is False
+    assert reached == [stage]
+    assert path.read_bytes() == old and sched.show_job("paused") == before
+    assert sched._reload_required is False and not (path.parent / (path.name + ".tmp")).exists()
+
+
+def test_successful_scheduler_save_syncs_file_before_replace_and_directory_after(
+    make_scheduler: MakeScheduler, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import stat
+
+    sched, path = make_scheduler()
+    real_fsync, real_replace = os.fsync, os.replace
+    events = []
+
+    def fsync(fd: int) -> None:
+        events.append("dir_sync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file_sync")
+        real_fsync(fd)
+
+    def replace(src, dst):
+        if str(dst) == str(path):
+            events.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(scheduler_module.os, "fsync", fsync)
+    monkeypatch.setattr(scheduler_module.os, "replace", replace)
+    assert sched.resume_job("paused") is True
+    assert events == ["file_sync", "replace", "dir_sync"]
+    assert sched._reload_required is False and sched.show_job("paused")["enabled"] is True
+
+
+@pytest.mark.parametrize("sync_fails", [False, True], ids=["sync-succeeded", "sync-failed"])
+def test_directory_close_error_does_not_override_the_replace_outcome(
+    make_scheduler: MakeScheduler, monkeypatch: pytest.MonkeyPatch,
+    isolated_schedule: _IsolatedScheduler, sync_fails: bool,
+) -> None:
+    """A close error must not override a known committed or uncertain outcome."""
+    import stat
+
+    sched, path = make_scheduler()
+    old = path.read_bytes()
+    real_close, real_fsync = os.close, os.fsync
+    seen: list[str] = []
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            seen.append("directory_sync")
+            if sync_fails:
+                raise OSError("private sync canary")
+        real_fsync(fd)
+
+    def close(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            seen.append("directory_close")
+            real_close(fd)  # simulate a close that reports an error after closing
+            raise OSError("private close canary")
+        real_close(fd)
+
+    monkeypatch.setattr(scheduler_module.os, "fsync", fsync)
+    monkeypatch.setattr(scheduler_module.os, "close", close)
+
+    outcome = sched.resume_job("paused")
+
+    assert seen == ["directory_sync", "directory_close"]
+    assert path.read_bytes() != old
+    if sync_fails:
+        assert outcome is False and sched._reload_required is True
+        assert not isolated_schedule.jobs
+        before = path.read_bytes()
+        assert sched.resume_job("paused") is False and path.read_bytes() == before
+        monkeypatch.setattr(scheduler_module.os, "fsync", real_fsync)
+        assert sched.reload()["failed"] == 0 and sched._reload_required is False
+    else:
+        assert outcome is True and sched._reload_required is False
+    assert sched.show_job("paused")["enabled"] is True

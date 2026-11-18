@@ -9,6 +9,8 @@ Approved route, 2026-11-01. Planning is intentionally drafted on `feature/provid
 - Canonical specifications: `openspec/specs/` on `main`.
 - Pending predecessor requirements: `openspec/changes/provider-model-catalog/specs/`. These are not yet canonical specifications. The new artifacts must explicitly distinguish modifications of canonical requirements from replacements of these pending requirements.
 
+> **Historical status note (2026-11-17).** "Pending" and "not canonical" describe the predecessor at planning time. On `main` the predecessor `provider-model-catalog` has since been archived as `openspec/changes/archive/2026-11-17-provider-model-catalog` and its specifications synchronized into `openspec/specs/`; that integration lives on `main`, not in this feature branch, which carries the planning text as written. Decisions, dependency ordering and headings are unchanged.
+
 ## Route and gates
 
 1. Draft and review the new planning artifacts here, one batch at a time. Preserve the predecessor's frozen artifacts and accepted ADRs; scope any supersession explicitly in the new change.

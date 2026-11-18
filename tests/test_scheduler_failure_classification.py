@@ -189,9 +189,14 @@ def test_launch_failure_record_carries_classification_and_next_run(
     s = _fallback_scheduler(tmp_path, monkeypatch)
     if executor_available:
         executor = MagicMock()
-        executor.spawn_agent = MagicMock(return_value={
-            "success": False, "error": "spawn_agent: ConnectError: connection refused",
-        })
+        from model_registry import ModelRegistryError
+        from outcome_utils import with_execution
+
+        # Classification comes only from trusted, fixed registry text (a stamped refusal);
+        # unstamped free-form provider prose is never classified or published.
+        executor.spawn_agent = MagicMock(return_value=with_execution({
+            "success": False, "error": f"spawn_agent: {ModelRegistryError('unknown_connection')}",
+        }, "refused"))
         s.builtin_executor = executor
 
     s._run_job("nightly")

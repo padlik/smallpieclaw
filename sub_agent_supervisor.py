@@ -46,6 +46,11 @@ ORIGIN_SCHEDULED = "scheduled"
 OWNED_CHILD_DRAIN_TIMEOUT_S = 180.0
 
 
+_ADMISSION_FAILED_LABEL = (
+    "spawn_agent: model admission failed; details are withheld (check the model selector and /models)"
+)
+
+
 @dataclass(frozen=True)
 class ExecutionOwnership:
     """Immutable execution origin and optional owning operator-turn identity."""
@@ -357,10 +362,13 @@ class SubAgentSupervisor:
             bad_selector = isinstance(exc, ModelRegistryError) and exc.code in {
                 "malformed_selector", "unknown_connection",
             }
+            # Only the trusted registry error carries fixed, safe text; any other factory ValueError may hold provider/secret text, so it
+            # is replaced by a fixed label and never forwarded or stringified.
+            trusted = isinstance(exc, ModelRegistryError)
             return {
                 "success": False,
                 "output": "",
-                "error": f"spawn_agent: {exc}",
+                "error": f"spawn_agent: {exc}" if trusted else _ADMISSION_FAILED_LABEL,
                 "exit_code": -1,
                 "error_type": "wrong_model_for_task",
                 "recoverable": False,
