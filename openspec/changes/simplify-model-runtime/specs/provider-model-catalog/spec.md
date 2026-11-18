@@ -63,6 +63,15 @@ Bootstrap discovery and `/models` refresh SHALL query every configured connectio
 - **THEN** that provider's cached candidates become empty
 - **AND** the active selection and saved preference are unchanged and remain usable for later admissions
 
+#### Scenario: Display-name whitespace does not invalidate the inventory
+- **GIVEN** a provider's complete response contains a candidate whose provider-reported display text has leading or trailing whitespace, or is blank after trimming
+- **AND** every candidate identity is well formed and no provider-supplied text contains the resolved credential
+- **WHEN** refresh completes
+- **THEN** the display text is shown trimmed, or as the exact raw upstream ID when blank
+- **AND** the complete inventory is committed fresh with every candidate retained
+- **AND** the candidate's canonical and upstream IDs are exactly as the provider reported them, never trimmed or normalized
+- **AND** a malformed candidate identity or any provider text containing the resolved credential still fails the whole refresh and keeps the last-good candidates stale
+
 #### Scenario: Late refresh cannot restore a deleted provider
 - **GIVEN** a connection was removed from `config.toml` and the daemon restarted
 - **AND** the cache still holds that connection's old candidates

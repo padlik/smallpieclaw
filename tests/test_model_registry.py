@@ -1489,7 +1489,7 @@ def test_saved_configured_selector_is_active_even_when_not_cached(
 
     assert view.active_model_id == "p/not-cached" and view.remembered_model_id == "p/not-cached"
     assert view.selection_status == "active"
-    assert registry.selection_notice is None and not registry.saved_selection_unusable
+    assert registry.selection_notice is None
     assert discovery.calls == [] and _tree(tmp_path) == before  # no write, no fallback, no discovery
 
 
@@ -1517,7 +1517,7 @@ def test_invalid_saved_selection_is_unset_with_notice_and_never_replaced(
     view = registry.restore_selection()
 
     assert view.active_model_id is None and view.selection_status == "no_selection"
-    assert registry.saved_selection_unusable
+    assert registry.selection_notice is not None
     notice = registry.selection_notice
     assert notice is not None and 0 < len(notice) <= 300
     assert _PREF_CANARY not in notice and str(tmp_path) not in notice and "p/first" not in notice
@@ -1533,7 +1533,7 @@ def test_unreadable_saved_selection_is_unset_not_treated_as_missing(tmp_path: Pa
     view = registry.restore_selection()
 
     assert view.active_model_id is None  # not the missing-file automatic first-candidate choice
-    assert registry.saved_selection_unusable and registry.selection_notice is not None
+    assert registry.selection_notice is not None
     assert selection.is_dir() and discovery.calls == []
 
 
@@ -1548,7 +1548,7 @@ def test_saved_selector_naming_a_removed_connection_is_unset_with_notice(tmp_pat
 
     assert view.active_model_id is None and view.selection_status == "saved_selection_unavailable"
     assert view.remembered_model_id == "gone/m"
-    assert registry.saved_selection_unusable
+    assert registry.selection_notice is not None
     assert registry.selection_notice is not None and "gone" not in registry.selection_notice
     assert discovery.calls == [] and _tree(tmp_path) == before
 
@@ -1572,7 +1572,7 @@ def test_without_preference_first_ordinal_canonical_id_is_active_in_memory_only(
     assert view.active_model_id == "Zeta/m" and view.selection_status == "active"
     assert view.remembered_model_id is None  # a choice made in memory is not a saved selection
     assert not selection.exists() and discovery.calls == [] and _tree(tmp_path) == before
-    assert registry.selection_notice is None and not registry.saved_selection_unusable
+    assert registry.selection_notice is None
 
 
 def test_unsaved_automatic_choice_is_rederived_at_restart_not_remembered(tmp_path: Path) -> None:
@@ -1598,7 +1598,7 @@ def test_no_preference_and_empty_cache_leaves_selection_unset_without_files(tmp_
 
     assert view.active_model_id is None and view.selection_status == "no_selection"
     assert not cache_path.exists() and not selection.exists() and discovery.calls == []
-    assert registry.selection_notice is None and not registry.saved_selection_unusable
+    assert registry.selection_notice is None
 
 
 def test_cached_candidates_of_removed_connections_are_filtered_before_the_automatic_choice(
@@ -2243,3 +2243,120 @@ def test_required_cap_from_parsed_config_reaches_the_anthropic_wire(tmp_path: Pa
         client.close()
 
     assert json.loads(seen[0].content)["max_tokens"] == 333
+
+
+# --- low-issue wave: selector-validation category (6) and repair clears stale notice (7) ---
+
+
+@pytest.mark.parametrize("selector", ["p/bad\nid", "p/https://host.invalid/m", "p/sec:value"])
+def test_selector_rejected_by_preference_validation_is_malformed_not_persistence_failure(
+    tmp_path: Path, selector: str
+) -> None:
+    registry, _, selection, discovery = _build_world(
+        tmp_path, cached=(model("first"),), preference=b'model = "p/first"\n'
+    )
+    registry.restore_selection()
+    before_tree, before_view = _tree(tmp_path), registry.view()
+
+    with pytest.raises(ModelRegistryError) as error:
+        registry.select(selector)
+
+    assert error.value.code == "malformed_selector"
+    assert selector not in str(error.value) and "bad" not in str(error.value)
+    assert registry.view() == before_view and _tree(tmp_path) == before_tree
+    assert discovery.calls == []
+
+
+def test_real_preference_write_failure_is_still_persistence_failed(tmp_path: Path) -> None:
+    registry, _, selection, _ = _build_world(
+        tmp_path, cached=(model("first"),), preference_is_directory=True
+    )
+    registry.restore_selection()
+
+    with pytest.raises(ModelRegistryError) as error:
+        registry.select("p/first")
+
+    assert error.value.code == "persistence_failed"
+    assert selection.is_dir() and registry.view().active_model_id is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"model = 7\n", b'model = "gone/m"\n'],
+    ids=["corrupt", "unconfigured-connection"],
+)
+def test_successful_deliberate_select_repairs_selection_and_clears_stale_notice(
+    tmp_path: Path, raw: bytes
+) -> None:
+    registry, _, selection, discovery = _build_world(
+        tmp_path, cached=(model("first"),), preference=raw
+    )
+    registry.restore_selection()
+    assert registry.selection_notice is not None and registry.view().active_model_id is None
+
+    view = registry.select("p/first")
+
+    assert selection.read_bytes() == b'model = "p/first"\n'
+    assert registry.selection_notice is None
+    assert view.active_model_id == "p/first" and view.selection_status == "active"
+    assert registry.needs_first_start_discovery is False
+    assert registry.view().active_model_id == "p/first"
+    restarted, _, _, _ = _build_world(tmp_path)
+    assert restarted.selection_notice is None and restarted.restore_selection().active_model_id == "p/first"
+    assert discovery.calls == []
+
+
+def test_failed_repair_write_keeps_notice_state_and_preference_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import model_settings
+
+    registry, _, selection, _ = _build_world(
+        tmp_path, cached=(model("first"),), preference=b"model = 7\n"
+    )
+    registry.restore_selection()
+    notice, before_view = registry.selection_notice, registry.view()
+
+    def failing_replace(*_args: object) -> None:
+        raise OSError("private detail")
+
+    monkeypatch.setattr(model_settings.os, "replace", failing_replace)
+    with pytest.raises(ModelRegistryError):
+        registry.select("p/first")
+
+    assert registry.selection_notice == notice is not None
+    assert registry.view() == before_view
+    assert selection.read_bytes() == b"model = 7\n"
+
+
+def test_refresh_alone_never_clears_the_corrupt_preference_notice_or_saves_a_choice(
+    tmp_path: Path,
+) -> None:
+    registry, _, selection, discovery = _build_world(
+        tmp_path, cached=(model("first"),), preference=b"model = 7\n"
+    )
+    discovery.responses["p"] = inventory("p", (model("first"), model("second")))
+    registry.restore_selection()
+
+    report = registry.refresh()
+
+    assert report.refreshed_provider_ids == ("p",)
+    assert registry.selection_notice is not None
+    assert registry.view().active_model_id is None
+    assert selection.read_bytes() == b"model = 7\n"
+
+
+def test_explicit_admission_without_main_still_works_with_corrupt_preference_and_never_touches_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _, selection, _ = _build_world(
+        tmp_path, cached=(model("first"),), preference=b"model = 7\n"
+    )
+    monkeypatch.setenv("FAKE_KEY", "k")
+    registry.restore_selection()
+
+    run = registry.admit("p/not-cached")
+
+    assert run.model.id == "p/not-cached"
+    assert registry.selection_notice is not None
+    assert selection.read_bytes() == b"model = 7\n"

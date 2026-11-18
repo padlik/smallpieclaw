@@ -8,6 +8,8 @@
 
 ADR review completed for this change against the 39 existing records (`adr/0001`–`adr/0039`), the frozen proposal/design and nine pending follow-up deltas. This is a planning review, not an implementation acceptance or permission to apply, commit, merge or synchronize. The predecessor `provider-model-catalog` at `a57ab26` is implemented but its deltas remain pending; synchronize predecessor first only in a separately authorized lifecycle step. Reviewed planning and new ADRs must later be published through a docs-only branch based on `main`, with the exact planning state committed and merged to `main` and brought back to the implementation branch before separately authorized apply.
 
+> **Historical status note (2026-11-17).** "Pending" and "not canonical" describe the predecessor at planning time. On `main` the predecessor `provider-model-catalog` has since been archived as `openspec/changes/archive/2026-11-17-provider-model-catalog` and its specifications synchronized into `openspec/specs/`; that integration lives on `main`, not in this feature branch, which carries the planning text as written. Decisions, dependency ordering and headings are unchanged.
+
 ## In-Force ADRs Reviewed
 
 Full-document supersession history was checked: 0001→0002→0003, 0010→0026, 0011→0024→0027 (with partial earlier edges), 0017→0028, 0018→0026; partial edges do not kill entire older records. The affected live constraints are:

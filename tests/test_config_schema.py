@@ -1517,3 +1517,92 @@ def test_obsolete_field_error_never_echoes_value(minimal_config, mutate):
     """Obsolete-field diagnostics name keys/paths but never the configured value or secret."""
     mutate(minimal_config)
     assert _OBSOLETE_SENTINEL not in _obsolete_message(minimal_config)
+
+
+# --- input-handling wave: public parse_config provider characterization (issue 13) ---
+# Captured against the pre-cleanup source: first error, exact path/message and the
+# parsed ProviderConfig values (type, api_key, base_url, request_timeout).
+
+def _provider_cases() -> dict:
+    P = lambda **kw: {"providers": kw}  # noqa: E731
+    return {
+     "absent": {}, "none": {"providers": None}, "empty": {"providers": {}},
+     "nondict": {"providers": 7}, "badid": P(**{"-bad": {"type": "openai"}}),
+     "entry-not-table": P(a="x"),
+     "unknown-field": P(a={"type": "openai", "temperature": 1}),
+     "api_key_file": P(a={"type": "openai", "api_key_file": "f"}),
+     "retry-field": P(a={"type": "openai", "max_retries": 1}),
+     "type-missing": P(a={}), "type-nonstr": P(a={"type": 3}), "type-unsupported": P(a={"type": "nope"}),
+     "key-nonstr": P(a={"type": "openai", "api_key": 3}),
+     "url-nonstr": P(a={"type": "openai", "base_url": 3}),
+     "url-bad": P(a={"type": "openai", "base_url": "ftp://x"}),
+     "url-ref-missing": P(a={"type": "openai", "base_url": "${NOPE_UNSET_VAR}"}),
+     "timeout-bool": P(a={"type": "openai", "request_timeout": True}),
+     "timeout-str": P(a={"type": "openai", "request_timeout": "5"}),
+     "timeout-zero": P(a={"type": "openai", "request_timeout": 0}),
+     "timeout-neg": P(a={"type": "openai", "request_timeout": -1}),
+     "timeout-nan": P(a={"type": "openai", "request_timeout": float("nan")}),
+     "timeout-inf": P(a={"type": "openai", "request_timeout": float("inf")}),
+     "timeout-ok": P(a={"type": "openai", "request_timeout": 7.5}),
+     "ollama-nokey": P(a={"type": "ollama"}),
+     "ollama-badurl": P(a={"type": "ollama", "api_key": "k", "base_url": "https://evil.example"}),
+     "ollama-ok": P(a={"type": "ollama", "api_key": "k", "base_url": "https://ollama.com/api/"}),
+     "env-url": P(a={"type": "openai", "base_url": "https://${HOST_X:-h.example}/v1/"}),
+     "deferred-ref": P(a={"type": "openai", "api_key": "env:NOT_SET_ANYWHERE"}),
+     "mixed-first": {"providers": {"a": {"type": "nope", "temperature": 1}}, "models": [1]},
+     "mixed-struct-before-sec": {"providers": {"a": {"type": "nope"}}, "agent": {"x": "sec:missing"}},
+     "legacy-models": {"models": []},
+    }
+
+
+_PROVIDER_EXPECTED = {
+    'absent': ('OK', {}),
+    'none': ('OK', {}),
+    'empty': ('OK', {}),
+    'nondict': ('ERR', 'providers must be a table of [providers.<id>] connections'),
+    'badid': ('ERR', 'provider connection IDs must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}'),
+    'entry-not-table': ('ERR', 'providers.a must be a table'),
+    'unknown-field': ('ERR', 'providers.a.temperature is unsupported; a provider connection accepts only type, api_key, base_url and request_timeout (model selection and generation settings are not connection fields)'),
+    'api_key_file': ('ERR', 'providers.a.api_key_file is unsupported; configure the credential source at providers.a.api_key'),
+    'retry-field': ('ERR', 'providers.a.max_retries is unsupported; a provider connection accepts only type, api_key, base_url and request_timeout (retries are configured under [agent] max_retries/retry_delay)'),
+    'type-missing': ('ERR', 'providers.a.type must be one of: openai, openrouter, anthropic, google, ollama'),
+    'type-nonstr': ('ERR', 'providers.a.type must be one of: openai, openrouter, anthropic, google, ollama'),
+    'type-unsupported': ('ERR', 'providers.a.type must be one of: openai, openrouter, anthropic, google, ollama'),
+    'key-nonstr': ('ERR', 'providers.a.api_key must be a string'),
+    'url-nonstr': ('ERR', 'providers.a.base_url must be a string'),
+    'url-bad': ('ERR', 'providers.a.base_url must be a valid HTTP(S) URL'),
+    'url-ref-missing': ('ERR', 'providers.a.base_url must be a valid HTTP(S) URL'),
+    'timeout-bool': ('ERR', 'providers.a.request_timeout must be a finite positive number'),
+    'timeout-str': ('ERR', 'providers.a.request_timeout must be a finite positive number'),
+    'timeout-zero': ('ERR', 'providers.a.request_timeout must be a finite positive number'),
+    'timeout-neg': ('ERR', 'providers.a.request_timeout must be a finite positive number'),
+    'timeout-nan': ('ERR', 'providers.a.request_timeout must be a finite positive number'),
+    'timeout-inf': ('ERR', 'providers.a.request_timeout must be a finite positive number'),
+    'timeout-ok': ('OK', {'a': ['openai', '', '', 7.5]}),
+    'ollama-nokey': ('ERR', 'providers.a.api_key is required for cloud Ollama'),
+    'ollama-badurl': ('ERR', 'providers.a.base_url must use the official cloud Ollama origin https://ollama.com (optional /api path only)'),
+    'ollama-ok': ('OK', {'a': ['ollama', 'k', 'https://ollama.com', 120]}),
+    'env-url': ('ERR', 'providers.a.base_url must be a valid HTTP(S) URL'),
+    'deferred-ref': ('OK', {'a': ['openai', 'env:NOT_SET_ANYWHERE', '', 120]}),
+    'mixed-first': ('ERR', "'models' / [[models]] is no longer supported; configure [providers.<connection-id>] and select a discovered model with /models"),
+    'mixed-struct-before-sec': ('ERR', 'providers.a.type must be one of: openai, openrouter, anthropic, google, ollama'),
+    'legacy-models': ('ERR', "'models' / [[models]] is no longer supported; configure [providers.<connection-id>] and select a discovered model with /models"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_PROVIDER_EXPECTED))
+def test_parse_config_provider_behaviour_is_unchanged(case: str) -> None:
+    import copy as _copy
+
+    base = {"telegram": {"bot_token": "t", "allowed_chat_ids": [1]}, "agent": {"name": "x"}}
+    raw = {**_copy.deepcopy(base), **_copy.deepcopy(_provider_cases()[case])}
+    before = _copy.deepcopy(raw)
+    status, expected = _PROVIDER_EXPECTED[case]
+    if status == "ERR":
+        with pytest.raises(ConfigError) as error:
+            parse_config(raw)
+        assert str(error.value) == expected
+    else:
+        got = parse_config(raw).providers
+        assert {n: [p.type, p.api_key, p.base_url, p.request_timeout] for n, p in got.items()} == expected
+    assert raw == before  # the caller's input is never mutated

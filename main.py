@@ -836,8 +836,10 @@ def _run_with_model_services(
 
     memory   = MemoryStore(str(paths.memory_file))
     # Purge any model/LLM facts the agent may have written in past sessions.
-    # These are always stale — authoritative model info lives in config.toml and is
-    # injected fresh into every system prompt via _format_models().
+    # These are always stale — authoritative model info is the live model catalog
+    # (provider connections in config.toml, discovered candidates in the model
+    # cache, the Main selection in the preference file) and is injected fresh
+    # into every system prompt via prompt_builder.format_models().
     _purged = memory.purge_matching("model", "llm")
     if _purged:
         logger.info("Startup: purged %d stale model/provider key(s) from memory store", _purged)

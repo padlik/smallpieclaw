@@ -48,6 +48,32 @@ disposition, MCP unknown, drain privacy and config forwarding. This bounded
 audit does not assert exhaustive historical equivalence. Parent decides
 whether to rerun the full gate after Oracle review.
 
+## Input-handling review-fix addendum (candidate)
+
+Oracle FAIL on issue 11 only: raw credential guard now covers every raw candidate row before descriptors/normalization, and the walk is lazy and bounded. Six new class-582 nodes (4 whole-row credential, 2 wide-container allocation); class 582 now 67 nodes: 6,247 + 61 + 6 = 6,314; keep 5,837, rewrite 434, retire 43. Classes 0-581 and earlier executed records frozen; config tests untouched.
+
+## Input-handling/maintenance wave addendum (candidate)
+
+Against 6,247: 6,247 − 0 + 61 = 6308; keep 5831, rewrite 434, retire 43. Class 582 and `executed_input_maintenance_wave` (JSON authoritative) record the new node IDs; classes 0–581 and earlier executed records are frozen. One existing node (`..._google_unsafe_or_non_string_display_name_still_fails_the_inventory[7]`) keeps its ID and now expects the approved fallback; its unsafe siblings are unchanged. No full suite; issues 14/15 not started.
+
+## Reliability/security review-fix addendum (candidate)
+
+First Oracle review FAIL on directory close masking the established post-replace outcome and on typed synchronous cancellation becoming a failed launch. The original report/diffs/manifest are preserved in TEMP `before-review-fix/`. Three new class-581 nodes (two directory close fault variants and one real-supervisor typed-cancellation run) failed on actual behavior first (`review-fix-RED.log`), then passed (`review-fix-GREEN-final.log`). Class 581 is the current unaccepted wave, updated from 21 to 24 additions; classes 0–580 and earlier `executed_*` records are unchanged. Census: 6,223 + 24 = 6,247; keep 5,770, rewrite 434, retire 43. No full suite or task checkbox.
+
+## Reliability/security wave (candidate)
+
+Against 6,223: 6,223 − 0 + 21 = 6,244; keep 5,767, rewrite 434, retire 43. Class 581 and `executed_reliability_security_wave` append the 21 exact current node IDs and per-node generic assertion deltas. Classes 0–580 (incl. protected class 579/580) and prior execution records are untouched. The cooperative 120-second provider budget is not a hard interrupt for blocked synchronous I/O or JSON processing. No full suite; no checkbox.
+
+## Low-issue wave 1-8 addendum (candidate)
+
+Against the 6,207-node baseline: `6,207 − 0 + 16 = 6,223`; keep 5,746, rewrite 434, retire 43. Classes 0–579 and every `executed_*` record are frozen; class 580 and `executed_low_issues_1_8_wave` (JSON authoritative: new node IDs and per-node assertion deltas) are added. The `saved_selection_unusable` property was removed; its six test probes in `test_model_registry.py` now assert `selection_notice` directly with every other clause unchanged, and `test_recovery_does_not_hide_a_still_present_cache_notice` captures the stale notice before the repairing select. No node was removed or renamed. No full suite.
+
+## Panel round-1 fix addendum (candidate)
+
+Compared against the 6,190-node baseline: `6,190 − 0 + 17 = 6,207`; keep 5,730, rewrite 434, retire 43. Classes 0–578 and every `executed_*` record are frozen; class 579 and `executed_panel_round1_fixes` are added (JSON authoritative, 17 new node IDs listed there).
+
+Two panel findings were fixed in `model_discovery.py` only: surrounding whitespace in provider display text no longer invalidates the whole inventory (identity validation and credential-reflection rejection unchanged), and discovery is bounded to 100 pages per provider refresh (`pagination_limit`, last-good stale preserved). Causal RED was taken against a baseline copy of the source; an earlier setup-only RED (missing `_MAX_PAGES`) is disclosed and not relied on. No full suite; no checkbox change.
+
 ## Task 11.3 warning-fix addendum (candidate)
 
 Follow-up to the formal verification warnings; the 11.1 census below is

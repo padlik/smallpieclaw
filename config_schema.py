@@ -1164,32 +1164,22 @@ def _validate_http_url(url: str, field_path: str) -> None:
 
 
 def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
-    """Parse strict ``[providers.<name>]`` connection sections."""
-    providers_raw = raw.get("providers", {})
-    if providers_raw is None:
-        providers_raw = {}
-    if not isinstance(providers_raw, dict):
-        raise ConfigError("providers must be a table of [providers.<id>] connections")
+    """Build ``ProviderConfig`` values from ``[providers.<name>]`` sections.
+
+    Precondition: ``_validate_provider_structure`` already accepted the raw
+    structure (container and entry types, connection IDs, allowed fields,
+    adapter type, string credential/URL and request timeout). Only
+    ``base_url`` has since been expanded, so this performs the checks that
+    need the expanded value (URL syntax, cloud Ollama endpoint and credential)
+    and applies defaults and endpoint normalization.
+    """
+    providers_raw = raw.get("providers") or {}
     result: dict[str, ProviderConfig] = {}
 
     for name, entry in providers_raw.items():
-        if not isinstance(entry, dict):
-            raise ConfigError(f"providers.{name} must be a table")
-        allowed = {"type", "api_key", "base_url", "request_timeout"}
-        for key in entry:
-            if key not in allowed:
-                destination = "[agent] max_retries/retry_delay" if key in {"max_retries", "retry_delay"} else "provider connection fields"
-                raise ConfigError(f"providers.{name}.{key} is unsupported; use {destination}")
-        adapter = entry.get("type")
-        supported = set(_PROVIDER_TYPES)
-        if adapter not in supported:
-            raise ConfigError(f"providers.{name}.type must be one of: {', '.join(sorted(supported))}")
+        adapter = entry["type"]
         api_key = entry.get("api_key", "")
-        if not isinstance(api_key, str):
-            raise ConfigError(f"providers.{name}.api_key must be a string credential or reference")
         base_url = entry.get("base_url", "")
-        if not isinstance(base_url, str):
-            raise ConfigError(f"providers.{name}.base_url must be a string")
         if adapter == "ollama":
             if base_url:
                 _validate_http_url(base_url, f"providers.{name}.base_url")
@@ -1215,13 +1205,6 @@ def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
         elif base_url:
             _validate_http_url(base_url, f"providers.{name}.base_url")
         timeout_value = entry.get("request_timeout", 120)
-        if (
-            isinstance(timeout_value, bool)
-            or not isinstance(timeout_value, (int, float))
-            or not math.isfinite(timeout_value)
-            or timeout_value <= 0
-        ):
-            raise ConfigError(f"providers.{name}.request_timeout must be a finite positive number")
         url_parts = urlsplit(base_url)
         result[name] = ProviderConfig(
             name=name,

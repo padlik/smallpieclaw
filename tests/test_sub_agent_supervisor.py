@@ -21,6 +21,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from outcome_utils import with_execution
+
 from confirmation import GrantLifetime
 from memory_store import ShortTermMemory
 from sub_agent_registry import SubAgentRecord, SubAgentRegistry, get_registry
@@ -126,12 +128,12 @@ class TestSchedulerSynchronousRejection:
         s._jobs_meta["capped_job"] = {"task": "do work", "enabled": True, "notify": True}
 
         mock_executor = MagicMock()
-        mock_executor.spawn_agent = MagicMock(return_value={
+        mock_executor.spawn_agent = MagicMock(return_value=with_execution({
             "success": False,
             "output": "",
             "error": "spawn_agent: max_subagents cap reached (6/6).",
             "exit_code": -1,
-        })
+        }, "refused"))
         s.builtin_executor = mock_executor
         s.notify = MagicMock()
 
@@ -994,7 +996,7 @@ class TestSubmitRejectionShape:
 
         assert res["success"] is False
         assert res["error_type"] == "wrong_model_for_task"
-        assert "not found" in res["error"]
+        assert "details are withheld" in res["error"] and "nope" not in res["error"]
         # finish_cb must NOT fire on synchronous admission failure.
         assert finish_calls == []
 
@@ -1303,7 +1305,7 @@ class TestSubmitRejectionCompatibility:
     @pytest.mark.parametrize(
         "kind,expected_error",
         [
-            ("value_error", "spawn_agent: Model 'nope' not found"),
+            ("value_error", "spawn_agent: model admission failed; details are withheld (check the model selector and /models)"),
             ("model_not_found", "spawn_agent: model registry model not found"),
         ],
         ids=["generic-value-error", "registry-model-not-found"],

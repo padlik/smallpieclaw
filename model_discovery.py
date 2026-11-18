@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -16,6 +18,12 @@ if TYPE_CHECKING:
     from config_schema import ResolvedProviderConnection
 
 _OLLAMA_ORIGIN = "https://ollama.com"
+# Generous per-provider-refresh page budget (initial page included) so a server
+# that never stops issuing fresh continuations cannot hang startup discovery.
+_MAX_PAGES = 100
+_MAX_PRESENTATION_DEPTH = 32  # bounded walk of a discarded presentation value
+_MAX_PRESENTATION_NODES = 10_000
+_DISCOVERY_BUDGET_S = 120  # cooperative per-connection elapsed budget (not a hard interrupt)
 
 
 class ModelDiscoveryError(RuntimeError):
@@ -76,9 +84,11 @@ class ModelDiscovery:
         """Inject the provider HTTP client and a clock; only provider endpoints are contacted."""
         self._client = client
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._monotonic = time.monotonic
 
     def fetch(self, connection: ResolvedProviderConnection) -> ProviderInventory:
         """Return only a complete validated inventory; provider failures are atomic."""
+        deadline = self._monotonic() + _DISCOVERY_BUDGET_S
         provider_id = getattr(connection, "provider_id")
         adapter = getattr(connection, "adapter")
         try:
@@ -98,47 +108,83 @@ class ModelDiscovery:
         endpoint = _endpoint(adapter, base_url)
         headers = _auth_headers(adapter, api_key)
         try:
-            raw_models = self._fetch_pages(adapter, endpoint, headers, getattr(connection, "request_timeout", None))
+            raw_models = self._fetch_pages(
+                adapter, endpoint, headers, getattr(connection, "request_timeout", None), deadline,
+            )
         except ModelDiscoveryError:
             raise
         except Exception:
             raise ModelDiscoveryError("provider_request_failed") from None
 
+        # Whole raw candidates are checked for the resolved credential before any
+        # descriptor is built or any field is discarded or normalized.
+        secret = api_key if isinstance(api_key, str) and api_key else None
+        for row in raw_models:
+            _reject_credential_in_json(row, secret, lambda: self._remaining(deadline))
+        self._remaining(deadline)
         descriptors = (
             tuple(_google_descriptor(provider_id, row) for row in raw_models)
             if adapter == "google"
             else ()
         )
         models = tuple(_normalize_model(provider_id, adapter, row) for row in raw_models)
+        self._remaining(deadline)
         if len({model.id for model in models}) != len(models):
             raise ModelDiscoveryError("duplicate_model")
         fetched_at = _timestamp(self._clock)
+        self._remaining(deadline)
         return ProviderInventory(provider_id, adapter, models, fetched_at, descriptors)
 
+    def _remaining(self, deadline: float) -> float:
+        """Return the positive remaining elapsed budget or fail with a fixed code."""
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise ModelDiscoveryError("discovery_timeout")
+        return remaining
+
     def _fetch_pages(
-        self, adapter: str, endpoint: str, headers: dict[str, str], timeout: float | None
+        self, adapter: str, endpoint: str, headers: dict[str, str], timeout: float | None,
+        deadline: float,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         url = endpoint
         params: dict[str, str] | None = None
         seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        requested = 0
         while True:
+            remaining = self._remaining(deadline)
             _require_same_origin(endpoint, url)
             page_key = (url, tuple(sorted((params or {}).items())))
             if page_key in seen:
                 raise ModelDiscoveryError("pagination_cycle")
             seen.add(page_key)
+            if requested >= _MAX_PAGES:
+                raise ModelDiscoveryError("pagination_limit")
+            requested += 1
             try:
                 request = httpx.Request(
                     "GET",
                     url,
                     params=params,
                     headers={**headers, "Accept": "application/json"},
-                    extensions={"timeout": _timeout_extensions(timeout)},
+                    extensions={"timeout": _timeout_extensions(
+                        min(timeout, remaining) if timeout is not None else remaining
+                    )},
                 )
-                response = self._client.send(request, auth=None, follow_redirects=False)
-                response.raise_for_status()
-                payload = response.json()
+                response = self._client.send(request, auth=None, follow_redirects=False, stream=True)
+                try:
+                    response.raise_for_status()
+                    chunks: list[bytes] = []
+                    for chunk in response.iter_bytes():
+                        self._remaining(deadline)
+                        chunks.append(chunk)
+                    self._remaining(deadline)
+                    payload = json.loads(b"".join(chunks))
+                    self._remaining(deadline)  # JSON decoding can consume time
+                finally:
+                    response.close()
+            except ModelDiscoveryError:
+                raise
             except Exception:
                 raise ModelDiscoveryError("provider_request_failed") from None
             if adapter in {"openai", "anthropic"}:
@@ -194,6 +240,7 @@ class ModelDiscovery:
                     raise ModelDiscoveryError("invalid_response")
                 rows.extend(page)
                 break
+        self._remaining(deadline)
         return rows
 
 
@@ -243,18 +290,74 @@ def _normalize_model(provider_id: str, adapter: str, row: dict[str, Any]) -> Mod
             raise ModelDiscoveryError("invalid_response")
         _positive_optional(top_provider, "max_completion_tokens", values, "output_tokens")
     metadata = ModelMetadata(**values)
-    if "display_name" in row:
+    if adapter == "google" and "displayName" in row:
+        raw_display = row["displayName"]  # Google's friendly name; identity stays baseModelId
+    elif "display_name" in row:
         raw_display = row["display_name"]
     elif "name" in row:
         raw_display = row["name"]
     else:
         raw_display = upstream_id
+    if isinstance(raw_display, str):
+        raw_display = raw_display.strip() or upstream_id  # whitespace is presentation-only
+    elif raw_display is None or type(raw_display) in (bool, int, float, list, dict):
+        raw_display = upstream_id  # unusable JSON presentation never blocks safe identity
     display = _safe_response_string(raw_display, "display_name", presentation=True)
     try:
         _identity(f"{provider_id}/{upstream_id}", provider_id, upstream_id)
     except ModelSettingsError:
         raise ModelDiscoveryError("invalid_response") from None
     return ModelRecord(f"{provider_id}/{upstream_id}", provider_id, upstream_id, display, metadata)
+
+
+def _json_children(mapping: dict[Any, Any]) -> Iterator[Any]:
+    """Yield a dict's keys and values lazily; a non-string key fails closed."""
+    for key, child in mapping.items():
+        if type(key) is not str:
+            raise ModelDiscoveryError("invalid_response")
+        yield key
+        yield child
+
+
+def _reject_credential_in_json(value: Any, secret: str | None, tick: Callable[[], object] | None) -> None:
+    """Fail closed when a raw JSON value holds the resolved credential.
+
+    Lazy and bounded: a stack of child iterators keeps pending work O(depth),
+    and every admitted node (container, key or leaf) is counted against the
+    node limit and clock-checked before its own children are produced. Only
+    plain JSON types are examined; anything else or an exhausted bound is
+    rejected with a fixed code (``invalid_inventory`` for a credential hit, the
+    registry's existing reflected-credential classification) and nothing from the
+    value is formatted.
+    """
+    stack: list[Iterator[Any]] = [iter((value,))]
+    nodes = 0
+    while stack:
+        try:
+            item = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        nodes += 1
+        if nodes > _MAX_PRESENTATION_NODES or len(stack) - 1 > _MAX_PRESENTATION_DEPTH:
+            raise ModelDiscoveryError("invalid_response")
+        if tick is not None:
+            tick()
+        kind = type(item)
+        if item is None or kind is bool:
+            continue
+        if kind is str:
+            if secret is not None and secret in item:
+                raise ModelDiscoveryError("invalid_inventory")
+        elif kind in (int, float):
+            if secret is not None and secret in str(item):
+                raise ModelDiscoveryError("invalid_inventory")
+        elif kind is list:
+            stack.append(iter(item))
+        elif kind is dict:
+            stack.append(_json_children(item))
+        else:
+            raise ModelDiscoveryError("invalid_response")
 
 
 def _google_descriptor(provider_id: str, row: dict[str, Any]) -> GoogleModelDescriptor:
