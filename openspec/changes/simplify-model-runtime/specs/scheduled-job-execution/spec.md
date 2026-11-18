@@ -8,7 +8,7 @@ Baseline: canonical `openspec/specs/scheduled-job-execution/spec.md` as already 
 
 ### Requirement: Job configuration errors are contained to the offending job
 
-A parseable job with malformed or obsolete fields SHALL keep its raw values and fail only itself. A bad or obsolete time or scheduling field SHALL leave the job visibly unscheduled with a visible config error. Any other bad or obsolete field SHALL be visible as a config error and SHALL produce a recorded launch failure when the job fires. Obsolete fields SHALL be `schedule_type` values `daily` and `interval`, the legacy `time`, `hours`, and `minutes` fields, and a per-job `fallback_models`; their config errors SHALL name the field and direct the operator to `cron` or `once` scheduling or to remove the key. No obsolete field SHALL be converted, derived into a cron, or ignored. Add and modify SHALL reject obsolete fields before `_on_attempt` with the same guidance. Field checks SHALL be type-strict with no coercion, and healthy sibling jobs SHALL load, register, and run normally.
+A parseable job with a malformed or obsolete field SHALL keep its raw values and fail only itself: a bad or obsolete time or scheduling field leaves it visibly unscheduled with a config error; any other such field shows a config error and records a launch failure on firing. Obsolete fields SHALL NOT be converted, derived into a cron, or ignored, and their errors SHALL name the field and direct to `cron`, `once`, or key removal. Add and modify SHALL reject obsolete fields before `_on_attempt`.
 
 #### Scenario: Bad scheduling field leaves a job unscheduled
 - **GIVEN** a parseable job has an invalid schedule type, cron, `run_at`, or non-boolean `enabled`
@@ -63,6 +63,18 @@ A parseable job with malformed or obsolete fields SHALL keep its raw values and 
 - **THEN** the owned run ID and active tracking are minted and `last_run` is persisted
 - **AND** the config error is reported through the normal failed-launch record, alert regardless of `notify`, and tracking release
 
+#### Scenario: Job field checks are type-strict
+- **GIVEN** a job field holds a value of the wrong type
+- **WHEN** the field is checked
+- **THEN** it SHALL be treated as bad without coercion
+
+#### Scenario: Obsolete field set is fixed
+- **GIVEN** a job uses `schedule_type` `daily` or `interval`, `time`, `hours`, `minutes`, or `fallback_models`
+- **WHEN** the job is loaded or add/modify is validated
+- **THEN** the field SHALL be obsolete and its config error SHALL name it and direct the operator to `cron` or `once` scheduling or to remove the key
+- **AND** it SHALL NOT be converted, derived into a cron, or ignored
+- **AND** add and modify SHALL reject it before `_on_attempt` with the same guidance
+
 ### Requirement: A pinned scheduled model never falls back
 
 No scheduled run SHALL fall back to, substitute, or retry on another model at any stage. Selector errors, credential failures, adapter limitations, context rejections, inference errors, and provider outages SHALL fail that run as a normal job failure recorded in its **job execution record**, without affecting the daemon or other jobs.
@@ -81,7 +93,7 @@ No scheduled run SHALL fall back to, substitute, or retry on another model at an
 
 ### Requirement: Scheduled admission uses a trusted source and one root admission
 
-The scheduler SHALL pass the raw saved selector through supervision with `SOURCE_SCHEDULED` options built only by scheduler code. That source SHALL exempt only the strict model-shape guard so that the scheduled selector classification applies; all other spawn checks SHALL remain. The root factory SHALL call one scheduled admission that resolves the selector against the fixed connection map, resolves credentials once, and returns an immutable pin; every other profile SHALL use ordinary direct admission. No connection fingerprint, configuration generation, selection revision, or document identity recheck SHALL be performed.
+The scheduler SHALL pass the raw saved selector through supervision with `SOURCE_SCHEDULED` options built only by scheduler code, exempting only the strict model-shape guard so scheduled selector classification applies. The root factory SHALL call one scheduled admission that resolves the selector against the fixed connection map, resolves credentials once, and returns an immutable pin; every other profile SHALL use ordinary direct admission.
 
 #### Scenario: Model-facing spawn keeps its strict guard
 - **GIVEN** a model-facing `spawn_agent` call supplies a blank or non-string `model`
@@ -110,6 +122,11 @@ The scheduler SHALL pass the raw saved selector through supervision with `SOURCE
 - **GIVEN** a main, on-demand, plan, or diagnostic run
 - **WHEN** the root factory admits it
 - **THEN** ordinary direct admission is used
+
+#### Scenario: Scheduled admission performs no identity recheck
+- **GIVEN** a scheduled admission is attempted
+- **WHEN** admission resolves the selector and credentials
+- **THEN** no connection fingerprint, configuration generation, selection revision, or document identity recheck SHALL be performed
 
 ### Requirement: Scheduler mutations edit the parsed document by explicit patch
 

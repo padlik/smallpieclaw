@@ -8,7 +8,7 @@ Baseline: canonical `openspec/specs/telegram-command-surface/spec.md` as already
 
 ### Requirement: `/models` lists, refreshes, and selects discovered models
 
-Authorized `/models` SHALL list about 20 cached candidates simply, offer a refresh of every configured provider, and show per-provider fresh/stale status, the active selection, and whether it is saved or an unsaved automatic choice, including an active or saved selector that is not in the cache. Displayed capabilities and limits SHALL be labelled advisory and SHALL NOT be presented as budgets or as a promise of callability. Refresh SHALL update only the cache. Candidate buttons SHALL use opaque callbacks no longer than 64 bytes and reject expired or unknown tokens. Selection SHALL be made only through these candidate buttons; no typed `/models` selection command SHALL exist, and `/models` arguments SHALL NOT select a model. A button selection SHALL need no active Main selection and SHALL validate only the captured selector's non-empty first-slash shape and configured connection, never cache membership or upstream existence; an unexpired token SHALL NOT be rejected merely because a refresh removed its candidate from the cache. It SHALL atomically persist the preference before publishing the active selection or reporting success. When the preference is corrupt or invalid, `/models` SHALL say so without showing file content, SHALL NOT fall back to an automatic selection, and a deliberate button selection SHALL replace the preference without restart; with an empty cache the operator refreshes until candidates exist (or waits for providers to recover) before selecting, and an existing valid saved selector remains active and displayed whether cached or not.
+Authorized `/models` SHALL list about 20 cached candidates, offer refresh of every configured provider, and show per-provider fresh/stale status and the active selection as saved or an unsaved automatic choice, even when not cached. Capabilities and limits SHALL be labelled advisory, not budgets or a callability promise. Refresh SHALL update only the cache. Selection SHALL occur only through candidate buttons with opaque callbacks of at most 64 bytes; `/models` arguments SHALL NOT select.
 
 #### Scenario: `/models` presents a concise catalog
 - **GIVEN** a cache contains about 20 candidates with fresh and stale providers
@@ -52,7 +52,7 @@ Authorized `/models` SHALL list about 20 cached candidates simply, offer a refre
 - **THEN** it carries only an opaque token of at most 64 bytes
 - **AND** the token resolves to the selector server-side
 
-#### Scenario: Expired or unknown selection token is rejected
+#### Scenario: Expired or removed selection token is rejected
 - **GIVEN** a selection callback token expired or is unknown
 - **WHEN** the callback is used
 - **THEN** active selection and preference are unchanged
@@ -69,3 +69,26 @@ Authorized `/models` SHALL list about 20 cached candidates simply, offer a refre
 - **GIVEN** `/models` reports the saved preference as corrupt
 - **WHEN** the operator selects a candidate
 - **THEN** the preference is atomically replaced and the selection is active without restart
+
+#### Scenario: Button selection needs no main selection and no cache membership
+- **GIVEN** a valid unexpired token captures a selector
+- **WHEN** its candidate button is used, whether or not a main selection is active
+- **THEN** selection SHALL validate only the captured selector's non-empty first-slash shape and configured connection, never cache membership or upstream existence
+
+#### Scenario: Button selection persists before it is published or reported
+- **GIVEN** a candidate button is chosen
+- **WHEN** the selection succeeds
+- **THEN** the preference SHALL be atomically persisted before the active selection is published or success is reported
+
+#### Scenario: Corrupt preference is reported without content or automatic fallback
+- **GIVEN** the saved preference is corrupt or invalid
+- **WHEN** `/models` displays the catalog
+- **THEN** it SHALL say so without showing file content and SHALL NOT fall back to an automatic selection
+- **AND** a deliberate button selection SHALL replace the preference without a restart
+
+#### Scenario: Saved selection stays active while the cache is empty
+- **GIVEN** a valid saved selector and an empty cache
+- **WHEN** `/models` displays the catalog
+- **THEN** the saved selector remains active and displayed
+- **AND** with no usable unexpired candidate token, new selection buttons wait until a refresh or provider recovery produces candidates
+- **AND** an already-issued usable unexpired token can still select its captured selector even if a refresh left the cache empty

@@ -10,7 +10,7 @@ Final canonical Purpose (handoff for a later **authorized predecessor-then-follo
 
 ### Requirement: Context monitor tracks context-window consumption by category
 
-The system SHALL maintain a `ContextMonitor` on the `AgentController` that tracks estimated input tokens in three categories: system prompt, chat history, and tool definitions. The main run's ReAct loop SHALL push a snapshot each turn; sub-agent runs SHALL NOT publish to the main monitor. The monitor SHALL retain the last published snapshot when the agent is idle so that context inspection works between runs. Snapshots SHALL include counts, the configured compaction threshold, turn number, model identity, and `is_live` diagnostic metadata; they SHALL NOT contain a completion reserve, effective context window, inferred model capacity, capacity percentage, headroom, or danger level.
+`AgentController` SHALL hold a `ContextMonitor` of estimated input tokens by system prompt, chat history, and tool definitions. The main ReAct loop SHALL push a snapshot each turn; sub-agents SHALL NOT publish to it; it SHALL keep the last snapshot when idle. Snapshots SHALL carry counts, compaction threshold, turn, model identity, and `is_live`, never capacity data.
 
 Feature: Context monitoring
 Rule: The monitor is always on and lightweight — a reference-swap snapshot per turn, not a deep copy.
@@ -39,14 +39,17 @@ Rule: The monitor is always on and lightweight — a reference-swap snapshot per
 - **WHEN** a context inspection is requested
 - **THEN** the monitor SHALL report that no snapshot is available
 
+#### Scenario: Snapshot carries no capacity-derived data
+- **GIVEN** the monitor holds a published snapshot
+- **WHEN** its fields are inspected
+- **THEN** it SHALL NOT contain a completion reserve, effective context window, inferred model capacity, capacity percentage, headroom, or danger level
+
 ### Requirement: Tool definitions sub-categorised by MCP server
 
-The context monitor SHALL sub-categorise tool-definition token cost by source: built-in tools as one group, and each MCP server as a separate group identified by its server name. The per-server grouping SHALL be seeded from the full list of registered MCP servers (from the MCP manager/registry), so that servers with zero discovered tools still appear with a token cost of zero. This enables identification of MCP servers that contribute a disproportionate share of the estimated input.
-
-Built-in tools SHALL be classified by checking the tool name against the set of known built-in and pseudo-tool schema names (`BUILTIN_TOOL_SCHEMAS` and `PSEUDO_TOOL_SCHEMAS`). This classification SHALL NOT depend on the `ToolRegistry`, which is MCP-only. Tools not found in the registry and not in the builtin name set SHALL be classified as `unknown`.
+The monitor SHALL group tool-definition token cost by source: built-ins as one group and each MCP server, seeded from all registered servers, by name. Built-ins SHALL be classified by name against `BUILTIN_TOOL_SCHEMAS` and `PSEUDO_TOOL_SCHEMAS`, never by the MCP-only `ToolRegistry`; tools absent from the registry and both schema name sets SHALL be `unknown`.
 
 Feature: Context monitoring
-Rule: Tool definitions arrive in batches per MCP server — the monitor groups them so fat servers are visible. Built-in tools are identified by name, not by registry membership.
+Rule: Tool definitions arrive in batches per MCP server — the monitor groups them so fat servers are visible.
 
 #### Scenario: Tool defs grouped by server
 - **GIVEN** the agent has 21 built-in tools and MCP tools from servers "github", "filesystem", and "weather"
@@ -71,9 +74,19 @@ Rule: Tool definitions arrive in batches per MCP server — the monitor groups t
 - **THEN** that server SHALL appear with a token cost of zero
 - **AND** the server SHALL be listed so the operator can see it is connected but empty
 
+#### Scenario: Registered servers seed the grouping
+- **GIVEN** the MCP manager or registry lists registered servers, some with no discovered tools
+- **WHEN** the monitor groups tool definitions by server
+- **THEN** the per-server grouping SHALL be seeded from that full list of registered servers
+
+#### Scenario: Unclassified tools are reported as unknown
+- **GIVEN** a tool definition is neither found in the registry nor named in the built-in and pseudo-tool schema name sets
+- **WHEN** the monitor classifies it
+- **THEN** it SHALL be classified as `unknown`
+
 ### Requirement: Context snapshot refreshable outside the ReAct loop
 
-The context monitor SHALL support partial snapshot refresh when tool definitions change outside the ReAct loop. After tool-changing Telegram commands (`/mcp on`, `/mcp off`, `/mcp auth`, `/mcp auth revoke`), the system SHALL recompute `tool_defs_by_server` and `tool_defs_tokens` from the current tool definitions and publish an updated snapshot via `dataclass_replace` on the last published snapshot. System prompt tokens, chat history tokens, compaction threshold, turn number, and model identity SHALL be preserved from the last snapshot. The refreshed snapshot SHALL be marked `is_live=False`.
+After `/mcp on`, `/mcp off`, `/mcp auth`, or `/mcp auth revoke`, the monitor SHALL recompute `tool_defs_by_server` and `tool_defs_tokens` from the current tool definitions and publish an updated snapshot via `dataclass_replace` on the last one, preserving its other counts, threshold, turn, and model identity, with `is_live=False`.
 
 Feature: Context monitoring
 Rule: Tool-defs data should be current even when the agent is idle — the operator needs accurate tool-defs breakdown after MCP changes.
@@ -115,9 +128,16 @@ Rule: Tool-defs data should be current even when the agent is idle — the opera
 - **THEN** no snapshot refresh SHALL be attempted
 - **AND** the next ReAct loop run SHALL publish a fresh snapshot with current tool definitions
 
+#### Scenario: Tool changes outside the loop support partial refresh
+- **GIVEN** tool definitions change outside the ReAct loop
+- **WHEN** the monitor refreshes its last published snapshot
+- **THEN** it SHALL recompute `tool_defs_by_server` and `tool_defs_tokens` from the current definitions and publish a partial refresh via `dataclass_replace` on the last published snapshot
+- **AND** `system_prompt_tokens`, `chat_history_tokens`, `compaction_threshold`, `turn`, and model identity SHALL be preserved from that snapshot
+- **AND** the refreshed snapshot SHALL have `is_live=False`
+
 ### Requirement: /context Telegram command renders summary dashboard
 
-The `/context` command SHALL read the latest snapshot from the context monitor and render a summary showing the pinned model identity, estimated token counts for system prompt, chat history, and tool definitions, their total, the configured compaction threshold, and tool definitions grouped by MCP server. It SHALL NOT show a context window, capacity percentage, completion reserve, headroom, or danger level. The command SHALL work both mid-run (live snapshot) and idle (last snapshot).
+The `/context` command SHALL render the latest monitor snapshot as a summary: pinned model identity, estimated tokens for system prompt, chat history, and tool definitions with their total, the compaction threshold, and tool definitions grouped by MCP server. It SHALL NOT show a context window, capacity percentage, completion reserve, headroom, or danger level, and SHALL work both mid-run and idle.
 
 Feature: Context monitoring
 Rule: Summary only — key points, not a detailed research view.

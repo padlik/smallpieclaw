@@ -8,7 +8,7 @@ Baseline: canonical `openspec/specs/xdg-path-resolution/spec.md` as already chan
 
 ### Requirement: XDG Base Directory resolution
 
-`xdg_paths(agent_name)` MUST resolve all agent paths from XDG environment variables and standard fallbacks. It MUST be pure and side-effect free, returning a frozen `XDGPaths` without creating directories or writing files. It SHALL expose `model_selection_file` below resolved agent `config_home`, `models_cache_file` below resolved agent `cache_home`, and `models_config_file` below resolved agent `config_home` as the path of the retired combined settings file used only for its existence check; callers SHALL NOT reconstruct these paths locally.
+`xdg_paths(agent_name)` MUST resolve all agent paths from XDG environment variables and standard fallbacks, purely and without side effects, returning a frozen `XDGPaths` and creating no directories or files. It SHALL expose `model_selection_file` and `models_config_file` below `config_home` and `models_cache_file` below `cache_home`; callers SHALL NOT reconstruct these paths locally. `models_config_file` is the retired combined settings file, used only for an existence check.
 
 #### Scenario: Default XDG paths with no env vars set
 - **GIVEN** none of `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, or `XDG_RUNTIME_DIR` are set

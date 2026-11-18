@@ -5,113 +5,89 @@
 Define how the system classifies LLM errors into typed categories, persists disk checkpoints for crash recovery, presents inline retry/cancel error cards in Telegram, provides `/resume` for recovering interrupted runs after a process restart, classifies scheduled job failures, and configures error handling behavior.
 
 ## Requirements
-
 ### Requirement: LLM errors are classified into typed categories
 
-The system SHALL classify LLM errors caught in `react_loop._request_turn()` into seven typed categories by inspecting `type(exc)` and message content. Each category SHALL produce a tailored user-facing message instead of a generic error string. The seven categories are: `timeout` (httpx.TimeoutException), `connection` (httpx.ConnectError), `rate_limit` (httpx.HTTPStatusError with 429 status), `empty` (LLMEmptyResponseError), `context` (LLMContextOverflowError), `permanent` (LLMPermanentError), and `unknown` (any otherwise-unclassified exception, including non-429 HTTPStatusError, generic LLMError, or other exceptions). `LLMCancelledError` SHALL NOT be classified — it propagates immediately without checkpoint, error card, or retry prompt. No new exception classes SHALL be created in provider modules.
-
-Feature: LLM error recovery
-Rule: The user sees a meaningful error message, not a raw exception dump.
+The system SHALL retain the seven existing categories: `timeout`, `connection`, `rate_limit`, `empty`, `context`, `permanent`, and `unknown`. Provider retry exhaustion is evaluated against the agent-owned request budget. Cancellation SHALL still propagate without classification or checkpoint.
 
 #### Scenario: Timeout error is classified and shown to user
-- **GIVEN** the LLM call raises `httpx.TimeoutException` after all provider retries are exhausted
-- **WHEN** `_request_turn()` catches the exception
-- **THEN** the error is classified as type `timeout`
-- **AND** the user-facing message starts with "⏱️ Request timed out"
-- **AND** the error detail is logged to the structured log
+- **GIVEN** the logical request exhausts agent-level attempts on `httpx.TimeoutException`
+- **WHEN** `_request_turn()` catches it
+- **THEN** it is classified `timeout` with message starting `⏱️ Request timed out`
+- **AND** its detail is structured-logged
 
 #### Scenario: Connection error is classified and shown to user
 - **GIVEN** the LLM call raises `httpx.ConnectError`
-- **WHEN** `_request_turn()` catches the exception
-- **THEN** the error is classified as type `connection`
-- **AND** the user-facing message starts with "🔌 Connection failed"
+- **WHEN** `_request_turn()` catches it
+- **THEN** it is classified `connection` with message starting `🔌 Connection failed`
 
 #### Scenario: Rate limit error is classified and shown to user
-- **GIVEN** the LLM call raises `httpx.HTTPStatusError` with status code 429
-- **WHEN** `_request_turn()` catches the exception
-- **THEN** the error is classified as type `rate_limit`
-- **AND** the user-facing message starts with "🚫 Rate limit reached"
+- **GIVEN** the LLM call raises HTTP 429
+- **WHEN** `_request_turn()` catches it
+- **THEN** it is classified `rate_limit` with message starting `🚫 Rate limit reached`
 
 #### Scenario: Empty response error is classified and shown to user
 - **GIVEN** the LLM call raises `LLMEmptyResponseError`
-- **WHEN** `_request_turn()` catches the exception
-- **THEN** the error is classified as type `empty`
-- **AND** the user-facing message starts with "📭 Model returned no content"
+- **WHEN** `_request_turn()` catches it
+- **THEN** it is classified `empty` with message starting `📭 Model returned no content`
 
 #### Scenario: Context overflow error is classified as non-retryable
 - **GIVEN** the LLM call raises `LLMContextOverflowError`
-- **WHEN** `_request_turn()` catches the exception
-- **THEN** the error is classified as type `context`
-- **AND** the user-facing message starts with "📏 Context too long"
-- **AND** the error is marked as non-retryable
+- **WHEN** `_request_turn()` catches it
+- **THEN** it is classified `context`, starts with `📏 Context too long`, and remains non-retryable automatically
 
 #### Scenario: Permanent error is classified as non-retryable
 - **GIVEN** the LLM call raises `LLMPermanentError`
-- **WHEN** `_request_turn()` catches the exception
-- **THEN** the error is classified as type `permanent`
-- **AND** the user-facing message starts with "❌"
-- **AND** the error is marked as non-retryable
+- **WHEN** `_request_turn()` catches it
+- **THEN** it is classified `permanent`, starts with `❌`, and is not automatically retried
 
 #### Scenario: Unknown error is classified as retryable
-- **GIVEN** the LLM call raises an exception not matching any specific category (e.g., non-429 HTTPStatusError, generic LLMError, or other exception)
-- **WHEN** `_request_turn()` catches the exception
-- **THEN** the error is classified as type `unknown`
-- **AND** the user-facing message starts with "❌ LLM error:"
-- **AND** the error is marked as retryable
+- **GIVEN** an exception matches no existing typed category
+- **WHEN** `_request_turn()` catches it
+- **THEN** it remains `unknown`, starts with `❌ LLM error:`, and is operator-retryable
+- **AND** unknown errors are not automatically retried unless typed transient policy permits
 
 #### Scenario: User cancellation is not classified or checkpointed
-- **GIVEN** the user runs `/stop` during an LLM call, raising `LLMCancelledError`
-- **WHEN** `_request_turn()` receives the exception
-- **THEN** `LLMCancelledError` propagates immediately without classification
-- **AND** no checkpoint file is written
-- **AND** no error card or retry prompt is shown
-- **AND** the run terminates as cancelled
+- **GIVEN** `/stop` raises `LLMCancelledError` during a request
+- **WHEN** `_request_turn()` receives it
+- **THEN** cancellation ends that request without classification, checkpoint, or error card
 
 ### Requirement: Disk-persisted checkpoint on LLM error
 
-The system SHALL write a checkpoint file to `data/run_checkpoints/{trace_id}.json` when an LLM error occurs in `react_loop._request_turn()`. The checkpoint SHALL contain the full `_LoopState` (messages, step, goal_idx, max_steps, json_fail_streak) plus metadata (trace_id, user_goal, model, created_at, error_info with type, message, retryable, detail). The write SHALL be atomic (write to `.tmp` file, then `os.replace`). Checkpoint write failure (OSError) SHALL be non-fatal — the retry prompt proceeds without a checkpoint, and the user is still offered inline retry but cannot `/resume` after a crash.
-
-Feature: LLM error recovery
-Rule: The checkpoint is the recovery unit — it captures everything needed to resume the run without re-executing prior tools.
+The system SHALL atomically write `data/run_checkpoints/{trace_id}.json` with `_LoopState` (messages, step, goal index, max steps, JSON failure streak), trace, goal, model, timestamp, and error info (type, message, retryability, detail). It SHALL persist attempt mode/count/remaining budget. `OSError` remains non-fatal.
 
 #### Scenario: Checkpoint is written on LLM error
-- **GIVEN** the agent has completed 3 tool calls (step 3) and the LLM call fails with a timeout
-- **WHEN** `_request_turn()` catches the exception
-- **THEN** a checkpoint file is written to `data/run_checkpoints/{trace_id}.json`
-- **AND** the file contains all 3 tool results in the messages list
-- **AND** the file contains step=3, goal_idx, max_steps, json_fail_streak, model, created_at
-- **AND** the file contains error_info with type="timeout", retryable=true
+- **GIVEN** three tool calls completed and a later model request fails
+- **WHEN** `_request_turn()` checkpoints the run
+- **THEN** all tool results and existing loop metadata are stored
+- **AND** error info records type, message, retryability, and detail
+- **AND** pending attempt mode, attempt count, and remaining budget are stored
 
 #### Scenario: Checkpoint write is atomic
-- **GIVEN** an LLM error occurs and the checkpoint is being written
-- **WHEN** the write is in progress
-- **THEN** the data is first written to `{trace_id}.json.tmp`
-- **AND** then `os.replace` atomically renames it to `{trace_id}.json`
-- **AND** a crash during the write leaves no partial `.json` file
+- **GIVEN** a checkpoint is being written
+- **WHEN** the write commits
+- **THEN** it is written to a temporary file and atomically replaced
+- **AND** a crash cannot leave a partial final checkpoint
 
 #### Scenario: Checkpoint write failure is non-fatal
-- **GIVEN** the disk is full when the checkpoint is being written
-- **WHEN** `CheckpointStore.save()` catches `OSError`
-- **THEN** a warning is logged
-- **AND** the retry prompt still proceeds (inline retry works)
-- **AND** the user is not blocked by the write failure
+- **GIVEN** checkpoint writing raises `OSError`
+- **WHEN** the retry prompt is prepared
+- **THEN** a warning is logged and inline retry still proceeds
+- **AND** `/resume` is unavailable if the checkpoint could not be written
 
 #### Scenario: Checkpoint is deleted on successful run completion
-- **GIVEN** a checkpoint exists from a prior LLM error and the user pressed Retry
-- **WHEN** the resumed run completes successfully
-- **THEN** the checkpoint file is deleted from disk
+- **GIVEN** a checkpoint exists and explicit recovery succeeds
+- **WHEN** the resumed run completes
+- **THEN** the checkpoint is deleted
 
 #### Scenario: Checkpoint is deleted on explicit cancel
-- **GIVEN** a checkpoint exists and the user presses the Cancel button on the error card
-- **WHEN** the cancel signal is received
-- **THEN** the checkpoint file is deleted from disk
+- **GIVEN** a checkpoint exists and the operator cancels
+- **WHEN** cancellation is handled
+- **THEN** the checkpoint is deleted
 
 #### Scenario: Checkpoint survives retry-prompt timeout
-- **GIVEN** a checkpoint exists and the retry prompt is shown to the user
-- **WHEN** the 120s retry-prompt timeout expires without user action
-- **THEN** the agent thread unblocks and returns an error string
-- **AND** the checkpoint file is NOT deleted
-- **AND** the user can `/resume` the run later
+- **GIVEN** an error card is waiting for operator action
+- **WHEN** the retry-prompt timeout expires
+- **THEN** the run unblocks and checkpoint remains for `/resume`
 
 ### Requirement: Inline retry prompt with error card
 
@@ -316,3 +292,50 @@ Rule: Minimal config — two settings with sensible defaults.
 - **AND** the inline retry prompt still appears with Retry and Cancel buttons
 - **AND** pressing Retry resumes the run from in-memory state
 - **AND** `/resume` reports "No unfinished runs to resume" (no checkpoints on disk)
+
+### Requirement: Automatic retry settings belong to the agent
+
+`[agent] max_retries` SHALL default to 4 additional attempts; `retry_delay` SHALL default to 2 seconds. Delays SHALL grow 2/4/8/16 seconds. Zero retries SHALL mean one initial call. Provider- or model-level retry settings SHALL be rejected.
+
+#### Scenario: Retry defaults and zero are exact
+- **GIVEN** default retry settings or `max_retries=0`
+- **WHEN** an eligible transient request fails
+- **THEN** defaults permit at most five total calls with stated delays
+- **AND** zero permits exactly one outbound call
+
+#### Scenario: Exhausted retry budget ends the run but not the bot
+- **GIVEN** all permitted transient attempts are exhausted
+- **WHEN** the current request terminates
+- **THEN** the run ends
+- **AND** Telegram commands and later independent tasks remain available
+
+#### Scenario: Obsolete provider retry settings are rejected
+- **GIVEN** provider or model configuration contains retry settings
+- **WHEN** configuration is validated
+- **THEN** it reports the obsolete key and directs retries to `[agent]`
+
+### Requirement: One attempt state covers a logical model request
+
+One `CallAttemptState` SHALL span control-flow calls until a usable response/action is accepted, terminal failure is finalized, or cancellation occurs. Empty responses, allowed parse re-prompts, mode conversions, and human/confirmation waits SHALL retain it. A later independent model call gets a new state.
+
+#### Scenario: Control-flow loops retain request state
+- **GIVEN** empty output, safe parse re-prompt, confirmation wait, or local native-to-JSON conversion occurs before acceptance
+- **WHEN** the same logical response continues
+- **THEN** its attempt count and remaining budget are retained
+
+#### Scenario: Later model call receives a new state
+- **GIVEN** a usable action is accepted and its tool result is recorded
+- **WHEN** the next independent model response is needed
+- **THEN** it receives a new attempt state with prior tool results retained
+
+#### Scenario: Effects and partial output prohibit automatic retry
+- **GIVEN** a failed call emitted partial output or caused an effect
+- **WHEN** failure handling begins
+- **THEN** no automatic retry or whole-run replay occurs
+- **AND** a later failed call can still retry after earlier completed tool turns
+
+#### Scenario: Explicit checkpoint recovery does not refill budget
+- **GIVEN** Retry or `/resume` restores a checkpoint
+- **WHEN** the saved request continues
+- **THEN** the same state and remaining automatic budget are restored
+- **AND** no completed tool is re-executed

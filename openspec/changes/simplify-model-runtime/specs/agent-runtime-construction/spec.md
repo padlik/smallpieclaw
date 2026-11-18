@@ -8,7 +8,7 @@ Baseline: canonical `openspec/specs/agent-runtime-construction/spec.md` as alrea
 
 ### Requirement: Runtime options preserve supported construction values
 
-Runtime options SHALL accept the immutable run target produced by direct admission — an explicit selector resolved against the fixed connection map, or a snapshot of the active main selection when no selector is given — together with existing supported context, prompt, and run options. Construction SHALL NOT require an active main selection or catalog membership for an explicit target, and SHALL NOT re-admit, re-resolve credentials, or consult the catalog cache. Runtime options SHALL reject per-call `max_tokens`, `temperature`, and `top_p` before model admission or provider I/O.
+Runtime options SHALL accept the immutable run target produced by direct admission — an explicit selector resolved against the fixed connection map, or a snapshot of the active main selection when no selector is given — with the existing supported context, prompt, and run options. Construction SHALL NOT re-admit, re-resolve credentials, or consult the catalog cache. Runtime options SHALL reject per-call `max_tokens`, `temperature`, and `top_p` before model admission or provider I/O.
 
 #### Scenario: Model override is preserved
 - **GIVEN** direct admission resolves an explicit selector for a configured connection, even when the model is not cached and no main selection exists
@@ -32,3 +32,8 @@ Runtime options SHALL accept the immutable run target produced by direct admissi
 - **WHEN** the runtime constructs an execution product
 - **THEN** the supported values are applied according to the existing profile
 - **AND** runtime/profile, supervision, callback, and context ownership remain unchanged
+
+#### Scenario: Explicit target needs no main selection or catalog membership
+- **GIVEN** an explicit selector names a configured connection
+- **WHEN** runtime construction receives its admitted target
+- **THEN** construction SHALL NOT require an active main selection or catalog membership

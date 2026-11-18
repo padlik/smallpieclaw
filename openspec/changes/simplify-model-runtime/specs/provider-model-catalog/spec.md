@@ -8,7 +8,7 @@ Baseline: this delta edits the pending predecessor capability added by `openspec
 
 ### Requirement: Provider connections and canonical model identity
 
-The application SHALL accept provider connection entries `[providers.<connection-id>]` containing only `type`, optional `api_key` credential source, `base_url`, and `request_timeout`. Supported adapters SHALL be `openai`, `openrouter`, `anthropic`, `google`, and cloud-only `ollama`. Human configuration SHALL NOT define per-model entries, generation tuning, or provider retry settings. A model selector SHALL be `<connection-id>/<upstream-id>`, split only at the first slash: both parts MUST be non-empty, and every later slash belongs unchanged to the upstream ID. Selectors SHALL be used exactly as supplied, without trimming, aliasing, or case folding; display names SHALL NOT be selectors.
+The application SHALL accept `[providers.<connection-id>]` entries containing only `type`, optional `api_key` source, `base_url`, and `request_timeout`, with adapters `openai`, `openrouter`, `anthropic`, `google`, and cloud-only `ollama`, and no per-model entries, generation tuning, or retry settings. A selector SHALL be `<connection-id>/<upstream-id>`, split only at the first slash; both parts MUST be non-empty and used exactly as supplied; display names SHALL NOT be selectors.
 
 #### Scenario: Upstream ID contains slashes
 - **GIVEN** connection `router-main` is configured
@@ -42,7 +42,7 @@ The application SHALL accept provider connection entries `[providers.<connection
 
 ### Requirement: Provider inventory refresh is complete and atomic
 
-Bootstrap discovery and `/models` refresh SHALL query every configured connection using all supported pages. A validated complete response SHALL atomically replace that provider's candidates in the advisory cache, including a valid empty inventory. A failed, malformed, or incomplete response SHALL keep that provider's last-good candidates marked stale while other providers are updated. Refresh SHALL change only the cache, never connections, the saved preference, the active selection, run targets, or running work. Candidates of connections no longer configured SHALL NOT be listed. No fingerprint, configuration generation, or catalog revision SHALL gate refresh results.
+Bootstrap discovery and `/models` refresh SHALL query every configured connection using all supported pages and atomically replace that provider's advisory-cache candidates only with a validated complete response, including a valid empty one. A failed, malformed, or incomplete response SHALL keep its last-good candidates marked stale while other providers update. Refresh SHALL change only the cache. No fingerprint, configuration generation, or catalog revision SHALL gate refresh results.
 
 #### Scenario: Complete pagination replaces inventory
 - **GIVEN** a provider returns multiple pages and all pages validate
@@ -70,9 +70,14 @@ Bootstrap discovery and `/models` refresh SHALL query every configured connectio
 - **THEN** the removed connection's candidates are not listed and are dropped from the next cache write
 - **AND** no refresh result for it is committed
 
+#### Scenario: Refresh changes only the cache
+- **GIVEN** a refresh runs, whether it commits or fails
+- **WHEN** it completes
+- **THEN** connections, the saved preference, the active selection, run targets, and running work SHALL be unchanged
+
 ### Requirement: Managed settings separate remembered selection from active selection
 
-The durable selection preference SHALL be the file resolved as `model_selection_file` (`$XDG_CONFIG_HOME/<agent>/model-selection.toml`) holding exactly one deliberate selector as `model = "<connection-id>/<upstream-id>"`. Only a deliberate `/models` selection SHALL write it, by temporary file and atomic replace, before the new active selection is published. The active selection SHALL be held in memory; an automatic choice SHALL NOT be persisted. Neither the preference nor the cache SHALL contain credentials, credential references, endpoint URLs, raw responses, or error bodies. An unreadable, unparseable, or invalid preference SHALL leave the active selection unavailable, SHALL NOT be overwritten by any automatic or runtime write, and SHALL be replaced atomically by a deliberate selection without a restart.
+The durable selection preference SHALL be `model_selection_file` (`$XDG_CONFIG_HOME/<agent>/model-selection.toml`) holding exactly one deliberate selector as `model = "<connection-id>/<upstream-id>"`. Only a deliberate `/models` selection SHALL write it, by temporary file and atomic replace, before the new active selection is published. The active selection SHALL be held in memory and an automatic choice SHALL NOT be persisted.
 
 #### Scenario: Saved model is absent at startup
 - **GIVEN** the preference saves `openai-prod/gpt-x`, connection `openai-prod` is configured, and the cache has no `openai-prod/gpt-x` candidate
@@ -110,9 +115,20 @@ The durable selection preference SHALL be the file resolved as `model_selection_
 - **WHEN** the operator deliberately selects a model in `/models`
 - **THEN** the preference is atomically replaced and the selection becomes active immediately without a restart
 
+#### Scenario: Preference and cache hold no credentials or provider data
+- **GIVEN** the selection preference or the cache is written
+- **WHEN** its contents are inspected
+- **THEN** neither SHALL contain credentials, credential references, endpoint URLs, raw responses, or error bodies
+
+#### Scenario: Invalid preference is never overwritten automatically
+- **GIVEN** the preference is unreadable, unparseable, or invalid
+- **WHEN** startup or any automatic or runtime process runs
+- **THEN** the active selection is unavailable and the preference SHALL NOT be overwritten
+- **AND** only a deliberate selection SHALL replace it, atomically and without a restart
+
 ### Requirement: Selection, refresh, and admission are serialized safely
 
-`/models` selection callbacks SHALL carry an opaque token of at most 64 bytes that resolves server-side to the selector captured when the list was rendered; an expired or unknown token SHALL change nothing. A deliberate selection SHALL validate only selector shape and configured connection, not cache membership. Selection and refresh SHALL be serialized so neither publishes partial state and refresh never overwrites the selection or preference. Prompt and tool consumers SHALL read one shared view distinguishing a run's pinned target from the future active selection. Catalog presence SHALL NOT promise account callability.
+`/models` callbacks SHALL carry opaque tokens of at most 64 bytes resolving server-side to render-captured selectors; expired or unknown tokens SHALL change nothing. Deliberate selection SHALL check only selector shape and configured connection, not cache membership. Selection and refresh SHALL serialize without partial publication; refresh SHALL NOT overwrite selection or preference. Prompt and tool consumers SHALL share a view distinguishing a run's pinned target from future active selection.
 
 #### Scenario: Concurrent refresh and selection do not lose selection
 - **GIVEN** a refresh and a deliberate model selection overlap
@@ -144,9 +160,14 @@ The durable selection preference SHALL be the file resolved as `model_selection_
 - **WHEN** the callback is used
 - **THEN** the captured selector is selected and persisted, because the cache is not a whitelist
 
+#### Scenario: Catalog presence does not promise account callability
+- **GIVEN** a model appears in the catalog
+- **WHEN** any consumer presents or uses it
+- **THEN** catalog presence SHALL NOT be presented as a promise that the account can call the model
+
 ### Requirement: Embeddings and graph extraction remain explicit exceptions
 
-Embeddings SHALL be configured only by `[embeddings]` `provider`, `base_url`, `api_key`, and `model`; graph extraction only by `[graph_memory]` `extraction_provider`, `extraction_base_url`, `extraction_api_key`, and `extraction_model`, all required when graph memory is enabled. Neither SHALL inherit any value from a chat connection (even of the same adapter type), from chat selection, from the cache, or from the other service. Graph vectors SHALL use the shared embedding service; no further graph embedding configuration SHALL exist. A missing or invalid value SHALL degrade only the affected service, with an actionable warning, and SHALL NOT stop the bot.
+Embeddings SHALL be configured only by `[embeddings]` `provider`, `base_url`, `api_key`, and `model`, and graph extraction only by `[graph_memory]` `extraction_provider`, `extraction_base_url`, `extraction_api_key`, and `extraction_model`, all required when graph memory is enabled. Neither SHALL inherit from a chat connection, chat selection, the cache, or the other service. A missing or invalid value SHALL degrade only the affected service with an actionable warning and SHALL NOT stop the bot.
 
 #### Scenario: Missing embedding configuration degrades without stopping bot
 - **GIVEN** an `[embeddings]` field is missing or invalid
@@ -206,6 +227,12 @@ Embeddings SHALL be configured only by `[embeddings]` `provider`, `base_url`, `a
 - **GIVEN** graph memory and indexing are both enabled with valid configuration
 - **WHEN** graph memory embeds an entity
 - **THEN** it uses the configured `[embeddings]` service and not the graph extraction connection
+
+#### Scenario: No separate graph embedding configuration exists
+- **GIVEN** configuration is loaded, whether graph memory is enabled or disabled
+- **WHEN** configuration is validated
+- **THEN** no graph-specific embedding provider, endpoint, credential, or model setting SHALL exist
+- **AND** graph vectors SHALL use the shared embedding service
 
 ### Requirement: Graph extraction resolves its model independently of main selection
 
