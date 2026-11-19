@@ -118,7 +118,7 @@ def test_record_truncates_long_task(log):
 
 def test_rotate_removes_old_entries(log):
     # Inject an old entry directly
-    old_ts = (datetime.utcnow() - timedelta(hours=50)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old_ts = (datetime.now(timezone.utc) - timedelta(hours=50)).strftime("%Y-%m-%dT%H:%M:%SZ")
     old_entry = {
         "ts": old_ts, "tag": "old_job", "task": "t", "result": "r",
         "success": True, "elapsed_s": 1, "model": "",
@@ -135,7 +135,7 @@ def test_rotate_removes_old_entries(log):
 
 
 def test_rotate_keeps_recent_entries(log):
-    recent_ts = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     entry = {
         "ts": recent_ts, "tag": "recent_job", "task": "t", "result": "r",
         "success": True, "elapsed_s": 1, "model": "",
