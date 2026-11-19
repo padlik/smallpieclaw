@@ -216,6 +216,12 @@ data/scheduler_state.json
 # Local deepwork state
 .slim/
 
+# Local CodeGraph index
+.codegraph/
+
+# Local MCP documentation cache
+.mcp-docs/
+
 # Local Claude Code project state
 .claude/
 
