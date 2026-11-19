@@ -1,3 +1,10 @@
+# shell-network-toggle Specification
+
+## Purpose
+Define the single boolean configuration field that decides whether nsjail shell commands are network-isolated or share the host network, and the rejection of the legacy string field it replaces.
+
+## Requirements
+
 ### Requirement: Shell network access is controlled by a boolean allow_net config field
 
 The agent configuration MUST use a boolean `allow_net` field (default `false`) to control whether nsjail shell commands have network access. When `false`, network is isolated (`clone_newnet: true`). When `true`, the jail shares the host network namespace (`clone_newnet: false`). This replaces the legacy string `shell_nsjail_network` field.

@@ -1,3 +1,10 @@
+# session-log-management Specification
+
+## Purpose
+Define where large shell output artifacts are stored per conversation, how that folder is exposed read-only to the nsjail shell, and how old session log folders are cleaned up at startup.
+
+## Requirements
+
 ### Requirement: Shell output logs stored under XDG state home in per-conversation folders
 
 Shell command output artifacts (large outputs exceeding `max_output`) MUST be saved to `~/.local/state/<agent>/session_logs/<conversation_id>/shell-<timestamp>-<hex>.log` instead of the old `data/shell_logs/` location. The `_open_shell_log` helper in `builtin_tools/shell.py` MUST compute the log directory from the `conversation_id` held by `BuiltinExecutor` (via `self._owner.conversation_id`) and the XDG state home path. The directory is created owner-only (0700) and files are owner-only (0600), same as the previous `shell_logs` behavior. The `_finalize_shell_log` helper keeps the file only if `total_chars > max_output`, otherwise deletes it — unchanged behavior.

@@ -1,4 +1,9 @@
-## ADDED Requirements
+# plan-execution-parity Specification
+
+## Purpose
+Keep plan execution equally observable whichever way the model expresses a plan, so that native tool calls and json_mode text output produce the same tool trace and working-memory record, with a single plan-step ceiling.
+
+## Requirements
 
 ### Requirement: Plan execution MUST emit tool trace and working-memory step regardless of dispatch path
 

@@ -97,6 +97,15 @@ Bootstrap discovery and `/models` refresh SHALL query every configured connectio
 - **WHEN** it completes
 - **THEN** connections, the saved preference, the active selection, run targets, and running work SHALL be unchanged
 
+#### Scenario: Display-name whitespace does not invalidate the inventory
+- **GIVEN** a provider's complete response contains a candidate whose provider-reported display text has leading or trailing whitespace, or is blank after trimming
+- **AND** every candidate identity is well formed and no provider-supplied text contains the resolved credential
+- **WHEN** refresh completes
+- **THEN** the display text is shown trimmed, or as the exact raw upstream ID when blank
+- **AND** the complete inventory is committed fresh with every candidate retained
+- **AND** the candidate's canonical and upstream IDs are exactly as the provider reported them, never trimmed or normalized
+- **AND** a malformed candidate identity or any provider text containing the resolved credential still fails the whole refresh and keeps the last-good candidates stale
+
 ### Requirement: Managed settings separate remembered selection from active selection
 
 The durable selection preference SHALL be `model_selection_file` (`$XDG_CONFIG_HOME/<agent>/model-selection.toml`) holding exactly one deliberate selector as `model = "<connection-id>/<upstream-id>"`. Only a deliberate `/models` selection SHALL write it, by temporary file and atomic replace, before the new active selection is published. The active selection SHALL be held in memory and an automatic choice SHALL NOT be persisted.

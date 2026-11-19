@@ -1,3 +1,10 @@
+# conversation-persistence Specification
+
+## Purpose
+Define how the main agent's chat history survives process restarts, how the conversation identifier that names that history is generated and rotated, and which loss window on a hard crash is accepted.
+
+## Requirements
+
 ### Requirement: Main agent chat history persists across process restarts
 
 The main agent's `short_term` (chat history) MUST be serialized to `~/.local/state/<agent>/conversations/<conversation_id>.json` on process shutdown and on `/reset` (save variant). The save MUST be atomic — a crash during save MUST NOT produce a partial or corrupted file. On startup, if a `conversation_id` file exists at `~/.local/state/<agent>/conversation_id` and a corresponding `conversations/<id>.json` exists, the agent MUST load it into `ShortTermMemory` and pass it to `AgentController(short_term=loaded)`. If either file is missing or corrupted, the agent starts with a fresh `ShortTermMemory`. Working memory (`WorkingMemory`) is NEVER persisted — restart always starts a fresh task.

@@ -1,4 +1,9 @@
-## ADDED Requirements
+# shell-env-management Specification
+
+## Purpose
+Define the built-in tools that set, unset, list, and read session-scoped environment variables for shell commands, which persist across separate nsjail invocations within a session, and their confirmation behavior.
+
+## Requirements
 
 ### Requirement: shell_env_set persists a session-scoped environment variable
 
