@@ -385,7 +385,7 @@ async def cmd_resume(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         )
         return
 
-    checkpoints = checkpoint_store.list()
+    checkpoints = checkpoint_store.list_eligible()
     if not checkpoints:
         await update.effective_message.reply_text(
             "No unfinished runs to resume."
@@ -410,28 +410,17 @@ async def cmd_resume(iface: "TelegramInterface", update: Update, ctx: ContextTyp
         for i, cp in enumerate(checkpoints, 1):
             goal = html.escape(cp.get("user_goal", "?")[:60])
             step = cp.get("step", "?")
+            max_steps = cp.get("max_steps", "?")
             error_type = cp.get("error_info", {}).get("type", "unknown")
-            retryable = cp.get("error_info", {}).get("retryable", True)
             created = cp.get("created_at", "?")
-            status_icon = "🔄" if retryable else "❌"
             lines.append(
-                f"{i}. {status_icon} <b>{goal}</b>\n"
-                f"   Step {step} • Error: {error_type} • {created}\n"
+                f"{i}. 🔄 <b>{goal}</b>\n"
+                f"   Step {step}/{max_steps} • Error: {error_type} • {created}\n"
             )
         lines.append("\nUse <code>/resume N</code> to resume a specific checkpoint.")
         await update.effective_message.reply_text(
             "\n".join(lines),
             parse_mode=ParseMode.HTML,
-        )
-        return
-
-    # Check if the checkpoint is retryable
-    error_info = checkpoint.get("error_info", {})
-    if not error_info.get("retryable", True):
-        await update.effective_message.reply_text(
-            f"❌ This run failed with a non-retryable error "
-            f"({error_info.get('type', 'unknown')}). Cannot resume.\n\n"
-            f"Use /resume to list other checkpoints, or the checkpoint will remain on disk."
         )
         return
 
@@ -441,9 +430,10 @@ async def cmd_resume(iface: "TelegramInterface", update: Update, ctx: ContextTyp
     goal = checkpoint.get("user_goal", "")
     trace_id = checkpoint.get("trace_id", "")
     step = checkpoint.get("step", 0)
+    max_steps = checkpoint.get("max_steps", "?")
 
     await update.effective_message.reply_text(
-        f"💾 Resuming: {html.escape(goal[:60])} (step {step})",
+        f"💾 Resuming: {html.escape(goal[:60])} (step {step}/{max_steps})",
         parse_mode=ParseMode.HTML,
     )
 

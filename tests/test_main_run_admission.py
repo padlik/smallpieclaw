@@ -672,7 +672,7 @@ def test_checkpoint_resume_keeps_pinned_model_and_saved_attempts(make_world) -> 
     factory = _Factory(w, model_id=MODEL_B.id)
     controller = w.controller_with(llm=injected, run_client_factory=factory)
     controller._confirmation.request_retry = lambda *_a, **_k: "timeout"
-    result, exc = _run(w, resume_from=trace, trace_id=None)
+    result, exc = _run(w, resume_from=trace, trace_id=None, interactive_llm_recovery=True)
 
     assert exc is None and result.startswith("❌")
     assert w.registry.view().active_model_id == MODEL_A.id
@@ -724,14 +724,19 @@ def test_malformed_resumed_native_group_fails_closed_before_io(make_world) -> No
         assert w.store.save(trace, ckpt, owner=owner) is True
     finally:
         owner.release()
+    saved_file = Path(w.store._checkpoint_dir) / f"{trace}.json"
+    saved_bytes = saved_file.read_bytes()
     factory = _Factory(w, model_id=MODEL_B.id)
     controller = w.controller_with(llm=None, run_client_factory=factory)
     controller._confirmation.request_retry = lambda *_a, **_k: "timeout"  # operator boundary
-    result, exc = _run(w, resume_from=trace, trace_id=None)
+    result, exc = _run(w, resume_from=trace, trace_id=None, interactive_llm_recovery=True)
 
     assert exc is None and result.startswith("❌")
     assert "late result" not in result and "interleaved" not in result
     assert w.requests == []
+    # Preparation failed before any send: the eligible snapshot is byte-identical
+    # and no replacement non-retryable checkpoint replaced it.
+    assert saved_file.read_bytes() == saved_bytes
     owner = w.store.acquire_owner(trace)
     assert owner is not None, "checkpoint owner lease leaked"
     try:

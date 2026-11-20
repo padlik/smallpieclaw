@@ -1304,3 +1304,36 @@ class TestRootSubAgentFactoryWiring:
         assert outcome["embedding"] == (True, True, True)
         assert outcome["closed"] is True
         assert root_harness.unexpected == []
+
+
+class TestSubAgentProfilesStayHeadlessForLLMRecovery:
+    """No sub-agent profile may enable interactive LLM recovery, callbacks or not."""
+
+    @pytest.mark.parametrize(
+        "profile_name",
+        ["ON_DEMAND_SUBAGENT", "SCHEDULED_AGENT", "PLAN_STEP_AGENT", "DIAGNOSTIC_AGENT"],
+    )
+    def test_profile_run_has_no_interactive_llm_recovery(self, pin_a, profile_name):
+        from agent_runtime import RuntimeOptions, RuntimeProfile
+
+        runtime = AgentRuntime(
+            agent_cfg=AgentConfig(), embedding_factory=_unavailable_embedding,
+            base_memory=MagicMock(), builtin_executor=MagicMock(), results=MagicMock(),
+            notify_fn=lambda _msg: None,
+        )
+        runner = runtime.create(
+            getattr(RuntimeProfile, profile_name), RuntimeOptions(run_model=pin_a),
+            notify_fn=lambda _msg: None,
+        )
+        observed: list[bool] = []
+
+        def probe(ctx, *_args, **_kwargs):
+            observed.append(ctx.interactive_llm_recovery)
+            return "ok"
+
+        try:
+            with patch("agent_controller.react_loop", side_effect=probe):
+                assert runner.run("task") == "ok"
+        finally:
+            runner.close()
+        assert observed == [False]

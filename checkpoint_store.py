@@ -16,6 +16,31 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def is_resume_eligible(checkpoint: dict) -> bool:
+    """Return whether ``checkpoint`` may be offered for or accepted by resume.
+
+    The single recovery-layer policy: an explicit ``error_info.retryable`` of
+    ``False`` disables resume. Omitted metadata (older files) stays eligible and
+    is left to existing resume validation.
+    """
+    error_info = checkpoint.get("error_info")
+    return not (isinstance(error_info, dict) and error_info.get("retryable") is False)
+
+
+def startup_checkpoint_notice(store: "CheckpointStore") -> Optional[str]:
+    """Return the startup operator notice for eligible checkpoints, or ``None``."""
+    eligible = store.list_eligible()
+    if not eligible:
+        return None
+    goal = eligible[0].get("user_goal", "?")[:60]
+    if len(eligible) == 1:
+        return f"💾 Found unfinished run: '{goal}'. Send /resume to continue."
+    return (
+        f"💾 Found {len(eligible)} unfinished runs. Most recent: '{goal}'. "
+        "Send /resume to see all."
+    )
+
+
 class CheckpointRetireStatus(Enum):
     """Outcome of a guarded pending-checkpoint retirement."""
 
@@ -511,3 +536,11 @@ class CheckpointStore:
             reverse=True,
         )
         return checkpoints
+
+    def list_eligible(self) -> list[dict]:
+        """List valid checkpoints that resume may use, newest first.
+
+        The recovery-layer view over :meth:`list`: it only filters, so raw
+        enumeration and every file on disk are left untouched.
+        """
+        return [checkpoint for checkpoint in self.list() if is_resume_eligible(checkpoint)]

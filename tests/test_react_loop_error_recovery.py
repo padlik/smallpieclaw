@@ -243,10 +243,12 @@ def _build_context(
     trace_id: str = "r-test1",
     checkpoint_enabled: bool = True,
     confirmation: Optional[ConfirmationManager] = None,
+    interactive_llm_recovery: bool = False,
 ) -> ReactContext:
-    """Build a ReactContext wired for error-recovery tests."""
+    """Build a ReactContext wired for error-recovery tests (headless by default)."""
     data_dir = str(tmp_path / "data")
     return ReactContext(
+        interactive_llm_recovery=interactive_llm_recovery,
         llm=llm,
         tool_index=_NullToolIndex(),
         memory=_NullMemory(),
@@ -304,6 +306,7 @@ class TestHandleLLMError:
             ErrorThenSuccessLLM(RuntimeError("nope"), '{"action": "finish", "result": "done"}'),
             RecordingExecutor(),
             trace_id="r-retry",
+            interactive_llm_recovery=True,
         )
 
         def auto_retry(*_args, **_kwargs):
@@ -317,7 +320,10 @@ class TestHandleLLMError:
         error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
         state = _LoopState(messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8)
         llm = ErrorThenSuccessLLM(RuntimeError("nope"), '{"action": "finish", "result": "done"}')
-        ctx = _build_context(tmp_path, llm, RecordingExecutor(), trace_id="r-cancel")
+        ctx = _build_context(
+            tmp_path, llm, RecordingExecutor(), trace_id="r-cancel",
+            interactive_llm_recovery=True,
+        )
         # Write a pre-existing checkpoint first.
         if ctx.checkpoint_store is not None:
             ctx.checkpoint_store.save("r-cancel", {"created_at": "2024-01-01T00:00:00Z"})
@@ -334,7 +340,10 @@ class TestHandleLLMError:
         error_info = LLMErrorInfo("timeout", "⏱️ Request timed out", True, "detail")
         state = _LoopState(messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8)
         llm = ErrorThenSuccessLLM(RuntimeError("nope"), '{"action": "finish", "result": "done"}')
-        ctx = _build_context(tmp_path, llm, RecordingExecutor(), trace_id="r-timeout")
+        ctx = _build_context(
+            tmp_path, llm, RecordingExecutor(), trace_id="r-timeout",
+            interactive_llm_recovery=True,
+        )
 
         def auto_timeout(*_args, **_kwargs):
             return "timeout"
@@ -354,6 +363,7 @@ class TestHandleLLMError:
             RecordingExecutor(),
             trace_id="r-disabled",
             checkpoint_enabled=False,
+            interactive_llm_recovery=True,
         )
 
         def auto_retry(*_args, **_kwargs):
@@ -390,6 +400,7 @@ class TestReactLoopErrorRecovery:
             llm, executor, tmp_path,
             trace_id="r-recover",
             confirmation=confirmation,
+            interactive_llm_recovery=True,
         )
 
         assert result == "recovered"
@@ -419,6 +430,7 @@ class TestReactLoopErrorRecovery:
             llm, executor, tmp_path,
             trace_id="r-cancel",
             confirmation=confirmation,
+            interactive_llm_recovery=True,
         )
 
         assert result.startswith("❌")
@@ -443,6 +455,7 @@ class TestReactLoopErrorRecovery:
             llm, executor, tmp_path,
             trace_id="r-preserved",
             confirmation=confirmation,
+            interactive_llm_recovery=True,
         )
 
         assert result.startswith("❌")
@@ -467,6 +480,7 @@ class TestReactLoopErrorRecovery:
             llm, executor, tmp_path,
             trace_id="r-nocheckpt",
             confirmation=confirmation,
+            interactive_llm_recovery=True,
             checkpoint_enabled=False,
         )
 
@@ -542,7 +556,10 @@ class TestToolResultsCount:
             max_steps=8,
         )
         llm = ScriptedFinishLLM()
-        ctx = _build_context(tmp_path, llm, RecordingExecutor(), trace_id="r-count")
+        ctx = _build_context(
+            tmp_path, llm, RecordingExecutor(), trace_id="r-count",
+            interactive_llm_recovery=True,
+        )
 
         captured: list[str] = []
 
@@ -639,7 +656,7 @@ def run_failing_preparation(tmp_path):
         ctx = build_context(
             client, RecordingExecutor(),
             checkpoint_store=store, checkpoint_owner=owner, checkpoint_enabled=True,
-            confirmation=confirmation,
+            confirmation=confirmation, interactive_llm_recovery=True,
         )
         with patch("react_loop._build_system_prompt", return_value=("sys-prompt", None)):
             result = react_loop(ctx, "goal", progress_callback=lambda _m: None, initial_state=malformed)
@@ -648,15 +665,42 @@ def run_failing_preparation(tmp_path):
         client.close()
 
 
-def test_timeout_saves_valid_zero_outbound_state(tmp_path):
-    from call_attempt_state import CallAttemptState
-
+def test_permanent_preparation_failure_is_terminal_without_checkpoint(tmp_path):
+    """A malformed request is non-retryable: no provider I/O and no new checkpoint."""
     result, store, owner, requests = run_failing_preparation(tmp_path)
     try:
         assert result.startswith("❌")
+        assert "model/provider configuration" in result
         assert requests == []
-        saved = store.load("r-harness1", owner=owner)
-        assert isinstance(saved["attempt_state"], dict)
+        assert store.load("r-harness1", owner=owner) is None
+    finally:
+        owner.release()
+
+
+def save_zero_outbound_checkpoint(tmp_path, trace_id="r-harness1"):
+    """Persist an interactive retryable pre-send failure; return (store, owner)."""
+    ctx = _build_context(
+        tmp_path, ScriptedFinishLLM(), RecordingExecutor(), trace_id=trace_id,
+        interactive_llm_recovery=True,
+    )
+    ctx.confirmation.request_retry = lambda *args, **kwargs: "timeout"
+    owner = ctx.checkpoint_store.acquire_owner(trace_id)
+    ctx.checkpoint_owner = owner
+    state = _LoopState(
+        messages=[{"role": "user", "content": "goal"}], goal_idx=0, max_steps=8,
+        attempt_state=CallAttemptState(max_retries=0),
+    )
+    _handle_llm_error(
+        ctx, state, LLMErrorInfo("timeout", "⏱️ Request timed out", True, "d"),
+        lambda _m: None, "goal",
+    )
+    return ctx.checkpoint_store, owner
+
+
+def test_retryable_pre_send_failure_saves_valid_zero_outbound_state(tmp_path):
+    store, owner = save_zero_outbound_checkpoint(tmp_path, "r-zero-out")
+    try:
+        saved = store.load("r-zero-out", owner=owner)
         restored = CallAttemptState.from_dict(saved["attempt_state"])
         assert restored.outbound_attempts == 0
         assert restored.manual_retry_authorized is False

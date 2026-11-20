@@ -12,7 +12,6 @@ Everything runs against the real pinned ``LLMClient`` over ``httpx.MockTransport
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import threading
 from unittest.mock import MagicMock, patch
@@ -478,7 +477,6 @@ class TestProviderContextRejection:
         store = MagicMock()
         store.save.return_value = True
         confirmation = MagicMock()
-        confirmation.request_retry.return_value = "cancel"  # the operator declines a retry
         client = _client(wire)
         ctx = build_context(
             client, RecordingExecutor(), short_term=_short_term(),
@@ -492,12 +490,11 @@ class TestProviderContextRejection:
             client.close()
         assert len(wire.main_bodies) == 1  # no automatic resend, whatever the retry setting
         assert len(wire.summary_bodies) == summaries  # nothing was summarized in reaction
-        assert store.save.call_count == 1 and confirmation.request_retry.call_count == 1
-        payload = store.save.call_args.args[1]
-        assert payload["error_info"]["type"] == "context"
-        assert payload["model_id"]
+        # Context rejection is non-retryable: terminal guidance, no checkpoint, no card.
+        assert store.save.call_count == 0 and confirmation.request_retry.call_count == 0
+        assert result.startswith("❌") and "Reduce the request or context" in result
         if summaries == 0:  # nothing was compacted, and nothing was repaired after the rejection
-            assert PREFIX not in json.dumps(payload["messages"])
+            assert PREFIX not in wire.main_bodies[0]
         assert isinstance(result, str)
 
 

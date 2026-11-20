@@ -139,13 +139,9 @@ Only explicitly interactive runs with retryable LLM failures SHALL block on a Re
 - **WHEN** a new message arrives while an interactive retry prompt is active
 - **THEN** existing deferred-message behavior presents it after the current run ends
 
-## MODIFIED Requirements
+### Requirement: /resume command for eligible checkpoint recovery
 
-### Requirement: /resume command for checkpoint recovery
-
-The system SHALL provide `/resume` for eligible main-agent checkpoints only. The controller/recovery layer SHALL own eligibility and SHALL reject an otherwise valid checkpoint explicitly marked `error_info.retryable=false` before manual retry authorization or any send. Telegram SHALL consult the same rule for presentation; it SHALL NOT be the sole enforcement boundary. Otherwise valid legacy checkpoints without the flag SHALL remain eligible under existing validation.
-
-`/resume` SHALL resume the sole eligible checkpoint, or list multiple eligible checkpoints with contiguous numbers; `/resume N` SHALL select from that same filtered ordered list. The newest eligible checkpoint SHALL appear first. Non-retryable files SHALL remain untouched and excluded from actionable listings; the former specified deletion offer is intentionally removed, and no deletion interface is introduced. Resume SHALL reuse the stored trace and attempt state without refilling the automatic budget or replaying completed tools.
+The system SHALL provide `/resume` for eligible main-agent checkpoints only. The controller/recovery layer SHALL own eligibility and SHALL reject a valid checkpoint marked `error_info.retryable=false` before manual retry authorization or any send; Telegram SHALL apply the same rule for presentation only. `/resume` and `/resume N` SHALL use one filtered, newest-first, contiguously numbered list. Resume SHALL NOT delete ineligible files, refill the automatic budget or replay completed tools.
 
 #### Scenario: /resume with single checkpoint resumes immediately
 - **GIVEN** one eligible checkpoint from a prior timeout exists
@@ -156,6 +152,7 @@ The system SHALL provide `/resume` for eligible main-agent checkpoints only. The
 - **WHEN** `/resume` finds multiple eligible checkpoints
 - **THEN** it lists goal, step/max, error type and age with contiguous numbers
 - **AND** it prompts the operator to use `/resume N`
+- **AND** the newest eligible checkpoint is listed first
 
 #### Scenario: /resume N selects a specific checkpoint
 - **GIVEN** newest-to-oldest files contain retryable A, non-retryable B, retryable C
@@ -171,16 +168,18 @@ The system SHALL provide `/resume` for eligible main-agent checkpoints only. The
 - **WHEN** `/resume` is invoked while the agent is busy
 - **THEN** the response says "⚠️ Agent is currently running. Wait for it to finish or /stop it first."
 
-#### Scenario: /resume on corrupted checkpoint deletes it and reports
+#### Scenario: /resume preserves corrupted checkpoint files
 - **GIVEN** a checkpoint has invalid JSON or missing required fields
 - **WHEN** existing corrupted-checkpoint handling runs
-- **THEN** the corrupted file is deleted and the corruption is reported under existing validation/ownership rules
+- **THEN** enumeration skips files it cannot parse or validate, and an explicit resume attempt is refused under existing validation/ownership rules
+- **AND** the corrupted file remains unchanged on disk, without automatic deletion
 - **AND** remaining valid eligible checkpoints are available
 
 #### Scenario: /resume refuses non-retryable checkpoint
 - **WHEN** any frontend or direct controller caller explicitly attempts a non-retryable checkpoint
 - **THEN** controller/recovery rejects it with fixed guidance before authorization or sending
 - **AND** the checkpoint remains unchanged
+- **AND** no deletion action is offered
 
 #### Scenario: Legacy checkpoint omits retryability
 - **WHEN** an otherwise valid older checkpoint omits `error_info.retryable`
@@ -194,6 +193,9 @@ The system SHALL provide `/resume` for eligible main-agent checkpoints only. The
 - **GIVEN** an eligible checkpoint has trace `r-a1b2c3d4`
 - **WHEN** its resumed run succeeds
 - **THEN** it uses that trace for correlation and retires that checkpoint under existing ownership rules
+- **AND** it continues the stored attempt state without refilling the automatic budget or replaying completed tools
+
+## MODIFIED Requirements
 
 ### Requirement: Startup checkpoint scan notification
 
@@ -236,3 +238,8 @@ The system SHALL retain `[llm_error_handling] retry_timeout_seconds` (integer, d
 **Reason**: Replaced by "Inline retry prompt for eligible interactive failures"; the former requirement mandates a blocking Cancel-only card for non-retryable failures, which is intentionally retired.
 
 **Migration**: Keep interactive retryable Retry/Cancel behavior under the replacement requirement. Non-retryable failures return immediate fixed guidance without a card or wait.
+
+### Requirement: /resume command for checkpoint recovery
+**Reason**: Replaced by "/resume command for eligible checkpoint recovery"; the former requirement specified corrupted-checkpoint deletion and a non-retryable deletion offer, contrary to the approved non-destructive handling.
+
+**Migration**: Retain all other resume behavior under the replacement requirement. Corrupted and non-retryable checkpoint files remain unchanged; no automatic cleanup or deletion interface is introduced.

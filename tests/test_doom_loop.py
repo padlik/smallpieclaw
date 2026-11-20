@@ -260,6 +260,7 @@ class TestDoomLoopStateDefaults:
         ctx = build_context(ScriptedLLM(['{"action": "finish"}']), RecordingExecutor())
         ctx.checkpoint_store = _Store()
         ctx.checkpoint_enabled = True
+        ctx.interactive_llm_recovery = True
         ctx.confirmation.request_retry = lambda *a, **k: "cancel"
         state = _LoopState(
             messages=[{"role": "user", "content": "g"}], goal_idx=0,

@@ -23,7 +23,7 @@ def _make_iface(checkpoints=None, lock_locked=False):
     iface._get_agent_lock.return_value = lock
 
     checkpoint_store = MagicMock()
-    checkpoint_store.list.return_value = checkpoints or []
+    checkpoint_store.list_eligible.return_value = checkpoints or []
 
     agent = MagicMock()
     agent.checkpoint_store = checkpoint_store
@@ -83,8 +83,10 @@ async def test_resume_no_checkpoints():
 
 
 @pytest.mark.asyncio
-async def test_resume_non_retryable_refused():
-    """A non-retryable checkpoint is refused and stays on disk."""
+async def test_resume_non_retryable_is_not_offered(tmp_path):
+    """A non-retryable checkpoint is excluded from /resume and stays on disk."""
+    from checkpoint_store import CheckpointStore
+
     checkpoint = {
         "trace_id": "r-test123",
         "user_goal": "test goal",
@@ -98,12 +100,16 @@ async def test_resume_non_retryable_refused():
         },
         "created_at": "2026-08-21T14:30:00Z",
     }
-    iface = _make_iface(checkpoints=[checkpoint])
+    store = CheckpointStore(str(tmp_path))
+    assert store.save("r-test123", checkpoint)
+    iface = _make_iface()
+    iface.agent.checkpoint_store = store
     update, ctx = _make_update()
     await cmd_resume(iface, update, ctx)
     call_args = update.effective_message.reply_text.call_args
-    assert "non-retryable" in call_args[0][0]
+    assert call_args[0][0] == "No unfinished runs to resume."
     iface._run_agent_task.assert_not_called()
+    assert store.load("r-test123") == checkpoint
 
 
 @pytest.mark.asyncio

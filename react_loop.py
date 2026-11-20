@@ -330,6 +330,10 @@ class ReactContext:
     checkpoint_enabled: bool = True
     # Retry prompt timeout in seconds (config: llm_error_handling.retry_timeout_seconds)
     retry_timeout_seconds: int = 120
+    # Per-run capability: an operator can answer a Retry/Cancel prompt for this
+    # run. Never inferred from callbacks; set explicitly by the caller (Telegram
+    # root/resume). Headless runs leave it False and end LLM failures immediately.
+    interactive_llm_recovery: bool = False
 
     # Native tool calling — cached tool definitions built once at loop start
     _tool_defs: Optional[list[dict]] = None
@@ -753,19 +757,53 @@ def _get_user_goal(state: _LoopState) -> str:
     return ""
 
 
+_TERMINAL_GUIDANCE = {
+    "context": "Reduce the request or context and try again.",
+    "permanent": "Check the model/provider configuration and try again.",
+}
+_GUIDANCE_AFTER_EXHAUSTION = "Automatic retries were exhausted. Try the request again later."
+_GUIDANCE_NO_OPERATOR_RETRY = "No operator retry is available for this run. Try the request again."
+
+
+def _terminal_llm_failure(error_info: LLMErrorInfo, automatic_exhausted: bool) -> str:
+    """Return fixed, category-selected terminal guidance (never provider text)."""
+    guidance = _TERMINAL_GUIDANCE.get(error_info.type)
+    if guidance is None:
+        guidance = (
+            _GUIDANCE_AFTER_EXHAUSTION if automatic_exhausted
+            else _GUIDANCE_NO_OPERATOR_RETRY
+        )
+    head = error_info.message
+    if not head.startswith("❌"):
+        head = f"❌ {head}"
+    return f"{head}. {guidance}"
+
+
 def _handle_llm_error(
     ctx: ReactContext,
     state: _LoopState,
     error_info: LLMErrorInfo,
     progress: Callable[[str], None],
     user_goal: str,
+    automatic_exhausted: bool = False,
 ) -> Optional[str]:
-    """Handle an LLM error: write checkpoint, prompt user for retry/cancel.
+    """Handle an LLM error: end it terminally or, when eligible, prompt for retry.
+
+    Decided before any checkpoint save, retry token or wait: cancellation wins;
+    non-retryable and headless failures return fixed guidance. Only an
+    explicitly interactive run with a retryable failure writes a checkpoint and
+    blocks on the Retry/Cancel card. ``automatic_exhausted`` is true only when
+    the automatic request budget actually ran out.
 
     Returns None to retry (loop continues), or an error string to return.
     """
     import json as _json
     import secrets as _secrets
+
+    if ctx.cancel_event.is_set():
+        return "[Cancelled]"
+    if not error_info.retryable or not ctx.interactive_llm_recovery:
+        return _terminal_llm_failure(error_info, automatic_exhausted)
 
     attempt = state.attempt_state
     checkpoint: dict | None = None
@@ -1398,7 +1436,14 @@ def _request_turn(
                     return _Turn([], "", False, "[Cancelled]")
                 continue
             logger.warning("LLM request failed at step %d: %s", state.step, info.type)
-            result = _handle_llm_error(ctx, state, info, progress, _get_user_goal(state))
+            result = _handle_llm_error(
+                ctx, state, info, progress, _get_user_goal(state),
+                # Claim exhaustion only when the budget is really spent, not when
+                # an empty-response cap or a partial-output/effect veto stopped us.
+                automatic_exhausted=(
+                    (transient or retryable_control) and attempt.remaining_retries == 0
+                ),
+            )
             if result is None:
                 continue
             return _Turn([], "", False, result)

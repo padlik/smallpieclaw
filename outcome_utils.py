@@ -20,6 +20,21 @@ _VETO_ERROR_TYPES = frozenset(
 )
 
 
+RUNTIME_FAILURE_PREFIX = "❌"
+
+
+def is_runtime_failure_text(result: object) -> bool:
+    """Return whether *result* is an unstructured runtime terminal failure.
+
+    The runtime reserves a leading ``❌`` on plain terminal strings for failure
+    (including terminal LLM failures). Callers apply this only after
+    cancellation and explicit structured outcomes: a JSON outcome starts with
+    ``{``, so an explicitly successful one whose *output* begins with ``❌``
+    never matches.
+    """
+    return isinstance(result, str) and result.startswith(RUNTIME_FAILURE_PREFIX)
+
+
 def with_execution(outcome: dict, disposition: ExecutionDisposition) -> dict:
     """Return a shallow copy of *outcome* stamped with a private execution disposition.
 

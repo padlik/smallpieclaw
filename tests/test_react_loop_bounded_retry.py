@@ -274,6 +274,7 @@ def test_pre_authorized_grant_is_not_stacked_after_pre_send_error(tmp_path):
         llm=llm, tool_index=_NullToolIndex(), memory=_NullMemory(),
         builtin_executor=None, mcp_manager=None, skill_registry=None,
         confirmation=confirmation, cancel_event=threading.Event(), trace_id="r-grant-reuse",
+        interactive_llm_recovery=True,
     )
 
     assert _handle_llm_error(
@@ -317,6 +318,7 @@ def test_failed_retry_checkpoint_save_preserves_old_file_and_authorization(tmp_p
         builtin_executor=None, mcp_manager=None, skill_registry=None,
         checkpoint_store=store, checkpoint_owner=owner, confirmation=confirmation,
         cancel_event=threading.Event(), trace_id=trace_id,
+        interactive_llm_recovery=True,
     )
     state = _LoopState(
         messages=[{"role": "user", "content": "goal"}], goal_idx=0,
@@ -367,16 +369,23 @@ def test_retired_grant_is_consumed_once_when_post_send_checkpoint_save_fails(
         builtin_executor=None, mcp_manager=None, skill_registry=None,
         checkpoint_store=store, checkpoint_owner=owner, checkpoint_enabled=True,
         confirmation=confirmation, cancel_event=threading.Event(), trace_id=trace_id,
-        max_retries=0,
+        max_retries=0, interactive_llm_recovery=True,
     )
     state = _LoopState(
         messages=[{"role": "user", "content": "goal"}], goal_idx=0,
         max_steps=8, attempt_state=attempt,
     )
-    monkeypatch.setattr(store, "save", lambda *args, **kwargs: False)
+    save_attempts: list[str] = []
+
+    def failing_save(*args, **kwargs):
+        save_attempts.append(args[0])
+        return False
+
+    monkeypatch.setattr(store, "save", failing_save)
     try:
         turn = _request_turn(ctx, state, "system", lambda _message: None)
         assert turn.early_return.startswith("❌")
+        assert save_attempts == [trace_id]  # the post-send save was really attempted
         assert llm.json_calls == 1
         assert attempt.outbound_attempts == 2
         assert attempt.manual_retries_used == 1

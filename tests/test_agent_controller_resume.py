@@ -364,6 +364,7 @@ def test_checkpoint_uses_current_goal_anchor_and_resumes_native_history_unchange
     ctx.checkpoint_store = store
     ctx.checkpoint_owner = owner
     ctx.checkpoint_enabled = True
+    ctx.interactive_llm_recovery = True
     ctx.confirmation = ConfirmationManager()
     ctx.confirmation.request_retry = lambda *args, **kwargs: "timeout"
     try:
@@ -440,18 +441,11 @@ def test_startup_scan_with_checkpoints_sends_notification(tmp_path):
     def notify(msg):
         notifications.append(msg)
 
-    # Simulate the startup scan logic from main.py.
-    checkpoints = store.list()
-    if checkpoints:
-        most_recent = checkpoints[0]
-        goal = most_recent.get("user_goal", "?")[:60]
-        if len(checkpoints) == 1:
-            notify(f"💾 Found unfinished run: '{goal}'. Send /resume to continue.")
-        else:
-            notify(
-                f"💾 Found {len(checkpoints)} unfinished runs. Most recent: '{goal}'. "
-                "Send /resume to see all."
-            )
+    from checkpoint_store import startup_checkpoint_notice
+
+    startup_notice = startup_checkpoint_notice(store)
+    if startup_notice is not None:
+        notify(startup_notice)
 
     assert len(notifications) == 1
     assert "Analyze the logs" in notifications[0]
@@ -467,11 +461,11 @@ def test_startup_scan_no_checkpoints_sends_no_notification(tmp_path):
     def notify(msg):
         notifications.append(msg)
 
-    checkpoints = store.list()
-    if checkpoints:
-        most_recent = checkpoints[0]
-        goal = most_recent.get("user_goal", "?")[:60]
-        notify(f"💾 Found unfinished run: '{goal}'. Send /resume to continue.")
+    from checkpoint_store import startup_checkpoint_notice
+
+    startup_notice = startup_checkpoint_notice(store)
+    if startup_notice is not None:
+        notify(startup_notice)
 
     assert len(notifications) == 0
 
@@ -486,9 +480,9 @@ def test_strict_resume_first_send_is_initial_attempt(tmp_path):
     from react_loop import _LoopState, _request_turn
     from tests.execution_harness import RecordingExecutor, build_context
     from tests.test_react_loop_bounded_retry import ScriptedRequestLLM
-    from tests.test_react_loop_error_recovery import run_failing_preparation
+    from tests.test_react_loop_error_recovery import save_zero_outbound_checkpoint
 
-    result, store, owner, _requests = run_failing_preparation(tmp_path)
+    store, owner = save_zero_outbound_checkpoint(tmp_path)
     try:
         saved = store.load("r-harness1", owner=owner)
         attempt = CallAttemptState.from_dict(saved["attempt_state"])

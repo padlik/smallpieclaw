@@ -54,3 +54,44 @@ Final strict validation pending; no rule was weakened and no obsolete Cancel-onl
 
 ### Validation follow-up
 The scenario-loss errors cleared and all eight deltas parsed. Strict mode also treats description-length warnings as failures; shortened two ADDED descriptions and retained their full guidance/normalization clauses in explicit scenarios. No behavior changed; strict revalidation required.
+
+## specs Round 3 — 2026-11-20
+### Approved correction
+- Following implementation verification, the user approved correcting the stale corrupted-checkpoint scenario to existing non-destructive skip/refusal behavior, not adding automatic deletion. Proposal, design and explore brief remained frozen; specs and downstream artifacts were reopened for this correction.
+### 🔴 Fixed
+- A scenario rename inside MODIFIED failed strict scenario-loss validation. Reviewer `ses_e04dec913ffeWlKmsEKSsqp22s` confirmed the supported representation: remove the original `/resume command for checkpoint recovery` requirement and add `/resume command for eligible checkpoint recovery`, retaining the other resume obligations.
+### 🔴 Outstanding
+- Replacement requirement description exceeded the strict 500-character limit.
+
+## specs Round 4 — 2026-11-20
+### 🔴 Fixed
+- Reviewer proposed a 494-character description and three explicit scenario clauses preserving newest-first ordering, no deletion offer, and stored attempt state without budget refill or tool replay.
+### 🔴 Outstanding
+- Apply the lossless description/scenario redistribution and revalidate.
+
+## specs Round 5 — 2026-11-20
+### Result
+PASS from `ses_e04dec913ffeWlKmsEKSsqp22s` after inspecting the revised artifact. All ten resume scenarios and the complete contract remain; no runtime cleanup or new interface was introduced. Re-freeze subject to clean strict validation.
+### 🔴 Outstanding
+None.
+
+## adr Round 2 — 2026-11-20
+### Result
+PASS from `ses_e04dec913ffeWlKmsEKSsqp22s`. Manifest and ADR-0048 need no edits; existing no-cleanup, no-mutation and eligibility decisions remain consistent.
+### 🔴 Outstanding
+None.
+
+## tasks Round 2 — 2026-11-20
+### Result
+PASS from `ses_e04dec913ffeWlKmsEKSsqp22s`. Existing tasks cover the corrected behavior; no requirement-name references need changing.
+### 🟡 Addressed
+- Final validation evidence will be appended after the current renderer/spec repair checks complete, preserving the earlier run as historical evidence.
+### 🔴 Outstanding
+None.
+
+### Correction validation follow-up — 2026-11-20
+
+- Strict OpenSpec validation passed without errors or warnings; specs, ADR and tasks are re-frozen.
+- Oracle `ses_e04f37543ffeinES9TG9RNjWjq` closed both verification warnings: actual Telegram HTML now displays step/max steps, and the replacement resume requirement matches non-destructive handling. All 7 ADDED/MODIFIED requirements, 39 scenarios and 2 removals are supported.
+- Fresh project-venv `make check` passed: **6331 passed, 2 existing skips**; unexcluded Vulture and whitespace checks passed. Current evidence is recorded in `tasks.md`.
+- No checkpoint deletion code, configuration, dependencies, commits, merges or archive operations were introduced by this correction.

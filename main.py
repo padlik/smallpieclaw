@@ -899,7 +899,7 @@ def _run_with_model_services(
     )
 
     # Checkpoint store for LLM error recovery.
-    from checkpoint_store import CheckpointStore
+    from checkpoint_store import CheckpointStore, startup_checkpoint_notice
     checkpoint_store = CheckpointStore(data_dir)
     agent.checkpoint_store = checkpoint_store
 
@@ -936,6 +936,9 @@ def _run_with_model_services(
             trace_id=trace_id,
             resume_from=resume_from,
             milestone_notify_fn=milestone_notify_fn,
+            # Telegram root requests and /resume are the only runs an operator
+            # can answer a Retry/Cancel card for (ADR-0048).
+            interactive_llm_recovery=True,
         )
 
     # Build TelegramInterface first so notify() can reference it
@@ -1017,14 +1020,9 @@ def _run_with_model_services(
 
     # Startup checkpoint scan — notify operator of recoverable runs.
     try:
-        checkpoints = checkpoint_store.list()
-        if checkpoints:
-            most_recent = checkpoints[0]
-            goal = most_recent.get("user_goal", "?")[:60]
-            if len(checkpoints) == 1:
-                notify(f"💾 Found unfinished run: '{goal}'. Send /resume to continue.")
-            else:
-                notify(f"💾 Found {len(checkpoints)} unfinished runs. Most recent: '{goal}'. Send /resume to see all.")
+        startup_notice = startup_checkpoint_notice(checkpoint_store)
+        if startup_notice is not None:
+            notify(startup_notice)
     except Exception as exc:
         logger.warning("Startup checkpoint scan failed: %s", exc)
 

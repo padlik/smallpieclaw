@@ -25,7 +25,13 @@ from typing import Any, Callable, Generator, Optional
 from error_registry import ErrorTypeRegistry
 from agent_runtime import RuntimeProfile
 from exceptions import AgentError
-from outcome_utils import fail_outcome, read_execution, strip_execution, with_execution
+from outcome_utils import (
+    fail_outcome,
+    is_runtime_failure_text,
+    read_execution,
+    strip_execution,
+    with_execution,
+)
 from react_loop import ReactContext, parse_json
 from sub_agent_registry import (
     SOURCE_DIAGNOSTIC,
@@ -312,6 +318,12 @@ def _standardize_sub_agent_result(result: str, response_format: str) -> dict:
             outcome.setdefault("error", "")
             outcome.setdefault("exit_code", 0 if outcome.get("success") else -1)
             return outcome
+    # Explicit structured outcomes are honored above; the reserved plain-string
+    # prefix (a runtime terminal failure) comes last. Non-recoverable so the
+    # step is neither retried nor diagnosed by replaying the task.
+    if is_runtime_failure_text(result):
+        return fail_outcome(result, recoverable=False)
+    if isinstance(parsed, dict):
         if response_format == "json":
             return {
                 "success": True,

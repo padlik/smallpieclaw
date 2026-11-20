@@ -1119,6 +1119,9 @@ class TelegramInterface:
         retryable = info.get("retryable", True)
         model = info.get("model", "?")
         step = info.get("step", "?")
+        max_steps = info.get("max_steps")
+        if max_steps is not None:
+            step = f"{step}/{max_steps}"
         tool_results = info.get("tool_results_count", 0)
         detail = info.get("detail", "")
         if len(detail) > 200:

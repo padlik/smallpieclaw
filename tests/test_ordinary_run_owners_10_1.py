@@ -471,8 +471,10 @@ class TestOrdinaryRunOwners:
 
         def reject(request: httpx.Request) -> httpx.Response:
             requests.append(request)
+            # A non-transient, retryable (unknown) rejection: operator-retryable
+            # without an automatic resend; a 400 would now end terminally.
             return httpx.Response(
-                400, json={"error": {"type": "invalid_request_error", "message": "invalid"}}
+                409, json={"error": {"type": "conflict", "message": "conflict"}}
             )
 
         assert client._http is not None
@@ -488,7 +490,10 @@ class TestOrdinaryRunOwners:
             return "timeout"
 
         w.controller._confirmation.request_retry = stop_at_retry_prompt
-        w.controller.run("ignored", resume_from="r-retrycancel", admitted_llm=client)
+        w.controller.run(
+            "ignored", resume_from="r-retrycancel", admitted_llm=client,
+            interactive_llm_recovery=True,
+        )
         assert len(requests) == 1
         assert len(saved_on_failure) == 1 and saved_on_failure[0] != original_checkpoint
         assert _ckpt_bytes(w) == {}

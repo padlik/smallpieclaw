@@ -18,6 +18,7 @@ and other internal supervision controls flow through :class:`SupervisionOptions`
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import threading
 import time
@@ -27,6 +28,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from agent_logging import bind_run_context, clear_run_context
 from model_registry import ModelRegistryError
+from outcome_utils import is_runtime_failure_text
 from sub_agent_registry import SOURCE_ON_DEMAND
 from trace_context import child_trace_id
 
@@ -138,6 +140,24 @@ class SubmissionRequest:
         default_factory=lambda: ExecutionOwnership(ORIGIN_ON_DEMAND)
     )
     prompt_registry: Optional[object] = None
+
+
+def _result_is_failure(result: object) -> bool:
+    """Classify a non-cancelled runner result: structured outcome, then prefix.
+
+    An explicit structured outcome is only the *entire* stripped text parsed as
+    one JSON object whose ``success`` is a real boolean; it alone decides. JSON
+    embedded in prose or fences, malformed JSON and non-boolean flags are not
+    structured outcomes and fall through to the reserved plain-string prefix.
+    """
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result.strip())
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("success"), bool):
+            return not parsed["success"]
+    return is_runtime_failure_text(result)
 
 
 class SubAgentSupervisor:
@@ -557,6 +577,33 @@ class SubAgentSupervisor:
                     log_msg=("spawn_agent: [%s] cancelled | id=%s"),
                     log_args=(label, runner.agent_id),
                     icon_verb=("🛑", "cancelled"),
+                )
+            elif _result_is_failure(result):
+                # Failure, not success. Cancellation was handled above; then an
+                # explicit structured outcome decides, and only an unstructured
+                # string falls back to the reserved runtime terminal-failure prefix.
+                elapsed = int(time.time() - record.started_at)
+                self._finalize_terminal(
+                    record=record,
+                    status="failed",
+                    result=result,
+                    runner=runner,
+                    label=label,
+                    task=task,
+                    elapsed=elapsed,
+                    model=runner.model_id,
+                    result_log_cb=result_log_cb,
+                    notify=notify_result,
+                    completion_cb=completion_cb,
+                    save_context_cb=_save_context_before_completion,
+                    result_log_result=result,
+                    result_log_success=False,
+                    log_level="error",
+                    log_msg=(
+                        "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds"
+                    ),
+                    log_args=(label, runner.agent_id, runner.model_id, elapsed),
+                    icon_verb=("❌", "failed"),
                 )
             else:
                 elapsed = int(time.time() - record.started_at)

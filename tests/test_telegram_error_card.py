@@ -30,6 +30,34 @@ def test_classify_final_status_empty() -> None:
     assert _classify_final_status("") == "done"
 
 
+async def _render_error_card(info: dict) -> str:
+    """Send an error card through the real sender and return the HTML text."""
+    import json
+
+    from telegram_interface import TelegramInterface
+
+    message = MagicMock()
+    message.reply_text = AsyncMock()
+    await TelegramInterface._send_llm_error_prompt(
+        MagicMock(), message, "tok", json.dumps(info)
+    )
+    return message.reply_text.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_error_card_shows_step_over_max_steps() -> None:
+    """The card shows current step/max_steps, e.g. '<b>Step:</b> 4/20'."""
+    card = await _render_error_card({"message": "boom", "step": 4, "max_steps": 20})
+    assert "<b>Step:</b> 4/20\n" in card
+
+
+@pytest.mark.asyncio
+async def test_error_card_without_max_steps_shows_step_only() -> None:
+    """Payloads lacking max_steps keep the legacy step-only rendering."""
+    card = await _render_error_card({"message": "boom", "step": 4})
+    assert "<b>Step:</b> 4\n" in card
+
+
 def test_error_card_retryable_shows_both_buttons() -> None:
     """Verify that a retryable error card has both Retry and Cancel buttons."""
     token = "test-token"

@@ -26,6 +26,7 @@ from typing import Callable, Optional
 
 from agent_logging import bind_run_context
 from agent_runtime import AgentRuntime, ControllerDeps
+from checkpoint_store import is_resume_eligible
 from config_schema import AgentConfig, ExecutorPaths
 from confirmation import ConfirmationManager
 from context_monitor import ContextMonitor
@@ -504,6 +505,7 @@ class AgentController:
         resume_from: Optional[str] = None,
         milestone_notify_fn: Optional[Callable[[int], None]] = None,
         admitted_llm: Optional[LLMClient] = None,
+        interactive_llm_recovery: bool = False,
     ) -> str:
         """
         Process a user goal and return the final answer string.
@@ -518,6 +520,11 @@ class AgentController:
         ``prompt_id`` is the operator-facing "Prompt #N"; it is propagated into
         the log context and onto the shared BuiltinExecutor for sub-agent
         tracking.
+
+        ``interactive_llm_recovery`` is the per-run capability to block on an
+        operator Retry/Cancel card for retryable LLM failures. It defaults to
+        false and is never inferred from callbacks; Telegram enables it
+        explicitly for root requests and resume.
 
         ``admitted_llm`` is the already-admitted client this run uses for resume
         validation, trace binding, context and cleanup; it never replaces
@@ -548,6 +555,7 @@ class AgentController:
                 milestone_notify_fn=milestone_notify_fn,
                 checkpoint_owner=checkpoint_owner,
                 admitted_llm=admitted_llm,
+                interactive_llm_recovery=interactive_llm_recovery,
             )
         finally:
             if checkpoint_owner is not None:
@@ -565,6 +573,7 @@ class AgentController:
         milestone_notify_fn: Optional[Callable[[int], None]],
         checkpoint_owner: object,
         admitted_llm: Optional[LLMClient] = None,
+        interactive_llm_recovery: bool = False,
     ) -> str:
         """Execute a run while ``run`` owns the checkpoint trace lease.
 
@@ -667,6 +676,15 @@ class AgentController:
                         or not isinstance(error_info["detail"], str)
                     ):
                         raise ValueError("checkpoint error information is malformed")
+                    if not is_resume_eligible(checkpoint):
+                        # Decided before manual authorization or any send; the
+                        # snapshot is never rewritten, so it stays unchanged.
+                        return (
+                            f"❌ This run failed with a non-retryable error "
+                            f"({error_info['type']}) and cannot be resumed. "
+                            "Start a new task with a shorter request, or check the "
+                            "model/provider configuration."
+                        )
                     for key in ("step", "goal_idx", "max_steps", "json_fail_streak"):
                         if type(checkpoint[key]) is not int or checkpoint[key] < 0:
                             raise ValueError(f"checkpoint {key} is malformed")
@@ -714,6 +732,7 @@ class AgentController:
                 # A cancel during setup of this registered run event must survive react_loop's legacy clear().
                 ctx.owns_cancel_event = False
             ctx.checkpoint_owner = checkpoint_owner
+            ctx.interactive_llm_recovery = interactive_llm_recovery
             ctx.prompt_id = prompt_id
             ctx.milestone_notify_fn = milestone_notify_fn
 

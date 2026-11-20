@@ -487,7 +487,12 @@ def test_provider_failure_warning_and_run_lifecycle_keep_request_trace(tmp_path,
             ):
                 result = react_loop(ctx, "test provider failure", cancel_retry_prompt)
 
-            assert result == "❌ 🔌 Connection failed"
+            # Headless run (capability not enabled): the exhausted request ends
+            # with fixed terminal guidance instead of an operator retry card.
+            assert result == (
+                "❌ 🔌 Connection failed. Automatic retries were exhausted. "
+                "Try the request again later."
+            )
             assert len(requests) == 1
             assert json.loads(requests[0].content)["model"] == "trace-failure-pinned-model"
             assert client.llm_cfg["model"] == "trace-failure-pinned-model"

@@ -50,7 +50,7 @@ from model_discovery import ProviderInventory
 from tests.model_stores import ModelStores
 from outcome_utils import read_execution
 from path_policy import PathPolicy, PathVerdict
-from scheduler import Scheduler
+from scheduler import Scheduler, _next_run_label
 from sub_agent_registry import get_registry
 from token_usage import TokenUsageRegistry
 from xdg import xdg_paths
@@ -862,3 +862,71 @@ def test_scheduled_run_refuses_unrecognised_native_file_write(
     assert result["error_type"] == "scheduled_approval_denied"
     assert not result.get("requires_confirmation") and "token" not in result
     assert not target.exists() and not target.parent.exists()
+
+
+def _transport_failure(world: _World, status: int, body: dict) -> None:
+    """Make the provider answer every chat request with one HTTP failure."""
+    def chat(request: httpx.Request) -> httpx.Response:
+        world.chat_requests.append(request)
+        return httpx.Response(status, json=body)
+
+    world._chat = chat  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "sends", "error_type", "guidance"),
+    [
+        pytest.param(503, {"error": {"message": "unavailable"}}, 1, "unknown",
+                     "exhausted", id="transient-exhausted"),
+        pytest.param(400, {"error": {"code": "context_length_exceeded",
+                                      "message": "context_length_exceeded"}},
+                     1, "context", "Reduce the request or context", id="context"),
+    ],
+)
+def test_scheduled_headless_llm_failure_is_recorded_failed_without_replay(
+    make_world, status, body, sends, error_type, guidance,
+) -> None:
+    """Real scheduler -> supervisor -> runner -> react_loop on a failing provider.
+
+    The run ends once (the existing automatic budget, here zero retries), is
+    recorded as a failure with the existing classification and next-cron label,
+    and nothing replays the whole run. ``notify=false`` stays silent.
+    """
+    world = make_world(select=True, job_model=None)
+    _transport_failure(world, status, body)
+    world.sched._jobs_meta[TAG]["notify"] = False
+
+    world.sched._run_job(TAG)
+    assert world.sched.released_event.wait(_BOUND), ("run never released", world.records())
+
+    (terminal,) = world.records()
+    assert terminal["status"] == "failed" and terminal["success"] is False
+    assert terminal["result"].startswith("❌") and guidance in terminal["result"]
+    assert len(world.chat_requests) == sends  # no whole-run replay
+    assert len(world.factory.calls) == 1 and len(world.factory.runners) == 1
+    assert world.sched.notify.call_count == 0
+    assert terminal["error_type"] == error_type
+    assert terminal["next_run"] == _next_run_label(world.sched._jobs_meta[TAG])
+    assert "❌ ❌" not in terminal["result"]
+    assert TAG not in world.sched._running_jobs and not world.sched._active_runs.get(TAG)
+    (client,) = world.chats
+    assert client.close_count == 1 and client._closed
+    (runner,) = world.factory.runners
+    assert get_registry().get(runner.agent_id) is None
+
+
+def test_scheduled_headless_llm_failure_notifies_once_when_job_notifies(make_world) -> None:
+    """Notification policy is unchanged: a notifying job gets one failure notice."""
+    world = make_world(select=True, job_model=None)
+    _transport_failure(world, 503, {"error": {"message": "unavailable"}})
+    world.sched._jobs_meta[TAG]["notify"] = True
+
+    world.sched._run_job(TAG)
+    assert world.sched.released_event.wait(_BOUND), ("run never released", world.records())
+
+    (terminal,) = world.records()
+    assert terminal["status"] == "failed"
+    assert len(world.chat_requests) == 1  # still no whole-run replay
+    assert world.sched.notify.call_count == 1
+    notice = str(world.sched.notify.call_args)
+    assert TAG in notice and "failed" in notice.lower()

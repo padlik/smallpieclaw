@@ -803,6 +803,61 @@ class TestRootStartupComposition:
         assert "telegram:run" in root.events and "scheduler:stop" in root.events
         assert root.unexpected == []
 
+    @pytest.mark.parametrize("resume", [False, True], ids=["ordinary", "resume"])
+    def test_production_telegram_handler_enables_interactive_llm_recovery(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch, resume: bool,
+    ) -> None:
+        """The production ``agent_handler`` is what Telegram calls for requests and /resume.
+
+        A retryable provider failure must reach the operator as a Retry/Cancel card
+        (capability true) rather than ending silently; deleting the handler's
+        ``interactive_llm_recovery=True`` makes this fail. No adapter is re-created here.
+        """
+        root_harness.serve_provider_chat()
+        served = root_harness._route
+
+        def route(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.host == ACME_HOST and request.url.path == "/v1/messages":
+                request.read()
+                root_harness.requests.append(request)
+                return httpx.Response(409, json={"error": {"message": "conflict"}})
+            return served(request)
+
+        monkeypatch.setattr(root_harness, "_route", route)
+        outcome: dict[str, Any] = {}
+
+        def hold(root: RootHarness) -> None:
+            cards: list[str] = []
+            trace = "r-0000f001"
+            resume_from = None
+            if resume:
+                from call_attempt_state import CallAttemptState
+
+                resume_from = "r-0000f0aa"
+                assert root.main_controller.checkpoint_store.save(resume_from, {
+                    "format_version": 2, "trace_id": resume_from, "user_goal": "resume goal",
+                    "messages": [{"role": "user", "content": "resume goal"}], "step": 1,
+                    "goal_idx": 0, "max_steps": 8, "json_fail_streak": 0, "model_id": MAIN_ID,
+                    "attempt_state": CallAttemptState().to_dict(),
+                    "error_info": {"type": "timeout", "message": "t", "retryable": True, "detail": ""},
+                    "created_at": "2026-08-21T14:30:00Z",
+                })
+
+            def progress(message: str) -> None:
+                if message.startswith("__LLM_ERROR__:"):
+                    token = message.split(":", 2)[1]
+                    cards.append(token)
+                    root.main_controller.resume_llm_error(token, "cancel")
+
+            outcome["result"] = root.agent_handler(
+                1, "do it", progress, trace_id=trace, resume_from=resume_from,
+            )
+            outcome["cards"] = cards
+
+        root_harness.start(saved_default=None, write_cache=False, hold=hold)
+        assert len(outcome["cards"]) == 1, outcome
+        assert outcome["result"].startswith("❌")
+
     def test_main_request_uses_run_local_pin_and_fresh_catalog_view(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

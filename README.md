@@ -630,7 +630,7 @@ Both commands show usage if the `<tag>` or `<execution-id>` argument is missing.
 
 Context compaction fires automatically when the estimated input (system prompt, full chat history including images, and the complete current tool definitions) exceeds `agent.compaction_threshold_tokens` (default 60000) — older messages are summarised by the LLM without operator intervention, once per over-threshold request. The current goal and the last two messages (extended to whole tool-call/result groups) are kept unchanged and only the messages between them are summarised; when there is nothing between them, nothing is changed or truncated. The summary is requested through the run's own model connection with its own retry state, separate from the main request. The threshold is model-independent: discovered context or input limits never trigger, shrink or reject a request. Use `/reset` to start fresh, or `/reset discard` to skip saving.
 
-A genuine provider context-length rejection is never repaired automatically: it is classified `context` and follows the normal LLM error path (error card and checkpoint when enabled, `/resume`) with no forced compaction, truncation, automatic resend or model switch. Use `/reset` or the hidden `/compress`, or select a larger-context model with `/models`, then retry. The only output-token cap is `agent.required_output_cap_tokens` (positive integer, default 1024), sent only to adapters whose API requires one (currently Anthropic) and never sized from context or discovered limits.
+A genuine provider context-length rejection is never repaired automatically: it is classified `context` and returns immediate guidance without an error card, new checkpoint or `/resume` recovery, with no forced compaction, truncation, automatic resend or model switch. Reduce the request/context using `/reset` or the hidden `/compress`, or select a larger-context model with `/models`, then retry. The only output-token cap is `agent.required_output_cap_tokens` (positive integer, default 1024), sent only to adapters whose API requires one (currently Anthropic) and never sized from context or discovered limits.
 
 ### Graph memory (optional)
 
@@ -721,32 +721,39 @@ Resilience behaviours:
 
 ### LLM error recovery
 
-When an LLM call fails after all provider retries (timeout, connection error, rate limit, etc.), the agent:
+LLM failures are classified as `timeout`, `connection`, `rate_limit`, `empty`, `context`, `permanent`, or `unknown`. Existing automatic retry budgets are unchanged; not every category is automatically retried.
 
-1. **Classifies the error** into one of seven types: `timeout`, `connection`, `rate_limit`, `empty`, `context` (non-retryable), `permanent` (non-retryable), or `unknown`.
-2. **Writes a checkpoint** to `data/run_checkpoints/{trace_id}.json` containing the full conversation state (messages, step, tool results) so the run can be resumed after a crash or restart.
-3. **Shows an inline error card** in Telegram with:
+**Context and permanent failures** return immediate sanitized `❌` guidance: reduce the request/context, or check the model/provider configuration, respectively. They do not create a checkpoint or show a blocking card.
+
+**Headless runs** (on-demand sub-agents, scheduled agents, plan steps and diagnostic agents) also return terminal failure after the existing automatic policy finishes. Notifications and sensitive-tool confirmation do not enable LLM retry cards. Failed work is not automatically replayed as a whole task.
+
+**Telegram root requests and `/resume`** explicitly enable interactive LLM recovery. For retryable failures, the agent:
+
+1. **Writes a checkpoint**, when enabled, to `data/run_checkpoints/{trace_id}.json` containing the full conversation state and pending request attempt state.
+2. **Shows an inline error card** in Telegram with:
    - The error type and classified message
    - Model name, current step/max-steps, and count of preserved tool results
    - Truncated error detail (first 200 chars)
-   - **[🔄 Retry]** and **[❌ Cancel]** buttons for retryable errors
-   - **[❌ Cancel]** only for non-retryable errors (context overflow, permanent API errors)
-4. **Blocks the agent thread** for up to 120 seconds (configurable) waiting for the operator's decision:
-   - **Retry** — resumes the loop from the saved state, re-calling the LLM with the full conversation context (no tool re-execution)
-   - **Cancel** — deletes the checkpoint and returns an error string
+   - **[🔄 Retry]** and **[❌ Cancel]** buttons
+3. **Waits** for up to 120 seconds (configurable) for the operator's decision:
+   - **Retry** — continues with the full conversation context without re-executing completed tools or refilling the automatic retry budget
+   - **Cancel** — retires the checkpoint under existing ownership safeguards and returns an error string
    - **Timeout** — returns an error string but keeps the checkpoint on disk for later `/resume`
+
+If checkpoint saving fails, inline retry remains available, but a warning explains that disk recovery is unavailable. Returning a failure does not undo any tool effects already completed.
 
 ### `/resume` command
 
-Resumes an interrupted run from a saved checkpoint:
+Resumes an eligible interrupted main-agent run from a saved checkpoint:
 
-- `/resume` — resume the most recent checkpoint
-- `/resume N` — resume the Nth checkpoint when multiple exist
-- `/resume` with no checkpoints — reports "No unfinished runs to resume"
-- `/resume` while agent is busy — reports "⚠️ Agent is currently running. Wait or /stop it first."
-- Non-retryable checkpoints (context overflow) are refused with an explanation
+- `/resume` — resumes the sole eligible checkpoint, or lists multiple eligible checkpoints newest first
+- `/resume N` — resumes the Nth checkpoint from that filtered, contiguously numbered list
+- No eligible checkpoints — reports "No unfinished runs to resume."
+- Agent busy — reports "⚠️ Agent is currently running. Wait for it to finish or /stop it first."
 
-On startup, the agent scans for existing checkpoints and notifies the operator: "💾 Found unfinished run: '{goal}'. Send /resume to continue."
+The controller enforces the same eligibility rule used by Telegram and startup: explicit `error_info.retryable=false` prevents resume, even for direct controller callers. Older otherwise-valid checkpoints without that flag remain eligible. Non-retryable files remain untouched on disk but are hidden from actionable lists and startup notices; no cleanup interface is added.
+
+On startup, a sole eligible checkpoint produces: "💾 Found unfinished run: '{goal}'. Send /resume to continue." With multiple eligible checkpoints, the notice names the newest eligible goal and directs the operator to `/resume`. With none, no recovery notice is sent.
 
 ### Scheduled job failure notification
 
@@ -760,7 +767,7 @@ retry_timeout_seconds = 120  # how long to wait for operator retry/cancel decisi
 checkpoint_enabled = true    # whether to write disk-persisted checkpoints
 ```
 
-When `checkpoint_enabled = false`, inline retry still works (in-memory state), but `/resume` and crash recovery are not available.
+These settings do not enable interactive recovery for headless runs. When `checkpoint_enabled = false`, eligible Telegram failures still allow in-memory Retry/Cancel, but no new disk checkpoint is written. Previously stored eligible checkpoints remain subject to normal resume validation.
 
 ### Logging
 
