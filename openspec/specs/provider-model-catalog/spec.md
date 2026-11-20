@@ -474,7 +474,7 @@ Configuration validation SHALL reject a top-level `[[models]]` table and any of 
 
 ### Requirement: Obsolete agent model and context keys are rejected
 
-Configuration validation SHALL reject `[agent]` `default_model`, `background_model`, `fallback_model`, `fallback_models`, and `ctx_max_tokens` with an actionable error naming the key and its replacement, and SHALL NOT ignore or reinterpret them.
+Configuration validation SHALL reject `[agent]` `default_model`, `background_model`, `fallback_model`, `fallback_models`, `ctx_max_tokens`, and `diagnose_empty_responses` with an actionable error naming the key and its replacement or removal, and SHALL NOT ignore or reinterpret them. Rejection of `diagnose_empty_responses` SHALL use the existing removed-field validation with fixed guidance to remove the key because empty-response diagnostics were removed, and SHALL NOT change how other unknown keys are handled.
 
 #### Scenario: Obsolete agent selector is rejected
 - **GIVEN** configuration contains `agent.default_model`, `agent.background_model`, `agent.fallback_model`, or `agent.fallback_models`
@@ -486,6 +486,12 @@ Configuration validation SHALL reject `[agent]` `default_model`, `background_mod
 - **WHEN** configuration is validated
 - **THEN** it reports an actionable error directing the operator to `agent.compaction_threshold_tokens`
 
+#### Scenario: Retired empty-response diagnostics key is rejected
+- **GIVEN** configuration contains `agent.diagnose_empty_responses` with any value
+- **WHEN** configuration is validated
+- **THEN** startup fails with an error naming the key and telling the operator to remove it because diagnostics were removed
+- **AND** the key is not ignored, no diagnostic runs, and context monitoring and empty-response classification and retries are unaffected
+
 ### Requirement: Provider connections accept only connection fields
 
 Configuration validation SHALL reject any `[providers.<connection-id>]` field other than `type`, `api_key`, `base_url`, and `request_timeout`, including `max_tokens`, `temperature`, `top_p`, `model`, `max_retries`, `retry_delay`, and `retries`, with an actionable error naming the field path.
@@ -494,21 +500,6 @@ Configuration validation SHALL reject any `[providers.<connection-id>]` field ot
 - **GIVEN** `[providers.openai-prod]` contains `temperature`, `model`, or `max_retries`
 - **WHEN** configuration is validated
 - **THEN** it reports the field path and that only `type`, `api_key`, `base_url`, and `request_timeout` are supported, with retries under `[agent]`
-
-### Requirement: The retired combined model settings file receives only an existence notice
-
-The runtime's only contact with the retired combined `models-config.toml` (resolved as `models_config_file`) SHALL be an existence check. When it exists, the runtime SHALL emit one actionable notice naming its path and advising a deliberate `/models` selection, and SHALL NOT read, parse, convert, write, rename, or delete it.
-
-#### Scenario: Old combined file exists
-- **GIVEN** `models-config.toml` exists with any content, valid or not
-- **WHEN** the daemon starts
-- **THEN** one notice names its path and advises a deliberate `/models` selection
-- **AND** the file bytes are unchanged and no selection is derived from it
-
-#### Scenario: Old combined file is absent
-- **GIVEN** `models-config.toml` does not exist
-- **WHEN** the daemon starts
-- **THEN** no notice about it is emitted
 
 ### Requirement: Graph startup and live backfill validate their own configuration before side effects
 

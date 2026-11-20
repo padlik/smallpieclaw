@@ -7,7 +7,7 @@ Define the `XDGPaths` frozen dataclass and `xdg_paths(agent_name)` resolver in t
 ## Requirements
 ### Requirement: XDG Base Directory resolution
 
-`xdg_paths(agent_name)` MUST resolve all agent paths from XDG environment variables and standard fallbacks, purely and without side effects, returning a frozen `XDGPaths` and creating no directories or files. It SHALL expose `model_selection_file` and `models_config_file` below `config_home` and `models_cache_file` below `cache_home`; callers SHALL NOT reconstruct these paths locally. `models_config_file` is the retired combined settings file, used only for an existence check.
+`xdg_paths(agent_name)` MUST resolve all agent paths from XDG environment variables and standard fallbacks, purely and without side effects, returning a frozen `XDGPaths` and creating no directories or files. It SHALL expose `model_selection_file` below `config_home` and `models_cache_file` below `cache_home`; callers SHALL NOT reconstruct these paths locally. It SHALL NOT expose any path for the retired combined settings file.
 
 #### Scenario: Default XDG paths with no env vars set
 - **GIVEN** none of `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, or `XDG_RUNTIME_DIR` are set
@@ -21,7 +21,6 @@ Define the `XDGPaths` frozen dataclass and `xdg_paths(agent_name)` resolver in t
 - **AND** `scheduler_config` is `~/.config/piclaw/scheduler.toml`
 - **AND** `model_selection_file` is `~/.config/piclaw/model-selection.toml`
 - **AND** `models_cache_file` is `~/.cache/piclaw/models-cache.json`
-- **AND** `models_config_file` is `~/.config/piclaw/models-config.toml`
 - **AND** `memory_file` is `~/.local/share/piclaw/memory.json`
 - **AND** `graph_memory_db` is `~/.local/share/piclaw/graph_memory`
 - **AND** `tool_index_file` is `~/.cache/piclaw/tool_index.json`
@@ -43,7 +42,6 @@ Define the `XDGPaths` frozen dataclass and `xdg_paths(agent_name)` resolver in t
 - **AND** `config_file` is `/custom/cfg/piclaw/config.toml`
 - **AND** `scheduler_config` is `/custom/cfg/piclaw/scheduler.toml`
 - **AND** `model_selection_file` is `/custom/cfg/piclaw/model-selection.toml`
-- **AND** `models_config_file` is `/custom/cfg/piclaw/models-config.toml`
 - **AND** data, state, cache, and runtime paths use their standard defaults
 
 #### Scenario: Custom XDG_CACHE_HOME moves only the cache
@@ -83,6 +81,11 @@ Define the `XDGPaths` frozen dataclass and `xdg_paths(agent_name)` resolver in t
 - **WHEN** the cache is written
 - **THEN** it contains no credential, credential reference, or endpoint URL
 - **AND** existing path-policy and jail rules are not changed for it
+
+#### Scenario: Retired combined settings path is not exposed
+- **GIVEN** `xdg_paths("piclaw")` is called
+- **WHEN** the returned `XDGPaths` is inspected
+- **THEN** it has no `models_config_file` attribute
 
 ### Requirement: Migration sentinel helpers
 

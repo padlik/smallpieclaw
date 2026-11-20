@@ -244,7 +244,7 @@ For `/jobs history <tag>`, a tag with no active definition and no retained runs 
 
 ### Requirement: `/models` lists, refreshes, and selects discovered models
 
-Authorized `/models` SHALL list about 20 cached candidates, offer refresh of every configured provider, and show per-provider fresh/stale status and the active selection as saved or an unsaved automatic choice, even when not cached. Capabilities and limits SHALL be labelled advisory, not budgets or a callability promise. Refresh SHALL update only the cache. Selection SHALL occur only through candidate buttons with opaque callbacks of at most 64 bytes; `/models` arguments SHALL NOT select.
+Authorized `/models` SHALL list about 20 cached candidates, offer refresh of every configured provider, and show per-provider fresh/stale status and the active selection as saved or an unsaved automatic choice, even when not cached. Capabilities and limits SHALL be labelled advisory, not budgets or a callability promise. Refresh SHALL update only the cache. Selection SHALL occur only through candidate buttons with opaque callbacks of at most 64 bytes; `/models` arguments SHALL NOT select. The model registry SHALL be required at startup, with no registry-absent listing or mutation path, and a raw legacy `model:<name>` callback SHALL NOT select.
 
 #### Scenario: `/models` presents a concise catalog
 - **GIVEN** a cache contains about 20 candidates with fresh and stale providers
@@ -294,6 +294,13 @@ Authorized `/models` SHALL list about 20 cached candidates, offer refresh of eve
 - **THEN** active selection and preference are unchanged
 - **AND** the operator is asked to reopen `/models`
 - **AND** an unexpired token whose candidate was later removed from the cache is not rejected for that reason
+
+#### Scenario: Stale legacy model-name callback is refused
+- **GIVEN** an authenticated user sends a callback whose payload is the raw legacy form `model:<name>` rather than an opaque token
+- **WHEN** the callback is handled
+- **THEN** it is refused and the operator is asked to reopen `/models`
+- **AND** the active selection and preference bytes are unchanged and nothing is mutated
+- **AND** opaque-token validation and expiry rules are unchanged
 
 #### Scenario: Selection persistence fails
 - **GIVEN** a candidate button is chosen but the preference cannot be persisted
