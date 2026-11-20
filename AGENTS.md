@@ -15,6 +15,30 @@
 
 Failure to load `openspec-workflow` will result in missing critical workflow context.
 
+
+## OpenSpec Artifact Search
+
+Use QMD as the primary discovery and search interface for OpenSpec artifacts.
+
+### Search policy
+
+- For semantic or cross-artifact searches within `openspec/`, use QMD first.
+- Scope QMD searches to the `openspec` collection.
+- Use QMD to discover relevant requirements, scenarios, proposals, designs, and tasks.
+- After locating an artifact, use `Read` to inspect the authoritative file before making changes or drawing compliance conclusions.
+- Use `Grep` and `Glob` when exact matches, complete enumeration, or filesystem discovery are required.
+- If QMD is unavailable, stale, or returns insufficient results, fall back to `Grep`, `Glob`, and `Read`.
+- Never treat absence from QMD results as proof that an OpenSpec artifact does not exist.
+
+### Important constraints
+
+- OpenSpec Markdown files remain the source of truth.
+- QMD is a retrieval index, not an authoritative specification database.
+- Do not modify specifications or generate relationships solely from QMD search snippets.
+- When validating specification completeness or traceability, inspect all relevant source artifacts.
+- Do not assume QMD knows which OpenSpec change artifacts are active, archived, or superseded.
+
+
 ## Reasoning
 
 - Prefer retrieval-led reasoning over relying on pretrained knowledge.

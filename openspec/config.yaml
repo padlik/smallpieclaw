@@ -30,3 +30,8 @@ operations:
   archive:
     guidance:
       - Must run OpenSpec Sync before archiving
+      - After successfully archiving the change, refresh the QMD index.
+      - Run `qmd update && qmd embed` from the project root.
+      - Do not refresh QMD if archiving fails or is cancelled.
+      - If indexing fails, report the failure separately; do not retry the archive.
+      - Confirm whether QMD indexing succeeded.
