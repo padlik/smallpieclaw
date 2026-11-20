@@ -35,7 +35,7 @@ import agent_logging
 from builtin_tools.text_utils import redact_vault_secrets
 from config_schema import ProviderConfig, ResolvedProviderConnection
 from model_registry import CatalogDocument, ModelRecord, ModelRegistry, ModelRegistryError, ProviderState
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 
 _MAX_MSG = 256
 _MARKER = {"scheduled_selector_warning": True}
@@ -258,7 +258,7 @@ class _Registry:
     """A real registry seeded with an active Main ``p/main`` plus its probes."""
 
     registry: ModelRegistry
-    settings_path: Path
+    stores: ModelStores
     resolved: list[ProviderConfig]
     rendered_at_resolve: list[tuple[list[str], list[str]]]
 
@@ -270,8 +270,8 @@ def _seeded_registry(
 
     ``redactor`` is the registry's optional ``selector_redactor`` (default none).
     """
-    settings = ModelSettings(tmp_path / "models.toml")
-    settings.write(
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(
         CatalogDocument(
             providers=(ProviderState("p", "openai", "2026-10-22T00:00:00+00:00", "fresh"),),
             models=(ModelRecord("p/main", "p", "main", "Main"),),
@@ -287,9 +287,9 @@ def _seeded_registry(
         return _CONNECTION
 
     discovery = cast(Any, SimpleNamespace())  # never called by admission
-    registry = ModelRegistry({"p": _PROVIDER}, settings, discovery, resolver, selector_redactor=redactor)
+    registry = stores.registry({"p": _PROVIDER}, discovery, resolver, selector_redactor=redactor)
     registry.select("p/main")
-    return _Registry(registry, settings.path, resolved, rendered_at_resolve)
+    return _Registry(registry, stores, resolved, rendered_at_resolve)
 
 
 class _EmissionObserver(logging.Filter):
@@ -321,7 +321,7 @@ def _assert_no_warning_and_no_work(
     assert sinks.json_stream.getvalue() == "" and sinks.prose_stream.getvalue() == ""
     assert seeded.resolved == [] and seeded.rendered_at_resolve == []
     assert seeded.registry.view() == view_before
-    assert seeded.settings_path.read_bytes() == settings_before
+    assert seeded.stores.snapshot() == settings_before
 
 
 def _admit_expecting_failure(
@@ -344,7 +344,7 @@ def _admit_expecting_failure(
 def test_registry_unknown_short_selector_fails_typed_without_warning(tmp_path: Path, sinks: _Sinks) -> None:
     """An unconfigured-connection selector no longer warns and inherits Main."""
     seeded = _seeded_registry(tmp_path, sinks)
-    view_before, settings_before = seeded.registry.view(), seeded.settings_path.read_bytes()
+    view_before, settings_before = seeded.registry.view(), seeded.stores.snapshot()
 
     observer = _admit_expecting_failure(seeded, sinks, "ghost/not-known", "unknown_connection")
 
@@ -365,7 +365,7 @@ def test_registry_secret_selector_failure_never_leaks_it(
     (the bounded redacted evidence lives in the scheduler's record and alert)."""
     seeded = _seeded_registry(tmp_path, sinks, redactor=_REGISTRY_REDACTOR)
     selector = head + secret + "-public-suffix" * 200
-    view_before, settings_before = seeded.registry.view(), seeded.settings_path.read_bytes()
+    view_before, settings_before = seeded.registry.view(), seeded.stores.snapshot()
 
     observer = _admit_expecting_failure(seeded, sinks, selector, code)
 
@@ -392,7 +392,7 @@ def test_registry_malformed_selector_never_stringified(tmp_path: Path, sinks: _S
 
     poison = _Poison()
     seeded = _seeded_registry(tmp_path, sinks)
-    view_before, settings_before = seeded.registry.view(), seeded.settings_path.read_bytes()
+    view_before, settings_before = seeded.registry.view(), seeded.stores.snapshot()
 
     observer = _admit_expecting_failure(seeded, sinks, poison, "malformed_selector")
 
@@ -414,7 +414,7 @@ def test_registry_blank_and_non_string_selectors_fail_typed_without_warning(
 ) -> None:
     """Blank and non-string selectors no longer warn-and-inherit; the labels live in evidence."""
     seeded = _seeded_registry(tmp_path, sinks)
-    view_before, settings_before = seeded.registry.view(), seeded.settings_path.read_bytes()
+    view_before, settings_before = seeded.registry.view(), seeded.stores.snapshot()
 
     observer = _admit_expecting_failure(seeded, sinks, selector, "malformed_selector")
 

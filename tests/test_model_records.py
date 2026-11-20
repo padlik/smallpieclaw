@@ -16,7 +16,7 @@ from model_registry import (
 def test_records_are_frozen_and_nested_metadata_is_immutable() -> None:
     metadata = ModelMetadata(vision=True)
     record = ModelRecord("router/vendor/model", "router", "vendor/model", "Name", metadata)
-    document = CatalogDocument(1, 4, record.id, (ProviderState("router", "openrouter", None, "fresh", None),), (record,))
+    document = CatalogDocument(1, 4, (ProviderState("router", "openrouter", None, "fresh", None),), (record,))
 
     with pytest.raises(FrozenInstanceError):
         record.display_name = "changed"  # type: ignore[misc]

@@ -39,7 +39,6 @@ class ProviderContext:
     send_json: Callable[[dict[str, Any]], httpx.Response]
     track_usage: Callable[[int, int], None]
     caller_tag: str = ""
-    diagnose_empty: bool = False
     cancel_event: Optional[threading.Event] = None
     ollama_client: Any = field(default=None, repr=False)
     graph_extraction: bool = False
@@ -89,19 +88,6 @@ class LLMProvider(Protocol):
         """Send a chat request and return the response text."""
         ...
 
-    def chat_with_fallback(
-        self,
-        messages: list[dict],
-        system: str | None = None,
-        progress_cb=None,
-        json_mode: bool = False,
-    ) -> str:
-        """Compatibility alias for ``chat`` on the admitted immutable run model.
-
-        Never retries with an alternative model.
-        """
-        ...
-
     def chat_with_tools(
         self,
         messages: list[dict],
@@ -113,19 +99,6 @@ class LLMProvider(Protocol):
         Send a chat request with tool definitions and return a structured
         response (text or tool calls). Providers that do not support native
         tool calling should raise NotImplementedError.
-        """
-        ...
-
-    def chat_with_tools_fallback(
-        self,
-        messages: list[dict],
-        tools: list[dict],
-        system: str | None = None,
-        progress_cb=None,
-    ) -> ChatResponse:
-        """Compatibility alias for ``chat_with_tools`` on the admitted immutable run model.
-
-        Never retries with an alternative model.
         """
         ...
 

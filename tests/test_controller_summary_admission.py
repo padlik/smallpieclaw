@@ -40,7 +40,7 @@ from model_registry import (
     ModelRegistryError,
     ProviderState,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 
 AGENT = AgentConfig(ctx_max_tokens=4096, max_retries=3, retry_delay=0)
 HOST_A, HOST_B = "a.example.test", "b.example.test"
@@ -166,15 +166,14 @@ class _World:
 
     def make_registry(self, name: str, *, select: str | None) -> ModelRegistry:
         providers = {n: ProviderConfig(n, "openai", f"env:KEY_{n}", URLS[n], 9) for n in URLS}
-        settings = ModelSettings(self.tmp_path / f"{name}-models.toml")
-        settings.write(
+        stores = ModelStores.at(self.tmp_path, name)
+        stores.cache.write(
             CatalogDocument(
-                1, 2, None,
-                tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+                1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
                 (MODEL_A, MODEL_B),
             )
         )
-        registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+        registry = stores.registry(providers, _NoDiscovery(), _resolve)
         if select is not None:
             registry.select(select)
         return registry
@@ -409,6 +408,18 @@ def test_missing_every_client_falls_back_with_actionable_reason(world, caplog, o
     else:
         assert "NoneType" not in msg and "AttributeError" not in msg
     _assert_reason_reported(op, msg, caplog, NO_CHAT_REASON)
+
+
+def test_named_registries_do_not_share_persistence(world) -> None:
+    """Each named registry owns its own cache and preference files."""
+    empty = world.make_registry("empty", select=None)
+    borrowed = world.make_registry("borrowed", select=MODEL_B.id)
+
+    assert (world.tmp_path / "main-selection.toml").read_text() == f'model = "{MODEL_A.id}"\n'
+    assert (world.tmp_path / "borrowed-selection.toml").read_text() == f'model = "{MODEL_B.id}"\n'
+    assert not (world.tmp_path / "empty-selection.toml").exists()
+    assert world.registry.view().selection_status == "active"
+    assert empty.view().selection_status == "no_selection" and borrowed.view().remembered_model_id == MODEL_B.id
 
 
 @pytest.mark.parametrize("op", OPS)

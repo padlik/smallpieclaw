@@ -56,7 +56,7 @@ def make_outcome(success: bool = True, output: str = "", error: str = "",
 
 @dataclass
 class LLMCall:
-    """Record of one chat_with_fallback invocation."""
+    """Record of one scripted ``chat`` invocation."""
     messages: list
     system: Optional[str]
     images_present: bool
@@ -111,7 +111,10 @@ class ScriptedLLM:
         self._idx += 1
         return resp
 
-    def chat_with_fallback(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
+    def chat(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
+        if not json_mode:
+            # Compaction path (only used if a scenario forces compaction).
+            return "• scripted compaction summary"
         images_present = any(m.get("images") for m in messages)
         self.calls.append(LLMCall(messages=list(messages), system=system,
                                   images_present=images_present))
@@ -119,45 +122,13 @@ class ScriptedLLM:
         self._count_attempt("json")
         return response
 
-    # Compaction path (only used if a scenario forces compaction).
-    def chat(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
-        return "• scripted compaction summary"
-
-
-def build_real_llm(models: list[dict], default: str,
-                   script: list[str]):
-    """Build a *real* LLMClient with a scripted ``chat`` for routing scenarios.
-
-    Returns ``(client, used_models)`` where ``used_models`` records the active
-    model name for each ``chat`` invocation. The real ``chat_with_fallback`` runs
-    (so vision routing and active-index restoration are genuinely exercised)
-    while ``chat`` itself is replaced by the script.
-    """
-    from llm_client import LLMClient
-
-    cfg = {"models": models,
-           "agent": {"default_model": default}}
-    client = LLMClient(cfg)
-    used: list[str] = []
-    seq = list(script)
-    idx = [0]
-
-    def fake_chat(messages, system=None, progress_cb=None, json_mode=False):
-        used.append(client._models[client._active_idx].get("model"))
-        resp = seq[min(idx[0], len(seq) - 1)]
-        idx[0] += 1
-        return resp
-
-    client.chat = fake_chat
-    return client, used
-
 
 class NativeScriptedLLM(LLMClient):
     """A fake LLMClient that scripts native tool-calling responses.
 
     Subclasses ``LLMClient`` (bypassing ``__init__``) so react_loop's
     ``isinstance(ctx.llm, LLMClient)`` gate admits it into the native
-    tool-calling path. Each ``chat_with_tools_fallback`` call returns the next
+    tool-calling path. Each ``chat_with_tools`` call returns the next
     scripted ``ChatResponse`` and snapshots the messages it was handed, so a
     multi-turn payload's shape can be asserted after the run.
 
@@ -178,7 +149,7 @@ class NativeScriptedLLM(LLMClient):
         # Snapshot of the messages list handed to each native call.
         self.tool_calls_seen: list[list[dict]] = []
         # Snapshot of messages handed to the json_mode fallback
-        # (chat_with_fallback), captured after react_loop linearizes any native
+        # (``chat`` with ``json_mode``), captured after react_loop linearizes any native
         # tool-calling turns already in history.
         self.json_mode_calls: list[list[dict]] = []
 
@@ -212,7 +183,7 @@ class NativeScriptedLLM(LLMClient):
             state, manual = self._attempt_binding
             state.begin_outbound_attempt(mode, manual=manual)
 
-    def chat_with_tools_fallback(self, messages, tools, system=None, progress_cb=None):
+    def chat_with_tools(self, messages, tools, system=None, progress_cb=None):
         # Shallow-copy each message so later in-place mutation of the shared
         # list does not retroactively change what we assert was sent this turn.
         self.tool_calls_seen.append([dict(m) for m in messages])
@@ -227,17 +198,16 @@ class NativeScriptedLLM(LLMClient):
         self._count_attempt("native")
         return resp
 
-    def chat_with_fallback(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
-        # Reached when the native path is skipped or a scripted native failure
-        # falls back to json_mode. Record what the builder received (after
+    def chat(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
+        if not json_mode:
+            return "• scripted compaction summary"
+        # Reached when the native path is skipped or a local native-unsupported
+        # conversion falls to json_mode. Record what the builder received (after
         # react_loop linearizes native turns) so the payload's shape can be
         # asserted, then return a finish so the loop terminates deterministically.
         self.json_mode_calls.append([dict(m) for m in messages])
         self._count_attempt("json")
         return '{"action": "finish", "result": "done"}'
-
-    def chat(self, messages, system=None, progress_cb=None, json_mode=False) -> str:
-        return "• scripted compaction summary"
 
 
 # ---------------------------------------------------------------------------

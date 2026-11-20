@@ -5,8 +5,8 @@ their own configuration before side effects" (ADR-0039/0042).
 
 Side-effect events recorded by the spies below: construction of the graph
 store, of any ``EmbeddingClient``/``LLMClient``/``httpx.Client`` after the
-test's own setup, and any catalog/preference object (``ModelSettings``,
-``ModelRegistry``, ``ModelDiscovery.fetch``).  Invalid settings must produce
+test's own setup, and any catalog/preference object (``ModelCache``,
+``ModelPreference``, ``ModelRegistry``, ``ModelDiscovery.fetch``).  Invalid settings must produce
 no event at all; valid settings must produce the real store first.  Canary
 credentials only.
 """
@@ -34,7 +34,7 @@ from graph_memory import GraphPrerequisiteError
 from llm_client import LLMClient
 from memory_store import LongTermMemory
 from model_registry import ModelRegistry
-from model_settings import ModelSettings
+from model_settings import ModelCache, ModelPreference
 from xdg import xdg_paths
 
 GRAPH_HOST = "graph.v53.test"
@@ -155,7 +155,8 @@ class _Events:
         monkeypatch.setattr(graph_memory, "GraphMemoryStore", store_factory)
         if "GraphMemoryStore" in vars(backfill_graph_memory):
             monkeypatch.setattr(backfill_graph_memory, "GraphMemoryStore", store_factory)
-        monkeypatch.setattr(ModelSettings, "__init__", tripwire("ModelSettings"))
+        monkeypatch.setattr(ModelCache, "__init__", tripwire("ModelCache"))
+        monkeypatch.setattr(ModelPreference, "__init__", tripwire("ModelPreference"))
         monkeypatch.setattr(ModelRegistry, "__init__", tripwire("ModelRegistry"))
         monkeypatch.setattr(model_discovery.ModelDiscovery, "fetch", tripwire("ModelDiscovery.fetch"))
         # No chat connection credential is ever resolved for graph validation or live backfill.
@@ -409,7 +410,7 @@ class TestLiveBackfillValidatesItself:
         assert "providers" not in raw
         world = _cli_world(tmp_xdg, tmp_path, raw, monkeypatch)
         paths = xdg_paths(AGENT)
-        assert not paths.models_config_file.exists()
+        assert not (paths.config_home / "models-config.toml").exists()
         events = _Events(monkeypatch)
         assert _run_cli(world, monkeypatch) == 0
         # The CLI's single embedding client (needed for the vector dimension) precedes the
@@ -417,7 +418,7 @@ class TestLiveBackfillValidatesItself:
         assert events.log[:3] == ["EmbeddingClient", "httpx.Client", "GraphMemoryStore"]
         assert events.log.count("EmbeddingClient") == 1
         assert events.log.count("LLMClient") == 2
-        assert not paths.models_config_file.exists()
+        assert not (paths.config_home / "models-config.toml").exists()
         assert not paths.models_cache_file.exists()
         embed_calls, graph_calls = wire.to(EMBED_HOST), wire.to(GRAPH_HOST)
         assert embed_calls and len(graph_calls) == 2

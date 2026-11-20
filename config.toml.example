@@ -62,9 +62,11 @@ pairing_timeout = 300
 # A corrupt preference file is left untouched until a button replaces it;
 # if providers return no candidates, repair or delete it by hand and restart.
 #
-# Retired files are inert: models-config.toml (in the same config directory) and
-# the state-directory scheduler_jobs.json are only checked for existence, one
-# notice each; they are never read, parsed, converted, written or deleted.
+# Retired files are inert: models-config.toml (in the same config directory) is
+# ignored completely and left untouched (select a model with /models); the
+# state-directory scheduler_jobs.json is only checked for existence, one notice;
+# neither is ever read, parsed, converted, written or deleted.
+# Also removed: [agent] diagnose_empty_responses -- startup rejects it; delete the key.
 # Move old [[models]] data by hand (see README "Upgrading manually").
 # ---------------------------------------------------------------------------
 # api_key is optional for adapters that support unauthenticated connections;
@@ -139,9 +141,6 @@ compaction_threshold_tokens = 60000
 # Output-token cap sent only to adapters whose API requires one (currently Anthropic); other
 # adapters omit it. Positive integer; it is not sized from context or discovered model limits.
 required_output_cap_tokens = 1024
-# Enable verbose diagnostics when the LLM returns empty content (default: false).
-# Logs full HTTP response, checks stream/non-stream mismatch, finish_reason, and runs a curl probe.
-diagnose_empty_responses = false
 # Hard cap on concurrent managed (on-demand) sub-agents. Scheduler jobs do not count toward this cap.
 # Attempting to spawn beyond this limit returns a hard error. Default: 6.
 max_subagents = 6

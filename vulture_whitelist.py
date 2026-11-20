@@ -24,9 +24,7 @@ Skill.metadata
 
 # Protocol interface methods — abstract contracts, not called directly
 LLMProvider.chat
-LLMProvider.chat_with_fallback
 LLMProvider.chat_with_tools
-LLMProvider.chat_with_tools_fallback
 LLMProvider.embed
 ToolBackend.execute
 MemoryBackend.get

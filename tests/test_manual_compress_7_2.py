@@ -43,7 +43,7 @@ from model_registry import (
     ModelRegistry,
     ProviderState,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 
 AGENT = AgentConfig(ctx_max_tokens=4096, max_retries=1, retry_delay=0)
 HOST_A, HOST_B = "a.example.test", "b.example.test"
@@ -95,13 +95,12 @@ class _World:
         self.status = 200
         self.on_request = None
         providers = {n: ProviderConfig(n, "openai", f"env:KEY_{n}", URLS[n], 9) for n in URLS}
-        self.settings = ModelSettings(tmp_path / "models.toml")
-        self.settings.write(CatalogDocument(
-            1, 2, None,
-            tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+        self.stores = ModelStores.at(tmp_path)
+        self.stores.cache.write(CatalogDocument(
+            1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
             (MODEL_A, MODEL_B),
         ))
-        self.registry = ModelRegistry(providers, self.settings, _NoDiscovery(), _resolve)
+        self.registry = self.stores.registry(providers, _NoDiscovery(), _resolve)
         self.registry.select(MODEL_A.id)
         world = self
 
@@ -242,7 +241,8 @@ def test_unselected_admission_failure_is_actionable_and_leaves_everything_unchan
     world.seed()
     world.registry = ModelRegistry(
         {n: ProviderConfig(n, "openai", f"env:KEY_{n}", URLS[n], 9) for n in URLS},
-        ModelSettings(world.tmp_path / "empty.toml"), _NoDiscovery(), _resolve,
+        ModelStores.at(world.tmp_path, "empty").cache, _NoDiscovery(), _resolve,
+        preference=ModelStores.at(world.tmp_path, "empty").preference,
     )
     world.controller._run_client_factory = main._make_run_client_factory(
         world.registry, AGENT, world.embedding,

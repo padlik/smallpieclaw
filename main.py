@@ -719,9 +719,6 @@ def _run(
             logger.warning(
                 "%s Selection file: %s", model_registry.selection_notice, paths.model_selection_file,
             )
-        retired_notice = _retired_catalog_notice(paths.models_config_file)
-        if retired_notice is not None:
-            logger.warning("%s", retired_notice)
         _refresh_model_catalog(model_registry, paths.models_cache_file)
         try:
             _run_with_model_services(
@@ -745,22 +742,6 @@ def _run(
             # Set before the ExitStack unwinds so close_root_embedding skips it.
             retain_graph_dependencies = True
             raise
-
-
-def _retired_catalog_notice(retired_file: Path) -> str | None:
-    """Return the one startup notice for the retired combined model settings file.
-
-    The retired ``models-config.toml`` is only ever probed for existence
-    (``lexists``: a symlink or directory at the path counts, and a symlink is
-    never followed). It is never opened, read, parsed, written, renamed or
-    deleted, whatever its content or permissions; ``None`` means it is absent.
-    """
-    if not os.path.lexists(retired_file):
-        return None
-    return (
-        f"The retired combined model settings file exists at {retired_file}; it is never read "
-        "or changed and no model is derived from it. Choose a model deliberately with /models."
-    )
 
 
 def _refresh_model_catalog(model_registry: ModelRegistry, cache_file: Path) -> None:

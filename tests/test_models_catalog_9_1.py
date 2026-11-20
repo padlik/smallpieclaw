@@ -60,7 +60,7 @@ def build(
     preference = ModelPreference(env.pref_path)
     if cache_models:
         providers = tuple(ProviderState(c.name, "openai", "2026-10-01T12:00:00Z", "fresh") for c in connections)
-        cache.write(CatalogDocument(1, 1, None, providers, cache_models))
+        cache.write(CatalogDocument(1, 1, providers, cache_models))
     if corrupt_cache:
         env.cache_path.write_text(f"{{not json {SECRET}", encoding="utf-8")
     if saved is not None:
@@ -234,7 +234,7 @@ def test_no_notice_lines_when_files_are_healthy(tmp_path: Path) -> None:
 
 def test_notices_follow_the_refresh_outcome_selection_first_then_cache(tmp_path: Path) -> None:
     env = build(tmp_path, corrupt_cache=True, corrupt_pref=True)
-    env.registry._settings.write = _raise_oserror  # type: ignore[method-assign]
+    env.registry._cache.write = _raise_oserror  # type: ignore[method-assign]
 
     text, _ = run_models(env)
 
@@ -293,7 +293,7 @@ def test_the_models_command_and_refresh_callback_leave_selection_and_preference_
 def test_a_refresh_that_cannot_persist_keeps_the_selection_and_leaks_nothing(tmp_path: Path) -> None:
     env = build(tmp_path, cache_models=pa_models("m1"), saved="pa/m1")
     before = _state(env)
-    env.registry._settings.write = _raise_oserror  # type: ignore[method-assign]
+    env.registry._cache.write = _raise_oserror  # type: ignore[method-assign]
 
     text, _ = run_models(env)
 

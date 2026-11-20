@@ -76,13 +76,13 @@ def test_successful_public_wrappers_emit_one_call_and_preserve_usage(monkeypatch
     events = _capture_events(monkeypatch)
     try:
         if native:
-            response = client.chat_with_tools_fallback(
+            response = client.chat_with_tools(
                 [{"role": "user", "content": "request"}], tools=[]
             )
             assert isinstance(response, ChatResponse)
             assert response.tool_calls and response.tool_calls[0].name == "lookup"
         else:
-            assert client.chat_with_fallback(
+            assert client.chat(
                 [{"role": "user", "content": "request"}]
             ) == "ok"
 
@@ -204,7 +204,7 @@ def test_each_public_retry_invocation_gets_its_own_event_pair(monkeypatch):
     try:
         for _ in range(2):
             with pytest.raises(httpx.HTTPStatusError):
-                client.chat_with_fallback([{"role": "user", "content": "request"}])
+                client.chat([{"role": "user", "content": "request"}])
         assert len(requests) == 2
         assert [event for event, _message, _fields in events] == [
             LogEvent.LLM_CALL,

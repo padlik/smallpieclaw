@@ -47,7 +47,7 @@ from model_registry import (
     RunModel,
 )
 from model_discovery import ProviderInventory
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 from outcome_utils import read_execution
 from path_policy import PathPolicy, PathVerdict
 from scheduler import Scheduler
@@ -109,8 +109,8 @@ class _FireGate:
 class _Registry(ModelRegistry):
     """Real registry that counts admissions around the real implementation."""
 
-    def __init__(self, *args: object) -> None:
-        super().__init__(*args)
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
         self.scheduled_calls: list[object] = []
         self.scheduled_errors: list[str] = []
         self.ordinary_calls = 0
@@ -266,21 +266,19 @@ class _World:
         self.embed_http: list[httpx.Client] = []
         self.usage = TokenUsageRegistry()
         providers = {n: ProviderConfig(n, "openai", f"env:KEY_{n}", URLS[n], 9) for n in URLS}
-        self.settings_path = tmp_path / "models-config.toml"
-        settings = ModelSettings(self.settings_path)
-        settings.write(CatalogDocument(
-            1, 2, None,
-            tuple(
+        self.stores = stores = ModelStores.at(tmp_path)
+        stores.cache.write(CatalogDocument(
+            1, 2, tuple(
                 ProviderState(n, "openai", "2026-09-01T00:00:00Z",
                               "stale" if stale_provider and n == "pb" else "fresh")
                 for n in providers
             ),
             (MODEL_A, MODEL_B),
         ))
-        self.registry = _Registry(providers, settings, discovery or _NoDiscovery(), self._resolve)
+        self.registry = _Registry(providers, stores.cache, discovery or _NoDiscovery(), self._resolve, preference=stores.preference)
         if select:
             self.registry.select(MODEL_A.id)
-        self.document = self.settings_path.read_bytes()
+        self.document = self.stores.snapshot()
         monkeypatch.setattr(agent_controller, "LLMClient", self._make_llm)
 
         self.factory = _StrictFactory(self)
@@ -475,7 +473,7 @@ def test_cron_fire_admits_once_and_completes_on_pinned_model(
     assert not world.embed_http[0].is_closed, "borrowed embedding HTTP closed by runner"
     assert world.embed_requests == []
     assert world.registry.view().active_model_id == (MODEL_A.id if select else None)
-    assert world.settings_path.read_bytes() == world.document
+    assert world.stores.snapshot() == world.document
     assert _pb_status(world) == ("stale" if stale else "fresh")
 
 
@@ -534,7 +532,7 @@ def test_invalid_selector_fails_only_its_launch_with_its_own_code_and_never_subs
     assert TAG not in world.sched._running_jobs and not world.sched._active_runs.get(TAG)
     assert TAG in world.sched._jobs_meta, "a failed launch must not unschedule the job"
     assert world.registry.view().active_model_id == (MODEL_A.id if select else None)
-    assert world.settings_path.read_bytes() == world.document
+    assert world.stores.snapshot() == world.document
 
 
 def test_same_entry_refresh_during_admission_credentials_does_not_fail_launch(
@@ -575,7 +573,7 @@ def test_same_entry_refresh_during_admission_credentials_does_not_fail_launch(
         assert after_view.revision == before_view.revision + 1
         assert after_view.selection_revision == before_view.selection_revision
         assert after_view.models == before_view.models == (MODEL_A, MODEL_B)
-        after_bytes = world.settings_path.read_bytes()
+        after_bytes = world.stores.snapshot()
         assert after_bytes != world.document
     finally:
         gate.release.set()
@@ -599,7 +597,7 @@ def test_same_entry_refresh_during_admission_credentials_does_not_fail_launch(
     assert record["model"] == MODEL_B.id
     assert TAG not in world.sched._running_jobs and not world.sched._active_runs.get(TAG)
     assert registry.view() == after_view
-    assert world.settings_path.read_bytes() == after_bytes
+    assert world.stores.snapshot() == after_bytes
 
 
 def test_running_scheduled_run_cancelled_during_inflight_request(make_world) -> None:
@@ -656,7 +654,7 @@ def test_running_scheduled_run_cancelled_during_inflight_request(make_world) -> 
     assert not world.embed_http[0].is_closed, "borrowed embedding HTTP closed by runner"
     assert world.embed_requests == []
     assert world.registry.view().active_model_id == MODEL_A.id
-    assert world.settings_path.read_bytes() == world.document
+    assert world.stores.snapshot() == world.document
 
 
 def test_agents_cancel_managed_landing_as_admitted_run_registers_cancels_before_any_request(
@@ -820,7 +818,7 @@ def _run_tool_job(world: _World, monkeypatch: pytest.MonkeyPatch, call_id: str) 
     (embedding,) = world.embeddings
     assert embedding.close_count == 1 and not world.embed_http[0].is_closed
     assert world.registry.view().active_model_id == MODEL_A.id
-    assert world.settings_path.read_bytes() == world.document
+    assert world.stores.snapshot() == world.document
     (one,) = seen
     return one
 

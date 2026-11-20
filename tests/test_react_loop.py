@@ -98,7 +98,7 @@ class TestTurnOwnedFinishGate:
         ):
             result = _run_single_step(
                 ctx, state, "system", "goal", 0.0, lambda _message: None,
-                supports_native_fallback=False,
+                supports_native=False,
             )
 
         assert result == _StepResult(should_continue=True)
@@ -1387,14 +1387,14 @@ class TestSingleRecordLifecycle:
         orig_log_event = agent_logging.log_event
         mock_log_event = MagicMock(wraps=orig_log_event)
 
-        def fake_chat_with_fallback(_self, *args, **kwargs):
+        def fake_chat(_self, *args, **kwargs):
             agent_logging.log_event(
                 LogEvent.LLM_FAILED, "LLM request failed: test-model", level=logging.ERROR,
                 model="test-model", dur_ms=1, err="llm boom",
             )
             raise LLMError("llm boom")
 
-        llm.chat_with_fallback = lambda *a, **k: fake_chat_with_fallback(llm, *a, **k)
+        llm.chat = lambda *a, **k: fake_chat(llm, *a, **k)
 
         try:
             agent_logging.log_event = mock_log_event

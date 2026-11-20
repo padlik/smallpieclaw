@@ -186,18 +186,6 @@ class ScriptedFinishLLM(_AttemptBoundFake):
     def set_trace_id(self, trace_id: str) -> None:
         pass
 
-    def chat_with_fallback(
-        self,
-        messages: list,
-        system: Optional[str] = None,
-        progress_cb: Optional[Callable[[str], None]] = None,
-        json_mode: bool = False,
-    ) -> str:
-        self._record_send()
-        self.calls.append(list(messages))
-        self._call_count += 1
-        return self._response
-
     def chat(
         self,
         messages: list,
@@ -205,7 +193,12 @@ class ScriptedFinishLLM(_AttemptBoundFake):
         progress_cb: Optional[Callable[[str], None]] = None,
         json_mode: bool = False,
     ) -> str:
-        return "compaction summary"
+        if not json_mode:
+            return "compaction summary"
+        self._record_send()
+        self.calls.append(list(messages))
+        self._call_count += 1
+        return self._response
 
 
 class ErrorThenSuccessLLM(_AttemptBoundFake):
@@ -225,21 +218,6 @@ class ErrorThenSuccessLLM(_AttemptBoundFake):
     def set_trace_id(self, trace_id: str) -> None:
         pass
 
-    def chat_with_fallback(
-        self,
-        messages: list,
-        system: Optional[str] = None,
-        progress_cb: Optional[Callable[[str], None]] = None,
-        json_mode: bool = False,
-    ) -> str:
-        _ = system, progress_cb, json_mode
-        self._record_send()
-        self.calls.append(list(messages))
-        self._call_count += 1
-        if self._call_count == 1:
-            raise self._error
-        return self._success
-
     def chat(
         self,
         messages: list,
@@ -247,8 +225,15 @@ class ErrorThenSuccessLLM(_AttemptBoundFake):
         progress_cb: Optional[Callable[[str], None]] = None,
         json_mode: bool = False,
     ) -> str:
-        _ = system, progress_cb, json_mode
-        return "compaction summary"
+        _ = system, progress_cb
+        if not json_mode:
+            return "compaction summary"
+        self._record_send()
+        self.calls.append(list(messages))
+        self._call_count += 1
+        if self._call_count == 1:
+            raise self._error
+        return self._success
 
 
 def _build_context(

@@ -28,7 +28,6 @@ class TestXdgPathsDefaults:
         assert paths.runtime_dir == home_state / "test-agent"
 
         assert paths.config_file == paths.config_home / "config.toml"
-        assert paths.models_config_file == paths.config_home / "models-config.toml"
         assert paths.model_selection_file == paths.config_home / "model-selection.toml"
         assert paths.models_cache_file == paths.cache_home / "models-cache.json"
         assert paths.scheduler_config == paths.config_home / "scheduler.toml"
@@ -57,7 +56,6 @@ class TestXdgPathsDefaults:
         paths = xdg_paths("agent")
 
         assert paths.config_home == tmp_path / "c1" / "agent"
-        assert paths.models_config_file == tmp_path / "c1" / "agent" / "models-config.toml"
         assert paths.model_selection_file == tmp_path / "c1" / "agent" / "model-selection.toml"
         assert paths.models_cache_file == tmp_path / "c4" / "agent" / "models-cache.json"
         assert paths.data_home == tmp_path / "c2" / "agent"
@@ -90,8 +88,7 @@ class TestXdgPathsDefaults:
         for d in (paths.config_home, paths.data_home, paths.state_home,
                   paths.cache_home, paths.runtime_dir):
             assert not d.exists()
-        for leaf in (paths.model_selection_file, paths.models_cache_file,
-                     paths.models_config_file):
+        for leaf in (paths.model_selection_file, paths.models_cache_file):
             assert not leaf.exists()
         assert sorted(p.name for p in tmp_xdg.iterdir()) == ["runtime"]
 
@@ -112,9 +109,8 @@ def test_model_selection_and_cache_leaves_resolve_in_config_and_cache_homes(
     assert sorted(tmp_path.rglob("*")) == before  # pure: nothing created
     assert paths.model_selection_file == tmp_path / "custom-cfg" / "piclaw" / "model-selection.toml"
     assert paths.models_cache_file == tmp_path / "custom-cache" / "piclaw" / "models-cache.json"
-    # Retired combined settings path stays resolvable for its existence check only.
-    assert paths.models_config_file == tmp_path / "custom-cfg" / "piclaw" / "models-config.toml"
-    assert paths.models_config_file != paths.model_selection_file
+    # The retired combined settings path is not exposed at all.
+    assert not hasattr(paths, "models_config_file")
     assert paths.data_home == tmp_path / "home" / ".local" / "share" / "piclaw"
 
     # Moving only the cache root leaves the durable preference in config home.

@@ -48,7 +48,7 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 from sub_agent_registry import (
     CAPACITY_COUNTED_SOURCES,
     SOURCE_DIAGNOSTIC,
@@ -106,13 +106,12 @@ def registry(tmp_path: Path) -> ModelRegistry:
         name: ProviderConfig(name, "openai", f"env:KEY_{name}", url, 9)
         for name, url in _URLS.items()
     }
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(
-        1, 2, None,
-        tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(
+        1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
         (MODEL_A, MODEL_B),
     ))
-    reg = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+    reg = stores.registry(providers, _NoDiscovery(), _resolve)
     reg.select(MODEL_A.id)
     return reg
 
@@ -482,7 +481,7 @@ class TestAgentRuntimeCreateSubAgent:
             ctx_max_tokens=23456, compaction_threshold_tokens=12321,
             required_output_cap_tokens=617, max_retries=7, retry_delay=0.25, max_subagents=2,
             subagent_result_timeout=45, long_run_warn_minutes=12,
-            diagnose_empty_responses=True, default_model="pa/up/a",
+            default_model="pa/up/a",
             background_model="pb/up/b", fallback_models=["pb/up/b", "pa/up/a"],
             shell_backend="pty", shell_pty_cols=100, shell_pty_rows=30,
             shell_streaming=True, shell_nsjail_confirm_mode="adaptive",
@@ -518,7 +517,6 @@ class TestAgentRuntimeCreateSubAgent:
         assert runner._llm._required_output_cap == snapshot["required_output_cap_tokens"]
         assert runner._llm._max_retries == snapshot["max_retries"]
         assert runner._llm._retry_delay == snapshot["retry_delay"]
-        assert runner._llm._diagnose_empty is True
 
     def test_usage_registry_propagated(self, build, pin_a):
         usage = MagicMock()

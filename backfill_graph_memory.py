@@ -45,21 +45,16 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from functools import partial
-from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
 
-from config_schema import resolve_provider_connection
 from embedding_client import EmbeddingClient
-from model_registry import ModelRegistry
-from model_settings import ModelSettings, ModelSettingsError
 from providers._errors import LLMError
 
 if TYPE_CHECKING:
-    from config_schema import AgentConfig, AppConfig, ResolvedProviderConnection
-    from graph_memory import GraphMemoryStore, GraphPrerequisites
+    from config_schema import AgentConfig
+    from graph_memory import GraphMemoryStore
     from model_registry import RunModel
 
 # ---------------------------------------------------------------------------
@@ -158,57 +153,6 @@ def _load_toml(path: str) -> dict:
         import tomllib as tomli  # type: ignore[no-redef]  # Python 3.11+
     with open(path, "rb") as f:
         return tomli.load(f)
-
-
-_REFRESH_GUIDANCE = "start the agent and run /models refresh to save the provider model catalog"
-
-
-class _NoDiscovery:
-    """Discovery guard for saved-catalog preparation, which never refreshes."""
-
-    def fetch(self, _connection: ResolvedProviderConnection) -> NoReturn:
-        """Refuse provider discovery; backfill preparation uses only saved data."""
-        raise RuntimeError("backfill preparation must not run provider model discovery")
-
-
-def prepare_backfill_prerequisites(
-    app_cfg: AppConfig,
-    settings_path: Path,
-    *,
-    vault_file: str | None = None,
-) -> GraphPrerequisites:
-    """Pin the graph model from the saved catalog without changing any state.
-
-    The settings file is read once in read-only mode (no backup, no writes)
-    and its status is checked before building a ``ModelRegistry``, whose
-    constructor would otherwise hide load failures. No Main model is
-    restored or selected, no catalog is refreshed, and ``graph_memory.enabled``
-    is left to the caller. ``vault_file`` must be the vault used to parse
-    ``app_cfg``. Raises ``GraphPrerequisiteError`` on failure.
-    """
-    from graph_memory import GraphPrerequisiteError, resolve_graph_prerequisites
-
-    settings = ModelSettings(settings_path, read_only=True)
-    try:
-        status = settings.load().status
-    except ModelSettingsError:
-        raise GraphPrerequisiteError(
-            "catalog_read_failed",
-            "saved model catalog could not be read: check the settings file permissions, "
-            f"then {_REFRESH_GUIDANCE}",
-        ) from None
-    if status == "missing":
-        raise GraphPrerequisiteError("catalog_missing", f"no saved model catalog: {_REFRESH_GUIDANCE}")
-    if status == "corrupt":
-        raise GraphPrerequisiteError("catalog_corrupt", f"saved model catalog is corrupt: {_REFRESH_GUIDANCE}")
-
-    registry = ModelRegistry(
-        app_cfg.providers,
-        settings,
-        _NoDiscovery(),
-        partial(resolve_provider_connection, vault_file=vault_file),
-    )
-    return resolve_graph_prerequisites(app_cfg, registry, vault_file=vault_file)
 
 
 # ---------------------------------------------------------------------------

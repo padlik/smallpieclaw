@@ -149,7 +149,11 @@ class TestNativeVisionQueryIntercept:
         # propagate, and return a fixed analysis string.
         captured_vision: dict = {}
 
+        scripted_chat = llm.chat
+
         def fake_chat(messages, system=None, progress_cb=None, json_mode=False):
+            if json_mode:
+                return scripted_chat(messages, system=system, progress_cb=progress_cb, json_mode=json_mode)
             captured_vision["messages"] = messages
             return "A golden retriever in a park."
 
@@ -183,20 +187,20 @@ class TestNativeNotImplementedFallback:
 
     def test_not_implemented_falls_back_to_json_mode(self):
         # The native attempt raises NotImplementedError → the loop must switch to
-        # the json_mode chat_with_fallback path and finish without propagating.
+        # the json_mode chat path and finish without propagating.
         llm = NativeScriptedLLM([NotImplementedError("no native tool calling")])
         ex = RecordingExecutor()
 
         # Spy on the fallback to confirm it is invoked with json_mode=True, while
         # still delegating to the scripted implementation (which returns finish).
         seen_json_mode: list[bool] = []
-        orig = llm.chat_with_fallback
+        orig = llm.chat
 
         def spy(messages, system=None, progress_cb=None, json_mode=False):
             seen_json_mode.append(json_mode)
             return orig(messages, system=system, progress_cb=progress_cb, json_mode=json_mode)
 
-        llm.chat_with_fallback = spy
+        llm.chat = spy
 
         result, _calls, _progress = run_react(llm, ex, "do something")
 

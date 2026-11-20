@@ -215,7 +215,7 @@ class TestMilestoneDoubleFireGuard:
         real_run_single_step = rl._run_single_step
         rewound = [False]
 
-        def spy(ctx, state, system, user_goal, run_start, progress, supports_native_fallback):
+        def spy(ctx, state, system, user_goal, run_start, progress, supports_native):
             step_seen.append(state.step)
             if state.step == 2 and not rewound[0]:
                 rewound[0] = True
@@ -223,7 +223,7 @@ class TestMilestoneDoubleFireGuard:
                 state.warned_inactivity = False
             return real_run_single_step(
                 ctx, state, system, user_goal, run_start, progress,
-                supports_native_fallback,
+                supports_native,
             )
 
         with patch("react_loop._build_system_prompt", return_value=("sys", None)):

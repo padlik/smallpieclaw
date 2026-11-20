@@ -20,15 +20,15 @@ def _make_ctx(llm_responses: list[str]) -> tuple[ReactContext, list[str]]:
 
     call_counter = [0]
 
-    def fake_chat_with_fallback(messages, **kwargs):
+    def fake_chat(messages, **kwargs):
         idx = call_counter[0] % len(llm_responses)
         call_counter[0] += 1
         return llm_responses[idx]
 
     llm = MagicMock()
-    llm.chat_with_fallback.side_effect = fake_chat_with_fallback
+    llm.chat.side_effect = fake_chat
     # Native tool calling not supported in these tests — fall through to json_mode
-    llm.chat_with_tools_fallback.side_effect = NotImplementedError("native tools not mocked")
+    llm.chat_with_tools.side_effect = NotImplementedError("native tools not mocked")
     llm.llm_cfg = {"model": "test-model"}
 
     ctx = ReactContext(
@@ -94,13 +94,13 @@ class TestNonJsonProtocolError:
         ctx, _ = _make_ctx(responses)
         # Track all messages sent to the LLM
         captured_messages: list[list] = []
-        orig = ctx.llm.chat_with_fallback.side_effect
+        orig = ctx.llm.chat.side_effect
 
         def capture_messages(messages, **kwargs):
             captured_messages.append(list(messages))
             return orig(messages, **kwargs)
 
-        ctx.llm.chat_with_fallback.side_effect = capture_messages
+        ctx.llm.chat.side_effect = capture_messages
 
         with patch("react_loop._build_system_prompt", return_value=("sys_prompt", None)):
             react_loop(ctx, "task")

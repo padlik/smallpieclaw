@@ -168,38 +168,15 @@ async def cb_llm_retry(iface: "TelegramInterface", update: Update, ctx: ContextT
 
 @_require_cb_auth
 async def cb_model_switch(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle legacy model switch button presses.
+    """Refuse a stale raw ``model:<name>`` callback.
 
-    Once a provider model catalog is configured, raw ``model:<name>`` callback
-    data is no longer trusted: selection goes through opaque `/models` tokens
-    only, so this handler never reaches the legacy client.
+    Selection goes through opaque `/models` tokens only; this handler never
+    mutates the selection or the preference and only asks to reopen `/models`.
     """
     query = update.callback_query
     await _ack_query(query)
-    if getattr(iface, "model_registry", None) is not None:
-        try:
-            await query.edit_message_text(_MODELS_REOPEN_TEXT)
-        except Exception:
-            pass
-        return
-    model_name = query.data.split(":", 1)[1]
-
-    if iface.llm_client and hasattr(iface.llm_client, "set_model"):
-        success = iface.llm_client.set_model(model_name)
-        if success:
-            active = iface.llm_client.llm_cfg
-            text = (
-                f"✅ Switched to <b>{html.escape(active.get('name', model_name))}</b>"
-                f" (<code>{html.escape(model_name)}</code>)\n"
-                f"<i>Takes effect from your next message.</i>"
-            )
-        else:
-            text = f"❌ Model <code>{html.escape(model_name)}</code> not found."
-    else:
-        text = "❌ Model switching not available."
-
     try:
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+        await query.edit_message_text(_MODELS_REOPEN_TEXT)
     except Exception:
         pass
 

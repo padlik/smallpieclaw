@@ -36,10 +36,9 @@ from model_registry import (
     CatalogDocument,
     ModelMetadata,
     ModelRecord,
-    ModelRegistry,
     ProviderState,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 import sqlite_log
 from tests.run_model_fixtures import make_run_model_client
 from trace_context import child_trace_id, new_trace_id
@@ -171,8 +170,8 @@ class TestAgentControllerTrace:
 class TestReactLoopTraceLogging:
     def test_start_log_contains_trace_id(self, monkeypatch):
         llm = MagicMock()
-        llm.chat_with_fallback.return_value = '{"action": "finish", "result": "done"}'
-        llm.chat_with_tools_fallback.side_effect = NotImplementedError("native tools not mocked")
+        llm.chat.return_value = '{"action": "finish", "result": "done"}'
+        llm.chat_with_tools.side_effect = NotImplementedError("native tools not mocked")
         llm.llm_cfg = {"model": "test-model"}
         ctx = ReactContext(
             llm=llm, tool_index=MagicMock(), memory=MagicMock(), builtin_executor=None, mcp_manager=None, skill_registry=None,
@@ -222,7 +221,7 @@ class TestPinnedProviderTraceCorrelation:
             return real_chat(ctx, *args, **kwargs)
 
         with patch.object(openai_provider, "chat", side_effect=capture_context):
-            assert c.chat_with_fallback([{"role": "user", "content": "hi"}]) == "ok"
+            assert c.chat([{"role": "user", "content": "hi"}]) == "ok"
         assert observed == ["main r-fb123456"]
         assert len(requests) == 1
         c.close()
@@ -556,13 +555,12 @@ class TestSubAgentTracePropagation:
         providers = {
             "pa": ProviderConfig("pa", "openai", "env:KEY_pa", "https://a.example.test/v1", 9),
         }
-        settings = ModelSettings(tmp_path / "models-config.toml")
-        settings.write(CatalogDocument(
-            1, 2, None,
-            (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+        stores = ModelStores.at(tmp_path)
+        stores.cache.write(CatalogDocument(
+            1, 2, (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (record,),
         ))
-        registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+        registry = stores.registry(providers, _NoDiscovery(), _resolve)
         registry.select(record.id)
         run_model = registry.admit()
 

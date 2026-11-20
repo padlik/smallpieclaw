@@ -46,6 +46,18 @@ class TestTaskOutcomeTextHelper:
         assert text.endswith("…")
 
 
+def _summary_chat(llm, summary):
+    """Route the non-JSON summary call to ``summary``; ReAct JSON calls stay scripted."""
+    scripted = llm.chat
+
+    def chat(messages, system=None, progress_cb=None, json_mode=False):
+        if json_mode:
+            return scripted(messages, system=system, progress_cb=progress_cb, json_mode=json_mode)
+        return summary(messages)
+
+    return chat
+
+
 class TestReactLoopFinishSummary:
     def test_finish_uses_llm_summary_when_available(self, results_memory):
         writer = MagicMock()
@@ -60,7 +72,7 @@ class TestReactLoopFinishSummary:
         ])
         # Override chat() to return a realistic summary instead of the
         # hardcoded compaction string.
-        llm.chat = MagicMock(return_value="Deployed the site successfully using shell. No unresolved issues.")
+        llm.chat = _summary_chat(llm, MagicMock(return_value="Deployed the site successfully using shell. No unresolved issues."))
         ex = RecordingExecutor({"shell": make_outcome(output="file.txt")})
 
         _, _, _ = run_react(
@@ -89,7 +101,7 @@ class TestReactLoopFinishSummary:
         working.start_task("deploy site")
 
         llm = ScriptedLLM(['{"action": "finish", "result": "site deployed"}'])
-        llm.chat = MagicMock(side_effect=RuntimeError("model unavailable"))
+        llm.chat = _summary_chat(llm, MagicMock(side_effect=RuntimeError("model unavailable")))
         ex = RecordingExecutor({})
 
         _, _, _ = run_react(

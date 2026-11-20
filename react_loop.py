@@ -10,7 +10,6 @@ mutable state. This decouples the iteration logic from the controller class.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -1062,7 +1061,7 @@ def _ensure_tool_defs(
     ``model_catalog_view`` is the view captured for the request (an explicit
     ``None`` included); by default ``ctx.model_catalog_view`` is read. Cached definitions are rebuilt when that view differs from the
     view they were built with; a rebuild also drops the dependent per-run token
-    grouping cache (the definition revision is a digest of ``_tool_defs`` and
+    grouping cache (the grouping cache is derived from ``_tool_defs`` and
     follows it).
     """
     view = ctx.model_catalog_view if model_catalog_view is _VIEW_FROM_CONTEXT else model_catalog_view
@@ -1175,13 +1174,6 @@ def _action_from_turn(turn: _Turn, state: _LoopState) -> tuple[dict, Callable[[s
     return action_obj, _result_sink(state)
 
 
-def _definition_revision(ctx: ReactContext) -> str:
-    """Return the stable digest of the tool definitions sent with a request."""
-    return hashlib.sha256(
-        json.dumps(ctx._tool_defs or [], sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
 def _is_transient_llm_error(exc: BaseException) -> bool:
     """Return whether a failure is a transient transport or status error."""
     if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
@@ -1278,7 +1270,7 @@ def _request_turn(
     state: _LoopState,
     system: str,
     progress: Callable[[str], None],
-    supports_native_fallback: bool = False,
+    supports_native: bool = False,
 ) -> _Turn:
     """Perform bounded same-request retries and return the accepted model turn."""
     raw = ""
@@ -1288,7 +1280,7 @@ def _request_turn(
     attempt = state.attempt_state
     if attempt is None:
         attempt = state.attempt_state = CallAttemptState(ctx.max_retries, ctx.retry_delay)
-    native = bool(ctx._tool_defs and supports_native_fallback and attempt.mode == "native")
+    native = bool(ctx._tool_defs and supports_native and attempt.mode == "native")
     manual_call = False
     empty_count = 0
 
@@ -1320,7 +1312,6 @@ def _request_turn(
         manual_call = attempt.manual_retry_authorized
         bind = getattr(ctx.llm, "bind_attempt", None)
         has_transport_binding = callable(bind)
-        definition_revision = _definition_revision(ctx)
         before_send = (
             {"before_send": retire_before_send}
             if isinstance(ctx.llm, LLMClient)
@@ -1328,7 +1319,7 @@ def _request_turn(
             and ctx.checkpoint_owner is not None else {}
         )
         binding = (
-            bind(attempt, manual=manual_call, definition_revision=definition_revision, **before_send)
+            bind(attempt, manual=manual_call, **before_send)
             if has_transport_binding else nullcontext()
         )
 
@@ -1337,7 +1328,7 @@ def _request_turn(
                 if native:
                     attempts_before = attempt.outbound_attempts
                     try:
-                        response = ctx.llm.chat_with_tools_fallback(
+                        response = ctx.llm.chat_with_tools(
                             state.messages, tools=ctx._tool_defs, system=system,
                             progress_cb=progress,
                         )
@@ -1360,7 +1351,7 @@ def _request_turn(
                     return _Turn(tool_calls, raw, text_from_native, None, linearized_messages)
                 if linearized_messages is None:
                     linearized_messages = _linearize_native_turns(state.messages)
-                raw = ctx.llm.chat_with_fallback(
+                raw = ctx.llm.chat(
                     linearized_messages, system=system, progress_cb=progress, json_mode=True,
                 )
             if raw.strip():
@@ -1583,7 +1574,7 @@ def _run_single_step(
     user_goal: str,
     run_start: float,
     progress: Callable[[str], None],
-    supports_native_fallback: bool,
+    supports_native: bool,
 ) -> _StepResult:
     """Execute one ReAct step and return a control result for the outer loop.
 
@@ -1661,7 +1652,7 @@ def _run_single_step(
 
     turn = _request_turn(
         ctx, state, system, progress,
-        supports_native_fallback=supports_native_fallback,
+        supports_native=supports_native,
     )
     if turn.early_return is not None:
         return _StepResult(early_return=turn.early_return)
@@ -1779,9 +1770,9 @@ def _react_loop_owned(
         if ctx.owns_cancel_event:
             ctx.cancel_event.clear()
 
-        _supports_native_fallback = hasattr(ctx.llm, "chat_with_tools_fallback") and callable(
-            ctx.llm.chat_with_tools_fallback
-        )
+        # Native capability is only a local lookup of the canonical callable; the
+        # probe never invokes the provider or sends a request.
+        _supports_native = callable(getattr(ctx.llm, "chat_with_tools", None))
 
         _register_turn(ctx)
         if ctx.cancel_event.is_set():
@@ -1827,7 +1818,7 @@ def _react_loop_owned(
         while True:
             result = _run_single_step(
                 ctx, state, system, user_goal, run_start, _progress,
-                supports_native_fallback=_supports_native_fallback,
+                supports_native=_supports_native,
             )
             if result.early_return is not None:
                 return result.early_return

@@ -44,7 +44,7 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 from outcome_utils import read_execution
 from react_loop import ReactContext
 from sub_agent_registry import get_registry
@@ -89,9 +89,9 @@ class _NoDiscovery:
 class _Registry(ModelRegistry):
     """Real registry that records every admission around the real implementation."""
 
-    def __init__(self, *args: object) -> None:
+    def __init__(self, *args: object, **kwargs: object) -> None:
         """Build the real registry and empty admission records."""
-        super().__init__(*args)
+        super().__init__(*args, **kwargs)
         self.admits: list[object] = []
         self.errors: list[str] = []
         self.scheduled_calls = 0
@@ -206,17 +206,15 @@ class _World:
         self.embed_http: list[httpx.Client] = []
         self.usage = TokenUsageRegistry()
         providers = {n: ProviderConfig(n, "openai", f"env:KEY_{n}", URLS[n], 9) for n in URLS}
-        self.settings_path = tmp_path / "models-config.toml"
-        settings = ModelSettings(self.settings_path)
-        settings.write(CatalogDocument(
-            1, 2, None,
-            tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+        self.stores = stores = ModelStores.at(tmp_path)
+        stores.cache.write(CatalogDocument(
+            1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
             (MODEL_A, MODEL_B),
         ))
-        self.registry = _Registry(providers, settings, _NoDiscovery(), self._resolve)
+        self.registry = _Registry(providers, stores.cache, _NoDiscovery(), self._resolve, preference=stores.preference)
         if select:
             self.registry.select(MODEL_A.id)
-        self.document = self.settings_path.read_bytes()
+        self.document = self.stores.snapshot()
         monkeypatch.setattr(agent_controller, "LLMClient", self._make_llm)
 
         self.factory = _OrdinaryFactory(self.registry)
@@ -313,7 +311,7 @@ def _assert_nothing_allocated(world: _World, active_before: int) -> None:
     assert world.chat_requests == [] and world.embed_requests == []
     assert len(get_registry().list_active()) == active_before
     assert world.registry.scheduled_calls == 0
-    assert world.settings_path.read_bytes() == world.document
+    assert world.stores.snapshot() == world.document
 
 
 def _assert_one_closed_run_on(
@@ -339,7 +337,7 @@ def _assert_one_closed_run_on(
     assert get_registry().get(runner.agent_id) is None
     assert world.registry.view().active_model_id == main
     assert world.registry.scheduled_calls == 0
-    assert world.settings_path.read_bytes() == world.document
+    assert world.stores.snapshot() == world.document
     return request
 
 
@@ -422,7 +420,7 @@ def test_spawn_explicit_b_with_main_a_completes_through_supervisor(
 
     def main_state() -> tuple[str | None, bool]:
         return (world.registry.view().active_model_id,
-                world.settings_path.read_bytes() == world.document)
+                world.stores.snapshot() == world.document)
 
     def result_log(**fields: object) -> None:
         try:

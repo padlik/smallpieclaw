@@ -8,13 +8,18 @@ Delivery is best-effort; job history is authoritative.
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import threading
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telegram.constants import ParseMode
 
+from model_registry import ModelRegistry
+from tests.model_stores import ModelStores
 from telegram_formatter import ResultNotice, details_callback_data, format_result_notice
 from telegram_interface import TelegramInterface
 
@@ -27,9 +32,15 @@ _CONFIG = {
 }
 
 
+def _empty_registry() -> ModelRegistry:
+    """A real registry with no connections over absent stores (construction only reads)."""
+    absent = Path(tempfile.gettempdir()) / f"no-model-stores-{uuid.uuid4().hex}"
+    return ModelStores.at(absent).registry({}, SimpleNamespace(fetch=None), lambda _config: None)
+
+
 def _make_iface(scheduler=None) -> TelegramInterface:
     """Real interface (no bot built) with a recording send_message."""
-    iface = TelegramInterface(_CONFIG, MagicMock(return_value="done"), scheduler=scheduler)
+    iface = TelegramInterface(_CONFIG, MagicMock(return_value="done"), scheduler=scheduler, model_registry=_empty_registry())
     iface._app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
     iface._loop = asyncio.get_running_loop()
     return iface
@@ -155,7 +166,7 @@ async def test_oversized_notice_is_sent_as_a_fitting_message():
 
 def _make_startup_iface() -> TelegramInterface:
     """Interface whose loop has not started yet, so enqueue can only queue."""
-    iface = TelegramInterface(_CONFIG, MagicMock(return_value="done"))
+    iface = TelegramInterface(_CONFIG, MagicMock(return_value="done"), model_registry=_empty_registry())
     iface._app = SimpleNamespace(
         bot=SimpleNamespace(send_message=AsyncMock(), set_my_commands=AsyncMock()),
     )
@@ -312,7 +323,7 @@ async def test_idle_transition_is_serialized_against_turn_admission():
 def test_interface_installs_itself_as_scheduler_notice_sink():
     scheduler = MagicMock()
 
-    iface = TelegramInterface(_CONFIG, MagicMock(), scheduler=scheduler)
+    iface = TelegramInterface(_CONFIG, MagicMock(), scheduler=scheduler, model_registry=_empty_registry())
 
     scheduler.set_result_notice_sink.assert_called_once_with(iface.enqueue_scheduled_notice)
 

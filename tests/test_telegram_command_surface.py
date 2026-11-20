@@ -1462,12 +1462,12 @@ class TestJobsHelpDiscovery:
 # Registry-backed /status and /context (no standing llm_client)
 # ---------------------------------------------------------------------------
 #
-# A real ModelRegistry/ModelSettings with the FakeDiscovery boundary from
+# A real ModelRegistry over a real ModelCache/ModelPreference with the FakeDiscovery boundary from
 # tests/test_telegram_models.py supplies the current selection. The legacy
 # client below stands in for a stale pre-registry ``iface.llm_client``.
 
 _SEL_ACTIVE_ID = "p/alpha"
-_SEL_GONE_ID = "p/gone"
+_SEL_GONE_ID = "q/gone"  # saved selection naming a connection that is no longer configured
 _SEL_STATES = ("active", "no_selection", "saved_selection_unavailable")
 #: Fragments that must name the current selection state, per registry state.
 _SEL_EXPECTED = {
@@ -1497,27 +1497,28 @@ class _MonitoredAgent:
 
 
 def _selection_registry(tmp_path: Path, state: str):
-    """Return ``(registry, settings_path)`` restored into *state* after a real refresh."""
+    """Return ``(registry, stores)`` restored into *state* after a real refresh."""
     from model_registry import CatalogDocument, ProviderState
 
     from tests.test_telegram_models import _inventory, _make_registry, _model, _provider_config
 
     provider = _provider_config("p")
     alpha = _model("alpha", "p", context_tokens=1000)
-    gone = _model("gone", "p", context_tokens=1000)
-    default = {"active": _SEL_ACTIVE_ID, "no_selection": None,
-               "saved_selection_unavailable": _SEL_GONE_ID}[state]
+    saved = {"active": _SEL_ACTIVE_ID, "no_selection": None,
+             "saved_selection_unavailable": _SEL_GONE_ID}[state]
     seed = CatalogDocument(
-        1, 1, default,
-        (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
-        (alpha, gone),
+        1, 1, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+        (alpha,) if state != "no_selection" else (),
     )
-    registry, _settings, discovery = _make_registry(tmp_path, (provider,), seed_document=seed)
-    discovery.responses["p"] = _inventory("p", (alpha,))  # the refresh drops p/gone
+    registry, stores, discovery = _make_registry(
+        tmp_path, (provider,), seed_document=seed, remembered=saved,
+    )
+    # no_selection: nothing cached or discovered, so there is no automatic choice either.
+    discovery.responses["p"] = _inventory("p", (alpha,) if state != "no_selection" else ())
     registry.refresh()
     registry.restore_selection()
     assert registry.view().selection_status == state
-    return registry, tmp_path / "models-config.toml"
+    return registry, stores
 
 
 def _run_registry_command(handler, iface) -> str:
@@ -1564,8 +1565,8 @@ class TestRegistryBackedStatus:
     def test_status_shows_registry_selection_without_standing_client(self, tmp_path, state, standing_client):
         from telegram_commands import cmd_status
 
-        registry, settings_path = _selection_registry(tmp_path, state)
-        before = settings_path.read_bytes()
+        registry, stores = _selection_registry(tmp_path, state)
+        before = stores.snapshot()
         iface = _make_iface()
         iface.model_registry = registry
         iface.llm_client = _LegacyClient() if standing_client else None
@@ -1580,7 +1581,7 @@ class TestRegistryBackedStatus:
             assert _SEL_ACTIVE_ID not in llm_line
         # Presentation never selects a model or rewrites the saved selection.
         assert registry.view().selection_status == state
-        assert settings_path.read_bytes() == before
+        assert stores.snapshot() == before
 
     def test_status_without_registry_keeps_legacy_client_label(self):
         from telegram_commands import cmd_status
@@ -1640,8 +1641,8 @@ class TestRegistryBackedContext:
     def test_context_labels_current_registry_selection(self, tmp_path, state, standing_client):
         from telegram_commands import cmd_context
 
-        registry, settings_path = _selection_registry(tmp_path, state)
-        before = settings_path.read_bytes()
+        registry, stores = _selection_registry(tmp_path, state)
+        before = stores.snapshot()
         iface = _make_iface()
         iface.model_registry = registry
         iface.llm_client = _LegacyClient() if standing_client else None
@@ -1658,7 +1659,7 @@ class TestRegistryBackedContext:
         for fragment in self._LAYOUT:
             assert fragment in text, fragment
         assert registry.view().selection_status == state
-        assert settings_path.read_bytes() == before
+        assert stores.snapshot() == before
 
     def test_context_without_registry_keeps_legacy_client_label(self):
         from telegram_commands import cmd_context
@@ -1735,8 +1736,8 @@ class TestOrdinaryRequestErrorPresentation:
     def test_no_active_selection_offers_models_selection_and_finalizes_failed(self, tmp_path, state):
         from model_registry import ModelRegistryError
 
-        registry, settings_path = _selection_registry(tmp_path, state)
-        before = settings_path.read_bytes()
+        registry, stores = _selection_registry(tmp_path, state)
+        before = stores.snapshot()
         raised: list[BaseException] = []
 
         def handler(*_args, **_kwargs):
@@ -1756,7 +1757,7 @@ class TestOrdinaryRequestErrorPresentation:
         assert prompt_status == "failed"
         # Guidance only: no automatic substitution or saved-selection change.
         assert registry.view().active_model_id is None
-        assert settings_path.read_bytes() == before
+        assert stores.snapshot() == before
 
     @pytest.mark.parametrize("kind", ["unrelated_runtime_error", "other_registry_error"])
     def test_other_errors_keep_existing_presentation(self, tmp_path, kind):

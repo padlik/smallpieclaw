@@ -482,7 +482,7 @@ class TestRootStartupComposition:
         assert tuple(m.id for m in view.models) == DISCOVERED
         assert {p.provider_id: p.status for p in view.providers} == {"acme": "fresh", "gem": "fresh"}
         saved = ModelCache(root.paths.models_cache_file).load()
-        assert saved.status == "valid" and saved.document.default_model is None
+        assert saved.status == "valid"
         assert not root.paths.model_selection_file.exists()  # the automatic choice is never saved
         assert view.remembered_model_id is None
         assert tuple(m.id for m in saved.document.models) == DISCOVERED
@@ -512,8 +512,9 @@ class TestRootStartupComposition:
         assert "https://" not in text and "sec:" not in text and "env:" not in text
         assert ModelCache(paths.models_cache_file).load().status == "valid"
         # The retired combined file is neither read, adopted, rewritten nor backed up.
-        assert paths.models_config_file.read_bytes() == legacy
-        assert sorted(p.name for p in paths.models_config_file.parent.iterdir() if "models-config" in p.name) == [
+        legacy_file = paths.config_home / "models-config.toml"
+        assert legacy_file.read_bytes() == legacy
+        assert sorted(p.name for p in legacy_file.parent.iterdir() if "models-config" in p.name) == [
             "models-config.toml"
         ]
         # Discovery never writes the deliberate preference.
@@ -578,7 +579,6 @@ class TestRootStartupComposition:
             "no_selection" if remembered_for(saved_default) is None else "saved_selection_unavailable"
         )
         saved = ModelCache(root.paths.models_cache_file).load().document
-        assert saved.default_model is None
         preference = ModelPreference(root.paths.model_selection_file).load()
         assert preference.model == remembered_for(saved_default)
         assert preference.status == ("corrupt" if saved_default == INVALID_SAVED else "valid")
@@ -1182,8 +1182,6 @@ class TestRootStartupComposition:
         assert outcome["active_after_select"] == MAIN_ID
         # The deliberate /models choice is durable only in the XDG preference file.
         assert root.paths.model_selection_file.read_bytes() == f'model = "{MAIN_ID}"\n'.encode()
-        saved = ModelCache(root.paths.models_cache_file).load().document
-        assert saved.default_model is None
 
         # After selection: one run on the explicitly selected pin, one upstream request.
         (call,) = boundary.calls
@@ -2056,7 +2054,7 @@ class TestRootGraphStartupContainment:
         assert view.active_model_id == MAIN_ID and view.remembered_model_id is None
         assert not root.paths.model_selection_file.exists()
         saved = ModelCache(root.paths.models_cache_file).load().document
-        assert saved.default_model is None and GRAPH_ID not in {m.id for m in saved.models}
+        assert GRAPH_ID not in {m.id for m in saved.models}
         assert root.llm_clients == [] and root.main_controller.llm is None
         assert [r for r in root.requests if r.method == "POST" and r.url.host != EMBED_HOST] == []
         assert root.unexpected == [] and root.open_clients_at_exit == []
@@ -2165,8 +2163,6 @@ class TestRootGraphStartupContainment:
             # Main stays inactive: no fallback, no default, no chat client, no inference.
             view = root.registry.view()
             assert view.active_model_id is None and view.remembered_model_id is None
-            saved = ModelCache(root.paths.models_cache_file).load().document
-            assert saved.default_model is None
             assert outcome["clients_at_hold"] == 0 and root.llm_clients == []
             assert root.main_controller.llm is None
             assert [r for r in root.requests if r.method == "POST" and r.url.host != EMBED_HOST] == []
@@ -2243,7 +2239,7 @@ class TestRootManagedSettingsStartup:
                 for p in sorted(settings_path.parent.glob(f"{settings_path.name}.corrupt*"))
             }
 
-        # Delegating observers on the real ModelSettings read and the real FS replace.
+        # Delegating observers on the real ModelCache read and the real FS replace.
         loads: list[SimpleNamespace] = []
         real_load = ModelCache.load
 
@@ -2349,14 +2345,14 @@ class TestRootManagedSettingsStartup:
             assert command_write.target == write.incoming
             assert command_write.backups == write.backups
 
-            # The first (startup) payload, parsed by the real ModelSettings off the
+            # The first (startup) payload, parsed by the real ModelCache off the
             # production path, is a valid fresh catalog with no Main/default.
             expected = DISCOVERED  # graph extraction is never a catalog record (task 5.2)
             startup_copy = tmp_path / "phase-check" / "startup-payload.json"
             startup_copy.parent.mkdir()
             startup_copy.write_bytes(write.incoming)
             startup = ModelCache(startup_copy).load()
-            assert startup.status == "valid" and startup.document.default_model is None
+            assert startup.status == "valid"
             assert tuple(m.id for m in startup.document.models) == expected
             assert {p.status for p in startup.document.providers} == {"fresh"}
 
@@ -2364,7 +2360,7 @@ class TestRootManagedSettingsStartup:
             # one revision after startup, still no Main/default.
             assert settings_path.read_bytes() == command_write.incoming
             final = ModelCache(settings_path).load()
-            assert final.status == "valid" and final.document.default_model is None
+            assert final.status == "valid"
             assert final.document.models == startup.document.models
             assert tuple(m.id for m in final.document.models) == expected
             assert {p.status for p in final.document.providers} == {"fresh"}
@@ -2572,7 +2568,7 @@ class TestRootInitialCacheChoice:
 
 
 # ---------------------------------------------------------------------------
-# Task 10.3: the retired combined models-config.toml is only existence-checked
+# Task 3.2: a leftover models-config.toml is ignored completely
 # ---------------------------------------------------------------------------
 
 _RETIRED_CANARY = "sk-RETIRED0123456789canary"
@@ -2638,7 +2634,7 @@ def _lstat_fingerprint(path: Path) -> tuple[int, ...]:
 
 
 class TestRetiredCombinedCatalogFile:
-    """Real ``main._run`` startup: only an existence probe and one /models notice."""
+    """Real ``main._run`` startup: a leftover ``models-config.toml`` is never contacted or announced."""
 
     @staticmethod
     def _spy_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -2653,142 +2649,52 @@ class TestRetiredCombinedCatalogFile:
         return messages
 
     @staticmethod
-    def _forbid_settings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-        import model_settings
-
-        constructed: list[str] = []
-
-        def tripwire(self: object, path: object, *a: object, **k: object) -> None:
-            constructed.append(os.fspath(path))  # type: ignore[arg-type]
-            raise AssertionError("ModelSettings must not be constructed at runtime")
-
-        monkeypatch.setattr(model_settings.ModelSettings, "__init__", tripwire)
-        return constructed
-
-    @staticmethod
     def _prepare(root: RootHarness) -> Path:
-        retired = root.paths.models_config_file
-        retired.parent.mkdir(parents=True, exist_ok=True)
-        return retired
-
-    def _assert_one_notice(self, messages: list[str], retired: Path) -> None:
-        mine = [m for m in messages if str(retired) in m]
-        assert len(mine) == 1, messages
-        assert "/models" in mine[0] and "models-config.toml" in mine[0]
-        assert all(_RETIRED_CANARY not in m for m in messages)
+        legacy = root.paths.config_home / "models-config.toml"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        return legacy
 
     @pytest.mark.parametrize("kind", sorted(_RETIRED_CONTENTS))
-    def test_existing_file_gets_one_path_naming_notice_and_is_never_touched(
+    def test_existing_file_is_never_read_written_or_deleted_and_emits_no_notice(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch, kind: str,
     ) -> None:
-        retired = self._prepare(root_harness)
-        retired.write_bytes(_RETIRED_CONTENTS[kind])
-        before, fingerprint = retired.read_bytes(), _lstat_fingerprint(retired)
-        siblings = sorted(p.name for p in retired.parent.iterdir())
-        contacts = _install_contact_traps(monkeypatch, retired)
-        constructed = self._forbid_settings(monkeypatch)
+        legacy = self._prepare(root_harness)
+        legacy.write_bytes(_RETIRED_CONTENTS[kind])
+        before, fingerprint = legacy.read_bytes(), _lstat_fingerprint(legacy)
+        contacts = _install_contact_traps(monkeypatch, legacy)
         messages = self._spy_warnings(monkeypatch)
 
         root_harness.start(saved_default=None, write_cache=False)
 
-        assert contacts == [] and constructed == []
-        self._assert_one_notice(messages, retired)
+        assert contacts == []
+        assert not any("models-config" in m or str(legacy) in m for m in messages), messages
+        assert all(_RETIRED_CANARY not in m for m in messages)
         contacts.armed = False
-        assert retired.read_bytes() == before and _lstat_fingerprint(retired) == fingerprint
-        assert [n for n in sorted(p.name for p in retired.parent.iterdir()) if "models-config" in n] == [
-            "models-config.toml"
-        ]
-        assert set(siblings) <= {p.name for p in retired.parent.iterdir()}
-        # The notice never derives or saves a selection.
+        assert legacy.read_bytes() == before and _lstat_fingerprint(legacy) == fingerprint
+        # The leftover never derives or saves a selection.
         assert not root_harness.paths.model_selection_file.exists()
         assert root_harness.registry.view().active_model_id == min(DISCOVERED)
 
-    def test_absent_file_emits_no_notice_and_is_not_created(
+    def test_absent_file_is_not_created_and_emits_no_notice(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        retired = root_harness.paths.models_config_file
-        contacts = _install_contact_traps(monkeypatch, retired)
+        legacy = root_harness.paths.config_home / "models-config.toml"
+        contacts = _install_contact_traps(monkeypatch, legacy)
         messages = self._spy_warnings(monkeypatch)
 
         root_harness.start(saved_default=None, write_cache=False)
 
         assert contacts == []
         assert not any("models-config" in m for m in messages)
-        assert not retired.exists()
+        assert not legacy.exists()
 
-    def test_unreadable_mode_file_is_noticed_without_any_open(
-        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        retired = self._prepare(root_harness)
-        retired.write_bytes(_RETIRED_CONTENTS["secret-like"])
-        retired.chmod(0)
-        fingerprint = _lstat_fingerprint(retired)
-        contacts = _install_contact_traps(monkeypatch, retired)
-        try:
-            messages = self._spy_warnings(monkeypatch)
-            root_harness.start(saved_default=None, write_cache=False)
-            assert contacts == []
-            contacts.armed = False
-            self._assert_one_notice(messages, retired)
-            assert _lstat_fingerprint(retired) == fingerprint
-        finally:
-            contacts.armed = False
-            retired.chmod(0o600)
-
-    def test_directory_at_the_retired_path_is_noticed_and_left_alone(
-        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        retired = self._prepare(root_harness)
-        retired.mkdir()
-        contacts = _install_contact_traps(monkeypatch, retired)
-        messages = self._spy_warnings(monkeypatch)
-        root_harness.start(saved_default=None, write_cache=False)
-        contacts.armed = False
-        assert contacts == [] and retired.is_dir() and list(retired.iterdir()) == []
-        self._assert_one_notice(messages, retired)
-
-    def test_symlink_is_noticed_and_its_target_never_read(
-        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        retired = self._prepare(root_harness)
-        target = tmp_path / "elsewhere.toml"
-        target.write_bytes(_RETIRED_CONTENTS["secret-like"])
-        retired.symlink_to(target)
-        before, fingerprint = target.read_bytes(), _lstat_fingerprint(target)
-        contacts = _install_contact_traps(monkeypatch, retired, target)
-        messages = self._spy_warnings(monkeypatch)
-        root_harness.start(saved_default=None, write_cache=False)
-        assert contacts == []
-        contacts.armed = False
-        self._assert_one_notice(messages, retired)
-        assert os.path.islink(retired) and os.readlink(retired) == str(target)
-        assert target.read_bytes() == before and _lstat_fingerprint(target) == fingerprint
-
-    def test_notice_is_not_repeated_by_later_catalog_work(
-        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        retired = self._prepare(root_harness)
-        retired.write_bytes(_RETIRED_CONTENTS["valid-catalog"])
-        messages = self._spy_warnings(monkeypatch)
-
-        def hold(root: RootHarness) -> None:
-            root.registry.refresh()
-            root.registry.select(OTHER_ID)
-
-        root_harness.start(saved_default=None, write_cache=False, hold=hold)
-        self._assert_one_notice(messages, retired)
-        assert root_harness.registry.view().active_model_id == OTHER_ID
-
-    def test_only_the_startup_existence_probe_references_the_retired_path_in_production(self) -> None:
-        """Production names ``models_config_file`` only in ``xdg`` (path) and ``main`` (probe)."""
+    def test_production_sources_no_longer_reference_the_retired_file(self) -> None:
         repo = Path(main_mod.__file__).resolve().parent
-        hits: dict[str, int] = {}
-        for source in sorted(repo.glob("*.py")) + sorted(repo.glob("*/*.py")):
-            if "tests" in source.parts or ".venv" in source.parts:
-                continue
-            count = source.read_text(encoding="utf-8").count("models_config_file")
-            if count:
-                hits[source.relative_to(repo).as_posix()] = count
-        assert set(hits) == {"xdg.py", "main.py"}, hits
-        probe = Path(main_mod.__file__).read_text(encoding="utf-8")
-        assert probe.count("models_config_file") == 1
+        offenders = [
+            source.relative_to(repo).as_posix()
+            for source in sorted(repo.glob("*.py")) + sorted(repo.glob("*/*.py"))
+            if "tests" not in source.parts and ".venv" not in source.parts
+            and ("models_config_file" in source.read_text(encoding="utf-8")
+                 or "models-config" in source.read_text(encoding="utf-8"))
+        ]
+        assert offenders == []

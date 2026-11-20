@@ -65,7 +65,6 @@ def mock_llm_response():
             response_json = json.dumps(response_json)
         mock = MagicMock()
         mock.chat.return_value = response_json
-        mock.chat_with_fallback.return_value = response_json
         mock.embed.return_value = [0.1] * 128
         return mock
     return _factory
@@ -181,7 +180,7 @@ def make_builtin_executor(tmp_path):
         "tool_timeout", "max_output_size", "top_tools", "ctx_max_tokens",
         "compaction_threshold_tokens", "required_output_cap_tokens",
         "max_subagents", "subagent_result_timeout", "long_run_warn_minutes",
-        "diagnose_empty_responses", "default_model", "background_model",
+        "default_model", "background_model",
         "fallback_models", "shell_backend", "shell_pty_cols",
         "shell_pty_rows", "shell_streaming", "shell_nsjail_confirm_mode",
         "shell_nsjail_memory_mb", "shell_nsjail_pids_max",

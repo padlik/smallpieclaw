@@ -17,9 +17,9 @@ Architecture
   writes them to the store without blocking the agent turn
 - parse_extraction()  : JSON triplet parser (no Pydantic required)
 - format_for_prompt() : assemble graph context string for system prompt injection
-- resolve_graph_prerequisites() : data-only startup check that pins the graph
-  extraction model and verifies the
-  embedding configuration; it creates no graph client, store or writer
+- resolve_graph_startup() : data-only startup check that pins the explicit graph
+  extraction route and verifies the embedding configuration; it creates no
+  graph client, store or writer
 
 Three-layer schema
 ------------------
@@ -49,7 +49,7 @@ from providers._errors import LLMError
 
 if TYPE_CHECKING:
     from config_schema import AgentConfig, AppConfig
-    from model_registry import ModelRegistry, RunModel
+    from model_registry import RunModel
 
 logger = logging.getLogger(__name__)
 
@@ -1522,57 +1522,6 @@ class GraphPrerequisites:
     pin: RunModel
     embedding_provider: str
     embedding_model: str
-
-
-def resolve_graph_prerequisites(
-    app_cfg: AppConfig,
-    registry: ModelRegistry,
-    *,
-    vault_file: str | None = None,
-) -> GraphPrerequisites:
-    """Pin the graph model and verify embeddings once.
-
-    This is data-only preparation: it never checks ``graph_memory.enabled``
-    (the caller decides whether graph memory runs), refreshes no catalog,
-    writes no settings, and creates no graph LLM client, store or writer.
-    The temporary embedding client used for the availability check is always
-    closed and never returned. Raises ``GraphPrerequisiteError`` on failure.
-    """
-    from model_registry import ModelRegistryError
-
-    try:
-        pin = registry.resolve_graph_model(app_cfg.graph_memory.extraction_model)
-    except ModelRegistryError as exc:
-        raise GraphPrerequisiteError(
-            exc.code,
-            "graph memory extraction model is unusable: set graph_memory.extraction_model "
-            "to an exact catalog model ID (see /models), refresh with /models refresh, "
-            "and check the provider credentials",
-        ) from None
-
-    _probe_embeddings_with_client(app_cfg, vault_file)
-    return GraphPrerequisites(pin, app_cfg.embeddings.provider, app_cfg.embeddings.model)
-
-
-def _probe_embeddings_with_client(app_cfg: AppConfig, vault_file: str | None) -> None:
-    """Legacy catalog-path check: verify embeddings with a short-lived client.
-
-    Used only by ``resolve_graph_prerequisites`` (retired with the legacy registry
-    helpers); graph startup and live backfill use the pure ``_require_embeddings``.
-    """
-    from embedding_client import EmbeddingClient
-
-    client = EmbeddingClient(app_cfg.embeddings, vault_file=vault_file)
-    try:
-        available = client.available
-    finally:
-        client.close()
-    if not available:
-        raise GraphPrerequisiteError(
-            "embedding_unavailable",
-            "graph memory requires embeddings: configure [embeddings] provider, "
-            "base_url, api_key and model explicitly",
-        )
 
 
 def _require_embeddings(app_cfg: AppConfig, vault_file: str | None) -> None:

@@ -36,40 +36,24 @@ class ModelDiscoveryError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class GoogleModelDescriptor:
-    """Google-only discovery details that are not part of the managed model schema."""
-
-    canonical_id: str
-    resource_name: str
-    generation_methods: tuple[str, ...] | None
-
-    def __post_init__(self) -> None:
-        """Copy generation methods into an immutable tuple when present."""
-        if self.generation_methods is not None:
-            object.__setattr__(self, "generation_methods", tuple(self.generation_methods))
-
-
-@dataclass(frozen=True)
 class ProviderInventory:
-    """A fully fetched immutable inventory and adapter descriptors."""
+    """A fully fetched immutable provider inventory."""
 
     provider_id: str
     adapter: str
     models: tuple[ModelRecord, ...]
     last_success_at: str
-    descriptors: tuple[GoogleModelDescriptor, ...] = ()
 
     def __post_init__(self) -> None:
         """Copy inventory collections to prevent retaining mutable caller aliases."""
         object.__setattr__(self, "models", tuple(self.models))
-        object.__setattr__(self, "descriptors", tuple(self.descriptors))
 
     def __repr__(self) -> str:
         """Return inventory identity without any connection or credential fields."""
         return (
             f"ProviderInventory(provider_id={self.provider_id!r}, adapter={self.adapter!r}, "
             f"models={self.models!r}, "
-            f"last_success_at={self.last_success_at!r}, descriptors={self.descriptors!r})"
+            f"last_success_at={self.last_success_at!r})"
         )
 
 
@@ -117,23 +101,21 @@ class ModelDiscovery:
             raise ModelDiscoveryError("provider_request_failed") from None
 
         # Whole raw candidates are checked for the resolved credential before any
-        # descriptor is built or any field is discarded or normalized.
+        # structural check runs or any field is discarded or normalized.
         secret = api_key if isinstance(api_key, str) and api_key else None
         for row in raw_models:
             _reject_credential_in_json(row, secret, lambda: self._remaining(deadline))
         self._remaining(deadline)
-        descriptors = (
-            tuple(_google_descriptor(provider_id, row) for row in raw_models)
-            if adapter == "google"
-            else ()
-        )
+        if adapter == "google":
+            for row in raw_models:
+                _validate_google_row(row)
         models = tuple(_normalize_model(provider_id, adapter, row) for row in raw_models)
         self._remaining(deadline)
         if len({model.id for model in models}) != len(models):
             raise ModelDiscoveryError("duplicate_model")
         fetched_at = _timestamp(self._clock)
         self._remaining(deadline)
-        return ProviderInventory(provider_id, adapter, models, fetched_at, descriptors)
+        return ProviderInventory(provider_id, adapter, models, fetched_at)
 
     def _remaining(self, deadline: float) -> float:
         """Return the positive remaining elapsed budget or fail with a fixed code."""
@@ -360,19 +342,16 @@ def _reject_credential_in_json(value: Any, secret: str | None, tick: Callable[[]
             raise ModelDiscoveryError("invalid_response")
 
 
-def _google_descriptor(provider_id: str, row: dict[str, Any]) -> GoogleModelDescriptor:
-    """Retain Google resource and generation-method values without inference semantics."""
-    upstream_id = row.get("baseModelId")
-    resource_name = row.get("name")
-    upstream_id = _safe_response_string(upstream_id, "upstream_id")
-    resource_name = _safe_response_string(resource_name, "resource_name")
-    methods: tuple[str, ...] | None = None
+def _validate_google_row(row: dict[str, Any]) -> None:
+    """Reject a Google row whose resource, base model id or generation methods are malformed."""
+    _safe_response_string(row.get("baseModelId"), "upstream_id")
+    _safe_response_string(row.get("name"), "resource_name")
     if "supportedGenerationMethods" in row:
         raw_methods = row["supportedGenerationMethods"]
         if not isinstance(raw_methods, list):
             raise ModelDiscoveryError("invalid_response")
-        methods = tuple(_safe_response_string(method, "generation_method") for method in raw_methods)
-    return GoogleModelDescriptor(f"{provider_id}/{upstream_id}", resource_name, methods)
+        for method in raw_methods:
+            _safe_response_string(method, "generation_method")
 
 
 def _positive_optional(row: dict[str, Any], key: str, values: dict[str, Any], target: str) -> None:

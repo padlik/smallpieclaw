@@ -47,7 +47,8 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelCache, ModelSettings
+from model_settings import ModelCache
+from tests.model_stores import ModelStores
 from providers._errors import LLMCancelledError
 from react_loop import ReactContext
 from sub_agent_registry import get_registry
@@ -115,15 +116,14 @@ class _NoDiscovery:
 
 def _registry(tmp_path: Path, *, select: ModelRecord | None = MODEL_A) -> ModelRegistry:
     providers = {name: _provider(name) for name in ("pa", "pb")}
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(
         CatalogDocument(
-            1, 2, None,
-            tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+            1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
             (MODEL_A, MODEL_B),
         )
     )
-    registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+    registry = stores.registry(providers, _NoDiscovery(), _resolve)
     if select is not None:
         registry.select(select.id)
     return registry
@@ -1040,7 +1040,7 @@ def test_root_pins_survive_later_main_selection_and_real_refresh(
     assert after_models[MAIN_ID].metadata.output_tokens == 1024
     assert after_models[MAIN_ID].metadata.input_tokens == 50_000
     saved = outcome["saved_after"]
-    assert saved.status == "valid" and saved.document.default_model is None
+    assert saved.status == "valid"
     assert outcome["preference_after"] == f'model = "{OTHER_ID}"\n'.encode()
     # The disposable cache stores no revision; it holds the refreshed Main limits.
     assert {m.id: m.metadata.output_tokens for m in saved.document.models}[MAIN_ID] == 1024

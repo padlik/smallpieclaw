@@ -38,7 +38,6 @@ def _paths_for(state_dir) -> XDGPaths:
         config_file=state_dir / "config.toml",
         model_selection_file=state_dir / "model-selection.toml",
         models_cache_file=state_dir / "models-cache.json",
-        models_config_file=state_dir / "models.toml",
         scheduler_config=state_dir / "scheduler.toml",
         memory_file=state_dir / "memory.json",
         graph_memory_db=state_dir / "graph_memory",

@@ -26,8 +26,8 @@ from conversation_io import _save_conversation as save_conversation
 from llm_client import LLMCancelledError, LLMError
 from config_schema import ProviderConfig
 from memory_store import ShortTermMemory
-from model_registry import CatalogDocument, ModelMetadata, ModelRecord, ModelRegistry, ProviderState
-from model_settings import ModelSettings
+from model_registry import CatalogDocument, ModelMetadata, ModelRecord, ProviderState
+from tests.model_stores import ModelStores
 from telegram_commands import cmd_compress
 from tests.test_main_run_admission import _Memory, _NullToolIndex
 from tests import test_manual_compress_7_2 as base
@@ -456,11 +456,11 @@ SDK_CANARY = f"ORACLE_UNREGISTERED_PROVIDER_CANARY {CANARY_KEY} {CANARY_URL}"
 def ollama_world(world):
     """Root factory over a REAL official-cloud Ollama provider (real SDK client, counted MockTransport)."""
     providers = {"po": ProviderConfig("po", "ollama", "env:KEY_po", "https://ollama.com", 9)}
-    settings = ModelSettings(world.tmp_path / "ollama-models.toml")
-    settings.write(CatalogDocument(
-        1, 2, None, (ProviderState("po", "ollama", "2026-09-01T00:00:00Z", "fresh"),), (OLLAMA_MODEL,),
+    stores = ModelStores.at(world.tmp_path, "ollama")
+    stores.cache.write(CatalogDocument(
+        1, 2, (ProviderState("po", "ollama", "2026-09-01T00:00:00Z", "fresh"),), (OLLAMA_MODEL,),
     ))
-    registry = ModelRegistry(providers, settings, base._NoDiscovery(), base._resolve)
+    registry = stores.registry(providers, base._NoDiscovery(), base._resolve)
     registry.select(OLLAMA_MODEL.id)
     world.controller._run_client_factory = main._make_run_client_factory(registry, base.AGENT, world.embedding)
     return world

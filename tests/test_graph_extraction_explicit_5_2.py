@@ -193,7 +193,7 @@ class TestResolveGraphStartup:
             raise AssertionError("no client/registry may be touched for invalid extraction settings")
 
         monkeypatch.setattr(EmbeddingClient, "__init__", forbidden)
-        monkeypatch.setattr(ModelRegistry, "resolve_graph_model", forbidden)
+        monkeypatch.setattr(ModelRegistry, "__init__", forbidden)
         app_cfg = _parse(_graph_section(extraction_api_key=None))
         with pytest.raises(GraphPrerequisiteError) as info:
             graph_memory.resolve_graph_startup(app_cfg, vault_file=None)
@@ -211,7 +211,7 @@ class TestResolveGraphStartup:
     def test_valid_settings_build_a_private_pin_without_a_catalog(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("FIVE2_GRAPH_SECRET_VAR", GRAPH_KEY)
         monkeypatch.setattr(
-            ModelRegistry, "resolve_graph_model",
+            ModelRegistry, "__init__",
             lambda *_a, **_k: pytest.fail("graph extraction must not consult the catalog"),
         )
         monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda *_a, **_k: httpx.Response(200, json={}))
@@ -303,7 +303,7 @@ class TestExtractionWireIsolation:
         self, wire: _Wire, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            ModelRegistry, "resolve_graph_model",
+            ModelRegistry, "__init__",
             lambda *_a, **_k: pytest.fail("graph extraction must not consult the catalog"),
         )
         app_cfg = _parse(_graph_section())

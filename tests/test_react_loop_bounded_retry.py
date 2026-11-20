@@ -57,12 +57,12 @@ class ScriptedRequestLLM:
         self._record(mode)
         return result
 
-    def chat_with_fallback(self, *args, **kwargs):
+    def chat(self, *args, **kwargs):
         del args, kwargs
         self.json_calls += 1
         return self._take(self.json_script, "json")
 
-    def chat_with_tools_fallback(self, *args, **kwargs):
+    def chat_with_tools(self, *args, **kwargs):
         del args, kwargs
         self.native_calls += 1
         return self._take(self.native_script, "native")
@@ -559,7 +559,7 @@ class _StateRecordingLLM(ScriptedLLM):
         self.states: list[CallAttemptState] = []
         self.tools_run_before_call: list[int] = []
 
-    def chat_with_fallback(self, messages, system=None, progress_cb=None, json_mode=False):
+    def chat(self, messages, system=None, progress_cb=None, json_mode=False):
         del progress_cb, json_mode
         self.calls.append(LLMCall(messages=list(messages), system=system, images_present=False))
         response = self._next()

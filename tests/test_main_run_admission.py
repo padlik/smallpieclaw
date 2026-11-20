@@ -43,12 +43,11 @@ from model_registry import (
     CatalogView,
     ModelMetadata,
     ModelRecord,
-    ModelRegistry,
     ModelRegistryError,
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 
 TRACE = "r-0a1b2c3d"
 STOPPED = "⚠️ Task stopped by operator."
@@ -241,16 +240,14 @@ class _World:
         self.tmp_path = tmp_path
         self.stack = stack
         providers = {n: ProviderConfig(n, "openai", f"env:KEY_{n}", URLS[n], 9) for n in URLS}
-        self.settings_path = tmp_path / "models-config.toml"
-        settings = ModelSettings(self.settings_path)
-        settings.write(
+        self.stores = stores = ModelStores.at(tmp_path)
+        stores.cache.write(
             CatalogDocument(
-                1, 2, None,
-                tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+                1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
                 (MODEL_A, MODEL_B),
             )
         )
-        self.registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+        self.registry = stores.registry(providers, _NoDiscovery(), _resolve)
         self.registry.select(MODEL_A.id)
         self.requests: list[httpx.Request] = []
         self.clients: list[_TrackedLLM] = []
@@ -350,7 +347,7 @@ class _World:
                 self.controller._graph_memory_writer is self.graph_writer,
                 list(self.graph_writer.calls),
             ),
-            "settings": self.settings_path.read_bytes(),
+            "settings": self.stores.snapshot(),
             "ckpt": {p.name: p.read_bytes() for p in sorted(Path(self.store._checkpoint_dir).glob("*"))},
             "registered": list(self.executor._supervisor.registered),
         }

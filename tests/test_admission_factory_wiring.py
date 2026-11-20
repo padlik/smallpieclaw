@@ -46,7 +46,7 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 
 
 _URLS = {"pa": "https://a.example.test/v1", "pb": "https://b.example.test/v1"}
@@ -66,7 +66,9 @@ def _record(provider: str, upstream: str, context: int) -> ModelRecord:
 
 MODEL_A = _record("pa", "up/a", 5000)
 MODEL_B = _record("pb", "up/b", 7000)
-_REMEMBERED = {"active": MODEL_A.id, "no-selection": None, "remembered-missing": "pa/up/gone"}
+# Main states: a saved selection, nothing saved with nothing cached, and an unusable saved
+# selection (corrupt preference: no active Main, never replaced automatically).
+_REMEMBERED = {"active": MODEL_A.id, "no-selection": None, "unusable-selection": None}
 
 
 @pytest.fixture(autouse=True)
@@ -114,7 +116,7 @@ class _Wiring:
 
     registry: ModelRegistry
     runtime: AgentRuntime
-    settings_path: Path
+    stores: ModelStores
     memory: MagicMock
     results: MagicMock
     admit: MagicMock
@@ -147,14 +149,17 @@ def build(tmp_path: Path) -> Iterator[Callable[[str], _Wiring]]:
             name: ProviderConfig(name, "openai", f"env:KEY_{name}", url, 9)
             for name, url in _URLS.items()
         }
-        settings_path = tmp_path / state / "models-config.toml"
-        settings_path.parent.mkdir()
-        ModelSettings(settings_path).write(CatalogDocument(
-            1, 2, _REMEMBERED[state],
-            tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
-            (MODEL_A, MODEL_B),
+        (tmp_path / state).mkdir()
+        stores = ModelStores.at(tmp_path / state)
+        stores.cache.write(CatalogDocument(
+            1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+            () if state == "no-selection" else (MODEL_A, MODEL_B),
         ))
-        registry = ModelRegistry(providers, ModelSettings(settings_path), _NoDiscovery(), _resolve)
+        if _REMEMBERED[state] is not None:
+            stores.preference.write(_REMEMBERED[state])
+        if state == "unusable-selection":
+            stores.preference.path.write_bytes(b"not a preference\n")
+        registry = stores.registry(providers, _NoDiscovery(), _resolve)
         registry.restore_selection()
         embeddings: list[EmbeddingClient] = []
 
@@ -178,7 +183,7 @@ def build(tmp_path: Path) -> Iterator[Callable[[str], _Wiring]]:
         runners: list[SubAgentRunner] = []
         spy = stack.enter_context
         wiring = _Wiring(
-            registry, runtime, settings_path, memory, results,
+            registry, runtime, stores, memory, results,
             admit=spy(patch.object(registry, "admit", wraps=_recording(registry.admit, pins))),
             admit_scheduled=spy(patch.object(
                 registry, "admit_scheduled", wraps=_recording(registry.admit_scheduled, pins))),
@@ -237,7 +242,7 @@ def test_profile_branch_admits_once_and_pins_runner(
 ) -> None:
     """Each profile uses its own entry once; the exact pin reaches the runner."""
     wiring = build("active")
-    before = wiring.settings_path.read_bytes()
+    before = wiring.stores.snapshot()
     runner = wiring.factory()(model=selector, runtime_profile=profile)
 
     primary, other = ((wiring.admit_scheduled, wiring.admit) if profile is _SCHEDULED
@@ -254,7 +259,7 @@ def test_profile_branch_admits_once_and_pins_runner(
     assert wiring.resolver.call_count == 1
     assert wiring.embeddings == [runner._embedding]
     assert wiring.registry.view().active_model_id == MODEL_A.id
-    assert wiring.settings_path.read_bytes() == before
+    assert wiring.stores.snapshot() == before
     if profile is _SCHEDULED:
         assert runner._agent.memory is not wiring.memory and runner._agent.results is None
     else:
@@ -314,28 +319,28 @@ def test_supported_arguments_forwarded(
     assert runner.model_id == MODEL_B.id
 
 
-@pytest.mark.parametrize("state", ["no-selection", "remembered-missing"])
+@pytest.mark.parametrize("state", ["no-selection", "unusable-selection"])
 def test_ordinary_explicit_selector_is_admitted_once_without_active_main(
     build: Callable[[str], _Wiring], state: str,
 ) -> None:
     """Task 4.1: an ordinary explicit selector needs neither Main nor cache membership."""
     wiring = build(state)
-    before = wiring.settings_path.read_bytes()
+    before = wiring.stores.snapshot()
     runner = wiring.factory()(model=MODEL_B.id, runtime_profile=RuntimeProfile.ON_DEMAND_SUBAGENT)
     assert wiring.admissions() == 1 and [pin.model.id for pin in wiring.pins] == [MODEL_B.id]
     assert wiring.resolver.call_count == 1 and runner.model_id == MODEL_B.id
     assert wiring.registry.view().active_model_id is None
-    assert wiring.settings_path.read_bytes() == before
+    assert wiring.stores.snapshot() == before
 
 
-@pytest.mark.parametrize("state", ["no-selection", "remembered-missing"])
+@pytest.mark.parametrize("state", ["no-selection", "unusable-selection"])
 def test_inactive_main_rejects_only_inheriting_scheduled_admission(
     build: Callable[[str], _Wiring], state: str,
 ) -> None:
     """Task 8.1: only an inheriting scheduled launch needs Main; it fails before allocation,
     while an explicit selector is pinned exactly with no Main."""
     wiring = build(state)
-    before = wiring.settings_path.read_bytes()
+    before = wiring.stores.snapshot()
     with pytest.raises(ModelRegistryError) as caught:
         wiring.factory()(model=None, runtime_profile=_SCHEDULED)
     assert caught.value.code == "no_active_selection"
@@ -348,7 +353,7 @@ def test_inactive_main_rejects_only_inheriting_scheduled_admission(
     assert wiring.admissions() == 2 and [pin.model.id for pin in wiring.pins] == [MODEL_B.id]
     assert wiring.resolver.call_count == 1 and runner.model_id == MODEL_B.id
     assert wiring.registry.view().active_model_id is None
-    assert wiring.settings_path.read_bytes() == before
+    assert wiring.stores.snapshot() == before
 
 
 @pytest.mark.parametrize("value", [None, 1], ids=["None", "numeric"])

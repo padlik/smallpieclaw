@@ -51,7 +51,7 @@ class World:
         cache = ModelCache(self.cache_path)
         self.preference = ModelPreference(self.pref_path)
         cache.write(CatalogDocument(
-            1, 1, None, (ProviderState("pa", "openai", "2026-10-01T12:00:00Z", "fresh"),), models,
+            1, 1, (ProviderState("pa", "openai", "2026-10-01T12:00:00Z", "fresh"),), models,
         ))
         if saved is not None:
             self.preference.write(saved)

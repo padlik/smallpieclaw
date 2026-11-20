@@ -788,9 +788,22 @@ class TestParseConfigWithEnvVars:
     def test_string_value_for_bool_field_raises(self, minimal_config):
         # A string value (which is what you'd get if env:VAR resolved a flag)
         # must be rejected rather than silently coerced.
-        minimal_config["agent"] = {"diagnose_empty_responses": "false"}
-        with pytest.raises(ConfigError, match="agent.diagnose_empty_responses"):
+        minimal_config["agent"] = {"shell_streaming": "false"}
+        with pytest.raises(ConfigError, match="agent.shell_streaming"):
             parse_config(minimal_config)
+
+    @pytest.mark.parametrize("value", [True, False, "false", 0, None], ids=repr)
+    def test_removed_empty_response_diagnostics_key_is_rejected_with_guidance(self, minimal_config, value):
+        minimal_config["agent"] = {"diagnose_empty_responses": value}
+        with pytest.raises(ConfigError) as caught:
+            parse_config(minimal_config)
+        message = str(caught.value)
+        assert "agent.diagnose_empty_responses" in message
+        assert "remove" in message.lower() and "diagnostics" in message.lower()
+
+    def test_other_unknown_agent_keys_are_still_ignored(self, minimal_config):
+        minimal_config["agent"] = {"never_a_real_agent_key": True}
+        parse_config(minimal_config)  # no global unknown-key rejection was introduced
 
     def test_string_value_for_int_field_raises(self, minimal_config):
         # A numeric string like "4096" must be rejected — env:VAR in numeric fields

@@ -32,11 +32,10 @@ from model_registry import (
     CatalogDocument,
     ModelMetadata,
     ModelRecord,
-    ModelRegistry,
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 from token_usage import TokenUsageRegistry
 
 STOPPED = "⚠️ Task stopped by operator."
@@ -93,14 +92,12 @@ class _World:
         """Persist catalog A+B, select A and build the controller."""
         self.stack = stack
         providers = {n: ProviderConfig(n, "openai", f"env:KEY_{n}", URLS[n], 9) for n in URLS}
-        self.settings_path = tmp_path / "models-config.toml"
-        settings = ModelSettings(self.settings_path)
-        settings.write(CatalogDocument(
-            1, 2, None,
-            tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+        self.stores = stores = ModelStores.at(tmp_path)
+        stores.cache.write(CatalogDocument(
+            1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
             (MODEL_A, MODEL_B),
         ))
-        self.registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+        self.registry = stores.registry(providers, _NoDiscovery(), _resolve)
         self.registry.select(MODEL_A.id)
         self.usage = TokenUsageRegistry()
         self.requests: list[httpx.Request] = []
@@ -143,10 +140,8 @@ class _World:
         return client
 
     def main_selection(self) -> tuple[Optional[str], Optional[str]]:
-        """Return (active Main, persisted default) as re-read from disk."""
-        loaded = ModelSettings(self.settings_path).load()
-        assert loaded.status == "valid" and loaded.document is not None
-        return self.registry.view().active_model_id, loaded.document.default_model
+        """Return (active Main, saved selection) as re-read from disk."""
+        return self.registry.view().active_model_id, self.stores.selected()
 
 
 class _Loop:

@@ -57,7 +57,7 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 from react_loop import ReactContext, _assemble_system_prompt, _ensure_tool_defs, react_loop
 from tool_registry import Tool
 
@@ -147,10 +147,10 @@ def _build_world(
         ProviderState(name, cfg.type, "2026-09-01T00:00:00Z", "fresh") for name, cfg in connections.items()
     )
     seeded = tuple(sorted((removed, *alpha_models, *bravo_models), key=lambda item: item.id))
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(1, 2, None, states, seeded))
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(1, 2, states, seeded))
     discovery = _Discovery()
-    registry = ModelRegistry(connections, settings, discovery, _resolve)
+    registry = stores.registry(connections, discovery, _resolve)
 
     registry.select(removed.id)
     pinned = registry.admit()
@@ -638,9 +638,9 @@ class _RecordingNativeLLM(NativeScriptedLLM):
         super().__init__(responses)
         self.dispatches: list[tuple[str | None, list | None]] = []
 
-    def chat_with_tools_fallback(self, messages, tools, system=None, progress_cb=None):
+    def chat_with_tools(self, messages, tools, system=None, progress_cb=None):
         self.dispatches.append((system, copy.deepcopy(tools)))
-        return super().chat_with_tools_fallback(messages, tools, system=system, progress_cb=progress_cb)
+        return super().chat_with_tools(messages, tools, system=system, progress_cb=progress_cb)
 
 
 # ---------------------------------------------------------------------------
@@ -929,10 +929,10 @@ def changed_pin_world(tmp_path: Path) -> _ChangedPinWorld:
     other = _model("zeta-b", context=2000)
     connections = {"alpha": ProviderConfig("alpha", "openai", ALPHA_REF, ALPHA_URL)}
     states = (ProviderState("alpha", "openai", "2026-09-01T00:00:00Z", "fresh"),)
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(1, 2, None, states, (historical, other)))
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(1, 2, states, (historical, other)))
     discovery = _Discovery()
-    registry = ModelRegistry(connections, settings, discovery, _resolve)
+    registry = stores.registry(connections, discovery, _resolve)
     registry.select(historical.id)
     pinned = registry.admit()
     registry.select(other.id)

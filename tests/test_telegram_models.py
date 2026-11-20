@@ -4,7 +4,7 @@ Scope boundary (do not expand): `/models` becomes read-only + refresh when a
 real `ModelRegistry` is injected as `iface.model_registry`. No selection
 button, no canonical model id in any callback, no new public command, no
 generic pagination framework. The legacy `iface.llm_client.list_models()` /
-`set_model()` path stays exactly as-is when `iface.model_registry` is None.
+`set_model()` path was removed: the registry is required (remove-obsolete-model-paths 4.1).
 Opaque <=64-byte selection tokens with expiry/revalidation/persist-before-ack
 are a separate later task and are intentionally not covered here.
 
@@ -53,7 +53,7 @@ from model_registry import (  # noqa: E402
     ModelRegistry,
     ProviderState,
 )
-from model_settings import ModelSettings  # noqa: E402
+from tests.model_stores import ModelStores  # noqa: E402
 from telegram_commands import cmd_models  # noqa: E402
 
 
@@ -146,25 +146,30 @@ def _make_registry(
     connections: tuple[FakeProviderConfig, ...],
     *,
     seed_document: CatalogDocument | None = None,
+    remembered: str | None = None,
     resolver=None,
-) -> tuple[ModelRegistry, ModelSettings, FakeDiscovery]:
-    """Build a real `ModelRegistry`. `resolver` defaults to the always-succeeding
-    `_resolve`; pass a custom one to exercise external credential-resolution
-    failure via the registry's own public constructor, not private patching."""
-    settings = ModelSettings(tmp_path / "models-config.toml")
+) -> tuple[ModelRegistry, ModelStores, FakeDiscovery]:
+    """Build a real `ModelRegistry` over a real cache and preference file.
+
+    `resolver` defaults to the always-succeeding `_resolve`; pass a custom one to
+    exercise external credential-resolution failure via the registry's own public
+    constructor, not private patching. `remembered` seeds the saved selection."""
+    stores = ModelStores.at(tmp_path)
     if seed_document is not None:
-        settings.write(seed_document)
+        stores.cache.write(seed_document)
+    if remembered is not None:
+        stores.preference.write(remembered)
     discovery = FakeDiscovery()
     conn_map = {c.name: c for c in connections}
-    registry = ModelRegistry(conn_map, settings, discovery, resolver or _resolve)
-    return registry, settings, discovery
+    registry = stores.registry(conn_map, discovery, resolver or _resolve)
+    return registry, stores, discovery
 
 
 # ---------------------------------------------------------------------------
 # Telegram update/iface fixtures
 # ---------------------------------------------------------------------------
 
-def _make_iface(*, model_registry=None, llm_client=None):
+def _make_iface(*, model_registry, llm_client=None):
     from telegram_interface import TelegramInterface
     import time
 
@@ -358,8 +363,7 @@ class TestRegistryBackedCatalog:
         pa = _provider_config("pa")
         pb = _provider_config("pb")
         seed = CatalogDocument(
-            1, 1, None,
-            (ProviderState("pb", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+            1, 1, (ProviderState("pb", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (_model("old-model", "pb", context_tokens=1000),),
         )
         registry, _, discovery = _make_registry(tmp_path, (pa, pb), seed_document=seed)
@@ -421,19 +425,22 @@ class TestRegistryBackedCatalog:
         assert "4096 + " not in text and "+ 4096" not in text, "must not fabricate a derived budget"
 
     @pytest.mark.parametrize(
-        "remembered,active_after_refresh,expected",
+        "remembered,discovered,active_after_refresh,expected",
         [
-            (None, False, "no selection"),
-            ("p/gone", False, "saved selection unavailable"),
-            ("p/m1", True, "active"),
+            (None, False, False, "no selection"),
+            (None, True, False, "automatic, unsaved"),  # in-memory ordinal choice, never saved
+            ("gone/m", True, False, "saved selection unavailable"),  # connection no longer configured
+            ("p/m1", True, True, "active"),
         ],
     )
-    def test_selection_status_states(self, tmp_path: Path, remembered, active_after_refresh, expected):
+    def test_selection_status_states(
+        self, tmp_path: Path, remembered, discovered, active_after_refresh, expected
+    ):
         p = _provider_config("p")
         m = _model("m1", "p", context_tokens=100)
-        seed = CatalogDocument(1, 1, remembered, (), ())
-        registry, _, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
-        discovery.responses["p"] = _inventory("p", (m,))
+        seed = CatalogDocument(1, 1, (), ())
+        registry, _, discovery = _make_registry(tmp_path, (p,), seed_document=seed, remembered=remembered)
+        discovery.responses["p"] = _inventory("p", (m,) if discovered else ())
         registry.refresh()
         registry.restore_selection()
         if active_after_refresh:
@@ -639,7 +646,7 @@ class TestConstructorInjection:
         )
         assert iface.model_registry is registry
 
-    def test_real_constructor_defaults_to_no_registry(self, tmp_path: Path):
+    def test_real_constructor_requires_a_registry(self, tmp_path: Path):
         from telegram_interface import TelegramInterface
 
         config = {
@@ -649,56 +656,68 @@ class TestConstructorInjection:
                 "allowed_user_ids": [42],
             }
         }
-        iface = TelegramInterface(
-            config,
-            agent_handler=MagicMock(),
-            downloads_dir=str(tmp_path),
+        with pytest.raises(TypeError, match="model_registry"):
+            TelegramInterface(config, agent_handler=MagicMock(), downloads_dir=str(tmp_path))  # type: ignore[call-arg]
+
+
+class TestLegacyModelPathsRemoved:
+    """Registry-only: no legacy list, no raw ``model:<name>`` mutation (task 4.1)."""
+
+    @staticmethod
+    def _world(tmp_path: Path):
+        p = _provider_config("p")
+        old = _model("old-model", "p", context_tokens=100)
+        target = _model("target-model", "p", context_tokens=100)
+        seed = CatalogDocument(
+            1, 1, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),), (old, target),
         )
-        assert iface.model_registry is None
+        registry, stores, _discovery = _make_registry(tmp_path, (p,), seed_document=seed, remembered="p/old-model")
+        registry.restore_selection()
+        return registry, stores, target
 
-
-class TestLegacyPathPreserved:
-    """When `iface.model_registry` is None, behavior is exactly the pre-8.1 one."""
-
-    def test_legacy_llm_client_path_renders_active_and_inactive_entries(self):
-        legacy_client = MagicMock()
-        legacy_client.list_models = MagicMock(
-            return_value=[
-                {"name": "gpt", "model": "gpt-4o", "active": True, "vision": True},
-                {"name": "claude", "model": "claude-3", "active": False, "vision": False},
-            ]
-        )
-        iface = _make_iface(model_registry=None, llm_client=legacy_client)
-        update, ctx, captured = _make_command_update()
-        asyncio.run(cmd_models(iface, update, ctx))
-
-        legacy_client.list_models.assert_called_once()
-        assert "LLM Models" in captured["text"]
-        assert "gpt-4o" in captured["text"]
-        assert "claude-3" in captured["text"]
-        buttons = _flatten_buttons(captured["reply_markup"])
-        assert buttons == ["model:claude"], "only the inactive entry gets a switch button"
-
-    def test_legacy_switch_button_invokes_real_cb_model_switch_and_set_model(self):
+    def test_authenticated_raw_model_callback_is_refused_with_reopen_and_changes_nothing(self, tmp_path: Path):
         from telegram_callbacks import cb_model_switch
 
+        registry, stores, target = self._world(tmp_path)
         legacy_client = MagicMock()
-        legacy_client.set_model = MagicMock(return_value=True)
-        legacy_client.llm_cfg = {"name": "claude"}
-        iface = _make_iface(model_registry=None, llm_client=legacy_client)
-        update, query = _make_callback_update("model:claude")
+        iface = _make_iface(model_registry=registry, llm_client=legacy_client)
+        before = stores.snapshot()
+        view_before = registry.view()
 
+        update, query = _make_callback_update(f"model:{target.id}")
         asyncio.run(cb_model_switch(iface, update, MagicMock()))
 
-        legacy_client.set_model.assert_called_once_with("claude")
-        query.edit_message_text.assert_awaited_once()
+        text = query.edit_message_text.call_args.args[0]
+        assert "/models" in text
+        legacy_client.set_model.assert_not_called()
+        assert stores.snapshot() == before
+        assert registry.view() == view_before
 
-    def test_no_registry_and_no_llm_client_reports_unavailable(self):
-        iface = _make_iface(model_registry=None, llm_client=None)
+    def test_unauthenticated_raw_model_callback_is_still_rejected_before_any_effect(self, tmp_path: Path):
+        from telegram_callbacks import cb_model_switch
+
+        registry, stores, target = self._world(tmp_path)
+        iface = _make_iface(model_registry=registry)
+        before = stores.snapshot()
+
+        update, query = _make_callback_update(f"model:{target.id}", user_id=999)
+        asyncio.run(cb_model_switch(iface, update, MagicMock()))
+
+        query.answer.assert_awaited_once()
+        assert "Not authorized" in query.answer.call_args.args[0]
+        query.edit_message_text.assert_not_called()
+        assert stores.snapshot() == before
+
+    def test_models_command_has_no_legacy_list_even_with_a_legacy_client(self, tmp_path: Path):
+        registry, _stores, _target = self._world(tmp_path)
+        legacy_client = MagicMock()
+        iface = _make_iface(model_registry=registry, llm_client=legacy_client)
         update, ctx, captured = _make_command_update()
+
         asyncio.run(cmd_models(iface, update, ctx))
 
-        assert "not available" in captured["text"]
+        legacy_client.list_models.assert_not_called()
+        assert "model:" not in " ".join(_flatten_buttons(captured["reply_markup"]))
 
 
 # ---------------------------------------------------------------------------
@@ -768,8 +787,7 @@ class TestUnexpectedRefreshExceptionSafety:
 
         p = _provider_config("p")
         seed = CatalogDocument(
-            1, 1, None,
-            (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+            1, 1, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (_model("last-good", "p", context_tokens=100),),
         )
         registry, _, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
@@ -803,17 +821,16 @@ class TestRefreshPersistenceHonesty:
 
         p = _provider_config("p")
         seed = CatalogDocument(
-            1, 1, None,
-            (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+            1, 1, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (_model("seed-model", "p", context_tokens=100),),
         )
-        registry, settings, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
+        registry, stores, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
         discovery.responses["p"] = _inventory("p", (_model("new-model", "p", context_tokens=200),))
 
-        settings_path = tmp_path / "models-config.toml"
+        settings_path = stores.cache.path
         original_bytes = settings_path.read_bytes()
         monkeypatch.setattr(
-            settings, "write",
+            stores.cache, "write",
             lambda _doc: (_ for _ in ()).throw(ModelSettingsError("write_failed")),
         )
 
@@ -969,14 +986,14 @@ class TestProviderSectionBudgeted:
 # ---------------------------------------------------------------------------
 
 class TestModelSelectionCallback:
-    """Real `ModelRegistry`/`ModelSettings`/`SelectionTokenCache` — no mocked
+    """Real `ModelRegistry`/`ModelCache`/`ModelPreference`/`SelectionTokenCache` — no mocked
     `select`/`view`/cache internals anywhere in this class."""
 
     def test_select_callback_persists_before_any_ack_or_edit(self, tmp_path: Path):
         cb_model_select = _get_cb_model_select()
         p = _provider_config("provider-" + "a" * 50)
         target = _model("model-" + "z" * 50, p.name, context_tokens=100, display_name="Target-" + "z" * 50)
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses[p.name] = _inventory(p.name, (target,))
 
         iface = _make_iface(model_registry=registry)
@@ -984,13 +1001,13 @@ class TestModelSelectionCallback:
         token = _button_callback_data(markup, label_contains="Target-")
 
         events: list[str] = []
-        original_write = settings.write
+        original_write = stores.preference.write
 
-        def _recording_write(doc):
-            original_write(doc)
+        def _recording_write(selector):
+            original_write(selector)
             events.append("persisted")
 
-        settings.write = _recording_write
+        stores.preference.write = _recording_write
 
         update, query = _make_callback_update(token)
         query.answer = AsyncMock(side_effect=lambda *a, **k: events.append("acked"))
@@ -998,14 +1015,13 @@ class TestModelSelectionCallback:
 
         asyncio.run(cb_model_select(iface, update, MagicMock()))
 
-        assert "persisted" in events, "a successful selection must actually call through to the real settings.write"
+        assert "persisted" in events, "a successful selection must actually call through to the real preference write"
         assert "acked" in events and "edited" in events
         assert events.index("persisted") < events.index("acked"), "no ack before the selection is durably saved"
         assert events.index("persisted") < events.index("edited"), "no success edit before the selection is saved"
 
         assert registry.view().active_model_id == target.id
-        loaded = settings.load()
-        assert loaded.document is not None and loaded.document.default_model == target.id
+        assert stores.selected() == target.id
 
     def test_select_callback_reports_failure_and_leaves_prior_selection_unchanged_when_persistence_fails(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1017,11 +1033,12 @@ class TestModelSelectionCallback:
         old = _model("old-model", "p", context_tokens=100, display_name="Old-Model")
         target = _model("target-model", "p", context_tokens=200, display_name="Target-Model")
         seed = CatalogDocument(
-            1, 1, "p/old-model",
-            (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+            1, 1, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (old,),
         )
-        registry, settings, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
+        registry, stores, discovery = _make_registry(
+            tmp_path, (p,), seed_document=seed, remembered="p/old-model",
+        )
         registry.restore_selection()
         discovery.responses["p"] = _inventory("p", (old, target))
 
@@ -1029,11 +1046,11 @@ class TestModelSelectionCallback:
         _text, markup = _mint_via_cmd_models(iface)
         token = _button_callback_data(markup, label_contains="Target-Model")
 
-        settings_path = tmp_path / "models-config.toml"
+        settings_path = stores.preference.path
         original_bytes = settings_path.read_bytes()
         monkeypatch.setattr(
-            settings, "write",
-            lambda _doc: (_ for _ in ()).throw(ModelSettingsError("write_failed")),
+            stores.preference, "write",
+            lambda _selector: (_ for _ in ()).throw(ModelSettingsError("write_failed")),
         )
 
         update, query = _make_callback_update(token)
@@ -1051,11 +1068,10 @@ class TestModelSelectionCallback:
         p = _provider_config("p")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
         seed = CatalogDocument(
-            1, 1, None,
-            (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+            1, 1, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (target,),
         )
-        registry, settings, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
+        registry, stores, discovery = _make_registry(tmp_path, (p,), seed_document=seed)
         discovery.responses["p"] = RuntimeError("provider down")
 
         iface = _make_iface(model_registry=registry)
@@ -1066,14 +1082,13 @@ class TestModelSelectionCallback:
         asyncio.run(cb_model_select(iface, update, MagicMock()))
 
         assert registry.view().active_model_id == target.id
-        loaded = settings.load()
-        assert loaded.document is not None and loaded.document.default_model == target.id
+        assert stores.selected() == target.id
 
     def test_select_callback_ignores_catalog_revision_change_when_target_still_present(self, tmp_path: Path):
         cb_model_select = _get_cb_model_select()
         p = _provider_config("p")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (target,))
 
         iface = _make_iface(model_registry=registry)
@@ -1094,7 +1109,7 @@ class TestModelSelectionCallback:
         p = _provider_config("p")
         old = _model("old-model", "p", context_tokens=100, display_name="Old-Model")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (old, target))
 
         iface = _make_iface(model_registry=registry)
@@ -1105,7 +1120,7 @@ class TestModelSelectionCallback:
         discovery.responses["p"] = _inventory("p", (old,))  # a later successful refresh drops the target
         registry.refresh()
 
-        settings_path = tmp_path / "models-config.toml"
+        settings_path = stores.preference.path
         before_bytes = settings_path.read_bytes()
 
         update, query = _make_callback_update(token)
@@ -1124,7 +1139,7 @@ class TestModelSelectionCallback:
 
         p = _provider_config("p")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (target,))
 
         fake_now = [1_000.0]
@@ -1151,7 +1166,7 @@ class TestModelSelectionCallback:
         elif case == "cache_restarted":
             iface.model_selection_tokens = SelectionTokenCache(clock=clock)  # brand-new process-memory cache
 
-        settings_path = tmp_path / "models-config.toml"
+        settings_path = stores.preference.path
         before_bytes = settings_path.read_bytes() if settings_path.exists() else b""
 
         update, query = _make_callback_update(token)
@@ -1168,7 +1183,7 @@ class TestModelSelectionCallback:
         cb_model_select = _get_cb_model_select()
         p = _provider_config("p")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (target,))
 
         iface = _make_iface(model_registry=registry)
@@ -1186,7 +1201,7 @@ class TestModelSelectionCallback:
         cb_model_select = _get_cb_model_select()
         p = _provider_config("p")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (target,))
 
         iface = _make_iface(model_registry=registry)
@@ -1205,17 +1220,17 @@ class TestModelSelectionCallback:
 
         p = _provider_config("p")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (target,))
 
         write_calls: list[int] = []
-        original_write = settings.write
+        original_write = stores.preference.write
 
-        def _recording_write(doc):
+        def _recording_write(selector):
             write_calls.append(1)
-            return original_write(doc)
+            return original_write(selector)
 
-        settings.write = _recording_write
+        stores.preference.write = _recording_write
 
         armed = [False]
 
@@ -1230,7 +1245,7 @@ class TestModelSelectionCallback:
         _text, markup = _mint_via_cmd_models(iface)
         token = _button_callback_data(markup, label_contains="Target-Model")
 
-        settings_path = tmp_path / "models-config.toml"
+        settings_path = stores.preference.path
         before_bytes = settings_path.read_bytes() if settings_path.exists() else b""
         write_calls.clear()
         armed[0] = True
@@ -1238,7 +1253,7 @@ class TestModelSelectionCallback:
         update, query = _make_callback_update(token, user_id=999)  # not in allowed_ids
         asyncio.run(cb_model_select(iface, update, MagicMock()))
 
-        assert write_calls == [], "an unauthorized caller must never trigger a settings write"
+        assert write_calls == [], "an unauthorized caller must never trigger a preference write"
         after_bytes = settings_path.read_bytes() if settings_path.exists() else b""
         assert after_bytes == before_bytes
         assert registry.view().active_model_id is None
@@ -1248,7 +1263,7 @@ class TestModelSelectionCallback:
 
         p = _provider_config("p")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (target,))
 
         legacy_client = MagicMock()
@@ -1266,7 +1281,7 @@ class TestModelSelectionCallback:
 
         p = _provider_config("p")
         target = _model("target-model", "p", context_tokens=100, display_name="Target-Model")
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", (target,))
 
         iface = _make_iface(model_registry=registry)
@@ -1292,7 +1307,7 @@ class TestModelSelectionCallback:
         """Regression lock: already expected to pass with the first slice."""
         p = _provider_config("p")
         models = tuple(_model(f"model-{i:02d}", "p", context_tokens=100) for i in range(25))
-        registry, settings, discovery = _make_registry(tmp_path, (p,))
+        registry, stores, discovery = _make_registry(tmp_path, (p,))
         discovery.responses["p"] = _inventory("p", models)
 
         iface = _make_iface(model_registry=registry)

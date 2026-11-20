@@ -99,7 +99,7 @@ def test_client_constructor_rejects_generation_knob(knob: str, value: object) ->
 
 
 @pytest.mark.parametrize(
-    "call", ["chat", "chat_with_fallback", "chat_with_tools", "chat_with_tools_fallback"]
+    "call", ["chat", "chat_with_tools"]
 )
 @pytest.mark.parametrize(("knob", "value"), _KNOBS)
 def test_public_call_rejects_generation_knob_before_send(

@@ -51,7 +51,7 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 
 from tests.execution_harness import RecordingExecutor, ScriptedLLM, run_react
 from tests.root_startup_harness import MAIN_ID as ROOT_MAIN_ID
@@ -146,13 +146,12 @@ def _registry(tmp_path: Path) -> ModelRegistry:
         name: ProviderConfig(name, "openai", f"env:KEY_{name}", url, 9)
         for name, url in _URLS.items()
     }
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(
-        1, 2, None,
-        tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(
+        1, 2, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
         (MODEL_A, MODEL_B),
     ))
-    registry = ModelRegistry(providers, settings, _NoDiscovery(), _resolve)
+    registry = stores.registry(providers, _NoDiscovery(), _resolve)
     registry.select(MODEL_A.id)
     return registry
 
@@ -477,7 +476,7 @@ class TestSubAgentModelConfiguration:
             tool_timeout=21, max_output_size=1234, top_tools=9,
             ctx_max_tokens=23456, compaction_threshold_tokens=33333, max_retries=7, retry_delay=0.25, max_subagents=2,
             subagent_result_timeout=45, long_run_warn_minutes=12,
-            diagnose_empty_responses=True, default_model="pa/up/a",
+            default_model="pa/up/a",
             background_model="pb/up/b", fallback_models=["pb/up/b", "pa/up/a"],
             shell_backend="pty", shell_pty_cols=100, shell_pty_rows=30,
             shell_streaming=True, shell_nsjail_confirm_mode="adaptive",
@@ -506,7 +505,6 @@ class TestSubAgentModelConfiguration:
             assert runner._agent.inactivity_warn_minutes == 4
             assert runner._llm._max_retries == snapshot["max_retries"]
             assert runner._llm._retry_delay == snapshot["retry_delay"]
-            assert runner._llm._diagnose_empty is True
 
         assert asdict(caller_cfg) == snapshot
 

@@ -32,10 +32,9 @@ from model_registry import (
     CatalogDocument,
     ModelMetadata,
     ModelRecord,
-    ModelRegistry,
     ProviderState,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 from outcome_utils import with_execution
 from tests.execution_harness import _NullToolIndex
 
@@ -177,17 +176,17 @@ class _World:
             )
             for name, ctx in metas.items()
         )
-        self.settings_path = tmp_path / "models-config.toml"
-        self.settings = ModelSettings(self.settings_path)
-        self.settings.write(
+        self.stores = stores = ModelStores.at(tmp_path)
+        self.stores.cache.write(
             CatalogDocument(
-                1, 2, "p/A",
+                1, 2,
                 (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
                 models,
             )
         )
-        self.registry = ModelRegistry(
-            {"p": provider}, self.settings, _Discovery(),
+        stores.preference.write("p/A")
+        self.registry = stores.registry(
+            {"p": provider}, _Discovery(),
             lambda cfg: ResolvedProviderConnection(
                 provider_id=cfg.name, adapter=cfg.type, base_url=cfg.base_url,
                 request_timeout=cfg.request_timeout, api_key="fake-test-key",
@@ -240,7 +239,7 @@ class _World:
 
     def snapshot(self) -> dict:
         return {
-            "settings": self.settings_path.read_bytes(),
+            "settings": self.stores.snapshot(),
             "short": json.dumps(self.short_term.to_dict(), sort_keys=True),
             "working": json.dumps(self.working.to_dict(), sort_keys=True),
             "ckpt": sorted(p.name for p in Path(self.store._checkpoint_dir).glob("*")),
@@ -295,7 +294,7 @@ def _deferred_state(world) -> dict:
         "events": list(world.memory.events),
         "goal": world.working.goal,
         "short": json.dumps(world.short_term.to_dict(), sort_keys=True),
-        "settings": world.settings_path.read_bytes(),
+        "settings": world.stores.snapshot(),
         "ckpt": _ckpt_bytes(world),
         "pending": "tok-1" in world.executor._pending_confirmations._pending,
         "grant": world.controller._confirmation.grant_ledger.check("file_write", "/tmp"),

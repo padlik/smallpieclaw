@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import re
+import tempfile
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+from model_registry import ModelRegistry
 from telegram_commands import cmd_pair, cmd_unpair
+from tests.model_stores import ModelStores
 
 
 def _call(command, iface, user_id: int, args: list[str] | None = None) -> list[str]:
@@ -33,6 +38,12 @@ def _iface(timeout: int = 300) -> Any:
     return iface
 
 
+def _empty_registry() -> ModelRegistry:
+    """A real registry with no connections over absent stores (construction only reads)."""
+    absent = Path(tempfile.gettempdir()) / f"no-model-stores-{uuid.uuid4().hex}"
+    return ModelStores.at(absent).registry({}, SimpleNamespace(fetch=None), lambda _config: None)
+
+
 def _real_iface(timeout: int) -> Any:
     """Construct the real interface without building a Telegram application."""
     from telegram_interface import TelegramInterface
@@ -47,6 +58,7 @@ def _real_iface(timeout: int) -> Any:
             }
         },
         agent_handler=lambda *_: None,
+        model_registry=_empty_registry(),
     )
 
 

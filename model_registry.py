@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Mapping
 if TYPE_CHECKING:
     from config_schema import ProviderConfig, ResolvedProviderConnection
     from model_discovery import ModelDiscovery, ProviderInventory
-    from model_settings import ModelCache, ModelPreference, ModelSettings
+    from model_settings import ModelCache, ModelPreference
 
 ProviderStatus = Literal["fresh", "stale"]
 SelectionStatus = Literal["active", "no_selection", "saved_selection_unavailable"]
@@ -122,11 +122,10 @@ class ProviderState:
 
 @dataclass(frozen=True)
 class CatalogDocument:
-    """Versioned persisted catalog and remembered model selection."""
+    """Versioned cached discovery catalog (the selection lives in the preference file)."""
 
     schema_version: int = 1
     revision: int = 0
-    default_model: str | None = None
     providers: tuple[ProviderState, ...] = ()
     models: tuple[ModelRecord, ...] = ()
 
@@ -186,26 +185,25 @@ class ModelRegistry:
     def __init__(
         self,
         connections: Mapping[str, ProviderConfig],
-        settings: ModelSettings | ModelCache,
+        cache: ModelCache,
         discovery: ModelDiscovery,
         credential_resolver: Callable[[ProviderConfig], ResolvedProviderConnection],
         *,
+        preference: ModelPreference,
         selector_redactor: Callable[[str], str] | None = None,
-        preference: ModelPreference | None = None,
     ) -> None:
-        """Load cached settings and bind injected connection/discovery services.
+        """Load the cache and preference and bind injected connection/discovery services.
 
         ``selector_redactor`` optionally redacts saved scheduled selector strings
         before they are bounded into a scheduled-selector warning.
-        ``preference`` is the durable deliberate selection (ADR-0040): when
-        given, it is the only selection source and sink, and the catalog's
-        ``default_model`` is neither read nor written for selection. A
+        ``preference`` is the durable deliberate selection (ADR-0040) and the only
+        selection source and sink; the cache never holds a selection. A
         corrupt preference leaves no remembered selection and its bytes are
         never rewritten except by a deliberate ``select``.
         """
         self._lock = threading.RLock()
         self._selector_redactor = selector_redactor
-        self._settings = settings
+        self._cache = cache
         self._discovery = discovery
         self._credential_resolver = credential_resolver
         # Fixed for the process lifetime (ADR-0040): a read-only private copy;
@@ -225,7 +223,7 @@ class ModelRegistry:
         self._selection_revision = 0
         document = CatalogDocument()
         try:
-            loaded = settings.load()
+            loaded = cache.load()
         except (OSError, ValueError) as exc:
             self._settings_error_code = _safe_code(getattr(exc, "code", None), "settings_load_failed")
         else:
@@ -237,18 +235,13 @@ class ModelRegistry:
                 self._settings_error_code = "settings_load_failed"
         self._document = _filter_document_to_connections(document, self._connections)
         self._preference = preference
-        if preference is None:
-            self._remembered_model_id = document.default_model
-            if self._remembered_model_id is not None:
-                self._selection_revision = document.revision
-        else:
-            saved = preference.load()
-            self._preference_status = saved.status
-            self._remembered_model_id = saved.model if saved.status == "valid" else None
-            if saved.status == "corrupt":
-                self._selection_notice = _SELECTION_INVALID_NOTICE
-            elif saved.model is not None and saved.model.partition("/")[0] not in self._connections:
-                self._selection_notice = _SELECTION_UNCONFIGURED_NOTICE
+        saved = preference.load()
+        self._preference_status = saved.status
+        self._remembered_model_id = saved.model if saved.status == "valid" else None
+        if saved.status == "corrupt":
+            self._selection_notice = _SELECTION_INVALID_NOTICE
+        elif saved.model is not None and saved.model.partition("/")[0] not in self._connections:
+            self._selection_notice = _SELECTION_UNCONFIGURED_NOTICE
         self._models = {record.id: record for record in self._document.models}
         self._provider_states = {item.provider_id: item for item in self._document.providers}
         # The automatic choice is made from the cache as loaded (connection-filtered),
@@ -277,7 +270,7 @@ class ModelRegistry:
         counts as existing) and the connection-filtered cache loaded at
         construction had zero candidates (an unreadable cache counts as empty).
         """
-        if self._preference is not None and self._preference_status != "missing":
+        if self._preference_status != "missing":
             return False
         return self._remembered_model_id is None and self._initial_automatic_choice is None
 
@@ -320,15 +313,6 @@ class ModelRegistry:
         self._models = {record.id: record for record in document.models}
         self._provider_states = {item.provider_id: item for item in document.providers}
 
-    def _write_candidate(self, candidate: CatalogDocument) -> None:
-        """Persist one candidate or raise a detail-free registry failure."""
-        try:
-            self._settings.write(candidate)
-        except (OSError, ValueError):
-            self._settings_error_code = "persistence_failed"
-            raise ModelRegistryError("persistence_failed") from None
-        self._settings_error_code = None
-
     def select(self, canonical_id: str) -> CatalogView:
         """Persist a deliberate selection before making it active.
 
@@ -339,38 +323,24 @@ class ModelRegistry:
         """
         with self._lock:
             parse_selector(canonical_id, self._connections)
-            if self._preference is not None:
-                # Durable before published: a failed write leaves prior bytes
-                # and the prior active choice untouched.
-                try:
-                    self._preference.write(canonical_id)
-                except (OSError, ValueError) as exc:
-                    # ``ModelPreference.write`` validates before any I/O (any coded
-                    # ModelSettingsError other than ``write_failed`` is a bad selector);
-                    # everything else, including a code-less ValueError, is persistence.
-                    code = getattr(exc, "code", None)
-                    if isinstance(code, str) and code != "write_failed":
-                        raise ModelRegistryError("malformed_selector") from None
-                    raise ModelRegistryError("persistence_failed") from None
-                self._remembered_model_id = canonical_id
-                self._active_model_id = canonical_id
-                self._selection_revision += 1
-                # A durable deliberate selection repairs a corrupt/unconfigured saved one.
-                self._selection_notice = None
-                self._preference_status = "valid"
-                return self.view()
-            candidate = replace(
-                self._document,
-                revision=self._document.revision + 1,
-                default_model=canonical_id,
-                providers=tuple(self._provider_states[key] for key in sorted(self._provider_states)),
-                models=tuple(self._models[key] for key in sorted(self._models)),
-            )
-            self._write_candidate(candidate)
-            self._publish_document(candidate)
+            # Durable before published: a failed write leaves prior bytes
+            # and the prior active choice untouched.
+            try:
+                self._preference.write(canonical_id)
+            except (OSError, ValueError) as exc:
+                # ``ModelPreference.write`` validates before any I/O (any coded
+                # ModelSettingsError other than ``write_failed`` is a bad selector);
+                # everything else, including a code-less ValueError, is persistence.
+                code = getattr(exc, "code", None)
+                if isinstance(code, str) and code != "write_failed":
+                    raise ModelRegistryError("malformed_selector") from None
+                raise ModelRegistryError("persistence_failed") from None
             self._remembered_model_id = canonical_id
             self._active_model_id = canonical_id
-            self._selection_revision = candidate.revision
+            self._selection_revision += 1
+            # A durable deliberate selection repairs a corrupt/unconfigured saved one.
+            self._selection_notice = None
+            self._preference_status = "valid"
             return self.view()
 
     def restore_selection(self) -> CatalogView:
@@ -380,9 +350,7 @@ class ModelRegistry:
                 return self.view()
             self._restore_called = True
             remembered = self._remembered_model_id
-            if self._preference is None:
-                self._active_model_id = remembered if remembered in self._models else None
-            elif self._selection_notice is not None:
+            if self._selection_notice is not None:
                 self._active_model_id = None  # actionable unset: never an automatic replacement
             elif remembered is not None:
                 # Saved and configured: active as saved, independent of cache membership.
@@ -467,49 +435,6 @@ class ModelRegistry:
         except Exception:
             raise ModelRegistryError("credential_resolution_failed") from None
         if not _resolved_connection_matches(model.provider_id, config, connection):
-            raise ModelRegistryError("credential_resolution_failed")
-        return RunModel(model, connection, catalog_revision, selection_revision)
-
-    def resolve_graph_model(self, selector: str) -> RunModel:
-        """Pin one exact catalog record for graph work, independent of Main.
-
-        ``selector`` must be a ``str`` (otherwise ``invalid_request``) and is
-        looked up verbatim: no trimming, case folding, aliasing, defaulting or
-        Main inheritance; any string that is not an exact canonical id fails
-        with ``model_not_found``. Main's active, remembered or missing selection
-        is neither required nor consulted. Credentials are resolved once
-        outside the lock; a resolver failure or a connection that does not
-        match the configured route fails with ``credential_resolution_failed``.
-        Connections are fixed for the process lifetime, so only the target
-        record is rechecked afterwards: a change or removal of its record fails
-        with ``connection_changed``; unrelated Main selection or catalog
-        refresh does not. The returned pin
-        carries the catalog and selection revisions current at that final
-        recheck as read-only provenance. This method is read-only: it never
-        selects, restores, refreshes, persists or changes revisions.
-        """
-        if not isinstance(selector, str):
-            raise ModelRegistryError("invalid_request")
-        with self._lock:
-            model = self._models.get(selector)
-            if model is None:
-                raise ModelRegistryError("model_not_found")
-            provider_id = model.provider_id
-            config = self._connections.get(provider_id)
-            if config is None:
-                raise ModelRegistryError("connection_changed")
-
-        try:
-            connection = self._credential_resolver(config)
-        except Exception:
-            raise ModelRegistryError("credential_resolution_failed") from None
-
-        with self._lock:
-            if self._models.get(selector) != model:
-                raise ModelRegistryError("connection_changed")
-            catalog_revision = self._document.revision
-            selection_revision = self._selection_revision
-        if not _resolved_connection_matches(provider_id, config, connection):
             raise ModelRegistryError("credential_resolution_failed")
         return RunModel(model, connection, catalog_revision, selection_revision)
 
@@ -601,9 +526,6 @@ class ModelRegistry:
                 candidate = replace(
                     self._document,
                     revision=self._document.revision + 1,
-                    default_model=(
-                        self._remembered_model_id if self._preference is None else self._document.default_model
-                    ),
                     providers=tuple(candidate_states[key] for key in sorted(candidate_states)),
                     models=tuple(candidate_models[key] for key in sorted(candidate_models)),
                 )
@@ -620,7 +542,7 @@ class ModelRegistry:
                     # reported but never rolls back usable in-memory discovery,
                     # and never touches the preference or the active choice.
                     try:
-                        self._settings.write(candidate)
+                        self._cache.write(candidate)
                     except (OSError, ValueError):
                         self._settings_error_code = "persistence_failed"
                         errors.append(("catalog", "persistence_failed"))

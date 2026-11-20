@@ -391,9 +391,6 @@ def test_real_loop_reuses_cached_full_definitions_on_every_native_request(
     assert [c.tool for c in calls] == ["shell_env_list", "shell_env_list"]
     (built,) = builds
     assert built == build_tool_definitions()
-    expected_revision = react_loop._definition_revision(SimpleNamespace(_tool_defs=built))
-    # Every send carries the same full-definition revision.
-    assert [b.revision for b in binds] == [expected_revision] * 3
     # Per turn exactly one send: there is no pre-send preview binding any more.
     assert [(b.attempts, b.requests) for b in binds] == [(1, 1)] * 3
     assert len(captured) == 3
@@ -450,12 +447,8 @@ def test_ordinary_mcp_schema_failure_falls_back_without_leaking_exception_text(
 _CHAT_SIGNATURES = {
     "chat": ((("messages", inspect.Parameter.empty), ("system", None), ("progress_cb", None),
               ("json_mode", False)), "str"),
-    "chat_with_fallback": ((("messages", inspect.Parameter.empty), ("system", None),
-                            ("progress_cb", None), ("json_mode", False)), "str"),
     "chat_with_tools": ((("messages", inspect.Parameter.empty), ("tools", inspect.Parameter.empty),
                          ("system", None), ("progress_cb", None)), "ChatResponse"),
-    "chat_with_tools_fallback": ((("messages", inspect.Parameter.empty), ("tools", inspect.Parameter.empty),
-                                  ("system", None), ("progress_cb", None)), "ChatResponse"),
 }
 
 
@@ -466,7 +459,7 @@ def _annotation_name(annotation: object) -> str:
 
 @pytest.mark.parametrize("owner", [LLMProvider, LLMClient], ids=["protocol", "client"])
 def test_llm_provider_chat_signatures_are_retained(owner: type) -> None:
-    """The four established chat methods keep their parameters, defaults, kinds and
+    """The two canonical chat methods keep their parameters, defaults, kinds and
     return types on both the protocol and the concrete client."""
     for name, (params, returns) in _CHAT_SIGNATURES.items():
         signature = inspect.signature(getattr(owner, name))
@@ -477,41 +470,28 @@ def test_llm_provider_chat_signatures_are_retained(owner: type) -> None:
         assert _annotation_name(signature.return_annotation) == returns, name
 
 
-@pytest.mark.parametrize("native", [False, True], ids=["text-alias", "native-alias"])
-def test_compatibility_alias_propagates_failure_from_one_pinned_send(
-    monkeypatch: pytest.MonkeyPatch, native: bool,
-) -> None:
-    """``chat_with_fallback``/``chat_with_tools_fallback`` delegate once to the pinned
-    method; a transient provider failure propagates to the shared retry owner after
-    exactly one send to the same model, with no alternate model or protocol."""
+@pytest.mark.parametrize("native", [False, True], ids=["text", "native"])
+def test_canonical_chat_propagates_failure_from_one_pinned_send(native: bool) -> None:
+    """``chat``/``chat_with_tools`` send once to the pinned model; a transient provider
+    failure propagates to the shared retry owner after exactly one send to the same
+    model, with no alternate model or protocol."""
     captured: list[httpx.Request] = []
     client = make_run_model_client(
         "openai",
         httpx.MockTransport(lambda request: captured.append(request) or httpx.Response(503, text="busy")),
         metadata=_NATIVE_META, upstream_id="native-model",
     )
-    target = "chat_with_tools" if native else "chat"
-    delegated: list[str] = []
-    real_target = getattr(client, target)
-
-    def delegate_spy(*args: Any, **kwargs: Any) -> Any:
-        """Record the alias's delegation, then run the real pinned method."""
-        delegated.append(target)
-        return real_target(*args, **kwargs)
-
-    monkeypatch.setattr(client, target, delegate_spy)
     state = CallAttemptState(2, 0)
     messages = [{"role": "user", "content": "request"}]
     try:
         with client.bind_attempt(state), pytest.raises(httpx.HTTPStatusError):
             if native:
-                client.chat_with_tools_fallback(messages, build_tool_definitions())
+                client.chat_with_tools(messages, build_tool_definitions())
             else:
-                client.chat_with_fallback(messages)
+                client.chat(messages)
     finally:
         client.close()
 
-    assert delegated == [target]
     assert len(captured) == 1 and state.outbound_attempts == 1
     wire = json.loads(captured[0].content)
     assert wire["model"] == "native-model"

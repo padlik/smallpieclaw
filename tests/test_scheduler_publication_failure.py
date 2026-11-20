@@ -223,7 +223,7 @@ def make_scheduler(
         monkeypatch.setenv(var, str(tmp_path / var.lower()))
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     paths = xdg_paths("publication-failure-test")
-    assert str(paths.models_config_file).startswith(str(tmp_path))
+    assert str(paths.model_selection_file).startswith(str(tmp_path))
     created: list[Scheduler] = []
 
     def _make(text: str = _TOML, *, enabled: bool = False) -> tuple[Scheduler, Path]:

@@ -846,9 +846,9 @@ def runtime_runner(tmp_path):
     )
     from embedding_client import EmbeddingClient
     from model_registry import (
-        CatalogDocument, ModelMetadata, ModelRecord, ModelRegistry, ProviderState,
+        CatalogDocument, ModelMetadata, ModelRecord, ProviderState,
     )
-    from model_settings import ModelSettings
+    from tests.model_stores import ModelStores
 
     model = ModelRecord(
         "pa/model-a", "pa", "model-a", "model-a display",
@@ -857,10 +857,9 @@ def runtime_runner(tmp_path):
         ),
     )
     provider = ProviderConfig("pa", "openai", "env:KEY_pa", "https://a.example.test/v1", 9)
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(
-        1, 2, None,
-        (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(
+        1, 2, (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),),
         (model,),
     ))
 
@@ -870,7 +869,7 @@ def runtime_runner(tmp_path):
             request_timeout=config.request_timeout, api_key="test-secret",
         )
 
-    registry = ModelRegistry({"pa": provider}, settings, _NoDiscovery(), resolve)
+    registry = stores.registry({"pa": provider}, _NoDiscovery(), resolve)
     registry.select(model.id)
 
     def unavailable_embedding(event: threading.Event) -> EmbeddingClient:

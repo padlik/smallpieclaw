@@ -499,7 +499,8 @@ class TelegramInterface:
         usage_registry=None,
         downloads_dir: str = "downloads",
         mcp_manager=None,             # Optional[MCPManager]
-        model_registry=None,          # Optional[ModelRegistry] — provider catalog (task 8.1)
+        *,
+        model_registry,               # ModelRegistry — required: /models is registry-only
         model_selection_tokens=None,  # Optional[SelectionTokenCache] — /models selection (task 8.2)
     ):
         tg_cfg = config["telegram"]
@@ -519,7 +520,7 @@ class TelegramInterface:
         self.skill_registry = skill_registry
         self._usage_registry = usage_registry  # TokenUsageRegistry
         self.mcp_manager = mcp_manager
-        self.model_registry = model_registry  # Optional[ModelRegistry] — provider catalog (task 8.1)
+        self.model_registry = model_registry
         if model_selection_tokens is None:
             from telegram_model_selection import SelectionTokenCache
 

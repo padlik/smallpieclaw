@@ -1496,43 +1496,13 @@ def _models_catalog_keyboard(
 
 @_require_auth
 async def cmd_models(iface: "TelegramInterface", update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the provider model catalog, or fall back to the legacy model list."""
-    registry = getattr(iface, "model_registry", None)
-    if registry is not None:
-        result = await _render_models_catalog(registry)
-        keyboard = _models_catalog_keyboard(
-            iface, registry, result,
-            user_id=getattr(getattr(update, "effective_user", None), "id", None),
-            chat_id=getattr(getattr(update, "effective_chat", None), "id", None),
-        )
-        await update.effective_message.reply_text(result.text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        return
-
-    if not iface.llm_client or not hasattr(iface.llm_client, "list_models"):
-        await update.effective_message.reply_text("Multi-model support not available.")
-        return
-
-    models = iface.llm_client.list_models()
-
-    lines = [f"🤖 <b>LLM Models</b> ({len(models)} configured)\n"]
-    buttons = []
-    for m in models:
-        active_icon = "✅" if m["active"] else "⬜"
-        vision_tag = " 👁" if m.get("vision") else ""
-        lines.append(
-            f"{active_icon} <b>{html.escape(m['name'])}</b>: "
-            f"<code>{html.escape(m['model'])}</code>{vision_tag}"
-        )
-        if not m["active"]:
-            buttons.append([InlineKeyboardButton(
-                f"Switch to {m['name']}",
-                callback_data=f"model:{m['name']}",
-            )])
-
-    keyboard = InlineKeyboardMarkup(buttons) if buttons else None
-    await update.effective_message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
+    """Show the provider model catalog with refresh and opaque selection buttons."""
+    registry = iface.model_registry
+    result = await _render_models_catalog(registry)
+    keyboard = _models_catalog_keyboard(
+        iface, registry, result,
+        user_id=getattr(getattr(update, "effective_user", None), "id", None),
+        chat_id=getattr(getattr(update, "effective_chat", None), "id", None),
     )
+    await update.effective_message.reply_text(result.text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 

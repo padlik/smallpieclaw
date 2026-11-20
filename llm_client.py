@@ -195,7 +195,6 @@ class LLMClient:
         self._required_output_cap = int(agent_config.required_output_cap_tokens)
         self._max_retries = int(agent_config.max_retries)
         self._retry_delay = float(agent_config.retry_delay)
-        self._diagnose_empty = bool(agent_config.diagnose_empty_responses)
         self._embedding_client = embedding_client
         self._cancel_event = cancel_event
         self._usage_registry = usage_registry
@@ -394,16 +393,6 @@ class LLMClient:
 
         return self._logged_chat_invocation("text", invoke)
 
-    def chat_with_fallback(
-        self,
-        messages: list[dict],
-        system: str | None = None,
-        progress_cb=None,
-        json_mode: bool = False,
-    ) -> str:
-        """Compatibility wrapper; delegates once without model/protocol fallback."""
-        return self.chat(messages, system, progress_cb=progress_cb, json_mode=json_mode)
-
     def chat_with_tools(
         self,
         messages: list[dict],
@@ -460,16 +449,6 @@ class LLMClient:
                 err=_safe_llm_failure_category(exc),
             )
             raise
-
-    def chat_with_tools_fallback(
-        self,
-        messages: list[dict],
-        tools: list[dict],
-        system: str | None = None,
-        progress_cb=None,
-    ) -> ChatResponse:
-        """Compatibility wrapper; delegates once without hidden fallback."""
-        return self.chat_with_tools(messages, tools, system, progress_cb=progress_cb)
 
     def _invoke_provider(
         self,
@@ -543,7 +522,6 @@ class LLMClient:
             send_json=lambda payload: self._send_json(payload, mode),
             track_usage=self._track_usage,
             caller_tag=self._caller_tag,
-            diagnose_empty=self._diagnose_empty,
             cancel_event=self._cancel_event,
             ollama_client=self._ollama_client,
             graph_extraction=self._graph_policy is not None,

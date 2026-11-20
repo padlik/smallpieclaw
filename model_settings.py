@@ -1,11 +1,10 @@
-"""Strict TOML persistence for managed provider model catalog state."""
+"""Persistence for the discovery cache and the durable model selection preference."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
-import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -45,131 +44,6 @@ class ModelSettingsError(ValueError):
         """Create an error that exposes only a stable safe failure code."""
         self.code = code
         super().__init__(f"model settings {code.replace('_', ' ')}")
-
-
-@dataclass(frozen=True)
-class SettingsLoadResult:
-    """Outcome of loading managed settings without implicit model selection."""
-
-    status: Literal["valid", "missing", "corrupt"]
-    document: CatalogDocument | None = None
-    preserved_path: Path | None = None
-
-
-class ModelSettings:
-    """Load and atomically write one validated v1 TOML catalog document."""
-
-    def __init__(self, path: Path, *, read_only: bool = False) -> None:
-        """Bind managed settings to ``path`` without creating it.
-
-        With ``read_only=True`` the instance never writes, backs up, or creates
-        files: the first successful ``load`` result becomes a stable snapshot
-        and ``write`` always raises ``ModelSettingsError("read_only")``.
-        """
-        self.path = Path(path)
-        self._read_only = read_only
-        self._snapshot: SettingsLoadResult | None = None
-        self._preserved_content: bytes | None = None
-        self._preservation_failed = False
-
-    def load(self) -> SettingsLoadResult:
-        """Return valid, missing, or corrupt settings state.
-
-        Default mode rereads the file on every call and preserves corrupt bytes
-        in a sibling backup. Read-only mode reports corrupt state without any
-        backup (``preserved_path`` is ``None``) and returns its first
-        successful result on every later call.
-        """
-        if self._snapshot is not None:
-            return self._snapshot
-        try:
-            content = self.path.read_bytes()
-        except FileNotFoundError:
-            return self._settle(SettingsLoadResult("missing"))
-        except OSError:
-            raise ModelSettingsError("read_failed") from None
-
-        try:
-            parsed = _tomllib.loads(content.decode("utf-8"))
-            document = _document_from_mapping(parsed)
-        except (UnicodeDecodeError, _tomllib.TOMLDecodeError, ModelSettingsError, TypeError, ValueError):
-            if self._read_only:
-                return self._settle(SettingsLoadResult("corrupt"))
-            preserved = self._preserve_corrupt()
-            return SettingsLoadResult("corrupt", preserved_path=preserved)
-        return self._settle(SettingsLoadResult("valid", document))
-
-    def write(self, document: CatalogDocument) -> None:
-        """Validate and atomically replace the settings file.
-
-        Read-only instances raise ``ModelSettingsError("read_only")`` before
-        any validation or filesystem access.
-        """
-        if self._read_only:
-            raise ModelSettingsError("read_only")
-        _validate_document(document)
-        payload = _document_to_toml(document).encode("utf-8")
-        temporary: str | None = None
-        try:
-            self._preserve_existing_corrupt_content()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, self.path)
-            temporary = None
-        except OSError:
-            raise ModelSettingsError("write_failed") from None
-        finally:
-            if temporary is not None:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
-
-    def _settle(self, result: SettingsLoadResult) -> SettingsLoadResult:
-        """Record ``result`` as the read-only snapshot; default mode never caches."""
-        if self._read_only:
-            self._snapshot = result
-        return result
-
-    def _preserve_corrupt(self) -> Path:
-        """Copy corrupt bytes to a unique sibling before exposing corrupt state."""
-        backup = self.path.with_name(f"{self.path.name}.corrupt")
-        suffix = 1
-        while backup.exists():
-            backup = self.path.with_name(f"{self.path.name}.corrupt.{suffix}")
-            suffix += 1
-        try:
-            shutil.copy2(self.path, backup)
-        except OSError:
-            self._preservation_failed = True
-            raise ModelSettingsError("preserve_failed") from None
-        try:
-            self._preserved_content = self.path.read_bytes()
-        except OSError:
-            self._preservation_failed = True
-            raise ModelSettingsError("preserve_failed") from None
-        return backup
-
-    def _preserve_existing_corrupt_content(self) -> None:
-        """Refuse overwrite until the current corrupt bytes have a safe copy."""
-        if self._preservation_failed:
-            raise ModelSettingsError("preserve_failed")
-        try:
-            content = self.path.read_bytes()
-        except FileNotFoundError:
-            return
-        except OSError:
-            raise ModelSettingsError("read_failed") from None
-        if self._preserved_content == content or _is_valid_content(content):
-            return
-        self._preserve_corrupt()
 
 
 @dataclass(frozen=True)
@@ -256,8 +130,6 @@ class ModelCache:
     unreadable or invalid file as absent without touching it (no backup, no
     quarantine); ``write`` replaces the file atomically (temporary file,
     ``fsync``, ``os.replace``) so a failure leaves the prior bytes or absence.
-    ``load``/``write`` mirror ``ModelSettings`` so the registry treats both
-    as its catalog store.
     """
 
     def __init__(self, path: Path) -> None:
@@ -375,34 +247,15 @@ def _preference_selector(value: Any) -> str:
     return selector
 
 
-def _is_valid_content(content: bytes) -> bool:
-    """Return whether existing bytes satisfy the complete managed schema."""
-    try:
-        _document_from_mapping(_tomllib.loads(content.decode("utf-8")))
-    except (UnicodeDecodeError, _tomllib.TOMLDecodeError, ModelSettingsError, TypeError, ValueError):
-        return False
-    return True
-
-
 def _document_from_mapping(data: Any) -> CatalogDocument:
-    """Decode a parsed TOML object using explicit versioned allowlists."""
+    """Decode a parsed mapping (from the JSON cache) using explicit versioned allowlists."""
     if not isinstance(data, dict):
         raise ModelSettingsError("invalid_schema")
-    # ``supplemental`` and per-model ``sources`` belong to the retired public-supplement
-    # schema: the retired-file reader accepts and discards them; they are never written.
-    _keys(data, {"schema_version", "revision", "default_model", "providers", "models", "supplemental"})
+    _keys(data, {"schema_version", "revision", "providers", "models"})
     schema_version = _integer(data.get("schema_version"), "schema_version", minimum=1)
     if schema_version != 1:
         raise ModelSettingsError("unsupported_version")
     revision = _integer(data.get("revision"), "revision", minimum=0)
-    default_model = data.get("default_model")
-    if default_model is not None:
-        default_model = _safe_string(default_model, "default_model")
-        remembered_provider, separator, remembered_upstream = default_model.partition("/")
-        if not separator:
-            raise ModelSettingsError("invalid_default_model")
-        _identity(default_model, _provider_id(remembered_provider), remembered_upstream)
-
     providers_table = data.get("providers", {})
     if not isinstance(providers_table, dict):
         raise ModelSettingsError("invalid_schema")
@@ -451,10 +304,7 @@ def _document_from_mapping(data: Any) -> CatalogDocument:
         metadata = _metadata_from_mapping(raw_model)
         models.append(ModelRecord(model_id, provider_id, upstream_id, display_name, metadata))
 
-    if not isinstance(data.get("supplemental", []), list):
-        raise ModelSettingsError("invalid_schema")
-
-    return CatalogDocument(schema_version, revision, default_model, tuple(providers), tuple(models))
+    return CatalogDocument(schema_version, revision, tuple(providers), tuple(models))
 
 
 def _validate_document(document: CatalogDocument) -> None:
@@ -502,8 +352,6 @@ def _document_to_mapping(document: CatalogDocument) -> dict[str, Any]:
         "providers": providers,
         "models": models,
     }
-    if document.default_model is not None:
-        result["default_model"] = document.default_model
     return result
 
 
@@ -533,25 +381,6 @@ def _metadata_from_mapping(data: dict[str, Any]) -> ModelMetadata:
         else:
             values[name] = value
     return ModelMetadata(**values)
-
-
-def _document_to_toml(document: CatalogDocument) -> str:
-    """Encode the fixed schema as TOML without generic object serialization."""
-    data = _document_to_mapping(document)
-    lines = [f"schema_version = {data['schema_version']}", f"revision = {data['revision']}"]
-    if "default_model" in data:
-        lines.append(f"default_model = {_quote(data['default_model'])}")
-    for provider_id, provider in data["providers"].items():
-        lines.extend(["", f"[providers.{_quote_key(provider_id)}]"])
-        for name in ("adapter", "last_success_at", "status", "sanitized_last_error_code"):
-            if name in provider:
-                lines.append(f"{name} = {_toml_value(provider[name])}")
-    for model in data["models"]:
-        lines.extend(["", "[[models]]"])
-        for name in ("id", "provider_id", "upstream_id", "display_name", *_FIELDS):
-            if name in model:
-                lines.append(f"{name} = {_toml_value(model[name])}")
-    return "\n".join(lines) + "\n"
 
 
 def _keys(mapping: dict[str, Any], allowed: set[str]) -> None:
@@ -624,19 +453,3 @@ def _timestamp(value: Any) -> str:
 def _quote(value: str) -> str:
     """Encode a string using TOML-compatible JSON basic-string escaping."""
     return json.dumps(value, ensure_ascii=False)
-
-
-def _quote_key(value: str) -> str:
-    """Quote provider table names, including otherwise unsupported punctuation."""
-    return _quote(value)
-
-
-def _toml_value(value: Any) -> str:
-    """Encode one schema scalar with no arbitrary Python serialization."""
-    if isinstance(value, str):
-        return _quote(value)
-    if type(value) is bool:
-        return "true" if value else "false"
-    if type(value) is int:
-        return str(value)
-    raise ModelSettingsError("invalid_scalar")

@@ -231,7 +231,7 @@ def _saved_document(
         for model_id in sorted(ids)
     )
     # Selection lives only in the separate preference file (task 3.3, ADR-0040).
-    return CatalogDocument(1, 3, None, tuple(providers), models)
+    return CatalogDocument(1, 3, tuple(providers), models)
 
 
 def _acme_row(upstream: str) -> dict[str, Any]:
@@ -839,7 +839,7 @@ class RootHarness:
                 )
             )
         if legacy_settings is not None:
-            self.paths.models_config_file.write_bytes(legacy_settings)
+            (self.paths.config_home / "models-config.toml").write_bytes(legacy_settings)
         if saved_default is not None:
             ModelPreference(self.paths.model_selection_file).write(saved_default)
         if preference_bytes is not None:

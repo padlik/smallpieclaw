@@ -25,7 +25,8 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings
+from model_settings import ModelCache, ModelPreference
+from tests.model_stores import ModelStores
 from config_schema import ProviderConfig, ResolvedProviderConnection
 
 
@@ -105,22 +106,23 @@ def make_registry(
     models: tuple[ModelRecord, ...] = (),
     remembered: str | None = None,
     discovery: FakeDiscovery | None = None,
-) -> tuple[ModelRegistry, ModelSettings, FakeDiscovery]:
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    if models or remembered is not None:
-        settings.write(
+) -> tuple[ModelRegistry, ModelStores, FakeDiscovery]:
+    stores = ModelStores.at(tmp_path)
+    if models:
+        stores.seed(
             CatalogDocument(
                 1,
                 2,
-                remembered,
                 tuple(ProviderState(item.name, item.type, "2026-09-01T00:00:00Z", "fresh") for item in connections),
                 models,
             )
         )
+    if remembered is not None:
+        stores.preference.write(remembered)
     discovery = discovery or FakeDiscovery()
     conn_map = {item.name: item for item in connections}
-    registry = ModelRegistry(conn_map, settings, discovery, resolve)
-    return registry, settings, discovery
+    registry = stores.registry(conn_map, discovery, resolve)
+    return registry, stores, discovery
 
 
 def resolve(provider: FakeProviderConfig) -> FakeResolvedConnection:
@@ -230,7 +232,8 @@ def test_ordinary_selection_and_admission_use_exact_canonical_ids_only(
     assert registry.admit(other.id).model == other
 
 
-def test_unavailable_saved_id_is_remembered_but_not_restored_or_admitted(tmp_path: Path) -> None:
+def test_saved_id_missing_from_cache_stays_active_and_admissible(tmp_path: Path) -> None:
+    """ADR-0040: the saved selection is active as saved, independent of cache membership."""
     registry, _, discovery = make_registry(tmp_path, remembered="p/old/model")
     discovery.responses["p"] = inventory()
 
@@ -238,24 +241,21 @@ def test_unavailable_saved_id_is_remembered_but_not_restored_or_admitted(tmp_pat
     view = registry.restore_selection()
 
     assert view.remembered_model_id == "p/old/model"
-    assert view.active_model_id is None
-    assert view.selection_status == "saved_selection_unavailable"
+    assert view.active_model_id == "p/old/model"
+    assert view.selection_status == "active"
     assert registry.admit("p/new").model.upstream_id == "new"  # explicit needs neither Main nor cache
-    with pytest.raises(ModelRegistryError) as error:
-        registry.admit()
-    assert error.value.code == "no_active_selection"  # implicit use has no restored Main
+    assert registry.admit().model.id == "p/old/model"
 
 
 def test_selection_persists_before_active_publication_and_write_failure_keeps_prior_choice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first, second = model("first"), model("second")
-    registry, settings, _ = make_registry(tmp_path, models=(first, second))
+    registry, stores, _ = make_registry(tmp_path, models=(first, second))
     registry.select(first.id)
-    previous = settings.load().document
-    assert previous is not None
+    previous = stores.preference.path.read_bytes()
 
-    monkeypatch.setattr(settings, "write", lambda _document: (_ for _ in ()).throw(OSError("private detail")))
+    monkeypatch.setattr(stores.preference, "write", lambda _selector: (_ for _ in ()).throw(OSError("private detail")))
     with pytest.raises(ModelRegistryError) as error:
         registry.select(second.id)
 
@@ -263,28 +263,27 @@ def test_selection_persists_before_active_publication_and_write_failure_keeps_pr
     view = registry.view()
     assert view.active_model_id == first.id
     assert view.remembered_model_id == first.id
-    assert settings.load().document == previous
+    assert stores.preference.path.read_bytes() == previous
     assert "private detail" not in str(error.value)
 
 
-def test_corrupt_managed_state_is_preserved_and_registry_remains_inactive(tmp_path: Path) -> None:
-    path = tmp_path / "models-config.toml"
+def test_corrupt_cache_is_untouched_and_registry_remains_inactive(tmp_path: Path) -> None:
+    stores = ModelStores.at(tmp_path)
     original = b"schema_version = 1\nrevision = true\n"
-    path.write_bytes(original)
-    settings = ModelSettings(path)
-    registry = ModelRegistry({"p": config()}, settings, FakeDiscovery(), resolve)
+    stores.cache.path.write_bytes(original)
+    registry = stores.registry({"p": config()}, FakeDiscovery(), resolve)
 
     view = registry.restore_selection()
 
     assert view.selection_status == "no_selection"
     assert view.active_model_id is None
-    assert path.read_bytes() == original
-    assert (tmp_path / "models-config.toml.corrupt").read_bytes() == original
+    assert stores.cache.path.read_bytes() == original
+    assert not stores.cache.path.with_name(stores.cache.path.name + ".corrupt").exists()  # never quarantined
 
 
 def test_refresh_replaces_complete_inventory_and_persists_provider_values(tmp_path: Path) -> None:
     old, current = model("old"), model("vendor/model/rev")
-    registry, _, discovery = make_registry(tmp_path, models=(old,))
+    registry, stores, discovery = make_registry(tmp_path, models=(old,))
     discovery.responses["p"] = inventory(models=(current,))
 
     report = registry.refresh()
@@ -296,7 +295,7 @@ def test_refresh_replaces_complete_inventory_and_persists_provider_values(tmp_pa
     assert view.models[0].upstream_id == "vendor/model/rev"
     assert view.models[0].metadata.vision is False
     assert view.providers[0].status == "fresh"
-    loaded = registry._settings.load().document
+    loaded = stores.cache.load().document
     assert loaded is not None
     assert loaded.models == (current,)
 
@@ -356,7 +355,7 @@ def test_malformed_or_duplicate_inventory_is_rejected_without_partial_merge(tmp_
 
 def test_control_character_inventory_timestamp_preserves_last_good_as_stale(tmp_path: Path) -> None:
     cached, untrusted_addition = model("cached"), model("untrusted-addition")
-    registry, settings, discovery = make_registry(tmp_path, models=(cached,))
+    registry, stores, discovery = make_registry(tmp_path, models=(cached,))
     malformed = dataclass_replace(
         inventory(models=(untrusted_addition,)), last_success_at="2026-10-01\n12:00:00"
     )
@@ -369,7 +368,7 @@ def test_control_character_inventory_timestamp_preserves_last_good_as_stale(tmp_
     assert report.error_codes == (("p", "invalid_inventory"),)
     assert view.models == (cached,)
     assert view.providers[0].status == "stale"
-    persisted = settings.load().document
+    persisted = stores.cache.load().document
     assert persisted is not None
     assert persisted.models == (cached,)
     assert persisted.providers[0].status == "stale"
@@ -381,10 +380,10 @@ def test_refresh_write_failure_publishes_discovery_in_memory_and_keeps_disk_and_
 ) -> None:
     """Task 3.4: the cache is advisory, so a failed cache write is reported but not rolled back."""
     cached = model("cached", context=100)
-    registry, settings, discovery = make_registry(tmp_path, models=(cached,))
+    registry, stores, discovery = make_registry(tmp_path, models=(cached,))
     registry.select(cached.id)
     before_view = registry.view()
-    before_document = settings.load().document
+    before_document = stores.cache.load().document
     assert before_document is not None
     if change == "addition":
         returned = inventory(models=(cached, model("new")))
@@ -394,7 +393,7 @@ def test_refresh_write_failure_publishes_discovery_in_memory_and_keeps_disk_and_
         expected = (model("cached", context=200),)
     discovery.responses["p"] = returned
     monkeypatch.setattr(
-        settings, "write", lambda _document: (_ for _ in ()).throw(OSError("private write detail"))
+        stores.cache, "write", lambda _document: (_ for _ in ()).throw(OSError("private write detail"))
     )
 
     report = registry.refresh()
@@ -406,23 +405,23 @@ def test_refresh_write_failure_publishes_discovery_in_memory_and_keeps_disk_and_
     assert after_view.active_model_id == cached.id
     assert after_view.remembered_model_id == before_view.remembered_model_id
     assert after_view.selection_revision == before_view.selection_revision
-    assert settings.load().document == before_document
+    assert stores.cache.load().document == before_document
     assert "private write detail" not in repr(report)
 
 
 def test_refresh_persists_candidate_before_publishing_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cached, added = model("cached"), model("added")
-    registry, settings, discovery = make_registry(tmp_path, models=(cached,))
+    registry, stores, discovery = make_registry(tmp_path, models=(cached,))
     before = registry.view()
     discovery.responses["p"] = inventory(models=(cached, added))
-    original_write = settings.write
+    original_write = stores.cache.write
     observed: list[tuple[str, ...]] = []
 
     def inspect_then_write(document: CatalogDocument) -> None:
         observed.append(tuple(item.id for item in registry.view().models))
         original_write(document)
 
-    monkeypatch.setattr(settings, "write", inspect_then_write)
+    monkeypatch.setattr(stores.cache, "write", inspect_then_write)
 
     report = registry.refresh()
 
@@ -434,7 +433,7 @@ def test_refresh_persists_candidate_before_publishing_it(tmp_path: Path, monkeyp
 
 def test_refresh_merges_against_selection_made_while_fetch_is_blocked(tmp_path: Path) -> None:
     first, added = model("first"), model("added")
-    registry, settings, discovery = make_registry(tmp_path, models=(first,))
+    registry, stores, discovery = make_registry(tmp_path, models=(first,))
     entered = threading.Event()
     release = threading.Event()
 
@@ -445,7 +444,7 @@ def test_refresh_merges_against_selection_made_while_fetch_is_blocked(tmp_path: 
             return inventory(models=(first, added))
 
     discovery = BlockingDiscovery()
-    registry = ModelRegistry({"p": config()}, settings, discovery, resolve)
+    registry = stores.registry({"p": config()}, discovery, resolve)
     result: list[object] = []
     worker = threading.Thread(target=lambda: result.append(registry.refresh()))
     worker.start()
@@ -457,15 +456,15 @@ def test_refresh_merges_against_selection_made_while_fetch_is_blocked(tmp_path: 
     assert not worker.is_alive()
     assert result and isinstance(result[0], object)
     assert registry.view().active_model_id == first.id
-    loaded = settings.load().document
+    loaded = stores.cache.load().document
     assert loaded is not None
-    assert loaded.default_model == first.id
+    assert stores.selected() == first.id
     assert {item.id for item in loaded.models} == {first.id, added.id}
 
 
 def test_newer_completed_refresh_discards_older_late_result(tmp_path: Path) -> None:
     old, latest = model("old"), model("latest")
-    registry, settings, _ = make_registry(tmp_path)
+    registry, stores, _ = make_registry(tmp_path)
     first_entered = threading.Event()
     release_first = threading.Event()
     counter_lock = threading.Lock()
@@ -483,7 +482,7 @@ def test_newer_completed_refresh_discards_older_late_result(tmp_path: Path) -> N
                 return inventory(models=(old,))
             return inventory(models=(latest,))
 
-    registry = ModelRegistry({"p": config()}, settings, OrderedDiscovery(), resolve)
+    registry = stores.registry({"p": config()}, OrderedDiscovery(), resolve)
     older_report: list[object] = []
     older = threading.Thread(target=lambda: older_report.append(registry.refresh()))
     older.start()
@@ -543,12 +542,11 @@ def test_refresh_rejects_mismatched_resolved_connection_before_discovery(
         request_timeout=20,
     )
     cached = ModelRecord("typed-account/cached", "typed-account", "cached", "Cached")
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(
         CatalogDocument(
             1,
             4,
-            cached.id,
             (ProviderState("typed-account", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (cached,),
         )
@@ -567,9 +565,7 @@ def test_refresh_rejects_mismatched_resolved_connection_before_discovery(
             return inventory("typed-account", (model("new", "typed-account"),))
 
     discovery = NoNetworkDiscovery()
-    registry = ModelRegistry(
-        {provider.name: provider}, settings, discovery, lambda _config: resolved
-    )
+    registry = stores.registry({provider.name: provider}, discovery, lambda _config: resolved)
 
     report = registry.refresh()
 
@@ -585,12 +581,11 @@ def test_refresh_sanitizes_credential_resolver_failure_and_preserves_stale_cache
     tmp_path: Path,
 ) -> None:
     cached = model("cached")
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(
         CatalogDocument(
             1,
             2,
-            cached.id,
             (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
             (cached,),
         )
@@ -603,7 +598,7 @@ def test_refresh_sanitizes_credential_resolver_failure_and_preserves_stale_cache
     def failed_resolver(_config: FakeProviderConfig) -> FakeResolvedConnection:
         raise RuntimeError("PRIVATE_CREDENTIAL_SENTINEL")
 
-    registry = ModelRegistry({"p": config()}, settings, NoNetworkDiscovery(), failed_resolver)
+    registry = stores.registry({"p": config()}, NoNetworkDiscovery(), failed_resolver)
 
     report = registry.refresh()
 
@@ -625,12 +620,12 @@ def _capture_admission(
 
 def test_refresh_write_failure_removal_is_published_but_keeps_active_choice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cached = model("cached")
-    registry, settings, discovery = make_registry(tmp_path, models=(cached,))
+    registry, stores, discovery = make_registry(tmp_path, models=(cached,))
     registry.select(cached.id)
-    before_document = settings.load().document
+    before_document = stores.cache.load().document
     assert before_document is not None
     discovery.responses["p"] = inventory()
-    monkeypatch.setattr(settings, "write", lambda _document: (_ for _ in ()).throw(OSError("private")))
+    monkeypatch.setattr(stores.cache, "write", lambda _document: (_ for _ in ()).throw(OSError("private")))
 
     report = registry.refresh()
 
@@ -640,7 +635,7 @@ def test_refresh_write_failure_removal_is_published_but_keeps_active_choice(tmp_
     assert registry.view().active_model_id == cached.id  # a failed cache write never changes the active choice
     assert registry.view().models == ()
     assert registry.view().revision == before_document.revision + 1
-    assert settings.load().document == before_document
+    assert stores.cache.load().document == before_document
 
 
 def test_discovery_and_resolved_credentials_never_appear_in_public_views_or_errors(tmp_path: Path) -> None:
@@ -682,7 +677,7 @@ def test_scheduled_admission_pins_saved_selector_exactly_or_inherits_main_with_o
     main_model, explicit_model = model("main", "p"), model("explicit", "q")
     uncached = ModelRecord(expected_id, "p", expected_id[2:], expected_id[2:])
     expected_model = {"p/main": main_model, "q/explicit": explicit_model}.get(expected_id, uncached)
-    _, settings, discovery = make_registry(
+    _, stores, discovery = make_registry(
         tmp_path,
         connections=(config("p"), config("q")),
         models=(main_model, explicit_model),
@@ -694,9 +689,7 @@ def test_scheduled_admission_pins_saved_selector_exactly_or_inherits_main_with_o
         observations.append(provider.name)
         return resolve(provider)
 
-    registry = ModelRegistry(
-        {"p": config("p"), "q": config("q")}, settings, discovery, observing_resolver
-    )
+    registry = stores.registry({"p": config("p"), "q": config("q")}, discovery, observing_resolver)
     registry.select(main_model.id)
     if stale_explicit_provider:
         discovery.responses["p"] = inventory("p", (main_model,))
@@ -708,7 +701,7 @@ def test_scheduled_admission_pins_saved_selector_exactly_or_inherits_main_with_o
     observations.clear()
     caplog.clear()
     before_view = registry.view()
-    settings_path = tmp_path / "models-config.toml"
+    settings_path = stores.cache.path
     before_bytes = settings_path.read_bytes()
 
     pin = registry.admit_scheduled(raw_selector)
@@ -748,7 +741,7 @@ def test_scheduled_admission_fails_invalid_selector_with_its_own_code_and_never_
     tmp_path: Path, caplog: pytest.LogCaptureFixture, main_state: str, raw_selector: object, code: str
 ) -> None:
     main_model, explicit_model = model("main", "p"), model("explicit", "q")
-    _, settings, discovery = make_registry(
+    _, stores, discovery = make_registry(
         tmp_path, connections=(config("p"), config("q")), models=(main_model, explicit_model)
     )
     calls: list[str] = []
@@ -757,13 +750,13 @@ def test_scheduled_admission_fails_invalid_selector_with_its_own_code_and_never_
         calls.append(provider.name)
         return resolve(provider)
 
-    registry = ModelRegistry({"p": config("p"), "q": config("q")}, settings, discovery, counting_resolver)
+    registry = stores.registry({"p": config("p"), "q": config("q")}, discovery, counting_resolver)
     if main_state == "active":
         registry.select(main_model.id)
     caplog.set_level(logging.WARNING, logger="model_registry")
     caplog.clear()
     before_view = registry.view()
-    settings_path = tmp_path / "models-config.toml"
+    settings_path = stores.cache.path
     before_bytes = settings_path.read_bytes()
     selector_copy = copy.deepcopy(raw_selector)
 
@@ -787,16 +780,14 @@ def _registry_warning_count(caplog: pytest.LogCaptureFixture) -> int:
     )
 
 
-@pytest.mark.parametrize("main_state", ["unselected", "remembered-missing"])
 def test_scheduled_admission_inherits_only_an_active_main_and_explicit_needs_none(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, main_state: str
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     main_model, explicit_model = model("main", "p"), model("explicit", "q")
-    _, settings, discovery = make_registry(
+    _, stores, discovery = make_registry(
         tmp_path,
         connections=(config("p"), config("q")),
         models=(main_model, explicit_model),
-        remembered="p/gone" if main_state == "remembered-missing" else None,
     )
     calls: list[str] = []
 
@@ -804,16 +795,12 @@ def test_scheduled_admission_inherits_only_an_active_main_and_explicit_needs_non
         calls.append(provider.name)
         return resolve(provider)
 
-    registry = ModelRegistry({"p": config("p"), "q": config("q")}, settings, discovery, counting_resolver)
-    if main_state == "remembered-missing":
-        registry.restore_selection()
-        assert registry.view().selection_status == "saved_selection_unavailable"
-    else:
-        assert registry.view().selection_status == "no_selection"
+    registry = stores.registry({"p": config("p"), "q": config("q")}, discovery, counting_resolver)
+    assert registry.view().selection_status == "no_selection"
     caplog.set_level(logging.WARNING, logger="model_registry")
     caplog.clear()
     before_view = registry.view()
-    settings_path = tmp_path / "models-config.toml"
+    settings_path = stores.cache.path
     before_bytes = settings_path.read_bytes()
 
     with pytest.raises(ModelRegistryError) as error:
@@ -835,7 +822,8 @@ def test_scheduled_admission_inherits_only_an_active_main_and_explicit_needs_non
 def test_scheduled_admission_without_saved_catalog_runs_explicit_and_fails_closed_for_inherited(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    settings_path = tmp_path / "models-config.toml"
+    stores = ModelStores.at(tmp_path)
+    settings_path = stores.cache.path
     calls: list[str] = []
 
     def counting_resolver(provider: FakeProviderConfig) -> FakeResolvedConnection:
@@ -843,9 +831,7 @@ def test_scheduled_admission_without_saved_catalog_runs_explicit_and_fails_close
         return resolve(provider)
 
     discovery = FakeDiscovery()
-    registry = ModelRegistry(
-        {"p": config("p"), "q": config("q")}, ModelSettings(settings_path), discovery, counting_resolver
-    )
+    registry = stores.registry({"p": config("p"), "q": config("q")}, discovery, counting_resolver)
     caplog.set_level(logging.WARNING, logger="model_registry")
     caplog.clear()
     before_view = registry.view()
@@ -883,7 +869,7 @@ def test_scheduled_admission_rejects_unusable_credential_resolution_without_fall
     expected_provider: str,
 ) -> None:
     main_model, explicit_model = model("main", "p"), model("explicit", "q")
-    _, settings, discovery = make_registry(
+    _, stores, discovery = make_registry(
         tmp_path,
         connections=(config("p"), config("q")),
         models=(main_model, explicit_model),
@@ -897,11 +883,11 @@ def test_scheduled_admission_rejects_unusable_credential_resolution_without_fall
             raise RuntimeError("PRIVATE_CREDENTIAL_SENTINEL fake-secret")
         return FakeResolvedConnection(provider.name, provider.type, "https://wrong.invalid")
 
-    registry = ModelRegistry({"p": config("p"), "q": config("q")}, settings, discovery, failing_resolver)
+    registry = stores.registry({"p": config("p"), "q": config("q")}, discovery, failing_resolver)
     registry.select(main_model.id)
     caplog.clear()
     before_view = registry.view()
-    settings_path = tmp_path / "models-config.toml"
+    settings_path = stores.cache.path
     before_bytes = settings_path.read_bytes()
 
     with pytest.raises(ModelRegistryError) as error:
@@ -946,15 +932,15 @@ class _ScheduledAdmissionGate:
 
 def _race_registry(
     tmp_path: Path, gate: _ScheduledAdmissionGate
-) -> tuple[ModelRegistry, ModelSettings, FakeDiscovery]:
-    _, settings, discovery = make_registry(
+) -> tuple[ModelRegistry, ModelStores, FakeDiscovery]:
+    _, stores, discovery = make_registry(
         tmp_path,
         connections=(config("p"), config("q")),
         models=(model("main", "p"), model("sibling", "p"), model("explicit", "q")),
     )
-    registry = ModelRegistry({"p": config("p"), "q": config("q")}, settings, discovery, gate.resolve)
+    registry = stores.registry({"p": config("p"), "q": config("q")}, discovery, gate.resolve)
     registry.select("p/main")
-    return registry, settings, discovery
+    return registry, stores, discovery
 
 
 def _race_scheduled_admission(
@@ -1007,8 +993,8 @@ def test_scheduled_admission_is_not_invalidated_by_state_change_during_credentia
 ) -> None:
     """Task 4.1: no selection, catalog-revision or record recheck; the admission-time snapshot is pinned."""
     gate = _ScheduledAdmissionGate()
-    registry, settings, discovery = _race_registry(tmp_path, gate)
-    settings_path = settings.path
+    registry, stores, discovery = _race_registry(tmp_path, gate)
+    settings_path = stores.cache.path
     observed: dict[str, object] = {}
 
     def mutate() -> object:
@@ -1046,8 +1032,8 @@ def test_scheduled_admission_ignores_document_published_despite_cache_write_fail
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     gate = _ScheduledAdmissionGate()
-    registry, settings, discovery = _race_registry(tmp_path, gate)
-    settings_path = settings.path
+    registry, stores, discovery = _race_registry(tmp_path, gate)
+    settings_path = stores.cache.path
     main_model, explicit_model = model("main", "p"), model("explicit", "q")
     before_view = registry.view()
     before_document = registry._document
@@ -1105,7 +1091,7 @@ def test_connection_map_is_fixed_without_live_replacement(tmp_path: Path) -> Non
         return resolve(provider)
 
     source = {"p": config(url="https://original.invalid")}
-    registry = ModelRegistry(source, ModelSettings(tmp_path / "models-config.toml"), discovery, recording_resolver)
+    registry = ModelStores.at(tmp_path).registry(source, discovery, recording_resolver)
 
     assert not hasattr(registry, "replace_connections")
     source["p"] = config(url="https://moved.invalid")
@@ -1129,25 +1115,23 @@ def test_connection_map_is_fixed_without_live_replacement(tmp_path: Path) -> Non
 
 
 def _make_registry(
-    tmp_path: Path, models: tuple[ModelRecord, ...], *, catalog_default: str | None = None,
+    tmp_path: Path, models: tuple[ModelRecord, ...],
 ) -> tuple[ModelRegistry, Path, Path, FakeDiscovery]:
-    """Build a real registry over a real catalog file and a real preference file."""
+    """Build a real registry over a real cache file and a real preference file."""
     import model_settings
-    from model_settings import ModelPreference
 
-    catalog = tmp_path / "models-config.toml"
-    ModelSettings(catalog).write(CatalogDocument(
-        1, 2, catalog_default,
-        (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),), models,
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(
+        1, 2, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),), models,
     ))
     selection = tmp_path / "config" / "model-selection.toml"
     discovery = FakeDiscovery()
     registry = ModelRegistry(
-        {"p": config()}, ModelSettings(catalog), discovery, resolve,
+        {"p": config()}, stores.cache, discovery, resolve,
         preference=ModelPreference(selection),
     )
     assert model_settings  # module used by callers for OS-boundary patching
-    return registry, catalog, selection, discovery
+    return registry, stores.cache.path, selection, discovery
 
 
 def test_deliberate_selection_is_durable_before_publication_and_failure_keeps_prior_choice(
@@ -1192,22 +1176,19 @@ def test_deliberate_selection_is_durable_before_publication_and_failure_keeps_pr
 
 
 def test_preference_is_the_only_selection_source_and_sink(tmp_path: Path) -> None:
-    """The combined catalog's ``default_model`` is neither read nor written for selection."""
+    """Selection is read from and written to the preference file only, never the cache."""
     first, second = model("first"), model("second")
-    registry, catalog, selection, discovery = _make_registry(
-        tmp_path, (first, second), catalog_default=second.id,
-    )
+    registry, catalog, selection, discovery = _make_registry(tmp_path, (first, second))
+    catalog_bytes = catalog.read_bytes()
     view = registry.restore_selection()
-    # Task 3.5: the in-memory ordinal-first choice, never the catalog default (second).
+    # Task 3.5: the in-memory ordinal-first choice, never saved.
     assert view.remembered_model_id is None and view.active_model_id == first.id
     assert not selection.exists()  # no automatic preference write
-
-    from model_settings import ModelPreference
 
     selection.parent.mkdir(parents=True, exist_ok=True)
     selection.write_text('model = "p/second"\n', encoding="utf-8")
     registry = ModelRegistry(
-        {"p": config()}, ModelSettings(catalog), discovery, resolve,
+        {"p": config()}, ModelCache(catalog), discovery, resolve,
         preference=ModelPreference(selection),
     )
     discovery.responses["p"] = FakeInventory("p", "openai", (first, second), "2026-10-01T12:00:00Z")
@@ -1215,7 +1196,7 @@ def test_preference_is_the_only_selection_source_and_sink(tmp_path: Path) -> Non
     view = registry.restore_selection()
     assert (view.remembered_model_id, view.active_model_id) == (second.id, second.id)
     assert selection.read_bytes() == b'model = "p/second"\n'
-    assert ModelSettings(catalog).load().document.default_model == second.id
+    assert catalog.read_bytes() != catalog_bytes  # refresh rewrote only the cache
 
 
 def test_corrupt_preference_is_untouched_by_startup_and_refresh_until_deliberate_select(
@@ -1228,14 +1209,14 @@ def test_corrupt_preference_is_untouched_by_startup_and_refresh_until_deliberate
     selection.parent.mkdir(parents=True)
     corrupt = b'model = "p/first"\napi_key = "sk-corruptcanary0123456"\n'
     selection.write_bytes(corrupt)
-    catalog = tmp_path / "models-config.toml"
-    ModelSettings(catalog).write(CatalogDocument(
-        1, 2, None, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),), (first,),
+    cache = ModelCache(tmp_path / "models-cache.json")
+    cache.write(CatalogDocument(
+        1, 2, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),), (first,),
     ))
     discovery = FakeDiscovery()
     discovery.responses["p"] = FakeInventory("p", "openai", (first,), "2026-10-01T12:00:00Z")
     registry = ModelRegistry(
-        {"p": config()}, ModelSettings(catalog), discovery, resolve,
+        {"p": config()}, cache, discovery, resolve,
         preference=ModelPreference(selection),
     )
     registry.refresh()
@@ -1268,7 +1249,7 @@ def _registry(
     selection = tmp_path / "config" / "model-selection.toml"
     if models:
         ModelCache(cache_path).write(CatalogDocument(
-            1, 0, None, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),), models,
+            1, 0, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),), models,
         ))
     if cache_bytes is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1453,8 +1434,7 @@ def _build_world(
     if cached:
         providers = tuple(sorted({m.provider_id for m in cached}))
         ModelCache(cache_path).write(CatalogDocument(
-            1, 0, None,
-            tuple(ProviderState(pid, "openai", "2026-09-01T00:00:00Z", "fresh") for pid in providers),
+            1, 0, tuple(ProviderState(pid, "openai", "2026-09-01T00:00:00Z", "fresh") for pid in providers),
             cached,
         ))
     selection.parent.mkdir(parents=True, exist_ok=True)
@@ -1583,7 +1563,7 @@ def test_unsaved_automatic_choice_is_rederived_at_restart_not_remembered(tmp_pat
     assert not selection.exists()
     # The cache changes between runs; the former automatic choice is not sticky.
     ModelCache(cache_path).write(CatalogDocument(
-        1, 0, None, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
+        1, 0, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),),
         (model("a"), model("c")),
     ))
     restarted, _, _, _ = _build_world(tmp_path)
@@ -1686,8 +1666,7 @@ def _real_world(
     if cached:
         providers = tuple(sorted({m.provider_id for m in cached}))
         ModelCache(cache_path).write(CatalogDocument(
-            1, 0, None,
-            tuple(ProviderState(pid, "anthropic", "2026-09-01T00:00:00Z", "fresh") for pid in providers),
+            1, 0, tuple(ProviderState(pid, "anthropic", "2026-09-01T00:00:00Z", "fresh") for pid in providers),
             cached,
         ))
     if cache_bytes is not None:

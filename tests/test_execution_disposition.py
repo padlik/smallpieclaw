@@ -1436,7 +1436,16 @@ class TestActualDispatchConfirmationTrace:
         action = json.dumps({"action": "tool", "tool": "vision_query",
                              "args": {"path": image_path, "question": "What?"}})
         llm = ScriptedLLM([action, _FINISH])
-        llm.chat = MagicMock(return_value="A cat.")
+        scripted_chat = llm.chat
+        vision_chat = MagicMock(return_value="A cat.")
+
+        def chat(messages, system=None, progress_cb=None, json_mode=False):
+            # The vision query is the non-JSON call; ReAct turns stay scripted.
+            if json_mode:
+                return scripted_chat(messages, system=system, progress_cb=progress_cb, json_mode=json_mode)
+            return vision_chat(messages)
+
+        llm.chat = chat
         traces: list[ToolTrace] = []
         ctx = build_context(llm, RecordingExecutor(), on_tool_trace=traces.append)
         stub = ctx.builtin_executor
@@ -1470,7 +1479,7 @@ class TestActualDispatchConfirmationTrace:
 
         assert confirmation.last_call is not None
         assert confirmation.last_call[1] == "vision_query"
-        llm.chat.assert_called_once()
+        vision_chat.assert_called_once()
         assert [t.execution_disposition for t in traces] == ["executed"]
         assert traces[0].success is True
         assert result == "done"

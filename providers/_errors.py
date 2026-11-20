@@ -3,8 +3,8 @@ providers/_errors.py
 --------------------
 LLM provider error hierarchy shared across provider backends.
 
-These exception types classify failures from LLM API calls so the retry helper
-(``_with_retry``) and callers can distinguish transient, permanent, empty, and
+These exception types classify failures from LLM API calls so the shared
+retry owner (ReAct) and callers can distinguish transient, permanent, empty, and
 cancelled conditions. Moved verbatim from ``llm_client.py`` during the provider
 extraction refactor; ``llm_client`` re-imports them for backward compatibility.
 """
@@ -22,7 +22,7 @@ class LLMPermanentError(LLMError):
     """
     Raised for API-level errors that should never be retried — e.g. content filter
     violations, invalid API keys, bad request parameters.  Propagates immediately out
-    of _with_retry without consuming any retry attempts.
+    to the shared retry owner without consuming any retry attempts.
     """
 
 

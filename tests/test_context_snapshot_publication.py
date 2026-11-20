@@ -268,8 +268,8 @@ def test_tool_defs_grouping_failure_still_completes_with_a_real_count_in_loop() 
 
     llm = MagicMock()
     llm.llm_cfg = {"model": "test", "max_tokens": 512, "context_window": 4096}
-    llm.chat_with_fallback.return_value = '{"action":"finish","result":"done"}'
-    llm.chat_with_tools_fallback = MagicMock(side_effect=NotImplementedError())
+    llm.chat.return_value = '{"action":"finish","result":"done"}'
+    llm.chat_with_tools = MagicMock(side_effect=NotImplementedError())
     ctx.llm = llm
 
     # Force the grouping computation to fail in the first turn.
@@ -320,8 +320,8 @@ def test_react_loop_caches_tool_def_grouping_per_run() -> None:
     # compaction/snapshot pass and then the is_live=False final publish.
     llm = MagicMock()
     llm.llm_cfg = {"model": "test", "max_tokens": 512, "context_window": 4096}
-    llm.chat_with_fallback.return_value = '{"action":"finish","result":"done"}'
-    llm.chat_with_tools_fallback = MagicMock(side_effect=NotImplementedError())
+    llm.chat.return_value = '{"action":"finish","result":"done"}'
+    llm.chat_with_tools = MagicMock(side_effect=NotImplementedError())
     ctx.llm = llm
 
     with patch("react_loop.group_tool_defs_by_server") as mock_group:

@@ -15,6 +15,7 @@ import threading
 import traceback
 from pathlib import Path
 from typing import Callable
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import httpx
@@ -31,6 +32,7 @@ from config_schema import (
     ResolvedProviderConnection,
     parse_config,
 )
+from embedding_client import EmbeddingClient
 from llm_client import LLMClient
 from model_registry import (
     CatalogDocument,
@@ -41,7 +43,7 @@ from model_registry import (
     ProviderState,
     RunModel,
 )
-from model_settings import ModelSettings, SettingsLoadResult
+from tests.model_stores import ModelStores
 from providers._errors import LLMCancelledError, LLMPermanentError
 from react_loop import ReactContext
 
@@ -669,195 +671,104 @@ def test_graph_writer_finite_stop_drains_buffered_batch_on_real_worker_thread(
 
 
 # ---------------------------------------------------------------------------
-# resolve_graph_prerequisites — graph pin, fixed-cap budget, embedding check
+# resolve_graph_startup — explicit graph pin, Main independence, embedding check
 #
-# Uses the real ModelRegistry, ModelSettings, budget kernel and EmbeddingClient.
-# Only the credential resolver, environment, discovery and HTTP transport are
-# faked. The helper is imported inside each test so this module still collects
-# before the API exists.
+# The live startup path takes only the explicit ``[graph_memory]`` extraction
+# fields and ``[embeddings]``: there is no catalog, registry or Main input.
+# Real ModelStores/ModelRegistry are built only to prove their state is neither
+# read nor changed. The environment and HTTP boundary are the only fakes.
 # ---------------------------------------------------------------------------
 
-_PREREQ_GRAPH_ID = "g/org/graph-model"
-_PREREQ_MAIN_ID = "p/main"
-_PREREQ_GRAPH_KEY = "fake-prereq-graph-key"
-_PREREQ_EMBED_KEY = "fake-prereq-embedding-key"
-_PREREQ_CONN_KEY = "fake-prereq-connection-key"
-_PREREQ_LEAK = "sk-prereqleak12345"
-_PREREQ_SECRETS = (_PREREQ_GRAPH_KEY, _PREREQ_EMBED_KEY, _PREREQ_CONN_KEY, _PREREQ_LEAK)
-_PREREQ_LOCAL_CONTEXT = 3000
-_PREREQ_SEEDED_AT = "2026-09-01T00:00:00Z"
-_REMEMBERED_MAIN = {"unselected": None, "remembered-missing": "p/gone", "active-main": _PREREQ_MAIN_ID}
-_MAIN_STATUS = {
-    "unselected": "no_selection",
-    "remembered-missing": "saved_selection_unavailable",
-    "active-main": "active",
-}
-_REAL_HTTPX_CLIENT = httpx.Client
-
-
-def _meta(context: int | None = None, output: int | None = None) -> ModelMetadata:
-    """Return provider-reported metadata for the populated token limits."""
-    return ModelMetadata(context_tokens=context, output_tokens=output)
-
-
-def _prereq_providers() -> dict[str, ProviderConfig]:
-    """Return graph, Main, embedding and chat-only connections with distinct credentials."""
-    def connection(name: str, adapter: str, key: str) -> ProviderConfig:
-        return ProviderConfig(name, adapter, api_key=key, base_url=f"https://{name}.prereq.test/v1", request_timeout=20)
-
-    return {
-        "g": connection("g", "openai", "env:PREREQ_GRAPH_KEY"),
-        "p": connection("p", "openai", "env:PREREQ_MAIN_KEY"),
-        "e": connection("e", "openai", "env:PREREQ_CONN_KEY"),
-        "a": connection("a", "anthropic", "env:PREREQ_CONN_KEY"),
-    }
-
-
-_PREREQ_EMBED_URL = "https://embed.prereq.test/v1"
+_STARTUP_MODEL = "graph-extract-model"
+_STARTUP_KEY = "fake-startup-graph-key"
+_STARTUP_EMBED_KEY = "fake-startup-embedding-key"
+_STARTUP_CONN_KEY = "fake-startup-connection-key"
+_STARTUP_LEAK = "sk-startupleak12345"
+_STARTUP_EMBED_URL = "https://embed.startup.test/v1"
 _DEFAULT_EMBEDDINGS = EmbeddingsConfig(
-    provider="openai", base_url=_PREREQ_EMBED_URL, model="text-embed", api_key="env:PREREQ_EMBED_KEY"
+    provider="openai", base_url=_STARTUP_EMBED_URL, model="text-embed", api_key="env:STARTUP_EMBED_KEY"
 )
-
-
-class _GraphCredentials:
-    """Fake external credential resolver that records each resolved provider identity."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.fail = False
-
-    def __call__(self, config: ProviderConfig) -> ResolvedProviderConnection:
-        self.calls.append(config.name)
-        if self.fail:
-            raise RuntimeError(f"vault {_PREREQ_LEAK} token: {_PREREQ_GRAPH_KEY}")
-        return ResolvedProviderConnection(
-            config.name, config.type, config.base_url, config.request_timeout, _PREREQ_GRAPH_KEY
-        )
-
-
-class _NoDiscovery:
-    """External discovery boundary that records and refuses any fetch."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    def fetch(self, connection: ResolvedProviderConnection) -> object:
-        self.calls.append(connection.provider_id)
-        raise AssertionError("graph prerequisites must not run discovery")
-
-
-class _ObservedSettings(ModelSettings):
-    """Real managed settings that records writes; may serve an unvalidated document."""
-
-    def __init__(self, path: Path, preloaded: CatalogDocument | None = None) -> None:
-        super().__init__(path)
-        self.writes: list[CatalogDocument] = []
-        self._preloaded = preloaded
-
-    def load(self) -> SettingsLoadResult:
-        """Return the preloaded document, if any, else the real persisted state."""
-        if self._preloaded is not None:
-            return SettingsLoadResult("valid", self._preloaded)
-        return super().load()
-
-    def write(self, document: CatalogDocument) -> None:
-        """Record, then delegate the real validated write."""
-        self.writes.append(document)
-        super().write(document)
+_MAIN_STATES = ("unselected", "saved-main", "unusable-main")
 
 
 @dataclasses.dataclass
-class _PrereqWorld:
-    """Real registry/config plus the observed fake boundaries."""
+class _StartupWorld:
+    """Explicit config, a real Main registry over real stores, and the tripwire log."""
 
     app_cfg: AppConfig
+    stores: ModelStores
     registry: ModelRegistry
-    settings: _ObservedSettings
-    discovery: _NoDiscovery
-    credentials: _GraphCredentials
-    transports: list[_TrackingTransport]
     tripwires: list[str]
+    clients: list[httpx.Client]
 
     def observe(self) -> tuple[object, ...]:
-        """Snapshot registry state, settings bytes and side-effect counters."""
-        return (
-            self.registry.view(),
-            self.settings.path.read_bytes(),
-            len(self.settings.writes),
-            len(self.discovery.calls),
-        )
+        """Snapshot Main state and the saved cache/preference bytes."""
+        return (self.registry.view(), self.stores.snapshot())
 
 
 @pytest.fixture
-def prereq_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., _PrereqWorld]:
-    """Return a builder for a real registry, AppConfig and tracked embedding transport."""
+def startup_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., _StartupWorld]:
+    """Return a builder for explicit graph settings beside a real Main registry."""
 
     def build(
         *,
         main: str = "unselected",
-        freshness: str = "fresh",
-        metadata: ModelMetadata | None = None,
-        unvalidated: ModelMetadata | None = None,
         embeddings: EmbeddingsConfig = _DEFAULT_EMBEDDINGS,
-        selector: object = _PREREQ_GRAPH_ID,
         enabled: bool = True,
-    ) -> _PrereqWorld:
-        monkeypatch.setenv("PREREQ_EMBED_KEY", _PREREQ_EMBED_KEY)
-        monkeypatch.delenv("PREREQ_CONN_KEY", raising=False)
-        graph = ModelRecord(_PREREQ_GRAPH_ID, "g", "org/graph-model", "Graph Model", metadata or _meta(4096, 2048))
-        main_record = ModelRecord(_PREREQ_MAIN_ID, "p", "main", "Main", _meta(8192, 1024))
-        document = CatalogDocument(
-            1,
-            3,
-            _REMEMBERED_MAIN[main],
-            (
-                ProviderState("g", "openai", _PREREQ_SEEDED_AT, freshness),
-                ProviderState("p", "openai", _PREREQ_SEEDED_AT, "fresh"),
-            ),
-            (graph, main_record),
+        graph_key: str = "env:STARTUP_GRAPH_KEY",
+    ) -> _StartupWorld:
+        monkeypatch.setenv("STARTUP_GRAPH_KEY", _STARTUP_KEY)
+        monkeypatch.setenv("STARTUP_EMBED_KEY", _STARTUP_EMBED_KEY)
+        monkeypatch.delenv("STARTUP_CONN_KEY", raising=False)
+        provider = ProviderConfig(
+            "p", "openai", api_key="env:STARTUP_CONN_KEY", base_url="https://p.startup.test/v1", request_timeout=20
         )
-        settings = _ObservedSettings(tmp_path / "models-config.toml")
-        settings.write(document)
-        if unvalidated is not None:
-            # Simulates a loaded record that bypassed metadata validation; the
-            # budget kernel must still refuse it.
-            settings._preloaded = dataclasses.replace(
-                document, models=(dataclasses.replace(graph, metadata=unvalidated), main_record)
+        stores = ModelStores.at(tmp_path)
+        saved = ModelRecord("p/main", "p", "main", "Main", ModelMetadata(context_tokens=8192, output_tokens=1024))
+        if main != "unselected":
+            stores.seed(
+                CatalogDocument(
+                    1, 3, (ProviderState("p", "openai", "2026-09-01T00:00:00Z", "fresh"),), (saved,),
+                ),
+                selected=saved.id if main == "saved-main" else None,
             )
-        settings.writes.clear()
-        providers = _prereq_providers()
-        credentials = _GraphCredentials()
-        discovery = _NoDiscovery()
-        registry = ModelRegistry(
-            {key: providers[key] for key in ("g", "p")}, settings, discovery, credentials
+        if main == "unusable-main":
+            stores.preference.path.write_bytes(b"not a preference\n")
+        registry = stores.registry(
+            {"p": provider}, SimpleNamespace(fetch=lambda _c: pytest.fail("startup must not discover")),
+            lambda cfg: ResolvedProviderConnection(
+                cfg.name, cfg.type, cfg.base_url, cfg.request_timeout, _STARTUP_CONN_KEY
+            ),
         )
-        assert registry.restore_selection().selection_status == _MAIN_STATUS[main]
+        registry.restore_selection()
         base = parse_config({
             "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [12345]},
-            "agent": {"compaction_threshold_tokens": _PREREQ_LOCAL_CONTEXT},
             "paths": {},
         })
         app_cfg = dataclasses.replace(
             base,
-            # Retained internal attribute (no longer configurable; removed in 6.2).
-            agent=dataclasses.replace(base.agent, ctx_max_tokens=_PREREQ_LOCAL_CONTEXT),
-            providers=providers,
+            providers={"p": provider},
             embeddings=embeddings,
-            graph_memory=GraphMemoryConfig(enabled=enabled, extraction_model=selector),  # type: ignore[arg-type]
+            graph_memory=GraphMemoryConfig(
+                enabled=enabled,
+                extraction_model=_STARTUP_MODEL,
+                extraction_provider="openai",
+                extraction_base_url="https://graph.startup.test/v1/",
+                extraction_api_key=graph_key,
+            ),
         )
 
-        transports: list[_TrackingTransport] = []
         tripwires: list[str] = []
+        clients: list[httpx.Client] = []
 
         def client_factory(*args: object, **kwargs: object) -> httpx.Client:
-            transport = _TrackingTransport(_refuse_connection)
-            transports.append(transport)
-            return _REAL_HTTPX_CLIENT(transport=transport)
+            tripwires.append("httpx.Client")
+            raise AssertionError("graph startup validation must build no HTTP client")
 
         def tripwire(name: str) -> Callable[..., None]:
             def tripped(*args: object, **kwargs: object) -> None:
                 tripwires.append(name)
-                raise AssertionError(f"{name} must not run during prerequisite checks")
+                raise AssertionError(f"{name} must not run during graph startup validation")
             return tripped
 
         monkeypatch.setattr(httpx, "Client", client_factory)
@@ -866,188 +777,124 @@ def prereq_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..
         monkeypatch.setattr(graph_memory, "create_graph_memory", tripwire("create_graph_memory"))
         monkeypatch.setattr(graph_memory.GraphMemoryStore, "__init__", tripwire("GraphMemoryStore"))
         monkeypatch.setattr(graph_memory.GraphMemoryWriter, "__init__", tripwire("GraphMemoryWriter"))
-        credentials.calls.clear()
-        return _PrereqWorld(app_cfg, registry, settings, discovery, credentials, transports, tripwires)
+        monkeypatch.setattr(EmbeddingClient, "__init__", tripwire("EmbeddingClient"))
+        return _StartupWorld(app_cfg, stores, registry, tripwires, clients)
 
     return build
 
 
-def _assert_no_side_effects(world: _PrereqWorld, before: tuple[object, ...]) -> None:
-    """Assert no state change, no forbidden construction, and closed request-free transports."""
-    assert world.observe() == before
-    assert world.settings.writes == []
-    assert world.discovery.calls == []
-    assert world.tripwires == []
-    assert len(world.transports) <= 1
-    for transport in world.transports:
-        assert transport.requests == []
-        assert transport.close_count == 1
-
-
-def _resolve_ok(world: _PrereqWorld) -> object:
-    """Resolve prerequisites, asserting the success-path side-effect contract."""
-    from graph_memory import resolve_graph_prerequisites
-
+def _start_ok(world: _StartupWorld) -> graph_memory.GraphPrerequisites:
+    """Resolve graph startup, asserting no Main/store change and no client construction."""
     before = world.observe()
-    embeddings = world.app_cfg.embeddings
-    result = resolve_graph_prerequisites(world.app_cfg, world.registry)
-    _assert_no_side_effects(world, before)
-    assert len(world.transports) == 1
-    assert world.credentials.calls == ["g"]
-    assert world.app_cfg.embeddings is embeddings
+    result = graph_memory.resolve_graph_startup(world.app_cfg, vault_file=None)
+    assert world.observe() == before
+    assert world.tripwires == []
     return result
 
 
-def _resolve_fails(world: _PrereqWorld, code: str) -> Exception:
-    """Resolve prerequisites expecting a safe GraphPrerequisiteError with ``code``."""
-    from graph_memory import GraphPrerequisiteError, resolve_graph_prerequisites
-
+def _start_fails(world: _StartupWorld, code: str) -> Exception:
+    """Resolve graph startup expecting a safe, secret-free GraphPrerequisiteError."""
     before = world.observe()
-    with pytest.raises(GraphPrerequisiteError) as caught:
-        resolve_graph_prerequisites(world.app_cfg, world.registry)
+    with pytest.raises(graph_memory.GraphPrerequisiteError) as caught:
+        graph_memory.resolve_graph_startup(world.app_cfg, vault_file=None)
     error = caught.value
     assert isinstance(error, ValueError)
     assert error.code == code
     rendered = "".join(traceback.format_exception(error))
-    for secret in _PREREQ_SECRETS:
+    for secret in (_STARTUP_KEY, _STARTUP_EMBED_KEY, _STARTUP_CONN_KEY, _STARTUP_LEAK):
         assert secret not in str(error)
         assert secret not in rendered
-    _assert_no_side_effects(world, before)
+    assert world.observe() == before
+    assert world.tripwires == []
     return error
 
 
-@pytest.mark.parametrize(
-    ("main_state", "freshness"),
-    [
-        ("unselected", "fresh"),
-        ("remembered-missing", "stale"),
-        ("active-main", "fresh"),
-        ("active-main", "stale"),
-    ],
-)
-def test_prerequisites_pin_exact_graph_record_independent_of_main(
-    prereq_world: Callable[..., _PrereqWorld], main_state: str, freshness: str
+@pytest.mark.parametrize("main_state", _MAIN_STATES)
+def test_startup_pins_explicit_settings_independent_of_main(
+    startup_world: Callable[..., _StartupWorld], main_state: str
 ) -> None:
-    """Graph selector pins its exact record and budget whatever Main's state or freshness."""
-    from graph_memory import GraphPrerequisites
+    """The pin comes from explicit settings alone, whatever Main's state or saved bytes."""
+    world = startup_world(main=main_state)
 
-    world = prereq_world(main=main_state, freshness=freshness)
-    view = world.registry.view()
-    assert {state.provider_id: state.status for state in view.providers}["g"] == freshness
+    result = _start_ok(world)
 
-    result = _resolve_ok(world)
-
-    assert isinstance(result, GraphPrerequisites)
+    assert isinstance(result, graph_memory.GraphPrerequisites)
     assert {item.name for item in dataclasses.fields(result)} == {
         "pin", "embedding_provider", "embedding_model"
     }
-    assert result.pin.model == next(item for item in view.models if item.id == _PREREQ_GRAPH_ID)
-    assert result.pin.connection.provider_id == "g"
-    assert result.pin.connection.api_key == _PREREQ_GRAPH_KEY
-    assert (result.pin.catalog_revision, result.pin.selection_revision) == (view.revision, view.selection_revision)
+    assert result.pin.model.id == result.pin.model.upstream_id == _STARTUP_MODEL
+    assert result.pin.connection.provider_id == "graph-extraction"
+    assert result.pin.connection.base_url == "https://graph.startup.test/v1"
+    assert result.pin.connection.api_key == _STARTUP_KEY
+    assert (result.pin.catalog_revision, result.pin.selection_revision) == (0, 0)
     assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.embedding_model = "other"  # type: ignore[misc]
 
 
-def test_prerequisites_do_not_open_ordinary_admission(prereq_world: Callable[..., _PrereqWorld]) -> None:
+def test_startup_does_not_open_ordinary_admission(startup_world: Callable[..., _StartupWorld]) -> None:
     """A graph pin never activates Main: implicit ordinary admission stays closed."""
-    world = prereq_world()
-    _resolve_ok(world)
+    world = startup_world()
+    _start_ok(world)
     with pytest.raises(ModelRegistryError) as error:
         world.registry.admit()
     assert error.value.code == "no_active_selection"
     assert world.registry.view().active_model_id is None
 
 
-@pytest.mark.parametrize(
-    ("selector", "code"),
-    [
-        pytest.param("", "model_not_found", id="missing"),
-        pytest.param("   ", "model_not_found", id="blank"),
-        pytest.param(" g/org/graph-model", "model_not_found", id="whitespace"),
-        pytest.param("G/org/graph-model", "model_not_found", id="case-alias"),
-        pytest.param("org/graph-model", "model_not_found", id="noncanonical"),
-        pytest.param("g/org/unknown", "model_not_found", id="unknown-model"),
-        pytest.param(f"g/{_PREREQ_LEAK}", "model_not_found", id="secretish-unknown"),
-        pytest.param(None, "invalid_request", id="none"),
-        pytest.param(42, "invalid_request", id="int"),
-    ],
-)
-def test_unusable_graph_selector_fails_with_registry_code_and_guidance(
-    prereq_world: Callable[..., _PrereqWorld], selector: object, code: str
+def test_startup_credential_failure_is_sanitized(
+    startup_world: Callable[..., _StartupWorld], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Selector errors keep the registry code, name the fix, and resolve no credential."""
-    world = prereq_world(selector=selector)
-    error = _resolve_fails(world, code)
-    assert "graph_memory.extraction_model" in str(error) or "/models" in str(error)
-    assert world.credentials.calls == []
+    """An unresolvable extraction credential reference yields a safe code naming only the field."""
+    world = startup_world(graph_key="env:STARTUP_MISSING_VAR")
+    monkeypatch.delenv("STARTUP_MISSING_VAR", raising=False)
+    error = _start_fails(world, "extraction_credential_unavailable")
+    assert "graph_memory.extraction_api_key" in str(error)
+    assert "STARTUP_MISSING_VAR" not in str(error)
 
 
-def test_graph_credential_failure_is_sanitized(prereq_world: Callable[..., _PrereqWorld]) -> None:
-    """A raising graph credential resolver yields its safe registry code once."""
-    world = prereq_world()
-    world.credentials.fail = True
-    _resolve_fails(world, "credential_resolution_failed")
-    assert world.credentials.calls == ["g"]
-
-
-@pytest.mark.parametrize("valid", [True, False], ids=["valid", "invalid-selector"])
+@pytest.mark.parametrize("valid", [True, False], ids=["valid", "invalid-credential"])
 def test_disabled_config_is_still_validated_when_invoked(
-    prereq_world: Callable[..., _PrereqWorld], valid: bool
+    startup_world: Callable[..., _StartupWorld], valid: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The enabled gate belongs to the caller; invoking the helper always validates."""
+    """The enabled gate belongs to the caller; invoking startup resolution always validates."""
     if valid:
-        _resolve_ok(prereq_world(enabled=False))
+        _start_ok(startup_world(enabled=False))
     else:
-        _resolve_fails(prereq_world(enabled=False, selector="g/org/unknown"), "model_not_found")
+        monkeypatch.delenv("STARTUP_MISSING_VAR", raising=False)
+        _start_fails(startup_world(enabled=False, graph_key="env:STARTUP_MISSING_VAR"), "extraction_credential_unavailable")
 
 
-@pytest.mark.parametrize(
-    ("metadata", "unvalidated"),
-    [
-        pytest.param(_meta(4096, 1023), None, id="output-below-fixed-cap"),
-        pytest.param(_meta(1024), None, id="no-headroom"),
-        pytest.param(_meta(), None, id="no-limits"),
-        pytest.param(
-            None, ModelMetadata(context_tokens=4096, output_tokens="2048"), id="raw-string-output",  # type: ignore[arg-type]
-        ),
-        pytest.param(None, ModelMetadata(context_tokens=True), id="bool-context"),
-    ],
-)
-def test_graph_prerequisites_have_no_budget_or_limit_gate(
-    prereq_world: Callable[..., _PrereqWorld],
-    metadata: ModelMetadata | None,
-    unvalidated: ModelMetadata | None,
-) -> None:
-    """Discovered limits (even malformed) never fail graph prerequisites; no budget is computed."""
-    result = _resolve_ok(prereq_world(metadata=metadata, unvalidated=unvalidated))
+def test_startup_has_no_budget_or_limit_gate(startup_world: Callable[..., _StartupWorld]) -> None:
+    """No discovered limits exist on the explicit path, so no budget is computed or gated."""
+    result = _start_ok(startup_world())
     assert not hasattr(result, "budget")
+    assert result.pin.model.metadata == ModelMetadata()
 
 
 @pytest.mark.parametrize(
     "embeddings",
     [
         pytest.param(
-            EmbeddingsConfig(base_url=_PREREQ_EMBED_URL, model="text-embed", api_key="env:PREREQ_EMBED_KEY"),
+            EmbeddingsConfig(base_url=_STARTUP_EMBED_URL, model="text-embed", api_key="env:STARTUP_EMBED_KEY"),
             id="provider-missing",
         ),
         pytest.param(
-            EmbeddingsConfig(provider="openai", base_url=_PREREQ_EMBED_URL, api_key="env:PREREQ_EMBED_KEY"),
+            EmbeddingsConfig(provider="openai", base_url=_STARTUP_EMBED_URL, api_key="env:STARTUP_EMBED_KEY"),
             id="model-missing",
         ),
         pytest.param(
             EmbeddingsConfig(
-                provider="anthropic", base_url=_PREREQ_EMBED_URL, model="text-embed", api_key="env:PREREQ_EMBED_KEY"
+                provider="anthropic", base_url=_STARTUP_EMBED_URL, model="text-embed", api_key="env:STARTUP_EMBED_KEY"
             ),
             id="unsupported-adapter",
         ),
         pytest.param(
-            EmbeddingsConfig(provider="openai", base_url=_PREREQ_EMBED_URL, model="text-embed"),
+            EmbeddingsConfig(provider="openai", base_url=_STARTUP_EMBED_URL, model="text-embed"),
             id="api-key-missing",
         ),
         pytest.param(
-            EmbeddingsConfig(provider="openai", model="text-embed", api_key="env:PREREQ_EMBED_KEY"),
+            EmbeddingsConfig(provider="openai", model="text-embed", api_key="env:STARTUP_EMBED_KEY"),
             id="base-url-missing",
         ),
         pytest.param(
@@ -1056,40 +903,29 @@ def test_graph_prerequisites_have_no_budget_or_limit_gate(
         ),
         pytest.param(
             EmbeddingsConfig(
-                provider="openai", model="text-embed", api_key="env:PREREQ_EMBED_KEY",
-                base_url=f"https://user:{_PREREQ_LEAK}@embed.prereq.test/v1",
+                provider="openai", model="text-embed", api_key="env:STARTUP_EMBED_KEY",
+                base_url=f"https://user:{_STARTUP_LEAK}@embed.startup.test/v1",
             ),
             id="invalid-endpoint",
         ),
     ],
 )
-def test_unavailable_embeddings_fail_actionably_and_close_client(
-    prereq_world: Callable[..., _PrereqWorld], embeddings: EmbeddingsConfig
+def test_unavailable_embeddings_fail_actionably_without_building_a_client(
+    startup_world: Callable[..., _StartupWorld], embeddings: EmbeddingsConfig
 ) -> None:
-    """Embedding problems raise embedding_unavailable, name [embeddings], and close the client."""
-    world = prereq_world(embeddings=embeddings)
-    error = _resolve_fails(world, "embedding_unavailable")
+    """Embedding problems raise embedding_unavailable and name [embeddings]; no client is built."""
+    world = startup_world(embeddings=embeddings)
+    error = _start_fails(world, "embedding_unavailable")
     assert "embeddings" in str(error).lower()
-    assert len(world.transports) == 1
-    assert world.credentials.calls in ([], ["g"])
 
 
-@pytest.mark.parametrize(
-    ("embeddings", "connection_key"),
-    [
-        pytest.param(_DEFAULT_EMBEDDINGS, None, id="explicit-key-overrides-unavailable-connection-key"),
-        pytest.param(_DEFAULT_EMBEDDINGS, _PREREQ_CONN_KEY, id="explicit-key-wins-over-set-connection-key"),
-    ],
-)
+@pytest.mark.parametrize("connection_key", [None, _STARTUP_CONN_KEY], ids=["conn-key-unset", "conn-key-set"])
 def test_embedding_credential_comes_only_from_embedding_config(
-    prereq_world: Callable[..., _PrereqWorld],
-    monkeypatch: pytest.MonkeyPatch,
-    embeddings: EmbeddingsConfig,
-    connection_key: str | None,
+    startup_world: Callable[..., _StartupWorld], monkeypatch: pytest.MonkeyPatch, connection_key: str | None
 ) -> None:
     """The explicit [embeddings] key is used; a chat connection key is never consulted."""
-    world = prereq_world(embeddings=embeddings)
+    world = startup_world()
     if connection_key is not None:
-        monkeypatch.setenv("PREREQ_CONN_KEY", connection_key)
-    result = _resolve_ok(world)
+        monkeypatch.setenv("STARTUP_CONN_KEY", connection_key)
+    result = _start_ok(world)
     assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")

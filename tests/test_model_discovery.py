@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -10,7 +11,7 @@ import pytest
 
 from model_discovery import ModelDiscovery, ModelDiscoveryError
 from model_registry import CatalogDocument, ProviderState
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 
 
 @dataclass(frozen=True)
@@ -50,10 +51,10 @@ def _write_catalog(inventory, path) -> None:
         providers=(ProviderState(inventory.provider_id, inventory.adapter, inventory.last_success_at, "fresh"),),
         models=inventory.models,
     )
-    settings = ModelSettings(path / "models.toml")
-    settings.write(document)
-    assert settings.load().document == document
-    persisted = settings.path.read_text(encoding="utf-8")
+    stores = ModelStores.at(path)
+    stores.cache.write(document)
+    assert stores.cache.load().document == dataclasses.replace(document, revision=0)
+    persisted = stores.cache.path.read_text(encoding="utf-8")
     assert "api_key" not in persisted
     assert "test-secret" not in persisted
     assert "https://" not in persisted
@@ -142,11 +143,7 @@ def test_google_pages_use_exact_base_model_id_not_resource_name() -> None:
     assert [m.upstream_id for m in inventory.models] == ["gemini-1.5", "exact/second"]
     assert inventory.models[1].metadata.input_tokens == 100
     assert inventory.models[1].metadata.context_tokens is None
-    assert [(item.canonical_id, item.resource_name, item.generation_methods) for item in inventory.descriptors] == [
-        ("account/gemini-1.5", "models/gemini-latest", None),
-        ("account/exact/second", "models/next", ("generateContent",)),
-    ]
-    assert inventory.descriptors[1].canonical_id == inventory.models[1].id
+    assert [m.id for m in inventory.models] == ["account/gemini-1.5", "account/exact/second"]
 
 
 def test_openrouter_uses_same_origin_next_link_and_false_capability() -> None:
@@ -192,29 +189,16 @@ def test_foreign_pagination_is_rejected_before_credentialed_request() -> None:
     assert [request.url.host for request in captured] == ["openrouter.ai"]
 
 
-@pytest.mark.parametrize(
-    ("methods", "expected"),
-    [
-        (None, None),
-        ([], ()),
-        (["generateContent", "countTokens"], ("generateContent", "countTokens")),
-    ],
-)
-def test_google_descriptor_preserves_methods_state_and_exact_resource_identity(methods, expected) -> None:
+@pytest.mark.parametrize("methods", [None, [], ["generateContent", "countTokens"]])
+def test_google_valid_resource_and_generation_methods_are_accepted_with_exact_identity(methods) -> None:
     row = {"name": "models/resource-name", "baseModelId": "exact/upstream-id"}
     if methods is not None:
         row["supportedGenerationMethods"] = methods
     inventory = _discovery(lambda _: httpx.Response(200, json={"models": [row]})).fetch(
         Connection(adapter="google")
     )
-    descriptor = inventory.descriptors[0]
-    assert descriptor.canonical_id == inventory.models[0].id == "account/exact/upstream-id"
-    assert descriptor.resource_name == "models/resource-name"
-    assert descriptor.resource_name != inventory.models[0].upstream_id
-    assert descriptor.generation_methods == expected
-    if isinstance(methods, list):
-        methods.append("mutated-after-fetch")
-        assert descriptor.generation_methods == expected
+    assert inventory.models[0].id == "account/exact/upstream-id"
+    assert inventory.models[0].upstream_id == "exact/upstream-id"
 
 
 @pytest.mark.parametrize("methods", [None, "generateContent", 3, {"method": "generateContent"}, ["ok", None]])
@@ -240,19 +224,16 @@ def test_google_invalid_resource_or_inference_identity_fails_inventory(row) -> N
     assert error.value.code == "invalid_response"
 
 
-def test_google_descriptor_collections_are_immutable_and_inventory_copies_inputs() -> None:
-    methods = ["generateContent"]
-    from model_discovery import GoogleModelDescriptor, ProviderInventory
+def test_inventory_copies_its_model_collection_and_stores_no_google_descriptors() -> None:
+    import model_discovery
+    from model_discovery import ProviderInventory
 
-    descriptor = GoogleModelDescriptor("account/upstream", "models/resource", methods)
-    methods.append("mutated")
-    descriptors = [descriptor]
-    inventory = ProviderInventory("account", "google", (), "stamp", descriptors)
-    descriptors.clear()
-    assert descriptor.generation_methods == ("generateContent",)
-    assert inventory.descriptors == (descriptor,)
-    with pytest.raises(AttributeError):
-        descriptor.generation_methods.append("mutated")
+    models: list = []
+    inventory = ProviderInventory("account", "google", models, "stamp")
+    models.append("mutated")
+    assert inventory.models == ()
+    assert not hasattr(inventory, "descriptors")
+    assert not hasattr(model_discovery, "GoogleModelDescriptor")
 
 
 @pytest.mark.parametrize("url", ["http://localhost:11434", "https://192.168.0.4", "https://other.example"])
@@ -444,15 +425,15 @@ def test_second_page_failure_keeps_last_good_inventory_stale_without_partial_mer
 ) -> None:
     """A refresh ending on an incomplete page never replaces the prior inventory."""
     from config_schema import ProviderConfig, ResolvedProviderConnection
-    from model_registry import ModelMetadata, ModelRecord, ModelRegistry
+    from model_registry import ModelMetadata, ModelRecord
 
     cached = ModelRecord(
         "account/cached", "account", "cached", "Cached",
         ModelMetadata(100, None, None, None, None, None),
     )
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(
-        1, 2, None, (ProviderState("account", adapter, "2026-09-01T00:00:00Z", "fresh"),),
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(
+        1, 2, (ProviderState("account", adapter, "2026-09-01T00:00:00Z", "fresh"),),
         (cached,),
     ))
     pages: list[httpx.Request] = []
@@ -470,9 +451,9 @@ def test_second_page_failure_keeps_last_good_inventory_stale_without_partial_mer
             config.name, config.type, config.base_url, config.request_timeout, "test-secret"
         )
 
-    registry = ModelRegistry(
+    registry = stores.registry(
         {"account": ProviderConfig("account", adapter, "env:KEY")},
-        settings, _discovery(handler), resolve,
+        _discovery(handler), resolve,
     )
     report = registry.refresh()
 
@@ -482,8 +463,8 @@ def test_second_page_failure_keeps_last_good_inventory_stale_without_partial_mer
     assert view.providers[0].status == "stale"
     assert report.refreshed_provider_ids == ()
     assert [code for _provider, code in report.error_codes] == [view.providers[0].sanitized_last_error_code]
-    assert settings.load().document.models == (cached,)
-    assert "fresh-a" not in settings.path.read_text(encoding="utf-8")
+    assert stores.cache.load().document.models == (cached,)
+    assert "fresh-a" not in stores.cache.path.read_text(encoding="utf-8")
 
 
 def test_cloud_ollama_empty_api_key_requires_authentication_before_any_request() -> None:
@@ -547,18 +528,17 @@ def test_no_supplement_network_call_occurs(adapter: str) -> None:
 def _registry_for(adapter, handler, tmp_path):
     """Build a real registry over the real discovery and a MockTransport provider."""
     from config_schema import ProviderConfig, ResolvedProviderConnection
-    from model_registry import ModelRegistry
 
     def resolve(config: ProviderConfig) -> ResolvedProviderConnection:
         return ResolvedProviderConnection(
             config.name, config.type, config.base_url, config.request_timeout, "test-secret"
         )
 
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    return ModelRegistry(
+    stores = ModelStores.at(tmp_path)
+    return stores.registry(
         {"account": ProviderConfig("account", adapter, "env:KEY")},
-        settings, _discovery(handler), resolve,
-    ), settings
+        _discovery(handler), resolve,
+    ), stores
 
 
 @pytest.mark.parametrize("padded", ["Padded Name ", " Padded Name", "\tPadded Name\n"])
@@ -569,7 +549,7 @@ def test_presentation_whitespace_does_not_invalidate_openrouter_inventory(padded
         {"id": "vendor/padded", "name": padded},
         {"id": "vendor/last", "name": "Last"},
     ]}
-    registry, settings = _registry_for(
+    registry, stores = _registry_for(
         "openrouter", lambda _: httpx.Response(200, json=payload), tmp_path
     )
     assert registry.view().models == ()
@@ -584,7 +564,7 @@ def test_presentation_whitespace_does_not_invalidate_openrouter_inventory(padded
     assert set(by_id) == {"account/vendor/good", "account/vendor/padded", "account/vendor/last"}
     assert by_id["account/vendor/padded"].upstream_id == "vendor/padded"
     assert by_id["account/vendor/padded"].display_name == "Padded Name"
-    assert {model.id for model in settings.load().document.models} == set(by_id)
+    assert {model.id for model in stores.cache.load().document.models} == set(by_id)
     # An initially empty inventory is now usable for selection.
     assert registry.select("account/vendor/padded").models
 
@@ -608,13 +588,13 @@ def test_identity_whitespace_and_unsafe_ids_still_reject_inventory(model_id) -> 
 
 def test_padded_display_reflecting_credential_still_fails_closed(tmp_path) -> None:
     payload = {"data": [{"id": "vendor/m", "name": " prefix test-secret "}]}
-    registry, settings = _registry_for(
+    registry, stores = _registry_for(
         "openrouter", lambda _: httpx.Response(200, json=payload), tmp_path
     )
     report = registry.refresh()
     assert report.refreshed_provider_ids == ()
     assert registry.view().models == ()
-    assert not settings.path.exists() or "test-secret" not in settings.path.read_text(encoding="utf-8")
+    assert not stores.cache.path.exists() or "test-secret" not in stores.cache.path.read_text(encoding="utf-8")
 
 
 _FRESH_PAGE = {
@@ -671,14 +651,14 @@ def test_finishing_exactly_on_last_allowed_page_succeeds(adapter, monkeypatch) -
 def test_page_cap_failure_keeps_last_good_stale_without_partial_commit(monkeypatch, tmp_path) -> None:
     import model_discovery
     from config_schema import ProviderConfig, ResolvedProviderConnection
-    from model_registry import ModelMetadata, ModelRecord, ModelRegistry
+    from model_registry import ModelMetadata, ModelRecord
 
     monkeypatch.setattr(model_discovery, "_MAX_PAGES", 2, raising=False)
     cached = ModelRecord("account/cached", "account", "cached", "Cached",
                          ModelMetadata(100, None, None, None, None, None))
-    settings = ModelSettings(tmp_path / "models-config.toml")
-    settings.write(CatalogDocument(
-        1, 2, None, (ProviderState("account", "anthropic", "2026-09-01T00:00:00Z", "fresh"),),
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(
+        1, 2, (ProviderState("account", "anthropic", "2026-09-01T00:00:00Z", "fresh"),),
         (cached,),
     ))
     count = 0
@@ -695,9 +675,9 @@ def test_page_cap_failure_keeps_last_good_stale_without_partial_commit(monkeypat
             config.name, config.type, config.base_url, config.request_timeout, "test-secret"
         )
 
-    registry = ModelRegistry(
+    registry = stores.registry(
         {"account": ProviderConfig("account", "anthropic", "env:KEY")},
-        settings, _discovery(handler), resolve,
+        _discovery(handler), resolve,
     )
     report = registry.refresh()
 
@@ -707,8 +687,8 @@ def test_page_cap_failure_keeps_last_good_stale_without_partial_commit(monkeypat
     assert view.providers[0].status == "stale"
     assert report.refreshed_provider_ids == ()
     assert [code for _p, code in report.error_codes] == [view.providers[0].sanitized_last_error_code]
-    assert settings.load().document.models == (cached,)
-    assert "m1" not in settings.path.read_text(encoding="utf-8")
+    assert stores.cache.load().document.models == (cached,)
+    assert "m1" not in stores.cache.path.read_text(encoding="utf-8")
 
 
 def test_page_cap_is_per_connection_not_shared(monkeypatch) -> None:
@@ -737,7 +717,6 @@ def test_google_display_name_is_trimmed_presentation_while_identity_stays_exact(
     assert (record.id, record.upstream_id, record.display_name) == (
         "account/gemini-1.5", "gemini-1.5", "Gemini 1.5 Pro",
     )
-    assert inventory.descriptors[0].resource_name == "models/gemini-latest"
 
 
 def test_google_blank_display_name_falls_back_to_exact_upstream_id() -> None:
@@ -890,14 +869,13 @@ def test_each_provider_fetch_gets_a_new_budget(monkeypatch) -> None:
 def test_deadline_failure_leaves_registry_last_good_stale_and_cache_unmodified(monkeypatch, tmp_path) -> None:
     import model_discovery
     from config_schema import ProviderConfig, ResolvedProviderConnection
-    from model_registry import ModelMetadata, ModelRecord, ModelRegistry
+    from model_registry import ModelMetadata, ModelRecord
 
     monkeypatch.setattr(model_discovery, "_DISCOVERY_BUDGET_S", 120, raising=False)
     cached = ModelRecord("account/cached", "account", "cached", "Cached",
                          ModelMetadata(100, None, None, None, None, None))
-    settings = ModelSettings(tmp_path / "models.toml")
-    settings.write(CatalogDocument(1, 2, None,
-        (ProviderState("account", "openai", "2026-09-01T00:00:00Z", "fresh"),), (cached,)))
+    stores = ModelStores.at(tmp_path)
+    stores.cache.write(CatalogDocument(1, 2, (ProviderState("account", "openai", "2026-09-01T00:00:00Z", "fresh"),), (cached,)))
     tick = [0.0]
 
     def handler(_request):
@@ -910,12 +888,12 @@ def test_deadline_failure_leaves_registry_last_good_stale_and_cache_unmodified(m
     def resolve(config: ProviderConfig) -> ResolvedProviderConnection:
         return ResolvedProviderConnection(config.name, config.type, config.base_url, config.request_timeout, "test-secret")
 
-    registry = ModelRegistry({"account": ProviderConfig("account", "openai", "env:KEY")}, settings, discovery, resolve)
+    registry = stores.registry({"account": ProviderConfig("account", "openai", "env:KEY")}, discovery, resolve)
     report = registry.refresh()
     assert report.refreshed_provider_ids == () and registry.view().models == (cached,)
     assert registry.view().providers[0].status == "stale"
-    assert settings.load().document.models == (cached,)
-    assert b"new" not in settings.path.read_bytes()
+    assert stores.cache.load().document.models == (cached,)
+    assert b"new" not in stores.cache.path.read_bytes()
 
 
 # --- input-handling wave: unusable (non-string) presentation never invalidates identity ---
@@ -927,7 +905,7 @@ _UNUSABLE_IDS = ["null", "bool", "int", "float", "list", "object"]
 @pytest.mark.parametrize("unusable", _UNUSABLE, ids=_UNUSABLE_IDS)
 def test_unusable_presentation_json_value_falls_back_to_exact_upstream_id(unusable, tmp_path) -> None:
     payload = {"data": [{"id": "vendor/good", "name": "Good"}, {"id": "vendor/odd", "name": unusable}]}
-    registry, settings = _registry_for("openrouter", lambda _: httpx.Response(200, json=payload), tmp_path)
+    registry, stores = _registry_for("openrouter", lambda _: httpx.Response(200, json=payload), tmp_path)
     assert registry.view().models == ()
 
     report = registry.refresh()
@@ -940,7 +918,7 @@ def test_unusable_presentation_json_value_falls_back_to_exact_upstream_id(unusab
     assert by_id["account/vendor/odd"].display_name == "vendor/odd"
     assert by_id["account/vendor/odd"].upstream_id == "vendor/odd"
     assert by_id["account/vendor/good"].display_name == "Good"
-    assert {m.id for m in settings.load().document.models} == set(by_id)
+    assert {m.id for m in stores.cache.load().document.models} == set(by_id)
     assert registry.select("account/vendor/good").active_model_id == "account/vendor/good"
 
 
@@ -978,12 +956,12 @@ def test_credential_inside_discarded_presentation_value_fails_the_whole_refresh(
         payload = {"models": [_google_row(displayName=value)]}
     else:
         payload = {"data": [{"id": "vendor/a", "name": value}]}
-    registry, settings = _registry_for(adapter, lambda _: httpx.Response(200, json=payload), tmp_path)
+    registry, stores = _registry_for(adapter, lambda _: httpx.Response(200, json=payload), tmp_path)
 
     report = registry.refresh()
 
     assert report.refreshed_provider_ids == () and registry.view().models == ()
-    assert not settings.path.exists() or settings.load().document.models == ()
+    assert not stores.cache.path.exists() or stores.cache.load().document.models == ()
     assert "test-secret" not in caplog.text and "test-secret" not in repr(report)
     with pytest.raises(ModelDiscoveryError) as error:
         _discovery(lambda _: httpx.Response(200, json=payload)).fetch(
@@ -1071,12 +1049,12 @@ _CRED_PAYLOADS = {
 @pytest.mark.parametrize("case", list(_CRED_PAYLOADS))
 def test_credential_anywhere_in_a_raw_candidate_row_fails_the_whole_refresh(case, tmp_path, caplog) -> None:
     adapter, payload = _CRED_PAYLOADS[case]
-    registry, settings = _registry_for(adapter, lambda _: httpx.Response(200, json=payload), tmp_path)
+    registry, stores = _registry_for(adapter, lambda _: httpx.Response(200, json=payload), tmp_path)
 
     report = registry.refresh()
 
     assert report.refreshed_provider_ids == () and registry.view().models == ()
-    assert not settings.path.exists() or settings.load().document.models == ()
+    assert not stores.cache.path.exists() or stores.cache.load().document.models == ()
     assert "test-secret" not in caplog.text and "test-secret" not in repr(report)
     discovery = _discovery(lambda _: httpx.Response(200, json=payload))
     with pytest.raises(ModelDiscoveryError) as error:

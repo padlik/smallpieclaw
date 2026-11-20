@@ -227,8 +227,6 @@ def test_discovered_google_methods_infer_no_limits_and_rejection_stays_single_se
 
     record = inventory.models[0]
     assert (record.id, record.upstream_id) == ("acct/gemini-graph", "gemini-graph")
-    assert inventory.descriptors[0].resource_name == "models/gemini-graph-resource-001"
-    assert inventory.descriptors[0].generation_methods == ("generateContent", "countTokens")
     metadata = record.metadata
     assert (metadata.context_tokens, metadata.input_tokens, metadata.output_tokens) == (
         None, None, None

@@ -167,7 +167,7 @@ def legacy_scheduler_factory(
         monkeypatch.setenv(var, str(tmp_path / var.lower()))
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     paths = xdg_paths("legacy-readonly-test")
-    assert str(paths.models_config_file).startswith(str(tmp_path))
+    assert str(paths.model_selection_file).startswith(str(tmp_path))
     assert str(paths.scheduler_jobs).startswith(str(tmp_path))
     created: list[Scheduler] = []
 

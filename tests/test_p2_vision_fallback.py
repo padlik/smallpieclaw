@@ -68,7 +68,7 @@ def test_verified_vision_model_sends_images_on_its_pinned_route(tmp_path) -> Non
         upstream_id="verified-vision-model",
     )
     try:
-        assert client.chat_with_fallback([{
+        assert client.chat([{
             "role": "user", "content": "what is this?", "images": [str(image)]
         }]) == "ok"
         assert len(captured) == 1
@@ -97,7 +97,7 @@ def test_text_request_uses_same_pinned_model_without_vision_routing() -> None:
     )
     progress: list[str] = []
     try:
-        assert client.chat_with_fallback(
+        assert client.chat(
             [{"role": "user", "content": "plain text"}], progress_cb=progress.append
         ) == "ok"
         assert len(captured) == 1
@@ -158,7 +158,7 @@ def test_text_only_provider_failure_does_not_retry_or_retarget() -> None:
     pinned_model = client.llm_cfg["model"]
     try:
         with pytest.raises(httpx.HTTPStatusError):
-            client.chat_with_fallback([{"role": "user", "content": "plain text"}])
+            client.chat([{"role": "user", "content": "plain text"}])
 
         assert len(captured) == 1
         assert json.loads(captured[0].content)["model"] == "chosen-text-model"

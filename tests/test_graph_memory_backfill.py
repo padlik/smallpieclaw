@@ -23,7 +23,7 @@ import sys
 import textwrap
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 from unittest.mock import MagicMock, call
 
 import httpx
@@ -44,7 +44,6 @@ from config_schema import (
     AppConfig,
     EmbeddingsConfig,
     GraphMemoryConfig,
-    ProviderConfig,
     ResolvedProviderConnection,
     parse_config,
 )
@@ -52,8 +51,7 @@ from embedding_client import EmbeddingClient
 from graph_memory import GraphPrerequisiteError, GraphPrerequisites
 from llm_client import LLMClient
 from memory_store import LongTermMemory
-from model_registry import CatalogDocument, ModelMetadata, ModelRecord, ModelRegistry, ProviderState, RunModel
-from model_settings import ModelSettings
+from model_registry import ModelMetadata, ModelRecord, ModelRegistry, RunModel
 from providers._errors import LLMContextOverflowError, LLMError, LLMPermanentError
 from xdg import xdg_paths
 
@@ -1509,7 +1507,7 @@ class TestBackfillMainLiveAndDryRun:
       previews counts before provider/secret/env credential resolution, model
       pinning, catalog load or refresh, ladybug import, embedding/extraction
       client allocation, or DB creation;
-    - on the live path, calls ``prepare_backfill_prerequisites`` first, then
+    - on the live path, calls ``resolve_graph_startup`` first, then
       opens the independent embedding client, graph store, shared extraction
       helper, and runs the backfill engine;
     - closes all live clients on both success and error paths.
@@ -1592,7 +1590,7 @@ class TestBackfillMainLiveAndDryRun:
             paths.secrets_file.write_text('bot_token = "sec-resolved-token"\n')
 
         # Graph backfill reads no saved catalog: none is written for the live world.
-        assert not paths.models_config_file.exists()
+        assert not (paths.config_home / "models-config.toml").exists()
 
         longterm_path = paths.data_home / "longterm_memory.json"
         ltm = LongTermMemory(path=str(longterm_path))
@@ -1631,7 +1629,6 @@ class TestBackfillMainLiveAndDryRun:
             return tripped
 
         targets = [
-            (ModelSettings, "write"),
             (model_discovery.ModelDiscovery, "fetch"),
             (ModelRegistry, "refresh"),
         ]
@@ -1641,16 +1638,12 @@ class TestBackfillMainLiveAndDryRun:
                 (config_schema, "resolve_provider_connection"),
                 (config_schema, "_expand_value"),
                 (embedding_client, "_resolve_credential"),
-                (backfill_graph_memory, "prepare_backfill_prerequisites"),
                 (EmbeddingClient, "__init__"),
                 (LLMClient, "__init__"),
                 (LLMClient, "for_graph_extraction"),
                 (httpx.Client, "__init__"),
                 (graph_memory, "GraphMemoryStore"),
                 (graph_memory, "build_extraction_llm_call"),
-                (graph_memory, "resolve_graph_prerequisites"),
-                (ModelSettings, "load"),
-                (ModelRegistry, "resolve_graph_model"),
             ])
             if "GraphMemoryStore" in vars(backfill_graph_memory):
                 targets.append((backfill_graph_memory, "GraphMemoryStore"))
@@ -1900,7 +1893,7 @@ class TestBackfillMainLiveAndDryRun:
         assert calls["prepare"][0][1] is not None  # vault_file passed
         assert len(calls["build_extraction"]) == 1
         app_cfg, vault_file, prereqs = calls["prepare"][0]
-        assert not xdg_paths(self._CLI_AGENT).models_config_file.exists()
+        assert not (xdg_paths(self._CLI_AGENT).config_home / "models-config.toml").exists()
         assert vault_file == str(xdg_paths(self._CLI_AGENT).secrets_file)
         helper_args, helper_kwargs = calls["build_extraction"][0]
         assert len(helper_args) == 2
@@ -2088,7 +2081,7 @@ class TestBackfillMainLiveAndDryRun:
 
         A corrupt ``models-config.toml`` used to fail preparation with
         ``catalog_corrupt``.  Graph validation is now independent of it: the
-        run succeeds, never constructs ``ModelSettings``/``ModelRegistry`` and
+        run succeeds, never constructs a ``ModelRegistry`` and
         leaves the file byte-identical."""
         world = self._write_world(tmp_xdg, tmp_path, monkeypatch)
         paths = xdg_paths(self._CLI_AGENT)
@@ -2096,8 +2089,9 @@ class TestBackfillMainLiveAndDryRun:
             "toml-syntax": f"schema_version = 1\nrevision = [\n# {_BF_LEAK}\n".encode(),
             "invalid-schema": f'schema_version = 1\nrevision = 1\napi_key = "{_BF_LEAK}"\n'.encode(),
         }
-        paths.models_config_file.write_bytes(corrupt[failure])
-        catalog_before = paths.models_config_file.read_bytes()
+        legacy_catalog = paths.config_home / "models-config.toml"
+        legacy_catalog.write_bytes(corrupt[failure])
+        catalog_before = legacy_catalog.read_bytes()
         before_tree = self._tree_bytes(tmp_path)
 
         router = _RecordingRouter()
@@ -2110,7 +2104,6 @@ class TestBackfillMainLiveAndDryRun:
                 raise AssertionError(f"{label} must not run for live backfill")
             return tripped
 
-        monkeypatch.setattr(ModelSettings, "__init__", tripwire("ModelSettings"))
         monkeypatch.setattr(ModelRegistry, "__init__", tripwire("ModelRegistry"))
         monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda _transport, request: router.handle_request(request))
         stores: list[_FakeGraphStore] = []
@@ -2133,7 +2126,7 @@ class TestBackfillMainLiveAndDryRun:
                 assert exc.code == 0
             assert constructed == [] and forbidden == []
             assert len(stores) == 1 and stores[0].closed
-            assert paths.models_config_file.read_bytes() == catalog_before
+            assert legacy_catalog.read_bytes() == catalog_before
             state_key = world.state_path.relative_to(tmp_path).as_posix()
             assert {k: v for k, v in self._tree_bytes(tmp_path).items() if k != state_key} == {
                 k: v for k, v in before_tree.items() if k != state_key
@@ -2370,179 +2363,77 @@ class TestMainResolvesVaultFile:
 
 
 # ---------------------------------------------------------------------------
-# prepare_backfill_prerequisites — saved-catalog preparation (task 12.17)
+# resolve_graph_startup as used by the live backfill — explicit settings + vault
 #
-# Real ModelSettings (setup writes only), read-only load, ModelRegistry,
-# resolve_provider_connection, resolve_graph_prerequisites, budget kernel and
-# EmbeddingClient. Only the environment, vault file, filesystem read errors and
-# the HTTP transport are external fakes; tripwires refuse forbidden side
-# effects. The API is imported inside helpers so legacy tests still collect.
+# The live CLI path validates the explicit ``[graph_memory]`` extraction fields
+# and ``[embeddings]`` through ``resolve_graph_startup``: there is no saved
+# catalog, registry or Main input. Only the environment, the vault file and the
+# HTTP/constructor boundaries are external fakes; tripwires refuse any client,
+# transport, store or writer.
 # ---------------------------------------------------------------------------
 
-_BF_GRAPH_ID = "g/org/graph-model"
 _BF_GRAPH_KEY = "fake-backfill-graph-key"
-_BF_MAIN_KEY = "fake-backfill-main-key"
 _BF_EMBED_KEY = "fake-backfill-embed-key"
 _BF_VAULT_GRAPH_KEY = "fake-backfill-vault-graph-key"
 _BF_VAULT_EMBED_KEY = "fake-backfill-vault-embed-key"
 _BF_LEAK = "sk-backfillleak12345"
-_BF_SECRETS = (_BF_GRAPH_KEY, _BF_MAIN_KEY, _BF_EMBED_KEY, _BF_VAULT_GRAPH_KEY, _BF_VAULT_EMBED_KEY, _BF_LEAK)
-_BF_LOCAL_CONTEXT = 3000
+_BF_SECRETS = (_BF_GRAPH_KEY, _BF_EMBED_KEY, _BF_VAULT_GRAPH_KEY, _BF_VAULT_EMBED_KEY, _BF_LEAK)
 _BF_EMBEDDINGS = EmbeddingsConfig(
     provider="openai", model="text-embed", api_key="env:BF_EMBED_KEY", base_url="https://e.backfill.test/v1"
 )
-_BF_REAL_HTTPX_CLIENT = httpx.Client
-
-
-def _bf_meta(context: int | None = None, output: int | None = None) -> ModelMetadata:
-    """Return provider-reported metadata for the populated token limits."""
-    return ModelMetadata(context_tokens=context, output_tokens=output)
-
-
-def _bf_document(remembered: str | None, freshness: str, metadata: ModelMetadata) -> CatalogDocument:
-    """Return a saved catalog with an independent graph record and a Main record."""
-    return CatalogDocument(
-        1,
-        3,
-        remembered,
-        (
-            ProviderState("g", "openai", "2026-01-01T00:00:00Z", freshness),
-            ProviderState("p", "openai", "2026-01-01T00:00:00Z", "fresh"),
-        ),
-        (
-            ModelRecord(_BF_GRAPH_ID, "g", "org/graph-model", "Graph Model", metadata),
-            ModelRecord("p/main", "p", "main", "Main", _bf_meta(8192, 1024)),
-        ),
-    )
-
-
-class _BfTransport(httpx.MockTransport):
-    """Real MockTransport that refuses connections and records requests and closes."""
-
-    def __init__(self) -> None:
-        self.requests: list[httpx.Request] = []
-        self.close_count = 0
-
-        def refuse(request: httpx.Request) -> httpx.Response:
-            self.requests.append(request)
-            raise httpx.ConnectError("connection refused", request=request)
-
-        super().__init__(refuse)
-
-    def close(self) -> None:
-        """Count the close, then close the underlying transport."""
-        self.close_count += 1
-        super().close()
 
 
 @dataclasses.dataclass
-class _BackfillWorld:
-    """Saved catalog location, typed config and observed side-effect boundaries."""
+class _StartupWorld:
+    """Typed config, a supplied vault file and the forbidden-effect log."""
 
-    root: Path
-    settings_path: Path
     app_cfg: AppConfig
     vault_file: str
-    transports: list[_BfTransport]
     tripwires: list[str]
-
-    def snapshot(self) -> dict[str, bytes | None]:
-        """Return every entry and file's bytes below the world root (no Path.read_bytes)."""
-        tree: dict[str, bytes | None] = {}
-        for entry in sorted(self.root.rglob("*")):
-            key = entry.relative_to(self.root).as_posix()
-            if entry.is_file():
-                with entry.open("rb") as stream:
-                    tree[key] = stream.read()
-            else:
-                tree[key] = None
-        return tree
-
-    def assert_clean(self, before: dict[str, bytes | None]) -> None:
-        """Assert unchanged files/entries, no tripwire, and closed request-free transports."""
-        assert self.snapshot() == before
-        assert self.tripwires == []
-        assert len(self.transports) <= 1
-        for transport in self.transports:
-            assert transport.requests == []
-            assert transport.close_count == 1
 
 
 @pytest.fixture
-def backfill_world(tmp_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., _BackfillWorld]]:
-    """Build a saved-catalog world, then install transport and forbidden-effect tripwires."""
-    created: list[_BfTransport] = []
+def startup_world(tmp_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., _StartupWorld]:
+    """Build explicit graph settings and a custom vault, then install tripwires."""
 
     def build(
         *,
-        catalog: str = "valid",
-        raw: bytes = b"",
-        remembered: str | None = None,
-        freshness: str = "fresh",
-        metadata: ModelMetadata | None = None,
         graph_key: str = "env:BF_GRAPH_KEY",
         embeddings: EmbeddingsConfig = _BF_EMBEDDINGS,
-        selector: str = _BF_GRAPH_ID,
         enabled: bool = True,
-    ) -> _BackfillWorld:
-        root = tmp_xdg / "world"
-        (root / "state").mkdir(parents=True)
-        settings_path = root / "config" / "models-config.toml"
-        if catalog != "no-parent":
-            settings_path.parent.mkdir()
-        if catalog == "valid":
-            ModelSettings(settings_path).write(_bf_document(remembered, freshness, metadata or _bf_meta(4096, 2048)))
-        elif catalog == "raw":
-            settings_path.write_bytes(raw)
-        vault = root / "vaults" / "custom-vault.toml"
-        vault.parent.mkdir()
+    ) -> _StartupWorld:
+        vault = tmp_xdg / "world" / "vaults" / "custom-vault.toml"
+        vault.parent.mkdir(parents=True)
         vault.write_text(f'graph_key = "{_BF_VAULT_GRAPH_KEY}"\nembed_key = "{_BF_VAULT_EMBED_KEY}"\n')
         monkeypatch.setenv("HOME", str(tmp_xdg / "home"))
         monkeypatch.setenv("BF_GRAPH_KEY", _BF_GRAPH_KEY)
-        monkeypatch.setenv("BF_MAIN_KEY", _BF_MAIN_KEY)
         monkeypatch.setenv("BF_EMBED_KEY", _BF_EMBED_KEY)
-        monkeypatch.delenv("BF_CONN_KEY", raising=False)
-
-        def connection(name: str, key: str) -> ProviderConfig:
-            return ProviderConfig(name, "openai", api_key=key, base_url=f"https://{name}.backfill.test/v1", request_timeout=20)
-
         base = parse_config({
             "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [12345]},
-            "agent": {"compaction_threshold_tokens": _BF_LOCAL_CONTEXT},
             "paths": {},
         })
         app_cfg = dataclasses.replace(
             base,
-            # Retained internal attribute (no longer configurable; removed in 6.2).
-            agent=dataclasses.replace(base.agent, ctx_max_tokens=_BF_LOCAL_CONTEXT),
-            providers={
-                "g": connection("g", graph_key),
-                "p": connection("p", "env:BF_MAIN_KEY"),
-                "e": connection("e", "env:BF_CONN_KEY"),
-            },
             embeddings=embeddings,
-            graph_memory=GraphMemoryConfig(enabled=enabled, extraction_model=selector),
+            graph_memory=GraphMemoryConfig(
+                enabled=enabled,
+                extraction_model="graph-model",
+                extraction_provider="openai",
+                extraction_base_url="https://g.backfill.test/v1",
+                extraction_api_key=graph_key,
+            ),
         )
         tripwires: list[str] = []
-
-        def client_factory(*_args: object, **_kwargs: object) -> httpx.Client:
-            transport = _BfTransport()
-            created.append(transport)
-            return _BF_REAL_HTTPX_CLIENT(transport=transport)
 
         def tripwire(name: str) -> Callable[..., None]:
             def tripped(*_args: object, **_kwargs: object) -> None:
                 tripwires.append(name)
-                raise AssertionError(f"{name} must not run during backfill preparation")
+                raise AssertionError(f"{name} must not run during startup validation")
             return tripped
 
-        monkeypatch.setattr(httpx, "Client", client_factory)
+        monkeypatch.setattr(httpx, "Client", tripwire("httpx.Client"))
         for owner, name in (
-            (model_discovery.ModelDiscovery, "fetch"),
-            (ModelRegistry, "refresh"),
-            (ModelRegistry, "select"),
-            (ModelRegistry, "restore_selection"),
-            (ModelSettings, "write"),
+            (EmbeddingClient, "__init__"),
             (LLMClient, "__init__"),
             (LLMClient, "for_graph_extraction"),
             (graph_memory.GraphMemoryWriter, "__init__"),
@@ -2554,158 +2445,60 @@ def backfill_world(tmp_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[C
         monkeypatch.setattr(graph_memory, "GraphMemoryStore", tripwire("GraphMemoryStore"))
         if "GraphMemoryStore" in vars(backfill_graph_memory):
             monkeypatch.setattr(backfill_graph_memory, "GraphMemoryStore", tripwire("GraphMemoryStore"))
-        return _BackfillWorld(root, settings_path, app_cfg, str(vault), created, tripwires)
+        return _StartupWorld(app_cfg, str(vault), tripwires)
 
-    yield build
-    for transport in created:
-        if transport.close_count == 0:
-            transport.close()
+    return build
 
 
-def _prepare_ok(world: _BackfillWorld, *, vault_file: str | None = None) -> GraphPrerequisites:
-    """Prepare from the saved catalog, asserting the success-path side-effect contract."""
-    from backfill_graph_memory import prepare_backfill_prerequisites
-
-    before = world.snapshot()
-    embeddings = world.app_cfg.embeddings
-    result = prepare_backfill_prerequisites(world.app_cfg, world.settings_path, vault_file=vault_file)
-    world.assert_clean(before)
-    assert len(world.transports) == 1
-    assert world.app_cfg.embeddings is embeddings
-    assert isinstance(result, GraphPrerequisites)
-    return result
-
-
-def _prepare_fails(world: _BackfillWorld, code: str, *, vault_file: str | None = None) -> GraphPrerequisiteError:
-    """Prepare expecting a safe ``GraphPrerequisiteError`` with ``code`` and no side effect."""
-    from backfill_graph_memory import prepare_backfill_prerequisites
-
-    before = world.snapshot()
+def _startup_fails(world: _StartupWorld, code: str, *, vault_file: str | None = None) -> GraphPrerequisiteError:
+    """Resolve startup expecting a safe ``GraphPrerequisiteError`` with ``code`` and no side effect."""
     with pytest.raises(GraphPrerequisiteError) as caught:
-        prepare_backfill_prerequisites(world.app_cfg, world.settings_path, vault_file=vault_file)
+        graph_memory.resolve_graph_startup(world.app_cfg, vault_file=vault_file)
     error = caught.value
     assert error.code == code
     rendered = "".join(traceback.format_exception(error))
     for secret in _BF_SECRETS:
         assert secret not in rendered
-    world.assert_clean(before)
+    assert world.tripwires == []
     return error
 
 
-class TestPrepareBackfillPrerequisites:
-    """Independently callable saved-catalog preparation; the CLI gate stays with 12.25."""
+class TestStartupResolutionForBackfill:
+    """Explicit-settings resolution as the live backfill uses it."""
 
-    @pytest.mark.parametrize(
-        ("remembered", "freshness"),
-        [(None, "fresh"), ("p/gone", "stale"), ("p/main", "stale")],
-        ids=["main-unselected", "main-missing-stale", "main-remembered-stale"],
-    )
-    def test_saved_catalog_pins_graph_model_independent_of_main(
-        self, backfill_world: Callable[..., _BackfillWorld], remembered: str | None, freshness: str
-    ) -> None:
-        """Fresh or stale saved records pin the exact graph model and embedding identity."""
-        world = backfill_world(remembered=remembered, freshness=freshness)
-
-        result = _prepare_ok(world)
-
-        graph = _bf_document(remembered, freshness, _bf_meta(4096, 2048)).models[0]
-        assert result.pin.model == graph
-        assert (result.pin.connection.provider_id, result.pin.connection.api_key) == ("g", _BF_GRAPH_KEY)
-        assert result.pin.connection.base_url == "https://g.backfill.test/v1"
-        assert result.pin.catalog_revision == 3
-        assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
-
-    def test_disabled_graph_memory_is_still_prepared(self, backfill_world: Callable[..., _BackfillWorld]) -> None:
-        """The enabled gate belongs to the caller; invoking preparation always validates."""
-        result = _prepare_ok(backfill_world(enabled=False))
-        assert result.pin.model.id == _BF_GRAPH_ID
-
-    @pytest.mark.parametrize(
-        "metadata", [_bf_meta(), _bf_meta(4096, 1023), _bf_meta(1024)],
-        ids=["unknown", "output-below-fixed-cap", "no-headroom"],
-    )
-    def test_model_limits_are_not_a_startup_gate(
-        self, backfill_world: Callable[..., _BackfillWorld], metadata: ModelMetadata
-    ) -> None:
-        """Unknown or tiny discovered limits never fail preparation: graph has no fit gate."""
-        result = _prepare_ok(backfill_world(metadata=metadata))
-        assert result.pin.model.metadata == metadata
-        assert not hasattr(result, "budget")
+    def test_disabled_graph_memory_is_still_resolved(self, startup_world: Callable[..., _StartupWorld]) -> None:
+        """The enabled gate belongs to the caller; invoking resolution always validates."""
+        world = startup_world(enabled=False)
+        result = graph_memory.resolve_graph_startup(world.app_cfg, vault_file=None)
+        assert result.pin.model.id == "graph-model"
+        assert result.pin.connection.api_key == _BF_GRAPH_KEY
+        assert world.tripwires == []
 
     def test_supplied_vault_file_resolves_graph_and_embedding_secrets(
-        self, backfill_world: Callable[..., _BackfillWorld]
+        self, startup_world: Callable[..., _StartupWorld]
     ) -> None:
         """sec: references resolve through the supplied vault, not a default home vault."""
-        world = backfill_world(
+        world = startup_world(
             graph_key="sec:graph_key",
             embeddings=EmbeddingsConfig(
                 provider="openai", model="text-embed", api_key="sec:embed_key",
                 base_url="https://e.backfill.test/v1",
             ),
         )
-        result = _prepare_ok(world, vault_file=world.vault_file)
+        result = graph_memory.resolve_graph_startup(world.app_cfg, vault_file=world.vault_file)
         assert result.pin.connection.api_key == _BF_VAULT_GRAPH_KEY
+        assert result.pin.connection.base_url == "https://g.backfill.test/v1"
         assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
+        assert world.tripwires == []
 
-    @pytest.mark.parametrize("parent_exists", [True, False], ids=["file-missing", "parent-missing"])
-    def test_missing_catalog_fails_with_refresh_guidance(
-        self, backfill_world: Callable[..., _BackfillWorld], parent_exists: bool
-    ) -> None:
-        """A missing saved catalog fails before registry/embedding work and creates nothing."""
-        world = backfill_world(catalog="none" if parent_exists else "no-parent")
-        error = _prepare_fails(world, "catalog_missing")
-        assert "/models refresh" in str(error)
-        assert world.transports == []
-
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            f"schema_version = 1\nrevision = [\n# {_BF_LEAK}\n".encode(),
-            f'schema_version = 1\nrevision = 1\napi_key = "{_BF_LEAK}"\n'.encode(),
-        ],
-        ids=["toml-syntax", "invalid-schema"],
-    )
-    def test_corrupt_catalog_fails_without_backup_or_contents(
-        self, backfill_world: Callable[..., _BackfillWorld], raw: bytes
-    ) -> None:
-        """Corrupt bytes stay in place with no .corrupt sibling and never reach the error."""
-        world = backfill_world(catalog="raw", raw=raw)
-        error = _prepare_fails(world, "catalog_corrupt")
-        assert "/models refresh" in str(error)
-        assert world.transports == []
-
-    def test_unreadable_catalog_reports_permission_and_refresh_guidance(
-        self, backfill_world: Callable[..., _BackfillWorld], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An OS read error on the saved catalog is a safe catalog_read_failed failure."""
-        world = backfill_world()
-        target = world.settings_path.resolve()
-        real_read_bytes = Path.read_bytes
-
-        def denied(self: Path) -> bytes:
-            if self.resolve() == target:
-                raise PermissionError(13, f"Permission denied {_BF_LEAK}")
-            return real_read_bytes(self)
-
-        monkeypatch.setattr(Path, "read_bytes", denied)
-        error = _prepare_fails(world, "catalog_read_failed")
-        assert "permission" in str(error).lower()
-        assert "/models refresh" in str(error)
-        assert world.transports == []
-
-    def test_unknown_selector_keeps_model_not_found(self, backfill_world: Callable[..., _BackfillWorld]) -> None:
-        """An unknown graph selector keeps the registry code and names the setting to fix."""
-        error = _prepare_fails(backfill_world(selector=f"g/{_BF_LEAK}"), "model_not_found")
-        assert "graph_memory.extraction_model" in str(error)
-
-    @pytest.mark.parametrize("graph_key", ["env:BF_GRAPH_KEY", "sec:graph_key"], ids=["env-unset", "sec-no-vault"])
+    @pytest.mark.parametrize("graph_key", ["env:BF_MISSING_VAR", "sec:graph_key"], ids=["env-unset", "sec-no-vault"])
     def test_graph_credential_failure_is_sanitized(
-        self, backfill_world: Callable[..., _BackfillWorld], monkeypatch: pytest.MonkeyPatch, graph_key: str
+        self, startup_world: Callable[..., _StartupWorld], monkeypatch: pytest.MonkeyPatch, graph_key: str
     ) -> None:
         """Unresolvable graph credentials fail safely; no default vault is consulted."""
-        world = backfill_world(graph_key=graph_key)
-        monkeypatch.delenv("BF_GRAPH_KEY")
-        error = _prepare_fails(world, "credential_resolution_failed")
+        monkeypatch.delenv("BF_MISSING_VAR", raising=False)
+        world = startup_world(graph_key=graph_key)
+        error = _startup_fails(world, "extraction_credential_unavailable")
         assert "credential" in str(error).lower()
 
     @pytest.mark.parametrize(
@@ -2722,10 +2515,8 @@ class TestPrepareBackfillPrerequisites:
         ],
     )
     def test_unavailable_embeddings_fail_actionably(
-        self, backfill_world: Callable[..., _BackfillWorld], embeddings: EmbeddingsConfig
+        self, startup_world: Callable[..., _StartupWorld], embeddings: EmbeddingsConfig
     ) -> None:
-        """Bad explicit embeddings fail after the pin, with the temporary client closed."""
-        world = backfill_world(embeddings=embeddings)
-        error = _prepare_fails(world, "embedding_unavailable")
+        """Bad explicit embeddings fail with guidance and build no client."""
+        error = _startup_fails(startup_world(embeddings=embeddings), "embedding_unavailable")
         assert "embeddings" in str(error).lower()
-        assert len(world.transports) == 1

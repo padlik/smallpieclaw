@@ -35,10 +35,9 @@ from model_registry import (
     CatalogDocument,
     ModelMetadata,
     ModelRecord,
-    ModelRegistry,
     ProviderState,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 from telegram_commands import cmd_compress
 
 AGENT = AgentConfig(ctx_max_tokens=4096, max_retries=1, retry_delay=0)
@@ -63,11 +62,11 @@ class _Rig:
     def __init__(self, tmp_path: Path) -> None:
         self.requests: list[httpx.Request] = []
         provider = ProviderConfig("pa", "openai", "env:KEY_pa", "https://a.example.test/v1", 9)
-        settings = ModelSettings(tmp_path / "models.toml")
-        settings.write(CatalogDocument(
-            1, 2, None, (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),), (MODEL,),
+        stores = ModelStores.at(tmp_path)
+        stores.cache.write(CatalogDocument(
+            1, 2, (ProviderState("pa", "openai", "2026-09-01T00:00:00Z", "fresh"),), (MODEL,),
         ))
-        registry = ModelRegistry({"pa": provider}, settings, _NoDiscovery(), _resolve)
+        registry = stores.registry({"pa": provider}, _NoDiscovery(), _resolve)
         registry.select(MODEL.id)
         self.registry = registry
         self.clients: list[LLMClient] = []

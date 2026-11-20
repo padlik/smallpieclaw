@@ -420,7 +420,6 @@ class AgentConfig:
     max_subagents: int = 6
     subagent_result_timeout: int = 300
     long_run_warn_minutes: int = 30
-    diagnose_empty_responses: bool = False
     default_model: str = ""
     background_model: str = ""
     fallback_models: list[str] = field(default_factory=list)
@@ -841,7 +840,6 @@ def _parse_agent(raw: dict) -> AgentConfig:
         max_subagents=_parse_int(section.get("max_subagents"), 6, "agent.max_subagents"),
         subagent_result_timeout=_parse_int(section.get("subagent_result_timeout"), 300, "agent.subagent_result_timeout"),
         long_run_warn_minutes=_parse_int(section.get("long_run_warn_minutes"), 30, "agent.long_run_warn_minutes"),
-        diagnose_empty_responses=_parse_bool(section.get("diagnose_empty_responses", False), "agent.diagnose_empty_responses"),
         default_model="",
         background_model="",
         fallback_models=[],
@@ -1291,6 +1289,11 @@ def _reject_removed_fields(raw: dict) -> None:
         for key in ("default_model", "background_model", "fallback_models", "fallback_model"):
             if key in agent:
                 raise ConfigError(f"agent.{key} is no longer supported; select a discovered model with /models")
+        if "diagnose_empty_responses" in agent:
+            raise ConfigError(
+                "agent.diagnose_empty_responses is no longer supported; remove the key "
+                "(empty-response diagnostics were removed)"
+            )
         if "ctx_max_tokens" in agent:
             raise ConfigError(
                 "agent.ctx_max_tokens is no longer supported; use agent.compaction_threshold_tokens "

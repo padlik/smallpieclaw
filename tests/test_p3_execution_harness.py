@@ -29,10 +29,9 @@ from model_registry import (
     CatalogDocument,
     ModelMetadata,
     ModelRecord,
-    ModelRegistry,
     ProviderState,
 )
-from model_settings import ModelSettings
+from tests.model_stores import ModelStores
 from tests.execution_harness import (
     RecordingExecutor,
     ScriptedLLM,
@@ -144,14 +143,12 @@ class _VisionWorld:
         self.vision = _vision_record("pv", "vision-x", True)
         providers = {n: ProviderConfig(n, "openai", f"env:KEY_{n}", url, 9)
                      for n, url in _VISION_URLS.items()}
-        self.settings_path = tmp_path / "models-config.toml"
-        ModelSettings(self.settings_path).write(CatalogDocument(
-            1, 1, None,
-            tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
+        self.stores = ModelStores.at(tmp_path)
+        self.stores.cache.write(CatalogDocument(
+            1, 1, tuple(ProviderState(n, "openai", "2026-09-01T00:00:00Z", "fresh") for n in providers),
             (self.text, self.vision),
         ))
-        self.registry = ModelRegistry(providers, ModelSettings(self.settings_path),
-                                      _NoDiscovery(), _vision_resolve)
+        self.registry = self.stores.registry(providers, _NoDiscovery(), _vision_resolve)
         self.image = tmp_path / "pic.png"
         self.image.write_bytes(_IMAGE_BYTES)
         self.requests: list[httpx.Request] = []
@@ -205,7 +202,7 @@ class TestVisionRouting:
     def test_selected_verified_vision_pin_sends_image_and_finishes(self, vision_world):
         """The real client and loop send the image on the pinned vision route only."""
         client = vision_world.admit_selected(vision_world.vision)
-        settings_bytes = vision_world.settings_path.read_bytes()
+        settings_bytes = vision_world.stores.snapshot()
         result, calls, _progress = run_react(
             client, RecordingExecutor(), _VISION_GOAL, images=[str(vision_world.image)],
         )
@@ -223,7 +220,7 @@ class TestVisionRouting:
         # Pin, Main and persisted settings are untouched by the run.
         assert client.llm_cfg["id"] == vision_world.vision.id
         assert vision_world.registry.view().active_model_id == vision_world.vision.id
-        assert vision_world.settings_path.read_bytes() == settings_bytes
+        assert vision_world.stores.snapshot() == settings_bytes
 
     @pytest.mark.parametrize("vision_world", [False, None], indirect=True,
                              ids=["cached-false", "unknown"])
@@ -231,7 +228,7 @@ class TestVisionRouting:
         """False/unknown cached vision is display metadata: direct chat and the loop both
         send the image once each to the pinned model, with no alternate model."""
         client = vision_world.admit_selected(vision_world.text)
-        settings_bytes = vision_world.settings_path.read_bytes()
+        settings_bytes = vision_world.stores.snapshot()
         images = [str(vision_world.image)]
         client.chat([{"role": "user", "content": _VISION_GOAL, "images": images}])
         assert len(vision_world.requests) == 1
@@ -249,7 +246,7 @@ class TestVisionRouting:
             assert body["model"] == "text-x" and _image_urls(body) == [expected_url]
         assert client.llm_cfg["id"] == vision_world.text.id
         assert vision_world.registry.view().active_model_id == vision_world.text.id
-        assert vision_world.settings_path.read_bytes() == settings_bytes
+        assert vision_world.stores.snapshot() == settings_bytes
 
     def test_provider_image_rejection_is_a_normal_failure_without_substitution(self, vision_world):
         """A text-only model's genuine provider rejection surfaces once, sanitized, with
