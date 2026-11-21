@@ -82,13 +82,11 @@ class TestRealReactPreparation:
             client.close()
 
 class TestSummaryCall:
-    def test_summary_has_own_budget_and_main_state_untouched(self):
+    def test_summary_is_one_shot_and_main_state_untouched(self):
         calls = []
 
         def handler(request):
             calls.append(request)
-            if len(calls) == 1:
-                return httpx.Response(503, json={})
             return httpx.Response(200, json=SUMMARY)
 
         client = _client(handler, ModelMetadata(context_tokens=8_192, output_tokens=1_024))
@@ -96,7 +94,7 @@ class TestSummaryCall:
         state = _LoopState(messages=[], goal_idx=0, max_steps=1)
         try:
             assert _summarize_on_pin(ctx, "summarize me") == "- earlier steps summarized"
-            assert len(calls) == 2
+            assert len(calls) == 1
             assert state.attempt_state is None
         finally:
             client.close()

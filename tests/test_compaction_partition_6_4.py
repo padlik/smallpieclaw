@@ -230,14 +230,16 @@ class TestSummaryUsesPinnedClientWithOwnAttemptState:
             upstream_id="pinned-model",
         )
 
-    def test_retry_then_success_is_isolated_from_main_request_state(self):
+    def test_one_shot_success_is_isolated_from_main_request_state(self):
         seen: list[httpx.Request] = []
 
         def handler(request):
             seen.append(request)
-            if len(seen) == 1:
-                return httpx.Response(503, json={})
-            return httpx.Response(200, json=SUMMARY_BODY)
+            return httpx.Response(
+                200,
+                json={**SUMMARY_BODY, "usage": {
+                    "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}},
+            )
 
         client = self._client(handler)
         spy = _CheckpointSpy()
@@ -254,9 +256,12 @@ class TestSummaryUsesPinnedClientWithOwnAttemptState:
             _prepare_request(ctx, state, "sys", 0)
         finally:
             client.close()
-        assert len(seen) == 2
-        assert len(bound) == 2 and bound[0] is bound[1] and bound[0] is not main_attempt
-        assert bound[0].outbound_attempts == 2
+        assert len(seen) == 1
+        usage = client.get_today_usage()  # the one summary send is counted exactly once
+        assert (usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]) == (7, 3, 10)
+        assert len(bound) == 1 and bound[0] is not main_attempt
+        assert bound[0].outbound_attempts == 1 and bound[0].remaining_retries == 0
+        assert bound[0].manual_retries_used == 0
         assert main_attempt.to_dict() == main_before and main_attempt.outbound_attempts == 0
         for request in seen:  # route/credential/model come from the pinned run model only
             assert str(request.url) == "https://openai.example.test/v1/chat/completions"
@@ -267,7 +272,7 @@ class TestSummaryUsesPinnedClientWithOwnAttemptState:
         assert any("Compacted context" in str(m["content"]) for m in state.messages)
         assert spy.calls == []
 
-    def test_terminal_summary_error_leaves_main_state_and_checkpoint_alone(self):
+    def test_transient_summary_error_is_one_send_and_leaves_main_state_alone(self):
         seen: list[httpx.Request] = []
 
         def handler(request):
@@ -277,19 +282,20 @@ class TestSummaryUsesPinnedClientWithOwnAttemptState:
         client = self._client(handler)
         spy = _CheckpointSpy()
         ctx = build_context(
-            client, RecordingExecutor(), max_retries=1, compaction_threshold_tokens=500,
+            client, RecordingExecutor(), max_retries=2, compaction_threshold_tokens=500,
             checkpoint_store=spy,
         )
         state = _history_state()
-        main_attempt = state.attempt_state = CallAttemptState(1, 0)
+        main_attempt = state.attempt_state = CallAttemptState(2, 0)
         main_before = main_attempt.to_dict()
         bound = _observe_bindings(client)
         try:
             _prepare_request(ctx, state, "sys", 0)
         finally:
             client.close()
-        assert len(seen) == 2  # own bounded retry: first try + one retry
-        assert len(bound) == 2 and all(b is not main_attempt for b in bound)
+        assert len(seen) == 1  # one-shot: no summary retry despite max_retries=2
+        assert len(bound) == 1 and bound[0] is not main_attempt
+        assert bound[0].outbound_attempts == 1 and bound[0].automatic_retries_used == 0
         # 6.6: the terminal failure is absorbed as a compaction failure (history kept, run
         # disabled); the main attempt state and checkpoint are untouched either way.
         assert state.attempt_state is main_attempt and main_attempt.to_dict() == main_before

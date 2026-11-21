@@ -20,6 +20,7 @@ import httpx
 import pytest
 
 import context_manager
+import react_loop as react_loop_module
 from agent_logging import LogEvent
 from context_manager import CompactionFailedError, maybe_compact
 from model_registry import ModelMetadata
@@ -89,12 +90,13 @@ def _blank(_request):
 
 
 def _loop(wire, *, caplog, **ctx):
+    ctx.setdefault("max_retries", 0)
     client = _client(wire)
     try:
         with caplog.at_level(logging.DEBUG):
             result, calls, _progress = run_react(
                 client, RecordingExecutor(), "GOAL", short_term=_short_term(),
-                compaction_threshold_tokens=THRESHOLD, max_retries=0, **ctx,
+                compaction_threshold_tokens=THRESHOLD, **ctx,
             )
     finally:
         client.close()
@@ -157,6 +159,27 @@ class TestFailedSummaryDisablesTheRun:
         _assert_original_history_sent_every_step(wire, 2)
         assert [r.args[0] for r in _failure_records(caplog)] == ["summary_failed"]
         _assert_only_client_request_failures(caplog, len(wire.summary_bodies))
+
+
+class TestSummaryIsOneShotWhileMainKeepsItsRetries:
+    def test_transient_summary_failure_makes_one_send_no_wait_main_retries_twice(self, caplog):
+        wire = _Wire([_http_503], [_http_503, _http_503, TOOL, FINISH])
+        waits: list[tuple[int, float]] = []
+
+        def retry_wait(event, seconds):
+            waits.append((len(wire.main_bodies), seconds))
+            return event.is_set()
+
+        result, calls = _loop(wire, caplog=caplog, max_retries=2, retry_delay=0.5,
+                              retry_wait=retry_wait)
+        assert result == "done" and len(calls) == 1
+        assert len(wire.summary_bodies) == 1  # one outbound summary send, none after failure
+        # Both configured main retries are exercised, each on the original history/goal.
+        _assert_original_history_sent_every_step(wire, 4)
+        # Exactly the two main retry waits: after main send 1 and after main send 2.
+        # None happened between the summary failure and the first main send.
+        assert [sent for sent, _ in waits] == [1, 2]
+        assert [r.args[0] for r in _failure_records(caplog)] == ["summary_failed"]
 
 
 class TestWhitespaceSummaryDisablesTheRun:
@@ -309,6 +332,41 @@ class TestRunScope:
 # ---------------------------------------------------------------------------
 
 class TestFailurePreservesMainState:
+    @pytest.mark.parametrize("value", [None, 42], ids=["none", "int"])
+    def test_non_string_automatic_callback_result_is_an_empty_summary_failure(
+        self, value, caplog, monkeypatch,
+    ):
+        from call_attempt_state import CallAttemptState
+
+        seen: list[httpx.Request] = []
+        client = _client(lambda r: seen.append(r) or httpx.Response(200, json=SUMMARY_OK))
+        spy = MagicMock()
+        ctx = build_context(
+            client, RecordingExecutor(), compaction_threshold_tokens=10, max_retries=2,
+            checkpoint_store=spy,
+        )
+        messages = _history()
+        snapshot = copy.deepcopy(messages)
+        state = _LoopState(messages=messages, goal_idx=0, max_steps=1)
+        state.attempt_state = main_attempt = CallAttemptState(2, 0)
+        main_before = main_attempt.to_dict()
+        monkeypatch.setattr("react_loop._summarize_on_pin", lambda _ctx, _prompt: value)
+        try:
+            with caplog.at_level(logging.DEBUG):
+                _prepare_request(ctx, state, "sys", 0)
+                _prepare_request(ctx, state, "sys", 0)  # disabled: no second attempt
+        finally:
+            client.close()
+        # The original history is what the main request will send, goal index unchanged.
+        assert state.messages is messages and messages == snapshot and state.goal_idx == 0
+        assert state.auto_compaction_disabled is True and seen == []
+        records = _failure_records(caplog)
+        assert len(records) == 1 and records[0].levelno == logging.WARNING
+        assert records[0].args[0] == "empty_summary"
+        _assert_content_free(caplog)
+        assert state.attempt_state is main_attempt and main_attempt.to_dict() == main_before
+        assert spy.method_calls == []
+
     def test_original_objects_goal_index_and_main_attempt_survive(self):
         from call_attempt_state import CallAttemptState
 
@@ -370,6 +428,21 @@ class TestCancellation:
         self, reply, client_sees_cancel, caplog,
     ):
         self._prepare(reply, caplog, client_sees_cancel=client_sees_cancel)
+
+    def test_cancel_set_before_the_summary_send_makes_no_provider_call(self, caplog):
+        event = threading.Event()
+        seen: list[httpx.Request] = []
+        client = _client(lambda r: seen.append(r) or httpx.Response(200, json=SUMMARY_OK),
+                         cancel_event=event)
+        ctx = build_context(client, RecordingExecutor(), compaction_threshold_tokens=10,
+                            cancel_event=event)
+        event.set()
+        try:
+            with caplog.at_level(logging.DEBUG), pytest.raises(LLMCancelledError):
+                react_loop_module._summarize_on_pin(ctx, "prompt")
+        finally:
+            client.close()
+        assert seen == [] and _failure_records(caplog) == []
 
     def test_cancel_during_candidate_validation_is_a_cancel_not_a_failure(
         self, caplog, monkeypatch,

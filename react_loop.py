@@ -1212,48 +1212,35 @@ def _action_from_turn(turn: _Turn, state: _LoopState) -> tuple[dict, Callable[[s
     return action_obj, _result_sink(state)
 
 
-def _is_transient_llm_error(exc: BaseException) -> bool:
-    """Return whether a failure is a transient transport or status error."""
-    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
-        return True
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in {408, 429, 500, 502, 503, 504}
-    return False
-
-
 def _summarize_on_pin(ctx: ReactContext, prompt: str) -> str:
-    """Summarize on the pinned model with its own bounded attempt state.
+    """Summarize on the pinned model with one outbound attempt and no waits.
 
-    The summary is sent without any size preview or fit check. Waits are
-    cancel-responsive and cancellation propagates; the main request's attempt
-    state and pending checkpoint are never touched.
+    The optional automatic summary gets its own zero-retry attempt state, so it
+    never retries, waits, or authorizes manual continuation, and the main
+    request's attempt state and pending checkpoint are never touched. The summary
+    is sent without any size preview or fit check. Cancellation takes precedence
+    before the call, over a racing provider failure, and after a reply.
     """
     messages = [{"role": "user", "content": prompt}]
-    attempt = CallAttemptState(ctx.max_retries, ctx.retry_delay)
-    wait = ctx.retry_wait or (lambda event, seconds: event.wait(seconds))
-    while True:
-        if ctx.cancel_event.is_set():
-            raise LLMCancelledError("cancelled")
-        try:
-            bind_cancel = getattr(ctx.llm, "bind_cancel_event", None)
-            with (
-                bind_cancel(ctx.cancel_event) if callable(bind_cancel) else nullcontext(),
-                ctx.llm.bind_attempt(attempt, manual=attempt.manual_retry_authorized),
-            ):
-                text = ctx.llm.chat(messages)
-        except LLMCancelledError:
-            raise
-        except (LLMError, LLMEmptyResponseError, httpx.HTTPError) as exc:
-            if ctx.cancel_event.is_set():  # a cancel racing the failure is a cancel
-                raise LLMCancelledError("cancelled") from None
-            if not _is_transient_llm_error(exc) or not attempt.can_retry_automatically():
-                raise
-            if wait(ctx.cancel_event, attempt.next_retry_delay()) or ctx.cancel_event.is_set():
-                raise LLMCancelledError("cancelled") from None
-        else:
-            if ctx.cancel_event.is_set():  # a reply (even blank) after a cancel is a cancel
-                raise LLMCancelledError("cancelled")
-            return text
+    attempt = CallAttemptState(max_retries=0, retry_delay=0)
+    if ctx.cancel_event.is_set():
+        raise LLMCancelledError("cancelled")
+    try:
+        bind_cancel = getattr(ctx.llm, "bind_cancel_event", None)
+        with (
+            bind_cancel(ctx.cancel_event) if callable(bind_cancel) else nullcontext(),
+            ctx.llm.bind_attempt(attempt, manual=False),
+        ):
+            text = ctx.llm.chat(messages)
+    except LLMCancelledError:
+        raise
+    except (LLMError, LLMEmptyResponseError, httpx.HTTPError):
+        if ctx.cancel_event.is_set():  # a cancel racing the failure is a cancel
+            raise LLMCancelledError("cancelled") from None
+        raise
+    if ctx.cancel_event.is_set():  # a reply (even blank) after a cancel is a cancel
+        raise LLMCancelledError("cancelled")
+    return text
 
 
 def _prepare_request(
