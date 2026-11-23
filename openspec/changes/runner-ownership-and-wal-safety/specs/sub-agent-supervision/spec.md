@@ -52,6 +52,7 @@ On-demand/scheduled pre-acceptance failure SHALL independently attempt runner cl
 - **GIVEN** the supervisor has begun shutdown
 - **WHEN** an on-demand or scheduled submission reaches the final handoff
 - **THEN** it is rejected and any constructed runner is closed with applicable tracking rollback
+- **AND** direct supervisor callers receive `SupervisorStoppingError`, a `RuntimeError` subtype, after rollback
 - **AND** neither runner execution nor the accepted-task finish callback occurs
 
 ### Requirement: Accepted queued cancellation receives terminal cleanup
@@ -70,6 +71,12 @@ Accepted-before-start cancellation SHALL signal the existing cancelled outcome w
 - **THEN** the remaining cleanup stages are attempted and cleanup errors are recorded
 - **AND** its runner is not executed or retried
 
+#### Scenario: One queued-entry cancellation does not abandon the shutdown batch
+- **GIVEN** two queued accepted runners are cancelled by shutdown
+- **WHEN** the first runner's terminal cleanup raises a cancellation
+- **THEN** the second runner is still terminalized and the bounded started-worker drain is still attempted
+- **AND** that cancellation propagates only after both attempts
+
 #### Scenario: A started runner is cooperatively cancelled
 - **GIVEN** an accepted runner is already executing when shutdown begins
 - **WHEN** cancellation is signaled
@@ -81,6 +88,72 @@ Accepted-before-start cancellation SHALL signal the existing cancelled outcome w
 - **WHEN** shutdown is called again
 - **THEN** its close, finish callback and terminal signaling are not repeated
 - **AND** a terminal outcome still required by its owner remains retrievable under existing access rules
+
+### Requirement: Queued cancellation precedes the started-worker drain
+
+Shutdown SHALL terminalize cancelled queued entries before beginning the bounded drain of started work. This ordering SHALL NOT impose a new time bound on synchronous callbacks or require started workers to finish immediately. Only shutdown SHALL cancel accepted Futures; timeout and owner cancellation SHALL retain record signaling.
+
+#### Scenario: Queued cleanup precedes the started-worker drain
+- **GIVEN** a started worker is blocked and a second accepted runner is queued
+- **WHEN** supervisor shutdown begins
+- **THEN** executor shutdown cancels the queued Future and the supervisor terminalizes it before beginning the bounded worker drain
+- **AND** the queued runner never executes and its cleanup is attempted exactly once
+- **AND** the started runner remains worker-owned and open until execution unwinds
+
+### Requirement: Terminal stages remain independent
+
+Terminal processing SHALL attempt context persistence, result signaling, lifecycle logging, result recording and eligible completion handoff independently and at most once. A stage failure SHALL NOT skip later eligible attempts or cause a second terminalization through execution-error handling.
+
+#### Scenario: Result signaling fails after persistence cancellation
+- **GIVEN** context persistence raises a cancellation and result signaling raises an ordinary failure
+- **WHEN** terminal processing completes its remaining attempts
+- **THEN** lifecycle logging, result recording and eligible completion handoff are each attempted once
+- **AND** the original cancellation remains the propagated exception
+
+#### Scenario: Completion cancellation follows an ordinary terminal failure
+- **GIVEN** result signaling raises an ordinary failure and eligible completion handoff raises a cancellation
+- **WHEN** terminal processing finishes
+- **THEN** the cancellation takes precedence over the ordinary failure
+- **AND** every remaining eligible terminal and cleanup stage is attempted once without retrying execution or re-entering terminal processing through execution-error handling
+
+### Requirement: Local failures have explicit precedence
+
+Cleanup SHALL receive the exception escaping its protected local operation explicitly; unrelated ambient handlers and errors already handled into outcomes SHALL NOT establish a primary. Preserve that primary; otherwise propagate the first cancellation/non-`Exception` failure, or the first otherwise-propagating ordinary failure. Existing swallowed callback errors SHALL remain contained.
+
+#### Scenario: Cleanup runs inside an unrelated caller handler
+- **GIVEN** the protected local operation has no escaping failure but its caller is handling an unrelated exception
+- **WHEN** a cleanup stage raises a cancellation
+- **THEN** all remaining cleanup stages are attempted and that cancellation propagates
+- **AND** the unrelated caller exception does not suppress it
+
+#### Scenario: Genuine primary cancellation is paired with cleanup failure
+- **GIVEN** a local execution or terminal cancellation is escaping
+- **WHEN** cleanup also raises cancellation or an ordinary owned-signaling failure
+- **THEN** every remaining cleanup stage is attempted
+- **AND** the exact original local cancellation remains primary
+
+### Requirement: Stopping refusals are translated only at the spawn boundary
+
+Only the spawn compatibility shim SHALL translate `SupervisorStoppingError` into its existing structured refusal shape after rollback. Other submission errors and cancellation SHALL retain existing propagation. Scheduled launches SHALL retain existing generic safe failure presentation and exactly-once run release.
+
+#### Scenario: Spawn returns a safe stopping refusal
+- **GIVEN** a spawn request reaches the stopping supervisor's final handoff
+- **WHEN** the supervisor rolls back and raises `SupervisorStoppingError`
+- **THEN** the shim returns `success=false`, empty `output`, `exit_code=-1`, `error_type="impossible_with_current_tools"` and `recoverable=false`
+- **AND** the result is stamped `refused` and contains a fixed safe stopping message and operator restart guidance
+- **AND** the rejected runner never executes or invokes accepted-task finish
+
+#### Scenario: Unexpected submission faults are not stopping refusals
+- **GIVEN** registration or executor submission raises an unexpected ordinary error or cancellation
+- **WHEN** the spawn request unwinds
+- **THEN** the shim does not translate it into a stopping refusal
+- **AND** independent rollback is attempted without replacing the original exception
+
+#### Scenario: Scheduled stopping rejection releases its launch once
+- **GIVEN** a scheduled launch reaches a stopping supervisor through the spawn shim
+- **WHEN** the scheduler receives the structured stopping refusal
+- **THEN** it retains existing generic safe launch-failure reporting and releases that admitted run exactly once
+- **AND** no runner execution or supervisor accepted-task finish callback occurs
 
 ### Requirement: Shutdown handoff avoids orphaned tasks and locked callbacks
 

@@ -51,3 +51,25 @@ Constructor failure SHALL close allocated owned chat/embedding clients. Returned
 - **WHEN** the caller runs the task and then closes the runner twice
 - **THEN** run itself has not assumed close ownership and repeated close remains safe
 - **AND** borrowed root services remain open
+
+### Requirement: Launcher cleanup uses the local operation's primary
+
+Plan and diagnostic cleanup SHALL receive an explicitly identified exception escaping the protected local operation. An unrelated caller handler or an error already handled into an outcome SHALL NOT establish a primary. Remaining cleanup SHALL be attempted before propagating a sole cleanup cancellation; a genuine local primary SHALL retain identity.
+
+#### Scenario: Launcher cleanup runs inside an unrelated handler
+- **GIVEN** a plan or diagnostic operation finishes without an escaping local error while its caller handles an unrelated exception
+- **WHEN** a cleanup stage raises a cancellation
+- **THEN** remaining tracking cleanup and runner close are attempted once
+- **AND** the cleanup cancellation propagates rather than being suppressed by the caller's unrelated exception
+
+#### Scenario: Execution and cleanup both raise cancellation
+- **GIVEN** plan or diagnostic execution raises a cancellation escaping its local operation
+- **WHEN** a cleanup stage also raises cancellation
+- **THEN** every remaining cleanup stage is attempted once
+- **AND** the exact original execution cancellation remains primary
+
+#### Scenario: A handled diagnostic failure does not suppress cleanup cancellation
+- **GIVEN** a diagnostic execution error has been handled into an unavailable-analysis outcome
+- **WHEN** cleanup raises a cancellation
+- **THEN** remaining cleanup and runner close are attempted once
+- **AND** the cleanup cancellation propagates because the handled error is not an escaping local primary
