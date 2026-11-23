@@ -18,6 +18,7 @@ import pytest
 
 from memory_store import LongTermMemory
 from sub_agent_supervisor import SupervisionOptions
+from tests.inline_futures import run_inline_future
 
 
 def _make_runner(agent_id: str = "sa-p2", model_id: str = "test-model") -> MagicMock:
@@ -46,7 +47,7 @@ class TestSubAgentNoLongTermWrite:
         # Run the spawn closure synchronously so completion logic executes inline.
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **_kw: fn()):
+                          side_effect=run_inline_future):
             result = exc._exec_spawn_agent(
                 {"task": "do something"}, caller_depth=0,
                 options=SupervisionOptions(notify=False),

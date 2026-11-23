@@ -16,6 +16,7 @@ from builtin_executor import _save_context
 from builtin_tools.context_io import _load_context
 from memory_store import ShortTermMemory
 from sub_agent_supervisor import SupervisionOptions
+from tests.inline_futures import run_inline_future
 
 
 def _stm(turns):
@@ -134,7 +135,7 @@ class TestSpawnSavesContextInFinally:
         )
         with patch("sub_agent_registry.get_registry", return_value=_make_reg()), \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             exc._exec_spawn_agent(
                 {"task": "do work", "context_key": context_key},
                 caller_depth=0,
@@ -201,7 +202,7 @@ class TestSpawnSavesContextInFinally:
         with patch("sub_agent_registry.get_registry", return_value=registry), \
              patch("builtin_tools.context_io._save_context", side_effect=_save_spy) as _save_mock, \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             exc._exec_spawn_agent(
                 {"task": "do work", "context_key": "ctx-order"},
                 caller_depth=0,
@@ -330,7 +331,7 @@ class TestScheduledSpawnUsesNamespacedKey:
         exc = make_builtin_executor(sub_agent_factory=factory, data_dir=str(tmp_path))
         with patch("sub_agent_registry.get_registry", return_value=_make_reg()), \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             exc._exec_spawn_agent(args, caller_depth=0, options=options)
         return factory
 

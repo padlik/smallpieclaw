@@ -1258,6 +1258,9 @@ class TestRootStartupComposition:
         assert root.unexpected == []
 
 
+_REAL_GRAPH_STORE = graph_memory.GraphMemoryStore  # captured before any harness fake is installed
+
+
 class TestRootStartupGraphMemory:
     """Graph memory startup through the real ``main._run`` composition path."""
 
@@ -1405,6 +1408,66 @@ class TestRootStartupGraphMemory:
         # Telegram still alive; tool index may be degraded but not crashed.
         assert "telegram:run" in root.events
         assert root.unexpected == []
+
+    def test_real_store_open_failure_keeps_startup_serving_and_ordinary_request(
+        self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Real factory/store with a failing engine open: Telegram serves, requests work."""
+        secret = "SECRET-MARKER-engine-text"
+        root = root_harness
+        db_path = root.paths.graph_memory_db
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        artifacts = {
+            db_path: b"db-sentinel",
+            Path(f"{db_path}.wal"): b"wal-sentinel",
+            Path(f"{db_path}.wal.checkpoint"): b"checkpoint-sentinel",
+        }
+        for path, data in artifacts.items():
+            path.write_bytes(data)
+        open_calls: list[str] = []
+
+        def failing_open(path: str, **_kwargs: object) -> None:
+            """Nonmutating injected engine failure carrying a secret marker."""
+            open_calls.append(path)
+            raise RuntimeError(f"Corrupted wal {secret}")
+
+        # Undo only the harness's fake store: the real store/factory run unmodified.
+        monkeypatch.setattr(graph_memory, "GraphMemoryStore", _REAL_GRAPH_STORE)
+        monkeypatch.setattr(graph_memory, "_LADYBUG_AVAILABLE", True)
+        monkeypatch.setattr(graph_memory.ladybug, "Database", failing_open)
+        boundary = _ReactBoundary()
+        monkeypatch.setattr(agent_controller, "react_loop", boundary)
+        outcome: dict[str, Any] = {}
+
+        def hold(held: RootHarness) -> None:
+            """Serve one ordinary request while Telegram is running."""
+            assert "telegram:run" in held.events
+            outcome["request"] = _request(held, "ordinary request", "r-0000f001")
+
+        with caplog.at_level(logging.DEBUG):
+            root.start(saved_default=None, graph_enabled=True, write_cache=False, hold=hold)
+
+        assert len(open_calls) == 1
+        assert root.graph_store_instances == [] and root.graph_writer_instances == []
+        assert root.main_controller._graph_memory is None
+        assert root.main_controller._graph_memory_writer is None
+        assert root.builtin._graph_memory is None
+        assert "graph:writer:init" not in root.events
+        assert "telegram:init" in root.events and "telegram:run" in root.events
+        assert outcome["request"] == ("answer-1", None)
+        assert root.unexpected == []
+        assert {path: path.read_bytes() for path in artifacts} == artifacts
+        captured = capsys.readouterr()
+        text = "\n".join([caplog.text, captured.out, captured.err])
+        assert secret not in text and "Traceback" not in text
+        assert "RuntimeError" in text
+        for phrase in (
+            "graph memory is unavailable", "stop graph users",
+            "back up the database and all sidecars together",
+            "supported procedures", "restart after repair", "explicit operator approval",
+        ):
+            assert phrase in text.lower()
 
     def test_graph_starts_with_local_context_below_the_fixed_extraction_cap(
         self, root_harness: RootHarness, monkeypatch: pytest.MonkeyPatch,

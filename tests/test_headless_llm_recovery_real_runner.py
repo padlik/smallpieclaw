@@ -31,6 +31,7 @@ from tests.test_agent_runtime_characterization import (
     _registry,
     _unavailable_embedding,
 )
+from tests.inline_futures import run_inline_future
 
 RETRY_TIMEOUT_SECONDS = 20  # long enough that blocking on it is unmistakable
 AUTOMATIC_RETRIES = 2
@@ -241,7 +242,7 @@ def test_supervisor_reports_headless_llm_failure_and_cleans_up(chain_for):
     chain.executor._sub_agent_factory = chain.factory
 
     with patch.object(chain.executor._supervisor._pool, "submit",
-                      side_effect=lambda fn, *a, **kw: fn()):
+                      side_effect=run_inline_future):
         spawned = chain.executor._exec_spawn_agent({"task": "do the task"})
     retrieved = chain.executor._exec_get_agent_result(
         {"agent_id": spawned["agent_id"], "timeout": 1}

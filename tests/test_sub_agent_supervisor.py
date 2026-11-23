@@ -13,6 +13,7 @@ Covers OpenSpec change ``extract-sub-agent-supervisor`` tasks 1.1-1.6:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from contextlib import ExitStack
 from dataclasses import FrozenInstanceError
@@ -21,18 +22,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from outcome_utils import with_execution
+from outcome_utils import read_execution, with_execution
 
 from confirmation import GrantLifetime
 from memory_store import ShortTermMemory
 from sub_agent_registry import SubAgentRecord, SubAgentRegistry, get_registry
 from sub_agent_supervisor import (
     ORIGIN_ON_DEMAND,
+    ORIGIN_SCHEDULED,
     ExecutionOwnership,
     SubAgentSupervisor,
     SubmissionRequest,
     SupervisionOptions,
 )
+from tests.inline_futures import run_inline_future
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +275,7 @@ class TestOriginAwareTerminalDelivery:
                 if terminal == "timeout_cancelled":
                     record._timeout_cancelled = True
                 record.cancel()
-            fn()
-            return MagicMock()
+            return run_inline_future(fn)
 
         with patch("sub_agent_registry.get_registry", return_value=local_reg), \
              patch.object(exc._supervisor._pool, "submit", side_effect=run_now):
@@ -307,8 +309,7 @@ class TestOriginAwareTerminalDelivery:
                 if terminal == "timeout_cancelled":
                     record._timeout_cancelled = True
                 record.cancel()
-            fn()
-            return MagicMock()
+            return run_inline_future(fn)
 
         with patch("sub_agent_registry.get_registry", return_value=local_reg), \
              patch.object(exc._supervisor._pool, "submit", side_effect=run_now):
@@ -344,7 +345,7 @@ class TestTurnOwnershipObligations:
         with patch.object(
             exc._supervisor._pool,
             "submit",
-            side_effect=lambda fn, *_args, **_kwargs: fn(),
+            side_effect=run_inline_future,
         ):
             result = exc._exec_spawn_agent(
                 {"task": "child work"},
@@ -372,7 +373,7 @@ class TestTurnOwnershipObligations:
         with patch.object(
             exc._supervisor._pool,
             "submit",
-            side_effect=lambda fn, *_args, **_kwargs: fn(),
+            side_effect=run_inline_future,
         ):
             spawned = exc._exec_spawn_agent({"task": "legacy work"})
 
@@ -532,7 +533,7 @@ class TestOwnedCleanupFailureIsolation:
                 patch.object(
                     exc._supervisor._pool,
                     "submit",
-                    side_effect=lambda fn, *_args, **_kwargs: fn(),
+                    side_effect=run_inline_future,
                 )
             )
             if failure_point == "deregister_run":
@@ -759,9 +760,221 @@ class TestAdmissionRollback:
         assert local_reg.get(runner.agent_id) is None
         assert supervisor.unaccounted_children("r-owner") == []
         assert supervisor.draining_children("r-owner") == []
-        assert runner.closed is False
+        assert runner.closed is True
         # The successfully recorded prompt association is rolled back too.
         assert prompt_registry.get(owner_prompt_id).sub_agent_ids == []
+
+
+class TestRejectedSubmissionOwnership:
+    """A rejected submission closes its constructed runner and rolls back state."""
+
+    @staticmethod
+    def _runner(agent_id: str):
+        runner = FakeRunner(agent_id=agent_id)
+        runner.close = MagicMock(side_effect=runner.close)
+        runner.run = MagicMock()
+        return runner
+
+    @staticmethod
+    def _request(tmp_path, runner, *, scheduled=False, prompt_registry=None):
+        if scheduled:
+            ownership = ExecutionOwnership(origin=ORIGIN_SCHEDULED)
+        else:
+            ownership = ExecutionOwnership(
+                origin=ORIGIN_ON_DEMAND,
+                owner_turn_id="r-owner",
+                prompt_id=prompt_registry.start("r-owner", "p").prompt_id,
+            )
+        return SubmissionRequest(
+            task="t",
+            response_format="text",
+            label="job" if scheduled else "on-demand",
+            context_key=None,
+            factory=lambda **_k: runner,
+            factory_kwargs={},
+            data_dir=str(tmp_path),
+            ownership=ownership,
+            prompt_registry=prompt_registry,
+        )
+
+    @staticmethod
+    def _prompts(tmp_path):
+        from prompt_registry import PromptRegistry
+
+        return PromptRegistry(data_dir=str(tmp_path / "prompts"))
+
+    def _assert_rejected(self, runner, reg, finish_cb):
+        assert runner.close.call_count == 1
+        assert reg.get(runner.agent_id) is None
+        runner.run.assert_not_called()
+        finish_cb.assert_not_called()
+
+    def test_on_demand_prompt_association_failure_closes_runner(self, tmp_path):
+        prompts = self._prompts(tmp_path)
+        runner = self._runner("sa-own-prompt")
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        reg = SubAgentRegistry()
+        finish_cb = MagicMock()
+        with patch("sub_agent_registry.get_registry", return_value=reg), \
+             patch.object(prompts, "associate_sub_agent", side_effect=OSError("primary")):
+            with pytest.raises(OSError, match="primary"):
+                supervisor.submit(
+                    self._request(tmp_path, runner, prompt_registry=prompts),
+                    SupervisionOptions(notify=False, finish_cb=finish_cb),
+                )
+        self._assert_rejected(runner, reg, finish_cb)
+        assert supervisor.draining_children("r-owner") == []
+
+    def test_scheduled_executor_failure_closes_runner(self, tmp_path):
+        runner = self._runner("sa-own-sched")
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        reg = SubAgentRegistry()
+        finish_cb = MagicMock()
+        with patch("sub_agent_registry.get_registry", return_value=reg), \
+             patch.object(supervisor._pool, "submit", side_effect=RuntimeError("primary")):
+            with pytest.raises(RuntimeError, match="primary"):
+                supervisor.submit(
+                    self._request(tmp_path, runner, scheduled=True),
+                    SupervisionOptions(
+                        notify=False, source="scheduled", finish_cb=finish_cb
+                    ),
+                )
+        self._assert_rejected(runner, reg, finish_cb)
+
+    def test_registration_insert_then_raise_is_rolled_back(self, tmp_path):
+        import sub_agent_registry
+
+        runner = self._runner("sa-own-insert")
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        reg = SubAgentRegistry()
+        finish_cb = MagicMock()
+
+        real_register = sub_agent_registry.register_run
+
+        def insert_then_raise(r, **kwargs):
+            real_register(r, **kwargs)
+            raise RuntimeError("primary")
+
+        with patch("sub_agent_registry.get_registry", return_value=reg), \
+             patch("sub_agent_registry.register_run", insert_then_raise):
+            with pytest.raises(RuntimeError, match="primary"):
+                supervisor.submit(
+                    self._request(tmp_path, runner, scheduled=True),
+                    SupervisionOptions(
+                        notify=False, source="scheduled", finish_cb=finish_cb
+                    ),
+                )
+        self._assert_rejected(runner, reg, finish_cb)
+
+    def test_registration_failure_before_insert_closes_runner(self, tmp_path):
+        runner = self._runner("sa-own-noinsert")
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        reg = SubAgentRegistry()
+        finish_cb = MagicMock()
+        with patch("sub_agent_registry.get_registry", return_value=reg), \
+             patch("sub_agent_registry.register_run", side_effect=RuntimeError("primary")):
+            with pytest.raises(RuntimeError, match="primary"):
+                supervisor.submit(
+                    self._request(tmp_path, runner, scheduled=True),
+                    SupervisionOptions(
+                        notify=False, source="scheduled", finish_cb=finish_cb
+                    ),
+                )
+        self._assert_rejected(runner, reg, finish_cb)
+
+    @pytest.mark.parametrize(
+        "failing", ["owned", "close", "deregister", "prompt_remove"]
+    )
+    def test_rollback_stage_failure_does_not_skip_others_or_mask_primary(
+        self, tmp_path, failing
+    ):
+        prompts = self._prompts(tmp_path)
+        runner = self._runner("sa-own-stage")
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        reg = SubAgentRegistry()
+        finish_cb = MagicMock()
+        real_dereg = __import__("sub_agent_registry").deregister_run
+        dereg = MagicMock(side_effect=real_dereg)
+        remove = MagicMock(side_effect=prompts.remove_sub_agent)
+        owned = MagicMock(side_effect=supervisor._discard_owned)
+        if failing == "close":
+            runner.close.side_effect = OSError("close boom")
+        elif failing == "deregister":
+            dereg.side_effect = OSError("dereg boom")
+        elif failing == "owned":
+            owned.side_effect = OSError("owned boom")
+        else:
+            remove.side_effect = OSError("remove boom")
+        with patch("sub_agent_registry.get_registry", return_value=reg), \
+             patch("sub_agent_registry.deregister_run", dereg), \
+             patch.object(supervisor, "_discard_owned", owned), \
+             patch.object(prompts, "remove_sub_agent", remove), \
+             patch.object(supervisor._pool, "submit", side_effect=RuntimeError("primary")):
+            with pytest.raises(RuntimeError, match="primary"):
+                supervisor.submit(
+                    self._request(tmp_path, runner, prompt_registry=prompts),
+                    SupervisionOptions(notify=False, finish_cb=finish_cb),
+                )
+        assert owned.call_count == 1
+        assert runner.close.call_count == 1
+        assert dereg.call_count == 1
+        assert remove.call_count == 1
+        if failing != "owned":  # the injected fault is the removal itself
+            assert supervisor.draining_children("r-owner") == []
+        runner.run.assert_not_called()
+        finish_cb.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "failing", ["owned", "prompt_remove", "deregister", "close"]
+    )
+    def test_cleanup_cancellation_continues_stages_and_keeps_primary(
+        self, tmp_path, failing
+    ):
+        prompts = self._prompts(tmp_path)
+        runner = self._runner("sa-own-cleanup-cancel")
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        reg = SubAgentRegistry()
+        finish_cb = MagicMock()
+        real_dereg = __import__("sub_agent_registry").deregister_run
+        dereg = MagicMock(side_effect=real_dereg)
+        remove = MagicMock(side_effect=prompts.remove_sub_agent)
+        owned = MagicMock(side_effect=supervisor._discard_owned)
+        boom = KeyboardInterrupt("cleanup cancel")
+        {"owned": owned, "prompt_remove": remove, "deregister": dereg}.get(
+            failing, runner.close
+        ).side_effect = boom
+        primary = RuntimeError("primary")
+        with patch("sub_agent_registry.get_registry", return_value=reg), \
+             patch("sub_agent_registry.deregister_run", dereg), \
+             patch.object(supervisor, "_discard_owned", owned), \
+             patch.object(prompts, "remove_sub_agent", remove), \
+             patch.object(supervisor._pool, "submit", side_effect=primary):
+            with pytest.raises(RuntimeError) as caught:
+                supervisor.submit(
+                    self._request(tmp_path, runner, prompt_registry=prompts),
+                    SupervisionOptions(notify=False, finish_cb=finish_cb),
+                )
+        assert caught.value is primary
+        assert owned.call_count == 1
+        assert remove.call_count == 1
+        assert dereg.call_count == 1
+        assert runner.close.call_count == 1
+        runner.run.assert_not_called()
+        finish_cb.assert_not_called()
+
+    def test_cancellation_during_submission_propagates_after_rollback(self, tmp_path):
+        runner = self._runner("sa-own-cancel")
+        supervisor = SubAgentSupervisor(max_subagents=1)
+        reg = SubAgentRegistry()
+        with patch("sub_agent_registry.get_registry", return_value=reg), \
+             patch.object(supervisor._pool, "submit", side_effect=KeyboardInterrupt):
+            with pytest.raises(KeyboardInterrupt):
+                supervisor.submit(
+                    self._request(tmp_path, runner, scheduled=True),
+                    SupervisionOptions(notify=False, source="scheduled"),
+                )
+        assert runner.close.call_count == 1
+        assert reg.get(runner.agent_id) is None
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +1028,7 @@ class TestGraphMemoryNonAdmission:
         exc._graph_memory_writer = MagicMock()  # type: ignore[attr-defined]
 
         with patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             res = exc._exec_spawn_agent(
                 {"task": "produce a fact", "context_payload": {"n": "x"}},
                 caller_depth=0,
@@ -839,7 +1052,7 @@ class TestGraphMemoryNonAdmission:
         exc._graph_memory_writer = MagicMock()  # type: ignore[attr-defined]
 
         with patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             res = exc._exec_spawn_agent(
                 {"task": "produce a fact"},
                 caller_depth=0,
@@ -1001,6 +1214,60 @@ class TestSubmitRejectionShape:
         assert finish_calls == []
 
 
+class TestStoppingRefusalAtSpawnBoundary:
+    """Only the typed stopping error becomes the model-facing refusal."""
+
+    @staticmethod
+    def _spawn(exc, **kw):
+        return exc._exec_spawn_agent(
+            {"task": "x", "context_payload": {"n": "x"}}, caller_depth=0, **kw
+        )
+
+    def test_stopping_supervisor_returns_refusal_dict(self, make_builtin_executor, tmp_path):
+        runner = FakeRunner(agent_id="sa-stop")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]), data_dir=str(tmp_path)
+        )
+        exc._supervisor.shutdown(graceful_timeout=0.1)
+        finish_calls: list[str] = []
+
+        res = self._spawn(
+            exc, options=SupervisionOptions(job_tag="j", finish_cb=finish_calls.append)
+        )
+
+        assert res["success"] is False
+        assert res["output"] == ""
+        assert res["exit_code"] == -1
+        assert res["error_type"] == "impossible_with_current_tools"
+        assert res["recoverable"] is False
+        assert "shutting down" in res["error"]
+        assert "restart" in res["suggestion"].lower()
+        assert read_execution(res) == "refused"
+        assert runner.closed is True
+        assert finish_calls == []
+
+    @pytest.mark.parametrize("error", [
+        RuntimeError("sub-agent supervisor is shutting down"),
+        KeyboardInterrupt(),
+    ])
+    def test_generic_runtime_error_and_cancellation_propagate_unchanged(
+        self, make_builtin_executor, tmp_path, error
+    ):
+        runner = FakeRunner(agent_id="sa-generic")
+        exc = make_builtin_executor(
+            sub_agent_factory=_seq_factory([runner]), data_dir=str(tmp_path)
+        )
+        try:
+            with patch.object(exc._supervisor._pool, "submit", side_effect=error):
+                with pytest.raises(type(error)) as caught:
+                    self._spawn(exc)
+
+            assert caught.value is error
+            assert runner.closed is True
+        finally:
+            exc._supervisor.shutdown(graceful_timeout=0.1)
+
+
 def test_submission_request_direct_submit(tmp_path):
     """SubAgentSupervisor.submit admits a run and returns an agent_id."""
     from builtin_executor import _save_context
@@ -1079,7 +1346,7 @@ class TestGrantScopeExpiry:
 
         with patch("sub_agent_registry.get_registry", return_value=local_reg), \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             res = exc.spawn_agent({"task": "x"})
 
         assert res["success"] is True
@@ -1100,7 +1367,7 @@ class TestGrantScopeExpiry:
 
         with patch("sub_agent_registry.get_registry", return_value=local_reg), \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             res = exc._exec_spawn_agent({"task": "x"}, caller_depth=0)
 
         assert res["success"] is True
@@ -1197,7 +1464,7 @@ class TestLateCancellationTerminalDecision:
 
         with patch("sub_agent_registry.get_registry", return_value=local_reg), \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             spawned = exc._exec_spawn_agent(
                 {"task": "late cancel work"},
                 trace_id="" if scheduled else "r-owner",
@@ -1260,7 +1527,7 @@ class TestLateCancellationTerminalDecision:
 
         with patch("sub_agent_registry.get_registry", return_value=local_reg), \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *a, **kw: fn()):
+                          side_effect=run_inline_future):
             spawned = exc._exec_spawn_agent(
                 {"task": "post publication work"},
                 options=SupervisionOptions(
@@ -1363,3 +1630,1073 @@ class TestSubmitRejectionCompatibility:
         assert res["success"] is False and res["error_type"] == "wrong_model_for_task"
         assert "<connection>/<model>" in res["suggestion"] and "configured" in res["suggestion"]
         assert "secret-conn" not in res["error"] and res["recoverable"] is False
+
+
+# ---------------------------------------------------------------------------
+# Accepted queued cancellation and shutdown handoff (tasks 2.1-2.5)
+# ---------------------------------------------------------------------------
+
+class _HoldRunner(FakeRunner):
+    """Runner whose ``run`` blocks on an Event that ignores cancellation."""
+
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id=agent_id)
+        self.started = threading.Event()
+        self.hold = threading.Event()
+        self.run_calls = 0
+
+    def run(self, task):
+        self.run_calls += 1
+        self.started.set()
+        self.hold.wait(timeout=10.0)
+        return "late"
+
+
+class _QueuedHarness:
+    """Real-executor supervisor with one blocked worker and one queued task."""
+
+    def __init__(self, tmp_path):
+        self.supervisor = SubAgentSupervisor(max_subagents=1)
+        self.events: list[str] = []
+        self.finish_cb = MagicMock(side_effect=lambda tag: self.events.append("finish"))
+        self.grant_cb = MagicMock(side_effect=lambda aid: self.events.append("grant"))
+        self.completion_cb = MagicMock()
+        self.result_log_cb = MagicMock()
+        self.saved: list[tuple[str, bool]] = []
+        self.tmp_path = tmp_path
+        self.blocker = _HoldRunner("sa-block")
+        self.queued = _HoldRunner("sa-queued")
+        self.queued.close = MagicMock(
+            side_effect=lambda: self.events.append("close")
+        )
+
+    def request(self, runner, *, scheduled=False, context_key=None, ownership=None):
+        def save(key, memory, data_dir):
+            rec = get_registry().get(runner.agent_id) or self.record
+            self.saved.append((key, rec._result_event.is_set()))
+            self.events.append("save")
+
+        return SubmissionRequest(
+            task="t", response_format="text", label="job",
+            context_key=context_key, factory=lambda **_k: runner,
+            factory_kwargs={}, data_dir=str(self.tmp_path),
+            ownership=ownership or ExecutionOwnership(
+                origin=ORIGIN_SCHEDULED if scheduled else ORIGIN_ON_DEMAND
+            ),
+            save_context=save,
+        )
+
+    def options(self, **kw):
+        return SupervisionOptions(
+            notify=kw.pop("notify", True), finish_cb=self.finish_cb,
+            grant_scope_cb=self.grant_cb, completion_cb=self.completion_cb,
+            result_log_cb=self.result_log_cb, **kw,
+        )
+
+    def start(self, **kw):
+        self.supervisor.submit(self.request(self.blocker), self.options())
+        assert self.blocker.started.wait(5.0)
+        self.record = None
+        self.supervisor.submit(
+            self.request(self.queued, **kw), self.options()
+        )
+        self.record = get_registry().get(self.queued.agent_id)
+
+    def release(self):
+        self.blocker.hold.set()
+        self.queued.hold.set()
+        self.supervisor._pool.shutdown(wait=True)
+
+
+class TestQueuedCancellationTerminalCleanup:
+    """Shutdown finalizes accepted-but-never-started work exactly once."""
+
+    def test_shutdown_cancels_queued_runner_with_terminal_cleanup(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True, context_key="ctx")
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert h.queued.run_calls == 0
+            assert h.record.status == "cancelled"
+            assert h.record.result == "[Cancelled]"
+            assert h.record._result_event.is_set()
+            assert h.saved == [("ctx", False)]
+            assert h.queued.close.call_count == 1
+            assert h.grant_cb.call_args_list[-1].args == ("sa-queued",)
+            assert h.finish_cb.call_count == 1
+            assert h.events == ["save", "close", "grant", "finish"]
+            assert get_registry().get("sa-queued") is None
+        finally:
+            h.release()
+
+    def test_repeated_shutdown_does_not_repeat_terminal_effects(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True, context_key="ctx")
+            h.supervisor.shutdown(graceful_timeout=0.2)
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert h.queued.close.call_count == 1
+            assert h.finish_cb.call_count == 1
+            assert [c.args for c in h.grant_cb.call_args_list].count(("sa-queued",)) == 1
+            assert h.completion_cb.call_count == 1
+            assert h.saved == [("ctx", False)]
+        finally:
+            h.release()
+
+    def test_capacity_released_and_blocked_worker_not_closed(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.blocker.close = MagicMock()
+            h.start(scheduled=True)
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert get_registry().get("sa-queued") is None
+            assert h.blocker.close.call_count == 0  # started client stays worker-owned
+        finally:
+            h.release()
+
+    def test_scheduled_notification_and_result_log_routed_once(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True)
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert h.completion_cb.call_count == 1
+            completion = h.completion_cb.call_args.args[0]
+            assert completion.status == "cancelled"
+            assert completion.agent_id == "sa-queued"
+            assert h.result_log_cb.call_count == 1
+        finally:
+            h.release()
+
+    def test_timeout_cancelled_queued_run_suppresses_notification(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True)
+            h.record._timeout_cancelled = True
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert h.completion_cb.call_count == 0
+            assert h.result_log_cb.call_count == 1
+            assert h.finish_cb.call_count == 1
+        finally:
+            h.release()
+
+    def test_on_demand_queued_run_never_notifies(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=False)
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert h.completion_cb.call_count == 0
+            assert h.record.status == "cancelled"
+        finally:
+            h.release()
+
+    def test_turn_owned_outcome_retained_after_capacity_release(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            ownership = ExecutionOwnership(origin=ORIGIN_ON_DEMAND, owner_turn_id="r-own")
+            h.start(ownership=ownership)
+            h.supervisor.shutdown(graceful_timeout=0.2)
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert get_registry().get("sa-queued") is None
+            record = h.supervisor.get_owned_record("r-own", "sa-queued")
+            assert record is not None and record.result == "[Cancelled]"
+            assert h.supervisor.draining_children("r-own") == []
+        finally:
+            h.release()
+
+    @pytest.mark.parametrize("failing", ["save", "deregister", "close", "grant", "finish", "completion", "result_log"])
+    def test_terminal_stage_failure_does_not_skip_later_stages(self, tmp_path, failing):
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True, context_key="ctx")
+            boom = RuntimeError("boom")
+            if failing == "close":
+                h.queued.close.side_effect = boom
+            elif failing == "grant":
+                h.grant_cb.side_effect = boom
+            elif failing == "finish":
+                h.finish_cb.side_effect = boom
+            elif failing == "completion":
+                h.completion_cb.side_effect = boom
+            elif failing == "result_log":
+                h.result_log_cb.side_effect = boom
+            patches = []
+            if failing == "deregister":
+                patches.append(patch("sub_agent_registry.deregister_run", side_effect=boom))
+            with ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                if failing == "save":
+                    entry = h.supervisor._entries["sa-queued"]
+                    entry.request.save_context = MagicMock(side_effect=boom)
+                h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert h.queued.run_calls == 0
+            assert h.queued.close.call_count == 1
+            assert h.finish_cb.call_count == 1
+            assert h.grant_cb.call_count >= 1
+            assert h.record._result_event.is_set()
+            if failing != "deregister":
+                assert get_registry().get("sa-queued") is None
+        finally:
+            h.release()
+
+
+class TestShutdownHandoff:
+    """Submission/shutdown resolve to rejection-with-rollback or tracked work."""
+
+    @staticmethod
+    def _rejected(h, runner):
+        assert runner.run_calls == 0
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_immediate_worker_completion_retires_entry_baseline(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        runner = FakeRunner(agent_id="sa-fast")
+        done = threading.Event()
+        h.finish_cb.side_effect = lambda tag: done.set()
+        h.supervisor.submit(h.request(runner, scheduled=True), h.options())
+        assert _wait_event(done)
+        h.supervisor._pool.shutdown(wait=True)
+
+        assert h.supervisor._entries == {}
+        assert get_registry().get("sa-fast") is None
+
+    def test_plain_post_shutdown_submission_is_rejected_with_rollback_baseline(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        h.supervisor.shutdown(graceful_timeout=0.1)
+
+        with pytest.raises(RuntimeError):
+            h.supervisor.submit(h.request(h.queued, scheduled=True), h.options())
+
+        self._rejected(h, h.queued)
+        assert h.queued.close.call_count == 1
+        h.finish_cb.assert_not_called()
+        assert h.supervisor._entries == {}
+
+    def test_post_shutdown_submission_raises_typed_stopping_error(self, tmp_path):
+        from sub_agent_supervisor import SupervisorStoppingError
+
+        h = _QueuedHarness(tmp_path)
+        h.supervisor.shutdown(graceful_timeout=0.1)
+
+        with pytest.raises(SupervisorStoppingError) as caught:
+            h.supervisor.submit(h.request(h.queued, scheduled=True), h.options())
+
+        assert isinstance(caught.value, RuntimeError)
+        self._rejected(h, h.queued)
+        assert h.queued.close.call_count == 1
+        h.finish_cb.assert_not_called()
+        assert h.supervisor._entries == {}
+
+    def test_submission_during_shutdown_drain_is_rejected(self, tmp_path):
+        import sub_agent_supervisor as mod
+
+        h = _QueuedHarness(tmp_path)
+        in_drain, resume = threading.Event(), threading.Event()
+        real_sleep = mod.time.sleep
+        shutdown_thread: list[threading.Thread] = []
+        calls = []
+
+        def gated_sleep(seconds):
+            if threading.current_thread() is shutdown_thread[0] and not calls:
+                calls.append(1)
+                in_drain.set()
+                resume.wait(5.0)
+            real_sleep(min(seconds, 0.01))
+
+        try:
+            h.supervisor.submit(h.request(h.blocker), h.options())
+            assert h.blocker.started.wait(5.0)
+            t = threading.Thread(
+                target=lambda: h.supervisor.shutdown(graceful_timeout=0.3)
+            )
+            shutdown_thread.append(t)
+            with patch.object(mod.time, "sleep", gated_sleep):
+                t.start()
+                assert in_drain.wait(5.0)
+                try:
+                    with pytest.raises(RuntimeError):
+                        h.supervisor.submit(
+                            h.request(h.queued, scheduled=True), h.options()
+                        )
+                finally:
+                    resume.set()
+                t.join(10.0)
+            assert not t.is_alive()
+
+            self._rejected(h, h.queued)
+            assert h.queued.close.call_count == 1
+            assert h.supervisor._entries.get("sa-queued") is None
+        finally:
+            resume.set()
+            h.release()
+
+    def test_submission_paused_after_executor_accept_is_tracked_baseline(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        accepted, go = threading.Event(), threading.Event()
+        real_submit = h.supervisor._pool.submit
+
+        def paused_submit(fn, *a, **k):
+            future = real_submit(fn, *a, **k)
+            if not h.blocker.started.is_set():
+                return future
+            accepted.set()
+            go.wait(5.0)
+            return future
+
+        try:
+            h.supervisor.submit(h.request(h.blocker), h.options())
+            assert h.blocker.started.wait(5.0)
+            with patch.object(h.supervisor._pool, "submit", paused_submit):
+                t = threading.Thread(
+                    target=lambda: h.supervisor.submit(
+                        h.request(h.queued, scheduled=True), h.options()
+                    )
+                )
+                t.start()
+                assert accepted.wait(5.0)
+                reached = threading.Event()
+                real_lock = h.supervisor._submit_lock
+                shutdown_ident: list[int] = []
+
+                class _ProbeLock:
+                    """Signals when the shutdown thread reaches the lock boundary."""
+
+                    def __enter__(self):
+                        if shutdown_ident and threading.get_ident() == shutdown_ident[0]:
+                            reached.set()
+                        return real_lock.__enter__()
+
+                    def __exit__(self, *exc):
+                        return real_lock.__exit__(*exc)
+
+                h.supervisor._submit_lock = _ProbeLock()
+
+                def run_shutdown():
+                    shutdown_ident.append(threading.get_ident())
+                    h.supervisor.shutdown(graceful_timeout=0.2)
+
+                s = threading.Thread(target=run_shutdown)
+                s.start()
+                assert reached.wait(5.0)  # shutdown is at the handoff boundary
+                go.set()
+                t.join(10.0)
+                s.join(10.0)
+            assert not t.is_alive() and not s.is_alive()
+
+            assert h.queued.run_calls == 0
+            assert h.queued.close.call_count == 1
+            assert h.finish_cb.call_count == 1
+            assert get_registry().get("sa-queued") is None
+        finally:
+            go.set()
+            h.release()
+
+
+class TestShutdownEdges:
+    """Reentrancy, caller-context and cooperative-cancellation edges."""
+
+    def test_finish_callback_submission_is_rejected_without_deadlock(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        reentrant = _HoldRunner("sa-reentrant")
+        reentrant.close = MagicMock()
+        outcome: list[object] = []
+
+        def finish(tag):
+            h.events.append("finish")
+            try:
+                h.supervisor.submit(
+                    h.request(reentrant, scheduled=True), h.options()
+                )
+            except RuntimeError as exc:
+                outcome.append(exc)
+
+        h.finish_cb.side_effect = finish
+        try:
+            h.start(scheduled=True)
+            t = threading.Thread(
+                target=lambda: h.supervisor.shutdown(graceful_timeout=0.2)
+            )
+            t.start()
+            t.join(10.0)
+            assert not t.is_alive()
+
+            assert len(outcome) == 1
+            assert reentrant.run_calls == 0
+            assert reentrant.close.call_count == 1
+            assert get_registry().get("sa-reentrant") is None
+            assert h.queued.close.call_count == 1
+        finally:
+            h.release()
+
+    def test_shutdown_preserves_callers_run_context(self, tmp_path):
+        import structlog
+
+        from agent_logging import bind_run_context, clear_run_context
+
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True)
+            bind_run_context(trace="r-caller", agent="main")
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            bound = structlog.contextvars.get_contextvars()
+            assert bound.get("trace") == "r-caller"
+            assert bound.get("agent") == "main"
+        finally:
+            clear_run_context()
+            h.release()
+
+    def test_running_runner_cancelled_cooperatively_closes_after_unwind(self, tmp_path):
+        class CoopRunner(FakeRunner):
+            def __init__(self):
+                super().__init__(agent_id="sa-coop")
+                self.started = threading.Event()
+                self.closed_at_unwind = None
+
+            def run(self, task):
+                self.started.set()
+                self._cancel_event.wait(5.0)
+                self.closed_at_unwind = self.closed
+                return "[Cancelled]"
+
+        h = _QueuedHarness(tmp_path)
+        coop = CoopRunner()
+        done = threading.Event()
+        h.finish_cb.side_effect = lambda tag: done.set()
+        h.supervisor.submit(h.request(coop, scheduled=True), h.options())
+        assert coop.started.wait(5.0)
+        h.supervisor.shutdown(graceful_timeout=5.0)
+        assert _wait_event(done)
+
+        assert coop.closed_at_unwind is False
+        assert coop.closed is True
+        assert h.supervisor._entries == {}
+        h.supervisor._pool.shutdown(wait=True)
+
+
+class TestCancellationIsolation:
+    """Cancellation-derived BaseExceptions never skip terminal stages or entries."""
+
+    @staticmethod
+    def _shutdown_expecting_cancel(h):
+        import asyncio
+
+        with pytest.raises(asyncio.CancelledError):
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+    @staticmethod
+    def _assert_terminal(h, runner, record):
+        assert runner.run_calls == 0
+        assert record._result_event.is_set()
+        assert runner.close.call_count == 1
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_cancellation_in_context_save_still_signals_and_cleans(self, tmp_path):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True, context_key="ctx")
+            entry = h.supervisor._entries["sa-queued"]
+            entry.request.save_context = MagicMock(side_effect=asyncio.CancelledError())
+            self._shutdown_expecting_cancel(h)
+
+            self._assert_terminal(h, h.queued, h.record)
+            assert h.result_log_cb.call_count == 1
+            assert h.completion_cb.call_count == 1
+            assert h.grant_cb.call_count >= 1
+            assert h.finish_cb.call_count == 1
+        finally:
+            h.release()
+
+    @pytest.mark.parametrize("stage", ["close", "grant"])
+    def test_cancellation_in_cleanup_stage_still_runs_later_stages(self, tmp_path, stage):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True)
+            if stage == "close":
+                h.queued.close.side_effect = asyncio.CancelledError()
+            else:
+                h.grant_cb.side_effect = asyncio.CancelledError()
+            self._shutdown_expecting_cancel(h)
+
+            self._assert_terminal(h, h.queued, h.record)
+            assert h.grant_cb.call_count >= 1
+            assert h.finish_cb.call_count == 1
+            assert "sa-queued" not in h.supervisor._entries
+        finally:
+            h.release()
+
+    @staticmethod
+    def _two_queued(h):
+        """Blocker plus two queued accepted runners; returns the second one."""
+        second = _HoldRunner("sa-queued2")
+        second.close = MagicMock(side_effect=lambda: h.events.append("close2"))
+        h.start(scheduled=True)
+        h.supervisor.submit(h.request(second, scheduled=True), h.options())
+        return second
+
+    def test_cancellation_in_first_entry_does_not_abandon_later_entries(self, tmp_path):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        try:
+            second = self._two_queued(h)
+            h.queued.close.side_effect = asyncio.CancelledError()
+            self._shutdown_expecting_cancel(h)
+
+            assert second.run_calls == 0
+            assert second.close.call_count == 1
+            assert get_registry().get("sa-queued2") is None
+            assert get_registry().get("sa-queued") is None
+            assert h.finish_cb.call_count == 2
+            assert {"sa-queued", "sa-queued2"}.isdisjoint(h.supervisor._entries)
+        finally:
+            h.release()
+
+    def test_owned_signal_failure_is_contained_and_entries_retire(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            second = self._two_queued(h)
+            real = h.supervisor._signal_owned_cleanup
+            calls = []
+
+            def flaky(record, errors=None):
+                calls.append(record.agent_id)
+                if record.agent_id == "sa-queued":
+                    raise RuntimeError("owned signal boom")
+                return real(record, errors)
+
+            with patch.object(h.supervisor, "_signal_owned_cleanup", flaky):
+                h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert second.close.call_count == 1
+            assert {"sa-queued", "sa-queued2"} <= set(calls)
+            assert {"sa-queued", "sa-queued2"}.isdisjoint(h.supervisor._entries)
+            assert h.finish_cb.call_count == 2
+        finally:
+            h.release()
+
+    @pytest.mark.parametrize("hook", ["result_log", "completion", "finish"])
+    def test_cancellation_in_callback_keeps_other_attempts_and_entries(self, tmp_path, hook):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        try:
+            second = self._two_queued(h)
+            cb = {"result_log": h.result_log_cb, "completion": h.completion_cb,
+                  "finish": h.finish_cb}[hook]
+            first_call = []
+
+            def once(*a, **k):
+                if not first_call:
+                    first_call.append(1)
+                    raise asyncio.CancelledError()
+
+            cb.side_effect = once
+            self._shutdown_expecting_cancel(h)
+
+            assert second.close.call_count == 1
+            assert h.queued.close.call_count == 1
+            assert h.record._result_event.is_set()
+            assert h.finish_cb.call_count == 2
+            assert h.completion_cb.call_count == 2
+            assert h.result_log_cb.call_count == 2
+            assert {"sa-queued", "sa-queued2"}.isdisjoint(h.supervisor._entries)
+        finally:
+            h.release()
+
+
+class TestPrimaryCancellationPreserved:
+    """Terminal cleanup never replaces or swallows an in-flight cancellation."""
+
+    def test_context_cancel_plus_owned_signal_failure_keeps_original(self, tmp_path):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        primary = asyncio.CancelledError("primary")
+        try:
+            h.start(scheduled=True, context_key="ctx")
+            h.supervisor._entries["sa-queued"].request.save_context = MagicMock(
+                side_effect=primary
+            )
+            with patch.object(
+                h.supervisor, "_signal_owned_cleanup",
+                side_effect=RuntimeError("owned signal boom"),
+            ):
+                with pytest.raises(BaseException) as caught:
+                    h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert caught.value is primary
+            assert "sa-queued" not in h.supervisor._entries
+            assert h.finish_cb.call_count == 1
+        finally:
+            h.release()
+
+    @pytest.mark.parametrize("stage", ["close", "owned_signal"])
+    def test_cleanup_cancellation_does_not_replace_terminal_primary(self, tmp_path, stage):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        primary = asyncio.CancelledError("primary")
+        secondary = asyncio.CancelledError("secondary")
+        try:
+            h.start(scheduled=True, context_key="ctx")
+            h.supervisor._entries["sa-queued"].request.save_context = MagicMock(
+                side_effect=primary
+            )
+            if stage == "close":
+                h.queued.close.side_effect = secondary
+                ctx = contextlib.nullcontext()
+            else:
+                ctx = patch.object(
+                    h.supervisor, "_signal_owned_cleanup", side_effect=secondary
+                )
+            with ctx:
+                with pytest.raises(BaseException) as caught:
+                    h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert caught.value is primary
+            assert h.finish_cb.call_count == 1
+            assert "sa-queued" not in h.supervisor._entries
+        finally:
+            h.release()
+
+    def test_execution_cancel_plus_cleanup_cancel_keeps_execution_primary(self, tmp_path):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        primary = asyncio.CancelledError("exec primary")
+        runner = FakeRunner(agent_id="sa-exec")
+        runner.run = MagicMock(side_effect=primary)
+        runner.close = MagicMock(side_effect=asyncio.CancelledError("cleanup"))
+        request, options = h.request(runner, scheduled=True), h.options()
+        with patch.object(h.supervisor._pool, "submit", return_value=MagicMock()):
+            h.supervisor.submit(request, options)
+        record = get_registry().get("sa-exec")
+        try:
+            with pytest.raises(BaseException) as caught:
+                h.supervisor._run_and_notify(request, options, runner, record)
+
+            assert caught.value is primary
+            assert h.finish_cb.call_count == 1
+            assert "sa-exec" not in h.supervisor._entries
+        finally:
+            h.supervisor._pool.shutdown(wait=True)
+
+
+class TestExplicitPrimaryCleanup:
+    """Cleanup decides cancellation from an explicit primary, never ambient state."""
+
+    @staticmethod
+    def _run_worker(h, runner):
+        request, options = h.request(runner, scheduled=True), h.options()
+        with patch.object(h.supervisor._pool, "submit", return_value=MagicMock()):
+            h.supervisor.submit(request, options)
+        record = get_registry().get(runner.agent_id)
+        return request, options, record
+
+    def test_success_inside_unrelated_outer_except_propagates_cleanup_cancel(
+        self, tmp_path
+    ):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        cancel = asyncio.CancelledError("cleanup")
+        runner = FakeRunner(agent_id="sa-ambient")
+        runner.close = MagicMock(side_effect=cancel)
+        request, options, record = self._run_worker(h, runner)
+        try:
+            try:
+                raise ValueError("unrelated outer handler")
+            except ValueError:
+                with pytest.raises(BaseException) as caught:
+                    h.supervisor._run_and_notify(request, options, runner, record)
+
+            assert caught.value is cancel
+            assert h.finish_cb.call_count == 1
+            assert "sa-ambient" not in h.supervisor._entries
+        finally:
+            h.supervisor._pool.shutdown(wait=True)
+
+    def test_handled_execution_failure_does_not_suppress_cleanup_cancel(self, tmp_path):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        cancel = asyncio.CancelledError("cleanup")
+        runner = FakeRunner(agent_id="sa-handled")
+        runner.run = MagicMock(side_effect=RuntimeError("handled boom"))
+        runner.close = MagicMock(side_effect=cancel)
+        request, options, record = self._run_worker(h, runner)
+        try:
+            with pytest.raises(BaseException) as caught:
+                h.supervisor._run_and_notify(request, options, runner, record)
+
+            assert caught.value is cancel
+            assert record.status == "failed"
+            assert h.finish_cb.call_count == 1
+            assert "sa-handled" not in h.supervisor._entries
+        finally:
+            h.supervisor._pool.shutdown(wait=True)
+
+
+class TestTerminalPrecedence:
+    """Terminal effects are independent attempts with deterministic precedence."""
+
+    @staticmethod
+    def _worker(h, runner, context_key=None):
+        request = h.request(runner, scheduled=True)
+        if context_key:
+            request.context_key = context_key
+        options = h.options()
+        with patch.object(h.supervisor._pool, "submit", return_value=MagicMock()):
+            h.supervisor.submit(request, options)
+        return request, options, get_registry().get(runner.agent_id)
+
+    def test_context_cancel_plus_signal_error_still_attempts_log_and_completion(
+        self, tmp_path
+    ):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        cancel = asyncio.CancelledError("context save")
+        runner = FakeRunner(agent_id="sa-pair1")
+        request, options, record = self._worker(h, runner, context_key="ctx")
+        request.save_context = MagicMock(side_effect=cancel)
+        record.signal_result = MagicMock(side_effect=RuntimeError("signal boom"))
+        try:
+            with patch("sub_agent_supervisor.logger.info") as info, \
+                    pytest.raises(BaseException) as caught:
+                h.supervisor._run_and_notify(request, options, runner, record)
+
+            assert caught.value is cancel
+            assert record.signal_result.call_count == 1
+            lifecycle = [c for c in info.call_args_list if "done |" in c.args[0]]
+            assert len(lifecycle) == 1
+            assert h.result_log_cb.call_count == 1
+            assert h.completion_cb.call_count == 1
+            assert h.finish_cb.call_count == 1
+            assert "sa-pair1" not in h.supervisor._entries
+        finally:
+            h.supervisor._pool.shutdown(wait=True)
+
+    def test_cancel_after_earlier_ordinary_failure_wins_and_finalizes_once(
+        self, tmp_path
+    ):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        cancel = asyncio.CancelledError("result log")
+        runner = FakeRunner(agent_id="sa-pair2")
+        request, options, record = self._worker(h, runner)
+        record.signal_result = MagicMock(side_effect=RuntimeError("signal boom"))
+        h.result_log_cb.side_effect = cancel
+        try:
+            with pytest.raises(BaseException) as caught:
+                h.supervisor._run_and_notify(request, options, runner, record)
+
+            assert caught.value is cancel
+            assert record.signal_result.call_count == 1
+            assert h.result_log_cb.call_count == 1
+            assert h.completion_cb.call_count == 1
+            assert h.finish_cb.call_count == 1
+        finally:
+            h.supervisor._pool.shutdown(wait=True)
+
+    def test_ordinary_terminal_failure_propagates_without_second_finalize(
+        self, tmp_path
+    ):
+        h = _QueuedHarness(tmp_path)
+        boom = RuntimeError("signal boom")
+        runner = FakeRunner(agent_id="sa-once")
+        request, options, record = self._worker(h, runner)
+        record.signal_result = MagicMock(side_effect=boom)
+        try:
+            with pytest.raises(RuntimeError) as caught:
+                h.supervisor._run_and_notify(request, options, runner, record)
+
+            assert caught.value is boom
+            assert record.signal_result.call_count == 1
+            assert h.result_log_cb.call_count == 1
+            assert h.completion_cb.call_count == 1
+            assert record.status == "done"
+            assert h.finish_cb.call_count == 1
+        finally:
+            h.supervisor._pool.shutdown(wait=True)
+
+    def test_completion_cancel_after_signal_error_wins(self, tmp_path):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        cancel = asyncio.CancelledError("completion")
+        runner = FakeRunner(agent_id="sa-comp1")
+        request, options, record = self._worker(h, runner)
+        record.signal_result = MagicMock(side_effect=RuntimeError("signal boom"))
+        h.completion_cb.side_effect = cancel
+        try:
+            with pytest.raises(BaseException) as caught:
+                h.supervisor._run_and_notify(request, options, runner, record)
+
+            assert caught.value is cancel
+            assert record.signal_result.call_count == 1
+            assert h.completion_cb.call_count == 1
+            assert h.finish_cb.call_count == 1
+        finally:
+            h.supervisor._pool.shutdown(wait=True)
+
+    def test_first_cancel_wins_over_later_completion_cancel(self, tmp_path):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        first = asyncio.CancelledError("context first")
+        runner = FakeRunner(agent_id="sa-comp2")
+        request, options, record = self._worker(h, runner, context_key="ctx")
+        request.save_context = MagicMock(side_effect=first)
+        h.completion_cb.side_effect = asyncio.CancelledError("completion later")
+        try:
+            with pytest.raises(BaseException) as caught:
+                h.supervisor._run_and_notify(request, options, runner, record)
+
+            assert caught.value is first
+            assert h.completion_cb.call_count == 1
+            assert h.finish_cb.call_count == 1
+        finally:
+            h.supervisor._pool.shutdown(wait=True)
+
+
+class TestCancelledEntryExplicitPrimary:
+    """Shutdown-side cancelled-entry cleanup also ignores ambient handler state."""
+
+    def test_unrelated_outer_except_does_not_suppress_cleanup_cancel(self, tmp_path):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        cancel = asyncio.CancelledError("close")
+        try:
+            h.start(scheduled=True)
+            h.queued.close.side_effect = cancel
+            entry = h.supervisor._entries["sa-queued"]
+            try:
+                raise ValueError("unrelated outer handler")
+            except ValueError:
+                with pytest.raises(BaseException) as caught:
+                    h.supervisor._finalize_cancelled_entry(entry)
+
+            assert caught.value is cancel
+            assert h.finish_cb.call_count == 1
+            assert "sa-queued" not in h.supervisor._entries
+        finally:
+            h.release()
+
+
+class TestQueueFirstShutdown:
+    """Queued-work finalization precedes the cooperative started-work drain."""
+
+    def test_queued_entry_finalized_before_worker_drain_and_started_client_open(
+        self, tmp_path
+    ):
+        import sub_agent_supervisor as mod
+
+        h = _QueuedHarness(tmp_path)
+        in_drain, resume = threading.Event(), threading.Event()
+        snapshot: dict = {}
+        real_sleep = mod.time.sleep
+        shutdown_thread: list[threading.Thread] = []
+        blocker_close = MagicMock()
+        h.blocker.close = blocker_close
+
+        def gated_sleep(seconds):
+            if threading.current_thread() is shutdown_thread[0] and not snapshot:
+                snapshot["events"] = list(h.events)
+                snapshot["blocker_closed"] = blocker_close.call_count
+                in_drain.set()
+                resume.wait(5.0)
+            real_sleep(min(seconds, 0.01))
+
+        try:
+            h.start(scheduled=True)
+            t = threading.Thread(
+                target=lambda: h.supervisor.shutdown(graceful_timeout=0.3)
+            )
+            shutdown_thread.append(t)
+            with patch.object(mod.time, "sleep", gated_sleep):
+                t.start()
+                assert in_drain.wait(5.0)
+                resume.set()
+                t.join(10.0)
+            assert not t.is_alive()
+
+            assert "close" in snapshot["events"]
+            assert "finish" in snapshot["events"]
+            assert snapshot["blocker_closed"] == 0
+            assert h.queued.run_calls == 0
+        finally:
+            resume.set()
+            h.release()
+
+    @staticmethod
+    def _two_queued(h):
+        second = _HoldRunner("sa-queued2")
+        second.close = MagicMock(side_effect=lambda: h.events.append("close2"))
+        h.start(scheduled=True)
+        h.supervisor.submit(h.request(second, scheduled=True), h.options())
+        return second
+
+    def test_first_cleanup_cancel_outranks_later_drain_failure_and_attempts_all(
+        self, tmp_path
+    ):
+        import asyncio
+        import sub_agent_registry
+
+        h = _QueuedHarness(tmp_path)
+        cancel = asyncio.CancelledError("first cleanup")
+        second = _HoldRunner("sa-queued2")
+        second.close = MagicMock(side_effect=lambda: h.events.append("close2"))
+        per_entry: dict[str, dict[str, MagicMock]] = {}
+
+        def entry_options(agent_id):
+            obs = {
+                name: MagicMock()
+                for name in ("finish", "grant", "completion", "result_log")
+            }
+            per_entry[agent_id] = obs
+            return SupervisionOptions(
+                notify=True, finish_cb=obs["finish"], grant_scope_cb=obs["grant"],
+                completion_cb=obs["completion"], result_log_cb=obs["result_log"],
+            )
+
+        signals: list[str] = []
+        real_signal = h.supervisor._signal_owned_cleanup
+
+        def spy_signal(record, errors=None):
+            signals.append(record.agent_id)
+            return real_signal(record, errors)
+
+        try:
+            h.supervisor.submit(h.request(h.blocker), h.options())
+            assert h.blocker.started.wait(5.0)
+            h.supervisor.submit(
+                h.request(h.queued, scheduled=True, context_key="ctx1"),
+                entry_options("sa-queued"),
+            )
+            h.supervisor.submit(
+                h.request(second, scheduled=True, context_key="ctx2"),
+                entry_options("sa-queued2"),
+            )
+            h.queued.close.side_effect = cancel
+            records = {
+                agent_id: get_registry().get(agent_id)
+                for agent_id in ("sa-queued", "sa-queued2")
+            }
+            signal_spies = {}
+            for agent_id, record in records.items():
+                signal_spies[agent_id] = MagicMock(wraps=record.signal_result)
+                record.signal_result = signal_spies[agent_id]
+            registry = sub_agent_registry.get_registry()
+            calls = {"n": 0}
+            real_list = registry.list_active
+
+            def flaky_list():
+                calls["n"] += 1
+                if calls["n"] > 1:  # first call is shutdown's own snapshot
+                    raise RuntimeError("drain boom")
+                return real_list()
+
+            with patch.object(registry, "list_active", flaky_list), \
+                    patch.object(h.supervisor, "_signal_owned_cleanup", spy_signal):
+                with pytest.raises(BaseException) as caught:
+                    h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert caught.value is cancel
+            assert second.close.call_count == 1
+            assert h.queued.close.call_count == 1
+            assert calls["n"] >= 2  # drain was attempted despite the cancellation
+            assert {"sa-queued", "sa-queued2"}.isdisjoint(h.supervisor._entries)
+            for agent_id in ("sa-queued", "sa-queued2"):
+                obs = per_entry[agent_id]
+                assert obs["result_log"].call_count == 1, agent_id
+                assert obs["completion"].call_count == 1, agent_id
+                assert obs["finish"].call_count == 1, agent_id
+                assert obs["grant"].call_count == 1, agent_id
+                assert signals.count(agent_id) == 1, agent_id
+                signal_spies[agent_id].assert_called_once_with()  # real signal ran
+                assert records[agent_id]._result_event.is_set(), agent_id
+            assert sorted(key for key, _ in h.saved) == ["ctx1", "ctx2"]
+            assert not any(signalled for _, signalled in h.saved)  # saved before signal
+            h.finish_cb.assert_not_called()  # blocker (started work) not finalized
+        finally:
+            h.release()
+
+    def test_ordinary_drain_failure_propagates_after_every_entry_finalized(
+        self, tmp_path
+    ):
+        import sub_agent_registry
+
+        h = _QueuedHarness(tmp_path)
+        boom = RuntimeError("drain boom")
+        try:
+            second = self._two_queued(h)
+            registry = sub_agent_registry.get_registry()
+            real_list = registry.list_active
+            calls = {"n": 0}
+
+            def flaky_list():
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    raise boom
+                return real_list()
+
+            with patch.object(registry, "list_active", flaky_list):
+                with pytest.raises(RuntimeError) as caught:
+                    h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert caught.value is boom
+            assert second.close.call_count == 1
+            assert h.queued.close.call_count == 1
+            assert h.finish_cb.call_count == 2
+        finally:
+            h.release()
+
+    def test_shutdown_in_unrelated_handler_does_not_suppress_cleanup_cancel(
+        self, tmp_path
+    ):
+        import asyncio
+
+        h = _QueuedHarness(tmp_path)
+        cancel = asyncio.CancelledError("cleanup")
+        try:
+            h.start(scheduled=True)
+            h.queued.close.side_effect = cancel
+            try:
+                raise ValueError("unrelated outer handler")
+            except ValueError:
+                with pytest.raises(BaseException) as caught:
+                    h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert caught.value is cancel
+            assert h.finish_cb.call_count == 1
+        finally:
+            h.release()
+
+    def test_repeated_shutdown_does_not_duplicate_queued_effects(self, tmp_path):
+        h = _QueuedHarness(tmp_path)
+        try:
+            h.start(scheduled=True)
+            h.supervisor.shutdown(graceful_timeout=0.2)
+            h.supervisor.shutdown(graceful_timeout=0.2)
+
+            assert h.queued.close.call_count == 1
+            assert h.finish_cb.call_count == 1
+            assert h.completion_cb.call_count == 1
+        finally:
+            h.release()

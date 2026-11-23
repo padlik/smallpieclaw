@@ -344,6 +344,32 @@ def _standardize_sub_agent_result(result: str, response_format: str) -> dict:
 _VETO_PRIORITY = ("cancelled", "deferred", "refused")
 
 
+def _run_cleanup_stages(
+    stages: list[tuple[str, Callable[[], None]]],
+    context: str,
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    """Attempt every cleanup stage independently, logging each failure.
+
+    *primary* is the exception propagating out of the caller's own operation,
+    passed explicitly (never inferred from ambient handler state). A fault
+    never skips later stages and never replaces *primary*. A
+    cancellation-derived (non-``Exception``) fault with no primary is
+    re-raised after all stages ran, so cancellation is not swallowed.
+    """
+    deferred: BaseException | None = None
+    for name, stage in stages:
+        try:
+            stage()
+        except BaseException as exc:  # noqa: BLE001
+            logger.exception("%s cleanup stage '%s' failed", context, name)
+            if deferred is None and not isinstance(exc, Exception):
+                deferred = exc
+    if deferred is not None and primary is None:
+        raise deferred
+
+
 def _step_disposition(trace_dispositions: list[str]) -> str:
     """Return a step's disposition from its final attempt's local tool traces.
 
@@ -570,6 +596,11 @@ class PlanExecutor:
                 return False
         return True
 
+    def _remove_active(self, step_id: str) -> None:
+        """Remove *step_id* from the active-runner map under the lock."""
+        with self._active_lock:
+            self._active_runners.pop(step_id, None)
+
     def _skip_step(self, step: PlanStep, reason: str) -> dict:
         """Return a failure outcome for a skipped step."""
         return fail_outcome(f"Skipped: {reason}")
@@ -612,24 +643,35 @@ class PlanExecutor:
         # Registration happens only after construction succeeds. run()/close()
         # run under try/finally so a swallowed diagnostic failure never leaves a
         # stale "diagnostic" record in the registry.
-        register_run(
-            runner,
-            source=SOURCE_DIAGNOSTIC,
-            label=runner.label,
-            task_preview=task,
-        )
+        primary: BaseException | None = None
         try:
-            result = runner.run(task)
-            return str(result)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Diagnostic sub-agent failed for step '%s'", step.id)
-            return f"Diagnostic analysis unavailable: {exc}"
-        finally:
-            deregister_run(runner.agent_id)
             try:
-                runner.close()
-            except Exception:  # noqa: BLE001
-                pass
+                register_run(
+                    runner,
+                    source=SOURCE_DIAGNOSTIC,
+                    label=runner.label,
+                    task_preview=task,
+                )
+                try:
+                    result = runner.run(task)
+                    return str(result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "Diagnostic sub-agent failed for step '%s'", step.id
+                    )
+                    return f"Diagnostic analysis unavailable: {exc}"
+            except BaseException as primary_exc:  # noqa: BLE001
+                primary = primary_exc
+                raise
+        finally:
+            _run_cleanup_stages(
+                [
+                    ("deregister", lambda: deregister_run(runner.agent_id)),
+                    ("close", runner.close),
+                ],
+                f"Diagnostic '{step.id}'",
+                primary=primary,
+            )
 
     def _execute_step_with_recovery(
         self,
@@ -665,43 +707,58 @@ class PlanExecutor:
             # Re-check after potentially-blocking runner creation. Cancellation
             # may have arrived while the factory was running; discard the runner.
             if cancel_event.is_set():
-                try:
-                    runner.cancel()
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    runner.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                _run_cleanup_stages(
+                    [("cancel", runner.cancel), ("close", runner.close)],
+                    f"Plan step '{step.id}' (cancelled during creation)",
+                )
                 return self._skip_step(step, "cancelled during runner creation")
             # Make the plan step visible in the global registry with source
             # "plan-step". Registration and deregistration are co-located with
             # the _active_runners add/pop and owned by this step thread so a
             # cancel/timeout leaves no stale record once the thread unwinds.
-            with self._active_lock:
-                self._active_runners[step.id] = runner
-            register_run(
-                runner,
-                source=SOURCE_PLAN_STEP,
-                label=runner.label,
-                task_preview=task,
-                result_type=response_format,
-            )
             try:
-                outcome = strip_execution(
-                    self._execute_runner(runner, task, response_format)
-                )
-                attempt_disposition = _step_disposition(attempt_dispositions)
-                if attempt_disposition != "unknown":
-                    outcome = with_execution(outcome, attempt_disposition)  # type: ignore[arg-type]
-            finally:
                 with self._active_lock:
-                    self._active_runners.pop(step.id, None)
-                deregister_run(runner.agent_id)
+                    self._active_runners[step.id] = runner
+                register_run(
+                    runner,
+                    source=SOURCE_PLAN_STEP,
+                    label=runner.label,
+                    task_preview=task,
+                    result_type=response_format,
+                )
+            except BaseException as register_exc:
+                _run_cleanup_stages(
+                    [
+                        ("active-removal", partial(self._remove_active, step.id)),
+                        ("deregister", lambda: deregister_run(runner.agent_id)),
+                        ("close", runner.close),
+                    ],
+                    f"Plan step '{step.id}'",
+                    primary=register_exc,
+                )
+                raise
+            step_primary: BaseException | None = None
             try:
-                runner.close()
-            except Exception:  # noqa: BLE001
-                pass
+                try:
+                    outcome = strip_execution(
+                        self._execute_runner(runner, task, response_format)
+                    )
+                    attempt_disposition = _step_disposition(attempt_dispositions)
+                    if attempt_disposition != "unknown":
+                        outcome = with_execution(outcome, attempt_disposition)  # type: ignore[arg-type]
+                except BaseException as step_exc:
+                    step_primary = step_exc
+                    raise
+            finally:
+                _run_cleanup_stages(
+                    [
+                        ("active-removal", partial(self._remove_active, step.id)),
+                        ("deregister", lambda: deregister_run(runner.agent_id)),
+                        ("close", runner.close),
+                    ],
+                    f"Plan step '{step.id}'",
+                    primary=step_primary,
+                )
 
             if outcome.get("success", False):
                 if retry_count > 0:

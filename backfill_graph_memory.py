@@ -672,9 +672,9 @@ def main() -> None:
             logger.error("Failed to determine embedding dimension: %s", exc)
             sys.exit(1)
 
-        try:
-            from graph_memory import GraphMemoryStore
+        from graph_memory import GraphMemoryStore, graph_failure_message
 
+        try:
             store = GraphMemoryStore(
                 db_path=db_path,
                 embedder_fn=lambda text: embed_client.embed(text),
@@ -682,7 +682,7 @@ def main() -> None:
                 buffer_pool_mb=gm_cfg.buffer_pool_mb,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to open graph store: %s", exc)
+            logger.error("Failed to open graph store. %s", graph_failure_message(exc))
             sys.exit(1)
 
         try:

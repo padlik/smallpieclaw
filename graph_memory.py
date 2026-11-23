@@ -121,15 +121,10 @@ except ImportError:  # pragma: no cover
     ladybug = None  # type: ignore[assignment]
     _LADYBUG_AVAILABLE = False
 
-# LadybugDB 0.18.3 — error substring tokens used for recovery/migration.
+# LadybugDB 0.18.3 — error substring tokens used for migration.
 # Update these when upgrading LadybugDB. If the library adds typed exceptions
 # for these error categories in a future version, prefer those over substring
 # matching (currently 0.18.3 exposes only builtin RuntimeError).
-_LADYBUG_WAL_ERROR_TOKENS: tuple[str, ...] = (
-    "corrupted wal",
-    "invalid wal record",
-    "wal_record.cpp",
-)
 _LADYBUG_MIGRATION_ERROR_TOKENS: tuple[str, ...] = (
     "already exist",
     "duplicate",
@@ -347,62 +342,23 @@ class GraphMemoryStore:
         logger.info("GraphMemoryStore initialised at %s (dim=%d)", db_path, embedding_dim)
 
     # ------------------------------------------------------------------
-    # DB open helper — WAL recovery
+    # DB open helper
     # ------------------------------------------------------------------
 
     @staticmethod
     def _open_db(db_path: str, buffer_pool_size: int):
         """Open (or create) the LadybugDB database at *db_path*.
 
-        If opening fails with a corrupted WAL error the WAL files are removed
-        and the open is retried.  Deleting the WAL discards any transactions
-        that were committed but not yet checkpointed to the main DB file;
-        all checkpointed data is preserved.  This is acceptable because the
-        alternative is a permanently unreadable database.
-
-        WAL file paths (LadybugDB convention):
-            {db_path}.wal               — primary WAL
-            {db_path}.wal.checkpoint    — checkpoint WAL
+        Makes exactly one normal engine-open attempt, leaving native WAL replay
+        to the engine. Any failure propagates unchanged: the application never
+        deletes, renames, truncates or recreates database/sidecar files and
+        never retries the open.
         """
-        try:
-            return ladybug.Database(
-                db_path,
-                buffer_pool_size=buffer_pool_size,
-                max_num_threads=2,
-            )
-        except RuntimeError as exc:
-            # LadybugDB 0.18.3: WAL corruption is signalled via generic
-            # RuntimeError text. See _LADYBUG_WAL_ERROR_TOKENS.
-            if not _is_ladybug_error(exc, _LADYBUG_WAL_ERROR_TOKENS):
-                raise
-            # Attempt WAL recovery: remove corrupt WAL files and retry.
-            wal_path = db_path + ".wal"
-            ckpt_path = db_path + ".wal.checkpoint"
-            removed = []
-            for p in (wal_path, ckpt_path):
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                        removed.append(p)
-                    except OSError as rm_exc:
-                        raise RuntimeError(
-                            f"Corrupted WAL detected but could not remove '{p}': {rm_exc}"
-                        ) from exc
-            if not removed:
-                raise  # WAL files not found — original error was something else
-            logger.warning(
-                "graph_memory: Corrupted WAL detected — removed %s and retrying open. "
-                "Any data written since the last checkpoint has been lost.",
-                removed,
-            )
-            return ladybug.Database(
-                db_path,
-                buffer_pool_size=buffer_pool_size,
-                max_num_threads=2,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("graph_memory: Unexpected error opening database: %s", exc)
-            raise
+        return ladybug.Database(
+            db_path,
+            buffer_pool_size=buffer_pool_size,
+            max_num_threads=2,
+        )
 
     # ------------------------------------------------------------------
     # Schema
@@ -1623,6 +1579,19 @@ def resolve_graph_startup(
 # ---------------------------------------------------------------------------
 
 
+GRAPH_UNAVAILABLE_GUIDANCE = (
+    "Graph memory is unavailable. Stop graph users, back up the database and "
+    "all sidecars together, investigate or restore using supported procedures, "
+    "then restart after repair. Destructive salvage requires explicit operator "
+    "approval."
+)
+
+
+def graph_failure_message(exc: BaseException) -> str:
+    """Return fixed guidance plus the exception class only (never engine text)."""
+    return f"{GRAPH_UNAVAILABLE_GUIDANCE} (error class: {type(exc).__name__})"
+
+
 def create_graph_memory(
     cfg,  # AppConfig
     db_path: str,
@@ -1676,11 +1645,9 @@ def create_graph_memory(
             min_message_length=gm_cfg.min_message_length,
         )
         return store, writer
-    except (RuntimeError, OSError, ValueError) as exc:
-        logger.error("Failed to initialise graph memory: %s", exc)
-        return None, None
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to initialise graph memory with unexpected error: %s", exc)
+        # Class only: engine text may embed secrets or paths.
+        logger.error("%s", graph_failure_message(exc))
         return None, None
 
 

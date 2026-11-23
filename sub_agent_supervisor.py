@@ -22,7 +22,7 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -37,6 +37,10 @@ if TYPE_CHECKING:
     from sub_agent_registry import SubAgentRecord
 
 logger = logging.getLogger(__name__)
+
+
+class SupervisorStoppingError(RuntimeError):
+    """Raised when a submission reaches a supervisor that is shutting down."""
 
 
 CANCELLED_SENTINEL = "[Cancelled]"
@@ -160,6 +164,17 @@ def _result_is_failure(result: object) -> bool:
     return is_runtime_failure_text(result)
 
 
+@dataclass
+class _AcceptedEntry:
+    """An accepted submission that has not yet completed terminal cleanup."""
+
+    request: SubmissionRequest
+    options: SupervisionOptions
+    runner: SubAgentRunner
+    record: SubAgentRecord
+    future: Optional[Future] = None
+
+
 class SubAgentSupervisor:
     """Owns the background lifecycle of spawned and scheduled sub-agents."""
 
@@ -170,6 +185,12 @@ class SubAgentSupervisor:
         self._owned_lock = threading.Lock()
         self._owned_children: dict[str, _OwnedChildState] = {}
         self._active_turn_ids: set[str] = set()
+        # Guards only accepted-entry tracking and the stopping flag; never
+        # nested with ``_owned_lock`` or registry locks. Reentrant only so a
+        # synchronous (inline) pool double can retire its entry during submit.
+        self._submit_lock = threading.RLock()
+        self._entries: dict[str, _AcceptedEntry] = {}
+        self._stopping = False
 
     def register_active_turn(self, turn_id: str) -> None:
         """Mark *turn_id* as an operator turn whose confirmation channel is live."""
@@ -407,19 +428,21 @@ class SubAgentSupervisor:
         # through the shared helper so spawn and plan/diagnostic paths stay in
         # sync. ``options.source`` distinguishes on-demand from scheduled runs;
         # both count against the global capacity guard.
-        record = register_run(
-            runner,
-            source=options.source,
-            label=request.label,
-            task_preview=request.task,
-            result_type=request.response_format,
-        )
-        record.prompt_id = request.ownership.prompt_id
-        record.ownership = request.ownership
-        if request.ownership.owner_turn_id is not None:
-            with self._owned_lock:
-                self._owned_children[runner.agent_id] = _OwnedChildState(record)
+        # From here the supervisor owns the constructed runner: any failure
+        # before the task is accepted rolls back by runner identity and closes it.
         try:
+            record = register_run(
+                runner,
+                source=options.source,
+                label=request.label,
+                task_preview=request.task,
+                result_type=request.response_format,
+            )
+            record.prompt_id = request.ownership.prompt_id
+            record.ownership = request.ownership
+            if request.ownership.owner_turn_id is not None:
+                with self._owned_lock:
+                    self._owned_children[runner.agent_id] = _OwnedChildState(record)
             if (
                 request.ownership.origin == ORIGIN_ON_DEMAND
                 and request.ownership.prompt_id is not None
@@ -436,34 +459,23 @@ class SubAgentSupervisor:
                 runner.agent_id, request.label, runner.model_id, request.task[:100],
             )
 
-            self._pool.submit(
-                lambda: self._run_and_notify(request, options, runner, record)
-            )
-        except Exception:
-            # Admission failed after registration: roll back every piece of
-            # per-run state so no registry capacity slot, owned-child record,
-            # or prompt association is stranded by the failed submission.
-            from sub_agent_registry import deregister_run
-
-            with self._owned_lock:
-                self._owned_children.pop(runner.agent_id, None)
-            if (
-                request.ownership.origin == ORIGIN_ON_DEMAND
-                and request.ownership.prompt_id is not None
-                and request.prompt_registry is not None
-            ):
+            entry = _AcceptedEntry(request, options, runner, record)
+            with self._submit_lock:
+                if self._stopping:
+                    raise SupervisorStoppingError("sub-agent supervisor is shutting down")
+                self._entries[runner.agent_id] = entry
                 try:
-                    request.prompt_registry.remove_sub_agent(
-                        request.ownership.prompt_id,
-                        runner.agent_id,
+                    entry.future = self._pool.submit(
+                        lambda: self._run_and_notify(request, options, runner, record)
                     )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "spawn_agent: rollback of prompt association failed for %s",
-                        runner.agent_id,
-                        exc_info=True,
-                    )
-            deregister_run(runner.agent_id)
+                except BaseException:
+                    self._entries.pop(runner.agent_id, None)
+                    raise
+        except BaseException:
+            # Pre-acceptance failure (including cancellation): independently
+            # attempt every rollback stage once; cleanup faults are logged and
+            # never replace the primary exception, which is re-raised.
+            self._rollback_rejected(request, runner)
             raise
 
         return {
@@ -478,6 +490,46 @@ class SubAgentSupervisor:
             "agent_id": runner.agent_id,
             "response_format": request.response_format,
         }
+
+    def _rollback_rejected(self, request: SubmissionRequest, runner: SubAgentRunner) -> None:
+        """Release everything a rejected submission may have installed.
+
+        Locates state by ``runner.agent_id`` so it works even when registration
+        inserted a record and then raised. Each stage runs independently.
+        """
+        from sub_agent_registry import deregister_run
+
+        agent_id = runner.agent_id
+        prompt_id = request.ownership.prompt_id
+        stages: list[tuple[str, Callable[[], object]]] = [
+            ("owned_children", lambda: self._discard_owned(agent_id)),
+        ]
+        if (
+            request.ownership.origin == ORIGIN_ON_DEMAND
+            and prompt_id is not None
+            and request.prompt_registry is not None
+        ):
+            registry = request.prompt_registry
+            stages.append(
+                ("prompt_association", lambda: registry.remove_sub_agent(prompt_id, agent_id))
+            )
+        stages.append(("deregister_run", lambda: deregister_run(agent_id)))
+        stages.append(("runner.close", runner.close))
+        for stage_name, stage in stages:
+            try:
+                stage()
+            except BaseException:  # noqa: BLE001
+                # Every stage must run and the caller's primary exception must
+                # survive, even if a stage is itself cancelled.
+                logger.warning(
+                    "spawn_agent: rollback stage %s failed for %s",
+                    stage_name, agent_id, exc_info=True,
+                )
+
+    def _discard_owned(self, agent_id: str) -> None:
+        """Drop the turn-owned child state for *agent_id*, if any."""
+        with self._owned_lock:
+            self._owned_children.pop(agent_id, None)
 
     # ------------------------------------------------------------------
     # Background lifecycle
@@ -498,13 +550,8 @@ class SubAgentSupervisor:
         and ``finish_cb`` fires exactly once after unregister/close on every
         background terminal path.
         """
-        from sub_agent_registry import deregister_run
-
         task = request.task
         label = request.label
-        context_key = request.context_key
-        data_dir = request.data_dir
-        save_context = request.save_context
         job_tag = options.job_tag
         finish_tag = job_tag or label
         result_log_cb = options.result_log_cb
@@ -512,180 +559,303 @@ class SubAgentSupervisor:
             options.notify and request.ownership.origin == ORIGIN_SCHEDULED
         )
         completion_cb = options.completion_cb
-        context_save_attempted = False
+        _save_context_before_completion = self._context_saver(request, runner)
 
-        def _save_context_before_completion() -> None:
-            """Persist context before exposing completion to get_agent_result callers."""
-            nonlocal context_save_attempted
-            if not context_key or context_save_attempted or save_context is None:
-                return
-            context_save_attempted = True
-            try:
-                save_context(context_key, runner.short_term, data_dir)
-            except Exception as save_exc:  # noqa: BLE001
-                logger.warning(
-                    "spawn_agent: [%s] context save failed for %s: %s",
-                    label, context_key, save_exc,
-                )
-
+        primary: Optional[BaseException] = None
+        terminal_started = False
         try:
-            # Bind the parent's prompt_id into the pool thread's log context so
-            # every sub-agent log line correlates with the originating prompt.
-            parent_trace = runner.trace_id
-            run_trace_id = child_trace_id(parent_trace) if parent_trace else ""
-            bind_run_context(
-                trace=run_trace_id,
-                agent=runner.agent_id,
-                prompt_id=(
-                    str(request.ownership.prompt_id)
-                    if request.ownership.prompt_id is not None
-                    else ""
-                ),
-            )
-            # Real SubAgentRunner.run() accepts a prompt_id kwarg; test fakes may
-            # not, so fall back to the legacy signature. Use inspect.signature
-            # rather than a bare TypeError catch so real TypeErrors inside the
-            # runner do not silently restart execution.
-            run_signature = inspect.signature(runner.run)
-            if "prompt_id" in run_signature.parameters:
-                result = runner.run(task, prompt_id=request.ownership.prompt_id)
-            else:
-                result = runner.run(task)
-            # P2 consolidation: sub-agent results are NOT auto-persisted into
-            # semantic/graph memory. Auto-writing arbitrary sub-agent output
-            # risks prompt poisoning. If a result should be remembered, the
-            # operator/main agent must explicitly (and with confirmation) call
-            # memory_graph_store.
-            if result == CANCELLED_SENTINEL or record.is_cancelled:
-                elapsed = int(time.time() - record.started_at)
-                self._finalize_terminal(
-                    record=record,
-                    status="cancelled",
-                    result=CANCELLED_SENTINEL,
-                    runner=runner,
-                    label=label,
-                    task=task,
-                    elapsed=elapsed,
-                    model=runner.model_id,
-                    result_log_cb=result_log_cb,
-                    notify=notify_result,
-                    completion_cb=completion_cb,
-                    save_context_cb=_save_context_before_completion,
-                    result_log_result=CANCELLED_SENTINEL,
-                    result_log_success=False,
-                    log_level="info",
-                    log_msg=("spawn_agent: [%s] cancelled | id=%s"),
-                    log_args=(label, runner.agent_id),
-                    icon_verb=("🛑", "cancelled"),
-                )
-            elif _result_is_failure(result):
-                # Failure, not success. Cancellation was handled above; then an
-                # explicit structured outcome decides, and only an unstructured
-                # string falls back to the reserved runtime terminal-failure prefix.
-                elapsed = int(time.time() - record.started_at)
-                self._finalize_terminal(
-                    record=record,
-                    status="failed",
-                    result=result,
-                    runner=runner,
-                    label=label,
-                    task=task,
-                    elapsed=elapsed,
-                    model=runner.model_id,
-                    result_log_cb=result_log_cb,
-                    notify=notify_result,
-                    completion_cb=completion_cb,
-                    save_context_cb=_save_context_before_completion,
-                    result_log_result=result,
-                    result_log_success=False,
-                    log_level="error",
-                    log_msg=(
-                        "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds"
-                    ),
-                    log_args=(label, runner.agent_id, runner.model_id, elapsed),
-                    icon_verb=("❌", "failed"),
-                )
-            else:
-                elapsed = int(time.time() - record.started_at)
-                self._finalize_terminal(
-                    record=record,
-                    status="done",
-                    result=result,
-                    runner=runner,
-                    label=label,
-                    task=task,
-                    elapsed=elapsed,
-                    model=runner.model_id,
-                    result_log_cb=result_log_cb,
-                    notify=notify_result,
-                    completion_cb=completion_cb,
-                    save_context_cb=_save_context_before_completion,
-                    result_log_result=result,
-                    result_log_success=True,
-                    log_level="info",
-                    log_msg=(
-                        "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds"
-                    ),
-                    log_args=(label, runner.agent_id, runner.model_id, elapsed),
-                    icon_verb=("✅", "finished"),
-                )
-        except Exception as exc:  # noqa: BLE001
-            error_text = f"Error: {exc}"
-            elapsed = int(time.time() - record.started_at)
-            self._finalize_terminal(
-                record=record,
-                status="failed",
-                result=str(exc),
-                runner=runner,
-                label=label,
-                task=task,
-                elapsed=elapsed,
-                model=runner.model_id,
-                result_log_cb=result_log_cb,
-                notify=notify_result,
-                completion_cb=completion_cb,
-                save_context_cb=_save_context_before_completion,
-                result_log_result=error_text,
-                result_log_success=False,
-                log_level="error",
-                log_msg=(
-                    "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s"
-                ),
-                log_args=(label, runner.agent_id, runner.model_id, elapsed, exc),
-                icon_verb=("❌", "failed"),
-                exc_info=True,
-            )
+            try:
+                try:
+                    # Bind the parent's prompt_id into the pool thread's log context so
+                    # every sub-agent log line correlates with the originating prompt.
+                    parent_trace = runner.trace_id
+                    run_trace_id = child_trace_id(parent_trace) if parent_trace else ""
+                    bind_run_context(
+                        trace=run_trace_id,
+                        agent=runner.agent_id,
+                        prompt_id=(
+                            str(request.ownership.prompt_id)
+                            if request.ownership.prompt_id is not None
+                            else ""
+                        ),
+                    )
+                    # Real SubAgentRunner.run() accepts a prompt_id kwarg; test fakes may
+                    # not, so fall back to the legacy signature. Use inspect.signature
+                    # rather than a bare TypeError catch so real TypeErrors inside the
+                    # runner do not silently restart execution.
+                    run_signature = inspect.signature(runner.run)
+                    if "prompt_id" in run_signature.parameters:
+                        result = runner.run(task, prompt_id=request.ownership.prompt_id)
+                    else:
+                        result = runner.run(task)
+                    # P2 consolidation: sub-agent results are NOT auto-persisted into
+                    # semantic/graph memory. Auto-writing arbitrary sub-agent output
+                    # risks prompt poisoning. If a result should be remembered, the
+                    # operator/main agent must explicitly (and with confirmation) call
+                    # memory_graph_store.
+                    terminal_started = True
+                    if result == CANCELLED_SENTINEL or record.is_cancelled:
+                        elapsed = int(time.time() - record.started_at)
+                        self._finalize_terminal(
+                            record=record,
+                            status="cancelled",
+                            result=CANCELLED_SENTINEL,
+                            runner=runner,
+                            label=label,
+                            task=task,
+                            elapsed=elapsed,
+                            model=runner.model_id,
+                            result_log_cb=result_log_cb,
+                            notify=notify_result,
+                            completion_cb=completion_cb,
+                            save_context_cb=_save_context_before_completion,
+                            result_log_result=CANCELLED_SENTINEL,
+                            result_log_success=False,
+                            log_level="info",
+                            log_msg=("spawn_agent: [%s] cancelled | id=%s"),
+                            log_args=(label, runner.agent_id),
+                            icon_verb=("🛑", "cancelled"),
+                        )
+                    elif _result_is_failure(result):
+                        # Failure, not success. Cancellation was handled above; then an
+                        # explicit structured outcome decides, and only an unstructured
+                        # string falls back to the reserved runtime terminal-failure prefix.
+                        elapsed = int(time.time() - record.started_at)
+                        self._finalize_terminal(
+                            record=record,
+                            status="failed",
+                            result=result,
+                            runner=runner,
+                            label=label,
+                            task=task,
+                            elapsed=elapsed,
+                            model=runner.model_id,
+                            result_log_cb=result_log_cb,
+                            notify=notify_result,
+                            completion_cb=completion_cb,
+                            save_context_cb=_save_context_before_completion,
+                            result_log_result=result,
+                            result_log_success=False,
+                            log_level="error",
+                            log_msg=(
+                                "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds"
+                            ),
+                            log_args=(label, runner.agent_id, runner.model_id, elapsed),
+                            icon_verb=("❌", "failed"),
+                        )
+                    else:
+                        elapsed = int(time.time() - record.started_at)
+                        self._finalize_terminal(
+                            record=record,
+                            status="done",
+                            result=result,
+                            runner=runner,
+                            label=label,
+                            task=task,
+                            elapsed=elapsed,
+                            model=runner.model_id,
+                            result_log_cb=result_log_cb,
+                            notify=notify_result,
+                            completion_cb=completion_cb,
+                            save_context_cb=_save_context_before_completion,
+                            result_log_result=result,
+                            result_log_success=True,
+                            log_level="info",
+                            log_msg=(
+                                "spawn_agent: [%s] done | id=%s model=%s elapsed=%ds"
+                            ),
+                            log_args=(label, runner.agent_id, runner.model_id, elapsed),
+                            icon_verb=("✅", "finished"),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    if terminal_started:
+                        # A terminal-stage fault is never re-finalized as an
+                        # execution failure; it propagates after cleanup.
+                        try:
+                            # Fixed label, agent id and exception class only: raw
+                            # text/traceback may carry secrets or provider output.
+                            logger.error(
+                                "spawn_agent: terminal stage fault | id=%s error_class=%s",
+                                runner.agent_id, type(exc).__name__,
+                            )
+                        except BaseException:  # noqa: BLE001
+                            # Best-effort: a diagnostic failure (even cancellation)
+                            # must never replace the propagating primary fault.
+                            pass
+                        raise
+                    error_text = f"Error: {exc}"
+                    elapsed = int(time.time() - record.started_at)
+                    self._finalize_terminal(
+                        record=record,
+                        status="failed",
+                        result=str(exc),
+                        runner=runner,
+                        label=label,
+                        task=task,
+                        elapsed=elapsed,
+                        model=runner.model_id,
+                        result_log_cb=result_log_cb,
+                        notify=notify_result,
+                        completion_cb=completion_cb,
+                        save_context_cb=_save_context_before_completion,
+                        result_log_result=error_text,
+                        result_log_success=False,
+                        log_level="error",
+                        log_msg=(
+                            "spawn_agent: [%s] failed | id=%s model=%s elapsed=%ds | %s"
+                        ),
+                        log_args=(label, runner.agent_id, runner.model_id, elapsed, exc),
+                        icon_verb=("❌", "failed"),
+                        exc_info=True,
+                    )
+            except BaseException as primary_exc:  # noqa: BLE001
+                primary = primary_exc
+                raise
         finally:
             # Persist conversation context (if requested) regardless of
             # success/cancellation/failure so a crash mid-task does not lose
             # the sub-agent's short-term memory.
-            cleanup_stages: list[tuple[str, Callable[[], object]]] = [
-                ("save_context", _save_context_before_completion),
-                ("deregister_run", lambda: deregister_run(runner.agent_id)),
-                ("runner.close", runner.close),
-                ("clear_run_context", clear_run_context),
-            ]
-            if options.grant_scope_cb:
-                cleanup_stages.append(
-                    (
-                        "grant_scope_cb",
-                        lambda: options.grant_scope_cb(runner.agent_id),
-                    )
-                )
-            if options.finish_cb:
-                cleanup_stages.append(("finish_cb", lambda: options.finish_cb(finish_tag)))
+            self._terminal_cleanup(
+                options, runner, record, finish_tag,
+                _save_context_before_completion, clear_context=True,
+                primary=primary,
+            )
 
-            cleanup_errors: list[str] = []
+    @staticmethod
+    def _context_saver(
+        request: SubmissionRequest, runner: SubAgentRunner
+    ) -> Callable[[], None]:
+        """Return an at-most-once, failure-tolerant context persistence stage."""
+        attempted = False
+
+        def save() -> None:
+            """Persist context before exposing completion to result callers."""
+            nonlocal attempted
+            if not request.context_key or attempted or request.save_context is None:
+                return
+            attempted = True
             try:
-                for stage_name, cleanup_stage in cleanup_stages:
-                    try:
-                        cleanup_stage()
-                    except Exception as cleanup_exc:  # noqa: BLE001
-                        error = f"{stage_name} failed for {runner.agent_id}: {cleanup_exc}"
-                        cleanup_errors.append(error)
-                        logger.warning("spawn_agent: %s", error, exc_info=True)
-            finally:
+                request.save_context(
+                    request.context_key, runner.short_term, request.data_dir
+                )
+            except Exception as save_exc:  # noqa: BLE001
+                logger.warning(
+                    "spawn_agent: [%s] context save failed for %s: %s",
+                    request.label, request.context_key, save_exc,
+                )
+
+        return save
+
+    def _terminal_cleanup(
+        self,
+        options: SupervisionOptions,
+        runner: SubAgentRunner,
+        record: SubAgentRecord,
+        finish_tag: str,
+        save_context_cb: Callable[[], None],
+        *,
+        clear_context: bool,
+        primary: Optional[BaseException] = None,
+    ) -> None:
+        """Independently attempt each terminal cleanup stage exactly once.
+
+        *primary* is the exception propagating out of the caller's own
+        operation, if any; cleanup cancellation never replaces it.
+        """
+        from sub_agent_registry import deregister_run
+
+        cleanup_stages: list[tuple[str, Callable[[], object]]] = [
+            ("save_context", save_context_cb),
+            ("deregister_run", lambda: deregister_run(runner.agent_id)),
+            ("runner.close", runner.close),
+        ]
+        if clear_context:
+            cleanup_stages.append(("clear_run_context", clear_run_context))
+        if options.grant_scope_cb:
+            cleanup_stages.append(
+                ("grant_scope_cb", lambda: options.grant_scope_cb(runner.agent_id))
+            )
+        if options.finish_cb:
+            cleanup_stages.append(("finish_cb", lambda: options.finish_cb(finish_tag)))
+
+        cleanup_errors: list[str] = []
+        deferred: Optional[BaseException] = None
+        try:
+            for stage_name, cleanup_stage in cleanup_stages:
+                try:
+                    cleanup_stage()
+                except BaseException as cleanup_exc:  # noqa: BLE001
+                    error = f"{stage_name} failed for {runner.agent_id}: {cleanup_exc!r}"
+                    cleanup_errors.append(error)
+                    logger.warning("spawn_agent: %s", error, exc_info=True)
+                    if not isinstance(cleanup_exc, Exception) and deferred is None:
+                        # Cancellation propagates only after every stage ran.
+                        deferred = cleanup_exc
+        finally:
+            try:
                 self._signal_owned_cleanup(record, cleanup_errors)
+            except BaseException as signal_exc:  # noqa: BLE001
+                logger.warning(
+                    "spawn_agent: owned cleanup signal failed for %s",
+                    runner.agent_id, exc_info=True,
+                )
+                if not isinstance(signal_exc, Exception) and deferred is None:
+                    deferred = signal_exc
+            finally:
+                self._retire_entry(runner.agent_id)
+        if deferred is not None and primary is None:
+            # Cleanup cancellation propagates only with no primary in flight.
+            raise deferred
+
+    def _retire_entry(self, agent_id: str) -> None:
+        """Forget an accepted entry once its outermost cleanup has finished."""
+        with self._submit_lock:
+            self._entries.pop(agent_id, None)
+
+    def _finalize_cancelled_entry(self, entry: "_AcceptedEntry") -> None:
+        """Run cancellation-only terminal effects for work that never started.
+
+        Runs on the shutdown caller, outside every lock, without worker-only
+        context binding so the caller's thread-local context is untouched.
+        """
+        request, options = entry.request, entry.options
+        runner, record = entry.runner, entry.record
+        save_context_cb = self._context_saver(request, runner)
+        primary: Optional[BaseException] = None
+        try:
+            self._finalize_terminal(
+                record=record,
+                status="cancelled",
+                result=CANCELLED_SENTINEL,
+                runner=runner,
+                label=request.label,
+                task=request.task,
+                elapsed=int(time.time() - record.started_at),
+                model=runner.model_id,
+                result_log_cb=options.result_log_cb,
+                notify=options.notify and request.ownership.origin == ORIGIN_SCHEDULED,
+                completion_cb=options.completion_cb,
+                save_context_cb=save_context_cb,
+                result_log_result=CANCELLED_SENTINEL,
+                result_log_success=False,
+                log_level="info",
+                log_msg="spawn_agent: [%s] cancelled before start | id=%s",
+                log_args=(request.label, runner.agent_id),
+                icon_verb=("🛑", "cancelled"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "spawn_agent: terminal stage failed for %s", runner.agent_id,
+                exc_info=True,
+            )
+        except BaseException as primary_exc:  # noqa: BLE001
+            primary = primary_exc
+            raise
+        finally:
+            self._terminal_cleanup(
+                options, runner, record, options.job_tag or request.label,
+                save_context_cb, clear_context=False, primary=primary,
+            )
 
     def _signal_owned_cleanup(
         self, record: SubAgentRecord, cleanup_errors: Optional[list[str]] = None
@@ -743,38 +913,70 @@ class SubAgentSupervisor:
         """
         record.status = status
         record.result = result
-        save_context_cb()
-        record.signal_result()
-        log_fn = logger.error if log_level == "error" else logger.info
-        if exc_info:
-            log_fn(log_msg, *log_args, exc_info=True)
-        else:
-            log_fn(log_msg, *log_args)
-        self._safe_result_log(
-            result_log_cb,
-            tag=label,
-            task=task,
-            result=result_log_result,
-            success=result_log_success,
-            elapsed_s=elapsed,
-            model=model,
-        )
-        if not notify or completion_cb is None:
-            return
-        if status == "cancelled" and record.timeout_cancelled:
-            return
+        deferred: Optional[BaseException] = None
+
+        def defer(exc: BaseException) -> None:
+            """Keep the first cancellation, else the first ordinary fault."""
+            nonlocal deferred
+            if deferred is None or (
+                isinstance(deferred, Exception) and not isinstance(exc, Exception)
+            ):
+                deferred = exc
+
         try:
-            completion_cb(
-                RunCompletion(
-                    tag=label, status=status, result=result_log_result,
-                    elapsed_s=elapsed, model=model, agent_id=runner.agent_id,
+            save_context_cb()
+        except BaseException as save_exc:  # noqa: BLE001
+            # A fault must not skip later attempts; re-raise afterwards.
+            defer(save_exc)
+        try:
+            try:
+                record.signal_result()
+            except BaseException as signal_exc:  # noqa: BLE001
+                # A signal fault must not skip the remaining attempts.
+                defer(signal_exc)
+            try:
+                log_fn = logger.error if log_level == "error" else logger.info
+                if exc_info:
+                    log_fn(log_msg, *log_args, exc_info=True)
+                else:
+                    log_fn(log_msg, *log_args)
+            except BaseException as lifecycle_exc:  # noqa: BLE001
+                defer(lifecycle_exc)
+            try:
+                self._safe_result_log(
+                    result_log_cb,
+                    tag=label,
+                    task=task,
+                    result=result_log_result,
+                    success=result_log_success,
+                    elapsed_s=elapsed,
+                    model=model,
                 )
-            )
-        except Exception as notify_exc:  # noqa: BLE001
-            logger.warning(
-                "spawn_agent: [%s] completion handoff failed (%s): %s",
-                label, icon_verb[1], notify_exc,
-            )
+            except BaseException as log_exc:  # noqa: BLE001
+                # Cancellation must not skip the completion handoff.
+                defer(log_exc)
+            if not notify or completion_cb is None:
+                return
+            if status == "cancelled" and record.timeout_cancelled:
+                return
+            try:
+                completion_cb(
+                    RunCompletion(
+                        tag=label, status=status, result=result_log_result,
+                        elapsed_s=elapsed, model=model, agent_id=runner.agent_id,
+                    )
+                )
+            except Exception as notify_exc:  # noqa: BLE001
+                logger.warning(
+                    "spawn_agent: [%s] completion handoff failed (%s): %s",
+                    label, icon_verb[1], notify_exc,
+                )
+            except BaseException as notify_cancel:  # noqa: BLE001
+                defer(notify_cancel)
+        finally:
+            if deferred is not None:
+                raise deferred
+
 
     def _safe_result_log(
         self,
@@ -817,16 +1019,58 @@ class SubAgentSupervisor:
         """
         from sub_agent_registry import get_registry
 
+        with self._submit_lock:
+            self._stopping = True
+            accepted = list(self._entries.values())
+        for entry in accepted:
+            entry.record.cancel()
         registry = get_registry()
         active = registry.list_active()
-        if active:
-            logger.info("Shutdown: cancelling %d active sub-agent(s)…", len(active))
-            for record in active:
-                record.cancel()
-            deadline = time.monotonic() + graceful_timeout
-            while time.monotonic() < deadline:
-                if not any(r.status == "running" for r in registry.list_active()):
-                    break
-                time.sleep(0.25)
+        for record in active:
+            record.cancel()
+        # Queue-first: cancel never-started Futures and finalize them BEFORE the
+        # cooperative drain of started work, so queued cleanup is not hostage to
+        # the drain. Started workers keep ownership of their own clients.
         self._pool.shutdown(wait=False, cancel_futures=True)
+        with self._submit_lock:
+            cancelled = [
+                entry for entry in self._entries.values()
+                if entry.future is not None and entry.future.cancelled()
+            ]
+            for entry in cancelled:
+                self._entries.pop(entry.runner.agent_id, None)
+        deferred: Optional[BaseException] = None
+
+        def defer(exc: BaseException) -> None:
+            """Keep the first cancellation, else the first ordinary fault."""
+            nonlocal deferred
+            if deferred is None or (
+                isinstance(deferred, Exception) and not isinstance(exc, Exception)
+            ):
+                deferred = exc
+
+        for entry in cancelled:
+            try:
+                self._finalize_cancelled_entry(entry)
+            except BaseException as exc:  # noqa: BLE001
+                # One entry's failure or cancellation must not abandon the
+                # remaining claimed entries or the drain; re-raise afterwards.
+                logger.warning(
+                    "Shutdown: terminal cleanup failed for %s",
+                    entry.runner.agent_id, exc_info=True,
+                )
+                if not isinstance(exc, Exception):
+                    defer(exc)
+        try:
+            if active:
+                logger.info("Shutdown: cancelling %d active sub-agent(s)…", len(active))
+                deadline = time.monotonic() + graceful_timeout
+                while time.monotonic() < deadline:
+                    if not any(r.status == "running" for r in registry.list_active()):
+                        break
+                    time.sleep(0.25)
+        except BaseException as drain_exc:  # noqa: BLE001
+            defer(drain_exc)
+        if deferred is not None:
+            raise deferred
         logger.debug("Sub-agent pool shut down.")

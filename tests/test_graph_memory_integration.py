@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 import graph_memory
+import main as main_mod
 import token_usage
 from config_schema import (
     AgentConfig,
@@ -929,3 +930,97 @@ def test_embedding_credential_comes_only_from_embedding_config(
         monkeypatch.setenv("STARTUP_CONN_KEY", connection_key)
     result = _start_ok(world)
     assert (result.embedding_provider, result.embedding_model) == ("openai", "text-embed")
+
+
+# ---------------------------------------------------------------------------
+# Real factory/main boundary: engine open failure (tasks 5.1-5.2)
+# ---------------------------------------------------------------------------
+
+_OPEN_FAILURE_SECRET = "SECRET-MARKER-engine-text"
+
+
+def _open_failure_app_cfg() -> AppConfig:
+    """Return a valid enabled-graph config with explicit extraction settings."""
+    return parse_config({
+        "telegram": {"bot_token": "123456:ABC-DEF", "allowed_user_ids": [1]},
+        "agent": {"compaction_threshold_tokens": 60000},
+        "providers": {"chat": {"type": "openai", "api_key": "k", "base_url": "https://c.test/v1"}},
+        "embeddings": {
+            "provider": "openai", "model": "e", "api_key": "k", "base_url": "https://e.test/v1",
+        },
+        "graph_memory": {
+            "enabled": True,
+            "extraction_provider": "openai",
+            "extraction_base_url": "https://g.test/v1",
+            "extraction_api_key": "gk",
+            "extraction_model": "org/m",
+        },
+    })
+
+
+def _assert_fixed_guidance(text: str) -> None:
+    """Assert every required fixed guidance element is present."""
+    lowered = text.lower()
+    for phrase in (
+        "graph memory is unavailable",
+        "stop graph users",
+        "back up the database and all sidecars together",
+        "supported procedures",
+        "restart after repair",
+        "explicit operator approval",
+    ):
+        assert phrase in lowered
+
+
+def test_real_factory_open_failure_is_graph_unwired_with_fixed_guidance_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Injected nonmutating engine failure flows through real main/factory/store."""
+    app_cfg = _open_failure_app_cfg()
+    db_path = tmp_path / "graph_db"
+    sidecars = {
+        db_path: b"db-bytes",
+        Path(f"{db_path}.wal"): b"wal-bytes",
+        Path(f"{db_path}.wal.checkpoint"): b"ckpt-bytes",
+    }
+    for path, data in sidecars.items():
+        path.write_bytes(data)
+    open_calls: list[str] = []
+
+    def failing_open(path: str, **_kwargs: object) -> None:
+        open_calls.append(path)
+        raise RuntimeError(f"Corrupted wal {_OPEN_FAILURE_SECRET}")
+
+    writers: list[object] = []
+    real_writer = graph_memory.GraphMemoryWriter
+
+    def recording_writer(*args: object, **kwargs: object) -> object:
+        writers.append(real_writer(*args, **kwargs))
+        return writers[-1]
+
+    monkeypatch.setattr(graph_memory.ladybug, "Database", failing_open)
+    monkeypatch.setattr(graph_memory, "GraphMemoryWriter", recording_writer)
+    monkeypatch.setattr(main_mod, "create_graph_memory", graph_memory.create_graph_memory)
+    agent = SimpleNamespace()
+    builtin = SimpleNamespace()
+    with caplog.at_level("DEBUG"):
+        store, writer = main_mod._build_graph_memory(
+            app_cfg=app_cfg,
+            paths=SimpleNamespace(graph_memory_db=db_path),
+            agent=agent,
+            builtin=builtin,
+            vault_file=str(tmp_path / "no-vault"),
+            embedder_fn=lambda _text: [0.1, 0.2, 0.3],
+        )
+    assert (store, writer) == (None, None)
+    assert len(open_calls) == 1
+    assert writers == []
+    assert not hasattr(agent, "_graph_memory") and not hasattr(builtin, "_graph_memory")
+    assert {p: p.read_bytes() for p in sidecars} == sidecars
+    captured = capsys.readouterr()
+    text = "\n".join([caplog.text, captured.out, captured.err])
+    assert _OPEN_FAILURE_SECRET not in text
+    assert "Traceback" not in text
+    assert "RuntimeError" in text
+    _assert_fixed_guidance(text)

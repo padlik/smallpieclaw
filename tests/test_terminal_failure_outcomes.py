@@ -24,6 +24,7 @@ from react_loop import ReactContext
 from sub_agent_registry import get_registry
 from sub_agent_supervisor import CANCELLED_SENTINEL, SupervisionOptions
 from tests.test_sub_agent_supervisor import FakeRunner, _seq_factory
+from tests.inline_futures import run_inline_future
 
 FAILURE = "❌ ⏱️ Request timed out. Automatic retries were exhausted. Try the request again later."
 EXPLICIT_SUCCESS_WITH_MARK = json.dumps({"success": True, "output": "❌ literal text, not a failure"})
@@ -58,7 +59,7 @@ def _supervise(make_builtin_executor, tmp_path, runner, *, scheduled=False):
         completion_cb=completions.append,
     )
     with patch.object(exc._supervisor._pool, "submit",
-                      side_effect=lambda fn, *a, **kw: fn()):
+                      side_effect=run_inline_future):
         spawned = exc._exec_spawn_agent({"task": "work"}, options=options)
         retrieved = exc._exec_get_agent_result(
             {"agent_id": spawned["agent_id"], "timeout": 1}
@@ -184,7 +185,7 @@ def test_cancellation_wins_over_a_failure_text(make_builtin_executor, tmp_path):
         sub_agent_factory=_seq_factory([runner]), data_dir=str(tmp_path),
     )
     with patch.object(exc._supervisor._pool, "submit",
-                      side_effect=lambda fn, *a, **kw: fn()):
+                      side_effect=run_inline_future):
         exc._exec_spawn_agent({"task": "work"})
     record = get_registry().get_completed(runner.agent_id)
     assert record.status == "cancelled" and record.result == CANCELLED_SENTINEL

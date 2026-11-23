@@ -2072,6 +2072,73 @@ class TestBackfillMainLiveAndDryRun:
         finally:
             recorder.close_leftovers()
 
+    def test_live_open_failure_exits_nonzero_with_fixed_guidance_and_no_secret(
+        self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Real store/CLI boundary: engine open failure is fixed-guidance, class-only, nonzero."""
+        world = self._write_world(tmp_xdg, tmp_path, monkeypatch)
+        from xdg import xdg_paths
+
+        graph_db = xdg_paths(self._CLI_AGENT).graph_memory_db
+        artifacts = {
+            graph_db: b"db-sentinel",
+            Path(f"{graph_db}.wal"): b"wal-sentinel",
+            Path(f"{graph_db}.wal.checkpoint"): b"checkpoint-sentinel",
+        }
+        for artifact, data in artifacts.items():
+            artifact.write_bytes(data)
+        world.before_tree = self._tree_bytes(tmp_path)  # snapshot includes existing graph files
+        secret = "SECRET-MARKER-engine-text"
+        router = _RecordingRouter()
+        recorder = _ClientRecorder(monkeypatch)
+        open_calls: list[str] = []
+
+        def failing_open(path: str, **_kwargs: object) -> None:
+            """Nonmutating injected engine failure carrying a secret marker."""
+            open_calls.append(path)
+            raise RuntimeError(f"Corrupted wal {secret}")
+
+        monkeypatch.setattr(
+            httpx.HTTPTransport, "handle_request", lambda _transport, request: router.handle_request(request),
+        )
+        monkeypatch.setattr(graph_memory.ladybug, "Database", failing_open)
+        engine_calls: list[object] = []
+        monkeypatch.setattr(
+            backfill_graph_memory, "backfill_longterm_to_graph",
+            lambda **kw: engine_calls.append(kw),
+        )
+        monkeypatch.setattr(
+            sys, "argv",
+            ["backfill_graph_memory.py", "--config", str(world.config_path),
+             "--agent-name", self._CLI_AGENT],
+        )
+        try:
+            with caplog.at_level("DEBUG"):
+                with pytest.raises(SystemExit) as caught:
+                    backfill_graph_memory.main()
+            assert caught.value.code not in (0, None)
+            assert len(open_calls) == 1
+            assert engine_calls == []
+            assert [c._recorded_close_count for c in recorder.embed_clients] == [1]
+            assert self._tree_bytes(tmp_path) == world.before_tree
+            assert {a: a.read_bytes() for a in artifacts} == artifacts
+            captured = capsys.readouterr()
+            text = "\n".join([caplog.text, captured.out, captured.err])
+            assert secret not in text
+            assert "RuntimeError" in text
+            for phrase in (
+                "graph memory is unavailable",
+                "stop graph users",
+                "back up the database and all sidecars together",
+                "supported",
+                "restart",
+                "explicit operator approval",
+            ):
+                assert phrase in text.lower() or phrase in text
+        finally:
+            recorder.close_leftovers()
+
     @pytest.mark.parametrize("failure", ["toml-syntax", "invalid-schema"])
     def test_live_path_ignores_corrupt_catalog_and_never_reads_it(
         self, tmp_xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

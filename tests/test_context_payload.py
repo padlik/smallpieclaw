@@ -26,6 +26,7 @@ from react_loop import (
     _format_parent_context,
     _truncate_context_payload,
 )
+from tests.inline_futures import run_inline_future
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +197,7 @@ class TestSpawnAgentContextPayload:
 
         with patch("sub_agent_registry.get_registry", return_value=_make_registry(0)), \
              patch.object(exc._supervisor._pool, "submit",
-                          side_effect=lambda fn, *_args, **_kwargs: fn()):
+                          side_effect=run_inline_future):
             exc._exec_spawn_agent(
                 {
                     "task": "do work",

@@ -65,6 +65,7 @@ class FakeRunner:
         self._llm = MagicMock()
         self._agent = SimpleNamespace(max_iterations=max_iterations, _on_step=None)
         self.closed = False
+        self.close_count = 0
         self._run_impl = run_impl
 
     def run(self, task: str) -> str:
@@ -76,6 +77,7 @@ class FakeRunner:
         self._cancel_event.set()
 
     def close(self) -> None:
+        self.close_count += 1
         self.closed = True
 
 
@@ -448,3 +450,494 @@ class TestStatusCount:
         text = "\n".join(captured["texts"])
         # All four visible records are counted, not just capacity-counted ones.
         assert "🤖 Sub-agents: 4 running" in text
+
+
+# ---------------------------------------------------------------------------
+# Returned-runner ownership (tasks 3.1-3.2)
+# ---------------------------------------------------------------------------
+
+class _CloseFailRunner(FakeRunner):
+    def close(self) -> None:
+        self.close_count += 1
+        self.closed = True
+        raise RuntimeError("close failed")
+
+
+class _CleanupCancel(BaseException):
+    """Cancellation-derived (non-Exception) failure raised by cleanup stages."""
+
+
+def _raiser(exc: BaseException):
+    def _raise(*_a, **_k):
+        raise exc
+
+    return _raise
+
+
+class TestDiagnosticRunnerOwnership:
+    def _diagnose(self, runner):
+        executor = PlanExecutor(max_concurrent=1)
+        return executor._diagnose_step_failure(
+            PlanStep(id="a", tool="shell", args={}),
+            {"error_type": "tool_timeout", "error": "boom"},
+            _minimal_ctx(),
+            lambda **_kw: runner,
+            threading.Event(),
+        )
+
+    def test_registration_failure_before_insert_closes_runner(self, monkeypatch):
+        runner = FakeRunner(label="diagnose-a")
+        ran: list[str] = []
+        runner._run_impl = lambda r, t: ran.append(t) or "x"
+
+        def boom(*_a, **_k):
+            raise ValueError("register failed")
+
+        monkeypatch.setattr("execution_plan.register_run", boom)
+
+        with pytest.raises(ValueError, match="register failed"):
+            self._diagnose(runner)
+
+        assert runner.close_count == 1
+        assert ran == []
+        assert get_registry().list_active() == []
+
+    def test_registration_failure_after_insert_removes_record_and_closes(self, monkeypatch):
+        from sub_agent_registry import register_run as real_register
+
+        runner = FakeRunner(label="diagnose-a")
+
+        def insert_then_raise(*a, **k):
+            real_register(*a, **k)
+            raise ValueError("register failed late")
+
+        monkeypatch.setattr("execution_plan.register_run", insert_then_raise)
+
+        with pytest.raises(ValueError, match="register failed late"):
+            self._diagnose(runner)
+
+        assert runner.close_count == 1
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_deregistration_failure_still_closes_runner(self, monkeypatch):
+        runner = FakeRunner(label="diagnose-a", run_impl=lambda r, t: "diagnosis")
+
+        def bad_dereg(_agent_id):
+            raise OSError("dereg failed")
+
+        monkeypatch.setattr("execution_plan.deregister_run", bad_dereg)
+
+        assert self._diagnose(runner) == "diagnosis"
+
+        assert runner.close_count == 1
+
+    def test_deregistration_failure_does_not_replace_run_failure(self, monkeypatch):
+        def run_impl(_r, _t):
+            raise RuntimeError("run failed")
+
+        runner = FakeRunner(label="diagnose-a", run_impl=run_impl)
+        monkeypatch.setattr(
+            "execution_plan.deregister_run",
+            lambda _id: (_ for _ in ()).throw(OSError("dereg failed")),
+        )
+
+        text = self._diagnose(runner)
+
+        assert "run failed" in text
+        assert runner.close_count == 1
+
+    def test_cancellation_derived_dereg_failure_still_closes_once(self, monkeypatch):
+        runner = FakeRunner(label="diagnose-a", run_impl=lambda r, t: "diagnosis")
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+
+        with pytest.raises(_CleanupCancel):
+            self._diagnose(runner)
+
+        assert runner.close_count == 1
+
+    def test_success_inside_unrelated_outer_except_propagates_cleanup_cancel(
+        self, monkeypatch
+    ):
+        runner = FakeRunner(label="diagnose-a", run_impl=lambda r, t: "diagnosis")
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+
+        try:
+            raise ValueError("unrelated outer handler")
+        except ValueError:
+            with pytest.raises(_CleanupCancel):
+                self._diagnose(runner)
+
+        assert runner.close_count == 1
+
+    def test_handled_run_failure_plus_cleanup_cancel_propagates_cancel(self, monkeypatch):
+        cancel = _CleanupCancel("dereg cancelled")
+        runner = FakeRunner(
+            label="diagnose-a", run_impl=_raiser(RuntimeError("run failed"))
+        )
+        monkeypatch.setattr("execution_plan.deregister_run", _raiser(cancel))
+
+        with pytest.raises(_CleanupCancel) as caught:
+            self._diagnose(runner)
+
+        assert caught.value is cancel
+        assert runner.close_count == 1
+
+    def test_execution_cancel_plus_cleanup_cancel_keeps_execution_primary(
+        self, monkeypatch
+    ):
+        primary = _CleanupCancel("execution primary")
+        runner = FakeRunner(label="diagnose-a", run_impl=_raiser(primary))
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+
+        with pytest.raises(_CleanupCancel) as caught:
+            self._diagnose(runner)
+
+        assert caught.value is primary
+        assert runner.close_count == 1
+
+    def test_diagnostic_success_closes_exactly_once(self):
+        runner = FakeRunner(label="diagnose-a", run_impl=lambda r, t: "ok")
+
+        assert self._diagnose(runner) == "ok"
+        assert runner.close_count == 1
+
+    def test_cleanup_cancellation_does_not_replace_registration_error(self, monkeypatch):
+        runner = _CloseFailRunner(label="diagnose-a")
+        monkeypatch.setattr(
+            "execution_plan.register_run", _raiser(ValueError("register failed"))
+        )
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+
+        with pytest.raises(ValueError, match="register failed"):
+            self._diagnose(runner)
+
+        assert runner.close_count == 1
+
+    def test_close_failure_is_logged_and_contained(self, caplog):
+        runner = _CloseFailRunner(label="diagnose-a", run_impl=lambda r, t: "ok")
+
+        with caplog.at_level("ERROR", logger="execution_plan"):
+            assert self._diagnose(runner) == "ok"
+        assert "'close' failed" in caplog.text
+        assert runner.close_count == 1
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_cancellation_from_run_propagates_and_cleans_up(self):
+        def run_impl(_r, _t):
+            raise KeyboardInterrupt
+
+        runner = FakeRunner(label="diagnose-a", run_impl=run_impl)
+
+        with pytest.raises(KeyboardInterrupt):
+            self._diagnose(runner)
+
+        assert runner.close_count == 1
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_run_receives_task_and_borrowed_services_untouched(self):
+        ctx = _minimal_ctx()
+        runner = FakeRunner(label="diagnose-a", run_impl=lambda r, t: "ok")
+        executor = PlanExecutor(max_concurrent=1)
+        executor._diagnose_step_failure(
+            PlanStep(id="a", tool="shell", args={}),
+            {"error_type": "e", "error": "x"},
+            ctx,
+            lambda **_kw: runner,
+            threading.Event(),
+        )
+        ctx.llm.close.assert_not_called()
+
+
+class TestPlanStepRunnerOwnership:
+    def _run_step(self, executor, runner, cancel_event=None):
+        return executor._execute_step_with_recovery(
+            PlanStep(id="a", tool="shell", args={}),
+            _minimal_ctx(),
+            lambda **_kw: runner,
+            cancel_event or threading.Event(),
+        )
+
+    def test_success_inside_unrelated_outer_except_propagates_cleanup_cancel(
+        self, monkeypatch
+    ):
+        runner = FakeRunner(label="plan-a", run_impl=lambda r, t: "ok")
+        executor = PlanExecutor(max_concurrent=1)
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+
+        try:
+            raise ValueError("unrelated outer handler")
+        except ValueError:
+            with pytest.raises(_CleanupCancel):
+                self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+
+    def test_execution_cancel_plus_cleanup_cancel_keeps_execution_primary(
+        self, monkeypatch
+    ):
+        primary = _CleanupCancel("execution primary")
+        runner = FakeRunner(label="plan-a", run_impl=_raiser(primary))
+        executor = PlanExecutor(max_concurrent=1)
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+
+        with pytest.raises(_CleanupCancel) as caught:
+            self._run_step(executor, runner)
+
+        assert caught.value is primary
+        assert runner.close_count == 1
+
+    def test_registration_failure_before_insert_cleans_active_and_closes(self, monkeypatch):
+        runner = FakeRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+
+        def boom(*_a, **_k):
+            raise ValueError("register failed")
+
+        monkeypatch.setattr("execution_plan.register_run", boom)
+
+        with pytest.raises(ValueError, match="register failed"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+        assert get_registry().list_active() == []
+
+    def test_registration_failure_after_insert_removes_record(self, monkeypatch):
+        from sub_agent_registry import register_run as real_register
+
+        runner = FakeRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+
+        def insert_then_raise(*a, **k):
+            real_register(*a, **k)
+            raise ValueError("register failed late")
+
+        monkeypatch.setattr("execution_plan.register_run", insert_then_raise)
+
+        with pytest.raises(ValueError, match="register failed late"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_outcome_processing_failure_cleans_up_and_closes(self, monkeypatch):
+        runner = FakeRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+
+        def bad_outcome(_attempts):
+            raise ValueError("outcome processing failed")
+
+        monkeypatch.setattr("execution_plan._step_disposition", bad_outcome)
+
+        with pytest.raises(ValueError, match="outcome processing failed"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_deregistration_failure_still_removes_active_and_closes(self, monkeypatch):
+        runner = FakeRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+        monkeypatch.setattr(
+            "execution_plan.deregister_run",
+            lambda _id: (_ for _ in ()).throw(OSError("dereg failed")),
+        )
+
+        result = self._run_step(executor, runner)
+
+        assert result["success"] is True
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+
+    def test_execution_cancellation_propagates_and_cleans_up(self):
+        def run_impl(_r, _t):
+            raise KeyboardInterrupt
+
+        runner = FakeRunner(label="plan-a", run_impl=run_impl)
+        executor = PlanExecutor(max_concurrent=1)
+
+        with pytest.raises(KeyboardInterrupt):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_outcome_failure_not_replaced_by_dereg_and_close_failures(self, monkeypatch):
+        runner = _CloseFailRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+        monkeypatch.setattr(
+            "execution_plan._step_disposition",
+            lambda _a: (_ for _ in ()).throw(ValueError("outcome failed")),
+        )
+        monkeypatch.setattr(
+            "execution_plan.deregister_run",
+            lambda _id: (_ for _ in ()).throw(OSError("dereg failed")),
+        )
+
+        with pytest.raises(ValueError, match="outcome failed"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+
+    def test_successful_step_closes_once_and_keeps_borrowed_services(self):
+        ctx = _minimal_ctx()
+        runner = FakeRunner(label="plan-a")
+        close_calls: list[int] = []
+        runner.close = lambda: close_calls.append(1)  # type: ignore[method-assign]
+        executor = PlanExecutor(max_concurrent=1)
+
+        result = executor._execute_step_with_recovery(
+            PlanStep(id="a", tool="shell", args={}),
+            ctx,
+            lambda **_kw: runner,
+            threading.Event(),
+        )
+
+        assert result["success"] is True
+        assert close_calls == [1]
+        ctx.llm.close.assert_not_called()
+
+
+class _InsertThenFailDict(dict):
+    """Active-runner map whose insertion mutates, then raises."""
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        raise RuntimeError("active insert failed")
+
+
+class _PopFailDict(dict):
+    """Active-runner map whose removal raises."""
+
+    def pop(self, *_a, **_k):
+        raise RuntimeError("active removal failed")
+
+
+class TestPlanStepCleanupIndependence:
+    def _run_step(self, executor, runner):
+        return executor._execute_step_with_recovery(
+            PlanStep(id="a", tool="shell", args={}),
+            _minimal_ctx(),
+            lambda **_kw: runner,
+            threading.Event(),
+        )
+
+    def test_active_insertion_failure_closes_runner_once(self):
+        runner = FakeRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+        executor._active_runners = _InsertThenFailDict()
+
+        with pytest.raises(RuntimeError, match="active insert failed"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_active_removal_failure_still_deregisters_and_closes_preserving_error(self, monkeypatch):
+        runner = FakeRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+        executor._active_runners = _PopFailDict()
+        monkeypatch.setattr(
+            "execution_plan._step_disposition", _raiser(ValueError("outcome failed"))
+        )
+
+        with pytest.raises(ValueError, match="outcome failed"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert get_registry().get(runner.agent_id) is None
+
+    def test_registration_failure_cleanup_faults_do_not_replace_error(self, monkeypatch):
+        runner = _CloseFailRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+        monkeypatch.setattr(
+            "execution_plan.register_run", _raiser(ValueError("register failed"))
+        )
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+        executor._active_runners = _PopFailDict()
+
+        with pytest.raises(ValueError, match="register failed"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+
+    def test_cancelled_during_creation_close_failure_is_logged_once(self, caplog):
+        runner = _CloseFailRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+        cancel_event = threading.Event()
+
+        def factory(**_kw):
+            cancel_event.set()
+            return runner
+
+        with caplog.at_level("ERROR", logger="execution_plan"):
+            result = executor._execute_step_with_recovery(
+                PlanStep(id="a", tool="shell", args={}),
+                _minimal_ctx(),
+                factory,
+                cancel_event,
+            )
+
+        assert result["success"] is False
+        assert runner.close_count == 1
+        assert "close" in caplog.text and "failed" in caplog.text
+
+    def test_cleanup_cancellation_does_not_replace_outcome_error(self, monkeypatch):
+        runner = _CloseFailRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+        monkeypatch.setattr(
+            "execution_plan._step_disposition", _raiser(ValueError("outcome failed"))
+        )
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+
+        with pytest.raises(ValueError, match="outcome failed"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+
+    def test_cleanup_cancellation_without_primary_still_closes_then_propagates(self, monkeypatch):
+        runner = FakeRunner(label="plan-a")
+        executor = PlanExecutor(max_concurrent=1)
+        monkeypatch.setattr(
+            "execution_plan.deregister_run", _raiser(_CleanupCancel("dereg cancelled"))
+        )
+
+        with pytest.raises(_CleanupCancel):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1
+        assert executor._active_runners == {}
+
+    def test_run_cancellation_closes_exactly_once_and_preserved(self):
+        def run_impl(_r, _t):
+            raise _CleanupCancel("run cancelled")
+
+        runner = FakeRunner(label="plan-a", run_impl=run_impl)
+        executor = PlanExecutor(max_concurrent=1)
+
+        with pytest.raises(_CleanupCancel, match="run cancelled"):
+            self._run_step(executor, runner)
+
+        assert runner.close_count == 1

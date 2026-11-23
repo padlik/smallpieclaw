@@ -30,6 +30,7 @@ from sub_agent_supervisor import (
     ExecutionOwnership,
     SubmissionRequest,
     SupervisionOptions,
+    SupervisorStoppingError,
 )
 
 from builtin_tools import context_io
@@ -356,7 +357,22 @@ class AgentTools:
         # Accepted run — the supervisor owns registration, background execution,
         # result signalling, context persistence, notification, scheduler
         # callbacks, and cleanup.
-        result = self._owner._supervisor.submit(request, options)
+        try:
+            result = self._owner._supervisor.submit(request, options)
+        except SupervisorStoppingError:
+            # Exact type only: the supervisor already rolled the run back.
+            return with_execution({
+                "success": False,
+                "output": "",
+                "error": "spawn_agent: the sub-agent supervisor is shutting down.",
+                "exit_code": -1,
+                "error_type": "impossible_with_current_tools",
+                "recoverable": False,
+                "suggestion": (
+                    "The agent is stopping and cannot start sub-agents; "
+                    "restart the agent and retry."
+                ),
+            }, "refused")
 
         # Only an admitted run (an agent was registered) is an executed spawn;
         # a rejected runner construction never started anything.

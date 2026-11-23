@@ -674,6 +674,17 @@ python backfill_graph_memory.py --config config.toml --force     # re-import all
 
 Graph memory health is visible in `/status` and `/memory`. Health states: `active-empty` 🟡, `active-learning` 🟢, `active-used` 🟢, `*-degraded` 🟠, `failed` 🔴.
 
+#### Graph database open failures
+
+Graph startup makes one normal database-engine open attempt, allowing native WAL replay. If it fails, graph memory stays unavailable while the main agent continues without it; live backfill exits nonzero without importing records. Logs provide recovery guidance and the exception class, not raw engine error text. There is no new Telegram alert or automatic repair: the application does not delete, truncate, rename or recreate database/WAL files to recover from an open failure.
+
+Before investigating or restoring:
+
+1. Stop all graph users, including the agent and any live backfill.
+2. Back up the database and **all sidecars together**, including `.wal` and `.wal.checkpoint` when present. Do not discard WAL files: they may contain committed transactions not yet checkpointed.
+3. Investigate offline or restore a consistent backup using supported database procedures. Any destructive salvage requires explicit operator approval.
+4. Restart after repair and check graph memory health.
+
 ### Sub-agents
 
 Sub-agents are isolated background ReAct loops — non-blocking, with their own LLM context. Every agentic scheduled job runs as a sub-agent with its own job context: its complete result is kept in job history under its execution ID, and nothing from a scheduled run enters operator memory or recall. For jobs with `notify` on, the run-result notice is deferred until your current turn is idle and arrives silently (an expandable quote, or a compact message with a Details button for long results); with `notify` off nothing is sent but the result is still recorded. See "Run results and notices" in the scheduler section.
@@ -695,6 +706,8 @@ There is no sub-agent or scheduler model setting in `config.toml`. A sub-agent o
 Manage sub-agents: `/agents` to list, `/agents cancel <id>` or `/agents cancel <job_tag>` to stop.
 
 Sub-agents cannot spawn further sub-agents (max depth: 1).
+
+During shutdown, queued sub-agents are cancelled and cleaned up before the normal bounded wait for running work. Running clients remain open until their execution unwinds; this does not add a time limit to synchronous cleanup callbacks. New spawn requests are refused while the supervisor is stopping, with guidance to restart the agent before retrying. Scheduled launch failures retain their existing reporting.
 
 ### LLM providers & resilience
 

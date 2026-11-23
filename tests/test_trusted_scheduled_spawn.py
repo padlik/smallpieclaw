@@ -15,6 +15,7 @@ system (``tmp_path``).
 from __future__ import annotations
 
 import copy
+import html
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import MagicMock, patch
@@ -47,6 +48,7 @@ class _AcceptingFactory:
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.runners: list[MagicMock] = []
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
@@ -57,6 +59,7 @@ class _AcceptingFactory:
         runner._llm = MagicMock()
         runner._agent = MagicMock()
         runner._agent.max_iterations = 8
+        self.runners.append(runner)
         return runner
 
 
@@ -334,3 +337,31 @@ def test_scheduler_fire_empty_model_inherits(scheduler_env) -> None:
     assert factory.calls[0]["model"] == ""
     assert type(factory.calls[0]["model"]) is str
     assert sched.notify.call_args_list == []
+
+
+@pytest.mark.parametrize("scheduler_env", ['"p/model"'], ids=["selector"], indirect=True)
+def test_scheduled_launch_against_stopping_supervisor_is_generic_failure_released_once(
+    scheduler_env,
+) -> None:
+    """The shim's stopping refusal keeps the generic scheduled failure presentation."""
+    from scheduler import _LAUNCH_FAILED_LABEL
+
+    sched, factory = scheduler_env
+    executor = sched.builtin_executor
+    executor._supervisor.shutdown(graceful_timeout=0.1)
+    real_release = sched._release_run
+
+    with patch.object(sched, "_release_run", wraps=real_release) as release, \
+         patch("sub_agent_registry.get_registry", return_value=_registry()):
+        sched._run_job(_JOB_TAG)
+
+    assert len(factory.calls) == 1  # runner was built, then rolled back
+    (runner,) = factory.runners
+    runner.close.assert_called_once_with()  # rollback closed the returned runner
+    runner.run.assert_not_called()  # never executed
+    assert release.call_count == 1  # scheduler release only; no accepted-task finish
+    (alert,) = [c.args[0] for c in sched.notify.call_args_list]
+    assert "failed to spawn" in alert
+    assert html.escape(_LAUNCH_FAILED_LABEL) in alert
+    assert "shutting down" not in alert
+    assert sched._active_runs.get(_JOB_TAG, set()) == set()

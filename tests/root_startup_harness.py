@@ -73,10 +73,11 @@ import json
 import logging
 import tempfile
 import threading
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -112,6 +113,7 @@ from sub_agent_registry import SubAgentRegistry
 from token_usage import TokenUsageRegistry
 from tool_index import ToolIndex
 from xdg import xdg_paths
+from tests.inline_futures import run_inline_future
 
 AGENT_NAME = "rootagent"
 ACME_HOST = "anthropic.root.test"
@@ -1168,10 +1170,9 @@ class ScheduledRootProbe:
 
         self._mp.setattr(runs, "register", register_spy)
 
-        def run_inline(fn: Callable[[], None], *_args: object, **_kwargs: object) -> MagicMock:
+        def run_inline(fn: Callable[[], None], *_args: object, **_kwargs: object) -> Future[None]:
             """External pool boundary: run the real worker body once, inline."""
-            fn()
-            return MagicMock()
+            return run_inline_future(fn)
 
         with patch("sub_agent_registry.get_registry", return_value=runs), \
              patch.object(root.builtin._supervisor._pool, "submit", side_effect=run_inline), \

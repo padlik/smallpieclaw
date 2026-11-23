@@ -35,6 +35,7 @@ from tests.root_startup_harness import (
     ScheduledRootProbe,
     run_scheduled_root,
 )
+from tests.inline_futures import run_inline_future
 
 
 @pytest.mark.parametrize(
@@ -490,8 +491,7 @@ def _drive_scheduled_run(
             if terminal == "timeout_cancelled":
                 record._timeout_cancelled = True
             record.cancel()
-        fn()
-        return MagicMock()
+        return run_inline_future(fn)
 
     with patch("sub_agent_registry.get_registry", return_value=local_reg), \
          patch.object(executor._supervisor._pool, "submit", side_effect=run_now):

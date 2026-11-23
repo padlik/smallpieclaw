@@ -438,6 +438,79 @@ class TestSubAgentRunnerConstruction:
         assert callable(runner.notify_fn)
 
 
+class TestSubAgentRunnerOwnership:
+    """Freeze who owns and closes runner-allocated clients."""
+
+    def test_chat_allocation_failure_closes_embedding(self, pin_a):
+        embedding = MagicMock(spec=EmbeddingClient)
+        with patch("agent_controller.LLMClient", side_effect=RuntimeError("chat")):
+            with pytest.raises(RuntimeError, match="chat"):
+                SubAgentRunner(
+                    **_runner_kwargs(pin_a, embedding_factory=lambda _e: embedding)
+                )
+        embedding.close.assert_called_once_with()
+
+    def test_embedding_allocation_failure_allocates_no_chat_client(self, pin_a):
+        def failing_factory(_event: threading.Event) -> EmbeddingClient:
+            raise RuntimeError("embedding")
+
+        with patch("agent_controller.LLMClient") as chat_cls:
+            with pytest.raises(RuntimeError, match="embedding"):
+                SubAgentRunner(**_runner_kwargs(pin_a, embedding_factory=failing_factory))
+        chat_cls.assert_not_called()
+
+    def test_later_constructor_failure_closes_chat_and_embedding(self, pin_a):
+        embedding = MagicMock(spec=EmbeddingClient)
+        chat = MagicMock(spec=LLMClient)
+        with patch("agent_controller.LLMClient", return_value=chat), patch(
+            "agent_controller.AgentController", side_effect=RuntimeError("controller")
+        ):
+            with pytest.raises(RuntimeError, match="controller"):
+                SubAgentRunner(
+                    **_runner_kwargs(pin_a, embedding_factory=lambda _e: embedding)
+                )
+        chat.close.assert_called_once_with()
+        embedding.close.assert_called_once_with()
+
+    def test_direct_close_releases_owned_clients_and_is_repeatable(self, make_runner):
+        runner = make_runner()
+        assert runner._llm._closed is False
+        assert runner._embedding._http.is_closed is False
+        runner.close()
+        assert runner._llm._closed is True
+        assert runner._embedding._http.is_closed is True
+        runner.close()  # repeated close is safe
+        assert runner._llm._closed is True
+        assert runner._embedding._http.is_closed is True
+
+    def test_run_does_not_close_owned_clients(self, make_runner):
+        runner = make_runner()
+        with patch.object(runner._agent, "run", return_value="ok"):
+            assert runner.run("task") == "ok"
+        assert runner._llm._closed is False
+        assert runner._embedding._http.is_closed is False
+
+    def test_run_failure_does_not_close_owned_clients(self, make_runner):
+        runner = make_runner()
+        with patch.object(runner._agent, "run", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                runner.run("task")
+        assert runner._llm._closed is False
+        assert runner._embedding._http.is_closed is False
+
+    def test_close_leaves_borrowed_shared_services_open(self, pin_a):
+        shared = {
+            name: MagicMock()
+            for name in ("tool_index", "base_memory", "builtin_executor",
+                         "skill_registry", "results")
+        }
+        runner = SubAgentRunner(**_runner_kwargs(pin_a, **shared))
+        runner.close()
+        runner.close()
+        for service in shared.values():
+            service.close.assert_not_called()
+
+
 # ===========================================================================
 # 1.3 — fallback trichotomy, overrides, usage registry, caller tag, restore
 # ===========================================================================

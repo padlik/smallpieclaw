@@ -206,114 +206,97 @@ class TestGraphMemoryStorePathHandling:
         assert passed.startswith(str(tmp_path))
 
 
-class TestGraphMemoryWALRecovery:
-    """_open_db() removes corrupt WAL files and retries on corrupted-WAL errors."""
+class TestGraphMemoryOpenNonDestructive:
+    """_open_db() makes one engine-open attempt and never repairs files."""
 
-    def _make_ladybug_mock(self, monkeypatch, db_side_effect):
-        """Patch graph_memory.ladybug with a minimal mock whose Database calls db_side_effect."""
-        from unittest.mock import MagicMock as _MM
-        lbug_mock = _MM()
-        lbug_mock.Database.side_effect = db_side_effect
+    _MARKERS = [
+        "Corrupted wal file. Read out invalid WAL record type.",
+        "invalid wal record",
+        'Assertion failed in file "/x/storage/wal/wal_record.cpp" on line 76: UNREACHABLE_CODE',
+    ]
+
+    def _failing_engine(self, monkeypatch, message):
+        """Patch graph_memory.ladybug with an engine whose open fails without touching files."""
+        lbug_mock = MagicMock()
+        lbug_mock.Database.side_effect = RuntimeError(message)
         monkeypatch.setattr("graph_memory.ladybug", lbug_mock)
         return lbug_mock
 
-    def test_corrupted_wal_removes_wal_and_retries(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("message", _MARKERS)
+    def test_former_wal_markers_open_once_and_preserve_bytes(
+        self, tmp_path, monkeypatch, message
+    ):
         db_path = str(tmp_path / "graph")
-        wal_path = db_path + ".wal"
-        ckpt_path = db_path + ".wal.checkpoint"
+        files = {
+            db_path: b"db-bytes",
+            db_path + ".wal": b"wal-bytes",
+            db_path + ".wal.checkpoint": b"ckpt-bytes",
+        }
+        for p, data in files.items():
+            with open(p, "wb") as fh:
+                fh.write(data)
+        lbug_mock = self._failing_engine(monkeypatch, message)
 
-        # Create fake WAL sidecar files so the removal is exercised.
-        open(wal_path, "w").close()
-        open(ckpt_path, "w").close()
+        with pytest.raises(RuntimeError):
+            GraphMemoryStore._open_db(db_path, 64 * 1024 * 1024)
 
-        call_count = 0
+        assert lbug_mock.Database.call_count == 1
+        for p, data in files.items():
+            with open(p, "rb") as fh:
+                assert fh.read() == data
+        lbug_mock.Connection.assert_not_called()
 
-        def _db_side_effect(*_args, **_kw):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("Corrupted wal file. Read out invalid WAL record type.")
-            return MagicMock()
+    @pytest.mark.parametrize("message", _MARKERS + ["Disk is full"])
+    @pytest.mark.parametrize("sidecars", ["none", "wal_only", "ckpt_only"])
+    def test_absent_sidecars_and_unrelated_errors_open_once_unchanged(
+        self, tmp_path, monkeypatch, sidecars, message
+    ):
+        db_path = str(tmp_path / "graph")
+        files = {db_path: b"db-bytes"}
+        if sidecars == "wal_only":
+            files[db_path + ".wal"] = b"wal-bytes"
+        if sidecars == "ckpt_only":
+            files[db_path + ".wal.checkpoint"] = b"ckpt-bytes"
+        for p, data in files.items():
+            with open(p, "wb") as fh:
+                fh.write(data)
+        lbug_mock = self._failing_engine(monkeypatch, message)
 
-        self._make_ladybug_mock(monkeypatch, _db_side_effect)
+        with pytest.raises(RuntimeError, match=message[:8]):
+            GraphMemoryStore._open_db(db_path, 64 * 1024 * 1024)
 
-        from graph_memory import GraphMemoryStore as GMS
-        db = GMS._open_db(db_path, 64 * 1024 * 1024)
-        assert db is not None
-        assert call_count == 2, "Database should have been opened twice (fail then retry)"
-        assert not os.path.exists(wal_path), "WAL file should have been removed"
-        assert not os.path.exists(ckpt_path), "Checkpoint WAL file should have been removed"
+        assert lbug_mock.Database.call_count == 1
+        assert sorted(os.listdir(tmp_path)) == sorted(os.path.basename(p) for p in files)
+        for p, data in files.items():
+            with open(p, "rb") as fh:
+                assert fh.read() == data
 
-    def test_non_wal_error_is_reraised(self, tmp_path, monkeypatch):
-        db_path = str(tmp_path / "graph2")
+    def test_construction_failure_creates_no_connection_or_schema(
+        self, tmp_path, monkeypatch, embedder
+    ):
+        db_path = str(tmp_path / "graph")
+        with open(db_path, "wb") as fh:
+            fh.write(b"db-bytes")
+        lbug_mock = self._failing_engine(monkeypatch, "Corrupted wal file")
 
-        def _fail(*_args, **_kw):
-            raise RuntimeError("Disk is full")
-
-        self._make_ladybug_mock(monkeypatch, _fail)
-
-        from graph_memory import GraphMemoryStore as GMS
-        with pytest.raises(RuntimeError, match="Disk is full"):
-            GMS._open_db(db_path, 64 * 1024 * 1024)
-
-    def test_corrupted_wal_without_files_reraises(self, tmp_path, monkeypatch):
-        """If no WAL files are present the original exception is re-raised."""
-        db_path = str(tmp_path / "graph3")
-
-        def _fail(*_args, **_kw):
-            raise RuntimeError("Corrupted wal file. Read out invalid WAL record type.")
-
-        self._make_ladybug_mock(monkeypatch, _fail)
-
-        from graph_memory import GraphMemoryStore as GMS
         with pytest.raises(RuntimeError, match="Corrupted wal"):
-            GMS._open_db(db_path, 64 * 1024 * 1024)
+            GraphMemoryStore(db_path=db_path, embedder_fn=embedder, embedding_dim=4)
 
-    def test_assertion_failed_wal_removes_and_retries(self, tmp_path, monkeypatch):
-        """UNREACHABLE_CODE assertion in wal_record.cpp is also treated as WAL corruption."""
-        db_path = str(tmp_path / "graph4")
-        wal_path = db_path + ".wal"
-        ckpt_path = db_path + ".wal.checkpoint"
+        assert lbug_mock.Database.call_count == 1
+        lbug_mock.Connection.assert_not_called()
+        with open(db_path, "rb") as fh:
+            assert fh.read() == b"db-bytes"
 
-        open(wal_path, "w").close()
-        open(ckpt_path, "w").close()
+    def test_successful_open_returns_engine_database(self, tmp_path, monkeypatch):
+        lbug_mock = MagicMock()
+        monkeypatch.setattr("graph_memory.ladybug", lbug_mock)
 
-        call_count = 0
+        db = GraphMemoryStore._open_db(str(tmp_path / "graph"), 1024)
 
-        def _db_side_effect(*_args, **_kw):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError(
-                    'Assertion failed in file "/__w/ladybug/ladybug/src/storage/wal/wal_record.cpp" '
-                    "on line 76: UNREACHABLE_CODE"
-                )
-            return MagicMock()
-
-        self._make_ladybug_mock(monkeypatch, _db_side_effect)
-
-        from graph_memory import GraphMemoryStore as GMS
-        db = GMS._open_db(db_path, 64 * 1024 * 1024)
-        assert db is not None
-        assert call_count == 2, "Database should have been opened twice (fail then retry)"
-        assert not os.path.exists(wal_path), "WAL file should have been removed"
-        assert not os.path.exists(ckpt_path), "Checkpoint WAL file should have been removed"
-
-    def test_non_wal_assertion_error_is_reraised(self, tmp_path, monkeypatch):
-        """Assertion errors not related to WAL are not recovered."""
-        db_path = str(tmp_path / "graph5")
-
-        def _fail(*_args, **_kw):
-            raise RuntimeError(
-                "Assertion failed in file \"/some/path.cpp\" on line 42: UNREACHABLE_CODE"
-            )
-
-        self._make_ladybug_mock(monkeypatch, _fail)
-
-        from graph_memory import GraphMemoryStore as GMS
-        with pytest.raises(RuntimeError, match="UNREACHABLE_CODE"):
-            GMS._open_db(db_path, 64 * 1024 * 1024)
-
+        assert db is lbug_mock.Database.return_value
+        lbug_mock.Database.assert_called_once_with(
+            str(tmp_path / "graph"), buffer_pool_size=1024, max_num_threads=2
+        )
 
 class TestVectorExtensionLoader:
     """_load_vector_extension() should try LOAD first and INSTALL+LOAD on first use."""
