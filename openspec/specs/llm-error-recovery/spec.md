@@ -51,77 +51,9 @@ The system SHALL retain the seven existing categories: `timeout`, `connection`, 
 - **WHEN** `_request_turn()` receives it
 - **THEN** cancellation ends that request without classification, checkpoint, or error card
 
-### Requirement: Disk-persisted checkpoint on LLM error
-
-For retryable LLM failures in runs explicitly capable of interactive LLM recovery, the system SHALL atomically write `data/run_checkpoints/{trace_id}.json` when checkpoint writing is enabled. The checkpoint SHALL include `_LoopState` (messages, step, goal index, max steps, JSON failure streak), trace, goal, model, timestamp, error info (type, message, retryability, detail) and attempt mode/count/remaining budget. Headless and non-retryable failures SHALL NOT create new recovery checkpoints. `OSError` SHALL remain non-fatal. Existing ownership and exact-snapshot send-gate retirement SHALL remain enforced.
-
-#### Scenario: Checkpoint is written on LLM error
-- **GIVEN** three tool calls completed and a later interactive model request fails retryably
-- **WHEN** the system checkpoints the run
-- **THEN** all tool results, existing loop metadata, error info and pending attempt state are stored
-
-#### Scenario: Checkpoint write is atomic
-- **WHEN** an eligible checkpoint write commits
-- **THEN** a temporary file is atomically replaced and a crash cannot leave a partial final checkpoint
-
-#### Scenario: Checkpoint write failure is non-fatal
-- **WHEN** eligible checkpoint writing raises `OSError`
-- **THEN** a warning is logged and inline retry still proceeds
-- **AND** the user is told that disk recovery is unavailable rather than promised `/resume`
-
-#### Scenario: Checkpoint is deleted on successful run completion
-- **GIVEN** a checkpoint exists and explicit recovery succeeds
-- **WHEN** the resumed run completes
-- **THEN** its checkpoint is retired under existing ownership rules
-
-#### Scenario: Checkpoint is deleted on explicit cancel
-- **GIVEN** an eligible checkpoint exists
-- **WHEN** the operator explicitly cancels the recovery prompt
-- **THEN** the checkpoint is retired under existing ownership rules
-
-#### Scenario: Checkpoint survives retry-prompt timeout
-- **WHEN** an eligible interactive retry prompt times out
-- **THEN** the run unblocks and its checkpoint remains for `/resume`
-
-### Requirement: Inline retry prompt for eligible interactive failures
-
-Only explicitly interactive runs with retryable LLM failures SHALL block on a Retry/Cancel card, using the configured timeout (default 120 seconds). Cards SHALL show the classified icon/message, model, step/max steps, preserved tool-result count and at most 200 characters of safe error detail. Non-retryable and headless failures SHALL return guidance without any card or wait.
-
-#### Scenario: Retryable error shows Retry and Cancel buttons
-- **GIVEN** an interactive timeout error occurs and its checkpoint is written
-- **WHEN** Telegram renders the error card
-- **THEN** it shows the timeout icon/message, model, step/max steps and preserved-tool-result count
-- **AND** it shows Retry and Cancel buttons
-- **AND** it shows at most the first 200 characters of safe error detail
-
-#### Scenario: Non-retryable error has no blocking card
-- **WHEN** context overflow or permanent rejection occurs
-- **THEN** the run returns fixed actionable guidance without waiting for operator input
-- **AND** no Retry or Cancel-only error card is shown
-
-#### Scenario: User presses Retry and run resumes from checkpoint
-- **GIVEN** a retryable interactive error card is showing
-- **WHEN** the operator presses Retry
-- **THEN** the thread unblocks and continues the saved step/messages with the same attempt state
-- **AND** prior tool results are not re-executed
-- **AND** a new LLM call is made with the full conversation context
-
-#### Scenario: User presses Cancel and checkpoint is deleted
-- **GIVEN** a retryable interactive error card is showing
-- **WHEN** the operator presses Cancel
-- **THEN** the thread unblocks, retires its checkpoint under existing ownership rules and returns an error string to Telegram
-
-#### Scenario: Retry prompt times out without user action
-- **WHEN** an interactive retry card receives no decision before its configured timeout
-- **THEN** the run unblocks with an error string and leaves its checkpoint for `/resume`
-
-#### Scenario: New message during retry prompt is deferred
-- **WHEN** a new message arrives while an interactive retry prompt is active
-- **THEN** existing deferred-message behavior presents it after the current run ends
-
 ### Requirement: /resume command for eligible checkpoint recovery
 
-The system SHALL provide `/resume` for eligible main-agent checkpoints only. The controller/recovery layer SHALL own eligibility and SHALL reject a valid checkpoint marked `error_info.retryable=false` before manual retry authorization or any send; Telegram SHALL apply the same rule for presentation only. `/resume` and `/resume N` SHALL use one filtered, newest-first, contiguously numbered list. Resume SHALL NOT delete ineligible files, refill the automatic budget or replay completed tools.
+The system SHALL provide `/resume` for eligible main-agent checkpoints only. The controller/recovery layer SHALL own eligibility and SHALL reject a valid checkpoint marked `error_info.retryable=false` before manual retry authorization or any send; Telegram SHALL apply the same rule for presentation only. `/resume` and `/resume N` SHALL use one filtered, newest-first, contiguously numbered list. Resume SHALL NOT delete ineligible files, refill the automatic budget or replay completed tools. Each resumed execution SHALL admit the current active model once, preserving the saved state and historical identity without requiring model equality. An unavailable or inadmissible active model SHALL cause actionable local failure without sending or changing the checkpoint.
 
 #### Scenario: /resume with single checkpoint resumes immediately
 - **GIVEN** one eligible checkpoint from a prior timeout exists
@@ -174,6 +106,18 @@ The system SHALL provide `/resume` for eligible main-agent checkpoints only. The
 - **WHEN** its resumed run succeeds
 - **THEN** it uses that trace for correlation and retires that checkpoint under existing ownership rules
 - **AND** it continues the stored attempt state without refilling the automatic budget or replaying completed tools
+
+#### Scenario: Active model differs from checkpoint model
+- **GIVEN** an eligible checkpoint created with `a/model` and active selection `b/model`
+- **WHEN** `/resume` admits the saved task
+- **THEN** it continues on `b/model` without requiring `a/model` to remain configured or callable
+- **AND** saved messages, completed results and loop position are restored without executing prior tools
+
+#### Scenario: No active model can be admitted
+- **GIVEN** an eligible checkpoint and an unset or inadmissible active selection
+- **WHEN** `/resume` is attempted
+- **THEN** actionable selection/configuration guidance is returned without a provider send
+- **AND** the checkpoint bytes remain unchanged
 
 ### Requirement: Startup checkpoint scan notification
 
@@ -238,24 +182,6 @@ For a **scheduled run** with `notify=true`, run-result notices SHALL wait until 
 - **WHEN** the scheduler handles the launch failure
 - **THEN** the existing direct launch-failure alert is sent independently of the run-result notification setting
 
-### Requirement: LLM error handling configuration
-
-The system SHALL retain `[llm_error_handling] retry_timeout_seconds` (integer, default 120) and `checkpoint_enabled` (boolean, default true). These settings SHALL NOT grant interactive LLM recovery capability. When checkpoint writing is disabled, eligible interactive failures SHALL still allow in-memory Retry/Cancel, but no new disk recovery checkpoint SHALL be available. Existing stored eligible checkpoints SHALL follow existing resume validation.
-
-#### Scenario: Default config applies when section is absent
-- **WHEN** the configuration omits `[llm_error_handling]`
-- **THEN** retry timeout defaults to 120 seconds and checkpoint writing defaults to true
-
-#### Scenario: Checkpoint disabled still allows inline retry
-- **GIVEN** checkpoint writing is disabled and no prior checkpoints exist
-- **WHEN** an explicitly interactive request fails retryably
-- **THEN** no checkpoint is written but Retry/Cancel remains available from memory
-- **AND** `/resume` reports no unfinished runs
-
-#### Scenario: Configuration does not enable headless waits
-- **WHEN** a headless request fails with checkpoint writing enabled and a positive retry timeout
-- **THEN** it still returns terminal failure without a retry card, wait or new checkpoint
-
 ### Requirement: Automatic retry settings belong to the agent
 
 `[agent] max_retries` SHALL default to 4 additional attempts; `retry_delay` SHALL default to 2 seconds. Delays SHALL grow 2/4/8/16 seconds. Zero retries SHALL mean one initial call. Provider- or model-level retry settings SHALL be rejected.
@@ -279,7 +205,7 @@ The system SHALL retain `[llm_error_handling] retry_timeout_seconds` (integer, d
 
 ### Requirement: One attempt state covers a logical model request
 
-One `CallAttemptState` SHALL span control-flow calls until a usable response/action is accepted, terminal failure is finalized, or cancellation occurs. Empty responses, allowed parse re-prompts, mode conversions, and human/confirmation waits SHALL retain it. A later independent model call gets a new state.
+One `CallAttemptState` SHALL span control-flow calls until a usable response/action is accepted, terminal failure is finalized, or cancellation occurs. Empty responses, allowed parse re-prompts, mode conversions, and human/tool-confirmation waits SHALL retain it. A later independent model call gets a new state. Explicit `/resume`, including a model change, SHALL restore saved counters and grant at most the existing single manual continuation without refilling automatic attempts.
 
 #### Scenario: Control-flow loops retain request state
 - **GIVEN** empty output, safe parse re-prompt, confirmation wait, or local native-to-JSON conversion occurs before acceptance
@@ -298,34 +224,14 @@ One `CallAttemptState` SHALL span control-flow calls until a usable response/act
 - **AND** a later failed call can still retry after earlier completed tool turns
 
 #### Scenario: Explicit checkpoint recovery does not refill budget
-- **GIVEN** Retry or `/resume` restores a checkpoint
+- **GIVEN** `/resume` restores a checkpoint, on the same or a different active model
 - **WHEN** the saved request continues
-- **THEN** the same state and remaining automatic budget are restored
+- **THEN** the same state and remaining automatic budget are restored with at most the existing single manual continuation authorization
 - **AND** no completed tool is re-executed
-
-### Requirement: Interactive LLM recovery is explicitly enabled per run
-
-The system SHALL default each run's interactive LLM recovery capability to false. Telegram root requests and Telegram resume SHALL explicitly enable it. On-demand, scheduled, plan-step and diagnostic runners SHALL remain headless for LLM recovery regardless of callback presence, notification delivery, depth or label. This capability SHALL NOT govern sensitive-tool confirmation.
-
-#### Scenario: Real headless runner exhausts automatic attempts
-- **GIVEN** a headless runner encounters a transient LLM failure
-- **WHEN** its existing automatic request policy is exhausted
-- **THEN** it returns a sanitized terminal failure without invoking an operator retry wait, publishing a retry token or saving a new recovery checkpoint
-- **AND** the outbound attempt count remains bounded by the existing request budget
-
-#### Scenario: Notification callbacks do not enable recovery
-- **WHEN** a headless runner can send notifications or bridge an allowed tool confirmation
-- **THEN** its LLM recovery capability remains false
-- **AND** existing tool-confirmation policy is unchanged
-
-#### Scenario: Telegram root and resume retain interaction
-- **WHEN** Telegram invokes a root request or eligible resume
-- **THEN** the per-run capability is true and retryable failures retain interactive recovery
-- **AND** concurrent headless runs do not inherit that capability
 
 ### Requirement: Terminal LLM failures end safely and propagate as failures
 
-After the existing automatic policy finishes, non-retryable and headless terminal LLM failures SHALL return immediate fixed, sanitized guidance without a new checkpoint or card. Cancellation SHALL win. Callers SHALL report failure without whole-task replay, preserving cleanup, pre-send recovery data and scheduler policy. The scenarios below define guidance and outcome normalization.
+After the existing automatic policy finishes, all terminal LLM failures SHALL return fixed, sanitized guidance without an operator-input wait or card. Eligible retryable interactive failures SHALL follow durable checkpoint persistence and truthfully state recovery availability; non-retryable and headless failures SHALL NOT create new recovery checkpoints. Cancellation SHALL win. Callers SHALL report failure without whole-task replay, preserving cleanup, pre-send recovery data and scheduler policy. The scenarios below define guidance and outcome normalization.
 
 #### Scenario: Context or permanent failure is terminal
 - **WHEN** an interactive or headless request fails as context or permanent
@@ -347,7 +253,7 @@ After the existing automatic policy finishes, non-retryable and headless termina
 #### Scenario: Older retryable state survives preparation failure
 - **GIVEN** an eligible snapshot exists and resume has not sent a new request
 - **WHEN** preparation fails or cancellation occurs
-- **THEN** the saved snapshot remains unchanged and no replacement non-retryable checkpoint is written
+- **THEN** the saved snapshot remains unchanged and no replacement checkpoint is written
 - **AND** existing exact-snapshot retirement immediately before a new send remains unchanged
 
 #### Scenario: Runtime failure reaches all callers truthfully
@@ -369,3 +275,132 @@ After the existing automatic policy finishes, non-retryable and headless termina
 #### Scenario: Failure without automatic retry does not claim exhaustion
 - **WHEN** a headless unknown failure terminates without exhausting an automatic budget
 - **THEN** its fixed guidance reports the failure without claiming automatic retries were exhausted
+
+#### Scenario: Interactive failure releases execution without a card wait
+- **GIVEN** an eligible Telegram run exhausts its automatic policy on a retryable failure
+- **WHEN** checkpoint saving finishes or fails
+- **THEN** the run returns truthful recovery guidance without publishing a retry token or awaiting a decision
+- **AND** normal cleanup closes owned clients and releases checkpoint ownership after existing child draining
+
+### Requirement: Durable checkpoints preserve eligible failed requests
+
+Eligible retryable LLM failures SHALL atomically save `data/run_checkpoints/{trace_id}.json` when writing is enabled, then end without an operator wait. Headless and non-retryable failures SHALL NOT create new checkpoints. `OSError` SHALL remain non-fatal. Existing ownership and exact-snapshot send-gate retirement SHALL remain enforced. Payload, availability and abandoned-file rules follow the scenarios below.
+
+#### Scenario: Checkpoint is written on LLM error
+- **GIVEN** three tool calls completed and a later eligible model request fails retryably
+- **WHEN** the system checkpoints the run
+- **THEN** all tool results, existing loop metadata, error info and pending attempt state are stored
+- **AND** the payload SHALL include messages, step, goal index, max steps, JSON failure streak, trace, goal, model, timestamp, error type/message/retryability/detail and attempt mode/count/remaining budget
+- **AND** the failed run returns without waiting for operator input
+
+#### Scenario: Checkpoint write is atomic
+- **WHEN** an eligible checkpoint write commits
+- **THEN** a temporary file is atomically replaced and a crash cannot leave a partial final checkpoint
+
+#### Scenario: Checkpoint write failure is non-fatal
+- **WHEN** eligible checkpoint writing raises `OSError` or returns failure
+- **THEN** a warning is logged and the run ends with sanitized failure and recovery-unavailable guidance
+- **AND** no memory-only continuation or `/resume` promise is offered for that failed request
+
+#### Scenario: Checkpoint is deleted on successful run completion
+- **GIVEN** a checkpoint exists and explicit recovery succeeds
+- **WHEN** the resumed run completes
+- **THEN** its checkpoint is retired under existing ownership rules
+
+#### Scenario: Recovery guidance requires verified saved state
+- **GIVEN** an eligible retryable request fails
+- **WHEN** the owner-backed save returns success and exact-snapshot recovery verification succeeds
+- **THEN** the failure guidance offers `/resume`
+- **AND** a save failure or failed verification instead reports recovery unavailable
+
+#### Scenario: Abandoned checkpoint remains listed
+- **GIVEN** an eligible checkpoint is saved and the failed run has ended
+- **WHEN** the operator does not resume it
+- **THEN** removal of live cards introduces no automatic deletion or expiry
+- **AND** existing eligible enumeration and startup notification still apply
+- **AND** abandoned files SHALL remain subject to existing safe retirement or operator-managed cleanup, without a new discard command or cleanup mechanism
+
+### Requirement: Durable recovery configuration excludes live retry waits
+
+The system SHALL retain `[llm_error_handling] checkpoint_enabled` (boolean, default true). It SHALL reject `llm_error_handling.retry_timeout_seconds` with any value, naming the field and directing its removal because blocking Retry cards were removed. Configuration SHALL NOT grant per-run checkpoint eligibility. Disabled-write behavior follows the scenarios below.
+
+#### Scenario: Default config applies when section is absent
+- **WHEN** the configuration omits `[llm_error_handling]`
+- **THEN** checkpoint writing defaults to true and no live retry timeout is created
+
+#### Scenario: Checkpoint disabled provides no new recovery
+- **GIVEN** checkpoint writing is disabled and no prior checkpoints exist
+- **WHEN** an eligible Telegram request fails retryably
+- **THEN** it ends without writing a checkpoint or showing Retry/Cancel
+- **AND** it reports recovery unavailable and `/resume` reports no unfinished runs
+- **AND** disabling writing SHALL provide no memory-only recovery
+
+#### Scenario: Configuration does not enable headless waits
+- **WHEN** a headless request fails with checkpoint writing enabled
+- **THEN** it returns terminal failure without a retry card, wait or new checkpoint
+
+#### Scenario: Obsolete timeout setting is rejected
+- **WHEN** configuration contains `llm_error_handling.retry_timeout_seconds` with any value
+- **THEN** validation names the field and directs its removal because blocking Retry cards were removed
+- **AND** the setting is neither ignored nor repurposed
+
+#### Scenario: Disabled writes do not disable existing recovery
+- **GIVEN** an eligible checkpoint exists and new checkpoint writing is disabled
+- **WHEN** `/resume` continues it
+- **THEN** existing validation, attempt accounting and exact-snapshot pre-send retirement still apply
+- **AND** disabled new writes SHALL NOT prevent recovery of that existing eligible checkpoint
+
+### Requirement: Durable checkpoint recovery eligibility is explicitly enabled per run
+
+The system SHALL default each run's durable checkpoint recovery eligibility to false. Telegram root requests and Telegram resume SHALL explicitly enable it. On-demand, scheduled, plan-step and diagnostic runners SHALL remain ineligible regardless of callback presence, notification delivery, depth or label. This eligibility SHALL NOT govern sensitive-tool confirmation and SHALL NOT enable any LLM error retry wait.
+
+#### Scenario: Real headless runner exhausts automatic attempts
+- **GIVEN** a headless runner encounters a transient LLM failure
+- **WHEN** its existing automatic request policy is exhausted
+- **THEN** it returns a sanitized terminal failure without invoking an operator retry wait, publishing a retry token or saving a new recovery checkpoint
+- **AND** the outbound attempt count remains bounded by the existing request budget
+
+#### Scenario: Notification callbacks do not enable recovery
+- **WHEN** a headless runner can send notifications or bridge an allowed tool confirmation
+- **THEN** its durable checkpoint recovery eligibility remains false
+- **AND** existing tool-confirmation policy is unchanged
+
+#### Scenario: Telegram root and resume explicitly enable checkpoint eligibility
+- **WHEN** Telegram invokes a root request or eligible resume
+- **THEN** its per-run eligibility is true and retryable failures can save durable recovery state when writing is enabled
+- **AND** no live retry card is shown and concurrent headless runs do not inherit eligibility
+
+### Requirement: Resume model handoff is announced safely
+
+When canonical model IDs differ, recovery SHALL announce both models and the saved-context provider handoff after the ordinary goal/step resume notice and before model I/O. The notice SHALL use existing safe rendering/redaction, add no blocking approval, and expose no credentials, endpoints or raw checkpoint/provider error content.
+
+#### Scenario: Cross-provider handoff is announced
+- **GIVEN** an eligible checkpoint from `a/model` and an admitted active target `b/model`
+- **WHEN** resume validates the saved state
+- **THEN** a handoff notice naming both models and explaining saved-context delivery follows the ordinary resume notice before provider I/O
+- **AND** it SHALL explain that saved conversation and tool results will be sent to the selected model's provider
+- **AND** execution does not wait for another approval
+
+#### Scenario: Same-model resume does not imply original-client restoration
+- **GIVEN** checkpoint and admitted canonical model IDs match
+- **WHEN** resume starts
+- **THEN** the ordinary resume notice remains and no model-change notice is required
+- **AND** no original-client restoration guarantee is made
+
+#### Scenario: Notification failure does not duplicate execution
+- **WHEN** handoff-notice delivery fails
+- **THEN** notification failure SHALL NOT trigger repeated execution, second model admission or alternate target
+
+### Requirement: Stale live retry callbacks are inert
+
+Old LLM Retry/Cancel callbacks SHALL follow existing authentication, acknowledge their expired controls and direct the operator to `/resume`. They SHALL NOT resume execution, grant retry authorization, delete or rewrite checkpoints, or claim that retry started. New executions SHALL NOT publish live LLM retry tokens or render replacement Resume buttons.
+
+#### Scenario: Old Retry and Cancel buttons cannot mutate recovery
+- **GIVEN** an authenticated operator presses a Retry or Cancel button from before upgrade
+- **WHEN** its callback is handled
+- **THEN** it is acknowledged as expired with `/resume` guidance
+- **AND** no run starts, retry budget changes or checkpoint mutation occurs
+
+#### Scenario: Unauthenticated stale callback discloses no recovery information
+- **WHEN** an unauthenticated user sends an old LLM retry callback
+- **THEN** existing authentication denies access without disclosing checkpoint data or mutating state
